@@ -134,7 +134,7 @@ printf '%s\n' "$cmd"
 grep -q "minzoned" <<<"$cmd" || fail "the command does not install minzoned"
 grep -q "launchctl bootstrap system $PLIST" <<<"$cmd" \
   || fail "the command does not bootstrap $LABEL"
-# `min net setup` runs this script with `sudo sh`, its one elevation, so
+# `min finalize-install` runs this script with `sudo sh`, its one elevation, so
 # no step may call sudo itself (comment lines may name it).
 case "$cmd" in '#!/bin/sh'*) ;; *) fail "the command is not a /bin/sh script" ;; esac
 if grep -v '^[[:space:]]*#' <<<"$cmd" | grep -q 'sudo'; then

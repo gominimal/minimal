@@ -2189,9 +2189,15 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// `launchctl bootout`, logout and shutdown), and a foreground run is
 /// stopped with SIGINT. The handler only wakes a watcher thread, which
 /// runs [`stop_pending_asks`] (bounded at [`STOP_AUDIT_BOUND`]) and then
-/// hands the signal to `then`. The supervisor passes [`die_by_signal`], so
-/// after the asks are audited the process ends exactly as it did before
-/// the handler existed. Only a crash and SIGKILL stay outside this path.
+/// hands the signal to `then`. A second stop signal meanwhile ends the
+/// process at once by its default action. The supervisor stops the VM
+/// gracefully in `then`, bounded by its own deadline, and falls back to
+/// [`die_by_signal`] when that cannot finish, so the process always
+/// terminates by the signal. A signal during the boot aborts it: the VMM
+/// child is signalled without a guest ask. Only a crash and SIGKILL stay
+/// outside this path. The graceful VM stop applies to a signal sent to the
+/// supervisor alone: a terminal Ctrl-C also reaches the foreground VMM
+/// child, which shares the terminal's process group, and ends it directly.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn watch_stop_signals(
     boxes: BoxRegistry,
@@ -2254,6 +2260,15 @@ pub(crate) fn watch_stop_signals(
                     _ => return,
                 }
             };
+            // The watcher reads the pipe once, so this is the only set.
+            STOP_SIGNAL.get_or_init(|| (signum, std::time::Instant::now()));
+            // One graceful stop per process: a second SIGTERM or SIGINT
+            // while this one runs ends the process at once, by the signal's
+            // default action, instead of landing in a pipe nobody reads.
+            for default in [libc::SIGTERM, libc::SIGINT] {
+                // SAFETY: restoring a default disposition touches no memory.
+                unsafe { libc::signal(default, libc::SIG_DFL) };
+            }
             tracing::info!(signal = signum, "stop signal received");
             stop_pending_asks(&boxes);
             then(signum);
@@ -2261,15 +2276,73 @@ pub(crate) fn watch_stop_signals(
     Ok(())
 }
 
-/// End the process by `signum` with its default disposition, as it ended
-/// before the stop-signal handler was installed.
+/// The first stop signal and when it arrived, recorded by the watcher
+/// before anything else runs, so the supervisor's main thread can end the
+/// process by that signal once its own teardown has finished.
+static STOP_SIGNAL: std::sync::OnceLock<(libc::c_int, std::time::Instant)> =
+    std::sync::OnceLock::new();
+
+/// The stop signal the watcher received, and when, if one arrived.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-pub(crate) fn die_by_signal(signum: libc::c_int) {
-    // SAFETY: restoring the default disposition and signalling this process
-    // touch no memory; the default action of SIGTERM and SIGINT ends it.
+pub(crate) fn stop_signal_received() -> Option<(libc::c_int, std::time::Instant)> {
+    STOP_SIGNAL.get().copied()
+}
+
+/// What flushes the process's log when dropped: a detached supervisor's
+/// non-blocking writer guard. Held here rather than in `main`, so the
+/// stop-signal watcher, which ends the process from its own thread, can
+/// flush it too.
+static LOG_FLUSHER: Mutex<Option<Box<dyn Send>>> = Mutex::new(None);
+
+/// Hand over the guard whose drop flushes the log; [`flush_log`] drops it.
+pub fn set_log_flusher(guard: impl Send + 'static) {
+    *LOG_FLUSHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(guard));
+}
+
+/// Flush the log by dropping the guard [`set_log_flusher`] was handed, if
+/// any. Records logged afterwards may not reach the file.
+pub fn flush_log() {
+    let guard = LOG_FLUSHER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
+}
+
+/// End the process by the stop signal the watcher received, if one arrived;
+/// otherwise return. The log is flushed first ([`die_by_signal`]), so the
+/// last lines of a signal stop reach it before the process ends.
+pub fn die_by_received_stop_signal() {
+    if let Some((signum, _)) = stop_signal_received() {
+        die_by_signal(signum);
+    }
+}
+
+/// End the process by `signum` with its default disposition, as it ended
+/// before the stop-signal handler was installed, once the log is flushed
+/// ([`flush_log`]): whichever thread ends the process, the stop's last
+/// lines are written first.
+///
+/// Never returns. Where the signal does not end the process (pid 1 in a
+/// container ignores a default-action signal it sends itself), it exits
+/// with the shell's code for a death by that signal instead: a caller may
+/// hold the lifecycle lock until the process ends, and a process that
+/// lived on would hold it for good. In that case a supervisor sees exit
+/// code 128 + `signum`, not a death by signal, so systemd's
+/// `Restart=on-failure` reads the stop as a failure unless
+/// `SuccessExitStatus` names the code.
+///
+/// The exit is `_exit`, which runs no exit handlers or destructors: this
+/// can run on the watcher thread while the main thread is parked on the
+/// lifecycle lock, and a handler that waited on that thread would hang
+/// the one path that must end the process. The log is already flushed.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn die_by_signal(signum: libc::c_int) -> ! {
+    flush_log();
+    // SAFETY: restoring the default disposition, signalling this process and
+    // exiting it touch no memory; the default action of SIGTERM and SIGINT
+    // ends it, and `_exit` ends it where the signal is ignored.
     unsafe {
         libc::signal(signum, libc::SIG_DFL);
         libc::kill(libc::getpid(), signum);
+        libc::_exit(128 + signum)
     }
 }
 
@@ -3744,6 +3817,135 @@ mod tests {
                 "a released name is out of the zone"
             );
         }
+    }
+
+    /// The name hold and its release are the host door's alone: the in-VM
+    /// daemon's channel refuses both, naming the host's control socket, so
+    /// a guest can neither make a hold, take one over, nor release one. A
+    /// hold made over the host door stands, with its owner, after the
+    /// guest's refused attempts at it, and a name only the guest asked for
+    /// is never in the zone.
+    #[test]
+    fn the_guest_door_refuses_the_name_hold_and_its_release() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+        let in_zone = |name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == format!("{name}.min.internal"))
+        };
+        let hold = |name: &str, session_id| HoldBoxNameRequest {
+            name: name.to_string(),
+            session_id: Some(session_id),
+        };
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(hold("web", owner)),
+        )
+        .expect("the host door's hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "web".to_string(),
+                held: true,
+            }
+        );
+
+        for request in [
+            BoxControlRequest::HoldBoxName(hold("mine", other)),
+            BoxControlRequest::HoldBoxName(hold("web", other)),
+            BoxControlRequest::ReleaseBoxName(hold("web", owner)),
+            BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                name: "web".to_string(),
+                session_id: None,
+            }),
+        ] {
+            let refused =
+                control(&guest, &request).expect("the wrong-door request is still answered");
+            assert!(
+                matches!(
+                    &refused,
+                    BoxControlReply::Error { error } if error.contains("the host's control socket")
+                ),
+                "the guest channel refuses {request:?} naming the door that serves it, \
+                 got {refused:?}"
+            );
+        }
+        assert!(!in_zone("mine"), "a hold the guest asked for is not made");
+        assert!(in_zone("web"), "the host's hold outlives a guest's release");
+        assert!(
+            registry.release_held_name("web", Some(owner)),
+            "and is still its first owner's: the guest's takeover did not land"
+        );
+    }
+
+    /// A hold reloaded from the held-names file stands only while a host
+    /// client asks for it again: the one a `hold_box_name` over the host
+    /// door re-makes stays past the bound, and the one no client re-makes
+    /// is gone at the bound. Nothing else re-makes a hold, so this is what
+    /// clears the hold of a session that ended with no release.
+    #[test]
+    fn a_reloaded_hold_stays_only_when_the_host_door_remakes_it() {
+        use crate::box_registry::{HELD_NAME_RECONFIRM_BOUND, REGISTRY_FILE};
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let registry_file = dir.path().join(REGISTRY_FILE);
+        let gone = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+        let before = BoxRegistry::new(SUBNET).persisting_to(registry_file.clone());
+        assert!(before.hold_box_name("old", Some(gone)));
+        assert!(before.hold_box_name("web", Some(live)));
+
+        let registry = BoxRegistry::new(SUBNET).persisting_to(registry_file);
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let _server = spawn(
+            sock_path.clone(),
+            registry.clone(),
+            AnswererStatus::allocating_for_tests("control-test-node"),
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        let in_zone = |name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == format!("{name}.min.internal"))
+        };
+        assert!(in_zone("old") && in_zone("web"), "both holds are reloaded");
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                name: "web".to_string(),
+                session_id: Some(live),
+            }),
+        )
+        .expect("the hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "web".to_string(),
+                held: true,
+            }
+        );
+
+        registry.advance_clock(HELD_NAME_RECONFIRM_BOUND);
+        assert_eq!(
+            registry.expire_unconfirmed_holds(),
+            1,
+            "the hold no host client re-made is dropped at the bound"
+        );
+        assert!(!in_zone("old"), "the dropped name answers nothing");
+        assert!(in_zone("web"), "the hold the host door re-made stands");
     }
 
     /// The drawn port's story (T93): a guest that reports its publish was

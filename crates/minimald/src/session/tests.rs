@@ -164,6 +164,51 @@ fn inherited_session_env_prefix_not_substring() {
     );
 }
 
+/// A spawn failure with no probe diagnosis keeps the bare symptom — the
+/// exact message the pre-hint daemon surfaced, so an unrestricted host (or
+/// an off-Linux one, where no probe runs) sees no change.
+#[test]
+fn spawn_failed_error_without_a_hint_keeps_the_bare_symptom() {
+    assert_eq!(
+        super::spawn_failed_error(None).to_string(),
+        "session host exited before its channel could attach"
+    );
+}
+
+/// A spawn failure with a probe diagnosis names it: the symptom stays (the
+/// host did exit before attaching) and the restriction + fix the startup
+/// probe logged follow it, so the error a client sees on a userns-
+/// restricted host explains itself.
+#[test]
+fn spawn_failed_error_with_a_hint_names_the_restriction_and_fix() {
+    let hint = "kernel.apparmor_restrict_unprivileged_userns=1 and this \
+                 process is unconfined — fix: install minimald's AppArmor \
+                 profile (one-time, needs root)";
+    let msg = super::spawn_failed_error(Some(hint)).to_string();
+    assert!(
+        msg.starts_with("session host exited before its channel could attach — "),
+        "the symptom must stay the error's lead: {msg}"
+    );
+    assert!(msg.contains(hint), "the diagnosis must travel whole: {msg}");
+}
+
+/// A launch failure keeps its own message and kind, and gains the
+/// diagnosis only when the probe found one.
+#[test]
+fn with_userns_hint_appends_the_diagnosis_and_keeps_the_kind() {
+    let base = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "uid_map write");
+    let bare = super::with_userns_hint(base(), None);
+    assert_eq!(bare.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(bare.to_string(), "uid_map write");
+
+    let hinted = super::with_userns_hint(base(), Some("restricted — fix: x"));
+    assert_eq!(hinted.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        hinted.to_string(),
+        "uid_map write — likely cause: restricted — fix: x"
+    );
+}
+
 /// Reads the session record for `id`, or `None` once it has been deleted.
 async fn record_exists(client: &mut TestClient, id: SessionId) -> bool {
     client
@@ -234,6 +279,417 @@ async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
             .status,
         sessions::SessionStatus::Active,
     );
+}
+
+/// Attaching while the session's `WorkspaceFilesTarZst` upload is still
+/// streaming must be refused, not shortcut into `configure_loadout`:
+/// mid-upload the workspace is half-populated, and the default the
+/// Draft shortcut scaffolds against it conflicts with the layout the
+/// upload is about to land — wedging the session behind a layout
+/// error no retry can clear. The refusal leaves the workspace
+/// untouched (nothing is scaffolded). Two overlapping uploads keep
+/// attaches refused until both have finished, and an upload whose guard
+/// is dropped without finishing (a panic, a torn-down task) still clears
+/// its mark, so the same attach then goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // Bare `CreateSession` — the actor stays `Draft`, exactly the state
+    // a client is in while it streams the workspace upload.
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("uploading-session", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+
+    // Stand in for two overlapping in-flight uploads: the RPC handler
+    // takes this guard before it pulls the first byte, and finishes it
+    // once the unpack ends on either arm.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let first = crate::rpc::WorkspaceUploadInFlight::begin(handle.clone())
+        .await
+        .expect("first upload mark should land");
+    let second = crate::rpc::WorkspaceUploadInFlight::begin(handle.clone())
+        .await
+        .expect("second upload mark should land");
+
+    // The attach is refused with the in-flight message, not shortcut
+    // into a configure.
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "expected an attach refusal, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "expected the in-flight-upload refusal, got: {refusal:?}"
+    );
+
+    // The refusal happened before the Draft shortcut, so the workspace
+    // holds no scaffolded root `minimal.toml`.
+    let paths = handle.paths().await.expect("paths should resolve");
+    assert!(
+        !paths.working.as_utf8_path().join("minimal.toml").exists(),
+        "a refused attach must not scaffold the workspace"
+    );
+
+    // One upload finishing does not re-admit attaches while the other
+    // is still unpacking.
+    first
+        .finish()
+        .await
+        .expect("first upload mark should clear");
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "an attach must stay refused while any upload streams, got: {refusal:?}"
+    );
+
+    // The second upload never reaches its finish — dropping the guard
+    // stands in for a panic or a torn-down task — and the same attach
+    // then lands the session live.
+    drop(second);
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "attach after the upload").await;
+
+    // The attach that landed ran the Draft shortcut, which scaffolds the
+    // root `minimal.toml` in this harness — so its absence after the
+    // refusals above is the refusal's doing, not the harness's.
+    assert!(
+        paths
+            .working
+            .as_utf8_path()
+            .join(mfile::MFILE_NAME)
+            .exists(),
+        "the attach that landed should have scaffolded the workspace"
+    );
+}
+
+/// Serializes `(path, contents)` entries into the zstd-compressed tarball a
+/// client streams over `WorkspaceFilesTarZst`.
+async fn workspace_tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut tar = async_tar::Builder::new(Vec::new());
+    for (path, contents) in entries {
+        let mut header = async_tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, path, *contents).await.unwrap();
+    }
+    let tar_bytes = tar.into_inner().await.unwrap();
+    let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+    encoder.write_all(&tar_bytes).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    encoder.into_inner()
+}
+
+/// Streams `payload` through the real `WorkspaceFilesTarZst` subsystem on
+/// `client`, waits for the daemon to close the channel (the unpack, and the
+/// clear of its in-flight mark, are done by then), and returns its stderr.
+async fn upload_workspace(
+    client: &mut TestClient,
+    session_id: SessionId,
+    payload: &[u8],
+) -> String {
+    let mut channel = client
+        .open_subsystem(
+            crate::rpc::STREAM_WORKSPACE_FILES,
+            &[(crate::MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+        )
+        .await;
+    channel.data(payload).await.unwrap();
+    channel.eof().await.unwrap();
+    let mut stderr = Vec::new();
+    while let Some(msg) = channel.wait().await {
+        if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+            stderr.extend_from_slice(&data);
+        }
+    }
+    String::from_utf8_lossy(&stderr).into_owned()
+}
+
+/// Reads `channel` until the mock shell echoes `got:hello`, panicking if it
+/// closes first.
+async fn await_hello_echo(channel: &mut russh::Channel<russh::client::Msg>, what: &str) {
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut stdout = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                    return;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                panic!("{what} should mint a shell; got: {stdout:?}");
+            }
+        }
+    }
+}
+
+/// While the creating connection is still mid-activation, an attach from
+/// any other connection is refused, not shortcut into `configure_loadout`
+/// — before the workspace upload, and after it but before the creator's
+/// `ConfigureLoadout`. Either shortcut would compose an empty contribution
+/// against a workspace the creator has not finished with and then refuse the
+/// creator's own configure. Once the creator has configured and finalized,
+/// the same attach lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_from_elsewhere_during_activation_is_refused_until_the_creator_finishes() {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let server = TestServer::new().await;
+    let mut creator = server.connect().await;
+    let mut other = server.connect().await;
+    let session_id = creator
+        .call::<CreateSession>(&create_session_req("activating", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let paths = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+        .paths()
+        .await
+        .expect("paths should resolve");
+    let scaffolded = paths.working.as_utf8_path().join(mfile::MFILE_NAME);
+
+    // Before the upload.
+    let mut channel = other.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session isn't attachable yet"),
+        "an attach before the creator's upload must be refused, got: {refusal:?}"
+    );
+    assert!(!scaffolded.exists(), "a refused attach must not scaffold");
+
+    // The creator's upload, through the real subsystem.
+    let payload = workspace_tar_zst(&[("hello.txt", b"hello\n")]).await;
+    let stderr = upload_workspace(&mut creator, session_id, &payload).await;
+    assert!(stderr.is_empty(), "the upload should land, got: {stderr:?}");
+    assert!(paths.working.as_utf8_path().join("hello.txt").exists());
+
+    // After the upload, before the creator's `ConfigureLoadout`.
+    let mut channel = other.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session isn't attachable yet"),
+        "an attach between the upload and the configure must be refused, got: {refusal:?}"
+    );
+    assert!(!scaffolded.exists(), "a refused attach must not scaffold");
+
+    // The creator finishes its activation; nothing refused it.
+    unwrap_ready(
+        creator
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match creator
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let mut channel = other.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after the activation").await;
+}
+
+/// An upload that fails mid-stream, sent through the real
+/// `WorkspaceFilesTarZst` subsystem, clears its in-flight mark on the way
+/// out: the next attach lands rather than being refused forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_workspace_upload_does_not_leave_attaches_refused() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("failed-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+
+    // A truncated archive: the head of a real one, cut off mid-stream.
+    let noise: Vec<u8> = (0..64 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let payload = workspace_tar_zst(&[("big.bin", noise.as_slice())]).await;
+    let stderr = upload_workspace(&mut client, session_id, &payload[..payload.len() / 2]).await;
+    assert!(
+        stderr.contains("unpack failed"),
+        "the truncated upload should fail its unpack, got: {stderr:?}"
+    );
+
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after a failed upload").await;
+}
+
+/// An attach that arrives while a real `WorkspaceFilesTarZst` stream is
+/// half-sent is refused, and the same attach lands once the rest of the
+/// stream and its EOF have arrived: the subsystem itself marks the upload in
+/// flight before it unpacks the first byte, and clears the mark at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_while_a_real_workspace_upload_is_half_sent_is_refused_then_lands() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("half-sent-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let paths = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+        .paths()
+        .await
+        .expect("paths should resolve");
+    let working = paths.working.as_utf8_path();
+
+    // A small file ahead of incompressible noise several zstd blocks long,
+    // so the first half of the payload already carries the small file whole.
+    let noise: Vec<u8> = (0..512 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let payload =
+        workspace_tar_zst(&[("first.txt", b"first\n"), ("big.bin", noise.as_slice())]).await;
+    let (head, tail) = payload.split_at(payload.len() / 2);
+
+    let mut upload = client
+        .open_subsystem(
+            crate::rpc::STREAM_WORKSPACE_FILES,
+            &[(crate::MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+        )
+        .await;
+    upload.data(head).await.unwrap();
+    // The small file landing proves the unpack is underway, so the upload
+    // is marked in flight by now.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !working.join("first.txt").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first half of the upload should start unpacking");
+
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "an attach mid-stream must be refused, got: {refusal:?}"
+    );
+    assert!(
+        !working.join(mfile::MFILE_NAME).exists(),
+        "a refused attach must not scaffold the workspace"
+    );
+
+    upload.data(tail).await.unwrap();
+    upload.eof().await.unwrap();
+    let mut stderr = Vec::new();
+    while let Some(msg) = upload.wait().await {
+        if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+            stderr.extend_from_slice(&data);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stderr.is_empty(), "the upload should land, got: {stderr:?}");
+    assert!(working.join("big.bin").exists());
+
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after the upload").await;
+}
+
+/// `ConfigureLoadout` is refused while a workspace upload streams, the same
+/// as the attach shortcut that runs it: composing mid-upload would scaffold
+/// against a half-populated tree and let the session go `Active` with the
+/// upload still landing. Once the upload has ended the same configure lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_while_a_workspace_upload_streams_is_refused() {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("configure-mid-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let paths = handle.paths().await.expect("paths should resolve");
+    let upload = crate::rpc::WorkspaceUploadInFlight::begin(handle)
+        .await
+        .expect("upload mark should land");
+
+    let request = ConfigureLoadoutRequest {
+        session_id,
+        contribution: Default::default(),
+    };
+    match client.call::<ConfigureLoadout>(&request).await {
+        Errorable::Err { error } => assert!(
+            error.contains("session is still receiving its workspace upload"),
+            "expected the in-flight-upload refusal, got: {error:?}"
+        ),
+        Errorable::Ok(_) => panic!("a configure mid-upload must be refused"),
+    }
+    assert!(
+        !paths
+            .working
+            .as_utf8_path()
+            .join(mfile::MFILE_NAME)
+            .exists(),
+        "a refused configure must not scaffold the workspace"
+    );
+
+    upload.finish().await.expect("upload mark should clear");
+    unwrap_ready(client.call::<ConfigureLoadout>(&request).await.unwrap());
 }
 
 /// Drives the full SSH path into the session host with the mock launcher:
@@ -1490,6 +1946,65 @@ async fn a_launch_whose_record_cannot_be_written_kills_its_box() {
     assert_eq!(
         record.host_ip_enforcement, None,
         "a launch that could not record its outcome left none on the record"
+    );
+}
+
+/// A mint whose host dies between launch and attach must not say the host
+/// "exited" out of a channel that never wedged: the death is a spawn
+/// failure, and the client reads it as one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_configured_session(&mut client, "mint-died", "/tmp").await;
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostDiedBeforeAttach);
+
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "the refused attach should surface its error to the client, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session host exited before its channel could attach"),
+        "a host that died before its channel attached reads as a spawn failure, got: {refusal:?}"
+    );
+}
+
+/// A mint whose host wedges between launch and attach is alive but busy:
+/// calling it dead would mint a second host over a healthy, busy one. The
+/// refusal must name the wedged case, not the exited one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_configured_session(&mut client, "mint-wedged", "/tmp").await;
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostWedged);
+
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "the refused attach should surface its error to the client, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session host is busy; retry the attach once it drains"),
+        "a host that wedged before its channel attached reads as busy, not exited, got: {refusal:?}"
+    );
+    assert!(
+        !refusal.contains("exited before"),
+        "a wedged host must not be reported as exited, got: {refusal:?}"
+    );
+
+    // The busy refusal asks for a retry, so the retry must reach the wedged
+    // host: kept in the slot, it refuses busy again rather than a fresh host
+    // being minted over it (the seam is taken once, so a second mint would
+    // launch an ordinary host and the retry would attach).
+    let mut retry = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut retry).await;
+    assert!(
+        refusal.contains("session host is busy; retry the attach once it drains"),
+        "a retry must reach the kept wedged host, not mint a second one, got: {refusal:?}"
     );
 }
 
@@ -7857,6 +8372,67 @@ async fn expose_deny_typed_error() {
             refused[0]
         );
     }
+}
+
+/// A host-address box is answered before its stance is read: its record can
+/// carry no `dynamic_ingress`, so the stance check alone would deny every
+/// request — true of the setting, and wrong about the port, which already
+/// answers on the host's network. The answer is the typed needs-no-exposing
+/// refusal, not the deny; it makes no decision, so nothing is audited
+/// (NET-046), and the request's one info line says what became of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_host_address_answers_before_the_stance() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // The harness default: a host-address box that declared nothing.
+    let id = create_configured_session(&mut client, "hostweb", "/uwu").await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the host-address box resolves");
+    let record = handle.record().await.expect("the record reads");
+    assert_eq!(record.network, sessions::NetworkMode::HostNet);
+
+    match handle.expose_dynamic(3001).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                // The harness daemon is native, so the host's loopback
+                // answers too.
+                host_loopback: true,
+            },
+        )) => {}
+        other => panic!("a host-address box's port needs no exposing: {other:?}"),
+    }
+
+    let logged = capture.contents();
+    let lines: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("dynamic ingress expose") && line.contains("name=hostweb"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one line per request, got: {logged}");
+    assert!(
+        lines[0].contains("port=3001")
+            && lines[0].contains("outcome=\"needs no exposing\"")
+            && !lines[0].contains("denied"),
+        "the line says the port needs no exposing, not that it was denied: {}",
+        lines[0]
+    );
+    let audit = crate::audit::log_path(
+        server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path(),
+    );
+    assert!(
+        tokio::fs::metadata(&audit).await.is_err(),
+        "no decision was made, so none is audited"
+    );
 }
 
 /// NET-047: a request that does not end in a publish leaves nothing behind —

@@ -18,6 +18,7 @@ use minimal_client::{ensure_version_match, ensure_version_reported, version_asse
 use crate::*;
 
 mod admin;
+mod finalize_install;
 mod list;
 mod net;
 mod project;
@@ -26,9 +27,10 @@ mod session;
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the provider-kind rule its gate keys on.
-use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
+pub(crate) use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
+pub use finalize_install::*;
 pub use list::*;
 pub use net::*;
 pub use project::*;
@@ -82,9 +84,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(args),
-        })) => cmd_net_setup(&cli.global_args, args).await,
+        Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
@@ -506,14 +506,14 @@ pub(crate) async fn submit_verdict_and_wait(
         minimald_rpc::Errorable::Ok(s) => s,
         minimald_rpc::Errorable::Err { error } => {
             send_abort(client, session_id).await;
-            bail!("SubmitVerdict failed: {error}");
+            bail!("{error}");
         }
     };
     match step {
         SessionStep::Materialized { id } => Ok(id),
         SessionStep::Fault { error } => {
             send_abort(client, session_id).await;
-            bail!("SubmitVerdict faulted: {error}");
+            bail!("{error}");
         }
     }
 }
@@ -648,7 +648,8 @@ pub(crate) async fn best_effort_destroy(
 fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
     format!(
         "warning: port {} is already held by {}; this session will not \
-         forward it (first-come on the shared address)",
+         forward it (first-come on the shared address); recreate one of them \
+         with a different external port, e.g. --ingress <other>:<internal>",
         collision.port, collision.held_by
     )
 }
@@ -733,8 +734,12 @@ pub(crate) async fn upload_and_finalize(
             }
             Ok(())
         }
+        // The stage in the client's words, the cause in the daemon's: a
+        // refusal here can be a bare OS string from the record write or
+        // the composition check, which says nothing about where the
+        // activation stopped.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("FinalizeSession failed: {error}");
+            bail!("could not finish activating the session: {error}");
         }
     }
 }
@@ -844,9 +849,11 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
 #[cfg(test)]
 mod tests {
     /// NET-129: the activate warning for a yielded shared-address port is a
-    /// `warning:` line naming the port and the box that holds it.
+    /// `warning:` line naming the port, the box that holds it, and the way
+    /// out of the collision: a different external port, since the check keys
+    /// on the `--ingress` external port and both boxes are already `own_ip`.
     #[test]
-    fn shared_port_collision_warning_names_the_port_and_its_holder() {
+    fn shared_port_collision_warning_names_the_port_its_holder_and_the_way_out() {
         let line = super::shared_port_collision_warning(&minimald_rpc::SharedPortCollision {
             port: 18080,
             held_by: "first.min.internal".to_string(),
@@ -854,7 +861,9 @@ mod tests {
         assert_eq!(
             line,
             "warning: port 18080 is already held by first.min.internal; this session \
-             will not forward it (first-come on the shared address)"
+             will not forward it (first-come on the shared address); recreate one \
+             of them with a different external port, e.g. --ingress \
+             <other>:<internal>"
         );
     }
 }

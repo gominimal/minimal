@@ -52,6 +52,19 @@ pub struct ChannelConfig {
     pub(crate) pty: Option<RequestedPty>,
 }
 
+/// The fix to run for a host that refuses the unprivileged user namespace
+/// every session sandbox needs. One source for the daemon's startup warning
+/// and the spawn-failed attach error, so both name the same remediation:
+/// the daemon's own remedy for the restriction, the text the create gate's
+/// refusal carries too.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn userns_restriction_fix(restriction: sandbox2::UsernsRestriction) -> String {
+    restriction.remedy(sandbox2::RemedyTarget::Daemon {
+        bin: &server::this_daemon_path(),
+    })
+}
+
 #[cfg(test)]
 mod integration_naming_convention {
     //! Guards the integration-test auto-discovery contract (root variant). The

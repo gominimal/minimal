@@ -283,9 +283,9 @@ $> sudo scripts/install-apparmor-profile.sh              # installed binary
 $> sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"   # dev build
 ```
 
-Installed via `curl … | sh` instead of a checkout? The installer ships this
-loader and prints a hint when the host needs it; run
-`sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh`.
+Installed via `curl … | sh` instead of a checkout? The installer offers to
+finish the step when the host needs it. Later, run `min finalize-install`
+(`min finalize-install --show` names what it changes).
 
 See [docs/reference/linux-host-setup.md](docs/reference/linux-host-setup.md).
 

@@ -610,6 +610,11 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
 fn policy_list(lines: &mut Vec<Line>, label: &str, values: &Option<Vec<String>>) {
     match values {
         None => lines.push(Line::raw(format!("  {label}  allow-all"))),
+        // Present and empty grants nothing in its dimension — the shape an
+        // absent destination list resolves to (NET-074) — and is spelled
+        // `(none)`, the spelling `min session policy` prints, never a blank
+        // value.
+        Some(values) if values.is_empty() => lines.push(Line::raw(format!("  {label}  (none)"))),
         Some(values) => lines.push(Line::raw(format!("  {label}  {}", values.join(", ")))),
     }
 }
@@ -1067,6 +1072,41 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// NET-074: a destination list resolved to present and empty is spelled
+    /// `(none)` in the pane, as `min session policy` spells it, never left
+    /// blank — a names-only box shows its names and no subnet reach, a
+    /// subnets-only box the reverse.
+    #[test]
+    fn policy_pane_spells_a_resolved_empty_list_as_none() {
+        let pane = |allow_subnets: Vec<&str>, allow_dns_hosts: Vec<&str>| {
+            let list = |entries: Vec<&str>| Some(entries.into_iter().map(String::from).collect());
+            policy_text(
+                sessions::NetworkMode::OwnIp,
+                sessions::SessionPolicy {
+                    egress: Some(sessions::EgressPolicy {
+                        allow_subnets: list(allow_subnets),
+                        allow_dns_hosts: list(allow_dns_hosts),
+                        allow_protocols: None,
+                        deny_subnets: None,
+                    }),
+                    ingress: None,
+                    credentialed_upstream: None,
+                },
+            )
+        };
+
+        let names_only = pane(vec![], vec!["github.com"]);
+        assert!(
+            names_only.contains("egress\n  subnets  (none)\n  dns hosts  github.com\n"),
+            "a names-only box must spell its empty subnets row, got:\n{names_only}"
+        );
+        let subnets_only = pane(vec!["10.0.0.0/8"], vec![]);
+        assert!(
+            subnets_only.contains("egress\n  subnets  10.0.0.0/8\n  dns hosts  (none)\n"),
+            "a subnets-only box must spell its empty names row, got:\n{subnets_only}"
+        );
     }
 
     /// NET-134: the pane shows a declared credentialed-upstream lane in the

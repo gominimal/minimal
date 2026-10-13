@@ -23,6 +23,9 @@ ot.workspace = true
 orchestrator.workspace = true
 remote-client.workspace = true
 sandbox2.workspace = true
+# The installer's data prefix, for the AppArmor loader path the
+# user-namespace preflight names.
+paths.workspace = true
 
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true

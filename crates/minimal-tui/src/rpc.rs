@@ -334,6 +334,17 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 /// from, and [`release_held_name_after_attach`] still owes the row's
 /// withdrawal. `None` when the record cannot be read or holds no row.
 ///
+/// The zone hold a `host_ip` box's name depends on is not re-made here,
+/// on purpose: only the CLI's attach and exec re-send it
+/// (`rehold_held_name_before_attach`), because a re-hold owes the
+/// destroy-race undo that follows it — the session looked up again, then
+/// the hold released or handed back — and this path has no client to make
+/// that undo with. A session attached only from the dashboard therefore
+/// carries a hold nothing re-makes, and after a VM host daemon restart it
+/// is dropped by the reload expiry once the reconfirm bound passes — a
+/// documented gap, deferred until the architecture rules on a guest-door
+/// message for name holds.
+///
 /// # Errors
 ///
 /// The VM host daemon cannot be reached (#1790): the attach does not go
@@ -441,9 +452,9 @@ pub async fn release_held_name_after_attach(
 
 /// The full activate flow behind the create form: create the record, upload
 /// the project tree, compose the loadout contribution the CLI composed at
-/// startup, and finalize — so the new session comes up `Active`,
-/// attachable, and restart-persistent rather than dying as an unresumable
-/// `Pending` stub on the next daemon restart.
+/// startup, upload the composition's patch files, and finalize — so the new
+/// session comes up `Active`, attachable, and restart-persistent rather than
+/// dying as an unresumable `Pending` stub on the next daemon restart.
 ///
 /// Connects its own client so it can run as a background task without
 /// borrowing the provider's connection. A `ConfigureLoadout` that comes back
@@ -551,6 +562,13 @@ pub async fn activate(
             .upload_workspace_files_quiet(id, upload_root.as_std_path())
             .await
             .context("uploading project files")?;
+        // Collect the upload pairs before the contribution moves into the
+        // ConfigureLoadout RPC, through the collection `min session
+        // activate` uses: they land in the final composition of a
+        // `Materialized` response (the only one the dashboard accepts), so
+        // the client is authoritative for them.
+        let mut patches = minimal_client::contribution_patch_uploads(&contribution);
+        minimal_client::dedup_patch_uploads(&mut patches);
         // Drop hooks whose scripts live in a file. The dashboard has no
         // hook-script upload — that staging lives in the `minimal` crate,
         // which sits above this one — and the daemon refuses to finalize a
@@ -576,6 +594,15 @@ pub async fn activate(
             }
             Errorable::Err { error } => anyhow::bail!("{error}"),
         }
+        // The composition's patches must arrive between `ConfigureLoadout`
+        // and `FinalizeSession`: the daemon's finalize gate refuses a
+        // composition whose patch upload never completed. An empty list is
+        // a no-op. Quiet: the dashboard owns the screen, and a progress bar
+        // would corrupt it.
+        client
+            .upload_patches_quiet(id, &patches)
+            .await
+            .context("uploading composition patches")?;
         match client
             .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
                 session_id: id,

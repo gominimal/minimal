@@ -110,6 +110,11 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     if detach {
         return run_detach(timeout_secs);
     }
+    // A supervisor stopped by SIGTERM/SIGINT returns here once its teardown
+    // (the `Stopped` write, the guards' drops) has run; `main` then ends the
+    // process by that signal after flushing its log
+    // ([`crate::control::die_by_received_stop_signal`]), so its exit status
+    // still says what stopped it.
     run_foreground()
 }
 
@@ -529,12 +534,56 @@ fn run_foreground() -> Result<()> {
     boxes
         .try_register_node_namespace(node_port.port)
         .context("publishing the node namespace's row")?;
-    // SIGTERM (a service manager's stop) and SIGINT cancel and audit every
-    // pending ask before the process ends by the signal as it always did
-    // (NET-045). A handler that cannot be installed leaves the default.
-    if let Err(error) =
-        crate::control::watch_stop_signals(boxes.clone(), crate::control::die_by_signal)
-    {
+    // SIGTERM or SIGINT sent to the supervisor (a service manager's stop,
+    // or kill(1)) cancels and audits every pending ask (NET-045), then
+    // stops the VM the same way `minvmd stop` does: the guest gets the
+    // Shutdown RPC so the data volume's ext4 journal stays clean (informed
+    // by #705), the VMM child is signalled and reaped, and the main
+    // thread's own teardown writes the `Stopped` state, then `main` ends
+    // the process by the signal. The whole stop is bounded at
+    // `SIGNAL_STOP_BOUND` from the signal's arrival; when it cannot run,
+    // fails, or the teardown overruns that deadline, the watcher dies by
+    // the signal itself. A second signal meanwhile ends the process at
+    // once. A signal during the boot, before `Running`, aborts the boot:
+    // the VMM child is signalled without a guest ask (no guest daemon is
+    // up to take one), the watcher writes `Stopped`, and it ends the
+    // process by the signal, since the main thread is still in its READY
+    // wait. It keeps the lifecycle write lock from that write on, and the
+    // boot forks only under that lock, so no VMM is forked behind it.
+    //
+    // Not covered: a terminal Ctrl-C on a foreground run. The VMM child
+    // shares the terminal's foreground process group, so the tty delivers
+    // SIGINT to it directly, at the same moment as to the supervisor, and
+    // the VMM dies before the Shutdown RPC can run; the journal replay
+    // backstop bounds that case, as before. Nor is a SIGKILL of the
+    // supervisor: the orphaned VMM keeps the alive lock it inherited, so
+    // the VM still reads as live, and `min stop --force` is the recovery.
+    let signal_state_dir = state_dir.dir().to_path_buf();
+    if let Err(error) = crate::control::watch_stop_signals(boxes.clone(), move |signum| {
+        let deadline = crate::control::stop_signal_received()
+            .map_or_else(std::time::Instant::now, |(_, at)| at)
+            + crate::cmd::stop::SIGNAL_STOP_BOUND;
+        match crate::cmd::stop::graceful_stop_from_signal(signal_state_dir, deadline) {
+            Ok(crate::cmd::stop::SignalStop::TeardownFinished) => {
+                // The main thread normally ends the process by the signal
+                // once its teardown returns; this is the backstop.
+                tracing::info!(signum, "graceful stop after signal complete");
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                crate::control::die_by_signal(signum);
+            }
+            Ok(crate::cmd::stop::SignalStop::BootAborted) => {
+                // The main thread is still waiting for READY and would not
+                // return before the deadline, so the watcher ends the
+                // process.
+                tracing::info!(signum, "boot aborted after signal; dying by signal");
+                crate::control::die_by_signal(signum);
+            }
+            Err(e) => {
+                tracing::warn!(signum, error = %e, "graceful stop after signal failed; dying by signal");
+                crate::control::die_by_signal(signum);
+            }
+        }
+    }) {
         tracing::warn!(%error, "could not install the stop-signal handler");
     }
 
@@ -866,8 +915,7 @@ fn run_foreground() -> Result<()> {
         // names. A redraw hands the same door to the fresh boot.
         let (name, path) = &guest_report_door;
         cmd.env(name, path);
-        child = cmd
-            .env(MARKER_SOCK_ENV, &marker_sock_path)
+        cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
             // The node's proxy port travels to the guest through the VMM child's
             // env: the child is a separate process (like the marker socket path),
             // and its backend appends it to the kernel command line, where the
@@ -883,30 +931,35 @@ fn run_foreground() -> Result<()> {
             .env(
                 crate::vm::PUBLISH_GENERATION_ENV,
                 publish_generation.to_string(),
-            )
-            .spawn()
-            .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+            );
 
-        child_pid = child.id();
-        tracing::info!(pid = child_pid, "VMM child spawned");
-
-        // Update state with the known pid so that concurrent `stop` invocations
-        // during Starting can signal the correct process.
+        // Fork the VMM child and record its pid under one hold of the
+        // lifecycle write lock, so a stopper never sees a lifecycle whose
+        // child exists but is not recorded. A concurrent `stop` during
+        // Starting signals the pid it reads here. A stop signal's boot abort
+        // (`stop::graceful_stop_from_signal`) takes the same lock, writes
+        // `Stopped`, and keeps the lock until it has ended the process: it
+        // either reads this child's pid and signals it, or holds the lock
+        // first, and then this boot never forks.
         {
             let mut lock = state_dir
                 .lifecycle_lock()
                 .context("opening lifecycle lock")?;
             let _guard = lock.write().context("acquiring lifecycle write lock")?;
             let state = state_dir.read_state().context("reading state")?;
-            // A concurrent stop might have already reset us to Stopped; bail early.
+            // A concurrent stop might have already reset us to Stopped; bail
+            // before a child exists.
             if !matches!(state.lifecycle, Lifecycle::Starting) {
-                let _ = child.kill();
-                let _ = child.wait();
                 bail!(
-                    "lifecycle changed to {:?} during spawn; aborting",
+                    "lifecycle changed to {:?} before spawn; aborting",
                     state.lifecycle
                 );
             }
+            child = cmd
+                .spawn()
+                .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+            child_pid = child.id();
+            tracing::info!(pid = child_pid, "VMM child spawned");
             state_dir
                 .write_state(&State {
                     lifecycle: Lifecycle::Starting,

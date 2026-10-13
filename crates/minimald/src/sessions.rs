@@ -156,6 +156,9 @@ struct CreateSessionMsg {
     /// Authenticated SSH username, supplied by the RPC handler from
     /// the SSH connection context (never the client).
     username: Option<String>,
+    /// The creating connection's liveness, see
+    /// [`ManagerHandle::create_session_by`].
+    creator: Option<std::sync::Weak<()>>,
     responder: Responder<SessionId>,
 }
 
@@ -1093,6 +1096,7 @@ impl Manager {
             net_switch: Arc::clone(&self.net_switch),
             manager: self.weak_self.clone(),
             deny_all_opt_out: self.deny_all_opt_out,
+            creator: None,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -1117,6 +1121,7 @@ impl Manager {
         &mut self,
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, SessionsError> {
         if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
@@ -1162,7 +1167,9 @@ impl Manager {
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
 
-        match Session::run(self.session_config(handle.clone())).await {
+        let mut seed = self.session_config(handle.clone());
+        seed.creator = creator;
+        match Session::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
                 Ok(session_id)
@@ -1317,9 +1324,10 @@ impl Manager {
                 let CreateSessionMsg {
                     config,
                     username,
+                    creator,
                     responder,
                 } = *msg;
-                let created = self.create_session(config, username).await;
+                let created = self.create_session(config, username, creator).await;
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: tears down its running host and actor (if
@@ -1759,6 +1767,21 @@ impl ManagerHandle {
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
     ) -> Result<SessionId, SessionsError> {
+        self.create_session_by(config, username, None).await
+    }
+
+    /// [`Self::create_session`] for a session created over a connection:
+    /// `creator` is that connection's liveness. While it still upgrades the
+    /// session's activation belongs to its creator, so an attach to the
+    /// still-unconfigured session is refused instead of configuring it (see
+    /// the `Draft` shortcut in `Session::attach`). Passed at creation, not
+    /// afterwards, so there is no window in which the actor exists without it.
+    pub async fn create_session_by(
+        &self,
+        config: minimald_rpc::SessionConfig,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1766,6 +1789,7 @@ impl ManagerHandle {
             .send(ManagerMessage::CreateSession(Box::new(CreateSessionMsg {
                 config,
                 username,
+                creator,
                 responder: send,
             })))
             .await;

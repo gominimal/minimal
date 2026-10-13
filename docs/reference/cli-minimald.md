@@ -41,6 +41,8 @@ Runs the minimald server in the foreground.
 | `--gvproxy-bin <PATH>` | Path to the gvproxy ("gvisor-tap-vsock") binary used for networking. Defaults to the installed location: the user-local `bin/gvproxy-min` the installer stamps, else the system install path. |
 | `--egress-deny-all-opt-out` | Keep the earlier allow-all egress default for a box that declares no `egress` section. Without it, an own-address box with no egress declaration reaches no external address and shows `deny-all (default)` in `min session policy`. The flag does not change a box that declares its own egress section. The daemon reads the flag at start, so restart it to change the setting. Setting `MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment has the same effect as the flag. Only `1`, `true`, `yes`, or `on` opt out, in any letter case. A daemon that `min` starts automatically gets no flags but inherits the environment, so export the variable to keep the opt-out across those restarts. The VM-backed counterpart is `MINVMD_EGRESS_DENY_ALL_OPT_OUT` (see [minvmd](./cli-minvmd.md)) |
 
+`MINIMALD_USERNS_GATE=off` in the daemon's environment skips the user-namespace check that refuses every `CreateSession` on a host that blocks unprivileged user namespaces. The daemon logs the skip at `warn`.
+
 When the daemon brings its host-side listeners up it logs **two** serving
 lines, one per listener: the hostname proxy (`component=dns-proxy`, TCP) and
 the box-zone answerer (`component=zone-answerer`, UDP). Each names the port

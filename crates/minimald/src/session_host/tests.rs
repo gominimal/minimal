@@ -3622,7 +3622,7 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
             });
         assert!(
             record.contains(NOTICE),
-            "the record carries the same text the session's banner gets: {record}"
+            "the record carries the placement's own words: {record}"
         );
         assert!(
             record.contains(MACHINE_FIELD),
@@ -3846,7 +3846,7 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
         "the notice carries the machine spelling of the state: {notice}"
     );
     assert!(
-        !notice.contains("sudo") && !notice.contains("install-host-classifier.sh"),
+        !notice.contains("sudo") && !notice.contains("min finalize-install"),
         "the guest's notice names no installer: {notice}"
     );
     // Whatever its leaf looks like: the guest's state is the table's
@@ -3856,16 +3856,16 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
         notice,
         "the guest's notice is the interim's words whatever its leaf is"
     );
-    // The native notice still names the step, in both of its own shapes.
+    // The native notice still names the step's install, in both of its own
+    // shapes — `min finalize-install`, never a script or a placeholder.
     assert!(
-        super::unenforced_placement_notice(false, None).contains("install-host-classifier.sh"),
-        "an unplaced native box is told to install the step"
+        super::unenforced_placement_notice(false, None).contains("min finalize-install"),
+        "an unplaced native box is told to finish the install"
     );
     assert!(
-        super::unenforced_placement_notice(false, Some(&leaf))
-            .contains("install-host-classifier.sh"),
+        super::unenforced_placement_notice(false, Some(&leaf)).contains("min finalize-install"),
         "a placed native box on a host that cannot decide is told to \
-         install the step too"
+         finish the install too"
     );
 }
 
@@ -4107,7 +4107,7 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
     assert!(
         notice.contains("guest-side classifier enforcement is not available yet")
             && notice.contains("host_ip_enforcement=none")
-            && !notice.contains("install-host-classifier.sh"),
+            && !notice.contains("min finalize-install"),
         "the start-up record is the interim's words, not a command: {notice}"
     );
 
@@ -4321,7 +4321,7 @@ async fn expose_ask_human_deny_refused() {
         .expect_err("the human's deny refuses the publish");
     match refused {
         crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            crate::net::policy::ExposeRefusal::DeniedByHuman,
         ) => {}
         other => panic!("the denial is the typed deny error: {other:?}"),
     }
@@ -5455,9 +5455,16 @@ async fn expose_ask_prompts_attached_human() {
 
     let rendered = answer_ask_on(&mut channel, true).await;
     let rendered = String::from_utf8_lossy(&rendered);
+    // The frame is the one the VM-backed host's dialog draws: the protocol
+    // on the lead-in and the `? ` the question leads with, so a human — and
+    // the e2e's pty driver — meets one dialog on either host.
     assert!(
-        rendered.contains("web asks to publish port 3000"),
-        "the dialog's lead-in names the box and the port: {rendered}"
+        rendered.contains("web asks to publish port 3000/tcp."),
+        "the dialog's lead-in names the box, the port and the protocol: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("? {ASK_PROMPT}")),
+        "the question leads with the `? ` the VM-backed dialog draws: {rendered}"
     );
 
     let mapping = tokio::time::timeout(Duration::from_secs(30), asked)
@@ -6563,7 +6570,7 @@ async fn native_ask_prompt_still_renders() {
         matches!(
             refused,
             Err(crate::net::policy::ExposeFailure::Refused(
-                crate::net::policy::ExposeRefusal::DeniedByPolicy
+                crate::net::policy::ExposeRefusal::DeniedByHuman
             ))
         ),
         "the human's deny refuses the request: {refused:?}"
@@ -6596,11 +6603,11 @@ async fn ask_no_or_no_tty_records_nothing() {
     for (reason, expected) in [
         (
             minimald_rpc::AskRefused::Denied,
-            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            crate::net::policy::ExposeRefusal::DeniedByHuman,
         ),
         (
             minimald_rpc::AskRefused::NoTty,
-            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            crate::net::policy::ExposeRefusal::AskNoTerminal,
         ),
     ] {
         let asking = handle.clone();
@@ -6731,7 +6738,7 @@ async fn vm_ask_no_tty_is_denied() {
         matches!(
             result,
             Err(crate::net::policy::ExposeFailure::Refused(
-                crate::net::policy::ExposeRefusal::DeniedByPolicy
+                crate::net::policy::ExposeRefusal::AskNoTerminal
             ))
         ),
         "{result:?}"

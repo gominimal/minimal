@@ -1028,43 +1028,18 @@ pub mod classifier {
             .map(str::to_string)
     }
 
-    /// The account this daemon runs as: the daemon knows its own uid, and
-    /// the *name* is what a person types after the installer's `--user`, so
-    /// it is looked up rather than guessed. A uid with no account — a
-    /// container running a bare uid — is the `None` the hint below names
-    /// its fallback for.
-    #[cfg(target_os = "linux")]
-    #[must_use]
-    pub fn own_account() -> Option<String> {
-        nix::unistd::User::from_uid(nix::unistd::getuid())
-            .ok()
-            .flatten()
-            .map(|user| user.name)
-    }
-
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree. A stock install does not ship the installer (the
-    /// release stages only the apparmor one), so the hint names where the
-    /// script lives in the source repository rather than a `scripts/` path
-    /// the host does not have. The installer takes the account the daemon
-    /// runs as and the two source identities the classification rests on
-    /// (NET-078 — what the boxes cohort leaves as, and what the rest of the
-    /// slice leaves as; the step refuses to render one without the other, so
-    /// a hint that named neither is a command the step itself refuses). The
-    /// hint spells the whole command, so the advisory that carries it never
-    /// has to name a placeholder for the one thing the daemon knows — only
-    /// for the two things this host does.
+    /// classifier tree: the installed CLI's own verb, `min finalize-install`
+    /// (NET-122), which carries the privileged step itself and installs it
+    /// for the account this daemon runs as. The hint spells the whole
+    /// command: no placeholder — an un-enrolled host has no source identity
+    /// to be told (NET-078: its two identities are the classifier's own
+    /// cgroup matches, translated to nothing) — and no remote fetch, because
+    /// the step the CLI carries is the step of the release it came from.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        let account =
-            own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
-        format!(
-            "run: curl -fsSLO \
-             https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
-             && sudo bash ./install-host-classifier.sh --user {account} \
-             --cohort-address <cohort address> --node-plane-address <node-plane address>"
-        )
+        "min finalize-install".to_string()
     }
 
     /// Makes one level of the classifier layout, taking `AlreadyExists` as
@@ -2861,18 +2836,107 @@ impl std::fmt::Display for UsernsRestriction {
     }
 }
 
-/// Best-effort probe for whether this host will refuse the unprivileged user
-/// namespace every sandbox starts by unsharing — the counterpart of the
-/// network probe above, for the namespace that has no fallback.
+/// The binary a [`UsernsRestriction::remedy`] is written for. The AppArmor
+/// profile attaches by binary path, so the step that lifts that restriction
+/// differs per binary; the sysctl remedy does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemedyTarget<'a> {
+    /// `minimald`. `min finalize-install` loads the profile for the daemon
+    /// at the path the installer wrote; a daemon built from source runs
+    /// elsewhere, so the remedy also names the loader with `--path` for
+    /// `bin`, this daemon's own path. No cheap check tells the two apart
+    /// here, so both forms are always printed. A profile attaches at exec,
+    /// so the daemon that is running stays unconfined until it is
+    /// restarted.
+    Daemon { bin: &'a str },
+    /// A `mip` binary, which the installer's profile does not cover: the
+    /// loader script is run with `--path` for it. `bin` is the binary's
+    /// path; `data_dir` is the installer's data prefix, where the loader
+    /// lands (`<data_dir>/apparmor/install-apparmor-profile.sh`).
+    Mip { bin: &'a str, data_dir: &'a str },
+}
+
+impl UsernsRestriction {
+    /// The cause in the words a person reads inside a refusal — never the
+    /// sysctl key alone, which names the mechanism rather than the fact.
+    #[must_use]
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::Disabled => {
+                "user namespaces are switched off (user.max_user_namespaces=0 or no kernel support)"
+            }
+            Self::ApparmorUnconfined => "Ubuntu restricts unprivileged user namespaces",
+        }
+    }
+
+    /// The remedy this restriction takes for `target`, one sentence a person
+    /// can act on. The AppArmor restriction is lifted by the profile — the
+    /// install step for the daemon, the loader with `--path` for `mip` —
+    /// never by `sudo sysctl`, which switches the protection off for every
+    /// program, is lost at boot, and leaves the install's record unchanged.
+    /// Switched-off namespaces no profile can lift: the sysctl set now (the
+    /// gate re-reads it on the next create) and made persistent, or a kernel
+    /// built with them.
+    #[must_use]
+    pub fn remedy(self, target: RemedyTarget<'_>) -> String {
+        match (self, target) {
+            (Self::Disabled, _) => "Set user.max_user_namespaces above 0: sudo sysctl -w \
+                                    user.max_user_namespaces=15000 takes effect now, a \
+                                    /etc/sysctl.d drop-in keeps it across reboots; or use a \
+                                    kernel with CONFIG_USER_NS."
+                .to_string(),
+            (Self::ApparmorUnconfined, RemedyTarget::Daemon { bin }) => {
+                let bin = shell_word(bin);
+                format!(
+                    "Finish the install to allow it for Minimal only: min finalize-install   (see \
+                     what it changes first: min finalize-install --show). The profile takes effect \
+                     when the daemon next starts: run min stop, then your command again.\n\
+                     A daemon built from source is not covered: attach the profile to this \
+                     binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
+                     --path {bin}, then the same restart."
+                )
+            }
+            (Self::ApparmorUnconfined, RemedyTarget::Mip { bin, data_dir }) => {
+                let loader =
+                    shell_word(&format!("{data_dir}/apparmor/install-apparmor-profile.sh"));
+                let bin = shell_word(bin);
+                format!(
+                    "Attach the AppArmor profile to mip (one-time, needs root): sudo bash \
+                     {loader} --path {bin} (from a checkout: \
+                     sudo scripts/install-apparmor-profile.sh --path {bin})."
+                )
+            }
+        }
+    }
+}
+
+/// A path as one shell word for a remedy the operator pastes, so a space in
+/// it does not split the command. A path with a NUL cannot be quoted for a
+/// shell at all; it is shown bare.
+fn shell_word(path: &str) -> String {
+    shlex::try_quote(path).map_or_else(|_| path.to_string(), |q| q.into_owned())
+}
+
+/// Probe for whether this host will refuse the unprivileged user namespace
+/// every sandbox starts by unsharing — the counterpart of the network probe
+/// above, for the namespace that has no fallback.
 ///
 /// Returns the obstruction it finds, or `None` when none is visible. The
 /// sandbox child is forked from the calling process with no exec in between,
 /// so the caller's own privileges and AppArmor label are exactly what the
 /// kernel will check at `unshare`/`uid_map` time — probe from the daemon,
 /// not from a helper. Like the network probe this is a necessary-not-
-/// sufficient signal (seccomp or LSM policy can still deny at spawn time),
-/// but it is advisory: a false `None` surfaces later as the spawn error it
-/// always was, never as a loss of isolation.
+/// sufficient signal (seccomp or LSM policy can still deny at spawn time):
+/// a false `None` surfaces later as the spawn error it always was, never as
+/// a loss of isolation.
+///
+/// A `Some` is not advisory: `minimald` gates every session create on it
+/// (NET-141), refusing the create with this cause and its remedy, so a false
+/// `Some` — a host whose kernel would in fact allow the unshare — refuses
+/// every session on that host. Three facts are read, each live from `/proc`
+/// on every call, so a remedy applied to a running host takes effect at the
+/// next create without a restart; a daemon that must run anyway sets
+/// `MINIMALD_USERNS_GATE=off` to skip the gate.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn user_namespaces_restriction() -> Option<UsernsRestriction> {
@@ -3662,6 +3726,75 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 mod tests {
     use super::*;
     use config::{Config, SandboxMapped};
+
+    /// The daemon's AppArmor remedy names the install step for the
+    /// installed daemon and, on its own line, the loader with `--path` for
+    /// this daemon's own path, so a source-built daemon is covered too
+    /// (NET-141).
+    #[test]
+    fn daemon_apparmor_remedy_names_finalize_install_and_this_binary() {
+        let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
+            bin: "/home/me/src/minimal/target/debug/minimald",
+        });
+        assert_eq!(
+            remedy,
+            "Finish the install to allow it for Minimal only: min finalize-install   (see what \
+             it changes first: min finalize-install --show). The profile takes effect when the \
+             daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path \
+             /home/me/src/minimal/target/debug/minimald, then the same restart."
+        );
+        let spaced = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
+            bin: "/opt/my tools/minimald",
+        });
+        assert!(
+            spaced.contains("--path '/opt/my tools/minimald', then"),
+            "a path with a space is one shell word: {spaced}"
+        );
+    }
+
+    /// The mip AppArmor remedy is a command the operator pastes, so a data
+    /// dir or binary path with a space stays one shell word, while a plain
+    /// path is shown bare (NET-141).
+    #[test]
+    fn mip_apparmor_remedy_quotes_paths_with_spaces() {
+        let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/opt/my tools/mip",
+            data_dir: "/home/me/.local/share/minimal",
+        });
+        assert!(
+            remedy.contains(
+                "sudo bash /home/me/.local/share/minimal/apparmor/install-apparmor-profile.sh \
+                 --path '/opt/my tools/mip' (from a checkout: \
+                 sudo scripts/install-apparmor-profile.sh --path '/opt/my tools/mip')."
+            ),
+            "paths with spaces are single-quoted, plain ones bare: {remedy}"
+        );
+
+        let plain = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/usr/local/bin/mip",
+            data_dir: "/usr/local/share/minimal",
+        });
+        assert!(
+            plain.contains("--path /usr/local/bin/mip (from a checkout"),
+            "a plain path is not quoted: {plain}"
+        );
+
+        // The loader's path is built from the data dir, so a space there
+        // (a custom XDG_DATA_HOME) is quoted the same way.
+        let spaced_dir = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/usr/local/bin/mip",
+            data_dir: "/home/me/My Data/minimal",
+        });
+        assert!(
+            spaced_dir.contains(
+                "sudo bash '/home/me/My Data/minimal/apparmor/install-apparmor-profile.sh' \
+                 --path /usr/local/bin/mip (from a checkout"
+            ),
+            "a data dir with a space is one shell word: {spaced_dir}"
+        );
+    }
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
     // if either stops showing up we've broken the FsFlags → MountOptions
@@ -5282,32 +5415,18 @@ ff02::2\tip6-allrouters
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
 
-    /// A stock install does not ship the classifier installer, so the hint
-    /// says where to fetch it — the raw file, not GitHub's HTML viewer page,
-    /// which a `curl` of the URL would save and `sudo` would then run — rather
-    /// than name a checkout-relative `scripts/` path, and still spells the
-    /// `--user` the daemon knows.
+    /// NET-122: the hint is the installed CLI's own verb, spelled whole —
+    /// no placeholder a person cannot fill, and no fetch from the
+    /// repository's `main`, which is not the release they installed.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_install_hint_names_where_the_installer_lives() {
+    fn the_install_hint_names_the_installed_verb() {
         let hint = classifier::install_hint();
-        assert!(
-            hint.contains(
-                "https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh"
-            ),
-            "{hint}"
-        );
-        assert!(!hint.contains("/blob/"), "{hint}");
-        assert!(!hint.contains("sudo scripts/"), "{hint}");
-        // The fetch saves the file under its own name, so the run that
-        // follows finds it; a downloaded file has no executable bit, so the
-        // hint runs it via bash.
-        assert!(hint.contains("curl -fsSLO https://"), "{hint}");
-        assert!(
-            hint.contains("sudo bash ./install-host-classifier.sh"),
-            "{hint}"
-        );
-        assert!(hint.contains("--user "), "{hint}");
+        assert_eq!(hint, "min finalize-install");
+        assert!(!hint.contains("install-host-classifier.sh"), "{hint}");
+        for absent in ["<", ">", "curl", "raw.githubusercontent.com", "sudo"] {
+            assert!(!hint.contains(absent), "{absent:?} in {hint}");
+        }
     }
 
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
@@ -5401,28 +5520,6 @@ ff02::2\tip6-allrouters
             !classifier::tree_is_real(tree, None, false),
             "a host whose mount table cannot be read has no tree to check"
         );
-    }
-
-    /// The install hint names every argument the installer requires of a
-    /// person (NET-078): the account the daemon runs as — the one thing the
-    /// daemon knows and would otherwise make the reader look up — and the
-    /// two source identities, which the step refuses to render one of
-    /// without the other, so a hint without them is a command the installer
-    /// itself refuses. Pinned as data: the daemon's start-up warn line, the
-    /// native unenforced notice and `Cause::StepNotInstalled`'s command all
-    /// carry this string, and the installer's own `--check` hint names the
-    /// same two flags, so the two spellings cannot drift apart unseen.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn install_hint_names_the_installers_required_identities() {
-        let hint = classifier::install_hint();
-        assert!(
-            hint.contains("install-host-classifier.sh"),
-            "the hint names the privileged step's install: {hint}"
-        );
-        for flag in ["--cohort-address", "--node-plane-address"] {
-            assert!(hint.contains(flag), "the hint names {flag}: {hint}");
-        }
     }
 
     /// The files the kernel makes when a cgroup is created, modelled over a

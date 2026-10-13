@@ -550,10 +550,11 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald box_zone_connection_enforced_at_connect
   <!-- S8c/AC3; prose 46; event-driven -->
 
-- **NET-074** WHERE the deny-all default is in force and the opt-out flag is not set, WHEN an own-address box is created with no `egress` section THE SYSTEM SHALL give it no reach to any external address.
+- **NET-074** WHERE the deny-all default is in force and the opt-out flag is not set, WHEN a box is created with an `egress` section, or an own-address box with none, THE SYSTEM SHALL give each destination allow list the expanded section leaves absent, `allow_subnets` and `allow_dns_hosts`, no reach in that dimension, so that an own-address box with no `egress` section reaches no external address.
   tier:     T0
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
-  <!-- S9a/AC1; prose 47; feature+event; supersedes the shipped 03-spec R2.1 default of allow-all for absent `egress` fields; NET-076 binds the announcement window and NET-077 the opt-out -->
+  verify:   cargo nextest run -p sessions absent_destination_lists_grant_nothing_once_merged
+  <!-- S9a/AC1; prose 47; feature+event; stated per list, not per section: an absent list in the expanded spec grants nothing (the architecture replaces a table wholesale between layers, so an absent list is simply absent), so a section that names only `allow_dns_hosts` reaches its names and no address directly, and allow-all is written out (`0.0.0.0/0` and `::/0` in `allow_subnets`), never left to an absent list; the per-list rule is not mode-qualified, as the architecture's default-deny rule is not: a declared section on a host-address box resolves the same, a host that decides per box reads the resolved shape (NET-079) and refuses a narrowing list it cannot enforce, and only the absent-section default is an own-address box's; `allow_protocols` is a filter over the reach the two destination lists grant and grants none itself, so its absence narrows nothing and `allow_subnets = ["0.0.0.0/0"]` alone is allow-all; `::/0` grants nothing until an IPv6 path exists (NET-082) and is written as the forward-compatible spelling; supersedes the shipped 03-spec R2.1 meaning of an absent `allow_subnets` or `allow_dns_hosts` list, allow-all, in a declared section, and with it R2.1's allow-all for an own-address box with no `egress` section; NET-076 binds the announcement window and NET-077 the opt-out -->
   - WHERE the opt-out flag is not set, WHEN the user activates an own-address box with no `egress` section THE SYSTEM SHALL print one line that names the deny-all default and the flags that declare reach.
     tier:   T0
     verify: cargo nextest run -p minimal deny_all_in_force_note_printed
@@ -569,10 +570,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
   <!-- S9a/AC2; prose 48; state-driven; interview decision; window ended: the default is in force as of the change that flips both phase constants, so this requirement's condition no longer holds; the verify test proves that, asserting the shipped phase is `InForce`; the note printed in force is NET-074's child requirement -->
 
-- **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all default for a box with no `egress` section.
+- **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all meaning of an absent `egress` section and of an absent allow list in a declared one.
   tier:     T0
   verify:   cargo nextest run -p minimald deny_all_opt_out_keeps_prior_default
-  <!-- S9a/AC2; prose 48; optional-feature; the shipped default is 03-spec R2.1's -->
+  <!-- S9a/AC2; prose 48; optional-feature; the shipped meaning is 03-spec R2.1's; the opt-out is one flag for the section and its lists, since NET-074 is the one rule it defers -->
 
 - **NET-078** THE SYSTEM SHALL classify node-plane traffic and the host-address cohort separately with distinct source identities.
   tier:     T0
@@ -811,7 +812,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-140** WHEN a box is activated with `--deny-all-egress` THE SYSTEM SHALL declare every allow list in its `egress` section present and empty.
   tier:     T0
   verify:   cargo nextest run -p minimal deny_all_egress_flag_declares_every_allow_list_empty
-  <!-- S9b/AC2; event-driven; one argument group defines the flag for every command that takes the egress flags, with one meaning, and it conflicts with every `--allow-*` and `--deny-*` flag; an empty value for any of those flags stays a validation error and never becomes an empty list; in the box spec form deny-all is every allow list present and empty and an absent list stays unset, so the spec loader keeps the two apart; an unset section on a host-address box admits everything because no requirement narrows it (NET-120), which makes this flag the CLI's one deny-all declaration for that mode; mixed forms such as no addresses but some names are not offered, since the classifier decides addresses, never names -->
+  <!-- S9b/AC2; event-driven; one argument group defines the flag for every command that takes the egress flags, with one meaning, and it conflicts with every `--allow-*` and `--deny-*` flag; an empty value for any of those flags stays a validation error and never becomes an empty list; in the box spec form deny-all is every allow list present and empty, and an absent list in the expanded spec grants nothing in its dimension (NET-074), so the spec loader keeps the two apart and resolves neither early; the predicate that reads a resolved section as deny-all consults the two destination lists, `allow_protocols` being a filter over what they grant; an unset section on a host-address box admits everything because no requirement narrows it (NET-120), which makes this flag the CLI's one deny-all declaration for that mode; mixed forms such as no addresses but some names are not offered, since the classifier decides addresses, never names -->
   - WHILE a box's `egress` section is declared deny-all THE SYSTEM SHALL show `deny-all` in `min session policy`.
     tier:   T0
     verify: cargo nextest run -p minimal policy_shows_declared_deny_all
@@ -1141,10 +1142,10 @@ other candidate; the naming story is what the epic's summary leads with.
 bind the announcement and the opt-out flag for the deny-all default because
 both are observable; recording the window only in the plan was considered and
 rejected as leaving the opt-out flag unbound. Precedence: before the default is
-in force, and whenever the opt-out flag is set, an absent `egress` section
-keeps the shipped allow-all default of 03-spec R2.1; once in force without the
-opt-out, NET-074 and NET-075 apply. The default is now in force, so the
-announcement window NET-076 bound is over.
+in force, and whenever the opt-out flag is set, an absent `egress` section, and
+an absent allow list in a declared one, keep the shipped allow-all meaning of
+03-spec R2.1; once in force without the opt-out, NET-074 and NET-075 apply. The
+default is now in force, so the announcement window NET-076 bound is over.
 
 **Bounds that were chosen here.** "Local-only" for `*.min.internal` means the
 zone is answered only to lookups that originate on the machine (NET-006);
@@ -1219,8 +1220,10 @@ error for `egress` on a HostNet PTask (NET-120), because the two-address
 classifier (NET-078, design §4.1) gives the host-address cohort an enforcement
 identity and the deny-all story for those boxes (NET-079, NET-080) needs the
 declaration, while NET-065 keeps the rejection for `none` boxes, where there is
-nothing to enforce; R2.1's allow-all default for absent `egress` fields
-(NET-074, inside the window NET-076 and NET-077 bind); and R2.3's
+nothing to enforce; R2.1's allow-all meaning of an absent `allow_subnets` or
+`allow_dns_hosts` list in a declared section on any box, and so of an absent
+`egress` section on an own-address box (NET-074, inside the window NET-076 and
+NET-077 bind), `allow_protocols` keeping its meaning as a filter; and R2.3's
 `dynamic_allowed_ports` (NET-043). **Command tree.** This document binds the
 shipped verbs `min session activate` and `min session policy`. The
 architecture's command tree spells them `min session start` and `min box show
