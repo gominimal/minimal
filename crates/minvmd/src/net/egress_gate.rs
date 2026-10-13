@@ -172,6 +172,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
 use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
@@ -693,6 +694,15 @@ const REVOKING_ADDRESS_RULE: &str = "egress-publish-at-revoking-address";
 /// cannot hold could never be unbound at its box's end, so it is never
 /// bound.
 const PUBLISH_LEDGER_FULL_RULE: &str = "egress-publish-ledger-full";
+
+/// The rule name for a publish the gate holds back because the ledger
+/// attributes its listener to another box's address: the switch binds one
+/// forwarder per listener, so the publish could not become live, and one
+/// relayed between the holder's unbind and the ledger's update would be
+/// bound and attributed to nobody. A declared port's publish is kept as its
+/// row's waiting forward ([`PublishedForwards`]); either way the guest is
+/// answered as the switch answers a held listener.
+const LISTENER_HELD_RULE: &str = "egress-publish-listener-held";
 
 /// The rule name for a retraction the decision is applied by nothing at: a
 /// listener no applied publish names — keyed at the unspecified address the
@@ -1848,7 +1858,7 @@ async fn relay_control(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
-    guest_tx: OwnedWriteHalf,
+    mut guest_tx: OwnedWriteHalf,
     head: Vec<u8>,
     verb: ControlVerb,
     body: usize,
@@ -1933,30 +1943,108 @@ async fn relay_control(
     // not deliver published nothing. So does a publish the switch answers
     // with a status outside 2xx: it bound nothing, and a note nothing
     // releases would count against the bound for the gate's lifetime.
+    //
+    // A publish for a listener the ledger attributes to another box's
+    // address is not written on at all ([`LISTENER_HELD_RULE`]). The switch
+    // would refuse it while the holder's forward is bound, and would bind
+    // it, attributed to nobody, in the step between the holder's unbind at
+    // its row's withdrawal and the ledger's update. The guest is answered
+    // as the switch answers a held listener, so it reads what it reads
+    // today. When the publish is a port its row declared, the gate keeps it
+    // as that row's waiting forward and binds it itself once the holder's
+    // row is withdrawn ([`unbind_pass`]).
+    //
+    // A forward the gate bound that way was never asked for by its box's
+    // daemon, which publishes it at the box's next attach. That publish is
+    // not written on either: the switch refuses a second expose of a
+    // listener it holds, and the daemon fails the attach on any refused
+    // bind. The gate answers it as bound, which it is.
     let noted = match (verb, forward_listener(verb, &request)) {
         (ControlVerb::Expose, Some(listener)) => {
             match (published_inside(&request), published_protocol(&request)) {
-                (Some(inside), Some(proto)) => match forwards.note_published(
-                    listener,
-                    decision.request.switch_addr(),
-                    inside,
-                    proto,
-                    decision.applied,
-                ) {
-                    Ok(noted) => noted.then_some(listener),
-                    Err(full) => {
-                        refuse_request(
-                            &limiter,
-                            &RefusedRequest {
-                                rule: PUBLISH_LEDGER_FULL_RULE,
-                                addr: Some(decision.request.switch_addr()),
-                                what: Some(format!("port {}", listener.1)),
-                                reason: full.to_string(),
-                            },
-                        );
-                        return;
+                (Some(inside), Some(proto)) => {
+                    let addr = decision.request.switch_addr();
+                    let admitted = forwards.admit_publish(
+                        listener,
+                        addr,
+                        inside,
+                        proto,
+                        decision.applied,
+                        declaring_box(&table, decision.applied, addr, listener.1),
+                    );
+                    let held = |reason: String| RefusedRequest {
+                        rule: LISTENER_HELD_RULE,
+                        addr: Some(addr),
+                        what: Some(format!("port {}", listener.1)),
+                        reason,
+                    };
+                    match admitted {
+                        Ok(Admitted::Noted) => Some(listener),
+                        Ok(Admitted::Held) => None,
+                        Ok(Admitted::Bound) => {
+                            tracing::info!(
+                                switch_addr = %Ipv4Addr::from(addr),
+                                local = %forward_revoke::listener_local(listener.0, listener.1),
+                                "the host already bound this forward for the box when the \
+                                 listener's holder ended; the egress gate answered the \
+                                 publish as bound without relaying it"
+                            );
+                            answer_unrelayed(
+                                &mut guest,
+                                &mut guest_tx,
+                                forward_revoke::bound_answer(),
+                                drain_timeout,
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(Admitted::Waiting) => {
+                            refuse_request(
+                                &limiter,
+                                &held(
+                                    "another box holds this listener; the declared forward \
+                                     waits, and the host binds it when the holder's row is \
+                                     withdrawn"
+                                        .to_string(),
+                                ),
+                            );
+                            answer_unrelayed(
+                                &mut guest,
+                                &mut guest_tx,
+                                &forward_revoke::held_answer(),
+                                drain_timeout,
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(Admitted::HeldElsewhere) => {
+                            refuse_request(
+                                &limiter,
+                                &held("another box holds this listener".to_string()),
+                            );
+                            answer_unrelayed(
+                                &mut guest,
+                                &mut guest_tx,
+                                &forward_revoke::held_answer(),
+                                drain_timeout,
+                            )
+                            .await;
+                            return;
+                        }
+                        Err(full) => {
+                            refuse_request(
+                                &limiter,
+                                &RefusedRequest {
+                                    rule: PUBLISH_LEDGER_FULL_RULE,
+                                    addr: Some(addr),
+                                    what: Some(format!("port {}", listener.1)),
+                                    reason: full.to_string(),
+                                },
+                            );
+                            return;
+                        }
                     }
-                },
+                }
                 _ => None,
             }
         }
@@ -2098,6 +2186,41 @@ async fn relay_control(
             replies.end_port_at(addr, proto, inside);
         }
     }
+}
+
+/// The box whose row declared `port` at `addr`, when a row applied the
+/// publish and the port is one of the row's declared ones: the publishes a
+/// held listener keeps waiting ([`PublishedForwards::admit_publish`]). A
+/// runtime-published port is not kept: its forward comes and goes with a
+/// listener inside the box, and the box's own watcher retries it.
+fn declaring_box(table: &BoxTable, applied: Applied, addr: [u8; 4], port: u16) -> Option<BoxId> {
+    if applied != Applied::Row {
+        return None;
+    }
+    let row = table.by_source(addr)?;
+    row.admitted_ports().contains(&port).then(|| row.box_id())
+}
+
+/// Answers a publish the gate did not relay with `answer`, then waits for
+/// the guest to close its side, bounded by `drain_timeout`: the answer the
+/// switch gives an expose of a listener it already holds for a publish held
+/// back ([`LISTENER_HELD_RULE`], [`forward_revoke::held_answer`]), or the
+/// one it gives an expose it bound for a forward the gate's own expose
+/// already bound ([`forward_revoke::bound_answer`]). The gate does not close
+/// first: the daemon's client reads its answer on a kept-alive connection
+/// and closes from its own side, and a close from this side can drop the
+/// answer in flight.
+async fn answer_unrelayed(
+    guest: &mut Prefixed<OwnedReadHalf>,
+    guest_tx: &mut OwnedWriteHalf,
+    answer: &[u8],
+    drain_timeout: Duration,
+) {
+    if let Err(error) = guest_tx.write_all(answer).await {
+        tracing::warn!(%error, "egress gate could not answer a publish it did not relay");
+        return;
+    }
+    let _end = control_request_probe(guest, drain_timeout).await;
 }
 
 /// Ends a control connection whose request leg finished: half-close the
@@ -2279,9 +2402,57 @@ struct ControlDecision {
 /// unbinds them at a box's end and refusing to evict one protects nothing;
 /// counted with the row-held ones, enough of them would refuse every box's
 /// publish until the gate restarts.
+///
+/// Beside the applied publishes the ledger keeps the **waiting** declared
+/// forwards ([`WaitingForward`]): a publish a row admits as a declared port,
+/// for a listener the ledger attributes to another box's address. It is
+/// never relayed. When the holder's row is withdrawn, the step that drops
+/// the holder's attribution gives the listener to the forward waiting on it
+/// and the gate binds it itself ([`unbind_pass`]). One forward waits on a
+/// listener: the guest's registry elects which box takes a shared port and
+/// publishes for that box alone, so a later publish for the listener from
+/// another row is the guest's newer choice and replaces the one waiting.
+/// The gate makes no choice of its own. A waiting forward goes with its own
+/// row's withdrawal. They are bounded at
+/// [`PUBLISHED_FORWARDS_TRACKED`] too, and past the bound a new one is
+/// refused.
+///
+/// A forward is filed as waiting only by its own box's publish reaching the
+/// gate. A row's declared ports alone file nothing: the row carries the
+/// external ports and neither the inside port nor the protocol a forward
+/// needs. A guest that never sends the publish of a port it yields to
+/// another box (NET-129) therefore has nothing waiting, and the holder's
+/// withdrawal leaves that listener free.
+///
+/// A forward the gate's own expose bound is marked as handed over
+/// ([`Self::settle_claim`]). Its box's daemon never asked for that bind, so
+/// its next publish of the same forward is answered as bound and not
+/// relayed ([`Admitted::Bound`]): the switch would refuse a second expose of
+/// a listener it holds, and the guest would read its own forward as a
+/// failed bind.
+///
+/// A waiting forward whose listener the ledger attributes to its own
+/// address is one whose expose went unanswered
+/// ([`Self::keep_unanswered_claim`]): the switch may have bound it, so the
+/// attribution stays for the waiting row's withdrawal to unbind, and the
+/// waiting record stays for the expose to be retried.
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
+    /// The declared forwards waiting on a listener another box holds, at
+    /// most one per listener and address. Locked only while `applied` is,
+    /// so a listener's attribution and its waiting forwards change in one
+    /// step.
+    waiting: Mutex<Vec<WaitingForward>>,
+    /// The listeners a waiting forward was just given and the gate's own
+    /// expose is still in flight for ([`Self::claim_waiting`]). Locked only
+    /// while `applied` is.
+    claiming: Mutex<Vec<Listener>>,
+    /// The listeners whose standing attribution the gate's own expose bound
+    /// ([`Self::settle_claim`]). A listener leaves with its attribution, so
+    /// the set holds no more than the row-held side of `applied` does.
+    /// Locked only while `applied` is.
+    handed: Mutex<Vec<Listener>>,
     /// The rowless addresses an applied switch request named as the box's
     /// own — a port publish, a zone name, a retraction alike — oldest first,
     /// bounded at [`LEASES_VOUCHED_TRACKED`]. Each is a lease the guest
@@ -2300,6 +2471,40 @@ type Listener = ([u8; 4], u16);
 /// applied at, the inside port its forward dials, the protocol it named, and
 /// whether a row or the interim applied it.
 type AppliedPublish = (Listener, [u8; 4], u16, u8, Applied);
+
+/// A declared forward waiting on a listener another box holds: the listener,
+/// the waiting row's switch address, the inside port and the protocol — all
+/// from the guest's own publish — and the id of the box whose row declared
+/// the port, which orders the forwards waiting on one listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitingForward {
+    listener: Listener,
+    addr: [u8; 4],
+    inside: u16,
+    proto: u8,
+    box_id: BoxId,
+}
+
+/// What the ledger made of a publish the decision admitted
+/// ([`PublishedForwards::admit_publish`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admitted {
+    /// Noted as applied: the request is relayed.
+    Noted,
+    /// The listener is already attributed to the publish's own address:
+    /// nothing new is noted, and the request is relayed.
+    Held,
+    /// The gate's own expose already bound this very forward for the
+    /// publish's own address: nothing new is noted, the request is not
+    /// relayed, and the guest is answered as bound.
+    Bound,
+    /// Another address holds the listener and the publish is a declared
+    /// port's: kept as its row's waiting forward, not relayed.
+    Waiting,
+    /// Another address holds the listener and the publish is not a declared
+    /// port's: not relayed, and nothing is kept.
+    HeldElsewhere,
+}
 
 /// How many row-held publishes' attributions the ledger keeps. A row-held
 /// publish past the bound is refused ([`LedgerFull`]).
@@ -2339,6 +2544,9 @@ impl PublishedForwards {
     fn new() -> Self {
         Self {
             applied: Mutex::new(Vec::new()),
+            waiting: Mutex::new(Vec::new()),
+            claiming: Mutex::new(Vec::new()),
+            handed: Mutex::new(Vec::new()),
             vouched: Mutex::new(Vec::new()),
             flows: ForwardedFlows::default(),
         }
@@ -2357,17 +2565,232 @@ impl PublishedForwards {
     }
 
     /// Drops the attribution of `listener` when it is still the one applied
-    /// at `addr`: the box's end unbound it. Returns whether it was.
-    fn note_unbound_at(&self, listener: Listener, addr: [u8; 4]) -> bool {
+    /// at `addr`: the box's end unbound it. Returns whether it was, and in
+    /// the same step the listener's next attribution: when the entry was
+    /// dropped and a declared forward waits on `listener`, the one to bind
+    /// is noted as applied at its own row's address and handed back for the
+    /// caller to expose ([`Self::claim_waiting`]). No publish for the
+    /// listener can be decided between the two, so none is relayed while
+    /// the listener is free at the switch and held by nobody here.
+    fn hand_over_at(
+        &self,
+        listener: Listener,
+        addr: [u8; 4],
+    ) -> (bool, Result<Option<WaitingForward>, LedgerFull>) {
         let mut applied = self.lock();
         let Some(at) = applied
             .iter()
             .position(|(held, at, _, _, _)| *held == listener && *at == addr)
         else {
+            return (false, Ok(None));
+        };
+        applied.remove(at);
+        self.lock_handed().retain(|handed| *handed != listener);
+        (true, self.claim_in(&mut applied, listener))
+    }
+
+    /// Gives a listener nobody holds to the declared forward waiting on it:
+    /// noted as applied by its row, at its row's address, and handed back
+    /// for the caller to expose. A publish replaces any other row's forward
+    /// waiting on its listener ([`Self::admit_publish`]), so at most one
+    /// waits beside a forward whose own claim the switch refused; of those
+    /// two the one published last is taken, which is the guest's latest
+    /// choice of holder. `None` when the listener is held or nothing waits
+    /// on it.
+    ///
+    /// A listener held by a waiting forward whose expose went unanswered
+    /// ([`Self::keep_unanswered_claim`]) is claimed again by that forward,
+    /// with its attribution left as it is, so the caller's retry repeats
+    /// the expose.
+    ///
+    /// The claim is in flight until the caller's expose is answered
+    /// ([`Self::settle_claim`], [`Self::release_claim`],
+    /// [`Self::keep_unanswered_claim`]). Until then the waiting record
+    /// stays, and the claiming row's own withdrawal leaves the listener
+    /// alone ([`Self::claim_in_flight`]): an unbind sent beside the expose
+    /// could reach the switch on either side of it.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerFull`] when a forward waits on the free listener and the
+    /// row-held side of the ledger is at its bound: it stays waiting, and
+    /// the hand-over is owed a retry.
+    fn claim_waiting(&self, listener: Listener) -> Result<Option<WaitingForward>, LedgerFull> {
+        let mut applied = self.lock();
+        self.claim_in(&mut applied, listener)
+    }
+
+    fn claim_in(
+        &self,
+        applied: &mut Vec<AppliedPublish>,
+        listener: Listener,
+    ) -> Result<Option<WaitingForward>, LedgerFull> {
+        if let Some((_, holder, _, _, _)) = applied.iter().find(|entry| entry.0 == listener) {
+            if self.lock_claiming().contains(&listener) {
+                return Ok(None);
+            }
+            let unanswered = self
+                .lock_waiting()
+                .iter()
+                .find(|forward| forward.listener == listener && forward.addr == *holder)
+                .copied();
+            if unanswered.is_some() {
+                self.lock_claiming().push(listener);
+            }
+            return Ok(unanswered);
+        }
+        let Some(next) = self
+            .lock_waiting()
+            .iter()
+            .rfind(|forward| forward.listener == listener)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let row_held = applied
+            .iter()
+            .filter(|entry| entry.4 == Applied::Row)
+            .count();
+        if row_held >= PUBLISHED_FORWARDS_TRACKED {
+            tracing::warn!(
+                switch_addr = %Ipv4Addr::from(next.addr),
+                box_id = %BoxIdText(&next.box_id),
+                local = %forward_revoke::listener_local(listener.0, listener.1),
+                "the egress gate's publish ledger is at its bound; a waiting declared \
+                 forward stays waiting",
+            );
+            return Err(LedgerFull);
+        }
+        applied.push((listener, next.addr, next.inside, next.proto, Applied::Row));
+        self.lock_claiming().push(listener);
+        Ok(Some(next))
+    }
+
+    /// Whether the gate's own expose for `listener` is still in flight.
+    fn claim_in_flight(&self, listener: Listener) -> bool {
+        let _applied = self.lock();
+        self.lock_claiming().contains(&listener)
+    }
+
+    /// The expose of a claimed waiting forward was answered as bound: the
+    /// claim is settled, its waiting record goes, and the listener is
+    /// marked as handed over, so its box's own publish of the forward is
+    /// answered as bound ([`Admitted::Bound`]).
+    fn settle_claim(&self, forward: &WaitingForward) {
+        let _applied = self.lock();
+        self.lock_claiming()
+            .retain(|listener| *listener != forward.listener);
+        let mut handed = self.lock_handed();
+        if !handed.contains(&forward.listener) {
+            handed.push(forward.listener);
+        }
+        drop(handed);
+        self.lock_waiting().retain(|waiting| {
+            !(waiting.listener == forward.listener && waiting.addr == forward.addr)
+        });
+    }
+
+    /// The expose of a claimed waiting forward went unanswered: the switch
+    /// may have bound it. The claim is no longer in flight, and its
+    /// attribution stays, so the waiting row's withdrawal unbinds the
+    /// listener and no other box's publish for it is relayed meanwhile. The
+    /// waiting record stays too, for the expose to be retried
+    /// ([`Self::claim_waiting`]), unless its row was withdrawn meanwhile.
+    fn keep_unanswered_claim(&self, forward: &WaitingForward) {
+        let _applied = self.lock();
+        self.lock_claiming()
+            .retain(|listener| *listener != forward.listener);
+    }
+
+    /// The switch refused the expose of a claimed waiting forward: the
+    /// attribution the claim noted is taken back out, and the forward keeps
+    /// waiting unless its row was withdrawn meanwhile. Returns whether the
+    /// attribution was there to drop.
+    fn release_claim(&self, forward: &WaitingForward) -> bool {
+        let mut applied = self.lock();
+        self.lock_claiming()
+            .retain(|listener| *listener != forward.listener);
+        let Some(at) = applied
+            .iter()
+            .position(|(held, at, _, _, _)| *held == forward.listener && *at == forward.addr)
+        else {
             return false;
         };
         applied.remove(at);
+        self.lock_handed()
+            .retain(|handed| *handed != forward.listener);
         true
+    }
+
+    /// Drops every forward waiting at the box address `addr`: its row was
+    /// withdrawn, so nothing is bound for it later.
+    fn drop_waiting_at(&self, addr: [u8; 4]) {
+        let _applied = self.lock();
+        self.lock_waiting().retain(|waiting| waiting.addr != addr);
+    }
+
+    /// Decides what an admitted publish becomes, in one step with the
+    /// listener's attribution: noted as applied when nobody holds the
+    /// listener ([`Self::note_published`]); nothing new when its own address
+    /// already holds it, answered as bound when the gate's own expose bound
+    /// that very forward; and, when another address holds it, kept as a
+    /// waiting forward for `declared_by` — the box whose row declared the
+    /// port — or held back with nothing kept when no row declared it. The
+    /// waiting forward replaces every other one waiting on the listener,
+    /// the row's own earlier one and another row's alike: the guest
+    /// publishes a held port for the one box it elected, so the latest
+    /// publish names its choice. The holder's own waiting record, kept
+    /// while the gate's expose for it is unsettled, is left alone.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerFull`] as [`Self::note_published`] returns it, and for a
+    /// waiting forward past [`PUBLISHED_FORWARDS_TRACKED`] of them: it is
+    /// refused, and no attribution is evicted for it.
+    fn admit_publish(
+        &self,
+        listener: Listener,
+        addr: [u8; 4],
+        inside: u16,
+        proto: u8,
+        by: Applied,
+        declared_by: Option<BoxId>,
+    ) -> Result<Admitted, LedgerFull> {
+        let mut applied = self.lock();
+        let holder = applied
+            .iter()
+            .find(|(held, _, _, _, _)| *held == listener)
+            .map(|(_, at, port, held_proto, _)| (*at, *port == inside && *held_proto == proto));
+        let mut waiting = self.lock_waiting();
+        match (holder, declared_by) {
+            (None, _) => {
+                Self::push_applied(&mut applied, listener, addr, inside, proto, by)?;
+                waiting.retain(|held| !(held.listener == listener && held.addr == addr));
+                Ok(Admitted::Noted)
+            }
+            (Some((at, same_forward)), _) if at == addr => {
+                if same_forward && self.lock_handed().contains(&listener) {
+                    Ok(Admitted::Bound)
+                } else {
+                    Ok(Admitted::Held)
+                }
+            }
+            (Some(_), None) => Ok(Admitted::HeldElsewhere),
+            (Some((holder, _)), Some(box_id)) => {
+                waiting.retain(|held| held.listener != listener || held.addr == holder);
+                if waiting.len() >= PUBLISHED_FORWARDS_TRACKED {
+                    return Err(LedgerFull);
+                }
+                waiting.push(WaitingForward {
+                    listener,
+                    addr,
+                    inside,
+                    proto,
+                    box_id,
+                });
+                Ok(Admitted::Waiting)
+            }
+        }
     }
 
     /// Notes a publish the gate is about to apply: the address its listener
@@ -2375,7 +2798,10 @@ impl PublishedForwards {
     /// publishes and what applied it. The listener is keyed first — gvproxy
     /// binds one forwarder per loopback listener, so a second publish for a
     /// held listener never becomes live — and `Ok(false)` says the listener
-    /// was already held, so nothing new was noted.
+    /// was already held, so nothing new was noted. The control leg notes
+    /// through [`Self::admit_publish`], which also decides a listener
+    /// another address holds; this is the same note without that decision,
+    /// for the tests that file a publish directly.
     ///
     /// An interim publish at [`INTERIM_PUBLISHES_TRACKED`] evicts the oldest
     /// interim attribution, and never counts against the row-held bound.
@@ -2385,6 +2811,7 @@ impl PublishedForwards {
     /// [`LedgerFull`] for a row-held publish at
     /// [`PUBLISHED_FORWARDS_TRACKED`]: the publish is refused, never an older
     /// row-held attribution evicted.
+    #[cfg(test)]
     fn note_published(
         &self,
         listener: Listener,
@@ -2397,6 +2824,19 @@ impl PublishedForwards {
         if applied.iter().any(|(held, _, _, _, _)| *held == listener) {
             return Ok(false);
         }
+        Self::push_applied(&mut applied, listener, addr, inside, proto, by).map(|()| true)
+    }
+
+    /// Adds a publish for a listener nobody holds, under the bounds
+    /// [`Self::note_published`] documents.
+    fn push_applied(
+        applied: &mut Vec<AppliedPublish>,
+        listener: Listener,
+        addr: [u8; 4],
+        inside: u16,
+        proto: u8,
+        by: Applied,
+    ) -> Result<(), LedgerFull> {
         let held_by = applied.iter().filter(|entry| entry.4 == by).count();
         match by {
             Applied::Row if held_by >= PUBLISHED_FORWARDS_TRACKED => return Err(LedgerFull),
@@ -2414,7 +2854,7 @@ impl PublishedForwards {
             Applied::Row | Applied::Interim => {}
         }
         applied.push((listener, addr, inside, proto, by));
-        Ok(true)
+        Ok(())
     }
 
     /// Drops the attribution an applied retraction's listener carried, and
@@ -2433,6 +2873,7 @@ impl PublishedForwards {
             .position(|(held, _, _, _, _)| *held == listener)
             .map(|at| {
                 let (_, addr, inside, proto, _) = applied.remove(at);
+                self.lock_handed().retain(|handed| *handed != listener);
                 (addr, inside, proto)
             })
     }
@@ -2528,6 +2969,30 @@ impl PublishedForwards {
             "the ledger's lock is held only across a lookup or an update, never across a panic",
         )
     }
+
+    /// The listeners with a claim in flight. Taken only while [`Self::lock`]
+    /// is held.
+    fn lock_claiming(&self) -> MutexGuard<'_, Vec<Listener>> {
+        self.claiming.lock().expect(
+            "the claims' lock is held only across a lookup or an update, never across a panic",
+        )
+    }
+
+    /// The handed-over listeners. Taken only while [`Self::lock`] is held.
+    fn lock_handed(&self) -> MutexGuard<'_, Vec<Listener>> {
+        self.handed.lock().expect(
+            "the handed-over set's lock is held only across a lookup or an update, never \
+             across a panic",
+        )
+    }
+
+    /// The waiting forwards. Taken only while [`Self::lock`] is held.
+    fn lock_waiting(&self) -> MutexGuard<'_, Vec<WaitingForward>> {
+        self.waiting.lock().expect(
+            "the waiting forwards' lock is held only across a lookup or an update, never \
+             across a panic",
+        )
+    }
 }
 
 /// The gate's half of host-side ingress revocation (design §7.1, NET-121,
@@ -2602,6 +3067,16 @@ async fn revoke_on_row_withdrawal(
 /// connection gets a reset from the box's address, written into the switch
 /// over a frame connection of the gate's own ([`terminate_flows`]).
 ///
+/// A listener the box held may have another box's declared forward waiting
+/// on it ([`PublishedForwards`]). The box's own waiting forwards are dropped
+/// first: nothing is bound for a box that ended. Each listener a pass
+/// unbinds is handed to its waiting forward in the same step
+/// ([`unbind_pass`]), and a hand-over whose expose failed is retried with
+/// each unbind pass and then on the whole of `backoff` again, once the
+/// box's own unbinds are done or given up ([`retry_hand_overs`]): the waits
+/// the unbinds used are not taken out of the hand-overs'. The hold on the
+/// box's addresses never waits on a hand-over.
+///
 /// Every step logs one line, so a bundle's daemon log tail shows each
 /// forward's unbind beside its bind.
 async fn revoke_box_forwards(
@@ -2615,8 +3090,11 @@ async fn revoke_box_forwards(
     let addr = switch_addr.octets();
     let mut retries = backoff.iter();
     let mut attempt = 1usize;
+    forwards.drop_waiting_at(addr);
+    let mut owed = Vec::new();
     loop {
-        unbind_pass(&switch_sock, &forwards, &replies, addr, attempt).await;
+        owed = hand_over_owed(&switch_sock, &forwards, &replies, owed).await;
+        owed.extend(unbind_pass(&switch_sock, &forwards, &replies, addr, attempt).await);
         let flows = forwards.flows.take_at(addr);
         let still_bound = forwards.published_at(addr);
         if still_bound.is_empty() {
@@ -2624,6 +3102,7 @@ async fn revoke_box_forwards(
             // before the resets go out, which reuse no longer depends on.
             drop(withdrawal);
             terminate_flows(&switch_sock, switch_addr, &flows).await;
+            retry_hand_overs(&switch_sock, &forwards, &replies, owed, backoff).await;
             return None;
         }
         terminate_flows(&switch_sock, switch_addr, &flows).await;
@@ -2637,6 +3116,7 @@ async fn revoke_box_forwards(
                      bound, and its addresses stay held against reuse"
                 );
             }
+            retry_hand_overs(&switch_sock, &forwards, &replies, owed, backoff).await;
             return Some(withdrawal);
         };
         tokio::time::sleep(*wait).await;
@@ -2647,15 +3127,28 @@ async fn revoke_box_forwards(
 /// One pass over the forwards the ledger still holds at `addr`: an unexpose
 /// each, and the ledger entry and the reply-flow records dropped for each
 /// that is no longer bound. A failure is logged and left for the next pass.
+///
+/// The step that drops a listener's entry also gives the listener to the
+/// declared forward waiting on it, when one does
+/// ([`PublishedForwards::hand_over_at`]), and the pass binds that forward
+/// itself ([`apply_waiting`]). Returns the listeners whose hand-over failed
+/// and is owed a retry.
 async fn unbind_pass(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
     addr: [u8; 4],
     attempt: usize,
-) {
+) -> Vec<Listener> {
+    let mut owed = Vec::new();
     let switch_addr = Ipv4Addr::from(addr);
     for (listener, inside, proto) in forwards.published_at(addr) {
+        // The gate's own expose for this listener is still in flight: the
+        // forward was handed to this box as its row was withdrawn. It stays
+        // in the ledger, and the next pass unbinds it.
+        if forwards.claim_in_flight(listener) {
+            continue;
+        }
         let local = forward_revoke::listener_local(listener.0, listener.1);
         let outcome = match forward_revoke::protocol_name(proto) {
             Some(protocol) => {
@@ -2672,9 +3165,8 @@ async fn unbind_pass(
         };
         match outcome {
             Ok(unexposed) => {
-                if forwards.note_unbound_at(listener, addr)
-                    && !forwards.still_published(addr, inside, proto)
-                {
+                let (dropped, next) = forwards.hand_over_at(listener, addr);
+                if dropped && !forwards.still_published(addr, inside, proto) {
                     replies.end_port_at(addr, proto, inside);
                 }
                 tracing::info!(
@@ -2686,6 +3178,14 @@ async fn unbind_pass(
                     reason = "box ended",
                     "unbound the box's forwarder at its row's withdrawal"
                 );
+                let bound = match next {
+                    Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, next).await,
+                    Ok(None) => true,
+                    Err(LedgerFull) => false,
+                };
+                if !bound {
+                    owed.push(listener);
+                }
             }
             Err(error) => tracing::warn!(
                 %switch_addr,
@@ -2697,6 +3197,149 @@ async fn unbind_pass(
                  the ledger for a retry"
             ),
         }
+    }
+    owed
+}
+
+/// Binds a waiting declared forward the ledger just gave its listener to
+/// ([`PublishedForwards::claim_waiting`]): the expose is the gate's own,
+/// toward the waiting row's address at the inside port its guest published.
+/// Returns whether the forward is bound; `false` is a failed expose, owed a
+/// retry.
+///
+/// The ledger never keeps a claim the switch refused: a refused expose
+/// takes the claim back out, and the forward stays waiting. An expose that
+/// went unanswered may have been bound, so its claim stays in the ledger
+/// ([`PublishedForwards::keep_unanswered_claim`]): were it taken out, the
+/// waiting row's withdrawal would unbind nothing, and a forward the switch
+/// did bind would outlive its box and serve whichever box leased the
+/// address next.
+async fn apply_waiting(
+    switch_sock: &std::path::Path,
+    forwards: &PublishedForwards,
+    replies: &ReplyTables,
+    next: WaitingForward,
+) -> bool {
+    let switch_addr = Ipv4Addr::from(next.addr);
+    let local = forward_revoke::listener_local(next.listener.0, next.listener.1);
+    let remote = format!("{switch_addr}:{}", next.inside);
+    let exposed = match forward_revoke::protocol_name(next.proto) {
+        Some(protocol) => {
+            forward_revoke::expose(
+                switch_sock,
+                &local,
+                &remote,
+                protocol,
+                forward_revoke::REVOKE_TIMEOUT,
+            )
+            .await
+        }
+        None => Err(forward_revoke::ExposeError::Unspellable),
+    };
+    match exposed {
+        Ok(exposed) => {
+            forwards.settle_claim(&next);
+            tracing::info!(
+                %switch_addr,
+                box_id = %BoxIdText(&next.box_id),
+                %local,
+                %remote,
+                proto = next.proto,
+                already_bound = exposed == forward_revoke::Exposed::AlreadyBound,
+                reason = "holder ended",
+                "bound the waiting box's declared forwarder at its listener"
+            );
+            true
+        }
+        Err(error @ forward_revoke::ExposeError::Unanswered(_)) => {
+            forwards.keep_unanswered_claim(&next);
+            tracing::warn!(
+                %switch_addr,
+                box_id = %BoxIdText(&next.box_id),
+                %local,
+                %remote,
+                %error,
+                "binding the waiting box's declared forwarder at its listener went \
+                 unanswered; the switch may have bound it, so the ledger keeps it for that \
+                 box, and the expose is retried"
+            );
+            false
+        }
+        Err(error) => {
+            if forwards.release_claim(&next)
+                && !forwards.still_published(next.addr, next.inside, next.proto)
+            {
+                replies.end_port_at(next.addr, next.proto, next.inside);
+            }
+            tracing::warn!(
+                %switch_addr,
+                box_id = %BoxIdText(&next.box_id),
+                %local,
+                %remote,
+                %error,
+                "binding the waiting box's declared forwarder at its listener failed; the \
+                 ledger holds no forward for it, and it stays waiting for a retry"
+            );
+            false
+        }
+    }
+}
+
+/// Retries the hand-overs `owed`: for each listener, the forward waiting on
+/// it now is claimed and bound ([`apply_waiting`]). A listener somebody
+/// holds by now, or nothing waits on, is settled. One the ledger is too
+/// full to attribute is still owed. Returns the listeners still owed.
+async fn hand_over_owed(
+    switch_sock: &std::path::Path,
+    forwards: &PublishedForwards,
+    replies: &ReplyTables,
+    owed: Vec<Listener>,
+) -> Vec<Listener> {
+    let mut still_owed = Vec::new();
+    for listener in owed {
+        let bound = match forwards.claim_waiting(listener) {
+            Ok(Some(next)) => apply_waiting(switch_sock, forwards, replies, next).await,
+            Ok(None) => true,
+            Err(LedgerFull) => false,
+        };
+        if !bound {
+            still_owed.push(listener);
+        }
+    }
+    still_owed
+}
+
+/// Retries the hand-overs still `owed` once the box's own unbinds are done
+/// or given up, after each wait of `backoff`, and says which it gave up on.
+/// The budget is the hand-overs' own: however many waits the unbinds took,
+/// an owed hand-over is tried once more after every wait of `backoff`.
+async fn retry_hand_overs(
+    switch_sock: &std::path::Path,
+    forwards: &PublishedForwards,
+    replies: &ReplyTables,
+    mut owed: Vec<Listener>,
+    backoff: &'static [Duration],
+) {
+    for wait in backoff {
+        if owed.is_empty() {
+            return;
+        }
+        tokio::time::sleep(*wait).await;
+        owed = hand_over_owed(switch_sock, forwards, replies, owed).await;
+    }
+    give_up_hand_overs(&owed);
+}
+
+/// Says each hand-over the retries did not settle.
+fn give_up_hand_overs(owed: &[Listener]) {
+    for listener in owed {
+        tracing::error!(
+            local = %forward_revoke::listener_local(listener.0, listener.1),
+            "gave up binding the waiting box's declared forwarder at its listener; an \
+             expose the switch left unanswered stays attributed to the waiting box, and \
+             otherwise nothing is bound there until a box publishes it again or a later \
+             holder's row is withdrawn"
+        );
     }
 }
 
@@ -9308,7 +9951,9 @@ mod tests {
 
     /// Stands in for the switch's forwarder surface at `path`: answers each
     /// unexpose with the next of `answers` (status line and body), the last
-    /// one repeated, and hands each request to the returned receiver.
+    /// one repeated, and hands each request to the returned receiver. An
+    /// answer with an empty status is none at all: the request is read and
+    /// the connection closed.
     fn forwarder_answering(
         path: &std::path::Path,
         answers: &'static [(&'static str, &'static str)],
@@ -9331,6 +9976,9 @@ mod tests {
                 } else {
                     **answers.peek().expect("the last answer repeats")
                 };
+                if status.is_empty() {
+                    continue;
+                }
                 let answer = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
@@ -9478,6 +10126,1044 @@ mod tests {
         );
         assert!(forwards.published_at(LEASE).is_empty());
         assert!(!registry.table().revocation_pending(LEASE));
+    }
+
+    /// The address of a second box declaring the port `LEASE`'s box holds.
+    const WAITER: [u8; 4] = [100, 64, 0, 10];
+
+    /// The listener both boxes declare, at the address they share.
+    const SHARED: super::Listener = ([127, 0, 0, 1], 8080);
+
+    /// The unexpose of [`SHARED`], as the gate spells it.
+    const UNEXPOSE_SHARED: &str = r#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
+
+    fn box_id(n: u8) -> crate::bep_attach::BoxId {
+        [n; 16]
+    }
+
+    /// A declared publish of [`SHARED`] by the row at `addr`, toward its
+    /// inside port `inside`, as the gate's control leg files it.
+    fn publish_shared(
+        forwards: &PublishedForwards,
+        addr: [u8; 4],
+        inside: u16,
+        id: crate::bep_attach::BoxId,
+    ) -> Result<super::Admitted, super::LedgerFull> {
+        forwards.admit_publish(
+            SHARED,
+            addr,
+            inside,
+            super::egress::IPPROTO_TCP,
+            sessions::core::switch_request::Applied::Row,
+            Some(id),
+        )
+    }
+
+    /// Every request the stand-in switch was asked so far.
+    fn asked_so_far(asked: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut requests = Vec::new();
+        while let Ok(request) = asked.try_recv() {
+            requests.push(request);
+        }
+        requests
+    }
+
+    /// NET-129 on a VM host: a box whose declared port another box holds
+    /// waits. When the holder's row is withdrawn the gate unbinds the
+    /// holder's forwarder and binds the waiting box's itself, toward the
+    /// waiting box's address at the inside port its own publish named, and
+    /// the ledger attributes the listener to the waiting box. That box's own
+    /// withdrawal then unbinds it.
+    #[tokio::test]
+    async fn waiting_declared_forward_bound_when_holder_row_withdrawn() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        registry.register(
+            BoxRegistration::new("api", Ipv4Addr::from(WAITER), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+        assert_eq!(
+            forwards.address_of(SHARED),
+            Some(LEASE),
+            "a waiting forward takes nothing from the holder"
+        );
+
+        let kept = super::revoke_box_forwards(
+            sock.clone(),
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        assert!(kept.is_none());
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(requests.len(), 2, "one unexpose, one expose: {requests:?}");
+        assert!(requests[0].starts_with("POST /services/forwarder/unexpose "));
+        assert!(requests[0].ends_with(UNEXPOSE_SHARED));
+        assert!(requests[1].starts_with("POST /services/forwarder/expose "));
+        assert!(
+            requests[1].ends_with(
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.10:18081","protocol":"tcp"}"#
+            ),
+            "the expose dials the waiting box, got: {}",
+            requests[1]
+        );
+        assert_eq!(forwards.address_of(SHARED), Some(WAITER));
+        assert_eq!(
+            forwards.published_at(WAITER),
+            vec![(SHARED, 18081, super::egress::IPPROTO_TCP)]
+        );
+        assert!(forwards.inside_published(WAITER, 18081));
+        assert!(forwards.lock_waiting().is_empty());
+        assert_eq!(*forwards.lock_handed(), vec![SHARED]);
+
+        // The forward is the waiting box's now: its row's withdrawal unbinds it.
+        assert!(registry.withdraw(Ipv4Addr::from(WAITER)).is_some());
+        let withdrawal = withdrawn.try_recv().expect("the withdrawal is delivered");
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+        assert!(kept.is_none());
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(requests.len(), 1, "one unexpose: {requests:?}");
+        assert!(requests[0].ends_with(UNEXPOSE_SHARED));
+        assert_eq!(forwards.address_of(SHARED), None);
+        assert!(
+            forwards.lock_handed().is_empty(),
+            "the hand-over's mark goes with its attribution"
+        );
+    }
+
+    /// Two boxes publish one held listener: the later publish replaces the
+    /// earlier one, whichever box id is lower, since the guest publishes a
+    /// held port for the box it elected and the gate does not elect. Exactly
+    /// that one is bound at the hand-over and nothing is left waiting. The
+    /// listener is never free in the ledger across the hand-over, so a
+    /// publish that arrives during it is held back, not relayed to a switch
+    /// that would bind it for nobody.
+    #[tokio::test]
+    async fn of_two_publishes_for_a_held_listener_the_later_one_waits_and_is_bound() {
+        const LATER: [u8; 4] = [100, 64, 0, 11];
+        for later_first in [true, false] {
+            let dir = tempfile::TempDir::new().expect("a tempdir");
+            let sock = dir.path().join("switch.sock");
+            static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+            let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+            let (_registry, forwards, withdrawal) = withdrawn_with_one_forward();
+            let mut publishes = [(LATER, 18082, box_id(7)), (WAITER, 18081, box_id(3))];
+            if !later_first {
+                publishes.reverse();
+            }
+            for (addr, inside, id) in publishes {
+                assert_eq!(
+                    publish_shared(&forwards, addr, inside, id),
+                    Ok(super::Admitted::Waiting)
+                );
+            }
+            let (chosen, _, _) = publishes[1];
+            assert_eq!(
+                forwards
+                    .lock_waiting()
+                    .iter()
+                    .map(|waiting| waiting.addr)
+                    .collect::<Vec<_>>(),
+                vec![chosen],
+                "the later publish replaced the earlier one"
+            );
+
+            // The step that drops the holder's attribution names the next
+            // one: a publish decided right after it finds the listener held.
+            let (dropped, next) = forwards.hand_over_at(SHARED, LEASE);
+            assert!(dropped);
+            let next = next.expect("the ledger has room");
+            assert_eq!(next.map(|next| next.addr), Some(chosen));
+            assert_eq!(
+                forwards.admit_publish(
+                    SHARED,
+                    [100, 64, 0, 12],
+                    18083,
+                    super::egress::IPPROTO_TCP,
+                    sessions::core::switch_request::Applied::Row,
+                    None,
+                ),
+                Ok(super::Admitted::HeldElsewhere),
+                "a publish arriving in the hand-over is not relayed"
+            );
+            // Back to the state the withdrawal finds.
+            assert!(forwards.release_claim(&next.expect("the claim")));
+            assert_eq!(
+                forwards.note_published(
+                    SHARED,
+                    LEASE,
+                    18080,
+                    super::egress::IPPROTO_TCP,
+                    sessions::core::switch_request::Applied::Row
+                ),
+                Ok(true)
+            );
+
+            let kept = super::revoke_box_forwards(
+                sock,
+                Arc::clone(&forwards),
+                ReplyTables::new(),
+                withdrawal,
+                &TWO_QUICK_RETRIES,
+            )
+            .await;
+            server.abort();
+            assert!(kept.is_none());
+            let requests = asked_so_far(&mut asked);
+            let exposes: Vec<_> = requests
+                .iter()
+                .filter(|request| request.starts_with("POST /services/forwarder/expose "))
+                .collect();
+            assert_eq!(exposes.len(), 1, "exactly one waiting forward is bound");
+            let remote = if later_first {
+                r#""remote":"100.64.0.10:18081""#
+            } else {
+                r#""remote":"100.64.0.11:18082""#
+            };
+            assert!(exposes[0].contains(remote), "{exposes:?}");
+            assert_eq!(forwards.address_of(SHARED), Some(chosen));
+            assert!(forwards.lock_waiting().is_empty(), "nothing still waits");
+        }
+    }
+
+    /// A waiting forward goes with its own row: when the waiting box's row
+    /// is withdrawn first, the holder's later withdrawal unbinds the
+    /// listener and binds nothing.
+    #[tokio::test]
+    async fn a_waiting_forward_is_dropped_when_its_own_row_is_withdrawn() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let registry = BoxRegistry::new(SUBNET);
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        for (name, addr) in [("web", LEASE), ("api", WAITER)] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_admitted_ports([8080]),
+            );
+        }
+        let forwards = Arc::new(PublishedForwards::new());
+        assert_eq!(
+            publish_shared(&forwards, LEASE, 18080, box_id(1)),
+            Ok(super::Admitted::Noted)
+        );
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+
+        for addr in [WAITER, LEASE] {
+            assert!(registry.withdraw(Ipv4Addr::from(addr)).is_some());
+            let withdrawal = withdrawn.try_recv().expect("the withdrawal is delivered");
+            let kept = super::revoke_box_forwards(
+                sock.clone(),
+                Arc::clone(&forwards),
+                ReplyTables::new(),
+                withdrawal,
+                &TWO_QUICK_RETRIES,
+            )
+            .await;
+            assert!(kept.is_none());
+        }
+        server.abort();
+
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(
+            requests.len(),
+            1,
+            "the holder's unexpose alone: {requests:?}"
+        );
+        assert!(requests[0].ends_with(UNEXPOSE_SHARED));
+        assert_eq!(forwards.address_of(SHARED), None);
+        assert!(forwards.lock_waiting().is_empty());
+    }
+
+    /// A forward handed to a box whose own row is withdrawn before the
+    /// gate's expose is answered: that row's unbind leaves the listener
+    /// alone while the expose is in flight, since the two could reach the
+    /// switch in either order, and unbinds it once the expose has settled.
+    #[tokio::test]
+    async fn a_hand_over_in_flight_is_unbound_only_after_it_settles() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (_registry, forwards, _withdrawal) = withdrawn_with_one_forward();
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+        let (_, next) = forwards.hand_over_at(SHARED, LEASE);
+        let next = next
+            .expect("the ledger has room")
+            .expect("the waiting forward is claimed");
+
+        // The waiting box's row is withdrawn with the expose unanswered.
+        forwards.drop_waiting_at(WAITER);
+        let owed = super::unbind_pass(&sock, &forwards, &ReplyTables::new(), WAITER, 1).await;
+        assert!(owed.is_empty());
+        assert!(asked_so_far(&mut asked).is_empty(), "no unbind beside it");
+        assert_eq!(
+            forwards.published_at(WAITER).len(),
+            1,
+            "still in the ledger, so the withdrawal's next pass unbinds it"
+        );
+
+        forwards.settle_claim(&next);
+        let _owed = super::unbind_pass(&sock, &forwards, &ReplyTables::new(), WAITER, 2).await;
+        server.abort();
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with(UNEXPOSE_SHARED));
+        assert_eq!(forwards.address_of(SHARED), None);
+    }
+
+    /// The waiting forwards are bounded as the ledger is: one waits on each
+    /// held listener, and past the bound a new one is refused, with neither
+    /// a holder's attribution nor an earlier waiting forward evicted for
+    /// it. A later publish for a listener replaces the forward waiting on
+    /// it and takes no second slot.
+    #[test]
+    fn waiting_forwards_are_refused_past_the_ledger_bound() {
+        use sessions::core::switch_request::Applied;
+        const OTHER: [u8; 4] = [100, 64, 0, 11];
+        let forwards = PublishedForwards::new();
+        let listener = |n: usize| -> super::Listener {
+            let n = u16::try_from(n).expect("the bound fits sixteen bits");
+            ([127, 0, 0, 1], 10_000 + n)
+        };
+        let publish = |n: usize, addr: [u8; 4], inside: u16, by: Applied, id| {
+            forwards.admit_publish(
+                listener(n),
+                addr,
+                inside,
+                super::egress::IPPROTO_TCP,
+                by,
+                id,
+            )
+        };
+        // Every row-held slot holds a listener, and the interim holds one
+        // more, so there is one listener more to wait on than the bound.
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                publish(n, LEASE, 18080, Applied::Row, Some(box_id(1))),
+                Ok(super::Admitted::Noted)
+            );
+        }
+        let past = super::PUBLISHED_FORWARDS_TRACKED;
+        assert_eq!(
+            publish(past, LEASE, 18080, Applied::Interim, None),
+            Ok(super::Admitted::Noted)
+        );
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                publish(n, WAITER, 18081, Applied::Row, Some(box_id(2))),
+                Ok(super::Admitted::Waiting)
+            );
+        }
+        assert_eq!(
+            publish(past, WAITER, 18081, Applied::Row, Some(box_id(2))),
+            Err(super::LedgerFull),
+            "the waiting forward past the bound is refused"
+        );
+        assert_eq!(
+            publish(0, OTHER, 18099, Applied::Row, Some(box_id(3))),
+            Ok(super::Admitted::Waiting),
+            "a later publish replaces the forward waiting on its listener"
+        );
+        let waiting = forwards.lock_waiting();
+        assert_eq!(waiting.len(), super::PUBLISHED_FORWARDS_TRACKED);
+        let on_first: Vec<_> = waiting
+            .iter()
+            .filter(|forward| forward.listener == listener(0))
+            .map(|forward| (forward.addr, forward.inside))
+            .collect();
+        assert_eq!(on_first, vec![(OTHER, 18099)]);
+        drop(waiting);
+        assert_eq!(
+            forwards.address_of(listener(0)),
+            Some(LEASE),
+            "the holder's attribution is never evicted for a waiting forward"
+        );
+    }
+
+    /// A hand-over whose expose keeps failing is retried on the unbind's
+    /// own waits and then given up. The ledger never claims the forward:
+    /// nothing is attributed at the listener, the forward is still waiting,
+    /// and the old box's address is released all the same.
+    #[tokio::test]
+    async fn a_failed_hand_over_expose_leaves_no_attribution() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 2] = [
+            ("200 OK", ""),
+            (
+                "500 Internal Server Error",
+                "listen tcp 127.0.0.1:8080: bind failed\n",
+            ),
+        ];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+
+        assert!(kept.is_none(), "the old box's forward is unbound");
+        assert!(!registry.table().revocation_pending(LEASE));
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /services/forwarder/expose "))
+                .count(),
+            3,
+            "the first expose and one retry per backoff step: {requests:?}"
+        );
+        assert_eq!(requests.len(), 4, "and the one unexpose: {requests:?}");
+        assert_eq!(forwards.address_of(SHARED), None);
+        assert!(forwards.published_at(WAITER).is_empty());
+        assert!(!forwards.inside_published(WAITER, 18081));
+        assert_eq!(forwards.lock_waiting().len(), 1, "the forward still waits");
+    }
+
+    /// A hand-over's failed expose is retried, and the retry that binds is
+    /// attributed. A switch that answers the listener is already bound —
+    /// an earlier try's lost answer — counts as bound.
+    #[tokio::test]
+    async fn a_failed_hand_over_expose_is_retried_until_it_binds() {
+        static BINDS: [(&str, &str); 3] = [
+            ("200 OK", ""),
+            ("500 Internal Server Error", "transient"),
+            ("200 OK", ""),
+        ];
+        static ALREADY: [(&str, &str); 3] = [
+            ("200 OK", ""),
+            ("500 Internal Server Error", "transient"),
+            ("500 Internal Server Error", "proxy already running\n"),
+        ];
+        for answers in [&BINDS, &ALREADY] {
+            let dir = tempfile::TempDir::new().expect("a tempdir");
+            let sock = dir.path().join("switch.sock");
+            let (server, mut asked) = forwarder_answering(&sock, answers);
+            let (_registry, forwards, withdrawal) = withdrawn_with_one_forward();
+            assert_eq!(
+                publish_shared(&forwards, WAITER, 18081, box_id(2)),
+                Ok(super::Admitted::Waiting)
+            );
+
+            let kept = super::revoke_box_forwards(
+                sock,
+                Arc::clone(&forwards),
+                ReplyTables::new(),
+                withdrawal,
+                &TWO_QUICK_RETRIES,
+            )
+            .await;
+            server.abort();
+
+            assert!(kept.is_none());
+            assert_eq!(asked_so_far(&mut asked).len(), 3);
+            assert_eq!(forwards.address_of(SHARED), Some(WAITER));
+            assert!(forwards.lock_waiting().is_empty());
+        }
+    }
+
+    /// A switch that reads a request and closes without answering it.
+    const NO_ANSWER: (&str, &str) = ("", "");
+
+    /// A hand-over's expose that goes unanswered may have been bound by the
+    /// switch. The ledger keeps the listener attributed to the waiting box
+    /// through every retry and past the give-up, so no other box's publish
+    /// for it is relayed, and the waiting box's own withdrawal unbinds it:
+    /// a forward the switch did bind never outlives its box.
+    #[tokio::test]
+    async fn an_unanswered_hand_over_expose_keeps_its_attribution() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 5] = [
+            ("200 OK", ""),
+            NO_ANSWER,
+            NO_ANSWER,
+            NO_ANSWER,
+            ("200 OK", ""),
+        ];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        registry.register(
+            BoxRegistration::new("api", Ipv4Addr::from(WAITER), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+
+        let kept = super::revoke_box_forwards(
+            sock.clone(),
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        assert!(kept.is_none(), "the old box's forward is unbound");
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /services/forwarder/expose "))
+                .count(),
+            3,
+            "the first expose and one retry per backoff step: {requests:?}"
+        );
+        assert_eq!(
+            forwards.address_of(SHARED),
+            Some(WAITER),
+            "the switch may have bound it: the waiting box holds it in the ledger"
+        );
+        assert!(!forwards.claim_in_flight(SHARED));
+        assert_eq!(
+            forwards.admit_publish(
+                SHARED,
+                [100, 64, 0, 12],
+                18083,
+                super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row,
+                None,
+            ),
+            Ok(super::Admitted::HeldElsewhere),
+            "another box's publish for it is not relayed"
+        );
+
+        // The waiting box's own withdrawal unbinds what the switch may hold.
+        assert!(registry.withdraw(Ipv4Addr::from(WAITER)).is_some());
+        let withdrawal = withdrawn.try_recv().expect("the withdrawal is delivered");
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+        assert!(kept.is_none());
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(requests.len(), 1, "one unexpose: {requests:?}");
+        assert!(requests[0].ends_with(UNEXPOSE_SHARED));
+        assert_eq!(forwards.address_of(SHARED), None);
+        assert!(forwards.lock_waiting().is_empty());
+    }
+
+    /// An unanswered expose is retried with its attribution in place. A
+    /// retry the switch answers as bound, or as already bound by the try
+    /// whose answer was lost, settles it; a retry the switch refuses takes
+    /// the attribution back out and leaves the forward waiting.
+    #[tokio::test]
+    async fn an_unanswered_hand_over_expose_is_retried_until_it_is_answered() {
+        static BINDS: [(&str, &str); 3] = [("200 OK", ""), NO_ANSWER, ("200 OK", "")];
+        static ALREADY: [(&str, &str); 3] = [
+            ("200 OK", ""),
+            NO_ANSWER,
+            ("500 Internal Server Error", "proxy already running\n"),
+        ];
+        static REFUSED: [(&str, &str); 3] = [
+            ("200 OK", ""),
+            NO_ANSWER,
+            ("500 Internal Server Error", "bind failed\n"),
+        ];
+        for (answers, holder) in [
+            (&BINDS, Some(WAITER)),
+            (&ALREADY, Some(WAITER)),
+            (&REFUSED, None),
+        ] {
+            let dir = tempfile::TempDir::new().expect("a tempdir");
+            let sock = dir.path().join("switch.sock");
+            let (server, mut asked) = forwarder_answering(&sock, answers);
+            let (_registry, forwards, withdrawal) = withdrawn_with_one_forward();
+            assert_eq!(
+                publish_shared(&forwards, WAITER, 18081, box_id(2)),
+                Ok(super::Admitted::Waiting)
+            );
+
+            let kept = super::revoke_box_forwards(
+                sock,
+                Arc::clone(&forwards),
+                ReplyTables::new(),
+                withdrawal,
+                &TWO_QUICK_RETRIES,
+            )
+            .await;
+            server.abort();
+
+            assert!(kept.is_none());
+            let requests = asked_so_far(&mut asked);
+            assert!(
+                requests[2].ends_with(
+                    r#"{"local":"127.0.0.1:8080","remote":"100.64.0.10:18081","protocol":"tcp"}"#
+                ),
+                "the retry repeats the waiting box's expose, got: {}",
+                requests[2]
+            );
+            assert_eq!(forwards.address_of(SHARED), holder);
+            assert!(!forwards.claim_in_flight(SHARED));
+            assert_eq!(
+                forwards.lock_waiting().len(),
+                usize::from(holder.is_none()),
+                "a settled forward stops waiting, a refused one keeps waiting"
+            );
+        }
+    }
+
+    /// The waiting box's row is withdrawn while the gate's expose for it is
+    /// unanswered. The expose may have been bound, so the listener stays in
+    /// the ledger at that box's address, and its withdrawal's next pass
+    /// unbinds it rather than releasing the address with a forward still
+    /// dialling it.
+    #[tokio::test]
+    async fn an_unanswered_hand_over_is_unbound_by_its_withdrawn_row() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 2] = [NO_ANSWER, ("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (_registry, forwards, _withdrawal) = withdrawn_with_one_forward();
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+        let (_, next) = forwards.hand_over_at(SHARED, LEASE);
+        let next = next
+            .expect("the ledger has room")
+            .expect("the waiting forward is claimed");
+
+        // The waiting box's row is withdrawn, then the expose goes unanswered.
+        forwards.drop_waiting_at(WAITER);
+        assert!(!super::apply_waiting(&sock, &forwards, &ReplyTables::new(), next).await);
+        assert_eq!(forwards.address_of(SHARED), Some(WAITER));
+        assert_eq!(
+            forwards.claim_waiting(SHARED),
+            Ok(None),
+            "nothing waits any more, so nothing is exposed again"
+        );
+
+        let owed = super::unbind_pass(&sock, &forwards, &ReplyTables::new(), WAITER, 1).await;
+        server.abort();
+        assert!(owed.is_empty());
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(
+            requests.len(),
+            2,
+            "the expose, then the unexpose: {requests:?}"
+        );
+        assert!(requests[1].ends_with(UNEXPOSE_SHARED));
+        assert_eq!(forwards.address_of(SHARED), None);
+    }
+
+    /// A hand-over the ledger has no room to attribute is owed a retry: the
+    /// forward stays waiting on a listener nobody holds, and the retry after
+    /// a row-held slot frees binds it.
+    #[tokio::test]
+    async fn a_hand_over_at_the_ledger_bound_is_owed_a_retry() {
+        use sessions::core::switch_request::Applied;
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let forwards = PublishedForwards::new();
+        let tcp = super::egress::IPPROTO_TCP;
+        // The holder's publish is the interim's, so dropping it frees no
+        // row-held slot.
+        assert_eq!(
+            forwards.note_published(SHARED, LEASE, 18080, tcp, Applied::Interim),
+            Ok(true)
+        );
+        let other = |n: usize| -> super::Listener {
+            let n = u16::try_from(n).expect("the bound fits sixteen bits");
+            ([127, 0, 0, 1], 20000 + n)
+        };
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                forwards.note_published(other(n), [100, 64, 0, 20], 3000, tcp, Applied::Row),
+                Ok(true)
+            );
+        }
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+
+        let replies = ReplyTables::new();
+        let owed = super::unbind_pass(&sock, &forwards, &replies, LEASE, 1).await;
+        assert_eq!(owed, vec![SHARED], "the hand-over is owed");
+        assert_eq!(forwards.address_of(SHARED), None);
+        assert_eq!(forwards.lock_waiting().len(), 1, "the forward still waits");
+        let owed = super::hand_over_owed(&sock, &forwards, &replies, owed).await;
+        assert_eq!(owed, vec![SHARED], "still owed while the ledger is full");
+        assert_eq!(asked_so_far(&mut asked).len(), 1, "the unexpose alone");
+
+        assert!(forwards.note_retracted(other(0)).is_some());
+        let owed = super::hand_over_owed(&sock, &forwards, &replies, owed).await;
+        server.abort();
+        assert!(owed.is_empty());
+        assert_eq!(forwards.address_of(SHARED), Some(WAITER));
+        assert!(forwards.lock_waiting().is_empty());
+    }
+
+    /// At the gate: a declared publish that arrives while the holder's
+    /// unbind is in flight — the switch may already have freed the listener,
+    /// the ledger has not — is not relayed. The guest reads the answer the
+    /// switch gives a held listener, and the gate binds the forward itself
+    /// once the unbind is answered, attributed to the publishing box: that
+    /// box's own withdrawal unbinds it.
+    #[tokio::test]
+    async fn a_declared_publish_during_the_holders_unbind_waits_and_is_bound_by_the_gate() {
+        let registry = BoxRegistry::new(SUBNET);
+        let handle = registry.clone();
+        for (name, addr) in [("web", LEASE), ("api", WAITER)] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_admitted_ports([8080]),
+            );
+        }
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+
+        assert!(handle.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        let (mut unbind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to unbind the holder's forward")
+            .expect("accepting the gate's unbind");
+        let asked = read_forwarder_request(&mut unbind).await;
+        assert!(asked.ends_with(UNEXPOSE_SHARED), "got: {asked}");
+
+        // The waiting box publishes before the unbind is answered.
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&expose_request(
+                "127.0.0.1:8080",
+                "100.64.0.10:18081",
+                "tcp",
+            ))
+            .await
+            .expect("writing the waiting box's publish");
+        let expected = super::forward_revoke::held_answer();
+        let mut answer = vec![0u8; expected.len()];
+        tokio::time::timeout(DEADLINE, guest.read_exact(&mut answer))
+            .await
+            .expect("the gate answers the held publish")
+            .expect("reading the gate's answer");
+        assert_eq!(
+            String::from_utf8_lossy(&answer),
+            String::from_utf8_lossy(&expected)
+        );
+        assert!(
+            answer.starts_with(b"HTTP/1.1 500 ") && answer.ends_with(b"proxy already running\n"),
+            "the guest reads the switch's own answer for a held listener"
+        );
+        drop(guest);
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of a held publish reached the switch"),
+            Ok(Err(error)) => panic!("reading the switch end failed: {error}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        wait_for_log(&h.log, super::LISTENER_HELD_RULE).await;
+
+        // The unbind is answered: the gate binds the waiting forward itself.
+        unbind
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the unbind");
+        let (mut bind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to bind the waiting forward")
+            .expect("accepting the gate's bind");
+        let asked = read_forwarder_request(&mut bind).await;
+        assert!(asked.starts_with("POST /services/forwarder/expose "));
+        assert!(
+            asked.ends_with(
+                r#"{"local":"127.0.0.1:8080","remote":"100.64.0.10:18081","protocol":"tcp"}"#
+            ),
+            "the gate's expose is the waiting box's own publish, got: {asked}"
+        );
+        bind.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the bind");
+
+        // Attributed to the waiting box: its row's withdrawal unbinds it.
+        tokio::time::timeout(DEADLINE, async {
+            while h.table.revocation_pending(LEASE) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the holder's revocation ends");
+        wait_for_log(&h.log, "bound the waiting box's declared forwarder").await;
+        assert!(handle.withdraw(Ipv4Addr::from(WAITER)).is_some());
+        let (mut unbind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to unbind the handed-over forward")
+            .expect("accepting the gate's unbind");
+        let asked = read_forwarder_request(&mut unbind).await;
+        assert!(asked.starts_with("POST /services/forwarder/unexpose "));
+        assert!(asked.ends_with(UNEXPOSE_SHARED), "got: {asked}");
+        unbind
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the unbind");
+    }
+
+    /// A hand-over's retries are its own. The box's unbind of another
+    /// forward uses every wait and gives up, and the hand-over owed from the
+    /// forward that did unbind is still retried on the whole backoff again:
+    /// the expose that binds is one the shared budget never reached.
+    #[tokio::test]
+    async fn a_hand_over_is_retried_on_its_own_budget_after_the_unbinds_give_up() {
+        const OTHER: super::Listener = ([127, 0, 0, 1], 9090);
+        const REFUSED: (&str, &str) = ("500 Internal Server Error", "bind failed\n");
+        const BUSY: (&str, &str) = ("500 Internal Server Error", "busy\n");
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        // Three unbind passes: the shared listener unbinds at once and its
+        // hand-over is refused on each; the other forward never unbinds.
+        // Then the hand-over's own retries, the second of which binds.
+        static ANSWERS: [(&str, &str); 9] = [
+            ("200 OK", ""),
+            REFUSED,
+            BUSY,
+            REFUSED,
+            BUSY,
+            REFUSED,
+            BUSY,
+            REFUSED,
+            ("200 OK", ""),
+        ];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+        assert_eq!(
+            forwards.note_published(
+                OTHER,
+                LEASE,
+                19090,
+                super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            publish_shared(&forwards, WAITER, 18081, box_id(2)),
+            Ok(super::Admitted::Waiting)
+        );
+
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+
+        assert!(kept.is_some(), "the other forward's unbind gave up");
+        assert!(registry.table().revocation_pending(LEASE));
+        assert_eq!(forwards.address_of(OTHER), Some(LEASE));
+        let requests = asked_so_far(&mut asked);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /services/forwarder/expose "))
+                .count(),
+            5,
+            "one expose per unbind pass, then one per wait of its own: {requests:?}"
+        );
+        assert_eq!(
+            forwards.address_of(SHARED),
+            Some(WAITER),
+            "the hand-over binds on a retry past the unbinds' give-up"
+        );
+        assert!(forwards.lock_waiting().is_empty());
+    }
+
+    /// At the gate, with the publishes a guest really sends for a shared
+    /// address (NET-129): the box that yields a port never publishes it, so
+    /// only the holder's publish reaches the gate. Two rows declare one
+    /// port at one loopback address; the holder's withdrawal unbinds the
+    /// listener, and the gate binds nothing for the other row. A row's
+    /// declared ports alone are no waiting forward: the row names neither
+    /// the inside port nor the protocol an expose needs.
+    #[tokio::test]
+    async fn a_declared_port_its_box_never_published_is_not_bound_at_the_holders_withdrawal() {
+        let registry = BoxRegistry::new(SUBNET);
+        let handle = registry.clone();
+        for (name, addr) in [("web", LEASE), ("api", WAITER)] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_admitted_ports([8080]),
+            );
+        }
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+
+        assert!(handle.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        let (mut unbind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to unbind the holder's forward")
+            .expect("accepting the gate's unbind");
+        let asked = read_forwarder_request(&mut unbind).await;
+        assert!(asked.ends_with(UNEXPOSE_SHARED), "got: {asked}");
+        unbind
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the unbind");
+        tokio::time::timeout(DEADLINE, async {
+            while h.table.revocation_pending(LEASE) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the holder's revocation ends");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), h.switch_listener.accept())
+                .await
+                .is_err(),
+            "the gate binds nothing for a row whose box never published the port"
+        );
+        assert!(
+            !h.log
+                .contents()
+                .contains("bound the waiting box's declared forwarder"),
+            "no hand-over is made"
+        );
+    }
+
+    /// At the gate: a forward the gate bound for a waiting box is one that
+    /// box's daemon never asked for, so the box's next attach publishes it.
+    /// The gate answers that publish as bound and writes none of it to the
+    /// switch, which would refuse a second expose of a listener it holds
+    /// and fail the box's attach. A publish at the same listener that dials
+    /// another inside port is a different forward, and is relayed.
+    #[tokio::test]
+    async fn a_publish_of_a_forward_the_gate_bound_is_answered_as_bound_and_not_relayed() {
+        let registry = BoxRegistry::new(SUBNET);
+        let handle = registry.clone();
+        for (name, addr) in [("web", LEASE), ("api", WAITER)] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_admitted_ports([8080]),
+            );
+        }
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+        let waiting_publish = expose_request("127.0.0.1:8080", "100.64.0.10:18081", "tcp");
+
+        // The holder's row is withdrawn, the waiting box publishes while the
+        // unbind is in flight, and the gate binds its forward itself.
+        assert!(handle.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        let (mut unbind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to unbind the holder's forward")
+            .expect("accepting the gate's unbind");
+        let _asked = read_forwarder_request(&mut unbind).await;
+        let (mut guest, _switch) = connect_control(&h).await;
+        guest
+            .write_all(&waiting_publish)
+            .await
+            .expect("writing the waiting box's publish");
+        let held = super::forward_revoke::held_answer();
+        let mut answer = vec![0u8; held.len()];
+        tokio::time::timeout(DEADLINE, guest.read_exact(&mut answer))
+            .await
+            .expect("the gate answers the held publish")
+            .expect("reading the gate's answer");
+        assert_eq!(answer, held);
+        drop(guest);
+        unbind
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the unbind");
+        let (mut bind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to bind the waiting forward")
+            .expect("accepting the gate's bind");
+        let asked = read_forwarder_request(&mut bind).await;
+        assert!(asked.starts_with("POST /services/forwarder/expose "));
+        bind.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the bind");
+        wait_for_log(&h.log, "bound the waiting box's declared forwarder").await;
+
+        // The box's next attach publishes the forward its daemon never bound.
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&waiting_publish)
+            .await
+            .expect("writing the box's own publish");
+        let bound = super::forward_revoke::bound_answer();
+        let mut answer = vec![0u8; bound.len()];
+        tokio::time::timeout(DEADLINE, guest.read_exact(&mut answer))
+            .await
+            .expect("the gate answers the publish itself")
+            .expect("reading the gate's answer");
+        assert!(
+            answer.starts_with(b"HTTP/1.1 200 "),
+            "the guest reads its forward as bound, got: {}",
+            String::from_utf8_lossy(&answer)
+        );
+        drop(guest);
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of the publish reached the switch"),
+            Ok(Err(error)) => panic!("reading the switch end failed: {error}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        wait_for_log(&h.log, "answered the publish as bound without relaying it").await;
+
+        // Another forward at the same listener is not the one the gate
+        // bound: the switch decides it.
+        let other = expose_request("127.0.0.1:8080", "100.64.0.10:19999", "tcp");
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&other)
+            .await
+            .expect("writing the other publish");
+        let mut spoken = vec![0u8; other.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(spoken, other, "a different forward is relayed");
     }
 
     /// The SYN-only rule on the forwarder path: a record is opened only by

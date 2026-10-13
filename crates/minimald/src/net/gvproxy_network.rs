@@ -84,10 +84,16 @@ impl OwnIpAttach {
             _relay: relay,
             switch,
             control,
-            exposed,
+            mut exposed,
             runtime_ingress,
             lease,
         } = self;
+        // A declared port bound for this spawn after its attach, at a
+        // shared-address port's hand-over (NET-129), is released with the
+        // ones the attach bound.
+        if let Some(runtime_ingress) = &runtime_ingress {
+            exposed.extend(runtime_ingress.detach_handed());
+        }
         if !exposed.is_empty() {
             crate::net::policy::release_declared_ingress(&control, &exposed).await;
         }
@@ -2168,6 +2174,153 @@ mod tests {
             vec![format!("{SHARED}:9090")],
             "teardown unbinds only what the attach bound: {unbound:?}"
         );
+        fake.abort();
+    }
+
+    /// NET-129 across a respawn: a shared-address port the box took over
+    /// while it ran is bound for the spawn that was running then. That
+    /// spawn's teardown unbinds it beside the forwards its attach bound, and
+    /// the box's next attach, which now holds the port of record, binds it
+    /// itself and succeeds.
+    #[tokio::test]
+    async fn a_port_taken_over_while_running_comes_down_with_its_spawn_and_binds_at_the_next_attach()
+     {
+        const FIRST_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const SECOND_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
+        const SHARED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+        let control = ControlChannel::Unix(scenario.control_path.clone());
+        let holder = sessions::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
+            .expect("a valid id");
+        {
+            let mut reg = scenario.registry.write().expect("registry lock");
+            reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
+            reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
+            reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                SHARED,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([8080, 9090]),
+            );
+        }
+        // The session actor's cell, shared with every spawn's guard through
+        // the reporter, as the launcher wires it.
+        let runtime = crate::net::provider::RuntimeIngress::default();
+        let reporter = scenario
+            .reporter
+            .clone()
+            .with_runtime_ingress(runtime.clone());
+
+        // First spawn: the box yields 8080, so its attach binds 9090 alone.
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            control.clone(),
+            lease_at(FIRST_LEASE),
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the first spawn attaches");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{SHARED}:9090")],
+            "the yielded port is not asked for at the attach: {events:?}"
+        );
+
+        // The holder is destroyed and the box takes the port over while it
+        // runs: its forward is bound and tracked with the running spawn.
+        let (_, hand_overs) = scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .unpublish_own_address(holder);
+        assert_eq!(hand_overs.len(), 1, "the box is handed the port");
+        let handed = sessions::PortMapping {
+            external_port: 8080,
+            internal_port: 80,
+            proto: sessions::IpProto::Tcp,
+        };
+        let bind =
+            crate::net::policy::bind_handed_port(&control, SHARED, FIRST_LEASE, &handed, None)
+                .await
+                .expect("the hand-over's bind stands");
+        let crate::net::policy::HandedBind::Bound(forwarder) = bind else {
+            panic!("a native host's switch bound the forward");
+        };
+        let exposed = collect_until(&mut events_rx, "/services/forwarder/expose", 1).await;
+        assert!(
+            exposed
+                .iter()
+                .any(|(_, body)| body.contains(&format!("\"remote\":\"{FIRST_LEASE}:80\""))),
+            "the hand-over's forward delivers to the running spawn's lease: {exposed:?}"
+        );
+        assert!(runtime.record_handed(forwarder).is_ok());
+        assert!(runtime.holds_handed(SHARED, &handed));
+
+        // The spawn ends: its teardown unbinds the handed-over forward with
+        // the one its attach bound.
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        let mut locals = locals_of(&unbound, "/services/forwarder/unexpose");
+        locals.sort();
+        assert_eq!(
+            locals,
+            vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
+            "the spawn's teardown unbinds both forwards: {unbound:?}"
+        );
+        assert!(!runtime.holds_handed(SHARED, &handed));
+        assert!(runtime.is_detached());
+
+        // The next spawn holds the port of record: its attach binds both
+        // ports itself, toward its own lease.
+        let second_tap = attach_scenario(&dir, "unused.sock").tap_fd;
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            second_tap,
+            control.clone(),
+            lease_at(SECOND_LEASE),
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the box's next attach succeeds");
+        let reattached = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        let mut locals = locals_of(&reattached, "/services/forwarder/expose");
+        locals.sort();
+        assert_eq!(
+            locals,
+            vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
+            "the next attach binds the port the box holds now: {reattached:?}"
+        );
+        assert!(
+            reattached
+                .iter()
+                .any(|(_, body)| body.contains(&format!("\"remote\":\"{SECOND_LEASE}:80\""))),
+            "toward the new spawn's lease: {reattached:?}"
+        );
+        Box::new(guard).teardown().await;
         fake.abort();
     }
 

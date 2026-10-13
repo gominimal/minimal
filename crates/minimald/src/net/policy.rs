@@ -207,6 +207,15 @@ impl PortForwarder {
         self.mapping.host_port()
     }
 
+    /// Whether this is the forward `mapping` declares at `published`: the
+    /// same listener and the same protocol. TCP and UDP on one port are two
+    /// forwards.
+    #[must_use]
+    pub fn is_forward_of(&self, published: Ipv4Addr, mapping: &PortMapping) -> bool {
+        self.mapping.protocol == protocol_str(mapping.proto)
+            && self.mapping.local == format!("{published}:{}", mapping.external_port)
+    }
+
     /// The internal port the forward delivers to — the port a revocation
     /// refuses at the box's ingress gate.
     #[must_use]
@@ -389,6 +398,83 @@ pub async fn apply_ingress(
         }
     }
     Ok(bound)
+}
+
+/// The body the forwarder answers an expose with when a forward is already
+/// bound at the listener, as an HTTP 500. On a VM-backed host the egress
+/// gate gives the same answer to a publish whose listener another box's row
+/// still holds, and keeps the publish to bind when that row is withdrawn.
+const ALREADY_RUNNING_BODY: &str = "proxy already running";
+
+/// Whether `error` is the forwarder's answer to an expose of a listener
+/// that is already bound, as [`post_json`] reports a refused request.
+fn is_already_running(error: &io::Error) -> bool {
+    let said = error.to_string();
+    said.contains("returned HTTP 500") && said.contains(ALREADY_RUNNING_BODY)
+}
+
+/// What binding a shared-address port's forward at its hand-over came to
+/// ([`bind_handed_port`]). Both carry the forwarder to track for the box.
+pub enum HandedBind {
+    /// The switch bound the forward.
+    Bound(PortForwarder),
+    /// On a VM-backed host, the listener is still held by the row of the
+    /// box that gave the port up. The host keeps this publish and binds it
+    /// when that row is withdrawn.
+    HeldByHost(PortForwarder),
+}
+
+/// Binds one declared mapping's forward for a box that took its port over
+/// while running (NET-129): the expose the box's own attach posts for the
+/// mapping ([`apply_ingress`]), at `published` toward `ptask_ip`. Nothing
+/// else of the box's ingress is touched, so a failure rolls nothing back.
+///
+/// On a VM-backed host an answer that the listener is already bound is the
+/// host's egress gate holding the publish behind the old holder's row,
+/// which it binds itself when that row is withdrawn: [`HandedBind::HeldByHost`].
+/// On a native host the same answer is a forward still bound at the
+/// listener, and is the error it reads as.
+///
+/// # Errors
+///
+/// Returns the I/O error from the failing `expose` call.
+pub async fn bind_handed_port(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    mapping: &PortMapping,
+    gate: Option<&Arc<super::switch::SessionGate>>,
+) -> io::Result<HandedBind> {
+    let req = expose_request(mapping, published, ptask_ip);
+    let answer = post_json(control, "/services/forwarder/expose", &req).await;
+    let forwarder = PortForwarder {
+        mapping: ExposedMapping {
+            local: req.local,
+            protocol: req.protocol,
+        },
+        internal_port: mapping.internal_port,
+        gate: gate.cloned(),
+        revoked: Arc::new(AtomicBool::new(false)),
+    };
+    handed_bind(control.host_unbinds_declared_forwards(), answer, forwarder)
+}
+
+/// Reads the forwarder's answer to a hand-over's expose
+/// ([`bind_handed_port`]). `host_holds_listeners` is whether a host-side
+/// gate sits in front of the switch
+/// ([`ControlChannel::host_unbinds_declared_forwards`]).
+fn handed_bind(
+    host_holds_listeners: bool,
+    answer: io::Result<()>,
+    forwarder: PortForwarder,
+) -> io::Result<HandedBind> {
+    match answer {
+        Ok(()) => Ok(HandedBind::Bound(forwarder)),
+        Err(error) if host_holds_listeners && is_already_running(&error) => {
+            Ok(HandedBind::HeldByHost(forwarder))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Removes every forward in `bound` from the switch's `control_sock` (R2.3
@@ -1972,7 +2058,7 @@ mod tests {
         /// end-of-head marker, then exactly its `Content-Length` body — the
         /// mirror of `post_json`'s keep-alive framing, so the fake forwarder
         /// never blocks reading past what the probe sent.
-        async fn read_request(sock: &mut UnixStream) -> Vec<u8> {
+        pub(super) async fn read_request(sock: &mut UnixStream) -> Vec<u8> {
             let mut buf = Vec::with_capacity(256);
             let mut scratch = [0u8; 512];
             let head_end = loop {
@@ -2338,6 +2424,135 @@ mod tests {
         }
     }
 
+    // ---- a shared-address port's forward bound at its hand-over (NET-129) --
+    mod handed_port {
+        use std::net::Ipv4Addr;
+
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixListener;
+
+        use super::super::{
+            ControlChannel, HandedBind, PortMapping, bind_handed_port, handed_bind,
+            is_already_running,
+        };
+        use super::forwarder_probe::read_request;
+
+        const PUBLISHED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 9);
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 128, 10);
+
+        fn mapping() -> PortMapping {
+            PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: sessions::IpProto::Tcp,
+            }
+        }
+
+        /// A forwarder that answers one expose with `status` and `body`,
+        /// framed as the real one frames its answers, and hands back the
+        /// request body it read.
+        fn forwarder_answering_once(
+            path: std::path::PathBuf,
+            status: u16,
+            body: &'static str,
+        ) -> tokio::task::JoinHandle<String> {
+            let listener = UnixListener::bind(&path).unwrap();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.expect("the bind is asked");
+                let request = String::from_utf8_lossy(&read_request(&mut sock).await).into_owned();
+                sock.write_all(
+                    format!(
+                        "HTTP/1.1 {status} Whatever\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("the fake forwarder must answer");
+                request
+            })
+        }
+
+        /// The switch binds the forward: the bind posts the expose the
+        /// box's own attach posts for the mapping, and hands back the
+        /// forwarder to track, naming the listener and the inside port.
+        #[tokio::test]
+        async fn a_bound_hand_over_hands_back_the_forwarder_to_track() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_once(sock.clone(), 200, "");
+
+            let bind = bind_handed_port(
+                &ControlChannel::Unix(sock),
+                PUBLISHED,
+                LEASE,
+                &mapping(),
+                None,
+            )
+            .await
+            .expect("the switch bound the forward");
+
+            let request = forwarder.await.expect("the fake forwarder ran");
+            assert!(
+                request.contains("\"local\":\"127.0.64.9:18080\""),
+                "{request}"
+            );
+            assert!(
+                request.contains("\"remote\":\"100.64.128.10:80\""),
+                "{request}"
+            );
+            let HandedBind::Bound(tracked) = bind else {
+                panic!("a 2xx answer is a bound forward");
+            };
+            assert_eq!(tracked.local(), "127.0.64.9:18080");
+            assert_eq!(tracked.internal_port(), 80);
+            // TCP and UDP on one port are two forwards: the tracked TCP
+            // one is not the UDP mapping's.
+            assert!(tracked.is_forward_of(PUBLISHED, &mapping()));
+            let udp = PortMapping {
+                proto: sessions::IpProto::Udp,
+                ..mapping()
+            };
+            assert!(!tracked.is_forward_of(PUBLISHED, &udp));
+        }
+
+        /// The forwarder's own answer for a listener that is already bound.
+        /// On a native host it is a failed bind: a forward still stands at
+        /// the listener. Behind a VM host's gate the same answer is the
+        /// gate keeping the publish for the old holder's row to end, so the
+        /// forwarder is handed back to track. Any other refusal fails on
+        /// both.
+        #[tokio::test]
+        async fn an_already_running_answer_is_held_only_behind_a_vm_hosts_gate() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_once(sock.clone(), 500, "proxy already running\n");
+            let control = ControlChannel::Unix(sock);
+            assert!(!control.host_unbinds_declared_forwards());
+
+            let Err(native) = bind_handed_port(&control, PUBLISHED, LEASE, &mapping(), None).await
+            else {
+                panic!("on a native host an already-bound listener is a failed bind");
+            };
+            let _request = forwarder.await.expect("the fake forwarder ran");
+            assert!(is_already_running(&native), "got: {native}");
+
+            let tracked = || super::declared_release::declared_at("127.0.64.9:18080");
+            assert!(matches!(
+                handed_bind(true, Err(native), tracked()),
+                Ok(HandedBind::HeldByHost(_))
+            ));
+            let refused = || {
+                std::io::Error::other(
+                    "gvproxy /services/forwarder/expose returned HTTP 500: listen tcp: bind failed",
+                )
+            };
+            assert!(!is_already_running(&refused()));
+            assert!(handed_bind(true, Err(refused()), tracked()).is_err());
+            assert!(handed_bind(false, Err(refused()), tracked()).is_err());
+        }
+    }
+
     // ---- who unbinds a declared forward when its box stops (NET-121) ------
     mod declared_release {
         use std::sync::Arc;
@@ -2351,7 +2566,7 @@ mod tests {
 
         /// A declared forwarder bound at `local`, as `apply_ingress` builds
         /// one, with no session gate behind it.
-        fn declared_at(local: &str) -> PortForwarder {
+        pub(super) fn declared_at(local: &str) -> PortForwarder {
             PortForwarder {
                 mapping: ExposedMapping {
                     local: local.to_string(),

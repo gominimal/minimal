@@ -63,6 +63,11 @@ struct RuntimeIngressState {
     /// switch may already have handed to another box.
     detached: bool,
     forwards: Vec<LiveIngressForward>,
+    /// The declared ports' forwards bound for this spawn after its attach
+    /// (NET-129): a shared-address port the box took over while it ran.
+    /// They deliver to the spawn's lease as its attach's own forwards do,
+    /// and come down with it the same way.
+    handed: Vec<crate::net::policy::PortForwarder>,
 }
 
 /// The ports a box published at runtime with its own `min net expose`
@@ -115,6 +120,50 @@ impl RuntimeIngress {
         }
         state.forwards.push(live);
         Ok(())
+    }
+
+    /// Records a declared port's forward bound after the attach, at a
+    /// shared-address port's hand-over (NET-129). Refused, handing the
+    /// forward back for the caller to release, when the spawn it delivers
+    /// to has ended.
+    pub(crate) fn record_handed(
+        &self,
+        forwarder: crate::net::policy::PortForwarder,
+    ) -> Result<(), crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        if state.detached {
+            return Err(forwarder);
+        }
+        state.handed.push(forwarder);
+        Ok(())
+    }
+
+    /// Whether the forward `mapping` declares at `published` is held as one
+    /// bound at a hand-over.
+    pub(crate) fn holds_handed(
+        &self,
+        published: std::net::Ipv4Addr,
+        mapping: &sessions::PortMapping,
+    ) -> bool {
+        self.state()
+            .handed
+            .iter()
+            .any(|forwarder| forwarder.is_forward_of(published, mapping))
+    }
+
+    /// The box stopped: takes the forwards bound at a hand-over, for the
+    /// session actor to release as declared forwards are.
+    pub(crate) fn take_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
+        std::mem::take(&mut self.state().handed)
+    }
+
+    /// The spawn ended: takes the forwards bound at a hand-over, for the
+    /// guard to release beside the ones its attach bound, and refuses new
+    /// ones until the next attach.
+    pub(crate) fn detach_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        state.detached = true;
+        std::mem::take(&mut state.handed)
     }
 
     /// A spawn attached: its lease is the box's switch address from here on.
