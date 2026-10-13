@@ -1262,7 +1262,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
 
 /// Drives `min session activate` through the compiled binary against this
 /// process's harness daemon while its user-namespace verdict is `verdict`
-/// (NET-141), and returns the refusal: the `error:` block on stderr, exactly
+/// (NET-143), and returns the refusal: the `error:` block on stderr, exactly
 /// — the activation's own progress lines (`Applying loadouts: ...`) precede
 /// it. Asserts the contract every cause shares on the way: exit 1, nothing
 /// on stdout, and no session left behind. The binary is used because the
@@ -1336,7 +1336,7 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
 }
 
 /// A host whose user-namespace verdict refuses the sandbox fails the
-/// activation before any session exists (NET-141): the daemon refuses the
+/// activation before any session exists (NET-143): the daemon refuses the
 /// create on its verdict, `min session activate` prints that refusal as its
 /// error, exits 1, and leaves no session behind. The cause-specific texts
 /// are the two tests below; this one holds the shape they share.
@@ -1405,7 +1405,7 @@ async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
 }
 
 /// Drives `min task run` through the compiled binary against this process's
-/// harness daemon while its user-namespace verdict is `verdict` (NET-141),
+/// harness daemon while its user-namespace verdict is `verdict` (NET-143),
 /// and returns the refusal: the `error:` block on stderr, exactly. A task
 /// run creates its ephemeral session through the same create the daemon
 /// refuses, so the refusal must reach the user as the daemon's verdict —
@@ -1480,7 +1480,7 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
 }
 
 /// A refused host reaches `min task run` through the same create as an
-/// activate, so the refusal is the machine verdict there too (NET-141):
+/// activate, so the refusal is the machine verdict there too (NET-143):
 /// printed verbatim, never wrapped as `CreateSession failed: ...` — a
 /// wrapper that called the daemon's verdict an RPC failure would mislabel
 /// it and bury the remedy's shape under a generic prefix.

@@ -331,7 +331,7 @@ async fn serve_create_session(
                 return Ok(Errorable::Err { error: message });
             }
 
-            // The user-namespace gate (NET-141): a host that refuses the
+            // The user-namespace gate (NET-143): a host that refuses the
             // unprivileged user namespace every session sandbox starts by
             // unsharing would otherwise mint a session whose first attach
             // dies writing /proc/self/uid_map, with the cause in this log
@@ -532,7 +532,7 @@ async fn serve_create_session(
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
-/// The refusal a host's user-namespace restriction yields (NET-141): the
+/// The refusal a host's user-namespace restriction yields (NET-143): the
 /// wire crate's lead — what the client recognises the refusal by — around
 /// the cause in the words the person reads, then that cause's own remedy
 /// for the daemon on its own line: the install step and the restart it
@@ -5591,7 +5591,7 @@ mod tests {
         );
     }
 
-    /// The user-namespace gate (NET-141): a host whose verdict refuses the
+    /// The user-namespace gate (NET-143): a host whose verdict refuses the
     /// sandbox refuses the create itself, and the reply carries the verdict
     /// — the cause in words and that cause's own remedy — with nothing
     /// allocated for a caller to tear down. The gate is this server's own
