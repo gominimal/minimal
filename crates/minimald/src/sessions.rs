@@ -119,7 +119,7 @@ fn build_record(
         box_id: config.box_id,
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
-        bound_ports: Default::default(),
+        bound_ports: std::collections::BTreeSet::new(),
         attrs: config.attrs,
     };
     record

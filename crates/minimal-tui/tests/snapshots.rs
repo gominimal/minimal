@@ -83,7 +83,7 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
         host_ip_enforcement: None,
         box_id: None,
         host_row_bound: false,
-        bound_ports: Default::default(),
+        bound_ports: std::collections::BTreeSet::new(),
         attrs: Default::default(),
     }
 }
