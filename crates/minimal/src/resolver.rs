@@ -527,6 +527,12 @@ pub(crate) enum RangeStepState {
     Installed,
     /// macOS: a custody check failed — [`RangeStep::failed_check`] names it.
     CustodyFailed,
+    /// macOS: the unit is installed and every custody check holds, but lo0
+    /// carries an address of the range with a mask other than `/32` —
+    /// [`RangeStep::failed_check`] names the address and its mask. The
+    /// installed program is one that applies the wrong mask, so the step
+    /// runs again to replace it.
+    WrongMask,
 }
 
 /// The range step on this host, as the detection reads it beside the hook:
@@ -543,8 +549,9 @@ pub(crate) enum RangeStepState {
 pub(crate) struct RangeStep {
     /// The one-line view.
     pub state: RangeStepState,
-    /// The custody check that failed, spelled out for the advisory and the
-    /// bundle, when one did.
+    /// The check that failed, spelled out for the advisory and the bundle,
+    /// when one did: a custody check, or the mask lo0 carries the range
+    /// with.
     pub failed_check: Option<String>,
     /// The program file's owner and mode, when it exists.
     pub program: Option<FileCustody>,
@@ -579,7 +586,9 @@ impl RangeStep {
     /// re-surfacing for the range once the probe reads present *and*
     /// custody holds). A host that needs no step holds vacuously; an
     /// absent unit does not — a range with no unit behind it is a range
-    /// the next boot removes.
+    /// the next boot removes. Neither does a unit over a range carried with
+    /// the wrong mask: its program is the one that applied that mask, and
+    /// the next boot runs it again.
     pub(crate) fn custody_holds(&self) -> bool {
         matches!(
             self.state,
@@ -692,7 +701,9 @@ pub(crate) fn range_program_path(plist_program: Option<&str>) -> &'static str {
 
 /// The range step the custody facts decide (NET-123's privileged step's
 /// custody, checked where the hook is detected): absent when neither of
-/// the unit's files is installed; installed when every check holds — every
+/// the unit's files is installed; wrong mask when every check holds but
+/// lo0 carries an address of the range with a mask other than `/32`;
+/// installed when every check holds — every
 /// directory component of both paths root-owned with no group or other
 /// write, both files root-owned with no group or other write, the plist's
 /// `ProgramArguments` naming the root-owned program path, and the loaded
@@ -780,9 +791,15 @@ pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
              not the root-owned {program_path}"
         )),
     }
-    match checks.first() {
-        None => step.state = RangeStepState::Installed,
-        Some(check) => step.failed_check = Some(check.clone()),
+    match (checks.first(), &facts.wide_alias) {
+        (Some(check), _) => step.failed_check = Some(check.clone()),
+        // Custody holds, so the unit is the one that runs at boot; the mask
+        // it left on the range is the one thing still to check.
+        (None, Some(alias)) => {
+            step.state = RangeStepState::WrongMask;
+            step.failed_check = Some(format!("lo0 carries {alias}, not {RANGE_ALIAS_MASK}"));
+        }
+        (None, None) => step.state = RangeStepState::Installed,
     }
     step
 }
@@ -3799,6 +3816,16 @@ pub(crate) fn names_verdict_at(
                 facts.push(format!(
                     "the boot-time setup that adds the loopback IPs boxes \
                      use ({}) fails a safety check: {check}",
+                    range_text()
+                ));
+            }
+            // Said beside whatever else is missing: the range is on the
+            // loopback, so no other fact names it, and this step is what
+            // replaces the program that applied the mask.
+            RangeStepState::WrongMask => {
+                facts.push(format!(
+                    "the loopback IPs boxes use ({}) have the wrong network \
+                     mask, which can slow name lookups on this machine",
                     range_text()
                 ));
             }
@@ -7440,6 +7467,7 @@ exit 0
         let mut facts = root_owned_facts();
         facts.wide_alias = Some("127.0.64.1 with netmask 0xff000000".to_string());
         let wide = range_step_over(&facts);
+        assert_eq!(wide.state, RangeStepState::WrongMask);
         assert!(
             !wide.custody_holds(),
             "a range carried with the wrong mask is not an installed step: {wide:?}"
