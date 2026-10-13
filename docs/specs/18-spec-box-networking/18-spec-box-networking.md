@@ -212,7 +212,7 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald run_box_ends_when_its_run_ends
   <!-- S1b-2c; event-driven within the WHILE; `min task run` creates a session for the run, execs the task into it, and today destroys it from the client; the destroy moves to the daemon side of the exec's exit so a lost client strands no session; the abandoned-launch reap covers only un-finalized sessions and does not reach this case -->
 
-- **NET-141** WHEN an activation targets a host whose user-namespace verdict refuses the sandbox THE SYSTEM SHALL fail the activation before the session is created, name the cause, exit non-zero, and leave no session behind.
+- **NET-143** WHEN an activation targets a host whose user-namespace verdict refuses the sandbox THE SYSTEM SHALL fail the activation before the session is created, name the cause, exit non-zero, and leave no session behind.
   tier:     T0
   verify:   cargo nextest run -p minimal activate_refuses_unconfinable_sandbox_before_session_creation
   verify:   cargo nextest run -p minimald create_reply_carries_user_namespace_verdict
