@@ -7,19 +7,19 @@
 
 use std::collections::HashMap;
 
-use camino::Utf8Path;
-use sessions::SessionId;
-use sessions::client::handler::handle_response;
-use sessions::core::compose::{ComposeError, ComposeOptions, SessionVar};
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
-use sessions::wire::policy::{WirePatchVerdict, WireVarVerdict};
-use sessions::wire::primitives::{
+use boxes::SessionId;
+use boxes::client::handler::handle_response;
+use boxes::core::compose::{ComposeError, ComposeOptions, SessionVar};
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
+use boxes::wire::policy::{WirePatchVerdict, WireVarVerdict};
+use boxes::wire::primitives::{
     PendingId, WirePendingPatch, WirePendingVar, WireResolvedVar, WireSessionVar, WireSource,
     WireVarSpec,
 };
-use sessions::wire::request::ContributionResponse;
+use boxes::wire::request::ContributionResponse;
+use camino::Utf8Path;
 
 // =====================================================================
 // Support
@@ -138,9 +138,9 @@ impl PolicyHooks for PanicHooks {
     // could not distinguish from a policy that decided on its own.
     fn on_hook_unapproved(
         &self,
-        _: sessions::core::policy::HooksPolicy,
+        _: boxes::core::policy::HooksPolicy,
         _: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<sessions::core::policy::HooksPolicy> {
+    ) -> HookResult<boxes::core::policy::HooksPolicy> {
         panic!("lifecycle-hook prompt should not have been invoked")
     }
 }
@@ -691,9 +691,7 @@ fn multi_file_patch_yields_per_file_verdicts() {
 
 /// Build a one-hook response from `source`.
 fn hook_response(source: WireSource) -> ContributionResponse {
-    use sessions::wire::primitives::{
-        PendingId, WireHookScript, WireLifecycleHook, WirePendingHook,
-    };
+    use boxes::wire::primitives::{PendingId, WireHookScript, WireLifecycleHook, WirePendingHook};
     ContributionResponse {
         session_id: session_id(),
         vars: vec![],
@@ -718,7 +716,7 @@ fn hook_response(source: WireSource) -> ContributionResponse {
 /// one appearing here is a bug or a bypass attempt and must not run.
 #[test]
 fn package_declared_hook_is_denied_without_prompting() {
-    use sessions::wire::policy::WireHookVerdict;
+    use boxes::wire::policy::WireHookVerdict;
 
     let (verdict, _) = handle_response(
         hook_response(package_source("helix")),
@@ -762,8 +760,8 @@ fn project_declared_hook_with_no_rule_reaches_the_prompt() {
 /// without prompting.
 #[test]
 fn project_hook_allowed_by_policy_skips_the_prompt() {
-    use sessions::core::policy::HooksPolicy;
-    use sessions::wire::policy::WireHookVerdict;
+    use boxes::core::policy::HooksPolicy;
+    use boxes::wire::policy::WireHookVerdict;
 
     let policy = UserPolicy::empty().with_hooks(HooksPolicy::empty().with_allow(["/repo"]));
     let (verdict, _) = handle_response(
@@ -790,8 +788,8 @@ fn project_hook_allowed_by_policy_skips_the_prompt() {
 /// the other two domains use.
 #[test]
 fn project_hook_denied_by_policy_beats_allow() {
-    use sessions::core::policy::HooksPolicy;
-    use sessions::wire::policy::WireHookVerdict;
+    use boxes::core::policy::HooksPolicy;
+    use boxes::wire::policy::WireHookVerdict;
 
     let policy = UserPolicy::empty().with_hooks(
         HooksPolicy::empty()
@@ -821,8 +819,8 @@ fn project_hook_denied_by_policy_beats_allow() {
 /// and no denial that would abort the activation.
 #[test]
 fn project_hook_ignored_by_policy_is_dropped_quietly() {
-    use sessions::core::policy::HooksPolicy;
-    use sessions::wire::policy::WireHookVerdict;
+    use boxes::core::policy::HooksPolicy;
+    use boxes::wire::policy::WireHookVerdict;
 
     let policy = UserPolicy::empty().with_hooks(HooksPolicy::empty().with_ignore(["/repo"]));
     let (verdict, _) = handle_response(
@@ -1121,7 +1119,7 @@ fn hook_wrong_decision_count_errors_as_hook_contract() {
 /// surfaces as [`ComposeError::InvalidPendingPatchDest`].
 #[test]
 fn invalid_pending_patch_dest_errors() {
-    use sessions::core::primitives::PatchError;
+    use boxes::core::primitives::PatchError;
 
     let response = ContributionResponse {
         session_id: session_id(),

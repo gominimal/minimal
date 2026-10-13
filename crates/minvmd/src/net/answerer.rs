@@ -7,7 +7,7 @@
 //! a microVM; the host answerer owns the zone on this host).
 //!
 //! The answer *semantics* are not this module's to invent: they are the
-//! shared decision ([`sessions::core::zone_answer`]) — the same one the
+//! shared decision ([`boxes::core::zone_answer`]) — the same one the
 //! native daemon's answerer calls — and what this module owns beside it is
 //! the DNS wire (decoding a query, encoding the reply the decision's
 //! verdict names, the SOA its negatives cite), the host loopback listener,
@@ -97,7 +97,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use minimald_rpc::ZoneAnswererStatus;
 use serde::{Deserialize, Serialize};
 
-use sessions::core::zone_answer::{self, ZoneRow, ZoneView};
+use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
 
 use crate::box_registry::{BoxRegistry, is_host_answerable};
 

@@ -101,11 +101,11 @@ pub const HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL
 /// operator set the opt-out on the host, and the guest daemon runs the egress
 /// default its host was started with. Truthy like the host's reader
 /// (`1`/`true`/`yes`/`on`, case-insensitive) through the one parse both
-/// sides share ([`sessions::egress_deny_all_opt_out_from_raw`]); an absent
+/// sides share ([`boxes::egress_deny_all_opt_out_from_raw`]); an absent
 /// token — an older minvmd, a native run — or any other value is `false`,
 /// the egress default.
 pub fn handed_egress_deny_all_opt_out() -> bool {
-    sessions::egress_deny_all_opt_out_from_raw(
+    boxes::egress_deny_all_opt_out_from_raw(
         std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN)
             .ok()
             .as_deref(),

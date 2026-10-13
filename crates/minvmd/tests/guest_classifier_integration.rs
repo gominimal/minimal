@@ -86,10 +86,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use serial_test::serial;
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -509,8 +509,8 @@ impl BoxSession {
     /// pending), finalizes the record, and keeps the handle for execs.
     async fn open(
         sock_path: &Path,
-        network: sessions::NetworkMode,
-        egress: Option<sessions::EgressPolicy>,
+        network: boxes::NetworkMode,
+        egress: Option<boxes::EgressPolicy>,
         label: &str,
         packages: &[&str],
     ) -> Result<BoxSession, String> {
@@ -571,7 +571,7 @@ impl BoxSession {
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
-            let policy = sessions::SessionPolicy {
+            let policy = boxes::SessionPolicy {
                 egress,
                 ..Default::default()
             };
@@ -820,8 +820,8 @@ fn strip_ansi(text: &str) -> String {
 
 async fn open_box(
     guest: &Guest,
-    network: sessions::NetworkMode,
-    egress: Option<sessions::EgressPolicy>,
+    network: boxes::NetworkMode,
+    egress: Option<boxes::EgressPolicy>,
     label: &str,
     packages: &[&str],
 ) -> Result<BoxSession, String> {
@@ -893,10 +893,10 @@ where
 /// ships the verdict with `SubmitVerdict`, which composes the loadout.
 async fn submit_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
-    response: sessions::wire::request::ContributionResponse,
+    response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
+    use boxes::wire::request::SessionStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
-    use sessions::wire::request::SessionStep;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     eprintln!(
@@ -905,12 +905,12 @@ async fn submit_verdict(
         response.patches.len(),
         response.lifecycle_hooks.len(),
     );
-    let (verdict, _policy) = sessions::client::handler::handle_response(
+    let (verdict, _policy) = boxes::client::handler::handle_response(
         response,
         &[],
-        sessions::core::policy::UserPolicy::empty(),
+        boxes::core::policy::UserPolicy::empty(),
         &NoPromptVars,
-        sessions::core::compose::ComposeOptions::default(),
+        boxes::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
     .map_err(|e| format!("gating pending items: {e}"))?;
@@ -1051,8 +1051,8 @@ async fn guest_classifier_table_present() {
     // and refuses the box, so the open failing is the recheck's negative.
     open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1081,8 +1081,8 @@ async fn guest_deny_all_probe_refused() {
     let guest = Guest::boot(&gvproxy);
     let mut box_session = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1145,8 +1145,8 @@ async fn guest_deny_all_resolver_reachable() {
     let guest = Guest::boot(&gvproxy);
     let mut box_session = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denydns",
         &["python"],
     )
@@ -1297,8 +1297,8 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
     let guest = Guest::boot(&gvproxy);
     let mut serving = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denysrv",
         &["python"],
     )
@@ -1310,7 +1310,7 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
     // the pinned in-guest port.
     let mut client = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         None,
         "client",
         &["python"],
@@ -1440,8 +1440,8 @@ async fn guest_host_ip_enforcement_per_box_after_load() {
     let guest = Guest::boot(&gvproxy);
     let mut box_session = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1515,8 +1515,8 @@ async fn guest_effect_probe_errno_per_family() {
     // probe at boot has already run one.
     open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )

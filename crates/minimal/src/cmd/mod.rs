@@ -182,7 +182,7 @@ pub(crate) async fn connect_daemon_unchecked(
 /// [`get_session_record`]. Used to build the typed request enums both `GetSessionRecord` and
 /// `GetSessionPolicy` expect.
 pub(crate) enum SessionLookup {
-    Id(sessions::SessionId),
+    Id(boxes::SessionId),
     Name(String),
 }
 
@@ -190,7 +190,7 @@ impl SessionLookup {
     /// Parse a user-supplied session string. If it parses as a UUID,
     /// the lookup is by ID; otherwise by name.
     pub(crate) fn parse(s: &str) -> Self {
-        match sessions::SessionId::parse_str(s) {
+        match boxes::SessionId::parse_str(s) {
             Ok(id) => Self::Id(id),
             Err(_) => Self::Name(s.to_string()),
         }
@@ -234,7 +234,7 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
     session: &str,
-) -> Result<sessions::Record, anyhow::Error> {
+) -> Result<boxes::Record, anyhow::Error> {
     let resp = get_session_record(client, session).await?;
     named_record(resp.record, session)
 }
@@ -252,7 +252,7 @@ pub(crate) async fn resolve_session(
 pub(crate) async fn resolve_session_version_gated(
     client: &mut client::Client,
     session: &str,
-) -> Result<sessions::Record, anyhow::Error> {
+) -> Result<boxes::Record, anyhow::Error> {
     let resp = get_session_record(client, session).await?;
     ensure_version_reported(resp.daemon_version.as_deref())?;
     named_record(resp.record, session)
@@ -309,7 +309,7 @@ pub(crate) fn is_id_prefix(s: &str) -> bool {
 pub(crate) fn match_id_prefix(
     entries: &[minimald_rpc::ListSessionsEntry],
     session: &str,
-) -> Result<Option<sessions::SessionId>, anyhow::Error> {
+) -> Result<Option<boxes::SessionId>, anyhow::Error> {
     if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
         return Ok(Some(entry.id));
     }
@@ -386,9 +386,9 @@ impl std::error::Error for AmbiguousIdPrefix {}
 
 /// Unwrap a looked-up record, naming what was asked for when nothing matched.
 pub(crate) fn named_record(
-    record: Option<sessions::Record>,
+    record: Option<boxes::Record>,
     session: &str,
-) -> Result<sessions::Record, anyhow::Error> {
+) -> Result<boxes::Record, anyhow::Error> {
     record.ok_or_else(|| anyhow::anyhow!("No session found matching '{session}'"))
 }
 
@@ -455,7 +455,7 @@ pub(crate) fn can_prompt_interactively() -> bool {
 /// policy after any hook mutations). Does NOT talk to the daemon —
 /// the caller decides whether to actually submit or abort.
 ///
-/// `policy` is the user's own [`UserPolicy`](sessions::core::policy::UserPolicy)
+/// `policy` is the user's own [`UserPolicy`](boxes::core::policy::UserPolicy)
 /// loaded from `user_policy.toml`; daemon-side pending items
 /// (packages, projects) are gated against it here on the client.
 /// `hooks` decides what happens when the policy can't auto-decide an
@@ -468,18 +468,18 @@ pub(crate) fn can_prompt_interactively() -> bool {
 /// submitted"; otherwise a `--no-prompt` run would submit a bogus
 /// approval on the wire.
 pub(crate) fn compute_verdict(
-    response: sessions::wire::request::ContributionResponse,
-    policy: sessions::core::policy::UserPolicy,
-    options: sessions::core::compose::ComposeOptions,
-    hooks: &dyn sessions::core::hooks::PolicyHooks,
+    response: boxes::wire::request::ContributionResponse,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
+    hooks: &dyn boxes::core::hooks::PolicyHooks,
 ) -> Result<
     (
-        sessions::wire::request::ContributionVerdict,
-        sessions::core::policy::UserPolicy,
+        boxes::wire::request::ContributionVerdict,
+        boxes::core::policy::UserPolicy,
     ),
-    sessions::core::compose::ComposeError,
+    boxes::core::compose::ComposeError,
 > {
-    sessions::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
+    boxes::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
         std::env::var(name)
     })
 }
@@ -489,11 +489,11 @@ pub(crate) fn compute_verdict(
 /// parked in `Draft{pending}` and leaks the session slot otherwise.
 pub(crate) async fn submit_verdict_and_wait(
     client: &mut client::Client,
-    session_id: sessions::SessionId,
-    verdict: sessions::wire::request::ContributionVerdict,
-) -> Result<sessions::SessionId, anyhow::Error> {
+    session_id: boxes::SessionId,
+    verdict: boxes::wire::request::ContributionVerdict,
+) -> Result<boxes::SessionId, anyhow::Error> {
+    use boxes::wire::request::SessionStep;
     use minimald_rpc::SubmitVerdict;
-    use sessions::wire::request::SessionStep;
 
     let resp = match client.oneshot_rpc::<SubmitVerdict>(verdict).await {
         Ok(r) => r,
@@ -527,15 +527,15 @@ pub(crate) async fn submit_verdict_and_wait(
 /// daemon-side session before propagating.
 pub(crate) async fn drive_pending_to_active(
     client: &mut client::Client,
-    response: sessions::wire::request::ContributionResponse,
-    policy: sessions::core::policy::UserPolicy,
-    options: sessions::core::compose::ComposeOptions,
-    hooks: &dyn sessions::core::hooks::PolicyHooks,
+    response: boxes::wire::request::ContributionResponse,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
+    hooks: &dyn boxes::core::hooks::PolicyHooks,
     project_dir: &camino::Utf8Path,
 ) -> Result<
     (
-        sessions::SessionId,
-        sessions::core::policy::UserPolicy,
+        boxes::SessionId,
+        boxes::core::policy::UserPolicy,
         Vec<(std::path::PathBuf, paths::SandboxRelPath)>,
     ),
     anyhow::Error,
@@ -547,7 +547,7 @@ pub(crate) async fn drive_pending_to_active(
             send_abort(client, session_id).await;
             // Declining at the prompt is not a broken project: only a
             // genuine compose failure gets the directory-led message.
-            use sessions::core::compose::ComposeError;
+            use boxes::core::compose::ComposeError;
             match e {
                 ComposeError::Aborted | ComposeError::Denied { .. } => bail!("{e}"),
                 _ => bail!(composition_failure_message(project_dir, &e.to_string())),
@@ -568,10 +568,10 @@ pub(crate) async fn drive_pending_to_active(
 /// now needs to upload. `Ignored`/`Denied` verdicts contribute
 /// nothing to the composition, so they're not uploaded.
 pub(crate) fn approved_patches_from_verdict(
-    verdict: &sessions::wire::request::ContributionVerdict,
+    verdict: &boxes::wire::request::ContributionVerdict,
 ) -> impl Iterator<Item = (std::path::PathBuf, paths::SandboxRelPath)> + '_ {
     verdict.patches.iter().filter_map(|v| match v {
-        sessions::wire::policy::WirePatchVerdict::Approved {
+        boxes::wire::policy::WirePatchVerdict::Approved {
             host_path,
             destination,
             ..
@@ -579,14 +579,14 @@ pub(crate) fn approved_patches_from_verdict(
             host_path.as_utf8_path().as_std_path().to_path_buf(),
             destination.clone(),
         )),
-        sessions::wire::policy::WirePatchVerdict::Ignored { .. }
-        | sessions::wire::policy::WirePatchVerdict::Denied { .. } => None,
+        boxes::wire::policy::WirePatchVerdict::Ignored { .. }
+        | boxes::wire::policy::WirePatchVerdict::Denied { .. } => None,
     })
 }
 
 /// Fire an `AbortSession` at the daemon for a `Pending` session the
 /// client has decided not to finalize. A best-effort teardown.
-pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId) {
+pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::SessionId) {
     use minimald_rpc::AbortSession;
     match client
         .oneshot_rpc::<AbortSession>(minimald_rpc::AbortSessionRequest { id: session_id })
@@ -614,10 +614,7 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
 /// back to `cmd_activate`.
-pub(crate) async fn best_effort_destroy(
-    client: &mut client::Client,
-    session_id: sessions::SessionId,
-) {
+pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id: boxes::SessionId) {
     /// Ceiling on how long we let a cleanup RPC run. Chosen well
     /// above a healthy `DestroySession` (single-digit milliseconds
     /// on a UDS) so the timeout only fires against pathologies.
@@ -671,9 +668,9 @@ fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) 
 /// base RPC timeout is not cut short.
 pub(crate) async fn upload_and_finalize(
     client: &mut client::Client,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
-    hook_scripts: &[sessions::client::hookscripts::StagedScript],
+    hook_scripts: &[boxes::client::hookscripts::StagedScript],
     hook_budget: std::time::Duration,
 ) -> Result<(), anyhow::Error> {
     client
@@ -774,7 +771,7 @@ impl Drop for ActivationInterrupt {
 
 pub(crate) fn arm_activation_interrupt(
     global: &GlobalArgs,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the

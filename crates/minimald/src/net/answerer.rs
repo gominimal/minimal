@@ -13,7 +13,7 @@
 //! microVM starts no answerer at all, and this module is the *native*
 //! deployment's half of the same semantics. The semantics are not
 //! per-deployment either way: they live in the shared decision
-//! ([`sessions::core::zone_answer`]), and what this module owns is the DNS
+//! ([`boxes::core::zone_answer`]), and what this module owns is the DNS
 //! wire — decoding a query, encoding the reply the decision's verdict
 //! names, and the SOA its negatives cite — plus the channel wire its rows
 //! publish over.
@@ -56,7 +56,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use sessions::core::zone_answer;
+use boxes::core::zone_answer;
 
 use super::SwitchSubnet;
 use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry, ZoneEntry};
@@ -1474,7 +1474,7 @@ async fn recheck_live_carve_outs_against(
                     attrs.host_ip_enforcement == Some(minimald_rpc::HostIpEnforcement::PerBox)
                 });
                 if !placed
-                    || record.network != sessions::NetworkMode::HostNet
+                    || record.network != boxes::NetworkMode::HostNet
                     || crate::net::classifier::verdict_of(record.policy.egress.as_ref())
                         != sandbox::config::Verdict::Deny
                 {
@@ -2319,7 +2319,7 @@ mod tests {
 
     use tracing_subscriber::fmt::MakeWriter;
 
-    use sessions::SessionId;
+    use boxes::SessionId;
 
     use super::super::DEFAULT_SUBNET;
     use super::super::dns::{DEFAULT_HOST_ID, is_host_answerable};

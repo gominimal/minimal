@@ -1,6 +1,6 @@
 //! Loadout selection, composition, and the `minimal loadout list`
 //! command. Backed by the on-disk primitives in
-//! [`sessions::client::disk`] and driven from the client `config.toml`
+//! [`boxes::client::disk`] and driven from the client `config.toml`
 //! (see [`crate::config`]).
 
 use anyhow::{Context as _, bail};
@@ -87,8 +87,8 @@ MINIMAL_MOTD = '''
 /// compile-time constant exercised by a unit test, so a parse failure
 /// is a bug in this file rather than a runtime condition.
 ///
-/// [`Loadout`]: sessions::core::loadout::Loadout
-fn builtin_default_loadout() -> sessions::core::loadout::Loadout {
+/// [`Loadout`]: boxes::core::loadout::Loadout
+fn builtin_default_loadout() -> boxes::core::loadout::Loadout {
     toml::from_str(BUILTIN_DEFAULT_TOML).expect("built-in default loadout TOML must parse")
 }
 
@@ -98,7 +98,7 @@ fn builtin_default_loadout() -> sessions::core::loadout::Loadout {
 #[derive(Debug)]
 pub(crate) struct ActiveLoadouts {
     /// The loadouts to compose, in application order.
-    pub(crate) loadouts: Vec<sessions::core::loadout::Loadout>,
+    pub(crate) loadouts: Vec<boxes::core::loadout::Loadout>,
     /// The directory these loadouts were read from — whatever
     /// `--config-dir` / `$XDG_CONFIG_HOME` resolved to for this run.
     ///
@@ -127,7 +127,7 @@ pub(crate) struct ActiveLoadouts {
 /// either layout — shadows the built-in.
 pub(crate) fn resolve_active_loadouts(
     selection: LoadoutSelection,
-    cfg: &sessions::client::config::Config,
+    cfg: &boxes::client::config::Config,
     global: &GlobalArgs,
 ) -> Result<ActiveLoadouts, anyhow::Error> {
     let loadouts_dir = resolve_loadouts_dir_for_activation(global)?;
@@ -180,7 +180,7 @@ pub(crate) fn resolve_active_loadouts(
             // "failed the predicate test", which tells the user
             // nothing about what a loadout name may contain — so the
             // rule is spelled out here instead.
-            let name = sessions::core::loadout::LoadoutName::try_new(name)
+            let name = boxes::core::loadout::LoadoutName::try_new(name)
                 .map_err(|_| {
                     anyhow::anyhow!(
                         "`{name}` is not a loadout name: names are the file or directory \
@@ -192,7 +192,7 @@ pub(crate) fn resolve_active_loadouts(
             // `LoadError`'s Display already embeds its I/O source, so flatten
             // it to a leaf before adding context; otherwise anyhow re-renders
             // the underlying error a second time from the chain.
-            sessions::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
+            boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
                 .map(|(loadout, _layout)| loadout)
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .with_context(|| format!("{source} `{name}`"))
@@ -214,13 +214,13 @@ pub(crate) fn resolve_active_loadouts(
 /// unusable, which the user wants told rather than silently replaced
 /// by the built-in.
 ///
-/// [`LoadError::NotFound`]: sessions::client::disk::LoadError::NotFound
+/// [`LoadError::NotFound`]: boxes::client::disk::LoadError::NotFound
 fn user_default_exists(loadouts_dir: &paths::HostAbsPath) -> Result<bool, anyhow::Error> {
-    let name = sessions::core::loadout::LoadoutName::try_new(BUILTIN_DEFAULT_NAME)
+    let name = boxes::core::loadout::LoadoutName::try_new(BUILTIN_DEFAULT_NAME)
         .expect("the built-in default's name is a valid loadout name");
-    match sessions::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name) {
+    match boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name) {
         Ok(_) => Ok(true),
-        Err(sessions::client::disk::LoadError::NotFound { .. }) => Ok(false),
+        Err(boxes::client::disk::LoadError::NotFound { .. }) => Ok(false),
         Err(e) => Err(anyhow::anyhow!("{e}")).context("default_loadouts `default`"),
     }
 }
@@ -285,11 +285,11 @@ pub(crate) fn loadout_display_list(active: &ActiveLoadouts) -> String {
 /// Build the [`ComposeOptions`] the client passes to
 /// `UserComposer::compose`, translating relevant config fields.
 ///
-/// [`ComposeOptions`]: sessions::core::compose::ComposeOptions
+/// [`ComposeOptions`]: boxes::core::compose::ComposeOptions
 pub(crate) fn compose_options_from_config(
-    cfg: &sessions::client::config::Config,
-) -> sessions::core::compose::ComposeOptions {
-    sessions::core::compose::ComposeOptions::default()
+    cfg: &boxes::client::config::Config,
+) -> boxes::core::compose::ComposeOptions {
+    boxes::core::compose::ComposeOptions::default()
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
@@ -311,9 +311,9 @@ pub(crate) fn stage_loadout_hook_scripts(
     active: &ActiveLoadouts,
     project_root: &paths::HostAbsPath,
     hooks_enabled: bool,
-) -> Result<Vec<sessions::client::hookscripts::StagedScript>, anyhow::Error> {
-    use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
-    use sessions::core::source::{ProvenancedHook, Source};
+) -> Result<Vec<boxes::client::hookscripts::StagedScript>, anyhow::Error> {
+    use boxes::client::hookscripts::{ScriptAnchors, stage_external_scripts};
+    use boxes::core::source::{ProvenancedHook, Source};
 
     if !hooks_enabled {
         return Ok(Vec::new());
@@ -356,9 +356,9 @@ pub(crate) fn stage_loadout_hook_scripts(
 /// function's problem — the activation has its own handling for both, and
 /// duplicating it here would report the same fault twice.
 pub(crate) fn check_project_hooks(project_root: &paths::HostAbsPath) -> Result<(), anyhow::Error> {
-    use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
-    use sessions::core::lifecyclehook::{HookScript, HookScriptBody};
-    use sessions::core::source::{ProvenancedHook, Source};
+    use boxes::client::hookscripts::{ScriptAnchors, stage_external_scripts};
+    use boxes::core::lifecyclehook::{HookScript, HookScriptBody};
+    use boxes::core::source::{ProvenancedHook, Source};
 
     let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
         return Ok(());
@@ -457,7 +457,7 @@ pub(crate) fn activate_hook_budget(
 }
 
 /// Compose the resolved [`ActiveLoadouts`] into a
-/// [`sessions::wire::request::WireContribution`] under the user's
+/// [`boxes::wire::request::WireContribution`] under the user's
 /// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
 /// auto-pass the allow step but the policy's `deny` / `ignore` rules
 /// still apply, so a loadout patch matching a deny rule fails the
@@ -472,16 +472,16 @@ pub(crate) fn activate_hook_budget(
 /// contribution — a hook (interactive prompt) may have appended
 /// allow/ignore/deny rules and the caller wants to persist them.
 ///
-/// [`UserPolicy`]: sessions::core::policy::UserPolicy
+/// [`UserPolicy`]: boxes::core::policy::UserPolicy
 pub(crate) fn compose_user_contribution(
     active: ActiveLoadouts,
-    policy: sessions::core::policy::UserPolicy,
-    options: sessions::core::compose::ComposeOptions,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
     hooks_enabled: bool,
 ) -> Result<
     (
-        sessions::wire::request::WireContribution,
-        sessions::core::policy::UserPolicy,
+        boxes::wire::request::WireContribution,
+        boxes::core::policy::UserPolicy,
     ),
     anyhow::Error,
 > {
@@ -498,12 +498,12 @@ pub(crate) fn compose_user_contribution(
         active
             .loadouts
             .into_iter()
-            .map(sessions::core::loadout::Loadout::without_lifecycle_hooks)
+            .map(boxes::core::loadout::Loadout::without_lifecycle_hooks)
             .collect()
     };
 
-    let mut composer = sessions::client::composer::UserComposer::new()
-        .with_orientation(sessions::core::compose::Orientation { loadouts_display })
+    let mut composer = boxes::client::composer::UserComposer::new()
+        .with_orientation(boxes::core::compose::Orientation { loadouts_display })
         // Anchors `$LOADOUT_ROOT` in the loadouts' patch sources at the
         // directory they were read from, so a loadout can patch in files
         // shipped beside it without naming an absolute config path.
@@ -540,12 +540,12 @@ fn resolve_loadouts_dir(args: &LoadoutListArgs, global: &GlobalArgs) -> PathBuf 
 /// with a leading `*`.
 pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let dir = resolve_loadouts_dir(&args, global);
-    let entries = match sessions::client::disk::list_loadouts(&dir) {
+    let entries = match boxes::client::disk::list_loadouts(&dir) {
         Ok(entries) => entries,
         // A missing directory is the fresh-install case: there are no
         // user loadouts yet, but the built-in `default` row below still
         // orients the user. Note where to add their own and continue.
-        Err(sessions::client::disk::ListError::NotFound { path }) => {
+        Err(boxes::client::disk::ListError::NotFound { path }) => {
             eprintln!(
                 "No loadouts directory at {} yet — add your own as `<name>.toml` \
                  there, or as `<name>/loadout.toml` to keep one under version control.",
@@ -664,8 +664,8 @@ impl LoadoutRow {
     /// never reach here — the caller reports them on stderr and keeps
     /// them out of the table (see [`cmd_loadout_list`]).
     fn from_entry(
-        entry: &sessions::client::disk::LoadoutEntry,
-        loadout: &sessions::core::loadout::Loadout,
+        entry: &boxes::client::disk::LoadoutEntry,
+        loadout: &boxes::core::loadout::Loadout,
         defaults: &std::collections::HashSet<String>,
     ) -> Self {
         let marker = if defaults.contains(&entry.name) {
@@ -741,7 +741,7 @@ mod tests {
     /// panic-shaped failure.
     #[test]
     fn resolve_active_loadouts_none_short_circuits() {
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -765,7 +765,7 @@ mod tests {
     fn resolve_active_loadouts_cli_missing_file_errors() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("minimal/loadouts")).unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -791,7 +791,7 @@ mod tests {
     /// absence is now [`LoadError::NotFound`], which has no source to
     /// double, so it could not catch a regression here.
     ///
-    /// [`LoadError::NotFound`]: sessions::client::disk::LoadError::NotFound
+    /// [`LoadError::NotFound`]: boxes::client::disk::LoadError::NotFound
     #[test]
     fn resolve_active_loadouts_cli_error_not_doubled() {
         let tmp = tempfile::tempdir().unwrap();
@@ -799,7 +799,7 @@ mod tests {
         std::fs::create_dir_all(&loadouts).unwrap();
         let malformed = "= not = toml =";
         std::fs::write(loadouts.join("broken.toml"), malformed).unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -814,7 +814,7 @@ mod tests {
         let rendered = format!("{err:#}");
         // The parse-error text belongs to `toml`, so derive it from the
         // same failing parse and assert it appears once, not twice.
-        let needle = toml::from_str::<sessions::core::loadout::LoadoutFile>(malformed)
+        let needle = toml::from_str::<boxes::core::loadout::LoadoutFile>(malformed)
             .expect_err("the fixture must not parse")
             .to_string();
         assert_eq!(
@@ -840,7 +840,7 @@ mod tests {
             "description = \"should never load\"\n",
         )
         .unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -874,7 +874,7 @@ mod tests {
     /// opt-out direction).
     #[test]
     fn loadout_lifecycle_hook_composes_alongside_other_items() {
-        let loadout: sessions::core::loadout::Loadout = toml::from_str(
+        let loadout: boxes::core::loadout::Loadout = toml::from_str(
             r#"
 name = "dev"
 packages = ["helix"]
@@ -896,8 +896,8 @@ on_activate = { type = "inline", value = "echo activated" }
                 loadouts_dir: stub_loadouts_dir(),
                 builtin_default: false,
             },
-            sessions::core::policy::UserPolicy::empty(),
-            sessions::core::compose::ComposeOptions::default(),
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
             true,
         )
         .expect("composition succeeds with the declared hook");
@@ -921,7 +921,7 @@ on_activate = { type = "inline", value = "echo activated" }
     /// which such a hook was previously cut off. `--no-hooks` zeroes it.
     #[test]
     fn activate_hook_budget_reflects_declared_on_activate_timeout() {
-        let loadout: sessions::core::loadout::Loadout = toml::from_str(
+        let loadout: boxes::core::loadout::Loadout = toml::from_str(
             r#"
 name = "slow"
 
@@ -980,7 +980,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             .all_vars()
             .find(|(n, _)| n.as_str() == "MINIMAL_MOTD")
             .map(|(_, v)| match v {
-                sessions::core::primitives::VarValue::Specified { value } => value.clone(),
+                boxes::core::primitives::VarValue::Specified { value } => value.clone(),
                 other => panic!("MINIMAL_MOTD must be a literal value, got {other:?}"),
             })
             .expect("MINIMAL_MOTD present");
@@ -1006,7 +1006,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
     /// shadow cases are asserted in the resolution tests above).
     #[test]
     fn loadout_display_list_joins_names() {
-        let mk = |name: &str| -> sessions::core::loadout::Loadout {
+        let mk = |name: &str| -> boxes::core::loadout::Loadout {
             toml::from_str(&format!("name = \"{name}\"\n")).expect("loadout parses")
         };
         let active = ActiveLoadouts {
@@ -1030,8 +1030,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
                 loadouts_dir: stub_loadouts_dir(),
                 builtin_default: true,
             },
-            sessions::core::policy::UserPolicy::empty(),
-            sessions::core::compose::ComposeOptions::default(),
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
             true,
         )
         .expect("empty composition succeeds");
@@ -1049,7 +1049,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
     fn resolve_active_loadouts_defaults_falls_back_to_builtin() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("minimal/loadouts")).unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1079,7 +1079,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             "description = \"user override\"\n",
         )
         .unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1114,7 +1114,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             "description = \"version controlled\"\npackages = [\"helix\"]\n",
         )
         .unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1151,7 +1151,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             "description = \"dir\"\n",
         )
         .unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1184,7 +1184,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             "description = \"user override\"\n",
         )
         .unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1211,7 +1211,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         let loadouts = tmp.path().join("minimal/loadouts");
         std::fs::create_dir_all(&loadouts).unwrap();
         std::fs::write(loadouts.join("default.toml"), "= not = toml =").unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1243,7 +1243,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             camino::Utf8PathBuf::from_path_buf(loadouts.clone()).unwrap(),
         )
         .unwrap();
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1281,7 +1281,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
     /// failing because the config dir was spelled relatively.
     #[test]
     fn resolve_active_loadouts_anchors_a_relative_config_dir_at_the_cwd() {
-        let cfg = sessions::client::config::Config::default();
+        let cfg = boxes::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
             minimal_dir: None,
@@ -1382,7 +1382,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         std::fs::create_dir_all(loadouts.join("flat")).unwrap();
         std::fs::write(loadouts.join("flat").join("config.toml"), "x = 1\n").unwrap();
 
-        let entries = sessions::client::disk::list_loadouts(&loadouts).expect("lists");
+        let entries = boxes::client::disk::list_loadouts(&loadouts).expect("lists");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["flat", "vc"]);
         assert!(entries.iter().all(|e| e.loadout.is_ok()));
@@ -1410,8 +1410,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
     /// and never has a script staged for it.
     #[test]
     fn no_hooks_strips_loadout_hooks_from_the_contribution() {
-        use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
-        use sessions::core::loadout::{Loadout, LoadoutName};
+        use boxes::core::lifecyclehook::{HookScript, LifecycleHook};
+        use boxes::core::loadout::{Loadout, LoadoutName};
 
         let build = |hooks_enabled: bool| {
             let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap()).with_lifecycle_hook(
@@ -1427,8 +1427,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             };
             let (contribution, _) = compose_user_contribution(
                 active,
-                sessions::core::policy::UserPolicy::empty(),
-                sessions::core::compose::ComposeOptions::default(),
+                boxes::core::policy::UserPolicy::empty(),
+                boxes::core::compose::ComposeOptions::default(),
                 hooks_enabled,
             )
             .expect("composing a hook-only loadout");

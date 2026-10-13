@@ -33,7 +33,7 @@ use switch::loopback::RangeProbe;
 
 /// The zone the daemon's answerer holds: the sessions zone's apex, the one
 /// spelling the daemons' registries read too.
-pub(crate) const ZONE: &str = sessions::core::zone_answer::ZONE_APEX;
+pub(crate) const ZONE: &str = boxes::core::zone_answer::ZONE_APEX;
 
 /// The link dedicated to [`ZONE`]'s DNS hook on Linux: a dummy interface
 /// the advisory's command creates, whose only job is to carry the routing
@@ -4315,7 +4315,7 @@ mod tests {
     #[test]
     fn zone_spellings_are_the_sessions_zone() {
         assert_eq!(ZONE, "min.internal");
-        assert_eq!(ZONE, sessions::core::zone_answer::ZONE_APEX);
+        assert_eq!(ZONE, boxes::core::zone_answer::ZONE_APEX);
         assert_eq!(RESOLVER_FILE, format!("/etc/resolver/{ZONE}"));
     }
 

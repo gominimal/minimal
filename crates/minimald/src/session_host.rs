@@ -28,8 +28,8 @@ use crate::RequestedPty;
 use crate::session::SessionPaths;
 use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
-use sessions::NetworkMode;
-use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
+use boxes::NetworkMode;
+use boxes::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 // The one per-box egress enforcement type (NET-079): shared with the session
 // record that carries a box's own launch outcome, so a launch's decision and
 // the record it lands on are one type with no conversion between them.
@@ -181,7 +181,7 @@ const DELTA_ROWS_SHOWN: usize = 10;
 fn log_session_contents(
     session_name: &str,
     baseline_packages: &[&str],
-    composition: Option<&sessions::core::compose::Composition>,
+    composition: Option<&boxes::core::compose::Composition>,
 ) {
     for p in baseline_packages {
         tracing::info!(
@@ -200,7 +200,7 @@ fn log_session_contents(
             session = session_name,
             domain = "package",
             name = %p.package(),
-            source = ?sessions::core::source::Provenanced::source(p),
+            source = ?boxes::core::source::Provenanced::source(p),
             "session content",
         );
     }
@@ -210,7 +210,7 @@ fn log_session_contents(
             session = session_name,
             domain = "var",
             name = %var.name(),
-            source = ?sessions::core::source::Provenanced::source(v),
+            source = ?boxes::core::source::Provenanced::source(v),
             "session content",
         );
         tracing::debug!(
@@ -227,7 +227,7 @@ fn log_session_contents(
             domain = "patch",
             host_source = %patch.host_path(),
             sandbox_dest = %patch.destination(),
-            source = ?sessions::core::source::Provenanced::source(sp),
+            source = ?boxes::core::source::Provenanced::source(sp),
             "session content (patch: materialized into session home at FinalizeSession)",
         );
     }
@@ -238,7 +238,7 @@ fn log_session_contents(
     // inspecting a session should be able to see which scripts it
     // carries and where each came from before any of them runs.
     for h in comp.lifecycle_hooks() {
-        let src = sessions::core::source::Provenanced::source(h);
+        let src = boxes::core::source::Provenanced::source(h);
         let hook = h.hook();
         [
             ("on_activate", hook.on_activate()),
@@ -250,8 +250,8 @@ fn log_session_contents(
         .filter_map(|(event, script)| script.map(|s| (event, s)))
         .for_each(|(event, script)| {
             let kind = match script.body() {
-                sessions::core::lifecyclehook::HookScriptBody::Inline(_) => "inline",
-                sessions::core::lifecyclehook::HookScriptBody::External(_) => "external",
+                boxes::core::lifecyclehook::HookScriptBody::Inline(_) => "inline",
+                boxes::core::lifecyclehook::HookScriptBody::External(_) => "external",
             };
             tracing::info!(
                 session = session_name,
@@ -1553,7 +1553,7 @@ pub(crate) trait SessionLauncher {
     fn launch(
         self,
         guest: bool,
-        session_id: sessions::SessionId,
+        session_id: boxes::SessionId,
         name: String,
         username: String,
         paths: SessionPaths,
@@ -2194,7 +2194,7 @@ pub struct HostAttrs {
 fn host_ip_enforcement(
     network_mode: NetworkMode,
     leaf: Option<&sandbox::config::ClassifierLeaf>,
-    declaration: Option<&sessions::EgressPolicy>,
+    declaration: Option<&boxes::EgressPolicy>,
 ) -> Option<HostIpEnforcement> {
     match network_mode {
         NetworkMode::HostNet => Some(match leaf {
@@ -2299,9 +2299,9 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// The composed hooks, so the attach and detach transitions can run
     /// them. `None` for a host spawned without one (tests, and a
     /// restart-orphaned actor).
-    composition: Option<Arc<sessions::core::compose::Composition>>,
+    composition: Option<Arc<boxes::core::compose::Composition>>,
     /// Identity and paths a hook run needs.
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     hooks_dir: paths::DaemonAbsPath,
     workspace_dir: paths::DaemonAbsPath,
 
@@ -2397,8 +2397,8 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
 struct HookPlan {
     event: crate::hooks::HookEvent,
     commands: crate::hooks::InjectedCommands,
-    composition: Arc<sessions::core::compose::Composition>,
-    session_id: sessions::SessionId,
+    composition: Arc<boxes::core::compose::Composition>,
+    session_id: boxes::SessionId,
     session_name: String,
     hooks_dir: paths::DaemonAbsPath,
     workspace: paths::DaemonAbsPath,
@@ -2939,7 +2939,7 @@ pub(crate) struct SandboxLauncher {
     /// mappings applied on the switch once this `OwnIp` PTask attaches and
     /// inbound ports gated on its other leg, removed on exit. Unused by other
     /// network modes.
-    pub(crate) policy: sessions::SessionPolicy,
+    pub(crate) policy: boxes::SessionPolicy,
     /// The proxy-routing-table handle the `OwnIp` lease is reported through
     /// on attach, so the box's `<name>.min.internal` route exists exactly
     /// while the box does (NET-001). Ignored by every other network mode.
@@ -2951,10 +2951,10 @@ pub(crate) struct SandboxLauncher {
     /// network mode; `None` for a session the activating client did not
     /// register, which self-allocates on a native host and is refused on a
     /// VM host, where the in-VM daemon draws nothing (NET-138).
-    pub(crate) box_addresses: Option<sessions::BoxAddresses>,
+    pub(crate) box_addresses: Option<boxes::BoxAddresses>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
-    pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
+    pub(crate) composition: Option<std::sync::Arc<boxes::core::compose::Composition>>,
     /// Weak handle back to the owning session actor, for  `min` commands
     /// (e.g. `min build`) to drive session side-ops.
     pub(crate) session: crate::session::WeakSessionHandle,
@@ -3513,7 +3513,7 @@ async fn create_session_leaf(
     root: &std::path::Path,
     mountinfo: Option<&str>,
     guest: bool,
-    session_id: &sessions::SessionId,
+    session_id: &boxes::SessionId,
     session_name: &str,
     verdict: sandbox::config::Verdict,
     can_decide_per_box: bool,
@@ -3668,7 +3668,7 @@ async fn create_session_leaf(
 /// paths.
 fn create_or_reclaim_box_leaf(
     root: &std::path::Path,
-    session_id: &sessions::SessionId,
+    session_id: &boxes::SessionId,
     verdict: sandbox::config::Verdict,
 ) -> io::Result<(std::path::PathBuf, bool)> {
     let id = session_id.to_string();
@@ -4073,7 +4073,7 @@ impl SessionLauncher for SandboxLauncher {
     async fn launch(
         self,
         guest: bool,
-        session_id: sessions::SessionId,
+        session_id: boxes::SessionId,
         name: String,
         username: String,
         paths: SessionPaths,
@@ -4094,7 +4094,7 @@ impl SessionLauncher for SandboxLauncher {
         // `allow` with a range. Read now, before the policy moves into the
         // network plan, for the missing-listen-plan line below.
         let listens_can_publish = policy.ingress.as_ref().is_some_and(|ingress| {
-            ingress.dynamic_ingress == Some(sessions::DynamicIngress::Allow)
+            ingress.dynamic_ingress == Some(boxes::DynamicIngress::Allow)
                 && ingress.dynamic_allowed_range.is_some()
         });
         let network_mode = self.network_mode;
@@ -4986,7 +4986,7 @@ impl SessionLauncher for MockLauncher {
     async fn launch(
         self,
         _guest: bool,
-        _session_id: sessions::SessionId,
+        _session_id: boxes::SessionId,
         _name: String,
         _username: String,
         _paths: SessionPaths,
@@ -5056,8 +5056,8 @@ pub(crate) struct HostParams {
     /// box is registered, so its host-side row ends with this host's shell
     /// (NET-138). The shell-exit prompt words its Keep item for that.
     pub holds_host_row: bool,
-    pub session_id: sessions::SessionId,
-    pub composition: Option<Arc<sessions::core::compose::Composition>>,
+    pub session_id: boxes::SessionId,
+    pub composition: Option<Arc<boxes::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
     /// The session's hostname-registry marker (NET-128): the host marks the
     /// box's name running when it takes over and stopped when it exits, so a
@@ -5081,7 +5081,7 @@ pub(crate) struct NameMarker {
     /// The daemon's registry the marks land in.
     registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
     /// The stable id of the session whose box's name is marked.
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
 }
 
 #[cfg(target_os = "linux")]
@@ -5089,7 +5089,7 @@ impl NameMarker {
     /// Marks one session's box name, in one registry.
     pub(crate) fn new(
         registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
-        session_id: sessions::SessionId,
+        session_id: boxes::SessionId,
     ) -> Self {
         Self {
             registry,
@@ -6322,12 +6322,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     ///
     /// Deliberately *narrow*: the host has a screen model, so it emits only
     /// what this session actually turned on. That matters most for
-    /// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN), which is
+    /// [`LEAVE_ALT_SCREEN`](boxes::terminal::LEAVE_ALT_SCREEN), which is
     /// not inert against a terminal that never left the normal buffer — see
     /// its docs. The `min` client's blind fallback exists only for the case
     /// where these bytes cannot reach the tty at all.
     fn unwind_codes(&self) -> Vec<u8> {
-        use sessions::terminal as term;
+        use boxes::terminal as term;
 
         let live = self.parser.screen();
         let clean = vt100::Parser::new(live.size().0, live.size().1, 0)

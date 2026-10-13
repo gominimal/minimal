@@ -219,7 +219,7 @@ impl VarsPolicy {
     /// [`Self::with_deny`], and [`Self::with_ignore`]:
     ///
     /// ```
-    /// use sessions::core::policy::{VarNameGlobs, VarsPolicy};
+    /// use boxes::core::policy::{VarNameGlobs, VarsPolicy};
     /// let p = VarsPolicy::empty()
     ///     .with_allow(VarNameGlobs::try_new(["MY_APP_*", "RUST_*"]).unwrap())
     ///     .with_deny(VarNameGlobs::try_new(["AWS_*"]).unwrap());
@@ -745,7 +745,7 @@ impl UserPolicy {
     /// Build it up via [`Self::with_vars`] and [`Self::with_patches`]:
     ///
     /// ```
-    /// use sessions::core::policy::{UserPolicy, VarNameGlobs, VarsPolicy};
+    /// use boxes::core::policy::{UserPolicy, VarNameGlobs, VarsPolicy};
     ///
     /// let p = UserPolicy::empty().with_vars(
     ///     VarsPolicy::empty()
@@ -1600,7 +1600,7 @@ mod tests {
 /// precedence, which is exactly why [`PathDecision`] derives no `Ord`
 /// and why these proofs exist.
 ///
-/// Run: `cargo kani -p sessions` (or `just kani`). Kani pinned at
+/// Run: `cargo kani -p boxes` (or `just kani`). Kani pinned at
 /// 0.68.0 in CI.
 #[cfg(kani)]
 mod kani_proofs {

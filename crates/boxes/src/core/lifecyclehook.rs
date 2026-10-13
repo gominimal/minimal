@@ -118,7 +118,7 @@ pub enum HookScriptBody {
 /// # Example
 ///
 /// ```
-/// use sessions::core::lifecyclehook::{HookScript, HookScriptBody, DEFAULT_HOOK_TIMEOUT};
+/// use boxes::core::lifecyclehook::{HookScript, HookScriptBody, DEFAULT_HOOK_TIMEOUT};
 ///
 /// let s: HookScript = toml::from_str("type = \"inline\"\nvalue = \"echo hi\"\n").unwrap();
 /// assert!(matches!(s.body(), HookScriptBody::Inline(b) if b == "echo hi"));
@@ -260,7 +260,7 @@ impl From<HookScript> for HookScriptRepr {
 /// # Example
 ///
 /// ```
-/// use sessions::core::lifecyclehook::{HookScriptBody, LifecycleHook};
+/// use boxes::core::lifecyclehook::{HookScriptBody, LifecycleHook};
 ///
 /// let src = r#"
 /// on_activate = { type = "inline", value = "echo hello" }

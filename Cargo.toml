@@ -28,7 +28,7 @@ members = [
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox",
-    "crates/sessions",
+    "crates/boxes",
     "crates/stdlib",
     "crates/switch",
     "crates/version",
@@ -71,7 +71,7 @@ package.version = "0.8.0"
 # and should be promoted here as their counts reach zero. Test code is exempt
 # from the panic family in clippy.toml.
 [workspace.lints.rust]
-# The kani proof harnesses (sessions, rcache) are gated on `cfg(kani)`, a
+# The kani proof harnesses (boxes, rcache) are gated on `cfg(kani)`, a
 # custom cfg. Declaring it once here keeps rustc's unexpected_cfgs lint quiet
 # on the normal (non-kani) builds without every crate repeating the check-cfg.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
@@ -268,7 +268,7 @@ paths = { path = "crates/paths" }
 remote-proto = { path = "crates/remote-proto" }
 remote-client = { path = "crates/remote-client" }
 sandbox = { path = "crates/sandbox" }
-sessions = { path = "crates/sessions" }
+boxes = { path = "crates/boxes" }
 switch = { path = "crates/switch" }
 version = { path = "crates/version" }
 

@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::io::SeekFrom;
 
+use boxes::SessionId;
 use camino::{Utf8Path, Utf8PathBuf};
 use paths::{DaemonAbsPath, DaemonRelPath};
 use russh::ChannelId;
@@ -29,7 +30,6 @@ use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
 };
 use russh_sftp::server::StatusReply;
-use sessions::SessionId;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::task::spawn;
@@ -737,10 +737,10 @@ pub(crate) async fn handle_sftp_subsystem(
 
 #[cfg(test)]
 mod tests {
+    use boxes::SessionId;
     use russh_sftp::client::SftpSession as SftpClient;
     use russh_sftp::client::error::Error as SftpClientError;
     use russh_sftp::protocol::{OpenFlags, StatusCode};
-    use sessions::SessionId;
     use std::os::unix::fs::PermissionsExt;
 
     use tokio::io::AsyncWriteExt;

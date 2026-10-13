@@ -486,7 +486,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
     let network = record.map(|r| r.network);
     let mut lines: Vec<Line> = Vec::new();
 
-    if network == Some(sessions::NetworkMode::NoNet) {
+    if network == Some(boxes::NetworkMode::NoNet) {
         // A none box has no network, so it can carry no egress or ingress
         // declaration at all — nothing here would describe anything real.
         lines.push(Line::styled(
@@ -502,7 +502,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
         {
             lines.push(Line::raw(format!(
                 "  {}",
-                sessions::CredentialedUpstream::policy_row(network)
+                boxes::CredentialedUpstream::policy_row(network)
             )));
         }
     } else {
@@ -525,13 +525,13 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                     "egress",
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
-                // The verdict by name, from the same `sessions` helper
+                // The verdict by name, from the same `boxes` helper
                 // `min session policy` prints: a default marked as one, a
                 // declared deny-all unmarked (the box chose it), never rows
                 // of blankness.
                 if let Some(label) = policy.egress.summary_label() {
                     lines.push(Line::raw(format!("  {label}")));
-                } else if let sessions::EffectiveEgress::Declared(egress) = &policy.egress {
+                } else if let boxes::EffectiveEgress::Declared(egress) = &policy.egress {
                     policy_list(&mut lines, "subnets", &egress.allow_subnets);
                     policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
                     match &egress.allow_protocols {
@@ -562,8 +562,8 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                 // effect. A mode not yet loaded prints the unmarked row.
                 if policy.credentialed_upstream.is_some() {
                     let row = network.map_or_else(
-                        || sessions::CredentialedUpstream::POLICY_ROW.to_string(),
-                        sessions::CredentialedUpstream::policy_row,
+                        || boxes::CredentialedUpstream::POLICY_ROW.to_string(),
+                        boxes::CredentialedUpstream::policy_row,
                     );
                     lines.push(Line::raw(format!("  {row}")));
                 }
@@ -571,7 +571,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                 // forwarder is the only per-session ingress minimald applies,
                 // and a host-address box shares its host's namespace, so
                 // there is no per-session ingress policy to show for it.
-                if network != Some(sessions::NetworkMode::HostNet) {
+                if network != Some(boxes::NetworkMode::HostNet) {
                     lines.push(Line::styled(
                         "ingress",
                         Style::default().add_modifier(Modifier::BOLD),
@@ -916,8 +916,8 @@ mod tests {
         assert_eq!(wrapped_height(&lines, 10), 5);
     }
 
-    fn sid(n: u128) -> sessions::SessionId {
-        sessions::SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
+    fn sid(n: u128) -> boxes::SessionId {
+        boxes::SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
     }
 
     fn sess_entry(n: u128, name: &str) -> minimald_rpc::ListSessionsEntry {
@@ -925,7 +925,7 @@ mod tests {
             id: sid(n),
             name: Some(name.to_string()),
             project_path: Some(paths::HostAbsPath::try_new("/src/x").unwrap()),
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
@@ -1028,19 +1028,19 @@ mod tests {
     }
 
     /// The Policy pane's text for one session with this mode and policy.
-    fn policy_text(network: sessions::NetworkMode, policy: sessions::SessionPolicy) -> String {
+    fn policy_text(network: boxes::NetworkMode, policy: boxes::SessionPolicy) -> String {
         let key = SessionKey {
             provider: "host".to_string(),
             id: sid(1),
         };
-        let record = sessions::Record {
+        let record = boxes::Record {
             id: sid(1),
             name: None,
             username: None,
             project_path: paths::HostAbsPath::try_new("/src/x").unwrap(),
             network,
             policy: policy.clone(),
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1054,12 +1054,12 @@ mod tests {
             key.clone(),
             crate::app::Detail {
                 record: Some(record),
-                policy: Some(sessions::EffectiveSessionPolicy {
+                policy: Some(boxes::EffectiveSessionPolicy {
                     egress: policy
                         .egress
                         .clone()
-                        .map_or(sessions::EffectiveEgress::DenyAll, |egress| {
-                            sessions::EffectiveEgress::Declared(egress)
+                        .map_or(boxes::EffectiveEgress::DenyAll, |egress| {
+                            boxes::EffectiveEgress::Declared(egress)
                         }),
                     ingress: policy.ingress.clone(),
                     credentialed_upstream: policy.credentialed_upstream.clone(),
@@ -1083,9 +1083,9 @@ mod tests {
         let pane = |allow_subnets: Vec<&str>, allow_dns_hosts: Vec<&str>| {
             let list = |entries: Vec<&str>| Some(entries.into_iter().map(String::from).collect());
             policy_text(
-                sessions::NetworkMode::OwnIp,
-                sessions::SessionPolicy {
-                    egress: Some(sessions::EgressPolicy {
+                boxes::NetworkMode::OwnIp,
+                boxes::SessionPolicy {
+                    egress: Some(boxes::EgressPolicy {
                         allow_subnets: list(allow_subnets),
                         allow_dns_hosts: list(allow_dns_hosts),
                         allow_protocols: None,
@@ -1115,17 +1115,17 @@ mod tests {
     /// and prints no row for a box that declared no lane.
     #[test]
     fn policy_pane_shows_the_credentialed_upstream_lane_when_declared() {
-        let laned = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy::deny_all()),
+        let laned = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
-            credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
         };
-        let unlaned = sessions::SessionPolicy {
+        let unlaned = boxes::SessionPolicy {
             credentialed_upstream: None,
             ..laned.clone()
         };
 
-        let own = policy_text(sessions::NetworkMode::OwnIp, laned.clone());
+        let own = policy_text(boxes::NetworkMode::OwnIp, laned.clone());
         assert!(
             own.contains(
                 "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
@@ -1133,13 +1133,13 @@ mod tests {
             "a laned own-address box must show the lane row, got:\n{own}"
         );
 
-        let bare = policy_text(sessions::NetworkMode::OwnIp, unlaned);
+        let bare = policy_text(boxes::NetworkMode::OwnIp, unlaned);
         assert!(
             !bare.contains("credentialed upstream"),
             "a box without a lane must show no lane row, got:\n{bare}"
         );
 
-        let host = policy_text(sessions::NetworkMode::HostNet, laned);
+        let host = policy_text(boxes::NetworkMode::HostNet, laned);
         assert!(
             host.contains(
                 "  credentialed upstream  box egress proxy listener (not in effect: host_ip box)"

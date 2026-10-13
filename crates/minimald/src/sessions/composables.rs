@@ -14,8 +14,8 @@
 //!
 //! [`ProjectComposable`]: mfile::ProjectComposable
 //! [`PackageComposable`]: mfile::PackageComposable
-//! [`SessionComposer::add`]: sessions::daemon::composer::SessionComposer::add
-//! [`SessionComposer::compose`]: sessions::daemon::composer::SessionComposer::compose
+//! [`SessionComposer::add`]: boxes::daemon::composer::SessionComposer::add
+//! [`SessionComposer::compose`]: boxes::daemon::composer::SessionComposer::compose
 //! [`InvalidInput`]: std::io::ErrorKind::InvalidInput
 
 use std::sync::Arc;
@@ -26,14 +26,14 @@ use std::sync::Arc;
 // through one definition instead of two string comparisons. The regression
 // guard on this side is `credential_class_fs_mappings_are_filtered_out`
 // below.
-use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
-use paths::DaemonAbsPath;
-use sessions::{
+use boxes::{
     SessionId,
     core::compose::ComposeOptions,
     daemon::composer::{ComposeOutcome, SessionComposer},
     wire::request::WireContribution,
 };
+use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
+use paths::DaemonAbsPath;
 
 /// The runtime-env attrs a package can declare on
 /// `BuildSpec.attrs`. See
@@ -265,15 +265,13 @@ fn fold_stack_vars_into_session<'a, I>(
 {
     for (name, mfile_val) in build_env_vars {
         let value = match mfile_val {
-            mfile::EnvVarValue::Value(v) => {
-                sessions::core::primitives::VarValue::specified(v.clone())
-            }
-            mfile::EnvVarValue::Inherit => sessions::core::primitives::VarValue::Inherit,
+            mfile::EnvVarValue::Value(v) => boxes::core::primitives::VarValue::specified(v.clone()),
+            mfile::EnvVarValue::Inherit => boxes::core::primitives::VarValue::Inherit,
         };
-        if let Ok(strict) = sessions::core::primitives::StrictVarName::try_new(name.clone()) {
+        if let Ok(strict) = boxes::core::primitives::StrictVarName::try_new(name.clone()) {
             session.vars.entry(strict).or_insert(value);
         } else if let Ok(entry) =
-            sessions::core::primitives::LenientVarEntry::try_new(name.as_str(), value)
+            boxes::core::primitives::LenientVarEntry::try_new(name.as_str(), value)
         {
             let already_present = session
                 .vars_lenient
@@ -548,9 +546,9 @@ pub(crate) fn run_composer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::core::compose::Composable;
     use decode::Layer;
     use indoc::indoc;
-    use sessions::core::compose::Composable;
 
     /// A package with `env_state_wiring` produces, via the
     /// composition path, the same env vars and `/state/<prefix>`
@@ -741,7 +739,7 @@ mod tests {
         ];
         fold_stack_vars_into_session(&mut session, "test-stack", vars.iter().map(|(k, v)| (k, v)));
 
-        let strict_name = sessions::core::primitives::StrictVarName::try_new("RUST_LOG").unwrap();
+        let strict_name = boxes::core::primitives::StrictVarName::try_new("RUST_LOG").unwrap();
         assert!(
             session.vars.contains_key(&strict_name),
             "strict-shaped went to vars"
@@ -760,15 +758,15 @@ mod tests {
     /// and lenient (linear scan).
     #[test]
     fn fold_stack_vars_never_overrides_session_declared() {
-        let strict_name = sessions::core::primitives::StrictVarName::try_new("RUST_LOG").unwrap();
+        let strict_name = boxes::core::primitives::StrictVarName::try_new("RUST_LOG").unwrap();
         let mut session = mfile::Session::default();
         session.vars.insert(
             strict_name.clone(),
-            sessions::core::primitives::VarValue::specified("debug"),
+            boxes::core::primitives::VarValue::specified("debug"),
         );
-        let lenient_entry = sessions::core::primitives::LenientVarEntry::try_new(
+        let lenient_entry = boxes::core::primitives::LenientVarEntry::try_new(
             "some-dashed-name",
-            sessions::core::primitives::VarValue::specified("session-wins"),
+            boxes::core::primitives::VarValue::specified("session-wins"),
         )
         .unwrap();
         session.vars_lenient.push(lenient_entry);
@@ -791,7 +789,7 @@ mod tests {
 
         // Strict value untouched.
         match session.vars.get(&strict_name).unwrap() {
-            sessions::core::primitives::VarValue::Specified { value } => {
+            boxes::core::primitives::VarValue::Specified { value } => {
                 assert_eq!(value, "debug", "session-declared value survives");
             }
             other => panic!("expected Specified, got {other:?}"),
@@ -799,7 +797,7 @@ mod tests {
         // Lenient — only the original entry, no duplicate.
         assert_eq!(session.vars_lenient.len(), 1);
         match session.vars_lenient[0].value() {
-            sessions::core::primitives::VarValue::Specified { value } => {
+            boxes::core::primitives::VarValue::Specified { value } => {
                 assert_eq!(value, "session-wins", "session-declared value survives");
             }
             other => panic!("expected Specified, got {other:?}"),

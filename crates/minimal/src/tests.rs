@@ -670,10 +670,10 @@ fn twin_entry(
     id: &str,
     name: Option<&str>,
     path: Option<&str>,
-    status: sessions::SessionStatus,
+    status: boxes::SessionStatus,
 ) -> minimald_rpc::ListSessionsEntry {
     minimald_rpc::ListSessionsEntry {
-        id: sessions::SessionId::parse_str(id).unwrap(),
+        id: boxes::SessionId::parse_str(id).unwrap(),
         name: name.map(str::to_owned),
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
@@ -692,7 +692,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        sessions::SessionStatus::Active,
+        boxes::SessionStatus::Active,
     )];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     assert_eq!(
@@ -715,7 +715,7 @@ fn duplicate_session_warning_flags_only_a_matching_path() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        sessions::SessionStatus::Active,
+        boxes::SessionStatus::Active,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -745,7 +745,7 @@ fn duplicate_session_warning_reuses_unnamed_session_by_id() {
         id,
         None,
         Some("/w"),
-        sessions::SessionStatus::Active,
+        boxes::SessionStatus::Active,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -770,7 +770,7 @@ fn duplicate_session_warning_skips_attach_for_materializing() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        sessions::SessionStatus::Materializing,
+        boxes::SessionStatus::Materializing,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -794,13 +794,13 @@ fn duplicate_session_warning_prefers_active_over_pending_match() {
             pending_id,
             Some("mzing"),
             Some("/w"),
-            sessions::SessionStatus::Materializing,
+            boxes::SessionStatus::Materializing,
         ),
         twin_entry(
             active_id,
             Some("live"),
             Some("/w"),
-            sessions::SessionStatus::Active,
+            boxes::SessionStatus::Active,
         ),
     ];
 
@@ -843,13 +843,13 @@ fn bare_status_counts_elsewhere_sessions() {
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             Some("api"),
             Some("/other"),
-            sessions::SessionStatus::Active,
+            boxes::SessionStatus::Active,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0066",
             None,
             Some("/third"),
-            sessions::SessionStatus::Pending,
+            boxes::SessionStatus::Pending,
         ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
@@ -879,25 +879,25 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             None,
             Some("/w"),
-            sessions::SessionStatus::Pending,
+            boxes::SessionStatus::Pending,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0066",
             Some("web"),
             Some("/w"),
-            sessions::SessionStatus::Materializing,
+            boxes::SessionStatus::Materializing,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0077",
             Some("spare"),
             Some("/w"),
-            sessions::SessionStatus::Active,
+            boxes::SessionStatus::Active,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0088",
             Some("api"),
             Some("/other"),
-            sessions::SessionStatus::Active,
+            boxes::SessionStatus::Active,
         ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
@@ -947,7 +947,7 @@ fn display_with_home_tilde_abbreviates_only_under_home() {
 /// alone rather than the full 36-character UUID.
 #[test]
 fn session_announce_label_prefers_name_with_short_id() {
-    let id = sessions::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
+    let id = boxes::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
     assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
     assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
 }
@@ -1488,7 +1488,7 @@ fn ingress_spec_defaults_to_tcp() {
     let m = parse_ingress_mapping("18080:80").unwrap();
     assert_eq!(m.external_port, 18080);
     assert_eq!(m.internal_port, 80);
-    assert_eq!(m.proto, sessions::IpProto::Tcp);
+    assert_eq!(m.proto, boxes::IpProto::Tcp);
 }
 
 #[test]
@@ -1496,7 +1496,7 @@ fn ingress_spec_parses_explicit_proto() {
     let m = parse_ingress_mapping("5353:53/udp").unwrap();
     assert_eq!(m.external_port, 5353);
     assert_eq!(m.internal_port, 53);
-    assert_eq!(m.proto, sessions::IpProto::Udp);
+    assert_eq!(m.proto, boxes::IpProto::Udp);
 }
 
 #[test]
@@ -2417,18 +2417,18 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
-/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// The `--network` parser accepts every [`boxes::NetworkMode::word`] and
 /// maps it back to the same mode, so the word the daemon logs and the
 /// refusals print is always one a person can type.
 #[test]
 fn network_parser_round_trips_every_mode_word() {
     for mode in [
-        sessions::NetworkMode::NoNet,
-        sessions::NetworkMode::HostNet,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::NoNet,
+        boxes::NetworkMode::HostNet,
+        boxes::NetworkMode::OwnIp,
     ] {
         let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
-        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+        assert_eq!(boxes::NetworkMode::from(parsed), mode, "{}", mode.word());
     }
 }
 
@@ -2530,11 +2530,11 @@ fn dynamic_ingress_flags_parse() {
         "--dynamic-range",
         "8000-8443",
     ]);
-    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Allow));
+    assert_eq!(a.dynamic_ingress, Some(boxes::DynamicIngress::Allow));
     assert_eq!(a.dynamic_range, Some((8000, 8443)));
 
     let a = activate(&["min", "session", "activate", "--dynamic-ingress", "ask"]);
-    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Ask));
+    assert_eq!(a.dynamic_ingress, Some(boxes::DynamicIngress::Ask));
     assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
 
     let Err(err) =
@@ -2561,7 +2561,7 @@ fn dynamic_ingress_flags_parse() {
     };
     let rendered = err.to_string();
     assert!(
-        rendered.contains(&sessions::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
+        rendered.contains(&boxes::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
         "the refusal must use the launch check's words, got: {rendered}"
     );
 }
@@ -2632,7 +2632,7 @@ async fn two_vms() -> (
 async fn create_box_on(
     server: &minimald::test_harness::TestServer,
     name: &str,
-) -> sessions::SessionId {
+) -> boxes::SessionId {
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest, Errorable,
         FinalizeSession, FinalizeSessionRequest, SessionConfig,
@@ -2648,8 +2648,8 @@ async fn create_box_on(
                 name: Some(name.to_string()),
                 project_path: paths::HostAbsPath::try_new(project_path)
                     .expect("the test cwd as a host path"),
-                network: sessions::NetworkMode::NoNet,
-                policy: sessions::SessionPolicy::default(),
+                network: boxes::NetworkMode::NoNet,
+                policy: boxes::SessionPolicy::default(),
                 task_addresses: Vec::new(),
                 box_id: None,
                 box_addresses: None,
@@ -2769,7 +2769,7 @@ async fn ls_shows_vm_per_box() {
     )
     .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
-    let row_of = |id: &sessions::SessionId| {
+    let row_of = |id: &boxes::SessionId| {
         table
             .lines()
             .find(|l| l.contains(&id.to_string()))
@@ -3476,7 +3476,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
 /// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
 /// `a1b2c3d4…` named `web`.
 fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
-    use sessions::SessionStatus::Active;
+    use boxes::SessionStatus::Active;
     vec![
         twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
         twin_entry(
@@ -3509,7 +3509,7 @@ fn a_unique_id_prefix_resolves_to_its_session() {
 /// resolves.
 #[test]
 fn an_ambiguous_id_prefix_names_the_candidates() {
-    use sessions::SessionStatus::Active;
+    use boxes::SessionStatus::Active;
     let entries = vec![
         twin_entry(
             "a1b2c3d4-0a99-78b1-9165-0809440f0052",
@@ -3541,7 +3541,7 @@ fn an_ambiguous_id_prefix_names_the_candidates() {
 /// as the first differing digit.
 #[test]
 fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
-    use sessions::SessionStatus::Active;
+    use boxes::SessionStatus::Active;
     let entries = vec![
         twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
         twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
@@ -3586,7 +3586,7 @@ fn a_non_hex_or_short_input_is_not_an_id_prefix() {
 /// resolves by its name: an exact name wins over a prefix.
 #[test]
 fn an_exact_name_wins_over_an_id_prefix() {
-    use sessions::SessionStatus::Active;
+    use boxes::SessionStatus::Active;
     let mut entries = prefix_entries();
     entries.push(twin_entry(
         "ffffffff-0a99-78b1-9165-0809440f0052",
@@ -3606,7 +3606,7 @@ fn an_exact_name_wins_over_an_id_prefix() {
 /// and a folded name wins over a session whose id starts with the same hex.
 #[test]
 fn a_name_resolves_case_insensitively() {
-    use sessions::SessionStatus::Active;
+    use boxes::SessionStatus::Active;
     let entries = vec![
         twin_entry(
             "ffffffff-0a99-78b1-9165-0809440f0052",
@@ -3632,7 +3632,7 @@ fn a_name_resolves_case_insensitively() {
 /// falls through to a session whose id starts with that prefix.
 #[test]
 fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
-    use sessions::SessionStatus::Active;
+    use boxes::SessionStatus::Active;
     let entries = vec![
         twin_entry(
             "ffffffff-0a99-78b1-9165-0809440f0052",

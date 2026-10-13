@@ -98,7 +98,7 @@ pub(crate) struct DecisionRecord {
     /// The decision the box's `dynamic_ingress` setting made for the
     /// request — `deny` (the default an absent declaration means), `allow`,
     /// or `ask`.
-    pub(crate) decision: sessions::DynamicIngress,
+    pub(crate) decision: boxes::DynamicIngress,
     /// Who actually decided it — see [`DecidedBy`].
     pub(crate) decided_by: DecidedBy,
     /// What became of the request — see [`DecisionOutcome`].
@@ -363,7 +363,7 @@ mod tests {
                 ts: chrono::Utc::now().to_rfc3339(),
                 box_name: "web".to_string(),
                 port: 3000,
-                decision: sessions::DynamicIngress::Allow,
+                decision: boxes::DynamicIngress::Allow,
                 decided_by: DecidedBy::BoxPolicy,
                 outcome: DecisionOutcome::Published,
                 reason: None,
@@ -376,7 +376,7 @@ mod tests {
                 ts: chrono::Utc::now().to_rfc3339(),
                 box_name: "web".to_string(),
                 port: 8080,
-                decision: sessions::DynamicIngress::Ask,
+                decision: boxes::DynamicIngress::Ask,
                 decided_by: DecidedBy::AttachedHuman,
                 outcome: DecisionOutcome::Refused,
                 reason: Some("dynamic ingress is denied for this box".to_string()),
@@ -430,7 +430,7 @@ mod tests {
             ts: chrono::Utc::now().to_rfc3339(),
             box_name: "web".to_string(),
             port: 3000,
-            decision: sessions::DynamicIngress::Ask,
+            decision: boxes::DynamicIngress::Ask,
             decided_by: DecidedBy::BoxPolicy,
             outcome: DecisionOutcome::Refused,
             reason: None,
@@ -508,7 +508,7 @@ mod tests {
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             box_name: "web".to_string(),
             port,
-            decision: sessions::DynamicIngress::Allow,
+            decision: boxes::DynamicIngress::Allow,
             decided_by: DecidedBy::BoxPolicy,
             outcome: DecisionOutcome::Published,
             reason: None,

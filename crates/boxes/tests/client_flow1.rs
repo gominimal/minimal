@@ -7,13 +7,13 @@
 
 use std::collections::HashMap;
 
+use boxes::client::composer::UserComposer;
+use boxes::core::compose::{ComposeError, ComposeOptions, StoredEnv};
+use boxes::core::loadout::Loadout;
+use boxes::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
+use boxes::core::source::Source;
+use boxes::wire::primitives::WireSource;
 use camino::Utf8Path;
-use sessions::client::composer::UserComposer;
-use sessions::core::compose::{ComposeError, ComposeOptions, StoredEnv};
-use sessions::core::loadout::Loadout;
-use sessions::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
-use sessions::core::source::Source;
-use sessions::wire::primitives::WireSource;
 
 // =====================================================================
 // Support
@@ -508,7 +508,7 @@ on_activate = {{ type = "inline", value = "echo activated" }}
         .unwrap();
 
     let json = serde_json_lenient::to_string(&contribution).unwrap();
-    let decoded: sessions::wire::request::WireContribution =
+    let decoded: boxes::wire::request::WireContribution =
         serde_json_lenient::from_str(&json).unwrap();
 
     assert_eq!(decoded.vars.len(), 1);
@@ -562,7 +562,7 @@ source = "${LOADOUT_ROOT}/themes/**/*.toml"
 
     // Read from disk, so the loadout is named after its file the way an
     // activation names it — that name is what picks the directory.
-    let loadout = sessions::client::disk::read_loadout_file(root.join("dev.toml").as_std_path())
+    let loadout = boxes::client::disk::read_loadout_file(root.join("dev.toml").as_std_path())
         .expect("fixture loadout loads");
     let mut composer = UserComposer::new()
         .with_env(pinned_env(&[]))
@@ -650,9 +650,9 @@ source = "${LOADOUT_ROOT}/themes/**/*.toml"
     // way an activation does, and collect the host paths each ends up
     // patching from.
     let sources_for = |name: &str| -> Vec<String> {
-        let loadout_name = sessions::core::loadout::LoadoutName::try_new(name).unwrap();
+        let loadout_name = boxes::core::loadout::LoadoutName::try_new(name).unwrap();
         let (loadout, _layout) =
-            sessions::client::disk::load_loadout(root.as_std_path(), &loadout_name)
+            boxes::client::disk::load_loadout(root.as_std_path(), &loadout_name)
                 .expect("fixture loadout loads");
         let mut composer = UserComposer::new()
             .with_env(pinned_env(&[]))
@@ -713,7 +713,7 @@ source = "$LOADOUT_ROOT/config.toml"
     );
     std::fs::write(root.join("dev.toml").as_std_path(), src).unwrap();
 
-    let loadout = sessions::client::disk::read_loadout_file(root.join("dev.toml").as_std_path())
+    let loadout = boxes::client::disk::read_loadout_file(root.join("dev.toml").as_std_path())
         .expect("fixture loadout loads");
     let mut composer = UserComposer::new()
         .with_env(pinned_env(&[]))
@@ -758,7 +758,7 @@ source = "$LOADOUT_ROOT/config.toml"
         matches!(
             err,
             ComposeError::Expansion(
-                sessions::core::expansion::ExpandError::LoadoutRootUnavailable { .. }
+                boxes::core::expansion::ExpandError::LoadoutRootUnavailable { .. }
             )
         ),
         "got: {err:?}",

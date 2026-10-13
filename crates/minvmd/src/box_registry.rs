@@ -63,9 +63,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
-use sessions::core::egress::EgressRules;
-use sessions::core::zone_answer;
-use sessions::{DynamicIngress, EgressPolicy, IpProto};
+use boxes::core::egress::EgressRules;
+use boxes::core::zone_answer;
+use boxes::{DynamicIngress, EgressPolicy, IpProto};
 use switch::SwitchSubnet;
 
 use crate::bep_attach::BoxId;
@@ -852,7 +852,7 @@ pub struct BoxRegistration {
     admitted_ports: Vec<u16>,
     declared_names: Vec<String>,
     egress: Option<EgressPolicy>,
-    credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    credentialed_upstream: Option<boxes::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
     task_addrs: Vec<Ipv4Addr>,
@@ -926,10 +926,7 @@ impl BoxRegistration {
     /// declaration is reduced to a lane in the row; its own content is the
     /// proxy document's to extend, so nothing of it is retained here.
     #[must_use]
-    pub fn with_credentialed_upstream(
-        mut self,
-        declaration: sessions::CredentialedUpstream,
-    ) -> Self {
+    pub fn with_credentialed_upstream(mut self, declaration: boxes::CredentialedUpstream) -> Self {
         self.credentialed_upstream = Some(declaration);
         self
     }
@@ -968,7 +965,7 @@ pub struct ClientBoxSpec {
     pub ingress_ports: Vec<u16>,
     /// The box's egress policy, as the client declared it. Absent compiles
     /// the egress default the registry's phase and opt-out resolve
-    /// (`sessions::effective_egress`), the same meaning the create request's
+    /// (`boxes::effective_egress`), the same meaning the create request's
     /// absent policy carries in the guest.
     pub egress: Option<EgressPolicy>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
@@ -977,7 +974,7 @@ pub struct ClientBoxSpec {
     /// rules say — while `None` is no lane, and the proxy's address stays
     /// refused under the box-to-host default-deny. The one field a client
     /// that predates NET-134 sends absent, every time.
-    pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    pub credentialed_upstream: Option<boxes::CredentialedUpstream>,
     /// The box's dynamic-ingress stance (NET-045): the stance half of the
     /// grant the row holds a runtime port report against. `None` is the
     /// declaration's `deny` default — a client that predates the grant
@@ -1016,7 +1013,7 @@ struct Creation {
     loopback_address: Ipv4Addr,
     ingress_ports: Vec<u16>,
     egress: Option<EgressPolicy>,
-    credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    credentialed_upstream: Option<boxes::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
     /// The task addresses filed with the box (NET-138), persisted with it
@@ -1082,7 +1079,7 @@ struct RegistryFile {
 #[serde(deny_unknown_fields)]
 struct HeldNamesFile {
     version: u32,
-    held_names: BTreeMap<String, Option<sessions::SessionId>>,
+    held_names: BTreeMap<String, Option<boxes::SessionId>>,
 }
 
 /// Writes `file` to `path` the one way any of the registry's persisted
@@ -1203,7 +1200,7 @@ fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Crea
 /// a rename that fails is a second error line, and the next hold writes
 /// over it — the holds are an interim every session's attach re-makes,
 /// never a record a resume is checked against.
-fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<sessions::SessionId>> {
+fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<boxes::SessionId>> {
     let why = match std::fs::read(path) {
         Ok(bytes) => match serde_json_lenient::from_slice::<HeldNamesFile>(&bytes) {
             Ok(file) if file.version == HELD_NAMES_FILE_VERSION => {
@@ -1297,15 +1294,15 @@ const SWITCH_REUSE_QUARANTINE: Duration = switch::SWITCH_ADDRESS_REUSE_QUARANTIN
 
 const _: () = assert!(
     SWITCH_REUSE_QUARANTINE.as_millis()
-        >= sessions::core::egress::REPLY_UDP_REPLIED_WINDOW.as_millis(),
+        >= boxes::core::egress::REPLY_UDP_REPLIED_WINDOW.as_millis(),
     "the switch address quarantine must outlast a replied UDP flow's record"
 );
 const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis() >= sessions::core::egress::REPLY_TCP_IDLE_CAP.as_millis(),
+    SWITCH_REUSE_QUARANTINE.as_millis() >= boxes::core::egress::REPLY_TCP_IDLE_CAP.as_millis(),
     "the switch address quarantine must outlast an idle TCP flow's record"
 );
 const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis() >= sessions::core::egress::DNS_ADMISSION_WINDOW.as_millis(),
+    SWITCH_REUSE_QUARANTINE.as_millis() >= boxes::core::egress::DNS_ADMISSION_WINDOW.as_millis(),
     "the switch address quarantine must outlast a DNS pin's admission window"
 );
 
@@ -2772,7 +2769,7 @@ pub struct BoxRegistry {
     /// session that made it, when its client named one, so a release
     /// frees only that session's hold, never a newer session's under the
     /// same name.
-    held_names: Arc<RwLock<BTreeMap<String, Option<sessions::SessionId>>>>,
+    held_names: Arc<RwLock<BTreeMap<String, Option<boxes::SessionId>>>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -2852,14 +2849,14 @@ pub struct BoxRegistry {
     /// section is compiled under: the gate's own phase
     /// ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]), so the row's
     /// frame half and the gate's publish half read one constant.
-    egress_default_phase: sessions::EgressDefaultPhase,
+    egress_default_phase: boxes::EgressDefaultPhase,
     /// The operator's deny-all opt-out (NET-077), read from
     /// `MINVMD_EGRESS_DENY_ALL_OPT_OUT` by the supervisor: with it set, a
     /// client box with no `egress` section keeps the earlier allow-all in
     /// every phase — the same default the guest daemon is handed on its boot
     /// line, so the host gate never denies what the guest allows. That
     /// agreement also needs this registry's phase to match the guest's
-    /// (`sessions::EGRESS_DEFAULT_PHASE`); if the two constants diverge, the
+    /// (`boxes::EGRESS_DEFAULT_PHASE`); if the two constants diverge, the
     /// stricter side wins.
     egress_deny_all_opt_out: bool,
     /// The client boxes' creations ([`Creation`]), keyed by the name's
@@ -2980,7 +2977,7 @@ impl BoxRegistry {
     /// the announced one no build ships now as well as the in-force one.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_egress_default_phase(mut self, phase: sessions::EgressDefaultPhase) -> Self {
+    pub(crate) fn with_egress_default_phase(mut self, phase: boxes::EgressDefaultPhase) -> Self {
         self.egress_default_phase = phase;
         self
     }
@@ -3521,7 +3518,7 @@ impl BoxRegistry {
             .unwrap_or_else(crate::bep_attach::mint_box_id);
         // The row's derived allow-list: the declaration's `allow_subnets`
         // dimension in its own spelling. `None` reaches this row only from
-        // the opt-out or the announced arm (`sessions::effective_egress`
+        // the opt-out or the announced arm (`boxes::effective_egress`
         // resolves it to present and empty in force), and there it is
         // allow-all, the meaning the compiled rules give `None`.
         let egress_allow_list = registration
@@ -4054,15 +4051,15 @@ impl BoxRegistry {
         // default is in force, unless the operator opted out — the shipped
         // allow-all otherwise. The row is compiled from what the box is held
         // to, so the host gate and the guest's gate agree.
-        let egress = match sessions::effective_egress(
+        let egress = match boxes::effective_egress(
             spec.egress.as_ref(),
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             self.egress_default_phase,
             self.egress_deny_all_opt_out,
         ) {
-            sessions::EffectiveEgress::Declared(policy) => Some(policy),
-            sessions::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
-            sessions::EffectiveEgress::AllowAll => None,
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            boxes::EffectiveEgress::AllowAll => None,
         };
         if let Some(policy) = egress {
             registration = registration.with_egress_policy(policy);
@@ -4917,7 +4914,7 @@ impl BoxRegistry {
     ///
     /// The hold is persisted ([`Self::persisting_to`]), so it survives a
     /// daemon restart.
-    pub fn hold_box_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
+    pub fn hold_box_name(&self, name: &str, owner: Option<boxes::SessionId>) -> bool {
         let old = {
             let mut held = self.held_names.write().expect(
                 "the held names' lock is never held across a panic, so it cannot be poisoned",
@@ -4954,7 +4951,7 @@ impl BoxRegistry {
     /// under whatever name it holds now (a rename moved it), plus `name`'s
     /// hold when no session owns it; a hold another session made under
     /// `name` stays. Without one, `name`'s hold goes whoever made it.
-    pub fn release_held_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
+    pub fn release_held_name(&self, name: &str, owner: Option<boxes::SessionId>) -> bool {
         let canonical = canonical_box_name(name);
         let mut held = self
             .held_names
@@ -5620,7 +5617,7 @@ impl BoxTable {
     /// octet arrays the publish decision compares a request's switch address
     /// by. The same bounds [`Self::is_allocatable`] decides frames by; the
     /// publish decision needs them as values because its table is an owned,
-    /// pure one ([`sessions::core::switch_request`]), built fresh per
+    /// pure one ([`boxes::core::switch_request`]), built fresh per
     /// request.
     #[must_use]
     pub fn ptask_run(&self) -> ([u8; 4], [u8; 4]) {
@@ -5755,8 +5752,8 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
 mod tests {
     use std::time::Duration;
 
-    use sessions::IpProto;
-    use sessions::core::egress::FrameVerdict;
+    use boxes::IpProto;
+    use boxes::core::egress::FrameVerdict;
     use switch::SwitchSubnet;
     use tokio::io::AsyncWriteExt;
 
@@ -5955,19 +5952,19 @@ mod tests {
         // applies — drops a frame to an address outside the LAN the first
         // declaration allowed, and admits the same frame under the row the
         // re-registration left.
-        let outside = sessions::core::egress::summarize(&ipv4_frame(
+        let outside = boxes::core::egress::summarize(&ipv4_frame(
             Ipv4Addr::new(100, 64, 0, 9).octets(),
             6,
             [203, 0, 113, 7],
             443,
         ));
         assert!(matches!(
-            sessions::core::egress::verdict(&outside, web.egress()),
+            boxes::core::egress::verdict(&outside, web.egress()),
             FrameVerdict::Drop(_)
         ));
         assert!(
             matches!(
-                sessions::core::egress::verdict(&outside, restated_row.egress()),
+                boxes::core::egress::verdict(&outside, restated_row.egress()),
                 FrameVerdict::Admit
             ),
             "the re-registration's reach is what the gate now decides by"
@@ -5985,7 +5982,7 @@ mod tests {
     /// and empty (NET-074), which does not touch the address rules below.
     #[test]
     fn undeclared_row_default_follows_phase_and_opt_out() {
-        use sessions::EgressDefaultPhase::{Announced, InForce};
+        use boxes::EgressDefaultPhase::{Announced, InForce};
 
         let reach_to = |phase, opt_out, egress: Option<EgressPolicy>, dest: [u8; 4]| {
             let registry = BoxRegistry::new(SUBNET)
@@ -6001,14 +5998,14 @@ mod tests {
                     dynamic_allowed_range: None,
                 })
                 .expect("the default plan hands out a client box");
-            let outside = sessions::core::egress::summarize(&ipv4_frame(
+            let outside = boxes::core::egress::summarize(&ipv4_frame(
                 row.switch_addr().octets(),
                 6,
                 dest,
                 443,
             ));
             matches!(
-                sessions::core::egress::verdict(&outside, row.egress()),
+                boxes::core::egress::verdict(&outside, row.egress()),
                 FrameVerdict::Admit
             )
         };
@@ -6914,9 +6911,9 @@ mod tests {
     #[test]
     fn held_box_names_persist_and_reload() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let owner = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
-        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+        let other = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
             .expect("a session id");
 
         let registry = persisted_registry(&dir);
@@ -6967,7 +6964,7 @@ mod tests {
         registry
             .register_client_box(client_spec("db"))
             .expect("the plan has an address for the box");
-        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let owner = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
         assert!(registry.hold_box_name("web", Some(owner)));
 
@@ -7022,7 +7019,7 @@ mod tests {
             }}"#,
         )
         .expect("a held-names file");
-        let first = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let first = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
 
         let registry = persisted_registry(&dir);
@@ -7051,9 +7048,9 @@ mod tests {
     #[test]
     fn an_unconfirmed_reloaded_hold_expires_and_a_reconfirmed_one_stays() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let gone = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let gone = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
-        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+        let live = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
             .expect("a session id");
         let before = persisted_registry(&dir);
         assert!(before.hold_box_name("old", Some(gone)));
@@ -7630,7 +7627,7 @@ mod tests {
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
             ..EgressPolicy::default()
         });
-        spec.credentialed_upstream = Some(sessions::CredentialedUpstream {});
+        spec.credentialed_upstream = Some(boxes::CredentialedUpstream {});
         spec.dynamic_ingress = Some(DynamicIngress::Allow);
         spec.dynamic_allowed_range = Some((9000, 9100));
         let web = registry
@@ -8558,24 +8555,24 @@ mod tests {
         // daemon's registry does: an A lookup for the published address,
         // NODATA for the name held at an address the host may not be told,
         // NXDOMAIN for a name no row holds.
-        let a = sessions::core::zone_answer::Lookup {
+        let a = boxes::core::zone_answer::Lookup {
             name: "web.min.internal".to_string(),
-            record: sessions::core::zone_answer::RecordType::A,
-            origin: sessions::core::zone_answer::Origin::OnMachine,
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
         };
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &view),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a held live name answers A with its published address"
         );
-        let lease_only = sessions::core::zone_answer::Lookup {
+        let lease_only = boxes::core::zone_answer::Lookup {
             name: "lease-only.min.internal".to_string(),
-            record: sessions::core::zone_answer::RecordType::A,
-            origin: sessions::core::zone_answer::Origin::OnMachine,
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
         };
         assert_eq!(
-            sessions::core::zone_answer::decide(&lease_only, &view),
-            sessions::core::zone_answer::Verdict::Nodata,
+            boxes::core::zone_answer::decide(&lease_only, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
             "a name held only at an address the host may not be told is NODATA"
         );
 
@@ -8595,8 +8592,8 @@ mod tests {
             "a stopped namespace keeps its name held, live: false"
         );
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &view),
-            sessions::core::zone_answer::Verdict::Nodata,
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
             "a stopped namespace answers NODATA, held"
         );
         registry.register(BoxRegistration::new(
@@ -8605,8 +8602,8 @@ mod tests {
             web.loopback_addr(),
         ));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a re-registration is a namespace that is running again"
         );
 
@@ -8614,8 +8611,8 @@ mod tests {
         // no name, so NXDOMAIN, never a stopped name held forever.
         assert!(registry.withdraw(web.switch_addr()).is_some());
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Nxdomain,
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
             "a withdrawn namespace's name is held by nothing"
         );
     }
@@ -8627,14 +8624,14 @@ mod tests {
     #[test]
     fn the_zone_view_holds_a_host_ip_box_name_with_no_row_behind_it() {
         let registry = BoxRegistry::new(SUBNET);
-        let a = sessions::core::zone_answer::Lookup {
+        let a = boxes::core::zone_answer::Lookup {
             name: "web.min.internal".to_string(),
-            record: sessions::core::zone_answer::RecordType::A,
-            origin: sessions::core::zone_answer::Origin::OnMachine,
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
         };
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Nxdomain,
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
             "a name nothing holds is NXDOMAIN, the pre-box state"
         );
 
@@ -8653,8 +8650,8 @@ mod tests {
             "a held name is held with no address and live"
         );
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &view),
-            sessions::core::zone_answer::Verdict::Nodata,
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
             "a held name answers NODATA: the box exists, no address to tell"
         );
 
@@ -8663,8 +8660,8 @@ mod tests {
         assert!(registry.release_held_name("web", None));
         assert!(!registry.release_held_name("web", None));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Nxdomain,
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
             "a released name answers nothing again"
         );
 
@@ -8677,14 +8674,14 @@ mod tests {
         ));
         assert!(registry.hold_box_name("web", None));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a name a row publishes answers the row's address, hold or no hold"
         );
         assert!(registry.release_held_name("web", None));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "the row keeps answering its address once the hold is gone"
         );
     }
@@ -8701,8 +8698,8 @@ mod tests {
                 .rows()
                 .any(|(held, _)| held == zone_name(name))
         };
-        let old = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let new = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let old = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let new = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
 
         // A newer session took the name: the old session's release leaves it.
         assert!(registry.hold_box_name("web", Some(old)));

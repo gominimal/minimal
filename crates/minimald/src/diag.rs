@@ -1010,7 +1010,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn diag_bundle_carries_the_box_zone_table() {
-        use sessions::SessionId;
+        use boxes::SessionId;
 
         let server = TestServer::new().await;
         server
@@ -1539,7 +1539,7 @@ mod tests {
             ts: chrono::Utc::now().to_rfc3339(),
             box_name: "web".to_string(),
             port,
-            decision: sessions::DynamicIngress::Allow,
+            decision: boxes::DynamicIngress::Allow,
             decided_by: crate::audit::DecidedBy::BoxPolicy,
             outcome: crate::audit::DecisionOutcome::Published,
             reason: None,

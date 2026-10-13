@@ -188,8 +188,8 @@ impl Loadout {
     /// the additive `with_*` methods:
     ///
     /// ```
-    /// use sessions::core::loadout::{Loadout, LoadoutName};
-    /// use sessions::core::primitives::{StrictVarName, VarValue};
+    /// use boxes::core::loadout::{Loadout, LoadoutName};
+    /// use boxes::core::primitives::{StrictVarName, VarValue};
     ///
     /// let l = Loadout::new(LoadoutName::try_new("dev").unwrap())
     ///     .with_package("helix")

@@ -13,9 +13,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
+use boxes::{NetworkMode, SessionId};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use sessions::{NetworkMode, SessionId};
 
 use crate::filter;
 use crate::rpc::{self, ProviderData};
@@ -54,8 +54,8 @@ pub struct ProviderView {
 /// The record + policy behind the detail pane, cached per session.
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
-    pub record: Option<sessions::Record>,
-    pub policy: Option<sessions::EffectiveSessionPolicy>,
+    pub record: Option<boxes::Record>,
+    pub policy: Option<boxes::EffectiveSessionPolicy>,
     /// Why the policy could not be fetched, when it could not: a daemon that
     /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
     /// says so instead of sitting on "loading policy…".
@@ -349,7 +349,7 @@ impl Model {
         const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
         const RECENT: chrono::Duration = chrono::Duration::seconds(5);
         if let Some(entry) = self.entry(key)
-            && !matches!(entry.status, sessions::SessionStatus::Active)
+            && !matches!(entry.status, boxes::SessionStatus::Active)
         {
             return "◌".to_string();
         }
@@ -897,7 +897,7 @@ pub struct DashOptions {
     /// loadouts + user policy), re-sent with every create so `n` in dash
     /// matches `min session activate`. Composition needs the CLI crate's
     /// config plumbing, which lives above this crate.
-    pub contribution: sessions::wire::request::WireContribution,
+    pub contribution: boxes::wire::request::WireContribution,
 }
 
 /// Entry point for `min dash`: discover providers, then drive the
@@ -1352,7 +1352,7 @@ mod tests {
             id: id(n),
             name: name.map(str::to_owned),
             project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),

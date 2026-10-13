@@ -203,7 +203,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -263,7 +263,7 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -413,7 +413,7 @@ impl FloodedAttach {
                 delta: None,
                 archives_dir: std::env::temp_dir(),
                 holds_host_row: false,
-                session_id: sessions::SessionId::nil(),
+                session_id: boxes::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
                 #[cfg(target_os = "linux")]
@@ -668,7 +668,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -731,7 +731,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -746,19 +746,19 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
     let codes = host.unwind_codes();
     let rendered = String::from_utf8_lossy(&codes).into_owned();
     assert!(
-        !rendered.contains(sessions::terminal::LEAVE_ALT_SCREEN),
+        !rendered.contains(boxes::terminal::LEAVE_ALT_SCREEN),
         "rmcup must not be sent for a session that never left the normal buffer: {rendered:?}",
     );
     assert!(
-        !rendered.contains(sessions::terminal::SHOW_CURSOR),
+        !rendered.contains(boxes::terminal::SHOW_CURSOR),
         "the cursor was never hidden, so nothing should unhide it: {rendered:?}",
     );
     assert_eq!(
         rendered,
         format!(
             "{}{}",
-            sessions::terminal::SGR_RESET,
-            sessions::terminal::FOCUS_REPORTING_OFF
+            boxes::terminal::SGR_RESET,
+            boxes::terminal::FOCUS_REPORTING_OFF
         ),
         "a clean screen unwinds to the two blind resets and nothing else",
     );
@@ -782,7 +782,7 @@ async fn a_kill_tells_the_binding_nothing() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -825,7 +825,7 @@ async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -1300,7 +1300,7 @@ async fn get_attrs_tracks_title_and_io_times() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -1378,7 +1378,7 @@ async fn kill_tears_down_host_and_reaps_process() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -1484,7 +1484,7 @@ async fn exit_releases_the_network() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -1540,7 +1540,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -1643,7 +1643,7 @@ async fn stale_binding_generation_input_is_discarded() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -1687,10 +1687,10 @@ async fn stale_binding_generation_input_is_discarded() {
 /// A composition with nothing in it. [`Host::hook_plan`] needs a composition
 /// to exist before it will plan a hook run, but no hook script is run by the
 /// plan itself, so an empty one is enough to test the wiring.
-fn bare_composition() -> Arc<sessions::core::compose::Composition> {
-    use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+fn bare_composition() -> Arc<boxes::core::compose::Composition> {
+    use boxes::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
     Arc::new(
-        sessions::core::compose::Composition::try_from(WireComposition {
+        boxes::core::compose::Composition::try_from(WireComposition {
             version: COMPOSITION_SNAPSHOT_VERSION,
             vars: Vec::new(),
             patches: Vec::new(),
@@ -1716,7 +1716,7 @@ impl SessionLauncher for SealingMockLauncher {
     async fn launch(
         self,
         _guest: bool,
-        _session_id: sessions::SessionId,
+        _session_id: boxes::SessionId,
         _name: String,
         _username: String,
         _paths: SessionPaths,
@@ -1777,7 +1777,7 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 delta: None,
                 archives_dir: std::env::temp_dir(),
                 holds_host_row: false,
-                session_id: sessions::SessionId::nil(),
+                session_id: boxes::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
                 #[cfg(target_os = "linux")]
@@ -2011,8 +2011,8 @@ fn daemon_enters_its_own_leaf() {
 #[test]
 fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
     use crate::net::classifier::{Cause, Decision};
+    use boxes::NetworkMode;
     use sandbox::config::Verdict;
-    use sessions::NetworkMode;
 
     const BROKEN_IMAGE: &str = "(broken guest image)";
     const INTERIM: &str = "(guest-side classifier enforcement is not available yet)";
@@ -2225,7 +2225,7 @@ fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
     let cohort = tree.path().join(sandbox::classifier::BOXES_DIR);
     let subtree = cohort.join(sandbox::config::DENY_DIR);
     std::fs::create_dir_all(&subtree).expect("the cohort directory and its subtree");
-    let id = sessions::SessionId::nil();
+    let id = boxes::SessionId::nil();
     // One verdict for the whole proof: the reclaim is the same code path in
     // either subtree, and a box's verdict is fixed at create.
     let verdict = sandbox::config::Verdict::Deny;
@@ -2304,7 +2304,7 @@ fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
 /// is about to run.
 #[test]
 fn host_ip_enforcement_says_what_the_launch_decided() {
-    use sessions::NetworkMode;
+    use boxes::NetworkMode;
 
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
     std::fs::create_dir_all(
@@ -2321,10 +2321,10 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
         )
         .expect("the leaf the launch places its box in"),
     );
-    let deny_all = sessions::EgressPolicy::deny_all();
+    let deny_all = boxes::EgressPolicy::deny_all();
     let placed = |mode,
                   leaf: Option<sandbox::config::ClassifierLeaf>,
-                  declaration: Option<&sessions::EgressPolicy>| {
+                  declaration: Option<&boxes::EgressPolicy>| {
         super::host_ip_enforcement(mode, leaf.as_ref(), declaration)
     };
 
@@ -2378,7 +2378,7 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
 /// never had.
 #[test]
 fn launch_record_never_per_box_for_unenforceable_declaration() {
-    use sessions::NetworkMode;
+    use boxes::NetworkMode;
 
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
     std::fs::create_dir_all(
@@ -2395,15 +2395,15 @@ fn launch_record_never_per_box_for_unenforceable_declaration() {
         )
         .expect("the leaf the launch places its box in"),
     );
-    let deny_all = sessions::EgressPolicy::deny_all();
+    let deny_all = boxes::EgressPolicy::deny_all();
     // The narrowing shapes the classifier cannot enforce, in the CLI's own
     // spellings: a denied range over an allow-all, and an allow list that
     // narrows one.
-    let deny_a_range = sessions::EgressPolicy {
+    let deny_a_range = boxes::EgressPolicy {
         deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
         ..Default::default()
     };
-    let allow_a_subnet = sessions::EgressPolicy {
+    let allow_a_subnet = boxes::EgressPolicy {
         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
         ..deny_all.clone()
     };
@@ -2648,7 +2648,7 @@ async fn every_line_of_a_multi_line_closure_report_is_read() {
 /// decisions, and nothing that could fetch or build. The state dir travels
 /// out with the launcher, because the context reads it long after this
 /// returns.
-fn sandbox_launcher(network_mode: sessions::NetworkMode) -> (SandboxLauncher, tempfile::TempDir) {
+fn sandbox_launcher(network_mode: boxes::NetworkMode) -> (SandboxLauncher, tempfile::TempDir) {
     let state = tempfile::tempdir().expect("a state dir for the launcher's context");
     (launcher_in(network_mode, state.path()), state)
 }
@@ -2657,11 +2657,8 @@ fn sandbox_launcher(network_mode: sessions::NetworkMode) -> (SandboxLauncher, te
 /// than one launch can hold one daemon's state under all of them — the real
 /// daemon builds one launcher per launch, so the per-launch construction is
 /// production's shape; only the state dir is shared.
-fn launcher_in(
-    network_mode: sessions::NetworkMode,
-    state_path: &std::path::Path,
-) -> SandboxLauncher {
-    launcher_with(network_mode, state_path, sessions::SessionPolicy::default())
+fn launcher_in(network_mode: boxes::NetworkMode, state_path: &std::path::Path) -> SandboxLauncher {
+    launcher_with(network_mode, state_path, boxes::SessionPolicy::default())
 }
 
 /// The same launcher carrying the session's policy, so a test can launch a
@@ -2669,9 +2666,9 @@ fn launcher_in(
 /// classifier decides a host-address box by is read off this policy
 /// (NET-079), and nothing else about the launcher changes.
 fn launcher_with(
-    network_mode: sessions::NetworkMode,
+    network_mode: boxes::NetworkMode,
     state_path: &std::path::Path,
-    policy: sessions::SessionPolicy,
+    policy: boxes::SessionPolicy,
 ) -> SandboxLauncher {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let config = mctx::ConfigBuilder::new()
@@ -2736,7 +2733,7 @@ fn launcher_with(
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
-    use sessions::NetworkMode;
+    use boxes::NetworkMode;
 
     // The one host state this proof cannot run on: a tree this daemon can
     // place a child in. The refusal it asserts is the guest's answer to a
@@ -2795,7 +2792,7 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
             Duration::from_secs(30),
             launcher.launch(
                 guest,
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "refusal-proof".to_string(),
                 "guest".to_string(),
                 test_paths(),
@@ -2890,8 +2887,8 @@ fn a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
+    use boxes::NetworkMode;
     use sandbox::config::Verdict;
-    use sessions::NetworkMode;
 
     // The window the launches write the daemon's process-global classifier
     // fact in — every host-address launch re-reads it, and the proof below
@@ -2964,7 +2961,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
     // refusal is the placed deny-all box over the two probe causes, pinned
     // beside this with its words.
     assert_eq!(
-        crate::net::classifier::verdict_of(Some(&sessions::EgressPolicy::deny_all())),
+        crate::net::classifier::verdict_of(Some(&boxes::EgressPolicy::deny_all())),
         Verdict::Deny,
         "the deny-all declaration still picks the deny subtree"
     );
@@ -3026,16 +3023,16 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
     ];
     const RECORD: &str = "the session's host-address box runs unenforced on this host";
     const MACHINE_FIELD: &str = "host_ip_enforcement=none";
-    let section = sessions::EgressPolicy {
+    let section = boxes::EgressPolicy {
         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-        ..sessions::EgressPolicy::deny_all()
+        ..boxes::EgressPolicy::deny_all()
     };
     let state = tempfile::tempdir().expect("a state dir for the daemon's context");
     for (label, name, egress) in [
         (
             "a deny-all box",
             "unenforced-proof-deny-all",
-            sessions::EgressPolicy::deny_all(),
+            boxes::EgressPolicy::deny_all(),
         ),
         (
             "a box carrying an egress section",
@@ -3046,7 +3043,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
         let mut launcher = launcher_with(
             NetworkMode::HostNet,
             state.path(),
-            sessions::SessionPolicy::new(Some(egress), None),
+            boxes::SessionPolicy::new(Some(egress), None),
         );
         // The stand-in tree, not the host's: the launch's leaf, its probe
         // and its reclaim all read this one root, and its decision and its
@@ -3060,7 +3057,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
             Duration::from_secs(30),
             launcher.launch(
                 false,
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 name.to_string(),
                 "user".to_string(),
                 test_paths(),
@@ -3138,8 +3135,8 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises() {
+    use boxes::NetworkMode;
     use sandbox::config::Verdict;
-    use sessions::NetworkMode;
 
     // The window the launches write the daemon's process-global classifier
     // fact in — every host-address launch re-reads it — taken for the whole
@@ -3192,9 +3189,9 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
     const MACHINE_FIELD: &str = "host_ip_enforcement=none";
     const NO_LEAF: &str = "this host places no classifier leaf for this session";
     const REFUSAL: &str = "was refused rather than run unenforced";
-    let section = sessions::EgressPolicy {
+    let section = boxes::EgressPolicy {
         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-        ..sessions::EgressPolicy::deny_all()
+        ..boxes::EgressPolicy::deny_all()
     };
     let state = tempfile::tempdir().expect("a state dir for the daemon's context");
     for (cause, probe_read, name, egress) in [
@@ -3205,7 +3202,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
             // record says so, and the reading settles TableNotEffective.
             "the table did not refuse the probe",
             "probe-cause-proof-ineffective",
-            sessions::EgressPolicy::deny_all(),
+            boxes::EgressPolicy::deny_all(),
         ),
         (
             "TableNotEffective",
@@ -3217,7 +3214,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
             "ProbeUnreadable",
             "the table's effect could not be read",
             "probe-cause-proof-unreadable",
-            sessions::EgressPolicy::deny_all(),
+            boxes::EgressPolicy::deny_all(),
         ),
         (
             "ProbeUnreadable",
@@ -3237,7 +3234,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
         let mut launcher = launcher_with(
             NetworkMode::HostNet,
             state.path(),
-            sessions::SessionPolicy::new(Some(egress), None),
+            boxes::SessionPolicy::new(Some(egress), None),
         );
         launcher.classifier_root = root.clone();
         launcher.classifier_mountinfo = Some(mountinfo.clone());
@@ -3245,7 +3242,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
             Duration::from_secs(30),
             launcher.launch(
                 false,
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 name.to_string(),
                 "user".to_string(),
                 test_paths(),
@@ -3312,8 +3309,8 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_box() {
+    use boxes::NetworkMode;
     use sandbox::config::Verdict;
-    use sessions::NetworkMode;
 
     // The window the launches write the daemon's process-global classifier
     // fact in — every host-address launch re-reads it — taken for the whole
@@ -3354,15 +3351,15 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     const REFUSAL: &str = "host_ip boxes on this host enforce only deny-all egress";
     // The box's declaration: the narrowing a per-box host has no verdict for,
     // in the CLI's own spelling of `--deny-subnets`.
-    let narrowing = sessions::SessionPolicy::new(
-        Some(sessions::EgressPolicy {
+    let narrowing = boxes::SessionPolicy::new(
+        Some(boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         }),
         None,
     );
     let state = tempfile::tempdir().expect("a state dir for the daemon's context");
-    let session_id = sessions::SessionId::parse_str("e2ea79c1-0000-4000-8000-000000000001")
+    let session_id = boxes::SessionId::parse_str("e2ea79c1-0000-4000-8000-000000000001")
         .expect("a session id the proof names its box by");
 
     // The fact as this box's create read it: a host that cannot decide per
@@ -3486,7 +3483,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     let mut launcher = launcher_with(
         NetworkMode::HostNet,
         state.path(),
-        sessions::SessionPolicy::default(),
+        boxes::SessionPolicy::default(),
     );
     launcher.classifier_root = root.clone();
     launcher.classifier_mountinfo = Some(mountinfo.clone());
@@ -3494,7 +3491,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         Duration::from_secs(30),
         launcher.launch(
             false,
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
             "race-proof-plain".to_string(),
             "user".to_string(),
             test_paths(),
@@ -3539,7 +3536,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
-    use sessions::NetworkMode;
+    use boxes::NetworkMode;
 
     // The one host state this proof cannot run on: a tree this daemon can
     // place a child in (the guest refusal test's skip, for the same reason).
@@ -3594,7 +3591,7 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
                 // instead of advised, so only the native launch reaches the
                 // record.
                 false,
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 name.to_string(),
                 "user".to_string(),
                 test_paths(),
@@ -3652,7 +3649,7 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hook_launch_does_not_advise_unenforced_placement() {
-    use sessions::NetworkMode;
+    use boxes::NetworkMode;
 
     // The one host state this proof cannot run on: a tree this daemon can
     // place a child in (the guest refusal test's skip, for the same reason).
@@ -3710,7 +3707,7 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
         Duration::from_secs(30),
         launcher_in(NetworkMode::HostNet, state.path()).launch(
             false,
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
             SESSION.to_string(),
             "user".to_string(),
             test_paths(),
@@ -3736,7 +3733,7 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
         Duration::from_secs(30),
         hook_launcher.launch(
             false,
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
             HOOK.to_string(),
             "user".to_string(),
             test_paths(),
@@ -3784,8 +3781,8 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
 /// the text are decided where they are written.
 #[test]
 fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
+    use boxes::NetworkMode;
     use sandbox::config::Verdict;
-    use sessions::NetworkMode;
     use std::path::Path;
 
     // The gate: the placement and the decision, never the host kind. A
@@ -3886,7 +3883,7 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
-    use sessions::NetworkMode;
+    use boxes::NetworkMode;
 
     // The guest refusal test's skip, for the same reason read for this
     // proof: the assertions below measure a launch the guest *refuses*, so
@@ -3923,16 +3920,16 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
         "has not loaded the classifier table",
     ];
     const RECORD: &str = "the session's host-address box runs unenforced on this host";
-    let section = sessions::EgressPolicy {
+    let section = boxes::EgressPolicy {
         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-        ..sessions::EgressPolicy::deny_all()
+        ..boxes::EgressPolicy::deny_all()
     };
     let state = tempfile::tempdir().expect("a state dir for the daemon's context");
     for (label, name, egress) in [
         (
             "a deny-all box",
             "guest-silent-proof-deny-all",
-            sessions::EgressPolicy::deny_all(),
+            boxes::EgressPolicy::deny_all(),
         ),
         (
             "a box carrying an egress section",
@@ -3943,7 +3940,7 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
         let launcher = launcher_with(
             NetworkMode::HostNet,
             state.path(),
-            sessions::SessionPolicy::new(Some(egress), None),
+            boxes::SessionPolicy::new(Some(egress), None),
         );
         let outcome = tokio::time::timeout(
             Duration::from_secs(30),
@@ -3951,7 +3948,7 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
                 // The guest: the one host that refuses what it cannot
                 // decide a verdict for.
                 true,
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 name.to_string(),
                 "user".to_string(),
                 test_paths(),
@@ -4008,8 +4005,8 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
 /// construction.
 #[test]
 fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
+    use boxes::NetworkMode;
     use sandbox::config::Verdict;
-    use sessions::NetworkMode;
 
     // A placed leaf of a box that carries an egress section — the one the
     // interim lets run. Its directory is the shape the daemon's placement
@@ -4033,7 +4030,7 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
     let recorded = super::host_ip_enforcement(
         NetworkMode::HostNet,
         Some(&leaf),
-        Some(&sessions::EgressPolicy::deny_all()),
+        Some(&boxes::EgressPolicy::deny_all()),
     );
     assert_eq!(
         recorded,
@@ -4152,9 +4149,9 @@ async fn dynamic_ingress_box(
     server: &TestServer,
     client: &mut crate::test_harness::TestClient,
     name: &str,
-    mode: Option<sessions::DynamicIngress>,
+    mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
-) -> (sessions::SessionId, crate::session::SessionHandle) {
+) -> (boxes::SessionId, crate::session::SessionHandle) {
     // The loopback verdict vouches for the handed address, so the registry
     // publishes the box at it — the address a runtime publish binds at.
     let manager = server.state.sessions_manager().await;
@@ -4269,7 +4266,7 @@ async fn expose_ask_human_deny_refused() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -4386,7 +4383,7 @@ async fn expose_ask_answered_after_the_stall_bound_publishes() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -4468,7 +4465,7 @@ async fn expose_ask_answered_after_the_stall_bound_publishes() {
         minimald_rpc::LiveMapping {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             pending: Some(false),
         },
         "the publish the human allowed is the one an allow box's takes"
@@ -4565,7 +4562,7 @@ async fn expose_ask_shed_mid_dialog_is_the_daemons_refusal() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -4737,7 +4734,7 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -4897,7 +4894,7 @@ async fn expose_ask_client_eof_mid_dialog_is_the_daemons_refusal() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -5014,7 +5011,7 @@ async fn expose_ask_after_detaching_is_refused_by_the_live_host() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -5179,7 +5176,7 @@ async fn expose_ask_answers_reach_their_own_ask_on_a_shared_port() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -5315,7 +5312,7 @@ async fn expose_ask_answers_reach_their_own_ask_on_a_shared_port() {
         minimald_rpc::LiveMapping {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             pending: Some(false),
         },
         "the publish is the one an allow box's request takes"
@@ -5415,7 +5412,7 @@ async fn expose_ask_prompts_attached_human() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -5477,7 +5474,7 @@ async fn expose_ask_prompts_attached_human() {
         minimald_rpc::LiveMapping {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             pending: Some(false),
         },
         "the publish the human allowed is the one an allow box's takes"
@@ -5540,7 +5537,7 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
         "askgate",
         switch,
         std::net::Ipv4Addr::new(127, 0, 64, 92),
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -5552,7 +5549,7 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
     let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
         "askgate".to_string(),
         switch,
-        &sessions::SessionPolicy::default(),
+        &boxes::SessionPolicy::default(),
         crate::net::SwitchSubnet::default(),
         None,
     ));
@@ -5622,7 +5619,7 @@ async fn expose_ask_without_client_refused() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -5693,7 +5690,7 @@ async fn expose_unenrolled_decision_audited() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Allow),
+        Some(boxes::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
@@ -5778,7 +5775,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         "web",
         switch,
         std::net::Ipv4Addr::new(127, 0, 64, 93),
-        Some(sessions::DynamicIngress::Allow),
+        Some(boxes::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
@@ -5791,7 +5788,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
         "web".to_string(),
         switch,
-        &sessions::SessionPolicy::default(),
+        &boxes::SessionPolicy::default(),
         crate::net::SwitchSubnet::default(),
         None,
     ));
@@ -5909,9 +5906,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
 /// and returns the withdrawal the VM host daemon's door read. The door holds
 /// the withdrawal's reply while the switch's requests are checked, so the
 /// unexpose is proved to come first, the order every unwind holds.
-async fn unaudited_vm_withdrawal(
-    mode: sessions::DynamicIngress,
-) -> minimald_rpc::BoxControlRequest {
+async fn unaudited_vm_withdrawal(mode: boxes::DynamicIngress) -> minimald_rpc::BoxControlRequest {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let (_web, handle) =
@@ -5941,7 +5936,7 @@ async fn unaudited_vm_withdrawal(
         .await
         .expect("the publish reaches the VM host daemon's door")
         .expect("the report door stand-in lives");
-    let admitted = if mode == sessions::DynamicIngress::Ask {
+    let admitted = if mode == boxes::DynamicIngress::Ask {
         assert!(
             matches!(admit, minimald_rpc::BoxControlRequest::AdmitAsk(_)),
             "an ask is raised with the host first: {admit:?}"
@@ -5949,7 +5944,7 @@ async fn unaudited_vm_withdrawal(
         host_end(minimald_rpc::AskAdmitOutcome::Admitted {
             ask_id: host_ask_id(),
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         })
     } else {
         assert!(
@@ -5958,7 +5953,7 @@ async fn unaudited_vm_withdrawal(
         );
         minimald_rpc::BoxControlReply::PortRecorded {
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         }
     };
     replies
@@ -5980,7 +5975,7 @@ async fn unaudited_vm_withdrawal(
     replies
         .send(minimald_rpc::BoxControlReply::PortRecorded {
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         })
         .expect("the report door stand-in lives");
     assert!(
@@ -6003,11 +5998,11 @@ async fn unaudited_vm_withdrawal(
 async fn unaudited_allow_withdraws_the_vm_row_under_its_source() {
     for (mode, source) in [
         (
-            sessions::DynamicIngress::Allow,
+            boxes::DynamicIngress::Allow,
             minimald_rpc::PortReportSource::Expose,
         ),
         (
-            sessions::DynamicIngress::Ask,
+            boxes::DynamicIngress::Ask,
             minimald_rpc::PortReportSource::Ask,
         ),
     ] {
@@ -6016,7 +6011,7 @@ async fn unaudited_allow_withdraws_the_vm_row_under_its_source() {
             minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
                 switch_address: ASK_SWITCH,
                 port: 3000,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source,
             }),
             "the {mode} publish's row entry is withdrawn under its own source"
@@ -6040,7 +6035,7 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Allow),
+        Some(boxes::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
@@ -6086,7 +6081,7 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
     replies
         .send(minimald_rpc::BoxControlReply::PortRecorded {
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         })
         .expect("the report door stand-in lives");
     // The caller hears the failed publish the fail-closed path owes, naming
@@ -6164,7 +6159,7 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Allow),
+        Some(boxes::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
@@ -6244,7 +6239,7 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
     replies
         .send(minimald_rpc::BoxControlReply::PortRecorded {
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         })
         .expect("the report door stand-in lives");
 
@@ -6260,7 +6255,7 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
         minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
             switch_address: ASK_SWITCH,
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             source: minimald_rpc::PortReportSource::Expose,
         }),
         "the row entry is withdrawn once no sweep is left to retry it"
@@ -6280,7 +6275,7 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
     replies
         .send(minimald_rpc::BoxControlReply::PortRecorded {
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         })
         .expect("the report door stand-in lives");
     assert!(
@@ -6328,7 +6323,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
-            session_id: sessions::SessionId::nil(),
+            session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
             #[cfg(target_os = "linux")]
@@ -6393,7 +6388,7 @@ fn per_launch_guest_reading_uses_the_held_listener() {
 /// echo round-trips through it.
 async fn attach_live_shell(
     client: &mut crate::test_harness::TestClient,
-    web: sessions::SessionId,
+    web: boxes::SessionId,
 ) -> russh::Channel<russh::client::Msg> {
     let mut channel = client.open_shell(web).await;
     channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
@@ -6455,7 +6450,7 @@ async fn expect_admit_ask(
         minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
             switch_address: ASK_SWITCH,
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         }),
         "the ask carries the row key, the port and the protocol, and nothing else"
     );
@@ -6483,7 +6478,7 @@ async fn guest_ask_prompt_not_rendered_on_vm_host() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -6519,7 +6514,7 @@ async fn guest_ask_prompt_not_rendered_on_vm_host() {
         .send(host_end(minimald_rpc::AskAdmitOutcome::Admitted {
             ask_id: host_ask_id(),
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         }))
         .expect("the report door stand-in lives");
     let mapping = tokio::time::timeout(Duration::from_secs(30), asked)
@@ -6550,7 +6545,7 @@ async fn native_ask_prompt_still_renders() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -6588,7 +6583,7 @@ async fn ask_no_or_no_tty_records_nothing() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -6670,7 +6665,7 @@ async fn vm_ask_ended_by_host_audited(
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -6827,7 +6822,7 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
         &server,
         &mut client,
         "web",
-        Some(sessions::DynamicIngress::Ask),
+        Some(boxes::DynamicIngress::Ask),
         Some((3000, 3999)),
     )
     .await;
@@ -6843,7 +6838,7 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
         .send(host_end(minimald_rpc::AskAdmitOutcome::Admitted {
             ask_id: host_ask_id(),
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         }))
         .expect("the report door stand-in lives");
     tokio::time::timeout(Duration::from_secs(30), asked)
@@ -6880,7 +6875,7 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
     replies
         .send(minimald_rpc::BoxControlReply::PortRecorded {
             port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
         })
         .expect("the report door stand-in lives");
     tokio::time::timeout(Duration::from_secs(30), stop)

@@ -261,7 +261,7 @@ pub(crate) async fn complete_own_ip_attach(
     control: ControlChannel,
     lease: PtaskLease,
     session_name: &str,
-    policy: Option<&sessions::SessionPolicy>,
+    policy: Option<&boxes::SessionPolicy>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
     handed_from_host: bool,
 ) -> io::Result<OwnIpGuard> {
@@ -374,7 +374,7 @@ async fn finish_own_ip_attach(
     control: ControlChannel,
     lease: PtaskLease,
     session_name: &str,
-    ingress: Option<&sessions::IngressPolicy>,
+    ingress: Option<&boxes::IngressPolicy>,
     gate: Option<&Arc<SessionGate>>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
@@ -558,7 +558,7 @@ mod tests {
     use crate::net::policy::{ControlChannel, register_dns_name};
     use crate::net::provider::network_for;
     use crate::test_harness::CaptureWriter;
-    use sessions::BoxAddresses;
+    use boxes::BoxAddresses;
 
     /// A lease at `ip` for an attach whose switch never handed it: epoch 0,
     /// which no allocator hands, so its teardown releases nothing.
@@ -822,7 +822,7 @@ mod tests {
         let handed_switch = Ipv4Addr::new(100, 64, 128, 9);
         let handed_loopback = Ipv4Addr::new(127, 0, 64, 9);
         let net = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "web",
             None,
@@ -873,7 +873,7 @@ mod tests {
         // came from, so the two allocators cannot meet and the handed
         // address is never drawn.
         let unregistered = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "other",
             None,
@@ -908,7 +908,7 @@ mod tests {
         // and the refusal spends nothing: no lease joins the table, no
         // attach is counted.
         let colliding_reserve = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "third",
             None,
@@ -944,7 +944,7 @@ mod tests {
         // table holds exactly the drawn lease and the handed one, nothing
         // drawn beside it, and the attach counts like any other.
         let reattached = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "web",
             None,
@@ -983,7 +983,7 @@ mod tests {
         // two taps on one address would key one PTask's frames to the
         // other's host-side row. The refusal spends nothing.
         let colliding_live = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "fourth",
             None,
@@ -1253,19 +1253,19 @@ mod tests {
 
     /// The two declared ports the NET-121 proofs publish: host `:8080` and
     /// `:9090`, each forwarding to its own number on the box.
-    fn declared_two_ports() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+    fn declared_two_ports() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 9090,
                         internal_port: 90,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -1279,24 +1279,24 @@ mod tests {
     /// Three declared ports — one more than any one attach can bind before a
     /// refusal — so a proof can show the rollback of a half-bound box: two
     /// bound, the third refused, and the two unbound with it.
-    fn declared_three_ports() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+    fn declared_three_ports() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 9090,
                         internal_port: 90,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 7070,
                         internal_port: 70,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -1331,7 +1331,7 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
@@ -1418,7 +1418,7 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         let policy = declared_two_ports();
 
@@ -1429,16 +1429,12 @@ mod tests {
         {
             let mut reg = registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090]),
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
         let dns::ZoneEntry::Held {
             address: held_from_finalize,
@@ -1597,13 +1593,13 @@ mod tests {
         {
             let mut reg = refused.registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090, 7070]),
             );
             reg.register_own_ip(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 BTreeSet::from([8080, 9090, 7070]),
             );
@@ -1711,16 +1707,12 @@ mod tests {
         {
             let mut reg = failed.registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090]),
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
         let held_before = failed
             .registry
@@ -1874,11 +1866,7 @@ mod tests {
                 .registry
                 .write()
                 .expect("registry lock")
-                .register_own_ip(
-                    sessions::SessionId::nil(),
-                    "web",
-                    BTreeSet::from([8080, 9090])
-                )
+                .register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]))
                 .is_none(),
             "finalize with no hand registers no name"
         );
@@ -1953,7 +1941,7 @@ mod tests {
             .write()
             .expect("registry lock")
             .publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090]),
@@ -2098,14 +2086,14 @@ mod tests {
 
         // Finalize has run for both boxes: the holder published 8080 first,
         // and this box (the nil id) yields it.
-        let holder = sessions::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
+        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
             .expect("a valid id");
         {
             let mut reg = scenario.registry.write().expect("registry lock");
             reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
             reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
             let collisions = reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 SHARED,
                 BTreeSet::from([8080, 9090]),
@@ -2115,11 +2103,7 @@ mod tests {
                 vec![8080],
                 "the later box yields the held port"
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
 
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
@@ -2200,7 +2184,7 @@ mod tests {
             .write()
             .expect("registry lock")
             .publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 PUBLISHED,
                 BTreeSet::from([8080, 9090]),
@@ -2232,7 +2216,7 @@ mod tests {
             PUBLISHED,
             FIRST_LEASE,
             3000,
-            sessions::IpProto::Tcp,
+            boxes::IpProto::Tcp,
             None,
         )
         .await
@@ -2249,7 +2233,7 @@ mod tests {
                 mapping: minimald_rpc::LiveMapping {
                     local: forwarder.local().to_string(),
                     internal_port: forwarder.internal_port(),
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                     // The gate-less runtime publish this test drives reads
                     // as reachable — there is no relay gate to have
                     // admitted the port — so the field says so outright
@@ -2310,7 +2294,7 @@ mod tests {
                 .registry
                 .read()
                 .expect("registry lock")
-                .own_lease(sessions::SessionId::nil()),
+                .own_lease(boxes::SessionId::nil()),
             Some(SECOND_LEASE),
             "the registry's lease, which the next publish delivers to, is the new spawn's"
         );
@@ -2655,15 +2639,15 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         // One declared port: host :48080 forwards to the box's :80.
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: HOST_PORT,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -2677,16 +2661,12 @@ mod tests {
         {
             let mut reg = registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([HOST_PORT]),
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([HOST_PORT]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([HOST_PORT]));
         }
 
         let mut fds = [0 as libc::c_int; 2];
@@ -2924,22 +2904,22 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         // Two declared ports, one in-box port: the shape that makes a
         // revocation's scoping observable.
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: REVOKED_PORT,
                         internal_port: INTERNAL_PORT,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: SIBLING_PORT,
                         internal_port: INTERNAL_PORT,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -2954,13 +2934,13 @@ mod tests {
         {
             let mut reg = registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([REVOKED_PORT, SIBLING_PORT]),
             );
             reg.register_own_ip(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 BTreeSet::from([REVOKED_PORT, SIBLING_PORT]),
             );
@@ -3289,7 +3269,7 @@ mod tests {
             .write()
             .expect("registry lock")
             .publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080u16, 9090]),

@@ -81,7 +81,7 @@ impl fmt::Display for IpProto {
 // These are the wire types `minimald-rpc` exposes; they live here (and are
 // re-exported up to `minimald-rpc`) so that `Record` — the only live
 // per-session store — can carry the policy configured at launch directly,
-// without a dependency cycle (`minimald-rpc` depends on `sessions`, not the
+// without a dependency cycle (`minimald-rpc` depends on `boxes`, not the
 // reverse). They are deliberately *not* `#[non_exhaustive]`: they are
 // constructed by literal at the config↔wire mapping sites across crates.
 // ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ pub struct PortMapping {
     pub proto: IpProto,
 }
 
-/// The hostnames NET-068's integration test exercises. Kept in `sessions` so
+/// The hostnames NET-068's integration test exercises. Kept in `boxes` so
 /// the `minimald` unit fixture and the `minvmd` integration test share one
 /// list and cannot drift.
 ///

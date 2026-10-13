@@ -46,10 +46,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use serial_test::serial;
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
 mod common;
@@ -58,7 +58,7 @@ mod common;
 /// protocols beyond TCP). Every operation's reach must be earned by DNS-pinned
 /// admission. The list is shared with the `minimald` unit fixture so the two
 /// cannot drift.
-const TOOLCHAIN_HOSTS: &[&str] = sessions::NET068_TOOLCHAIN_EGRESS_HOSTS;
+const TOOLCHAIN_HOSTS: &[&str] = boxes::NET068_TOOLCHAIN_EGRESS_HOSTS;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
 /// provider sockets beneath a default tempdir would overflow sun_path (104).
@@ -478,7 +478,7 @@ packages = [
 async fn create_toolchain_session(
     sock_path: &Path,
     control_sock: &Path,
-) -> Result<sessions::SessionId, String> {
+) -> Result<boxes::SessionId, String> {
     use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -502,8 +502,8 @@ async fn create_toolchain_session(
         .unwrap_or(0);
 
     let name = format!("hostname-allowlist-{uniq:x}");
-    let egress = sessions::EgressPolicy {
-        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    let egress = boxes::EgressPolicy {
+        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
         allow_subnets: Some(Vec::new()),
         allow_dns_hosts: Some(TOOLCHAIN_HOSTS.iter().map(|h| (*h).to_string()).collect()),
         deny_subnets: None,
@@ -518,8 +518,8 @@ async fn create_toolchain_session(
             name: Some(name),
             project_path: paths::HostAbsPath::try_new("/tmp")
                 .map_err(|e| format!("project_path: {e}"))?,
-            network: sessions::NetworkMode::OwnIp,
-            policy: sessions::SessionPolicy::new(Some(egress), None),
+            network: boxes::NetworkMode::OwnIp,
+            policy: boxes::SessionPolicy::new(Some(egress), None),
             // The addresses the registration handed back, so the in-VM
             // daemon attaches the box at its row's lease.
             task_addresses: Vec::new(),
@@ -606,7 +606,7 @@ async fn connect_and_auth(
 /// in the workspace (the SFTP subsystem presents `/workbench` as the root).
 async fn upload_workspace_file(
     handle: &mut russh::client::Handle<ClientHandler>,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     remote_path: &str,
     contents: &str,
 ) -> Result<(), String> {
@@ -716,7 +716,7 @@ where
     HookResult::decided(Vec::new())
 }
 
-/// Phase 3 of the compose flow (see `crates/sessions/docs/COMPOSITION.md`):
+/// Phase 3 of the compose flow (see `crates/boxes/docs/COMPOSITION.md`):
 /// gate the daemon's pending items with [`ApproveExpectedVar`] and ship the verdict
 /// with `SubmitVerdict`. Package patches whose source does not exist on this
 /// host come back `Ignored`; an `Approved` patch would need the
@@ -724,11 +724,11 @@ where
 /// not, so it is reported rather than left to fail at `FinalizeSession`.
 async fn submit_gated_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
-    response: sessions::wire::request::ContributionResponse,
+    response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
+    use boxes::wire::policy::WirePatchVerdict;
+    use boxes::wire::request::SessionStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
-    use sessions::wire::policy::WirePatchVerdict;
-    use sessions::wire::request::SessionStep;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     eprintln!(
@@ -737,12 +737,12 @@ async fn submit_gated_verdict(
         response.patches.len(),
         response.lifecycle_hooks.len(),
     );
-    let (verdict, _policy) = sessions::client::handler::handle_response(
+    let (verdict, _policy) = boxes::client::handler::handle_response(
         response,
         &[],
-        sessions::core::policy::UserPolicy::empty(),
+        boxes::core::policy::UserPolicy::empty(),
         &ApproveExpectedVar,
-        sessions::core::compose::ComposeOptions::default(),
+        boxes::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
     .map_err(|e| format!("gating pending items: {e}"))?;
@@ -795,7 +795,7 @@ async fn submit_gated_verdict(
 /// `FinalizeSession`.
 async fn configure_and_finalize(
     handle: &mut russh::client::Handle<ClientHandler>,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
 ) -> Result<(), String> {
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, FinalizeSession,
@@ -886,7 +886,7 @@ async fn configure_and_finalize(
 /// `(stdout, stderr, exit_status)`.
 async fn run_session_exec(
     sock_path: &Path,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     command: &str,
 ) -> Result<(String, String, Option<u32>), String> {
     use russh::ChannelMsg;

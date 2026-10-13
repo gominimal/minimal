@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use sessions::core::egress::{IPPROTO_TCP, IPPROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 

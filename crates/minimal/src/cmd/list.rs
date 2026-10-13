@@ -225,7 +225,7 @@ pub(crate) fn duplicate_session_warning(
     let existing = entries
         .iter()
         .filter(|e| e.project_path.as_ref() == Some(target))
-        .find(|e| e.status == sessions::SessionStatus::Active)
+        .find(|e| e.status == boxes::SessionStatus::Active)
         .or_else(|| {
             entries
                 .iter()
@@ -237,14 +237,14 @@ pub(crate) fn duplicate_session_warning(
          creates a second one, leaving bare `min` here ambiguous between them."
     );
     // Only point at `attach` for a session it will actually accept. Attach
-    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
+    // refuses anything not yet `Active` (see `boxes::SessionStatus`), so for
     // a `Pending`/`Materializing` duplicate the reuse command would fail
     // immediately — say to wait instead. When we do suggest it, use a key
     // `SessionLookup::parse` can resolve: a name matches by name and the full id
     // parses as a UUID, but the short unnamed handle would parse as a
     // nonexistent name and the attach lookup would miss.
     match existing.status {
-        sessions::SessionStatus::Active => {
+        boxes::SessionStatus::Active => {
             let key = existing
                 .name
                 .clone()
@@ -1276,11 +1276,11 @@ pub fn format_ls_across_vms_on(
 
 /// Human-readable lifecycle status for the `ls` table, using the same
 /// snake_case tokens the `--json` surface emits so the two agree.
-pub(crate) fn status_label(status: sessions::SessionStatus) -> &'static str {
+pub(crate) fn status_label(status: boxes::SessionStatus) -> &'static str {
     match status {
-        sessions::SessionStatus::Pending => "pending",
-        sessions::SessionStatus::Materializing => "materializing",
-        sessions::SessionStatus::Active => "active",
+        boxes::SessionStatus::Pending => "pending",
+        boxes::SessionStatus::Materializing => "materializing",
+        boxes::SessionStatus::Active => "active",
     }
 }
 

@@ -36,12 +36,12 @@ sysinfo.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-# The shared, pure frame verdict (`sessions::core::egress`) the host-side
+# The shared, pure frame verdict (`boxes::core::egress`) the host-side
 # egress gate applies per source address (NET-081), and the policy types the
 # host-side box table (NET-138) compiles a namespace's declaration from. The
 # gate runs in `minvmd` itself, outside the VM, so the verdict must be a
 # normal dependency, not a test-only one.
-sessions.workspace = true
+boxes.workspace = true
 # Shares minimald's portable RPC wire types: `NetworkMode` / `IpProto` drive the
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and
 # cannot be imported here, but the wire-types crate is portable).

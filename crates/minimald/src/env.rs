@@ -1383,12 +1383,8 @@ impl SessionChannel {
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
             let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
-            let network = crate::exec::task_network(
-                &record,
-                &switch,
-                sessions::EGRESS_DEFAULT_PHASE,
-                opt_out,
-            );
+            let network =
+                crate::exec::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, opt_out);
             let mut env = ctx
                 .make_env_with_network(
                     task_name,
@@ -1707,7 +1703,7 @@ impl SessionChannel {
                                 record.name.unwrap_or_else(|| self.name.clone()),
                                 record.network,
                             ),
-                            Err(_) => (self.name.clone(), sessions::NetworkMode::OwnIp),
+                            Err(_) => (self.name.clone(), boxes::NetworkMode::OwnIp),
                         };
                         let text = refusal.for_caller(&box_name, network, port_number);
                         if matches!(
@@ -2964,7 +2960,7 @@ exit $rc
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
         let mut request = crate::test_harness::create_session_req("web", "/uwu");
-        request.config.network = sessions::NetworkMode::NoNet;
+        request.config.network = boxes::NetworkMode::NoNet;
         let id = client.call::<CreateSession>(&request).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client
@@ -3010,7 +3006,7 @@ exit $rc
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 53),
             std::net::Ipv4Addr::new(127, 0, 64, 53),
-            Some(sessions::DynamicIngress::Ask),
+            Some(boxes::DynamicIngress::Ask),
             Some((3000, 3999)),
         )
         .await;
@@ -3080,7 +3076,7 @@ exit $rc
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 61),
             std::net::Ipv4Addr::new(127, 0, 64, 61),
-            Some(sessions::DynamicIngress::Allow),
+            Some(boxes::DynamicIngress::Allow),
             Some((3000, 3999)),
         )
         .await;
@@ -3114,10 +3110,10 @@ exit $rc
             .policy;
         assert_eq!(
             policy_at_create.ingress,
-            Some(sessions::IngressPolicy {
+            Some(boxes::IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some((3000, 3999)),
-                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             }),
             "the harness box is the one this test's stance describes"
         );

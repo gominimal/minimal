@@ -92,10 +92,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+use boxes::SessionPolicy;
 use minimald::net::switch::{SessionGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 use minimald::nsenter::GROUP_GRACE;
-use sessions::SessionPolicy;
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
 /// default `cargo test` run (and this sandbox) never attempts privileged netns
@@ -1776,7 +1776,7 @@ async fn netns_ownip_ptask_to_ptask() {
         return;
     }
     announce_to_the_runner("netns_ownip_ptask_to_ptask");
-    use sessions::{IngressPolicy, IpProto, PortMapping};
+    use boxes::{IngressPolicy, IpProto, PortMapping};
 
     let state = tempfile::tempdir().expect("switch state dir");
 
@@ -1871,8 +1871,8 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         return;
     }
     announce_to_the_runner("netns_ingress_static_port_mapping_exposes_then_unexposes");
+    use boxes::{IngressPolicy, IpProto, PortMapping};
     use minimald::net::policy::{ControlChannel, apply_ingress, remove_ingress};
-    use sessions::{IngressPolicy, IpProto, PortMapping};
 
     const INTERNAL: u16 = 80;
     const EXTERNAL: u16 = 18080;

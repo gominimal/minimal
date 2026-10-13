@@ -415,7 +415,7 @@ impl Eq for Stack {}
 
 /// Per-project session block. Contributes to sessions activated on
 /// this project — same primitives as
-/// [`sessions::core::loadout::Loadout`] (packages, vars, patches,
+/// [`boxes::core::loadout::Loadout`] (packages, vars, patches,
 /// lifecycle hooks), scoped to the project rather than the user.
 ///
 /// Where a loadout says "what this developer wants everywhere"
@@ -429,7 +429,7 @@ impl Eq for Stack {}
 /// Unlike a loadout, a session block has no name or description:
 /// there's at most one per mfile and it's identified by the project
 /// path. Contribution semantics (source tagging as
-/// [`sessions::core::source::Source::Project`], policy gating) land
+/// [`boxes::core::source::Source::Project`], policy gating) land
 /// with the `ProjectComposable` that will consume this in a later
 /// step.
 ///
@@ -466,23 +466,22 @@ pub struct Session {
     pub packages: Vec<String>,
     /// Variables with POSIX-shaped names — the common case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub vars:
-        BTreeMap<sessions::core::primitives::StrictVarName, sessions::core::primitives::VarValue>,
+    pub vars: BTreeMap<boxes::core::primitives::StrictVarName, boxes::core::primitives::VarValue>,
     /// Variables with Linux-permissive names — explicit opt-in for
     /// the rare case a non-POSIX name is necessary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub vars_lenient: Vec<sessions::core::primitives::LenientVarEntry>,
+    pub vars_lenient: Vec<boxes::core::primitives::LenientVarEntry>,
     /// Patches contributed by this project.
     #[serde(
         default,
-        skip_serializing_if = "sessions::core::primitives::Patches::is_empty"
+        skip_serializing_if = "boxes::core::primitives::Patches::is_empty"
     )]
-    pub patches: sessions::core::primitives::Patches,
+    pub patches: boxes::core::primitives::Patches,
     /// Scripts run at session-level transition points, in
     /// declaration order (concatenated with any hooks from the
     /// client's loadout).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_hooks: Vec<sessions::core::lifecyclehook::LifecycleHook>,
+    pub lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -2291,7 +2290,7 @@ mod tests {
     /// content is deliberately project-flavored (build toolchain,
     /// in-repo config paths, uniform build env) to reflect the
     /// intended use, but the assertions only check shape. Vars-
-    /// lenient coverage lives in the sessions crate's loadout tests
+    /// lenient coverage lives in the `boxes` crate's loadout tests
     /// since the wire form is identical.
     #[test]
     fn session_populated_block_parses_every_primitive() {
@@ -2494,7 +2493,7 @@ mod tests {
         );
     }
 
-    /// The demo project under `crates/sessions/example_project` must
+    /// The demo project under `crates/boxes/example_project` must
     /// stay parseable as a real `File`, hooks and all.
     ///
     /// It is documentation people copy from, and nothing else reads it,
@@ -2506,7 +2505,7 @@ mod tests {
     fn example_project_parses_with_its_lifecycle_hooks() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../sessions/example_project/minimal.toml"
+            "/../boxes/example_project/minimal.toml"
         );
         let src = std::fs::read_to_string(path).expect("example project is readable");
         let file: File = toml::from_str(&src).expect("example project must parse as an mfile");

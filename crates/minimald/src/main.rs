@@ -273,7 +273,7 @@ pub struct ListenArgs {
 
     /// Keep the earlier allow-all egress default for a box that declares no
     /// `egress` section (NET-077). With the deny-all default in force (see
-    /// [`sessions::EGRESS_DEFAULT_PHASE`]), an own-address box created with
+    /// [`boxes::EGRESS_DEFAULT_PHASE`]), an own-address box created with
     /// no egress declaration reaches nothing outside itself (NET-074) and
     /// shows `deny-all (default)` in `min session policy` (NET-075). Opt out
     /// to keep the prior default — a deployment that cannot carry the change
@@ -300,7 +300,7 @@ const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = minimald::guest::HANDED_EGRESS_DENY_AL
 /// every opt-out reader shares — `1`, `true`, `yes` or `on`; anything else,
 /// or unset, keeps the deny-all default.
 fn egress_deny_all_opt_out(flag: bool, env: Option<&str>) -> bool {
-    flag || sessions::egress_deny_all_opt_out_from_raw(env)
+    flag || boxes::egress_deny_all_opt_out_from_raw(env)
 }
 
 /// An error at the top level of minimald.
@@ -532,7 +532,7 @@ async fn async_main() -> Result<(), MainError> {
                 // The microVM's pid-1 has no flags to read, but the host
                 // hands it the operator's opt-out on the boot line (NET-077):
                 // the guest runs the egress default its host was started with
-                // — the rollout phase [`sessions::EGRESS_DEFAULT_PHASE`]
+                // — the rollout phase [`boxes::EGRESS_DEFAULT_PHASE`]
                 // carries — unless the operator opted out.
                 egress_deny_all_opt_out: guest::handed_egress_deny_all_opt_out(),
             }),

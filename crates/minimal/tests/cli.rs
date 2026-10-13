@@ -7,10 +7,10 @@
 
 mod common;
 
+use boxes::SessionId;
 use common::setup;
 use minimal::*;
 use minimald_rpc::{ListSessionsResponse, ResourcePool};
-use sessions::SessionId;
 
 use minimald::test_harness::unwrap_ready;
 
@@ -175,7 +175,7 @@ fn ls_shows_shared_resource_pool() {
             id: SessionId::nil(),
             name: None,
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
@@ -215,7 +215,7 @@ fn ls_table_exposes_project_path_and_status() {
             id: SessionId::nil(),
             name: Some("s1".to_string()),
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
@@ -259,7 +259,7 @@ fn ls_table_shows_host_address_enforcement() {
         id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: sessions::SessionStatus::Active,
+        status: boxes::SessionStatus::Active,
         git: None,
         host_ip_enforcement: enforcement,
         shared_port_collisions: Vec::new(),
@@ -318,7 +318,7 @@ fn ls_reports_yielded_shared_address_ports() {
         id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
         name: name.map(str::to_string),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: sessions::SessionStatus::Active,
+        status: boxes::SessionStatus::Active,
         git: None,
         host_ip_enforcement: None,
         shared_port_collisions: collisions,
@@ -393,7 +393,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: sessions::SessionStatus::Active,
+        status: boxes::SessionStatus::Active,
         git: None,
         host_ip_enforcement: enforcement,
         shared_port_collisions: Vec::new(),
@@ -734,13 +734,13 @@ async fn dashboard_activate_uploads_loadout_patches() {
     let patch_source = loadout_dir.path().join("gitconfig");
     std::fs::write(&patch_source, "[user]\n\tname = dash\n").unwrap();
 
-    let contribution = sessions::wire::request::WireContribution {
-        patches: vec![sessions::wire::primitives::WireSessionPatch {
-            patch: sessions::wire::primitives::WireResolvedPatch {
+    let contribution = boxes::wire::request::WireContribution {
+        patches: vec![boxes::wire::primitives::WireSessionPatch {
+            patch: boxes::wire::primitives::WireResolvedPatch {
                 host_path: paths::HostAbsPath::try_new(patch_source.to_str().unwrap()).unwrap(),
                 destination: paths::SandboxRelPath::try_new(".gitconfig").unwrap(),
             },
-            source: sessions::wire::primitives::WireSource::UserLoadout {
+            source: boxes::wire::primitives::WireSource::UserLoadout {
                 name: "dev".to_string(),
             },
         }],
@@ -755,7 +755,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         &sock,
         Some("dash-patched".to_string()),
         paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap(),
-        sessions::NetworkMode::NoNet,
+        boxes::NetworkMode::NoNet,
         contribution,
     )
     .await
@@ -872,12 +872,12 @@ async fn create_carries_dynamic_ingress() {
     for (name, dynamic_ingress, dynamic_range) in [
         (
             "dyn-allow",
-            Some(sessions::DynamicIngress::Allow),
+            Some(boxes::DynamicIngress::Allow),
             Some((8000, 8443)),
         ),
         // The mode alone, with no range and no static mapping, still makes
         // the declaration.
-        ("dyn-ask", Some(sessions::DynamicIngress::Ask), None),
+        ("dyn-ask", Some(boxes::DynamicIngress::Ask), None),
         ("dyn-bare", None, None),
     ] {
         let project = tempfile::TempDir::new().unwrap();
@@ -919,9 +919,9 @@ async fn create_carries_dynamic_ingress() {
     for (name, declared) in [
         (
             "dyn-allow",
-            Some((sessions::DynamicIngress::Allow, Some((8000, 8443)))),
+            Some((boxes::DynamicIngress::Allow, Some((8000, 8443)))),
         ),
-        ("dyn-ask", Some((sessions::DynamicIngress::Ask, None))),
+        ("dyn-ask", Some((boxes::DynamicIngress::Ask, None))),
         ("dyn-bare", None),
     ] {
         let resp = client
@@ -1048,13 +1048,13 @@ async fn policy_shows_resolved_dynamic_ingress() {
     let allowed_id = create_session_with_policy(
         &daemon,
         "dyn-allow-policy",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::new(
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::new(
             None,
-            Some(sessions::IngressPolicy {
+            Some(boxes::IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some((8000, 8443)),
-                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             }),
         ),
     )
@@ -1062,13 +1062,13 @@ async fn policy_shows_resolved_dynamic_ingress() {
     let declared_deny_id = create_session_with_policy(
         &daemon,
         "dyn-explicit-deny-policy",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::new(
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::new(
             None,
-            Some(sessions::IngressPolicy {
+            Some(boxes::IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: None,
-                dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+                dynamic_ingress: Some(boxes::DynamicIngress::Deny),
             }),
         ),
     )
@@ -1076,8 +1076,8 @@ async fn policy_shows_resolved_dynamic_ingress() {
     let bare_id = create_session_with_policy(
         &daemon,
         "dyn-bare-policy",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::default(),
     )
     .await;
 
@@ -1087,21 +1087,17 @@ async fn policy_shows_resolved_dynamic_ingress() {
         (
             "the allow stance over a range",
             allowed_id,
-            (
-                sessions::DynamicIngress::Allow,
-                Some((8000u16, 8443u16)),
-                true,
-            ),
+            (boxes::DynamicIngress::Allow, Some((8000u16, 8443u16)), true),
         ),
         (
             "the explicit deny stance",
             declared_deny_id,
-            (sessions::DynamicIngress::Deny, None, true),
+            (boxes::DynamicIngress::Deny, None, true),
         ),
         (
             "no dynamic flag given",
             bare_id,
-            (sessions::DynamicIngress::Deny, None, false),
+            (boxes::DynamicIngress::Deny, None, false),
         ),
     ] {
         let resp = client
@@ -1119,7 +1115,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
         format_policy(
             &mut out,
             &policy,
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             None,
             &[],
             None,
@@ -1147,7 +1143,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
         write_policy_json(
             &mut out,
             &policy,
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             None,
             Ok(vec![]),
             &[],
@@ -1894,14 +1890,14 @@ async fn policy_json_carries_schema_and_pending() {
     let session_id = create_session_with_policy(
         &daemon,
         "policy-json",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::new(
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::new(
             None,
-            Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+            Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: 3000,
                     internal_port: 3000,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -1936,13 +1932,13 @@ async fn policy_json_carries_schema_and_pending() {
         minimald_rpc::LiveMapping {
             local: "127.0.0.1:3200".to_string(),
             internal_port: 3200,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             pending: Some(true),
         },
         minimald_rpc::LiveMapping {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             pending: Some(false),
         },
     ];
@@ -1951,7 +1947,7 @@ async fn policy_json_carries_schema_and_pending() {
     write_policy_json(
         &mut out,
         &policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         Ok(live),
         &[],
@@ -2007,14 +2003,14 @@ async fn policy_json_carries_schema_and_pending() {
     let pre_field = minimald_rpc::LiveMapping {
         local: "127.0.0.1:3400".to_string(),
         internal_port: 3400,
-        proto: sessions::IpProto::Tcp,
+        proto: boxes::IpProto::Tcp,
         pending: None,
     };
     let mut out = Vec::new();
     write_policy_json(
         &mut out,
         &policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         Ok(vec![pre_field]),
         &[],
@@ -2042,8 +2038,8 @@ async fn policy_json_carries_schema_and_pending() {
 /// middle one, never collapsed into the first.
 #[test]
 fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
-    let policy = sessions::EffectiveSessionPolicy {
-        egress: sessions::EffectiveEgress::AllowAll,
+    let policy = boxes::EffectiveSessionPolicy {
+        egress: boxes::EffectiveEgress::AllowAll,
         ingress: None,
         credentialed_upstream: None,
     };
@@ -2054,7 +2050,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
     write_policy_json(
         &mut out,
         &policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
         &[],
@@ -2073,7 +2069,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
     write_policy_json(
         &mut out,
         &policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         Err("live port mappings are unavailable: no session found".to_string()),
         &[],
@@ -2091,7 +2087,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
     write_policy_json(
         &mut out,
         &policy,
-        sessions::NetworkMode::NoNet,
+        boxes::NetworkMode::NoNet,
         None,
         Ok(Vec::new()),
         &[],
@@ -2157,17 +2153,17 @@ async fn policy_json_failure_answers_with_the_error_contract() {
 #[tokio::test]
 async fn policy_shows_effective_egress() {
     let (daemon, args) = setup().await;
-    let egress = sessions::EgressPolicy {
+    let egress = boxes::EgressPolicy {
         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
         allow_dns_hosts: Some(vec!["github.com".to_string()]),
-        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
         deny_subnets: Some(vec!["169.254.169.254/32".to_string()]),
     };
     let session_id = create_session_with_policy(
         &daemon,
         "egress-policy",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::new(Some(egress.clone()), None),
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::new(Some(egress.clone()), None),
     )
     .await;
 
@@ -2185,7 +2181,7 @@ async fn policy_shows_effective_egress() {
     };
     assert_eq!(
         policy.egress,
-        sessions::EffectiveEgress::Declared(egress.clone()),
+        boxes::EffectiveEgress::Declared(egress.clone()),
         "the stored egress must survive the record round trip"
     );
 
@@ -2193,7 +2189,7 @@ async fn policy_shows_effective_egress() {
     format_policy(
         &mut out,
         &policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         &[],
         None,
@@ -2225,8 +2221,8 @@ async fn policy_shows_effective_egress() {
     let host_id = create_session_with_policy(
         &daemon,
         "egress-policy-host",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::new(Some(egress.clone()), None),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::new(Some(egress.clone()), None),
     )
     .await;
     let resp = client
@@ -2243,7 +2239,7 @@ async fn policy_shows_effective_egress() {
     format_policy(
         &mut out,
         &policy,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         None,
         &[],
         None,
@@ -2284,7 +2280,7 @@ async fn policy_shows_effective_egress() {
     format_policy(
         &mut out,
         &policy,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         Some(host_ip_enforcement),
         &[],
         None,
@@ -2307,8 +2303,8 @@ async fn policy_shows_effective_egress() {
     let none_id = create_session_with_policy(
         &daemon,
         "egress-policy-none",
-        sessions::NetworkMode::NoNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::NoNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
     let resp = client
@@ -2325,7 +2321,7 @@ async fn policy_shows_effective_egress() {
     format_policy(
         &mut out,
         &policy,
-        sessions::NetworkMode::NoNet,
+        boxes::NetworkMode::NoNet,
         None,
         &[],
         None,
@@ -2354,8 +2350,8 @@ async fn policy_shows_deny_all_default() {
     let bare_id = create_session_with_policy(
         &daemon,
         "bare-own-ip",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::default(),
     )
     .await;
 
@@ -2376,10 +2372,10 @@ async fn policy_shows_deny_all_default() {
     // (NET-076), and the command's data path carries that answer.
     assert_eq!(
         policy.egress,
-        sessions::effective_egress(
+        boxes::effective_egress(
             None,
-            sessions::NetworkMode::OwnIp,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::NetworkMode::OwnIp,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         ),
         "the daemon must answer the shipped phase's resolution for a bare box"
@@ -2388,11 +2384,11 @@ async fn policy_shows_deny_all_default() {
     // The default's own posture, with the phase passed explicitly: once in
     // force, a bare own-address box resolves to deny-all, and the command's
     // renderer prints it as that — and nothing else.
-    let in_force = sessions::EffectiveSessionPolicy {
-        egress: sessions::effective_egress(
+    let in_force = boxes::EffectiveSessionPolicy {
+        egress: boxes::effective_egress(
             None,
-            sessions::NetworkMode::OwnIp,
-            sessions::EgressDefaultPhase::InForce,
+            boxes::NetworkMode::OwnIp,
+            boxes::EgressDefaultPhase::InForce,
             false,
         ),
         ingress: None,
@@ -2400,14 +2396,14 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(
         in_force.egress,
-        sessions::EffectiveEgress::DenyAll,
+        boxes::EffectiveEgress::DenyAll,
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
     format_policy(
         &mut out,
         &in_force,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         &[],
         None,
@@ -2447,8 +2443,8 @@ async fn policy_shows_deny_all_default() {
     let host_id = create_session_with_policy(
         &daemon,
         "bare-host-net",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
     let resp = client
@@ -2461,12 +2457,12 @@ async fn policy_shows_deny_all_default() {
             panic!("GetEffectiveSessionPolicy failed: {error}")
         }
     };
-    assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
+    assert_eq!(policy.egress, boxes::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
     format_policy(
         &mut out,
         &policy,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         None,
         &[],
         None,
@@ -2481,7 +2477,7 @@ async fn policy_shows_deny_all_default() {
 }
 
 /// `--deny-all-egress` declares the deny-all section (NET-075's CLI half):
-/// the activation's record carries `sessions::EgressPolicy::deny_all()` —
+/// the activation's record carries `boxes::EgressPolicy::deny_all()` —
 /// every allow list present and empty, nothing denied on top — the shape the
 /// host-address classifier decides its deny verdict on (NET-079), not four
 /// absent lists: present-and-empty is the declaration that reaches nothing,
@@ -2548,7 +2544,7 @@ async fn deny_all_egress_flag_declares_every_allow_list_empty() {
     // left to subtract from.
     assert_eq!(
         strict.egress,
-        Some(sessions::EgressPolicy::deny_all()),
+        Some(boxes::EgressPolicy::deny_all()),
         "the flag must declare the deny-all section, every allow list \
          present and empty"
     );
@@ -2572,7 +2568,7 @@ async fn deny_all_egress_flag_declares_every_allow_list_empty() {
     };
     assert_eq!(
         policy.egress,
-        sessions::EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+        boxes::EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
         "a declared deny-all box's effective egress is its declaration, never \
          the default"
     );
@@ -2719,8 +2715,8 @@ async fn policy_shows_unset_egress_as_named_default() {
     let own_id = create_session_with_policy(
         &daemon,
         "unset-own-ip",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::default(),
     )
     .await;
     let resp = client
@@ -2735,10 +2731,10 @@ async fn policy_shows_unset_egress_as_named_default() {
     };
     assert_eq!(
         own_policy.egress,
-        sessions::effective_egress(
+        boxes::effective_egress(
             None,
-            sessions::NetworkMode::OwnIp,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::NetworkMode::OwnIp,
+            boxes::EGRESS_DEFAULT_PHASE,
             false
         ),
         "a box with no section resolves to the shipped phase's default"
@@ -2747,7 +2743,7 @@ async fn policy_shows_unset_egress_as_named_default() {
     format_policy(
         &mut out,
         &own_policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         &[],
         None,
@@ -2755,9 +2751,9 @@ async fn policy_shows_unset_egress_as_named_default() {
     .unwrap();
     let own_text = String::from_utf8(out).unwrap();
     let name = match own_policy.egress {
-        sessions::EffectiveEgress::DenyAll => "  deny-all (default)\n",
-        sessions::EffectiveEgress::AllowAll => "  allow-all (default)\n",
-        sessions::EffectiveEgress::Declared(_) => {
+        boxes::EffectiveEgress::DenyAll => "  deny-all (default)\n",
+        boxes::EffectiveEgress::AllowAll => "  allow-all (default)\n",
+        boxes::EffectiveEgress::Declared(_) => {
             panic!("a box with no section must never resolve to a declaration")
         }
     };
@@ -2780,7 +2776,7 @@ async fn policy_shows_unset_egress_as_named_default() {
     write_policy_json(
         &mut out,
         &own_policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
         &[],
@@ -2788,9 +2784,9 @@ async fn policy_shows_unset_egress_as_named_default() {
     .unwrap();
     let own_document: Value = serde_json_lenient::from_slice(&out).unwrap();
     let own_name = match own_policy.egress {
-        sessions::EffectiveEgress::DenyAll => "deny-all",
-        sessions::EffectiveEgress::AllowAll => "allow-all",
-        sessions::EffectiveEgress::Declared(_) => {
+        boxes::EffectiveEgress::DenyAll => "deny-all",
+        boxes::EffectiveEgress::AllowAll => "allow-all",
+        boxes::EffectiveEgress::Declared(_) => {
             panic!("a box with no section must never resolve to a declaration")
         }
     };
@@ -2810,8 +2806,8 @@ async fn policy_shows_unset_egress_as_named_default() {
     let host_id = create_session_with_policy(
         &daemon,
         "unset-host-ip",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
     let resp = client
@@ -2826,7 +2822,7 @@ async fn policy_shows_unset_egress_as_named_default() {
     };
     assert_eq!(
         host_policy.egress,
-        sessions::EffectiveEgress::AllowAll,
+        boxes::EffectiveEgress::AllowAll,
         "a bare host-address box keeps the shipped allow-all"
     );
     use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
@@ -2847,7 +2843,7 @@ async fn policy_shows_unset_egress_as_named_default() {
     format_policy(
         &mut out,
         &host_policy,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         Some(enforcement),
         &[],
         None,
@@ -2870,8 +2866,8 @@ async fn policy_shows_unset_egress_as_named_default() {
     let declared_id = create_session_with_policy(
         &daemon,
         "unset-beside-declared-deny-all",
-        sessions::NetworkMode::OwnIp,
-        sessions::SessionPolicy::new(Some(sessions::EgressPolicy::deny_all()), None),
+        boxes::NetworkMode::OwnIp,
+        boxes::SessionPolicy::new(Some(boxes::EgressPolicy::deny_all()), None),
     )
     .await;
     let resp = client
@@ -2886,14 +2882,14 @@ async fn policy_shows_unset_egress_as_named_default() {
     };
     assert_eq!(
         declared_policy.egress,
-        sessions::EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+        boxes::EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
         "a declared deny-all box's effective egress is its declaration"
     );
     let mut out = Vec::new();
     format_policy(
         &mut out,
         &declared_policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         &[],
         None,
@@ -2917,7 +2913,7 @@ async fn policy_shows_unset_egress_as_named_default() {
     write_policy_json(
         &mut out,
         &declared_policy,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
         &[],
@@ -2978,11 +2974,11 @@ fn policy_shows_baseline_set() {
     // way the command renders it: the box's own rules, and the helper's
     // enumeration beside them — the microVM backend's fabric, the plan the
     // helper's run path builds its registry and this set from.
-    let deny_all = sessions::EffectiveSessionPolicy {
-        egress: sessions::effective_egress(
+    let deny_all = boxes::EffectiveSessionPolicy {
+        egress: boxes::effective_egress(
             None,
-            sessions::NetworkMode::OwnIp,
-            sessions::EgressDefaultPhase::InForce,
+            boxes::NetworkMode::OwnIp,
+            boxes::EgressDefaultPhase::InForce,
             false,
         ),
         ingress: None,
@@ -2993,7 +2989,7 @@ fn policy_shows_baseline_set() {
     format_policy(
         &mut out,
         &deny_all,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         &[],
         Some(fabric),
@@ -3056,7 +3052,7 @@ fn policy_shows_baseline_set() {
     format_policy(
         &mut out,
         &deny_all,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         None,
         &[],
         Some(fabric),
@@ -3076,7 +3072,7 @@ fn policy_shows_baseline_set() {
     format_policy(
         &mut out,
         &deny_all,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::OwnIp,
         None,
         &[],
         None,
@@ -3103,8 +3099,8 @@ fn policy_shows_baseline_set() {
 async fn deny_all_in_force_note_printed() {
     const NOTE: &str = "egress: deny-all (default for an own-ip box with no egress section)";
     assert_eq!(
-        sessions::EGRESS_DEFAULT_PHASE,
-        sessions::EgressDefaultPhase::InForce,
+        boxes::EGRESS_DEFAULT_PHASE,
+        boxes::EgressDefaultPhase::InForce,
         "this build ships the deny-all default in force"
     );
     let (_daemon, args) = setup().await;
@@ -3206,7 +3202,7 @@ async fn deny_all_in_force_note_printed() {
 
     // The announced phase prints nothing: its announcement is retired.
     assert!(
-        deny_all_default_notice(sessions::EgressDefaultPhase::Announced).is_none(),
+        deny_all_default_notice(boxes::EgressDefaultPhase::Announced).is_none(),
         "the retired announcement must not print"
     );
 }
@@ -4432,7 +4428,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
-        network: sessions::NetworkMode::NoNet,
+        network: boxes::NetworkMode::NoNet,
         policy: Default::default(),
         task_addresses: Vec::new(),
         box_id: None,
@@ -4488,8 +4484,8 @@ async fn create_session_at(
         daemon,
         name,
         project_path,
-        sessions::NetworkMode::NoNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::NoNet,
+        boxes::SessionPolicy::default(),
     )
     .await
 }
@@ -4500,8 +4496,8 @@ async fn create_session_with(
     daemon: &common::TestDaemon,
     name: &str,
     project_path: paths::HostAbsPath,
-    network: sessions::NetworkMode,
-    policy: sessions::SessionPolicy,
+    network: boxes::NetworkMode,
+    policy: boxes::SessionPolicy,
 ) -> SessionId {
     let mut client = daemon.server.connect().await;
 
@@ -4568,8 +4564,8 @@ async fn create_session_with(
 async fn create_session_with_policy(
     daemon: &common::TestDaemon,
     name: &str,
-    network: sessions::NetworkMode,
-    policy: sessions::SessionPolicy,
+    network: boxes::NetworkMode,
+    policy: boxes::SessionPolicy,
 ) -> SessionId {
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
@@ -4649,8 +4645,8 @@ async fn net_forward_relays_over_ssh_channel() {
     let _id = create_session_with_policy(
         &daemon,
         "web",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
 
@@ -4695,8 +4691,8 @@ async fn net_forward_survives_a_refused_box_port() {
     let _id = create_session_with_policy(
         &daemon,
         "web",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
 
@@ -4773,8 +4769,8 @@ async fn net_forward_closes_with_session() {
     let _id = create_session_with_policy(
         &daemon,
         "web",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
 
@@ -4830,8 +4826,8 @@ async fn net_forward_announces_the_bound_local_port() {
     let _id = create_session_with_policy(
         &daemon,
         "web",
-        sessions::NetworkMode::HostNet,
-        sessions::SessionPolicy::default(),
+        boxes::NetworkMode::HostNet,
+        boxes::SessionPolicy::default(),
     )
     .await;
 

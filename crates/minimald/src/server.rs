@@ -266,7 +266,7 @@ pub struct Config {
     pub daemon_identity_dir: Option<DaemonAbsPath>,
 
     /// The daemon's opt-out of the deny-all egress default (NET-077). With
-    /// the default in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
+    /// the default in force (see [`boxes::EGRESS_DEFAULT_PHASE`]), an
     /// own-address box created with no `egress` section reaches nothing
     /// outside itself (NET-074) and shows `deny-all (default)` in
     /// `min session policy` (NET-075). A deployment that cannot carry that
@@ -275,7 +275,7 @@ pub struct Config {
     /// that declares its own egress section keeps its declared lists either
     /// way; the opt-out also keeps the earlier allow-all reading of a
     /// destination list the section left absent, which in force resolves to
-    /// present and empty (`sessions::effective_egress`).
+    /// present and empty (`boxes::effective_egress`).
     #[serde(default)]
     pub deny_all_opt_out: bool,
     /// How the create gate learns the host's verdict on the unprivileged
@@ -576,8 +576,8 @@ impl ServerState {
             slice_octet = slice_octet,
             reserved_loopback = %format!(
                 "{first}-{last}",
-                first = ::sessions::core::loopback::POOL_FIRST,
-                last = ::sessions::core::loopback::POOL_LAST
+                first = ::boxes::core::loopback::POOL_FIRST,
+                last = ::boxes::core::loopback::POOL_LAST
             ),
             "gvproxy switch this daemon's boxes lease on; published boxes \
              are granted from this host's reserved local range"
@@ -1337,7 +1337,7 @@ mod reap_seam {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use ::sessions::SessionId;
+    use ::boxes::SessionId;
     use tokio::sync::oneshot;
 
     type Hold = (oneshot::Sender<()>, oneshot::Receiver<()>);
@@ -1384,7 +1384,7 @@ mod reap_seam {
 /// restart. A finalized (`Active`) session is long-lived and must
 /// survive the connection that created it, so it is left untouched.
 /// Best-effort and never fatal: minimald is pid-1 in the guest.
-async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::sessions::SessionId>) {
+async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::SessionId>) {
     if ids.is_empty() {
         return;
     }
@@ -1407,7 +1407,7 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
         };
         if !matches!(
             status,
-            ::sessions::SessionStatus::Pending | ::sessions::SessionStatus::Materializing
+            ::boxes::SessionStatus::Pending | ::boxes::SessionStatus::Materializing
         ) {
             continue;
         }
@@ -3388,7 +3388,7 @@ mod tests {
                 .await
                 .record
                 .map(|record| record.status),
-            Some(::sessions::SessionStatus::Pending),
+            Some(::boxes::SessionStatus::Pending),
             "the refused attach must leave the session unfinalized for the reap"
         );
 
@@ -4103,7 +4103,7 @@ mod tests {
             .hostnames()
             .write()
             .unwrap()
-            .register_host_net(::sessions::SessionId::nil(), "web");
+            .register_host_net(::boxes::SessionId::nil(), "web");
         let authority = format!("web.min.internal:{backend}");
         let routed = proxy_get(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
@@ -4180,7 +4180,7 @@ mod tests {
             .hostnames()
             .write()
             .unwrap()
-            .register_host_net(::sessions::SessionId::nil(), "web");
+            .register_host_net(::boxes::SessionId::nil(), "web");
         let authority = format!("web.min.internal:{backend}");
         let routed = proxy_get(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound),
@@ -5167,7 +5167,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_zone_routes_on_an_instance_scoped_registry() {
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
 
         let dir = TempDir::new().unwrap();
         let state = ServerStateHandle::new(test_config(&dir), None)
@@ -5217,7 +5217,7 @@ mod tests {
         use std::collections::BTreeMap;
         use std::net::{IpAddr, Ipv4Addr};
 
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
 
         // `in_microvm` is what makes a daemon's registry route an own-IP box
         // to its reported address (a lease on the switch) rather than to the
@@ -5672,7 +5672,7 @@ mod tests {
     async fn answerer_starts_and_serves_the_zone_on_loopback() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
         use hickory_proto::op::{Message, ResponseCode};
         use hickory_proto::rr::rdata::A;
         use hickory_proto::rr::{RData, RecordType};
@@ -5853,7 +5853,7 @@ mod tests {
     async fn a_walked_answerer_publication_keeps_the_bind_and_reports_the_rung() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
         use hickory_proto::op::{Message, ResponseCode};
         use hickory_proto::rr::RecordType;
 

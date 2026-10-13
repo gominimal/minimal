@@ -123,7 +123,7 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
                         }
                     };
                     if is_dir {
-                        let file = path.join(sessions::client::disk::LOADOUT_FILE_NAME);
+                        let file = path.join(boxes::client::disk::LOADOUT_FILE_NAME);
                         // Existence only. Whether this is a *safe* file to
                         // read is `add_redacted_toml`'s call, and it makes
                         // it independently — a symlinked `loadout.toml` is
@@ -135,7 +135,7 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
                                 &file,
                                 &format!(
                                     "config/loadouts/{name}/{}.redacted",
-                                    sessions::client::disk::LOADOUT_FILE_NAME
+                                    boxes::client::disk::LOADOUT_FILE_NAME
                                 ),
                             )
                             .await;

@@ -1,8 +1,8 @@
-use paths::DaemonAbsPath;
-use sessions::{
+use boxes::{
     Record, SessionId,
     store::{DiskLoader, DiskSession, DiskSessionKey, Loader as _, SessionKey, SessionObject},
 };
+use paths::DaemonAbsPath;
 
 use std::fmt;
 use tokio::sync::{mpsc, oneshot};
@@ -49,11 +49,11 @@ enum StoreMessage {
     SessionDelete(DiskSessionKey, oneshot::Sender<Result<(), std::io::Error>>),
     CompositionLoad(
         DiskSessionKey,
-        oneshot::Sender<Result<Option<sessions::core::compose::Composition>, std::io::Error>>,
+        oneshot::Sender<Result<Option<boxes::core::compose::Composition>, std::io::Error>>,
     ),
     CompositionStore(
         DiskSessionKey,
-        std::sync::Arc<sessions::core::compose::Composition>,
+        std::sync::Arc<boxes::core::compose::Composition>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
     DeltaBaselineLoad(
@@ -287,7 +287,7 @@ impl SessionRecordHandle {
     /// and fall back to baseline.
     pub async fn load_composition(
         &self,
-    ) -> Result<Option<sessions::core::compose::Composition>, std::io::Error> {
+    ) -> Result<Option<boxes::core::compose::Composition>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         let _ = self
             .h
@@ -303,7 +303,7 @@ impl SessionRecordHandle {
     /// `min session activate` time.
     pub async fn store_composition(
         &self,
-        composition: &sessions::core::compose::Composition,
+        composition: &boxes::core::compose::Composition,
     ) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         let _ = self
@@ -372,8 +372,8 @@ impl WeakStoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::{NetworkMode, SessionStatus};
     use paths::HostAbsPath;
-    use sessions::{NetworkMode, SessionStatus};
     use std::collections::BTreeSet;
     use std::io::ErrorKind;
     use tempfile::TempDir;

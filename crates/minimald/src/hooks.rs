@@ -38,11 +38,11 @@ use std::fmt;
 use std::process::Stdio;
 use std::time::Duration;
 
+use boxes::SessionId;
+use boxes::core::compose::Composition;
+use boxes::core::lifecyclehook::{HookScript, HookScriptBody, staged_script_path};
+use boxes::core::source::{Provenanced, ProvenancedHook, Source};
 use paths::DaemonAbsPath;
-use sessions::SessionId;
-use sessions::core::compose::Composition;
-use sessions::core::lifecyclehook::{HookScript, HookScriptBody, staged_script_path};
-use sessions::core::source::{Provenanced, ProvenancedHook, Source};
 
 /// The transition a hook is running for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +76,7 @@ impl HookEvent {
     /// This event's script on `hook`, if it declares one.
     pub(crate) fn script_of(
         self,
-        hook: &sessions::core::lifecyclehook::LifecycleHook,
+        hook: &boxes::core::lifecyclehook::LifecycleHook,
     ) -> Option<&HookScript> {
         match self {
             Self::Activate => hook.on_activate(),
@@ -281,7 +281,7 @@ const OUTPUT_TAIL_BYTES: usize = 4096;
 /// truncating them would silently half-configure a session instead of
 /// failing it.
 ///
-/// [`MAX_HOOK_TIMEOUT`]: sessions::core::lifecyclehook::MAX_HOOK_TIMEOUT
+/// [`MAX_HOOK_TIMEOUT`]: boxes::core::lifecyclehook::MAX_HOOK_TIMEOUT
 pub(crate) async fn run_hooks<C: SessionCommands>(
     commands: &C,
     ctx: &HookContext<'_>,
@@ -758,7 +758,7 @@ fn tail_of(stdout: &[u8], stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::core::lifecyclehook::LifecycleHook;
+    use boxes::core::lifecyclehook::LifecycleHook;
 
     /// A [`SessionCommands`] that runs the command on the host instead
     /// of inside a sandbox. Exercises everything but the namespace
@@ -812,11 +812,11 @@ mod tests {
     ///
     /// Built through the public snapshot conversion rather than a
     /// test-only constructor: `Composition`'s own builders are
-    /// crate-private to `sessions`, and going through the wire form
+    /// crate-private to `boxes`, and going through the wire form
     /// exercises the same path a daemon restart takes.
     fn composition_of(hooks: Vec<ProvenancedHook>) -> Composition {
-        use sessions::wire::primitives::WireProvenancedHook;
-        use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+        use boxes::wire::primitives::WireProvenancedHook;
+        use boxes::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
         let wire = WireComposition {
             version: COMPOSITION_SNAPSHOT_VERSION,
             vars: Vec::new(),

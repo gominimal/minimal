@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
+use boxes::{NetworkMode, SessionId};
 use sandbox::{
     AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Resolver,
     Spawned, TapSpec,
 };
-use sessions::{NetworkMode, SessionId};
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;
@@ -303,9 +303,9 @@ pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<sessions::SessionPolicy>,
+    policy: Option<boxes::SessionPolicy>,
     own_address: Option<OwnAddressReporter>,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
     decision: Option<crate::net::classifier::Decision>,
 ) -> Arc<dyn Network> {
     match mode {
@@ -348,7 +348,7 @@ pub(crate) fn task_network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<sessions::SessionPolicy>,
+    policy: Option<boxes::SessionPolicy>,
     task_addresses: Vec<std::net::Ipv4Addr>,
 ) -> Arc<dyn Network> {
     match mode {
@@ -411,7 +411,7 @@ impl std::fmt::Debug for HostIpAddressNetwork {
 ///
 /// Pure over the declaration, so the verdict a box's plan is built around is
 /// pinned beside the plan it decides.
-fn host_address_verdict(declaration: Option<&sessions::EgressPolicy>) -> sandbox::config::Verdict {
+fn host_address_verdict(declaration: Option<&boxes::EgressPolicy>) -> sandbox::config::Verdict {
     crate::net::classifier::verdict_of(declaration)
 }
 
@@ -593,7 +593,7 @@ struct OwnIpNetwork {
     /// Registered as the PTask's `*.min.internal` hostname on attach (R3.1).
     identity: String,
     /// The launch's whole session policy, carried into the relay gate.
-    policy: Option<sessions::SessionPolicy>,
+    policy: Option<boxes::SessionPolicy>,
     /// The registry handle the lease is reported through on attach, so the
     /// box's proxy route exists exactly while the lease does (NET-001). `None`
     /// for a task launch, which owns no proxy route.
@@ -605,7 +605,7 @@ struct OwnIpNetwork {
     /// loopback address the host side names the box by. `None` for a launch
     /// the activating client did not register, which draws on a native
     /// switch and is refused on one the VM host owns (NET-138).
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
     /// For a task launch ([`task_network_for`]), the task addresses the VM
     /// host registered with the session's box (NET-138): the PTask attaches
     /// at the first one no task run holds. `None` for a box's own launch.
@@ -1087,8 +1087,8 @@ mod tests {
     async fn carve_out_targets_live_answerer_bind_in_the_box_plan() {
         use crate::net::classifier::{Decision, clear_live_answerer, set_live_answerer};
 
-        let deny_all = Some(sessions::SessionPolicy::new(
-            Some(sessions::EgressPolicy::deny_all()),
+        let deny_all = Some(boxes::SessionPolicy::new(
+            Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
         let native = Arc::new(Mutex::new(SwitchClient::new(
@@ -1152,8 +1152,8 @@ mod tests {
     /// a box in the guest's namespace has no reach into.
     #[tokio::test]
     async fn host_ip_box_resolves_through_answerer() {
-        let deny_all = Some(sessions::SessionPolicy::new(
-            Some(sessions::EgressPolicy::deny_all()),
+        let deny_all = Some(boxes::SessionPolicy::new(
+            Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
         let native = Arc::new(Mutex::new(SwitchClient::new(
@@ -1251,8 +1251,8 @@ mod tests {
     async fn guest_deny_all_box_resolves_through_answerer_once_decided() {
         use crate::net::classifier::{Cause, Decision};
 
-        let deny_all = Some(sessions::SessionPolicy::new(
-            Some(sessions::EgressPolicy::deny_all()),
+        let deny_all = Some(boxes::SessionPolicy::new(
+            Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
         let switch = counting_switch();
@@ -1353,7 +1353,7 @@ mod tests {
 
         for (declaration, expected, why) in [
             (
-                Some(sessions::EgressPolicy::deny_all()),
+                Some(boxes::EgressPolicy::deny_all()),
                 sandbox::config::Verdict::Deny,
                 "a deny-all box",
             ),

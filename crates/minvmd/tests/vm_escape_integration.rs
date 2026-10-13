@@ -83,10 +83,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use serial_test::serial;
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
 mod common;
@@ -459,8 +459,8 @@ impl BoxSession {
     async fn open(
         sock_path: &Path,
         control_sock: &Path,
-        network: sessions::NetworkMode,
-        egress: sessions::EgressPolicy,
+        network: boxes::NetworkMode,
+        egress: boxes::EgressPolicy,
         label: &str,
     ) -> Result<BoxSession, String> {
         use minimald_rpc::{
@@ -517,7 +517,7 @@ impl BoxSession {
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
-            let policy = sessions::SessionPolicy {
+            let policy = boxes::SessionPolicy {
                 egress: Some(egress.clone()),
                 ..Default::default()
             };
@@ -789,10 +789,10 @@ where
 /// ships the verdict with `SubmitVerdict`, which composes the loadout.
 async fn submit_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
-    response: sessions::wire::request::ContributionResponse,
+    response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
+    use boxes::wire::request::SessionStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
-    use sessions::wire::request::SessionStep;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     eprintln!(
@@ -801,12 +801,12 @@ async fn submit_verdict(
         response.patches.len(),
         response.lifecycle_hooks.len(),
     );
-    let (verdict, _policy) = sessions::client::handler::handle_response(
+    let (verdict, _policy) = boxes::client::handler::handle_response(
         response,
         &[],
-        sessions::core::policy::UserPolicy::empty(),
+        boxes::core::policy::UserPolicy::empty(),
         &NoPromptVars,
-        sessions::core::compose::ComposeOptions::default(),
+        boxes::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
     .map_err(|e| format!("gating pending items: {e}"))?;
@@ -845,8 +845,8 @@ async fn submit_verdict(
 /// startup race the session harness documents.
 async fn open_box(
     guest: &Guest,
-    network: sessions::NetworkMode,
-    egress: sessions::EgressPolicy,
+    network: boxes::NetworkMode,
+    egress: boxes::EgressPolicy,
     label: &str,
 ) -> BoxSession {
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1383,7 +1383,7 @@ fn host_interface_address() -> Ipv4Addr {
         let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
         u32::from(addr) & mask == u32::from(base) & mask
     };
-    let (reserved, reserved_prefix) = sessions::core::loopback::RESERVED_LOCAL_RANGE;
+    let (reserved, reserved_prefix) = boxes::core::loopback::RESERVED_LOCAL_RANGE;
     assert!(
         !addr.is_unspecified()
             && !in_block(Ipv4Addr::new(127, 0, 0, 0), 8)
@@ -1631,9 +1631,9 @@ async fn vm_escape_bounded_to_resident_union() {
     // disjoint half the cross-box spoof would have to buy.
     let mut box_a = open_box(
         &guest,
-        sessions::NetworkMode::OwnIp,
-        sessions::EgressPolicy {
-            allow_protocols: Some(vec![sessions::IpProto::Tcp, sessions::IpProto::Udp]),
+        boxes::NetworkMode::OwnIp,
+        boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
             allow_subnets: Some(vec![
                 "10.0.0.0/8".to_string(),
                 "100.64.0.0/16".to_string(),
@@ -1647,9 +1647,9 @@ async fn vm_escape_bounded_to_resident_union() {
     .await;
     let mut box_b = open_box(
         &guest,
-        sessions::NetworkMode::OwnIp,
-        sessions::EgressPolicy {
-            allow_protocols: Some(vec![sessions::IpProto::Tcp, sessions::IpProto::Udp]),
+        boxes::NetworkMode::OwnIp,
+        boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
             allow_subnets: Some(vec![
                 "192.168.0.0/16".to_string(),
                 "100.64.0.0/16".to_string(),

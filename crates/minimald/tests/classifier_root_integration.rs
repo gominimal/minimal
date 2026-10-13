@@ -62,6 +62,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use boxes::SessionId;
 use minimald::net::classifier::{
     Family, Observed, Reading, decide_now, read_filter, record_node_plane_fetch,
 };
@@ -72,7 +73,6 @@ use sandbox::classifier::{
     self, DAEMON_LEAF as THE_DAEMON_LEAF, create_box_leaf, daemon_leaf, place_pid, remove_box_leaf,
 };
 use sandbox::config::{ALLOW_DIR, DENY_DIR, Verdict};
-use sessions::SessionId;
 
 /// The loaded table's name, the installer's spelling of it: the daemon
 /// reads only its marker, so this is the proof's own name for what it

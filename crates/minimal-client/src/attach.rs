@@ -21,7 +21,7 @@ const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
 const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 
 /// Read and validate the session-key config, returning the resolved
-/// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
+/// [`boxes::keys::SessionKeys`] to negotiate at attach. A missing config
 /// file yields the shipped defaults; a present-but-invalid one (e.g. a
 /// termios-special leader) surfaces its error loudly so the user fixes the
 /// config rather than silently attaching with the wrong chord.
@@ -31,9 +31,9 @@ const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 /// those.
 pub fn resolve_session_keys(
     config_dir: Option<&Path>,
-) -> Result<sessions::keys::SessionKeys, anyhow::Error> {
+) -> Result<boxes::keys::SessionKeys, anyhow::Error> {
     let cfg_path = paths::minimal_config_dir_with_override(config_dir).join("config.toml");
-    let cfg = sessions::client::config::read_config_or_default(&cfg_path)
+    let cfg = boxes::client::config::read_config_or_default(&cfg_path)
         .map_err(|e| anyhow::anyhow!("reading session-keys config {cfg_path:?}: {e}"))?;
     cfg.session_keys
         .to_session_keys()
@@ -101,9 +101,9 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// for non-interactive exec channels, which have no detach.
 pub fn attach_command(
     sock: &Path,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     wire: Option<&str>,
-    session_keys: Option<&sessions::keys::SessionKeys>,
+    session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
@@ -157,28 +157,25 @@ pub fn attach_command(
     // paired with its `env` set above. Only the interactive attach path sends
     // these — exec/task channels pass `None`.
     if let Some(keys) = session_keys {
-        ssh.env(sessions::keys::LEADER_ENV, keys.leader.as_config_str())
+        ssh.env(boxes::keys::LEADER_ENV, keys.leader.as_config_str())
+            .env(boxes::keys::DETACH_KEY_ENV, keys.detach_key.as_config_str())
             .env(
-                sessions::keys::DETACH_KEY_ENV,
-                keys.detach_key.as_config_str(),
-            )
-            .env(
-                sessions::keys::FORWARD_KEY_ENV,
+                boxes::keys::FORWARD_KEY_ENV,
                 keys.forward_key.as_config_str(),
             )
             .env(
-                sessions::keys::BELL_ENV,
+                boxes::keys::BELL_ENV,
                 if keys.bell_on_leader { "1" } else { "0" },
             )
             .args([
                 "-o",
-                &format!("SendEnv={}", sessions::keys::LEADER_ENV),
+                &format!("SendEnv={}", boxes::keys::LEADER_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::DETACH_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::DETACH_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::FORWARD_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::FORWARD_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::BELL_ENV),
+                &format!("SendEnv={}", boxes::keys::BELL_ENV),
             ]);
     }
 
@@ -494,7 +491,7 @@ fn host_control_within(
 pub fn hold_box_name_beside(
     ssh_sock: &Path,
     box_name: &str,
-    session_id: Option<sessions::SessionId>,
+    session_id: Option<boxes::SessionId>,
     hold: bool,
 ) {
     let Some(control_sock) = ssh_sock
@@ -551,7 +548,7 @@ pub fn hold_box_name_beside(
 pub fn withdraw_box_row_at(
     control_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let request = minimald_rpc::BoxControlRequest::Withdraw(minimald_rpc::WithdrawBoxRequest {
@@ -593,7 +590,7 @@ pub fn withdraw_box_row_at(
 pub fn withdraw_box_row_beside(
     ssh_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(control_sock) = ssh_sock
@@ -631,7 +628,7 @@ pub fn withdraw_box_row_beside(
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) -> anyhow::Result<bool> {
     let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
@@ -868,11 +865,7 @@ impl HostAsks {
 /// The one line a late answer prints: how the ask it answered had already
 /// ended, as the VM host daemon recorded it.
 #[must_use]
-pub fn late_answer_line(
-    port: u16,
-    proto: sessions::IpProto,
-    end: minimald_rpc::AskLateEnd,
-) -> String {
+pub fn late_answer_line(port: u16, proto: boxes::IpProto, end: minimald_rpc::AskLateEnd) -> String {
     match end {
         minimald_rpc::AskLateEnd::Allowed => {
             format!("ask {port}/{proto} was already allowed by another attach")
@@ -989,7 +982,7 @@ mod tests {
             }
             seen
         });
-        let id = sessions::SessionId::nil();
+        let id = boxes::SessionId::nil();
         hold_box_name_beside(&ssh_sock, "web", Some(id), false);
         hold_box_name_beside(&ssh_sock, "api", Some(id), true);
         let seen = server.join().unwrap();
@@ -1011,7 +1004,7 @@ mod tests {
     #[test]
     fn late_answer_line_names_the_real_end() {
         use minimald_rpc::{AskCancelCause, AskLateEnd};
-        let tcp = sessions::IpProto::Tcp;
+        let tcp = boxes::IpProto::Tcp;
         assert_eq!(
             late_answer_line(3000, tcp, AskLateEnd::Allowed),
             "ask 3000/tcp was already allowed by another attach"
@@ -1035,7 +1028,7 @@ mod tests {
     #[test]
     fn attach_command_targets_the_provider_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1054,7 +1047,7 @@ mod tests {
     #[test]
     fn exec_path_keeps_inherited_stdio() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1074,8 +1067,8 @@ mod tests {
     #[test]
     fn attach_command_bounds_the_handshake() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let interactive = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
-        let exec = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let interactive = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
 
         let args = |cmd: &std::process::Command| -> Vec<String> {
             cmd.get_args()
@@ -1117,7 +1110,7 @@ mod tests {
     #[test]
     fn attach_command_targets_a_named_vm_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1133,7 +1126,7 @@ mod tests {
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
         let wire = remote_command(&["min".to_string(), "run".to_string(), "test".to_string()]);
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref(), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), wire.as_deref(), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1233,8 +1226,8 @@ mod tests {
     #[test]
     fn attach_command_negotiates_session_keys_when_given() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let keys = sessions::keys::SessionKeys::default();
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, Some(&keys)).unwrap();
+        let keys = boxes::keys::SessionKeys::default();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, Some(&keys)).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -1248,19 +1241,19 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            env.get(sessions::keys::LEADER_ENV).map(String::as_str),
+            env.get(boxes::keys::LEADER_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::DETACH_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
             Some("d")
         );
         assert_eq!(
-            env.get(sessions::keys::FORWARD_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::FORWARD_KEY_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::BELL_ENV).map(String::as_str),
+            env.get(boxes::keys::BELL_ENV).map(String::as_str),
             Some("0")
         );
 
@@ -1269,10 +1262,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
@@ -1286,7 +1279,7 @@ mod tests {
     #[test]
     fn attach_command_omits_session_keys_when_none() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -1300,10 +1293,10 @@ mod tests {
             })
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(!env.contains_key(name), "{name} should not be set for exec");
         }
@@ -1313,10 +1306,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 !args.iter().any(|a| a == format!("SendEnv={name}").as_str()),

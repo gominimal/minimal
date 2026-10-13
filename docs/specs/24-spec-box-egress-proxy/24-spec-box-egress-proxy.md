@@ -113,7 +113,7 @@ Sign-in
   verify:   ./scripts/session-e2e.sh bep_second_box_needs_no_sign_in
   - IF a box declaring a GitHub grant is created while no GitHub sign-in is held THEN THE SYSTEM SHALL fail the creation with the defined error `github_sign_in_required` and not prompt for sign-in.
     tier:   T0
-    verify: cargo nextest run -p sessions creation_without_sign_in_fails_with_defined_error
+    verify: cargo nextest run -p boxes creation_without_sign_in_fails_with_defined_error
     <!-- Gatehouse §6.2 v1.20 leaves the error name to this document; distinct from `gatehouse_unenrolled_node`, which stays the refusal where no proxy exists -->
 
 - **BEP-004** WHEN `min auth status` is run THE SYSTEM SHALL report whether a GitHub sign-in is held and its expiry, and output no token value.
@@ -171,31 +171,31 @@ Minting and sealing
 
 - **BEP-008** IF a box spec declares a GitHub grant and its `egress.allow_dns_hosts` does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_grant_host_set_outside_egress_is_exit_3
+  verify:   cargo nextest run -p boxes prop_grant_host_set_outside_egress_is_exit_3
   property: for every box spec and every module host set, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
 
 - **BEP-009** IF a box spec declares `network.mode = "none"` and a GitHub grant THEN THE SYSTEM SHALL refuse expansion with exit 3.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_none_mode_with_grant_is_exit_3
+  verify:   cargo nextest run -p boxes prop_none_mode_with_grant_is_exit_3
   property: for every box spec, expansion refuses iff `network.mode` is `none` and at least one runtime grant is declared
 
 - **BEP-010** IF a box spec declares `steering = "off"` and a GitHub grant THEN THE SYSTEM SHALL create the box with no interception CA injected and emit a validation warning naming the grant.
   tier:     T0
-  verify:   cargo nextest run -p sessions steering_off_with_grant_warns_and_injects_no_ca
+  verify:   cargo nextest run -p boxes steering_off_with_grant_warns_and_injects_no_ca
   - IF a box spec declares `steering = "off"` and `[network.bep] proxy_env = true` THEN THE SYSTEM SHALL refuse the expansion with exit 3 naming both fields.
     tier:   T0
-    verify: cargo nextest run -p sessions steering_off_with_proxy_env_is_refused
+    verify: cargo nextest run -p boxes steering_off_with_proxy_env_is_refused
     <!-- design §5.4 composes `proxy_env` with any steering mode, but `off` also disables CA injection, so an environment pointing at the proxy would fail every TLS handshake; the combination is unbuildable and is refused rather than warned -->
 
 - **BEP-056** WHERE the host is not enrolled, IF a box spec declares a GitHub grant with `mode = "installation"` THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the grant.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_installation_mode_unenrolled_is_exit_3
+  verify:   cargo nextest run -p boxes prop_installation_mode_unenrolled_is_exit_3
   property: for every box spec on an un-enrolled host, expansion refuses with exit 3 iff a GitHub grant declares `mode = "installation"`
   <!-- Gatehouse §6.10 Validation, un-enrolled: no App private key exists locally -->
 
 - **BEP-057** WHERE the host is not enrolled, IF a box spec declares a GitHub grant whose `github:repo:*` scopes are narrower than `full` and the client configuration does not acknowledge full-breadth minting THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the grant and the acknowledgement as the remedy.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_narrow_scopes_unenrolled_need_acknowledgement
+  verify:   cargo nextest run -p boxes prop_narrow_scopes_unenrolled_need_acknowledgement
   property: for every box spec on an un-enrolled host and every client configuration, expansion refuses with exit 3 iff some GitHub grant declares scopes narrower than `full` and the acknowledgement is unset
   <!-- Gatehouse §6.10 Validation, un-enrolled: the declared bound cannot be honored locally until local narrowing lands, and a warning would be the silent widening §6.4 forbids -->
   - WHERE the user-level or organization-level client configuration sets `[secrets] acknowledge_full_breadth_unenrolled = true` THE SYSTEM SHALL mint the member `full` and render it as `full` in `min box spec` with the acknowledgement visible and stating that it covers the member's reach for the box's life, within the credentialed lane's ceiling.
@@ -204,7 +204,7 @@ Minting and sealing
     <!-- the field name is this document's; the architecture carries it as a placeholder; Gatehouse v1.23 extends the acknowledgement to the reference's box-lifetime reach, so the rendering names that window, not the 8-hour token it replaced -->
   - IF a project `minimal.toml` sets the acknowledgement THEN THE SYSTEM SHALL ignore it and emit a warning.
     tier:   T0
-    verify: cargo nextest run -p sessions project_acknowledgement_is_ignored_with_warning
+    verify: cargo nextest run -p boxes project_acknowledgement_is_ignored_with_warning
     <!-- never project-supplied, so the declared scopes are honored unchanged the moment the host enrolls -->
 
 Steering and the interception CA
@@ -223,7 +223,7 @@ Steering and the interception CA
     <!-- Gatehouse §6.10 trust-store injection's environment block, carried there as [proposed]: making it normative was considered and declined (Gatehouse v1.22), so the architecture's guarantee covers OS-trust-store readers alone and this document builds the proposed block; if the architecture ratifies a different variable list, this requirement follows it; the block serves stacks that keep a store of their own; Node reads no OS store, so a Node client such as Claude Code refuses every leaf without it; the list is maintained with the package set, and the JVM keystore is outside it -->
   - IF a box spec's environment sets one of those variables THEN THE SYSTEM SHALL keep the spec's value and emit a validation warning naming the variable.
     tier:   T0
-    verify: cargo nextest run -p sessions spec_trust_env_shadows_platform_with_warning
+    verify: cargo nextest run -p boxes spec_trust_env_shadows_platform_with_warning
 
 - **BEP-012** WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
   tier:     T0
@@ -280,11 +280,11 @@ Steering and the interception CA
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
-  verify:   cargo nextest run -p sessions steering_defaults_to_dns
+  verify:   cargo nextest run -p boxes steering_defaults_to_dns
 
 - **BEP-017** WHILE the host has no box-zone resolver, IF a box spec's resolved steering is `dns` or `both` and it declares a credentialed upstream THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the missing resolver.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_dns_steering_without_resolver_is_exit_3
+  verify:   cargo nextest run -p boxes prop_dns_steering_without_resolver_is_exit_3
   property: for every box spec declaring a credentialed upstream, on a host with no box-zone resolver, expansion refuses iff the resolved steering is `dns` or `both`
 
 - **BEP-018** WHILE a box's resolved `quic443` stance is blocked, IF the box sends UDP to port 443 THEN THE SYSTEM SHALL reject the datagram with ICMP port unreachable.
@@ -293,7 +293,7 @@ Steering and the interception CA
   <!-- networking design §5.3 (v0.9): an active reject, never a silent drop, so a client falls back to TCP at once (§5.7's determinism rule); the stance governs the resolver-bypass path -->
   - THE SYSTEM SHALL resolve `quic443 = "auto"` to blocked exactly when the box declares a credentialed upstream and its resolved steering is `dns` or `both`, and to allowed otherwise.
     tier:   T1
-    verify: cargo nextest run -p sessions prop_quic443_auto_resolves_on_grants_and_steering
+    verify: cargo nextest run -p boxes prop_quic443_auto_resolves_on_grants_and_steering
     property: for every `quic443` value, credentialed-upstream set and steering mode, the resolved stance is blocked iff the value is `block`, or the value is `auto`, the set is non-empty and the steering is `dns` or `both`
     <!-- ubiquitous; Gatehouse §6.3.2/§6.11 (v1.25): under `proxy_env` or `off` nothing is steered at a TCP-only listener, so the block bought neither interception coverage nor fallback determinism -->
   - IF a box sends UDP to port 443 toward the steered proxy address THEN THE SYSTEM SHALL reject it with ICMP port unreachable, whatever the box's stance.
@@ -491,10 +491,10 @@ Store references
 
 - **BEP-034** IF a `[secret-store-rules]` rule names a deep module's host, Minimal's own infrastructure, or an injection header among `Host`, `:authority`, `Cookie`, `Proxy-*`, `Transfer-Encoding`, `Connection` and `Upgrade` THEN THE SYSTEM SHALL refuse the rule when reading configuration and name it.
   tier:     T0
-  verify:   cargo nextest run -p sessions store_rule_in_deny_set_is_refused
+  verify:   cargo nextest run -p boxes store_rule_in_deny_set_is_refused
   - IF a `[secret-store-rules]` rule or a `source = "store"` reference names the GitHub sign-in item THEN THE SYSTEM SHALL refuse it when reading configuration and name the GitHub module as the item's owner.
     tier:   T0
-    verify: cargo nextest run -p sessions store_rule_naming_sign_in_item_is_refused
+    verify: cargo nextest run -p boxes store_rule_naming_sign_in_item_is_refused
     <!-- Gatehouse §6.10 (v1.23): the item's identifier is reserved to the module, so a generic reference can never inject the operator's GitHub token -->
 
 - **BEP-065** WHEN a store value is injected THE SYSTEM SHALL emit exactly the registered prefix followed by the value as the header's value, or fill one `basic_auth` field with it.
@@ -508,16 +508,16 @@ Store references
 
 - **BEP-035** WHERE the client has no TTY, IF a store reference matches a rule with `action = "ask"` THEN THE SYSTEM SHALL deny the reference.
   tier:     T0
-  verify:   cargo nextest run -p sessions ask_rule_without_tty_denies
+  verify:   cargo nextest run -p boxes ask_rule_without_tty_denies
 
 - **BEP-036** IF a box spec declares a store reference whose registered upstream is not admitted by the box's egress THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the missing host.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_store_upstream_outside_egress_is_exit_3
+  verify:   cargo nextest run -p boxes prop_store_upstream_outside_egress_is_exit_3
   property: for every box spec and every registered upstream set, expansion refuses with exit 3 iff some registered upstream is absent from the egress declaration, naming exactly the absent hosts
 
 - **BEP-037** IF a project `minimal.toml` contains a `[secret-store-rules]` section THEN THE SYSTEM SHALL ignore it and emit a warning.
   tier:     T0
-  verify:   cargo nextest run -p sessions project_store_rules_are_ignored_with_warning
+  verify:   cargo nextest run -p boxes project_store_rules_are_ignored_with_warning
 
 Review, audit and revocation
 

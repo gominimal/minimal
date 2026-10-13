@@ -1,8 +1,8 @@
+use boxes::SessionId;
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{ChannelOpenHandle, Config as RuConfig, Msg, RunningSession, Session},
 };
-use sessions::SessionId;
 use std::{
     collections::BTreeMap,
     pin::Pin,
@@ -692,13 +692,13 @@ enum DialSite {
     InBox,
 }
 
-fn dial_site(network: sessions::NetworkMode) -> DialSite {
+fn dial_site(network: boxes::NetworkMode) -> DialSite {
     match network {
-        sessions::NetworkMode::HostNet => DialSite::Shared,
+        boxes::NetworkMode::HostNet => DialSite::Shared,
         // The modes this daemon knows, and any a newer config carries:
         // `127.0.0.1` always means inside the box, and dialing there from
         // the box is the one reading that holds for every isolated mode.
-        sessions::NetworkMode::NoNet | sessions::NetworkMode::OwnIp | _ => DialSite::InBox,
+        boxes::NetworkMode::NoNet | boxes::NetworkMode::OwnIp | _ => DialSite::InBox,
     }
 }
 
@@ -1174,7 +1174,7 @@ kill "$peer" 2>/dev/null
         // because the request must carry `none` — the harness's builders
         // default to the shared-netns mode the release test covers.
         let mut req = create_session_req("direct-tcpip-netns", "/tmp");
-        req.config.network = sessions::NetworkMode::NoNet;
+        req.config.network = boxes::NetworkMode::NoNet;
         use minimald_rpc::{
             ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
             FinalizeSessionRequest,

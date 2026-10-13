@@ -11,6 +11,7 @@ use std::io;
 use std::process::Stdio;
 use std::time::Duration;
 
+use boxes::SessionId;
 use futures::{
     StreamExt,
     stream::{self, BoxStream, Stream},
@@ -20,7 +21,6 @@ use russh::{
     Channel, ChannelId,
     server::{Msg, Session},
 };
-use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
 use tokio::sync::{mpsc, watch};
@@ -193,7 +193,7 @@ impl Exec for TaskExec {
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
 /// reported for it. `phase` is the rollout phase to resolve the egress under
-/// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
+/// — both callers pass [`boxes::EGRESS_DEFAULT_PHASE`], the phase this
 /// build ships, while the tests pass the phase by name so each arm's posture
 /// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
@@ -210,9 +210,9 @@ impl Exec for TaskExec {
 /// so attaching one where nothing needs gating would change behaviour the
 /// opt-out exists to keep.
 pub(crate) fn task_network(
-    record: &sessions::Record,
+    record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    phase: sessions::EgressDefaultPhase,
+    phase: boxes::EgressDefaultPhase,
     deny_all_opt_out: bool,
 ) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
@@ -227,7 +227,7 @@ pub(crate) fn task_network(
         record.network,
         switch,
         &format!("{session}-task"),
-        egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
+        egress.map(|section| boxes::SessionPolicy::new(Some(section), None)),
         // Never the record's handed box addresses (T66): the task's sandbox
         // is not the box the registration named — attaching it at the
         // session box's address would key its frames to the session's row.
@@ -254,7 +254,7 @@ pub(crate) fn task_network(
 /// host registered nothing for (a native host, a `host_ip` or `none` box)
 /// asks nothing.
 async fn ensure_task_rows_stand(
-    record: &sessions::Record,
+    record: &boxes::Record,
     switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
 ) -> io::Result<()> {
     let Some(addresses) = record.box_addresses else {
@@ -420,7 +420,7 @@ async fn task_producer(
         let network = task_network(
             &record,
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
         );
         // A task's `~/` resolves against the session's home, the same
@@ -2687,17 +2687,17 @@ mod tests {
 
     /// A session record carrying `mode`, with everything else at its default.
     #[cfg(target_os = "linux")]
-    fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
-        sessions::Record {
-            id: sessions::SessionId::nil(),
+    fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
+        boxes::Record {
+            id: boxes::SessionId::nil(),
             name: None,
             username: None,
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
-            policy: sessions::SessionPolicy::default(),
+            policy: boxes::SessionPolicy::default(),
             task_addresses: Vec::new(),
             box_addresses: None,
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             hooks_enabled: true,
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
@@ -2722,14 +2722,14 @@ mod tests {
                     port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
                 }),
         );
-        let unregistered = record_with(sessions::NetworkMode::OwnIp);
+        let unregistered = record_with(boxes::NetworkMode::OwnIp);
         super::ensure_task_rows_stand(&unregistered, &switch)
             .await
             .expect("a box with no host registration asks nothing");
 
-        let mut registered = record_with(sessions::NetworkMode::OwnIp);
+        let mut registered = record_with(boxes::NetworkMode::OwnIp);
         registered.name = Some("web".to_string());
-        registered.box_addresses = Some(sessions::BoxAddresses {
+        registered.box_addresses = Some(boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
         });
@@ -2760,29 +2760,29 @@ mod tests {
         ));
 
         let host = super::task_network(
-            &record_with(sessions::NetworkMode::HostNet),
+            &record_with(boxes::NetworkMode::HostNet),
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
         assert!(!host.plan().await.unwrap().isolates_netns());
 
         let no_net = super::task_network(
-            &record_with(sessions::NetworkMode::NoNet),
+            &record_with(boxes::NetworkMode::NoNet),
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
         let plan = no_net.plan().await.unwrap();
         assert!(plan.isolates_netns() && plan.tap().is_none());
 
-        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        let mut record = record_with(boxes::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
-        record.policy.ingress = Some(sessions::IngressPolicy::default());
+        record.policy.ingress = Some(boxes::IngressPolicy::default());
         // A VM host's switch draws nothing (NET-138): the task attaches at a
         // task address its box's registration filed.
         record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
-        let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let own_ip = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
             plan.isolates_netns(),
@@ -2799,7 +2799,7 @@ mod tests {
         let gated = crate::session::effective_egress_section(
             &record.policy,
             record.network,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         )
         .is_some();
@@ -2813,12 +2813,12 @@ mod tests {
 
         // No name: the session id, rather than an empty hostname.
         let unnamed = super::task_network(
-            &record_with(sessions::NetworkMode::OwnIp),
+            &record_with(boxes::NetworkMode::OwnIp),
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
-        assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+        assert!(format!("{unnamed:?}").contains(&boxes::SessionId::nil().to_string()));
     }
 
     /// A VM host's switch, which hands every address and draws none
@@ -2843,14 +2843,14 @@ mod tests {
     #[tokio::test]
     async fn in_box_run_task_draws_a_task_slot() {
         let switch = vm_host_switch();
-        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        let mut record = record_with(boxes::NetworkMode::OwnIp);
         record.task_addresses = vec![
             std::net::Ipv4Addr::new(100, 64, 128, 2),
             std::net::Ipv4Addr::new(100, 64, 128, 3),
         ];
-        let first = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let first = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         first.plan().await.expect("a free task address");
-        let second = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let second = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         second.plan().await.expect("a second free task address");
         let held: Vec<_> = switch
             .lock()
@@ -2864,7 +2864,7 @@ mod tests {
             "each run holds one task address"
         );
 
-        let third = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let third = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         let err = third.plan().await.expect_err("every task address is held");
         assert!(
             err.to_string()
@@ -2885,8 +2885,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
         let switch = vm_host_switch();
-        let record = record_with(sessions::NetworkMode::OwnIp);
-        let task = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let record = record_with(boxes::NetworkMode::OwnIp);
+        let task = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         let err = task.plan().await.expect_err("nothing is drawn");
         assert!(
             err.to_string()
@@ -2929,7 +2929,7 @@ mod tests {
         ));
         // A bare own-address box: no egress declaration, so its egress is
         // whatever the default resolves for an absent one.
-        let record = record_with(sessions::NetworkMode::OwnIp);
+        let record = record_with(boxes::NetworkMode::OwnIp);
 
         // Announced, no opt-out: an absent section still allows all, so the
         // task gets no gate at all — its inbound stays as open as it was
@@ -2938,7 +2938,7 @@ mod tests {
             crate::session::effective_egress_section(
                 &record.policy,
                 record.network,
-                sessions::EgressDefaultPhase::Announced,
+                boxes::EgressDefaultPhase::Announced,
                 false,
             ),
             None,
@@ -2947,7 +2947,7 @@ mod tests {
         let announced = super::task_network(
             &record,
             &switch,
-            sessions::EgressDefaultPhase::Announced,
+            boxes::EgressDefaultPhase::Announced,
             false,
         );
         assert!(
@@ -2961,18 +2961,14 @@ mod tests {
             crate::session::effective_egress_section(
                 &record.policy,
                 record.network,
-                sessions::EgressDefaultPhase::InForce,
+                boxes::EgressDefaultPhase::InForce,
                 false,
             ),
-            Some(sessions::EgressPolicy::deny_all()),
+            Some(boxes::EgressPolicy::deny_all()),
             "the in-force default resolves an absent section to deny-all"
         );
-        let in_force = super::task_network(
-            &record,
-            &switch,
-            sessions::EgressDefaultPhase::InForce,
-            false,
-        );
+        let in_force =
+            super::task_network(&record, &switch, boxes::EgressDefaultPhase::InForce, false);
         assert!(
             format!("{in_force:?}").contains("has_policy: true"),
             "the in-force default gates a bare box's task: {in_force:?}"
@@ -2987,17 +2983,17 @@ mod tests {
         // decides the destination list the declaration left absent
         // (`allow_dns_hosts`): present and empty, granting nothing
         // (NET-074); announced, the section is carried as declared.
-        let section = sessions::EgressPolicy {
+        let section = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..sessions::EgressPolicy::default()
+            ..boxes::EgressPolicy::default()
         };
-        let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
+        let mut declared_record = record_with(boxes::NetworkMode::OwnIp);
         declared_record.policy.egress = Some(section.clone());
         for (phase, expected) in [
-            (sessions::EgressDefaultPhase::Announced, section.clone()),
+            (boxes::EgressDefaultPhase::Announced, section.clone()),
             (
-                sessions::EgressDefaultPhase::InForce,
-                sessions::EgressPolicy {
+                boxes::EgressDefaultPhase::InForce,
+                boxes::EgressPolicy {
                     allow_dns_hosts: Some(Vec::new()),
                     ..section.clone()
                 },
@@ -3018,7 +3014,7 @@ mod tests {
         let declared = super::task_network(
             &declared_record,
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
         assert!(
@@ -4185,7 +4181,7 @@ mod tests {
         //! Tests that exercise the full ssh-exec stack against a real
         //! `TestServer`: russh transport, `ConnectionHandler` dispatch,
         //! and `handle_exec` request routing.
-        use sessions::SessionId;
+        use boxes::SessionId;
 
         use minimald_rpc::exec::ExecRequest;
 

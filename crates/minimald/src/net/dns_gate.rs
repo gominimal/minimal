@@ -13,7 +13,7 @@
 //! outside the VM, and it decides an undeclared destination against the DNS
 //! replies the box's own lookups received — filled from the same answers,
 //! held to the same intersection and the same numbers, all of them read
-//! from the one place both legs hold them, [`sessions::core::egress`] — so
+//! from the one place both legs hold them, [`boxes::core::egress`] — so
 //! nothing inside the VM, not even a relay replaced with a hostile one,
 //! can widen a box's destinations. This gate is then the *precision* copy
 //! inside the VM: it still intercepts the box's queries, answers the
@@ -26,7 +26,7 @@
 //! * **Pinning** (NET-066) — every DNS reply from the box's own resolver
 //!   (the switch gateway, NET-079's carve-out address) that answers a query
 //!   for a name the box's `egress.allow_dns_hosts` declared is split by the
-//!   pure rebinding intersection ([`sessions::core::egress`]): the answers
+//!   pure rebinding intersection ([`boxes::core::egress`]): the answers
 //!   that survive the box's denies and the infrastructure deny set are
 //!   admitted into a per-box table for [`ADMISSION_WINDOW`], capped at
 //!   [`MAX_ADDRESSES_PER_NAME`] addresses per name per family (design
@@ -59,7 +59,7 @@
 //!   them differently.
 //! * **REFUSED for a deny-all box's names outside the zone** (NET-141) —
 //!   when the box's egress is the deny-all shape (every `allow_*` dimension
-//!   present and empty, the shape `sessions::EgressPolicy::deny_all`
+//!   present and empty, the shape `boxes::EgressPolicy::deny_all`
 //!   materializes and the classifier places under `deny`), a query toward
 //!   this box's resolver that asks for any name outside the box zone, of
 //!   any record type, is answered REFUSED (rcode 5) by the relay itself and
@@ -226,7 +226,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 
 use super::policy::PolicyWarnLimiter;
 use super::switch::L4Packet;
-use sessions::core::egress::{self, EgressRules, InfrastructureDenySet};
+use boxes::core::egress::{self, EgressRules, InfrastructureDenySet};
 
 /// The port DNS is served on: the resolver's destination port on the query
 /// leg and its source port on the reply leg.
@@ -257,9 +257,9 @@ const COMPONENT: &str = "dns-gate";
 ///
 /// This leg does not own the number: both admission tables hold the same
 /// window, and both read it from the one place it lives,
-/// [`sessions::core::egress::DNS_ADMISSION_WINDOW`], so a pin can never
+/// [`boxes::core::egress::DNS_ADMISSION_WINDOW`], so a pin can never
 /// outlive its window on one leg while it lives on in the other.
-pub(crate) const ADMISSION_WINDOW: Duration = sessions::core::egress::DNS_ADMISSION_WINDOW;
+pub(crate) const ADMISSION_WINDOW: Duration = boxes::core::egress::DNS_ADMISSION_WINDOW;
 
 /// Design §5.3's cap on a name's admitted addresses: at most this many per
 /// name per family, fail closed. A reply whose A records run past the cap
@@ -273,8 +273,8 @@ pub(crate) const ADMISSION_WINDOW: Duration = sessions::core::egress::DNS_ADMISS
 /// half of the cap is the IPv4 half alone.
 ///
 /// Both admission tables hold the same cap, read from
-/// [`sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME`].
-const MAX_ADDRESSES_PER_NAME: usize = sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME;
+/// [`boxes::core::egress::DNS_MAX_ADDRESSES_PER_NAME`].
+const MAX_ADDRESSES_PER_NAME: usize = boxes::core::egress::DNS_MAX_ADDRESSES_PER_NAME;
 
 /// Sweep expired admissions once the table crosses this many entries — the
 /// per-box backstop behind the per-name cap, bounding memory without a
@@ -302,8 +302,8 @@ const TCP_RST: u8 = 0x04;
 /// table anyway.
 ///
 /// Both admission tables hold the same retention cap, read from
-/// [`sessions::core::egress::DNS_FLOW_IDLE_CAP`].
-const FLOW_IDLE_CAP: Duration = sessions::core::egress::DNS_FLOW_IDLE_CAP;
+/// [`boxes::core::egress::DNS_FLOW_IDLE_CAP`].
+const FLOW_IDLE_CAP: Duration = boxes::core::egress::DNS_FLOW_IDLE_CAP;
 
 /// Sweep idle flows once the table crosses this many entries: the bound's
 /// *memory* half, reclaiming entries no frame ever comes back to look up.
@@ -352,7 +352,7 @@ pub(crate) struct DnsGate {
     /// names, which pins nothing (see the module doc).
     names: Option<HashSet<String>>,
     /// Whether the box's egress is the deny-all shape
-    /// ([`sessions::EgressPolicy::admits_nothing`]): every query it sends for a
+    /// ([`boxes::EgressPolicy::admits_nothing`]): every query it sends for a
     /// name outside the box zone is answered REFUSED here and never
     /// forwarded (NET-141).
     deny_all: bool,
@@ -439,7 +439,7 @@ impl DnsGate {
     /// and the session's shared limiter.
     pub(crate) fn new(
         label: &str,
-        policy: Option<&sessions::EgressPolicy>,
+        policy: Option<&boxes::EgressPolicy>,
         rules: EgressRules,
         infrastructure: InfrastructureDenySet,
         host_alias: [u8; 4],
@@ -449,7 +449,7 @@ impl DnsGate {
             names: policy
                 .and_then(|policy| policy.allow_dns_hosts.as_ref())
                 .map(|hosts| hosts.iter().map(|host| normalized(host)).collect()),
-            deny_all: policy.is_some_and(sessions::EgressPolicy::admits_nothing),
+            deny_all: policy.is_some_and(boxes::EgressPolicy::admits_nothing),
             rules,
             infrastructure,
             host_alias,
@@ -945,10 +945,10 @@ pub(crate) mod tests {
 
     /// The box that allows `github.com` and, by address, nothing else: TCP
     /// declared, no subnets, the one name — the proof sentence's box.
-    fn github_only_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn github_only_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
                 deny_subnets: None,
@@ -966,13 +966,13 @@ pub(crate) mod tests {
     /// verdict carves out UDP/53 to the resolver before it checks protocol
     /// rules (NET-079), so `allow_protocols: Some([Tcp])` still lets the box
     /// resolve every allowed name.
-    fn toolchain_hosts_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn toolchain_hosts_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(
-                    sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
+                    boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
                         .iter()
                         .map(|h| (*h).to_string())
                         .collect(),
@@ -989,10 +989,10 @@ pub(crate) mod tests {
     /// — the idle-bound proofs' box, since a UDP flow is the one that carries
     /// no close signal for the gate to read and so can only ever be released
     /// by idleness.
-    fn github_udp_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Udp]),
+    fn github_udp_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Udp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
                 deny_subnets: None,
@@ -1006,10 +1006,10 @@ pub(crate) mod tests {
     /// denied-range refusal's box (NET-067). Two names, because the refusal
     /// log's requirement is the *name* and the answer — the log proof
     /// refuses each of them inside the limiter's interval and must hear both.
-    fn denied_range_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn denied_range_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["example.com".to_string(), "other.example".to_string()]),
                 deny_subnets: Some(vec!["10.9.9.0/24".to_string()]),
@@ -1112,12 +1112,12 @@ pub(crate) mod tests {
     /// A fresh gate over `policy`, on the default switch's resolver and
     /// infrastructure set and host alias, for the unit tests that drive the
     /// gate directly.
-    fn gate_for(policy: &sessions::SessionPolicy) -> DnsGate {
+    fn gate_for(policy: &boxes::SessionPolicy) -> DnsGate {
         let label = LEASE.to_string();
         DnsGate::new(
             &label,
             policy.egress.as_ref(),
-            sessions::core::egress::EgressRules::from_policy(
+            boxes::core::egress::EgressRules::from_policy(
                 policy.egress.as_ref(),
                 RESOLVER.octets(),
                 LEASE.octets(),
@@ -1143,9 +1143,9 @@ pub(crate) mod tests {
     /// the cap.
     #[test]
     fn admitted_addresses_are_capped_per_name() {
-        let two_names = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        let two_names = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string(), "second.example".to_string()]),
                 deny_subnets: None,
@@ -1395,7 +1395,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             exercised,
-            sessions::NET068_TOOLCHAIN_EGRESS_HOSTS,
+            boxes::NET068_TOOLCHAIN_EGRESS_HOSTS,
             "every NET-068 toolchain host is exercised, in the constant's order"
         );
         for (index, (name, address)) in toolchain.iter().enumerate() {
@@ -1965,7 +1965,7 @@ pub(crate) mod tests {
     /// refusal of the box's own deny range is proved where its effect lives,
     /// by the log line `denied_range_resolution_logged` asserts carries
     /// `dns-rebinding-denied-subnet`, and by the pure intersection's own
-    /// proofs in `sessions::core::egress`.
+    /// proofs in `boxes::core::egress`.
     #[tokio::test]
     async fn denied_range_resolution_refused() {
         let mut harness = spawn_test_relay(&denied_range_egress());
@@ -2646,11 +2646,11 @@ pub(crate) mod tests {
     }
 
     /// The deny-all box: every `allow_*` dimension present and empty, the
-    /// section `sessions::EgressPolicy::deny_all` materializes for
+    /// section `boxes::EgressPolicy::deny_all` materializes for
     /// `EffectiveEgress::DenyAll` (NET-141's deny-all case).
-    fn deny_all_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy::deny_all()),
+    fn deny_all_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
         }
@@ -2997,7 +2997,7 @@ pub(crate) mod tests {
     /// but NET-136's, which they keep answering NODATA.
     #[test]
     fn allow_list_and_allow_all_boxes_keep_forwarding() {
-        let allow_all = sessions::SessionPolicy {
+        let allow_all = boxes::SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -3116,7 +3116,7 @@ pub(crate) mod tests {
     fn forwarding_gates() -> [DnsGate; 2] {
         [
             test_gate(),
-            gate_for(&sessions::SessionPolicy {
+            gate_for(&boxes::SessionPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
@@ -3308,8 +3308,8 @@ pub(crate) mod tests {
     async fn undeclared_names_and_hosts_pin_nothing() {
         // The address-deny-all declaration of the existing egress proofs,
         // with no name list: resolving must not open it.
-        let policy = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+        let policy = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: None,

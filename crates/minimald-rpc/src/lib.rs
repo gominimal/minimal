@@ -9,15 +9,15 @@
 //!
 //! The server-side serving glue lives in the `minimald` crate.
 
+use boxes::SessionId;
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sessions::SessionId;
 
 pub mod exec;
 pub mod taskenv;
 pub mod trace;
 
-pub use sessions::{
+pub use boxes::{
     BoxAddresses, CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
     EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
 };
@@ -185,18 +185,18 @@ pub struct RunningSessionAttrs {
 /// when it did not and the box runs with the host's address and no verdict
 /// of its own.
 ///
-/// The type is defined in the sessions crate — beside the
-/// [`Record`](sessions::Record) field that carries a box's own launch
+/// The type is defined in the `boxes` crate — beside the
+/// [`Record`](boxes::Record) field that carries a box's own launch
 /// outcome, a session-plane type this crate already depends on — and
 /// re-exported here so the paths this crate's clients spell stay what they
 /// were: the listing's [`ListSessionsEntry::host_ip_enforcement`] answers in
 /// it, and the stringly surfaces carry its machine spelling.
-pub use sessions::HostIpEnforcement;
+pub use boxes::HostIpEnforcement;
 
 /// An entry in the ListSessions response.
 ///
 /// `project_path` and `status` mirror the fields of the same name on the
-/// session [`Record`](sessions::Record). They let a client resolve "which
+/// session [`Record`](boxes::Record). They let a client resolve "which
 /// session was built from this directory" and render a state glyph in a
 /// picker without a follow-up `GetSessionRecord` round-trip per session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,14 +206,14 @@ pub struct ListSessionsEntry {
     /// The absolute host path the session was built from. `None` on responses
     /// from daemons that predate this field — clients treat such entries as
     /// not matching the cwd but still listable/pickable. Always `Some` from a
-    /// current daemon, since [`Record`](sessions::Record) requires the path.
+    /// current daemon, since [`Record`](boxes::Record) requires the path.
     #[serde(default)]
     pub project_path: Option<paths::HostAbsPath>,
     /// The session's lifecycle status, used to render a state glyph in the
     /// interactive picker. Defaults to `Active` for daemons that predate the
     /// field so an older server still deserializes cleanly.
     #[serde(default)]
-    pub status: sessions::SessionStatus,
+    pub status: boxes::SessionStatus,
     /// Git context for the project path, probed by the client at list time
     /// (the daemon cannot probe it: on macOS it runs in the minvmd guest,
     /// where the host's project paths do not exist and git is not on PATH).
@@ -369,7 +369,7 @@ pub enum GetSessionRecordRequest {
 /// The response for a [`GetSessionRecord`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSessionRecordResponse {
-    pub record: Option<sessions::Record>,
+    pub record: Option<boxes::Record>,
     /// The build this daemon runs, so a client can assert the pair matches
     /// without spending a round trip on [`GetVersion`]. `None` from a daemon
     /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
@@ -478,7 +478,7 @@ pub struct SessionConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_addresses: Vec<std::net::Ipv4Addr>,
     /// The box id the same registration handed back
-    /// ([`sessions::Record::box_id`]): the id the host's row of the box
+    /// ([`boxes::Record::box_id`]): the id the host's row of the box
     /// holds. `None` for every activation that handed no box addresses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_id: Option<BoxId>,
@@ -504,16 +504,16 @@ pub struct SessionConfig {
 }
 
 /// Serde default for [`SessionConfig::hooks_enabled`]. See
-/// [`sessions::Record::hooks_enabled`] for why this cannot be a bare
+/// [`boxes::Record::hooks_enabled`] for why this cannot be a bare
 /// `#[serde(default)]`.
 fn default_hooks_enabled() -> bool {
     true
 }
 
-/// A box's identity on its host ([`sessions::BoxId`]): defined beside the
+/// A box's identity on its host ([`boxes::BoxId`]): defined beside the
 /// session record that carries it and re-exported under the path its
 /// clients spell, so no wire form changes.
-pub use sessions::BoxId;
+pub use boxes::BoxId;
 
 /// What a successful registration hands back: the allocated addresses —
 /// the pair [`BoxAddresses`] has always carried — and the box id the
@@ -773,7 +773,7 @@ pub struct HoldBoxNameRequest {
     /// them, never a newer session's under the same name. `None` from a
     /// client that predates the field: the release is by name alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<sessions::SessionId>,
+    pub session_id: Option<boxes::SessionId>,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
@@ -1456,7 +1456,7 @@ impl<'de> Deserialize<'de> for AnswererStatusReply {
 }
 
 /// The addresses a successful registration hands back
-/// ([`sessions::BoxAddresses`]): the box's switch address and its published
+/// ([`boxes::BoxAddresses`]): the box's switch address and its published
 /// loopback address, both allocated on the host from the address plan the
 /// host switch serves — the same pair the create request carries so the
 /// in-VM daemon attaches with it.
@@ -1718,7 +1718,7 @@ pub struct CreateSessionResponse {
     /// Whether the serving daemon opted out of the deny-all egress default
     /// (NET-077). The rollout's one fact the client cannot know from its
     /// own build: the phase is a build-time constant both sides share
-    /// ([`sessions::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
+    /// ([`boxes::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
     /// daemon alone. Carried here — on the reply the activation path
     /// already holds — so `min session activate` can keep its in-force note
     /// (NET-074) off a deployment that opted out: its bare boxes keep
@@ -1816,7 +1816,7 @@ pub struct ConfigureLoadoutRequest {
     /// empty-contribution fast path to
     /// [`ConfigureLoadoutResponse::Materialized`].
     #[serde(default)]
-    pub contribution: sessions::wire::request::WireContribution,
+    pub contribution: boxes::wire::request::WireContribution,
 }
 
 /// The response for a [`ConfigureLoadout`] RPC.
@@ -1824,7 +1824,7 @@ pub struct ConfigureLoadoutRequest {
 /// Both variants are part of the Phase 2 flow and reachable on the
 /// wire: `Materialized` when the daemon's composer finalizes in one
 /// shot (the session record is now
-/// [`Materializing`](sessions::SessionStatus::Materializing), not
+/// [`Materializing`](boxes::SessionStatus::Materializing), not
 /// yet `Active`), `Pending` when it collects items the client must
 /// gate before composition completes (the client follows up via
 /// `SubmitVerdict`).
@@ -1837,17 +1837,17 @@ pub struct ConfigureLoadoutRequest {
 pub enum ConfigureLoadoutResponse {
     /// No items need user gating; composition is complete and the
     /// session record has advanced to
-    /// [`Materializing`](sessions::SessionStatus::Materializing).
+    /// [`Materializing`](boxes::SessionStatus::Materializing).
     /// The client still has to upload the composition's patches
     /// and call `FinalizeSession` before the session becomes
     /// attachable.
     Materialized,
     /// Items need client-side gating. The session stays in
-    /// [`Pending`](sessions::SessionStatus::Pending); the client
+    /// [`Pending`](boxes::SessionStatus::Pending); the client
     /// follows up with `SubmitVerdict` carrying the same id.
     Pending {
         /// Pending items the client must gate.
-        response: sessions::wire::request::ContributionResponse,
+        response: boxes::wire::request::ContributionResponse,
     },
 }
 
@@ -2154,11 +2154,11 @@ impl OneshotSshRpc for Shutdown {
 /// Resume a `Pending` session with the client's per-item
 /// [`ContributionVerdict`]. The daemon promotes the record
 /// `Pending → Materializing` and replies with
-/// [`SessionStep::Materialized`](sessions::wire::request::SessionStep::Materialized);
+/// [`SessionStep::Materialized`](boxes::wire::request::SessionStep::Materialized);
 /// the client still has to upload patches and call
 /// `FinalizeSession` before the session is attachable.
 /// A `Fault` reply carries a structured
-/// [`WireError`](sessions::wire::errors::WireError) —
+/// [`WireError`](boxes::wire::errors::WireError) —
 /// `UnknownSessionId` for a verdict against no stashed session,
 /// `WrongState` if the record isn't `Pending`, or an
 /// `InvalidContribution` / `Internal` reflecting a failed
@@ -2167,8 +2167,8 @@ pub struct SubmitVerdict;
 
 impl OneshotSshRpc for SubmitVerdict {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SubmitVerdict");
-    type Request<'a> = sessions::wire::request::ContributionVerdict;
-    type Response = Errorable<sessions::wire::request::SessionStep>;
+    type Request<'a> = boxes::wire::request::ContributionVerdict;
+    type Response = Errorable<boxes::wire::request::SessionStep>;
 }
 
 /// Abort a `Pending` session before its `SubmitVerdict`.
@@ -2205,9 +2205,9 @@ impl OneshotSshRpc for AbortSession {
 //
 // `PortMapping`, `EgressPolicy`, `IngressPolicy`, `SessionPolicy`, and the
 // effective halves (`EffectiveEgress`, `EffectiveSessionPolicy`) are defined
-// in `sessions` and re-exported above, so the only live per-session store
-// (`sessions::Record`) can carry the policy configured at launch without a
-// `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
+// in `boxes` and re-exported above, so the only live per-session store
+// (`boxes::Record`) can carry the policy configured at launch without a
+// `boxes` → `minimald-rpc` dependency cycle. The RPC method types below
 // stay here, where the wire contract lives.
 // ---------------------------------------------------------------------------
 
@@ -2379,7 +2379,7 @@ pub struct SessionRuntimeFacts {
     pub id: SessionId,
     /// The per-box egress enforcement the session's box actually runs under
     /// (NET-079): the box's own launch record —
-    /// [`Record::host_ip_enforcement`](sessions::Record) — lowered to `none`
+    /// [`Record::host_ip_enforcement`](boxes::Record) — lowered to `none`
     /// when the host can no longer decide per box and never raised above it,
     /// and the host's own state only while the session's box has not
     /// launched. `None` for a session that is not host-address, for a
@@ -2441,7 +2441,7 @@ impl OneshotSshRpc for GetSessionHooks {
     /// Each hook paired with the loadout or project that declared it, in
     /// setup order (project first, then loadouts). Teardown order is the
     /// reverse; the caller renders whichever it needs.
-    type Response = Errorable<Vec<sessions::wire::primitives::WireProvenancedHook>>;
+    type Response = Errorable<Vec<boxes::wire::primitives::WireProvenancedHook>>;
 }
 
 /// An RPC for a process inside a PTask to request a dynamic ingress port
@@ -2699,7 +2699,7 @@ impl CleanCacheUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::wire::request::{ContributionResponse, WireContribution};
+    use boxes::wire::request::{ContributionResponse, WireContribution};
 
     /// A failed finalize must decode as an error, not as a success with
     /// nothing in it.
@@ -2975,7 +2975,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![mapping],
             dynamic_allowed_range: Some((10000, 20000)),
-            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            dynamic_ingress: Some(boxes::DynamicIngress::Ask),
         };
         let json = serde_json_lenient::to_string(&ingress).unwrap();
         let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
@@ -3725,7 +3725,7 @@ mod tests {
         assert!(entry.project_path.is_none(), "missing project_path → None");
         assert_eq!(
             entry.status,
-            sessions::SessionStatus::Active,
+            boxes::SessionStatus::Active,
             "missing status → default Active"
         );
     }
@@ -3831,7 +3831,7 @@ mod tests {
             id: SessionId::nil(),
             name: Some("second".to_string()),
             project_path: None,
-            status: sessions::SessionStatus::Active,
+            status: boxes::SessionStatus::Active,
             git: None,
             attrs: None,
             host_ip_enforcement: None,

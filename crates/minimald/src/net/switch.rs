@@ -17,7 +17,7 @@
 //! attachment path). A gated relay — every own-IP session's — also carries its
 //! session's network policy at this bridge, because gvproxy itself enforces
 //! nothing per client (v0.8.9 has no per-client ACL API): the egress leg
-//! applies the pure frame verdict (`sessions::core::egress`, NET-062/NET-063/
+//! applies the pure frame verdict (`boxes::core::egress`, NET-062/NET-063/
 //! NET-064) to every frame before it reaches the switch, and the ingress leg
 //! keeps the default-block posture of finding #2. Every relay — gated or not,
 //! the daemon's own included — also carries the lease it was attached with,
@@ -65,10 +65,10 @@ use tokio::task::JoinHandle;
 use super::dns_gate::DnsGate;
 use super::policy::{Direction, PolicyWarnLimiter, Proto};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
-use sessions::core::egress::{
+use boxes::core::egress::{
     self, DropReason, FrameSummary, FrameVerdict, IngressRules, ListenVerdict,
 };
-use sessions::core::zone_answer;
+use boxes::core::zone_answer;
 use switch::refusal;
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
@@ -1173,7 +1173,7 @@ pub(super) fn address_referenced(addr: Ipv4Addr) -> bool {
 /// traffic are decided here:
 ///
 /// - **Egress** (`tap → switch`) — every frame is decided by the pure verdict
-///   in `sessions::core::egress` against the box's compiled
+///   in `boxes::core::egress` against the box's compiled
 ///   [`EgressRules`]: what the box did not declare is dropped, without
 ///   answering, and says so once per rule per minute (NET-062, NET-063,
 ///   NET-064) — and every frame whose source is not the box's lease is
@@ -1291,7 +1291,7 @@ pub struct SessionGate {
     limiter: Arc<PolicyWarnLimiter>,
     /// The box's compiled egress rules — its declared dimensions, the
     /// resolver the carve-out is keyed to, and its lease (NET-084) — decided
-    /// by `sessions::core::egress`.
+    /// by `boxes::core::egress`.
     egress: egress::EgressRules,
     /// The box's compiled ingress rules — its declared internal ports, the
     /// permit range and the dynamic stance — the shared decision a
@@ -1335,7 +1335,7 @@ impl SessionGate {
     pub fn for_session(
         label: String,
         lease: Ipv4Addr,
-        policy: &sessions::SessionPolicy,
+        policy: &boxes::SessionPolicy,
         subnet: SwitchSubnet,
         hostname_proxy_port: Option<u16>,
     ) -> Self {
@@ -1371,7 +1371,7 @@ impl SessionGate {
         let (resets, resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         let (box_resets, box_resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         Self {
-            allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Tcp),
+            allowed: declared_ingress_ports(Some(policy), boxes::IpProto::Tcp),
             // The runtime-published half starts empty: nothing a box's
             // processes listen on is published until the watcher sees it
             // (NET-016), and an own-IP box that starts no watcher — one whose
@@ -1380,7 +1380,7 @@ impl SessionGate {
             // Nothing is exposed until a runtime publish is decided and its
             // forward stands (NET-044).
             exposed: Mutex::new(HashSet::new()),
-            udp_allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Udp),
+            udp_allowed: declared_ingress_ports(Some(policy), boxes::IpProto::Udp),
             revoked: Mutex::new(HashSet::new()),
             inbound_flows: Mutex::new(HashMap::new()),
             terminated_flows: Mutex::new(HashMap::new()),
@@ -1729,17 +1729,17 @@ impl SessionGate {
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
     /// src))` when it must be dropped — a new TCP connection or an unsolicited UDP
     /// datagram to a port the target did not declare — else `None` (pass).
-    fn inbound_drop(&self, frame: &[u8]) -> Option<(sessions::IpProto, u16, SocketAddrV4)> {
+    fn inbound_drop(&self, frame: &[u8]) -> Option<(boxes::IpProto, u16, SocketAddrV4)> {
         // NET-016/NET-044: the declared ports, the listen-published ones and
         // the runtime-exposed ones are one admission set for a new inbound
         // connection. The runtime halves are read under their locks per SYN
         // rather than snapshotted, so a frame never decides on a set the
         // watcher or the expose surface has already moved on from.
         if let Some((dst_port, src)) = blocked_syn(frame, |port| self.admits_tcp(port)) {
-            return Some((sessions::IpProto::Tcp, dst_port, src));
+            return Some((boxes::IpProto::Tcp, dst_port, src));
         }
         if let Some((dst_port, src)) = blocked_udp(frame, &self.udp_allowed, &self.conntrack) {
-            return Some((sessions::IpProto::Udp, dst_port, src));
+            return Some((boxes::IpProto::Udp, dst_port, src));
         }
         None
     }
@@ -1860,7 +1860,7 @@ impl SessionGate {
 
     /// The shared verdict for one port a process in the box is listening on,
     /// on the transport it listens with (NET-016): the pure decision
-    /// `sessions::core::egress` holds for the whole surface, asked of the
+    /// `boxes::core::egress` holds for the whole surface, asked of the
     /// rules this gate was compiled with at attach, so the listener watcher
     /// and the relay can never grow two derivations of the box's
     /// declaration that disagree. The transport is half of what the
@@ -1869,7 +1869,7 @@ impl SessionGate {
     /// (NET-121) — so the watcher asks with the transport it publishes on.
     /// The watcher calls this before it publishes anything.
     #[must_use]
-    pub fn listen_verdict(&self, proto: sessions::IpProto, port: u16) -> ListenVerdict {
+    pub fn listen_verdict(&self, proto: boxes::IpProto, port: u16) -> ListenVerdict {
         self.ingress.listen_verdict(proto, port)
     }
 
@@ -1877,7 +1877,7 @@ impl SessionGate {
     /// (NET-043), for the watcher's line naming why a listen it saw was left
     /// unpublished: the stance, no range, or out of range.
     #[must_use]
-    pub(crate) fn dynamic_verdict(&self, port: u16) -> sessions::core::egress::DynamicPortVerdict {
+    pub(crate) fn dynamic_verdict(&self, port: u16) -> boxes::core::egress::DynamicPortVerdict {
         self.ingress.dynamic_verdict(port)
     }
 
@@ -2312,14 +2312,14 @@ pub use switch::refusal::REVOKED_INGRESS_PORT_RULE;
 /// one derivation both ingress surfaces read: the relay's inbound gate
 /// ([`SessionGate::allowed`]/[`SessionGate::udp_allowed`]) and, through the
 /// registry's routes, the hostname proxy's own port gate. Compiled by the
-/// shared rules (`sessions::core::egress::IngressRules`), so the declared
+/// shared rules (`boxes::core::egress::IngressRules`), so the declared
 /// half and the listen-published half of a box's ingress answer the same
 /// form of the same declaration. An absent ingress policy admits nothing
 /// (the own-IP default-block posture).
 #[must_use]
 pub fn declared_ingress_ports(
-    policy: Option<&sessions::SessionPolicy>,
-    proto: sessions::IpProto,
+    policy: Option<&boxes::SessionPolicy>,
+    proto: boxes::IpProto,
 ) -> HashSet<u16> {
     IngressRules::from_policy(policy.and_then(|policy| policy.ingress.as_ref()))
         .declared(proto)
@@ -2331,7 +2331,7 @@ pub fn declared_ingress_ports(
 /// carries and the proxy sees, which [`Route::upstream`](crate::net::dns::Route::upstream)
 /// then translates to the internal port behind it. An own-address box that
 /// declares no ingress publishes nothing: absent ingress is the deny-all
-/// posture `sessions::validate_policy` accepts on `own_ip`, the same posture
+/// posture `boxes::validate_policy` accepts on `own_ip`, the same posture
 /// [`declared_ingress_ports`] gives a direct connection to it, so the set is
 /// empty and never `None`. `None` on a route means a *host-address* box
 /// (launch validation rejects an ingress declaration on every mode but
@@ -2340,7 +2340,7 @@ pub fn declared_ingress_ports(
 /// port on a native host's published-loopback route while a VM host refuses
 /// it (NET-071).
 #[must_use]
-pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTreeSet<u16> {
+pub fn declared_request_ports(policy: Option<&boxes::SessionPolicy>) -> BTreeSet<u16> {
     policy
         .and_then(|policy| policy.ingress.as_ref())
         .map(|ingress| {
@@ -2395,7 +2395,7 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// proxy instead (NET-071).
 #[must_use]
 pub fn compiled_egress(
-    policy: Option<&sessions::SessionPolicy>,
+    policy: Option<&boxes::SessionPolicy>,
     subnet: SwitchSubnet,
     lease: Ipv4Addr,
     hostname_proxy_port: Option<u16>,
@@ -2424,7 +2424,7 @@ pub fn compiled_egress(
 
 /// The egress verdict a direct TCP connection from a box whose own frames are
 /// decided by `rules` to `dst:port` would carry — the same pure
-/// `sessions::core::egress` verdict the relay applies to every frame the box
+/// `boxes::core::egress` verdict the relay applies to every frame the box
 /// sends, asked about a synthesized TCP frame, so the hostname proxy decides
 /// a request with the relay's own function and never grows a second
 /// implementation of the rules that could drift (NET-070, NET-071).
@@ -3059,7 +3059,7 @@ where
         if let Some(gate) = &gate
             && let Some((proto, dst_port, src)) = gate.inbound_drop(&frame[..n])
         {
-            if proto == sessions::IpProto::Tcp
+            if proto == boxes::IpProto::Tcp
                 && let Some(pkt) = &tcp
             {
                 gate.refuse_tcp_segment(&frame[..n], pkt, refusal::UNPUBLISHED_PORT);
@@ -3286,12 +3286,12 @@ pub(crate) mod tests {
     /// admission-set half they observe from outside.
     #[test]
     fn gate_admits_and_withdraws_a_listen_published_port() {
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: 18080,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 // A permit range with no stance permits nothing, so this
                 // gate's own rules would refuse 9999 — publishing is the
@@ -3313,15 +3313,15 @@ pub(crate) mod tests {
         // The declared port is admitted by its declaration alone.
         assert!(gate.admits_tcp(80));
         assert_eq!(
-            gate.listen_verdict(sessions::IpProto::Tcp, 9999),
+            gate.listen_verdict(boxes::IpProto::Tcp, 9999),
             ListenVerdict::Deny
         );
         assert_eq!(
-            gate.listen_verdict(sessions::IpProto::Tcp, 80),
+            gate.listen_verdict(boxes::IpProto::Tcp, 80),
             ListenVerdict::Declared
         );
         assert_eq!(
-            gate.listen_verdict(sessions::IpProto::Tcp, 3005),
+            gate.listen_verdict(boxes::IpProto::Tcp, 3005),
             ListenVerdict::Deny,
             "no stance: the range alone publishes nothing"
         );
@@ -3401,7 +3401,7 @@ pub(crate) mod tests {
         let gate = SessionGate::for_session(
             "100.64.0.10".into(),
             Ipv4Addr::new(100, 64, 0, 10),
-            &sessions::SessionPolicy::default(),
+            &boxes::SessionPolicy::default(),
             SwitchSubnet::default(),
             None,
         );
@@ -3462,12 +3462,12 @@ pub(crate) mod tests {
     /// terminated, and the revocation reports none ended.
     #[test]
     fn withdrawing_an_exposed_port_a_declaration_holds_keeps_its_connections() {
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: 18080,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -3518,18 +3518,18 @@ pub(crate) mod tests {
 
     #[test]
     fn for_session_collects_tcp_internal_ports_only() {
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 18080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 19999,
                         internal_port: 53,
-                        proto: sessions::IpProto::Udp,
+                        proto: boxes::IpProto::Udp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -3554,7 +3554,7 @@ pub(crate) mod tests {
         let empty = SessionGate::for_session(
             "x".into(),
             Ipv4Addr::new(100, 64, 0, 9),
-            &sessions::SessionPolicy::default(),
+            &boxes::SessionPolicy::default(),
             SwitchSubnet::default(),
             None,
         );
@@ -3693,12 +3693,12 @@ pub(crate) mod tests {
 
     #[test]
     fn inbound_drop_tags_the_transport() {
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: 18080,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -3717,13 +3717,13 @@ pub(crate) mod tests {
         let tcp = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         assert_eq!(
             gate.inbound_drop(&tcp).map(|d| d.0),
-            Some(sessions::IpProto::Tcp)
+            Some(boxes::IpProto::Tcp)
         );
         // Unsolicited UDP to an undeclared port -> dropped, tagged Udp.
         let udp = udp_frame(PEER, 33333, LEASE, 9999);
         assert_eq!(
             gate.inbound_drop(&udp).map(|d| d.0),
-            Some(sessions::IpProto::Udp)
+            Some(boxes::IpProto::Udp)
         );
         // Declared TCP port passes.
         let ok = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 80);
@@ -3755,7 +3755,7 @@ pub(crate) mod tests {
     /// Spawns a gated relay for a box at [`LEASE`] on the default switch
     /// subnet (whose gateway is the resolver the carve-out is keyed to),
     /// under `policy`.
-    pub(crate) fn spawn_test_relay(policy: &sessions::SessionPolicy) -> RelayHarness {
+    pub(crate) fn spawn_test_relay(policy: &boxes::SessionPolicy) -> RelayHarness {
         spawn_test_relay_with(policy, |_| {})
     }
 
@@ -3765,7 +3765,7 @@ pub(crate) mod tests {
     /// idle cap, shrunk short enough that their expiry is observable inside
     /// a test.
     pub(crate) fn spawn_test_relay_with(
-        policy: &sessions::SessionPolicy,
+        policy: &boxes::SessionPolicy,
         configure: impl FnOnce(&mut SessionGate),
     ) -> RelayHarness {
         spawn_relay_for(LEASE, Some(policy), configure)
@@ -3786,7 +3786,7 @@ pub(crate) mod tests {
     /// are the callers, for the things a policy cannot say.
     fn spawn_relay_for(
         lease: Ipv4Addr,
-        policy: Option<&sessions::SessionPolicy>,
+        policy: Option<&boxes::SessionPolicy>,
         configure: impl FnOnce(&mut SessionGate),
     ) -> RelayHarness {
         let mut fds = [0 as libc::c_int; 2];
@@ -3937,9 +3937,9 @@ pub(crate) mod tests {
     /// declared empty, every other dimension open. The address is the only
     /// thing undeclared, which is the drop the egress proofs probe — the
     /// strictest all-dimension deny-all would fire the protocol rule first.
-    fn undeclared_destination_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+    fn undeclared_destination_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: None,
@@ -4026,8 +4026,8 @@ pub(crate) mod tests {
         // frame below would be admitted by its rules alone, so the drops are
         // the own-address set's, which [`compiled_egress`] now hands the
         // verdict.
-        let covering = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+        let covering = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: Some(vec!["100.64.0.0/16".to_string()]),
                 allow_dns_hosts: None,
@@ -4163,15 +4163,15 @@ pub(crate) mod tests {
         // Deny-all, spelled the way the activating client's
         // `--deny-subnets 0.0.0.0/0` compiles: one declared dimension that
         // denies every IPv4 destination.
-        let deny_all = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+        let deny_all = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: None,
                 allow_dns_hosts: None,
                 deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             }),
             ingress: None,
-            credentialed_upstream: Some(sessions::CredentialedUpstream {}),
+            credentialed_upstream: Some(boxes::CredentialedUpstream {}),
         };
         let mut harness = spawn_test_relay(&deny_all);
 
@@ -4239,7 +4239,7 @@ pub(crate) mod tests {
         // same deny-all without a lane drops the listener's frame the same
         // way — the lane rule holds the address ahead of the rules, so the
         // frame never reaches the host gate at all.
-        let unlaned = sessions::SessionPolicy {
+        let unlaned = boxes::SessionPolicy {
             credentialed_upstream: None,
             ..deny_all.clone()
         };
@@ -4266,7 +4266,7 @@ pub(crate) mod tests {
         // where no minvmd gate stands beside the relay, as much as on a
         // VM-backed one. The counted warning line and the laned pass are
         // the two dedicated tests that follow.
-        let allow_all = sessions::SessionPolicy {
+        let allow_all = boxes::SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -4300,7 +4300,7 @@ pub(crate) mod tests {
         let capture = crate::test_harness::captured_log();
         let proxy = SwitchSubnet::default().box_egress_proxy_address();
         let listener_port = egress::PROXY_LISTENER_PORT;
-        let allow_all = sessions::SessionPolicy {
+        let allow_all = boxes::SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -4371,10 +4371,10 @@ pub(crate) mod tests {
     async fn a_laned_box_frame_to_the_proxy_listener_passes() {
         let capture = crate::test_harness::captured_log();
         let proxy = SwitchSubnet::default().box_egress_proxy_address();
-        let laned = sessions::SessionPolicy {
+        let laned = boxes::SessionPolicy {
             egress: None,
             ingress: None,
-            credentialed_upstream: Some(sessions::CredentialedUpstream {}),
+            credentialed_upstream: Some(boxes::CredentialedUpstream {}),
         };
         let mut harness = spawn_test_relay(&laned);
 
@@ -4473,9 +4473,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn allowed_egress_succeeds() {
         let capture = crate::test_harness::captured_log();
-        let policy = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        let policy = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 allow_dns_hosts: None,
                 deny_subnets: None,
@@ -4504,9 +4504,9 @@ pub(crate) mod tests {
     /// subnet still completes.
     #[tokio::test]
     async fn udp_dropped_when_only_tcp_allowed() {
-        let policy = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        let policy = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 allow_dns_hosts: None,
                 deny_subnets: None,
@@ -4519,7 +4519,7 @@ pub(crate) mod tests {
 
         // UDP to the *declared* subnet: still dropped, because only TCP is
         // allowed. (UDP DNS to the gateway would still flow — the carve-out
-        // is `sessions::core::egress`'s own proof.)
+        // is `boxes::core::egress`'s own proof.)
         let udp = udp_frame(LEASE, 40000, peer, 53);
         let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&udp).unwrap();
@@ -4569,12 +4569,12 @@ pub(crate) mod tests {
         use crate::net::dns_gate::tests::read_box_frame;
 
         let capture = crate::test_harness::captured_log();
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+        let policy = boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: 8080,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -5023,13 +5023,13 @@ pub(crate) mod tests {
 
     /// The one declared ingress of the reset-shape and revocation proofs:
     /// host `:8080` forwarding to the box's `:80`.
-    fn declared_ingress_80() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+    fn declared_ingress_80() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: 8080,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -5541,10 +5541,10 @@ pub(crate) mod tests {
     /// asks for no entry, NET-072) grants it nothing: the answer pins no
     /// address, so its half of the connect-time conjunction is decided by the
     /// subnets it declared alone.
-    fn zone_source_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn zone_source_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: None,
                 deny_subnets: None,
@@ -5559,10 +5559,10 @@ pub(crate) mod tests {
     /// by, where the denied box above resolves the very same name and is
     /// refused, so the pair says the reach is the entry's, never the
     /// resolution's.
-    fn zone_declared_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn zone_declared_egress() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(vec![format!("{ZONE_TARGET}/32")]),
                 allow_dns_hosts: None,
                 deny_subnets: None,
@@ -5576,14 +5576,14 @@ pub(crate) mod tests {
     /// number — the internal port a direct connection terminates on — so its
     /// ingress gate admits that port alone and every other port is a refusal
     /// the source's half cannot lift.
-    fn zone_target_policy() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
+    fn zone_target_policy() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
             egress: None,
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: ZONE_TARGET_PORT,
                     internal_port: ZONE_TARGET_PORT,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
@@ -5964,7 +5964,7 @@ pub(crate) mod tests {
         let gate = SessionGate::for_session(
             "100.64.0.9".into(),
             Ipv4Addr::new(100, 64, 0, 9),
-            &sessions::SessionPolicy::default(),
+            &boxes::SessionPolicy::default(),
             SwitchSubnet::default(),
             None,
         );
@@ -5979,7 +5979,7 @@ pub(crate) mod tests {
             &SessionGate::for_session(
                 "10.0.0.9".into(),
                 Ipv4Addr::new(10, 0, 0, 9),
-                &sessions::SessionPolicy::default(),
+                &boxes::SessionPolicy::default(),
                 custom,
                 None,
             ),
@@ -6032,7 +6032,7 @@ pub(crate) mod tests {
         let gate = SessionGate::for_session(
             "100.64.0.10".into(),
             Ipv4Addr::new(100, 64, 0, 10),
-            &sessions::SessionPolicy::default(),
+            &boxes::SessionPolicy::default(),
             SwitchSubnet::default(),
             None,
         );
@@ -6063,8 +6063,8 @@ pub(crate) mod tests {
         let lease = Ipv4Addr::new(100, 64, 0, 77);
         // Deny-all: the frame to the literal is dropped by the verdict, so
         // only the notice (and the ARP sentinel behind it) is observable.
-        let deny_all = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+        let deny_all = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: None,
                 allow_dns_hosts: None,
@@ -6125,7 +6125,7 @@ pub(crate) mod tests {
         // No egress declared: allow-all, so the only rule that can drop a
         // frame below is the source check — the destination is not what
         // fires.
-        let mut harness = spawn_test_relay(&sessions::SessionPolicy::default());
+        let mut harness = spawn_test_relay(&boxes::SessionPolicy::default());
 
         // An IPv4 frame sent from another box's address, then the sentinel.
         let spoofed = egress_tcp_frame(PEER, Ipv4Addr::new(203, 0, 113, 7), 443);
@@ -6281,7 +6281,7 @@ pub(crate) mod tests {
         // Addresses no other test publishes in the process-wide table.
         let holder = Ipv4Addr::new(100, 64, 77, 2);
         let peer = Ipv4Addr::new(100, 64, 77, 3);
-        let policy = sessions::SessionPolicy::default();
+        let policy = boxes::SessionPolicy::default();
         let gate = Arc::new(SessionGate::for_session(
             holder.to_string(),
             holder,
@@ -6327,7 +6327,7 @@ pub(crate) mod tests {
         // Addresses no other test publishes in the process-wide table.
         let holder = Ipv4Addr::new(100, 64, 78, 2);
         let peer = Ipv4Addr::new(100, 64, 78, 3);
-        let policy = sessions::SessionPolicy::default();
+        let policy = boxes::SessionPolicy::default();
         let peer_gate = Arc::new(SessionGate::for_session(
             peer.to_string(),
             peer,
@@ -6413,7 +6413,7 @@ pub(crate) mod tests {
         // Addresses no other test publishes in the process-wide table.
         let holder = Ipv4Addr::new(100, 64, 79, 2);
         let peer = Ipv4Addr::new(100, 64, 79, 3);
-        let policy = sessions::SessionPolicy::default();
+        let policy = boxes::SessionPolicy::default();
         let peer_gate = Arc::new(SessionGate::for_session(
             peer.to_string(),
             peer,
@@ -6479,25 +6479,25 @@ pub(crate) mod tests {
     /// something to answer. The address dimension is the one left undeclared
     /// so the reply's drop is [`DropReason::UndeclaredSubnet`], the same
     /// class a deny-all box's answers always take.
-    fn deny_all_with_published_ports() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+    fn deny_all_with_published_ports() -> boxes::SessionPolicy {
+        boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: None,
                 deny_subnets: None,
             }),
-            ingress: Some(sessions::IngressPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 18080,
                         internal_port: 8080,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 18081,
                         internal_port: 8081,
-                        proto: sessions::IpProto::Udp,
+                        proto: boxes::IpProto::Udp,
                     },
                 ],
                 dynamic_allowed_range: None,

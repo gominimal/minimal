@@ -59,12 +59,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use boxes::core::egress::EgressRules;
+#[cfg(target_os = "linux")]
+use boxes::core::loopback::LoopbackAllocator;
+use boxes::{SessionId, SessionPolicy};
 use hickory_proto::rr::Name;
 use serde::Serialize;
-use sessions::core::egress::EgressRules;
-#[cfg(target_os = "linux")]
-use sessions::core::loopback::LoopbackAllocator;
-use sessions::{SessionId, SessionPolicy};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ use super::SwitchSubnet;
 
 /// The DNS suffix every PTask box name carries (see the module docs). Read
 /// from the sessions zone's apex, the one spelling every registry shares.
-pub const HOSTNAME_SUFFIX: &str = sessions::core::zone_answer::ZONE_APEX;
+pub const HOSTNAME_SUFFIX: &str = boxes::core::zone_answer::ZONE_APEX;
 
 /// Whether `name` is a box-zone name — the zone apex itself or any name under
 /// it (NET-072). `name` is an already-normalized qname in presentation form:
@@ -1734,7 +1734,7 @@ impl RangeVerdict {
 /// The answerer's channel a daemon grants and releases through: the durable
 /// half of [`RESERVED_LOCAL_RANGE`]'s allocation, one record per host,
 /// guarded by its own lock file, spent through the pure allocator
-/// ([`sessions::core::loopback::LoopbackAllocator`]) the injectivity proof
+/// ([`boxes::core::loopback::LoopbackAllocator`]) the injectivity proof
 /// covers.
 ///
 /// Every method is a synchronous read-modify-write under the lock file, so a
@@ -2494,7 +2494,7 @@ mod tests {
     /// zone fails here.
     #[test]
     fn zone_spellings_are_the_sessions_zone() {
-        use sessions::core::zone_answer::{HOST_ROW_LABEL, HOST_ROW_NAME, ZONE_APEX};
+        use boxes::core::zone_answer::{HOST_ROW_LABEL, HOST_ROW_NAME, ZONE_APEX};
 
         assert_eq!(HOSTNAME_SUFFIX, "min.internal");
         assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
@@ -3362,7 +3362,7 @@ mod tests {
         for address in &addresses {
             assert_ne!(
                 *address,
-                sessions::core::loopback::ANSWERER_ADDRESS,
+                boxes::core::loopback::ANSWERER_ADDRESS,
                 "the answerer's own address was granted"
             );
             assert!(
@@ -3438,7 +3438,7 @@ mod tests {
         let book = lease_book(&state_root);
 
         let mut granted = BTreeSet::new();
-        for millis in 1..=sessions::core::loopback::POOL_LEN {
+        for millis in 1..=boxes::core::loopback::POOL_LEN {
             let namespace = LeaseNamespace::Box {
                 session: session_id(u128::from(millis)),
             };
@@ -3446,7 +3446,7 @@ mod tests {
                 LoopbackGrant::Granted(address) => {
                     assert_ne!(
                         address,
-                        sessions::core::loopback::ANSWERER_ADDRESS,
+                        boxes::core::loopback::ANSWERER_ADDRESS,
                         "no lease may include the answerer's own address"
                     );
                     assert!(granted.insert(address), "{address} granted twice");
@@ -3675,7 +3675,7 @@ mod tests {
         // the box stable across the release that added the stamp.
         assert_eq!(
             book.grant(LeaseNamespace::Box { session: live }),
-            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST)
+            LoopbackGrant::Granted(boxes::core::loopback::POOL_FIRST)
         );
         // A daemon started now — after the epoch, whenever that was —
         // sweeps the pre-stamp lines on liveness alone.
@@ -3743,7 +3743,7 @@ mod tests {
         };
         assert_eq!(
             book.grant(namespace),
-            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST)
+            LoopbackGrant::Granted(boxes::core::loopback::POOL_FIRST)
         );
 
         // One fd, the lock file, and it is read-only — the low two bits of
@@ -3837,7 +3837,7 @@ mod tests {
             LoopbackGrant::Granted(address) => address,
             other => panic!("the landed verdict lets the same ask grant: {other:?}"),
         };
-        assert_eq!(granted, sessions::core::loopback::POOL_FIRST);
+        assert_eq!(granted, boxes::core::loopback::POOL_FIRST);
 
         // And applying the verdict a second time changes nothing: the walk
         // lands once, and a book that already holds it is not re-opened.
@@ -3875,7 +3875,7 @@ mod tests {
             LoopbackGrant::Granted(address) => address,
             other => panic!("a present range grants the box its address: {other:?}"),
         };
-        assert_eq!(recorded, sessions::core::loopback::POOL_FIRST);
+        assert_eq!(recorded, boxes::core::loopback::POOL_FIRST);
         let fresh = LeaseNamespace::Box {
             session: session_id(2),
         };
@@ -3952,7 +3952,7 @@ mod tests {
     fn only_a_landed_present_verdict_vouches_for_a_handed_range_address() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
-        let handed = sessions::core::loopback::POOL_FIRST;
+        let handed = boxes::core::loopback::POOL_FIRST;
 
         // A native daemon's book: its own loopback answered before it opened.
         let present = lease_book(&state_root);
@@ -4002,7 +4002,7 @@ mod tests {
     async fn an_unvouched_hand_waits_for_the_verdict_and_is_answered_by_the_bound() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
-        let handed = sessions::core::loopback::POOL_FIRST;
+        let handed = boxes::core::loopback::POOL_FIRST;
 
         // A pending book whose deadline is far off: the hand is unvouched,
         // the verdict lands inside the bound, and the wait answers with the
@@ -4067,7 +4067,7 @@ mod tests {
         const STAGGER: std::time::Duration = std::time::Duration::from_millis(150);
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
-        let handed = sessions::core::loopback::POOL_FIRST;
+        let handed = boxes::core::loopback::POOL_FIRST;
 
         // A deadline the waiters are staggered across: the last one begins
         // to wait well after the first, with less than a whole wait left.
@@ -4179,7 +4179,7 @@ mod tests {
         });
         assert_eq!(
             granted.publishable_address(),
-            Some(sessions::core::loopback::POOL_FIRST),
+            Some(boxes::core::loopback::POOL_FIRST),
             "a granted address is the box's publish"
         );
 
@@ -4209,7 +4209,7 @@ mod tests {
         let state_root = lease_root(&tmp);
         let first = session_id(1);
         let second = session_id(2);
-        let address = sessions::core::loopback::POOL_FIRST;
+        let address = boxes::core::loopback::POOL_FIRST;
         // A stale or hand-edited record with two namespaces on one address.
         let corrupted = format!(
             concat!(
@@ -4250,7 +4250,7 @@ mod tests {
         };
         assert_eq!(
             book.grant(namespace),
-            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST)
+            LoopbackGrant::Granted(boxes::core::loopback::POOL_FIRST)
         );
 
         // A hand-corrupted record: a grant may not proceed over it.
@@ -4283,7 +4283,7 @@ mod tests {
             book.grant(LeaseNamespace::Box {
                 session: session_id(3)
             }),
-            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST),
+            LoopbackGrant::Granted(boxes::core::loopback::POOL_FIRST),
             "an empty record reads as a fresh host"
         );
     }

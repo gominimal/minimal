@@ -13,7 +13,7 @@ pub(crate) fn should_announce_session(global: &GlobalArgs) -> bool {
 /// session is unnamed. The short id is the leading block of the UUID — enough
 /// to tell two same-named sessions built from the same directory apart without
 /// the full 36-character id.
-pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str>) -> String {
+pub(crate) fn session_announce_label(id: &boxes::SessionId, name: Option<&str>) -> String {
     let id = id.to_string();
     let short = id.split('-').next().unwrap_or(&id);
     match name {
@@ -213,9 +213,9 @@ pub(crate) fn vm_host_answerer_start_line(
 /// session's under the same name.
 pub(crate) async fn release_held_box_name(
     control_sock: Option<std::path::PathBuf>,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     name: Option<&str>,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
 ) {
     if box_addresses.is_some() {
         return;
@@ -231,8 +231,8 @@ pub(crate) async fn release_held_box_name(
 /// daemon-side destroy ([`release_held_name_after_attach`]).
 async fn attached_session_record(
     sock: &std::path::Path,
-    id: sessions::SessionId,
-) -> anyhow::Result<Option<sessions::Record>> {
+    id: boxes::SessionId,
+) -> anyhow::Result<Option<boxes::Record>> {
     session_record_by(sock, minimald_rpc::GetSessionRecordRequest::Id(id)).await
 }
 
@@ -241,7 +241,7 @@ async fn attached_session_record(
 async fn session_record_by(
     sock: &std::path::Path,
     request: minimald_rpc::GetSessionRecordRequest,
-) -> anyhow::Result<Option<sessions::Record>> {
+) -> anyhow::Result<Option<boxes::Record>> {
     use minimald_rpc::GetSessionRecord;
     tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
         let mut client = client::Client::connect(sock).await?;
@@ -280,9 +280,9 @@ async fn session_record_by(
 /// all it keeps is the name answering NODATA, not NXDOMAIN.
 pub(crate) async fn release_held_name_after_attach(
     sock: &std::path::Path,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     name: &str,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
 ) {
     match attached_session_record(sock, id).await {
         Ok(None) => match box_addresses {
@@ -337,13 +337,13 @@ pub(crate) async fn release_held_name_after_attach(
 /// release is made.
 pub(crate) async fn rehold_held_name_before_attach(
     sock: &std::path::Path,
-    id: sessions::SessionId,
-    record: Option<&sessions::Record>,
+    id: boxes::SessionId,
+    record: Option<&boxes::Record>,
 ) {
     let Some(record) = record else {
         return;
     };
-    if record.network != sessions::NetworkMode::HostNet {
+    if record.network != boxes::NetworkMode::HostNet {
         return;
     }
     if record.box_addresses.is_some() {
@@ -382,12 +382,12 @@ pub(crate) async fn rehold_held_name_before_attach(
 /// nothing is undone (`None`): a release there could take the name from a
 /// live session, and a hold left standing blocks nothing.
 fn rehold_undo(
-    id: sessions::SessionId,
-    by_name: anyhow::Result<Option<sessions::Record>>,
-) -> Option<(sessions::SessionId, bool)> {
+    id: boxes::SessionId,
+    by_name: anyhow::Result<Option<boxes::Record>>,
+) -> Option<(boxes::SessionId, bool)> {
     let taken_over_by = by_name.ok()?.filter(|other| {
         other.id != id
-            && other.network == sessions::NetworkMode::HostNet
+            && other.network == boxes::NetworkMode::HostNet
             && other.box_addresses.is_none()
     });
     Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
@@ -408,7 +408,7 @@ fn rehold_undo(
 async fn hold_box_name_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     name: &str,
-    id: Option<sessions::SessionId>,
+    id: Option<boxes::SessionId>,
     hold: bool,
 ) -> bool {
     let request = minimald_rpc::HoldBoxNameRequest {
@@ -477,7 +477,7 @@ async fn hold_box_name_with_vm_host(
 pub fn box_registered_start_line(
     vm: Option<&str>,
     name: &str,
-    addresses: &sessions::BoxAddresses,
+    addresses: &boxes::BoxAddresses,
 ) -> String {
     match vm {
         Some(vm) => format!(
@@ -506,7 +506,7 @@ pub fn box_registered_start_line(
 /// CLI reference documents the flags as requiring `--network own_ip`.
 fn refuse_dynamic_ingress_off_own_ip(
     network: crate::cli::CliNetworkMode,
-    mode: Option<sessions::DynamicIngress>,
+    mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> Result<(), anyhow::Error> {
     if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
@@ -578,7 +578,7 @@ pub(crate) async fn activate_session(
     // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
     // records an allow-all policy that denies one range. `--deny-all-egress`
     // is the whole declaration on its own: it maps to
-    // `sessions::EgressPolicy::deny_all()`, every allow list present and
+    // `boxes::EgressPolicy::deny_all()`, every allow list present and
     // empty, rather than to four absent lists — a deny-all box declared by
     // flag must read in the record exactly like one declared by file, which
     // is the shape the host-address classifier decides its verdict on
@@ -586,13 +586,13 @@ pub(crate) async fn activate_session(
     // conflict (`cli.rs`) keeps it from combining with a rule flag, so the
     // arms cannot both run.
     let egress = if args.deny_all_egress {
-        Some(sessions::EgressPolicy::deny_all())
+        Some(boxes::EgressPolicy::deny_all())
     } else {
         let has_egress = !args.allow_subnets.is_empty()
             || !allow_protocols.is_empty()
             || !args.allow_dns_hosts.is_empty()
             || !args.deny_subnets.is_empty();
-        has_egress.then_some(sessions::EgressPolicy {
+        has_egress.then_some(boxes::EgressPolicy {
             allow_subnets: (!args.allow_subnets.is_empty())
                 .then(|| normalize_subnets(&args.allow_subnets)),
             allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
@@ -610,9 +610,9 @@ pub(crate) async fn activate_session(
     // same as an explicit deny.
     let has_ingress =
         !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
-    let policy = sessions::SessionPolicy {
+    let policy = boxes::SessionPolicy {
         egress,
-        ingress: has_ingress.then_some(sessions::IngressPolicy {
+        ingress: has_ingress.then_some(boxes::IngressPolicy {
             port_mappings,
             dynamic_allowed_range: args.dynamic_range,
             dynamic_ingress: args.dynamic_ingress,
@@ -623,7 +623,7 @@ pub(crate) async fn activate_session(
         // gate, whatever its egress rules say.
         credentialed_upstream: args
             .credentialed_upstream
-            .then(sessions::CredentialedUpstream::default),
+            .then(boxes::CredentialedUpstream::default),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -637,7 +637,7 @@ pub(crate) async fn activate_session(
         .clone()
         .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
 
-    let network: sessions::NetworkMode = args.network.into();
+    let network: boxes::NetworkMode = args.network.into();
 
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it. `box_addresses`
@@ -1243,7 +1243,7 @@ pub(crate) async fn activate_session(
     if config.network == minimald_rpc::NetworkMode::OwnIp
         && config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
-        && let Some(note) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
+        && let Some(note) = deny_all_default_notice(boxes::EGRESS_DEFAULT_PHASE)
     {
         eprintln!("{note}");
     }
@@ -1256,12 +1256,12 @@ pub(crate) async fn activate_session(
     // the policy now holds the normalized form, so reading it back would
     // print nothing.
     for entry in &args.allow_subnets {
-        if let Some(normalized) = sessions::normalized_cidr(entry) {
+        if let Some(normalized) = boxes::normalized_cidr(entry) {
             eprintln!("--allow-subnets {entry} is read as {normalized}");
         }
     }
     for entry in &args.deny_subnets {
-        if let Some(normalized) = sessions::normalized_cidr(entry) {
+        if let Some(normalized) = boxes::normalized_cidr(entry) {
             eprintln!("--deny-subnets {entry} is read as {normalized}");
         }
     }
@@ -1663,7 +1663,7 @@ pub(crate) async fn activate_session(
     // bound passes, and the name answers NXDOMAIN until the session's
     // next attach or exec.
     if kind == paths::ProviderKind::Minvmd
-        && config.network == sessions::NetworkMode::HostNet
+        && config.network == boxes::NetworkMode::HostNet
         && let Some(name) = config.name.as_deref()
     {
         hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
@@ -1774,7 +1774,7 @@ pub(crate) async fn resolve_attach_target_version_gated(
     client: &mut client::Client,
     sock: std::path::PathBuf,
     name: &str,
-) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
+) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
     match resolve_session_version_gated(client, name).await {
         Ok(record) => Ok((record, sock)),
         Err(selected) => match attach::resolve_box_vm(global, name).await? {
@@ -2003,7 +2003,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// session's own binding asks, and for every exec channel.
 pub(crate) async fn session_via_ssh(
     sock: &std::path::Path,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     wire: Option<String>,
     config_dir: Option<&std::path::Path>,
     host_asks_for: Option<&str>,
@@ -2366,7 +2366,7 @@ pub async fn cmd_session_policy(
 /// The one-line note `min session activate` prints for an own-address box
 /// that declares no egress while the deny-all default is in force
 /// (NET-074): the default the box now has, and the flags that declare its
-/// reach. `None` under [`sessions::EgressDefaultPhase::Announced`]: the
+/// reach. `None` under [`boxes::EgressDefaultPhase::Announced`]: the
 /// announcement that phase printed (NET-076) is retired with it, and an
 /// absent section still allows all there, so there is nothing to note.
 ///
@@ -2374,10 +2374,10 @@ pub async fn cmd_session_policy(
 /// the client, knows whether it set its opt-out (NET-077), so
 /// [`activate_session`] reads it off the create reply and stays silent for
 /// a box the default does not bind.
-pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
+pub fn deny_all_default_notice(phase: boxes::EgressDefaultPhase) -> Option<&'static str> {
     match phase {
-        sessions::EgressDefaultPhase::Announced => None,
-        sessions::EgressDefaultPhase::InForce => Some(
+        boxes::EgressDefaultPhase::Announced => None,
+        boxes::EgressDefaultPhase::InForce => Some(
             "egress: deny-all (default for an own-ip box with no egress section); declare \
              reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags",
         ),
@@ -2490,16 +2490,16 @@ pub fn print_classifier_advisory(
 /// tests that pin the rendering (NET-061, NET-075).
 pub fn format_policy(
     out: &mut impl std::io::Write,
-    effective: &sessions::EffectiveSessionPolicy,
-    network: sessions::NetworkMode,
-    host_ip_enforcement: Option<sessions::HostIpEnforcement>,
+    effective: &boxes::EffectiveSessionPolicy,
+    network: boxes::NetworkMode,
+    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — nothing the blocks print would describe anything
     // real (the same case the TUI's detail pane replaces with this note).
-    if network == sessions::NetworkMode::NoNet {
+    if network == boxes::NetworkMode::NoNet {
         writeln!(out, "No network policy (NoNet)")?;
         // A lane the box declared is still shown, marked as not in effect:
         // the view states what was declared (NET-134).
@@ -2507,7 +2507,7 @@ pub fn format_policy(
             writeln!(
                 out,
                 "  {}",
-                sessions::CredentialedUpstream::policy_row(network)
+                boxes::CredentialedUpstream::policy_row(network)
             )?;
         }
         return Ok(());
@@ -2521,9 +2521,9 @@ pub fn format_policy(
         // nothing"). The mark is the difference between a verdict the box
         // chose and the one the rollout chose for it, and the JSON document
         // carries the same distinction as `source`. The label is the
-        // `sessions` crate's, shared with the TUI's detail pane.
+        // `boxes` crate's, shared with the TUI's detail pane.
         writeln!(out, "  {label}")?;
-    } else if let sessions::EffectiveEgress::Declared(egress) = &effective.egress {
+    } else if let boxes::EffectiveEgress::Declared(egress) = &effective.egress {
         write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
         write_rules(
             out,
@@ -2579,7 +2579,7 @@ pub fn format_policy(
         writeln!(
             out,
             "  {}",
-            sessions::CredentialedUpstream::policy_row(network)
+            boxes::CredentialedUpstream::policy_row(network)
         )?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
@@ -2594,7 +2594,7 @@ pub fn format_policy(
     // shipped posture — the run path's allow-all interim node row still
     // decides those fetches, so the rows name what the set will bound, not
     // what bounds them today.
-    if network == sessions::NetworkMode::OwnIp
+    if network == boxes::NetworkMode::OwnIp
         && let Some(fabric) = fabric
     {
         let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
@@ -2616,7 +2616,7 @@ pub fn format_policy(
     // only per-session ingress minimald applies, and a host-address box
     // shares its host's namespace, so there is no per-session ingress policy
     // to show for it — "deny-all" there would claim a deny-rule exists.
-    if network != sessions::NetworkMode::HostNet {
+    if network != boxes::NetworkMode::HostNet {
         writeln!(out, "ingress")?;
         // The dynamic row is the resolved stance, printed whether or not
         // anything was declared (NET-043): an absent setting is the deny the
@@ -2632,7 +2632,7 @@ pub fn format_policy(
             .and_then(|ingress| ingress.dynamic_ingress)
         {
             Some(mode) => mode.to_string(),
-            None => format!("{} (default)", sessions::DynamicIngress::Deny),
+            None => format!("{} (default)", boxes::DynamicIngress::Deny),
         };
         let dynamic_range = effective
             .ingress
@@ -2773,7 +2773,7 @@ enum PolicyIngressJson<'a> {
     DenyAll {
         /// The dynamic stance the box runs under, resolved — deny, the
         /// evaluation an absent setting takes (NET-043).
-        dynamic_ingress: sessions::DynamicIngress,
+        dynamic_ingress: boxes::DynamicIngress,
         /// Always `default` here: a box that declared a stance is
         /// `declared`, whatever the stance.
         dynamic_ingress_source: &'static str,
@@ -2787,10 +2787,10 @@ impl<'a> PolicyIngressJson<'a> {
     /// empty→deny-all reading, so a box that declared nothing does not read
     /// as carrying an empty declaration beside a box that denied everything
     /// on purpose.
-    fn from_effective(policy: Option<&'a sessions::IngressPolicy>) -> Self {
+    fn from_effective(policy: Option<&'a boxes::IngressPolicy>) -> Self {
         match policy {
             None => Self::DenyAll {
-                dynamic_ingress: sessions::DynamicIngress::Deny,
+                dynamic_ingress: boxes::DynamicIngress::Deny,
                 dynamic_ingress_source: "default",
             },
             Some(ingress)
@@ -2799,7 +2799,7 @@ impl<'a> PolicyIngressJson<'a> {
                     && ingress.dynamic_ingress.is_none() =>
             {
                 Self::DenyAll {
-                    dynamic_ingress: sessions::DynamicIngress::Deny,
+                    dynamic_ingress: boxes::DynamicIngress::Deny,
                     dynamic_ingress_source: "default",
                 }
             }
@@ -2808,7 +2808,7 @@ impl<'a> PolicyIngressJson<'a> {
                 dynamic_allowed_range: ingress.dynamic_allowed_range,
                 dynamic_ingress: ingress
                     .dynamic_ingress
-                    .unwrap_or(sessions::DynamicIngress::Deny),
+                    .unwrap_or(boxes::DynamicIngress::Deny),
                 dynamic_ingress_source: if ingress.dynamic_ingress.is_some() {
                     "declared"
                 } else {
@@ -2824,9 +2824,9 @@ impl<'a> PolicyIngressJson<'a> {
 /// than the raw `None` the record stores.
 #[derive(serde::Serialize)]
 struct PolicyDeclaredIngressJson<'a> {
-    port_mappings: &'a [sessions::PortMapping],
+    port_mappings: &'a [boxes::PortMapping],
     dynamic_allowed_range: Option<(u16, u16)>,
-    dynamic_ingress: sessions::DynamicIngress,
+    dynamic_ingress: boxes::DynamicIngress,
     /// `declared` when the box set a stance, `default` when the resolved
     /// deny is the absent setting's — the text rendering's `(default)` mark,
     /// as a field, the way the egress block's `source` carries it.
@@ -2856,7 +2856,7 @@ struct PolicyEgressJson<'a> {
     /// the shape the strict record holds, empty lists and all, so a
     /// declared deny-all is reconstructable from the document alone.
     #[serde(skip_serializing_if = "Option::is_none")]
-    rules: Option<&'a sessions::EgressPolicy>,
+    rules: Option<&'a boxes::EgressPolicy>,
 }
 
 impl<'a> PolicyEgressJson<'a> {
@@ -2864,14 +2864,14 @@ impl<'a> PolicyEgressJson<'a> {
     /// named verdicts, the same declaration-versus-default distinction the
     /// `(default)` mark carries, so the text and the document say one
     /// thing about a box's egress.
-    fn from_effective(egress: &'a sessions::EffectiveEgress) -> Self {
+    fn from_effective(egress: &'a boxes::EffectiveEgress) -> Self {
         match egress {
-            sessions::EffectiveEgress::DenyAll => Self {
+            boxes::EffectiveEgress::DenyAll => Self {
                 effective: "deny-all",
                 source: "default",
                 rules: None,
             },
-            sessions::EffectiveEgress::AllowAll => Self {
+            boxes::EffectiveEgress::AllowAll => Self {
                 effective: "allow-all",
                 source: "default",
                 rules: None,
@@ -2879,7 +2879,7 @@ impl<'a> PolicyEgressJson<'a> {
             // The declared deny-all section keeps its name — the four
             // present-and-empty lists it would print as blankness — and its
             // `rules` ride beside the name the way every declaration's do.
-            sessions::EffectiveEgress::Declared(section) => Self {
+            boxes::EffectiveEgress::Declared(section) => Self {
                 effective: if section.admits_nothing() {
                     "deny-all"
                 } else {
@@ -2924,7 +2924,7 @@ struct PolicyBaselineEntryJson {
 #[derive(serde::Serialize)]
 struct PolicyJson<'a> {
     schema: &'static str,
-    network: sessions::NetworkMode,
+    network: boxes::NetworkMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     egress: Option<PolicyEgressJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2965,18 +2965,18 @@ fn no_shared_port_collisions(rows: &&[minimald_rpc::SharedPortCollision]) -> boo
 #[derive(serde::Serialize)]
 struct PolicyCredentialedUpstreamJson<'a> {
     #[serde(flatten)]
-    lane: &'a sessions::CredentialedUpstream,
+    lane: &'a boxes::CredentialedUpstream,
     effective: bool,
 }
 
 impl<'a> PolicyCredentialedUpstreamJson<'a> {
     fn from_effective(
-        effective: &'a sessions::EffectiveSessionPolicy,
-        network: sessions::NetworkMode,
+        effective: &'a boxes::EffectiveSessionPolicy,
+        network: boxes::NetworkMode,
     ) -> Option<Self> {
         effective.credentialed_upstream.as_ref().map(|lane| Self {
             lane,
-            effective: sessions::CredentialedUpstream::in_effect(network),
+            effective: boxes::CredentialedUpstream::in_effect(network),
         })
     }
 }
@@ -3009,8 +3009,8 @@ enum LiveIngressJson {
 /// the tests that pin the document, the way [`format_policy`] is.
 pub fn write_policy_json(
     out: &mut impl std::io::Write,
-    effective: &sessions::EffectiveSessionPolicy,
-    network: sessions::NetworkMode,
+    effective: &boxes::EffectiveSessionPolicy,
+    network: boxes::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
@@ -3033,8 +3033,8 @@ pub fn write_policy_json(
 /// rendering's warning lines.
 pub fn write_policy_json_noting(
     out: &mut impl std::io::Write,
-    effective: &sessions::EffectiveSessionPolicy,
-    network: sessions::NetworkMode,
+    effective: &boxes::EffectiveSessionPolicy,
+    network: boxes::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
@@ -3044,7 +3044,7 @@ pub fn write_policy_json_noting(
     // note is prose for a person, so the document carries the schema, the
     // mode, and a declared lane (marked not in effect) alone, and every
     // other key's absence says why.
-    let document = if network == sessions::NetworkMode::NoNet {
+    let document = if network == boxes::NetworkMode::NoNet {
         PolicyJson {
             schema: POLICY_JSON_SCHEMA,
             network,
@@ -3063,7 +3063,7 @@ pub fn write_policy_json_noting(
         // The baseline set is a switch-fabric surface, held to the same
         // gate as the text rendering's block: own-address modes, and a
         // fabric the helper gates named (NET-130).
-        let node_plane_baseline = if network == sessions::NetworkMode::OwnIp
+        let node_plane_baseline = if network == boxes::NetworkMode::OwnIp
             && let Some(fabric) = fabric
         {
             let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
@@ -3088,7 +3088,7 @@ pub fn write_policy_json_noting(
             // Ingress is an own-address surface — the text rendering's gate:
             // a host-address box shares its host's namespace, so a key there
             // would claim a per-session policy that does not exist.
-            ingress: (network != sessions::NetworkMode::HostNet)
+            ingress: (network != boxes::NetworkMode::HostNet)
                 .then(|| PolicyIngressJson::from_effective(effective.ingress.as_ref())),
             // The lane rides the document the way the text rendering prints
             // it: only when declared, so the key's absence is the no-lane
@@ -3114,7 +3114,7 @@ pub fn write_policy_json_noting(
             unaudited_listen_ports,
             // Ingress's own gate: a host-address box has no per-session
             // ingress, so it yields nothing a key could claim.
-            shared_port_collisions: if network == sessions::NetworkMode::HostNet {
+            shared_port_collisions: if network == boxes::NetworkMode::HostNet {
                 &[]
             } else {
                 shared_port_collisions
@@ -3242,8 +3242,8 @@ async fn session_policy_json_inputs(
     session: &str,
 ) -> Result<
     (
-        sessions::Record,
-        sessions::EffectiveSessionPolicy,
+        boxes::Record,
+        boxes::EffectiveSessionPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
         Vec<u16>,
         Vec<minimald_rpc::SharedPortCollision>,
@@ -3358,7 +3358,7 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
 fn normalize_subnets(entries: &[String]) -> Vec<String> {
     entries
         .iter()
-        .map(|entry| sessions::normalized_cidr(entry).unwrap_or_else(|| entry.clone()))
+        .map(|entry| boxes::normalized_cidr(entry).unwrap_or_else(|| entry.clone()))
         .collect()
 }
 
@@ -3567,8 +3567,8 @@ pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(
 }
 
 /// Human-readable origin for a hook row.
-pub(crate) fn render_hook_source(source: &sessions::wire::primitives::WireSource) -> String {
-    use sessions::wire::primitives::WireSource;
+pub(crate) fn render_hook_source(source: &boxes::wire::primitives::WireSource) -> String {
+    use boxes::wire::primitives::WireSource;
     match source {
         WireSource::UserLoadout { name } => format!("loadout {name}"),
         WireSource::Project { path } => format!("project {path}"),
@@ -3582,9 +3582,9 @@ pub(crate) fn render_hook_source(source: &sessions::wire::primitives::WireSource
 /// cannot break the row alignment; the full text is available via
 /// `--json`.
 pub(crate) fn render_hook_script(
-    script: &sessions::wire::primitives::WireHookScript,
+    script: &boxes::wire::primitives::WireHookScript,
 ) -> (&'static str, String, u64) {
-    use sessions::wire::primitives::WireHookScript;
+    use boxes::wire::primitives::WireHookScript;
     match script {
         WireHookScript::Inline { body, timeout_secs } => {
             let first = body.lines().next().unwrap_or("").trim();
@@ -3774,7 +3774,7 @@ pub(crate) fn destroy_gate(
 /// reads as `None` (unknowable), and the confirm renders without a listing.
 pub(crate) async fn session_delta(
     client: &mut client::Client,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
 ) -> Option<minimald_rpc::SessionDeltaResponse> {
     /// Client-side ceiling on the fetch. The daemon bounds each of its
     /// computations at 5 s; this sits just above so a slow-but-healthy
@@ -3859,9 +3859,9 @@ pub(crate) async fn destroy_all_sessions(
 pub(crate) async fn destroy_session(
     client: &mut client::Client,
     global: &GlobalArgs,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     name: Option<&str>,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
 
@@ -4295,7 +4295,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             // of a row: the hold moves with the name, so the old name no box
             // owns answers NXDOMAIN again and the new one is the one the
             // destroy releases.
-            if record.network == sessions::NetworkMode::HostNet && record.box_addresses.is_none() {
+            if record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none() {
                 let control_sock = vm_host_control_sock(
                     daemon_provider_kind(global),
                     global.minimal_dir.as_deref(),
@@ -4327,7 +4327,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::{
+    use boxes::{
         CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
         IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
@@ -4437,7 +4437,7 @@ mod tests {
         /// Register `name` the way the activation does, with `stance` over
         /// 3000-3999.
         async fn register(&self, name: &str, stance: DynamicIngress) -> RegisteredWithVmHost {
-            let policy = sessions::SessionPolicy {
+            let policy = boxes::SessionPolicy {
                 egress: None,
                 ingress: Some(IngressPolicy {
                     port_mappings: vec![],
@@ -4470,7 +4470,7 @@ mod tests {
                 &minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
                     switch_address: web.addresses.switch_address,
                     port,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }),
             )
             .unwrap();
@@ -4877,7 +4877,7 @@ mod tests {
         // session or the box opted out of the default — and so keeps
         // printing the per-dimension defaults, not `deny-all`.
         let policy = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy::default()),
             ingress: None,
             credentialed_upstream: None,
         };
@@ -4907,7 +4907,7 @@ mod tests {
     #[test]
     fn policy_shows_declared_deny_all() {
         let declared = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
         };
@@ -5017,7 +5017,7 @@ mod tests {
             &mut out,
             &declared,
             NetworkMode::HostNet,
-            Some(sessions::HostIpEnforcement::PerBox),
+            Some(boxes::HostIpEnforcement::PerBox),
             &[],
             None,
         )
@@ -5032,7 +5032,7 @@ mod tests {
         // rows: one allowed subnet makes the verdict "10.0.0.0/8 and
         // nothing else", not deny-all, so it must not collapse to the name.
         let not_deny_all = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 allow_dns_hosts: Some(vec![]),
                 allow_protocols: Some(vec![]),
@@ -5071,7 +5071,7 @@ mod tests {
         // spelled out as `(none)`, never printed blank, and the section is
         // not deny-all, since its names grant reach.
         let names_only = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy {
                 allow_subnets: Some(vec![]),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
                 allow_protocols: None,
@@ -5144,7 +5144,7 @@ mod tests {
     #[test]
     fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
         let unenforced = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
         };
@@ -5153,7 +5153,7 @@ mod tests {
             &mut out,
             &unenforced,
             NetworkMode::HostNet,
-            Some(sessions::HostIpEnforcement::None),
+            Some(boxes::HostIpEnforcement::None),
             &[],
             None,
         )
@@ -5176,7 +5176,7 @@ mod tests {
             &mut out,
             &enforced,
             NetworkMode::HostNet,
-            Some(sessions::HostIpEnforcement::PerBox),
+            Some(boxes::HostIpEnforcement::PerBox),
             &[],
             None,
         )
@@ -5216,7 +5216,7 @@ mod tests {
     #[test]
     fn policy_render_carries_the_credentialed_upstream_row_when_declared() {
         let laned = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: Some(CredentialedUpstream::default()),
         };
@@ -5233,7 +5233,7 @@ mod tests {
         // The same policy without the lane prints no row: silence is the
         // no-lane claim, not a lane that reads as undeclared.
         let unlaned = EffectiveSessionPolicy {
-            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
         };
@@ -5338,7 +5338,7 @@ mod tests {
         host_ip_enforcement: Option<&str>,
     ) -> minimald_rpc::CreateSessionResponse {
         minimald_rpc::CreateSessionResponse {
-            id: sessions::SessionId::nil(),
+            id: boxes::SessionId::nil(),
             daemon_version: Some("0.7.0".to_string()),
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
@@ -5935,8 +5935,8 @@ mod tests {
     /// ends with rather than creating the box unregistered.
     #[tokio::test]
     async fn activate_registers_box_with_vm_host() {
-        let policy = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+        let policy = boxes::SessionPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 allow_dns_hosts: None,
                 allow_protocols: Some(vec![IpProto::Tcp]),
@@ -6103,7 +6103,7 @@ mod tests {
             Some(dir.path()),
             NetworkMode::OwnIp,
             "web",
-            &sessions::SessionPolicy::default(),
+            &boxes::SessionPolicy::default(),
         )
         .await
         .expect("the registration is answered")
@@ -6136,7 +6136,7 @@ mod tests {
     /// cannot drift in what they declare or hold.
     #[tokio::test]
     async fn cli_and_dash_register_through_one_exchange() {
-        let policy = sessions::SessionPolicy {
+        let policy = boxes::SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -6200,22 +6200,22 @@ mod tests {
                 .to_string(),
         )
         .await;
-        let addresses = sessions::BoxAddresses {
+        let addresses = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
-        let mut record = sessions::Record {
-            id: sessions::SessionId::nil(),
+        let mut record = boxes::Record {
+            id: boxes::SessionId::nil(),
             name: Some("web".to_string()),
             username: None,
             project_path: paths::HostAbsPath::try_new("/p").unwrap(),
             network: NetworkMode::OwnIp,
-            policy: sessions::SessionPolicy {
+            policy: boxes::SessionPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
             },
-            status: sessions::SessionStatus::default(),
+            status: boxes::SessionStatus::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
@@ -6261,7 +6261,7 @@ mod tests {
     /// row fills the deny default in: nothing is permitted.
     #[tokio::test]
     async fn registration_carries_dynamic_ingress_grant() {
-        let granted = sessions::SessionPolicy {
+        let granted = boxes::SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -6270,11 +6270,11 @@ mod tests {
                     proto: IpProto::Tcp,
                 }],
                 dynamic_allowed_range: Some((3000, 3999)),
-                dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+                dynamic_ingress: Some(boxes::DynamicIngress::Ask),
             }),
             credentialed_upstream: None,
         };
-        let ungranted = sessions::SessionPolicy {
+        let ungranted = boxes::SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: Vec::new(),
@@ -6340,7 +6340,7 @@ mod tests {
     /// row and the new attachment all agree on it.
     #[tokio::test]
     async fn attachment_carries_the_registered_box_id() {
-        let policy = sessions::SessionPolicy {
+        let policy = boxes::SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -6480,7 +6480,7 @@ mod tests {
     /// silently break the retry.
     #[tokio::test]
     async fn autogen_registration_reminted_on_a_held_name() {
-        let policy = sessions::SessionPolicy {
+        let policy = boxes::SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -6575,7 +6575,7 @@ mod tests {
     /// went active keeps its row past the lease's close.
     #[tokio::test]
     async fn activation_lease_withdraws_uncommitted_and_keeps_committed() {
-        let policy = sessions::SessionPolicy {
+        let policy = boxes::SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -6794,7 +6794,7 @@ mod tests {
             ..Default::default()
         };
         let box_id = minimald_rpc::BoxId::from_bytes([7; 16]);
-        let handed = sessions::BoxAddresses {
+        let handed = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
@@ -6899,7 +6899,7 @@ mod tests {
         );
 
         // The activation's hold, once the session is active.
-        let id = sessions::SessionId::nil();
+        let id = boxes::SessionId::nil();
         hold_box_name_with_vm_host(control_sock(), "web", Some(id), true).await;
         {
             let seen = requests.lock().unwrap();
@@ -6911,7 +6911,7 @@ mod tests {
         }
 
         // The destroy of a session with a row releases nothing.
-        let handed = sessions::BoxAddresses {
+        let handed = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
@@ -6959,7 +6959,7 @@ mod tests {
         )
         .await;
         let control_sock = || vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path()));
-        let id = sessions::SessionId::nil();
+        let id = boxes::SessionId::nil();
 
         crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", true).await;
         assert!(
@@ -7070,7 +7070,7 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         assert_eq!(record.name.as_deref(), Some("web"));
-        assert_eq!(record.network, sessions::NetworkMode::HostNet);
+        assert_eq!(record.network, boxes::NetworkMode::HostNet);
         assert!(record.box_addresses.is_none());
 
         // A record that is not there: nothing to re-hold by.
@@ -7192,7 +7192,7 @@ mod tests {
     /// the name a live session holds.
     #[test]
     fn a_failed_name_lookup_undoes_no_rehold() {
-        let id = sessions::SessionId::nil();
+        let id = boxes::SessionId::nil();
         assert_eq!(rehold_undo(id, Ok(None)), Some((id, false)));
         assert_eq!(
             rehold_undo(id, Err(anyhow::anyhow!("no answer"))),
@@ -7270,7 +7270,7 @@ mod tests {
             project.path().to_str().unwrap(),
         )
         .await;
-        let handed = sessions::BoxAddresses {
+        let handed = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
@@ -7367,7 +7367,7 @@ mod tests {
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
         )
         .await;
-        let policy = sessions::SessionPolicy::default();
+        let policy = boxes::SessionPolicy::default();
         let handed = register_box_for_activation(
             paths::ProviderKind::Minvmd,
             Some(dir.path()),
@@ -7445,7 +7445,7 @@ mod tests {
             })
             .unwrap();
         let _alive = vm_state.try_acquire_alive_lock().unwrap();
-        let handed = sessions::BoxAddresses {
+        let handed = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };

@@ -374,7 +374,7 @@ try:
         # chord can't be mistaken for their tail. It is the shipped default
         # chord (leader `ctrl-]` = 0x1d, then the detach subcommand `d`), in a
         # single coalesced chunk, which is exactly the shape the daemon's
-        # ChordMatcher accepts (sessions::keys matches chords across and within
+        # ChordMatcher accepts (boxes::keys matches chords across and within
         # stdin chunks). An earlier era of this script sent a bare ctrl-w
         # (0x17) here; that key retired as a detach, so a stale byte now just
         # reaches the shell — where readline eats it as delete-previous-word

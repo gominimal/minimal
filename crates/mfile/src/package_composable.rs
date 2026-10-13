@@ -30,15 +30,15 @@
 //! flow through unchanged as regular patches, gate-able via
 //! [`PatchesPolicy`].
 //!
-//! [`Composable`]: sessions::core::compose::Composable
-//! [`Source::Package`]: sessions::core::source::Source::Package
+//! [`Composable`]: boxes::core::compose::Composable
+//! [`Source::Package`]: boxes::core::source::Source::Package
 //! [`ProjectComposable`]: crate::ProjectComposable
-//! [`Patch`]: sessions::core::primitives::Patch
-//! [`PatchesPolicy`]: sessions::core::policy::PatchesPolicy
+//! [`Patch`]: boxes::core::primitives::Patch
+//! [`PatchesPolicy`]: boxes::core::policy::PatchesPolicy
 
-use sessions::core::compose::{Composable, Contribution, Error};
-use sessions::core::primitives::{Patch, PatchDest, ResolvedVar, VarValue};
-use sessions::core::source::{ProvenancedPatch, ProvenancedVar, Source};
+use boxes::core::compose::{Composable, Contribution, Error};
+use boxes::core::primitives::{Patch, PatchDest, ResolvedVar, VarValue};
+use boxes::core::source::{ProvenancedPatch, ProvenancedVar, Source};
 
 /// One `env_state_wiring` entry: an env var the package wants
 /// pointed at a `/state/<prefix>` directory in the sandbox.
@@ -106,8 +106,8 @@ impl PackageFsMapping {
 /// [`Self::contribute`] can shape the walk pattern correctly for
 /// each variant.
 ///
-/// [`SessionComposer::add`]: sessions::daemon::composer::SessionComposer::add
-/// [`Source::Package`]: sessions::core::source::Source::Package
+/// [`SessionComposer::add`]: boxes::daemon::composer::SessionComposer::add
+/// [`Source::Package`]: boxes::core::source::Source::Package
 #[derive(Debug, Clone)]
 pub struct PackageComposable {
     package_name: String,
@@ -160,8 +160,8 @@ impl Composable for PackageComposable {
     /// treated as a package-declaration bug that should surface
     /// loudly rather than dropping the entry silently.
     ///
-    /// [`Source::Package`]: sessions::core::source::Source::Package
-    /// [`VarValue::Specified`]: sessions::core::primitives::VarValue::Specified
+    /// [`Source::Package`]: boxes::core::source::Source::Package
+    /// [`VarValue::Specified`]: boxes::core::primitives::VarValue::Specified
     fn contribute(
         self,
         _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
@@ -215,7 +215,7 @@ impl Composable for PackageComposable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::core::source::Provenanced;
+    use boxes::core::source::Provenanced;
 
     /// A package whose attrs declare `env_state_wiring` for GOCACHE +
     /// GOMODCACHE contributes two vars, each pointed at the

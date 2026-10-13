@@ -1,13 +1,13 @@
 //! Snapshot tests for the `view` half: render a fixed model into a
 //! `TestBackend` buffer and compare against the checked-in snapshots.
 
+use boxes::{NetworkMode, SessionId};
 use chrono::DateTime;
 use minimal_tui::app::{self, Detail, Model, Msg, SessionKey};
 use minimal_tui::render;
 use minimal_tui::rpc::ProviderData;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use sessions::{NetworkMode, SessionId};
 
 fn id(n: u128) -> SessionId {
     SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
@@ -18,7 +18,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         id: id(n),
         name: name.map(str::to_owned),
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
-        status: sessions::SessionStatus::Active,
+        status: boxes::SessionStatus::Active,
         git: None,
         host_ip_enforcement: None,
         shared_port_collisions: Vec::new(),
@@ -66,17 +66,17 @@ fn fixed_model(providers: Vec<ProviderData>) -> Model {
     model
 }
 
-fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
-    sessions::Record {
+fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
+    boxes::Record {
         id: id(1),
         name: name.map(str::to_owned),
         username: Some("chroma".to_string()),
         project_path: paths::HostAbsPath::try_new("/src/api").unwrap(),
         network,
-        policy: sessions::SessionPolicy::default(),
+        policy: boxes::SessionPolicy::default(),
         task_addresses: Vec::new(),
         box_addresses: None,
-        status: sessions::SessionStatus::Active,
+        status: boxes::SessionStatus::Active,
         hooks_enabled: true,
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
@@ -216,18 +216,18 @@ fn detail_pane_with_policy() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::EffectiveSessionPolicy {
-                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
+            policy: Some(boxes::EffectiveSessionPolicy {
+                egress: boxes::EffectiveEgress::Declared(boxes::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
-                ingress: Some(sessions::IngressPolicy {
-                    port_mappings: vec![sessions::PortMapping {
+                ingress: Some(boxes::IngressPolicy {
+                    port_mappings: vec![boxes::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     }],
                     dynamic_allowed_range: None,
                     dynamic_ingress: None,
@@ -259,8 +259,8 @@ fn detail_pane_names_a_declared_deny_all() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::EffectiveSessionPolicy {
-                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
+            policy: Some(boxes::EffectiveSessionPolicy {
+                egress: boxes::EffectiveEgress::Declared(boxes::EgressPolicy {
                     allow_subnets: Some(vec![]),
                     allow_dns_hosts: Some(vec![]),
                     allow_protocols: Some(vec![]),
@@ -299,8 +299,8 @@ fn detail_pane_marks_the_allow_all_default() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::EffectiveSessionPolicy {
-                egress: sessions::EffectiveEgress::AllowAll,
+            policy: Some(boxes::EffectiveSessionPolicy {
+                egress: boxes::EffectiveEgress::AllowAll,
                 ingress: None,
                 credentialed_upstream: None,
             }),
@@ -328,10 +328,10 @@ fn detail_pane_marks_a_credentialed_upstream_lane_not_in_effect() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::HostNet)),
-            policy: Some(sessions::EffectiveSessionPolicy {
-                egress: sessions::EffectiveEgress::AllowAll,
+            policy: Some(boxes::EffectiveSessionPolicy {
+                egress: boxes::EffectiveEgress::AllowAll,
                 ingress: None,
-                credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+                credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
             }),
             policy_error: None,
         },
@@ -385,8 +385,8 @@ fn detail_pane_marks_the_deny_all_default() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::EffectiveSessionPolicy {
-                egress: sessions::EffectiveEgress::DenyAll,
+            policy: Some(boxes::EffectiveSessionPolicy {
+                egress: boxes::EffectiveEgress::DenyAll,
                 ingress: None,
                 credentialed_upstream: None,
             }),
@@ -412,21 +412,21 @@ fn detail_pane_shows_dynamic_ingress() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::EffectiveSessionPolicy {
-                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
+            policy: Some(boxes::EffectiveSessionPolicy {
+                egress: boxes::EffectiveEgress::Declared(boxes::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
-                ingress: Some(sessions::IngressPolicy {
-                    port_mappings: vec![sessions::PortMapping {
+                ingress: Some(boxes::IngressPolicy {
+                    port_mappings: vec![boxes::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     }],
                     dynamic_allowed_range: None,
-                    dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+                    dynamic_ingress: Some(boxes::DynamicIngress::Ask),
                 }),
                 credentialed_upstream: None,
             }),

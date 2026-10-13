@@ -81,7 +81,7 @@ pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
-/// shape `sessions::EgressPolicy::deny_all` materializes, every `allow_*`
+/// shape `boxes::EgressPolicy::deny_all` materializes, every `allow_*`
 /// dimension present and empty — and nothing else. A box that declares
 /// anything it can reach is placed under `allow`, where the cohort's
 /// identity is carried and nothing is refused on its behalf: the
@@ -89,8 +89,8 @@ pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// declaration that admits anything is not that. An absent section is the
 /// default's to decide, never a deny-all here — the deny-all default is an
 /// own-address box's (NET-074).
-pub(crate) fn verdict_of(declaration: Option<&sessions::EgressPolicy>) -> Verdict {
-    if declaration.is_some_and(sessions::EgressPolicy::admits_nothing) {
+pub(crate) fn verdict_of(declaration: Option<&boxes::EgressPolicy>) -> Verdict {
+    if declaration.is_some_and(boxes::EgressPolicy::admits_nothing) {
         return Verdict::Deny;
     }
     Verdict::Allow
@@ -154,7 +154,7 @@ impl UnenforceableRule {
 /// about the host — [`refuses_unenforceable_declaration`] is the half that
 /// folds the host in.
 pub(crate) fn unenforceable_rules(
-    declaration: Option<&sessions::EgressPolicy>,
+    declaration: Option<&boxes::EgressPolicy>,
 ) -> Vec<UnenforceableRule> {
     let Some(section) = declaration else {
         return Vec::new();
@@ -198,11 +198,11 @@ pub(crate) fn unenforceable_rules(
 /// such, never refused on this ground — and `None` for any declaration the
 /// classifier can enforce, whatever the host.
 pub(crate) fn refuses_unenforceable_declaration(
-    network_mode: sessions::NetworkMode,
+    network_mode: boxes::NetworkMode,
     can_decide_per_box: bool,
-    declaration: Option<&sessions::EgressPolicy>,
+    declaration: Option<&boxes::EgressPolicy>,
 ) -> Option<Vec<UnenforceableRule>> {
-    if !matches!(network_mode, sessions::NetworkMode::HostNet) || !can_decide_per_box {
+    if !matches!(network_mode, boxes::NetworkMode::HostNet) || !can_decide_per_box {
         return None;
     }
     let rules = unenforceable_rules(declaration);
@@ -423,7 +423,7 @@ impl Cause {
 /// advisory never hands a person a command that leaves the cause standing
 /// or gets the box refused. It is never a prompt: it names what a person
 /// may run, and running it is the person's act, never the session start's.
-pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> String {
+pub fn advisory_text(cause: Cause, declaration: &boxes::EgressPolicy) -> String {
     let verdict = verdict_of(Some(declaration));
     let unenforceable = !unenforceable_rules(Some(declaration)).is_empty();
     let asked = if verdict == sandbox::config::Verdict::Deny {
@@ -3152,7 +3152,7 @@ mod tests {
         // The deny subtree is the declaration that admits no destination,
         // spelled the one shape that does: every `allow_*` dimension present
         // and empty.
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(verdict_of(Some(&deny_all)), Verdict::Deny);
 
         // Nothing else gets the deny subtree. A declaration that admits
@@ -3160,11 +3160,11 @@ mod tests {
         // name — is placed under `allow`, so the refusing rule is never the
         // one a box that said what it wanted is held to; an absent section
         // is the default's to decide, never a deny-all.
-        let reachable = sessions::EgressPolicy {
+        let reachable = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..deny_all.clone()
         };
-        let names_only = sessions::EgressPolicy {
+        let names_only = boxes::EgressPolicy {
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
             ..deny_all.clone()
         };
@@ -3266,7 +3266,7 @@ mod tests {
     fn unenforceable_rules_names_deny_subnets_and_partial_allow_lists() {
         // The CLI's own spelling of a narrowing: `--deny-subnets` subtracts
         // a range from an allow-all — one entry, one rule.
-        let deny_a_range = sessions::EgressPolicy {
+        let deny_a_range = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         };
@@ -3279,11 +3279,11 @@ mod tests {
         // Every entry is a rule, and every present `allow_*` list is one,
         // denied ranges first and the lists in the declaration's own field
         // order — the same order a person typed them in.
-        let narrowing = sessions::EgressPolicy {
+        let narrowing = boxes::EgressPolicy {
             deny_subnets: Some(vec!["10.1.0.0/16".to_string(), "10.2.0.0/16".to_string()]),
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
-            allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
         };
         let rules = unenforceable_rules(Some(&narrowing));
         assert_eq!(
@@ -3302,7 +3302,7 @@ mod tests {
         // declaration is not the deny-all shape: an empty `allow_subnets`
         // over a denied range admits one range and refuses the rest, and
         // "refuse the rest" is the rule the table cannot make.
-        let one_range = sessions::EgressPolicy {
+        let one_range = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/1".to_string()]),
             allow_subnets: Some(vec![]),
             ..Default::default()
@@ -3320,7 +3320,7 @@ mod tests {
         // shape, so the empty list is a narrowing by itself — "refuse
         // every subnet, allow everything else" — and the classifier has no
         // verdict for that half of it.
-        let lone_empty_allow_list = sessions::EgressPolicy {
+        let lone_empty_allow_list = boxes::EgressPolicy {
             allow_subnets: Some(vec![]),
             ..Default::default()
         };
@@ -3377,31 +3377,20 @@ mod tests {
         // the same declaration's box over exactly these rules, and the
         // paths that read the host answer over its two facts alone.
         assert_eq!(
-            refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
-                true,
-                Some(&narrowing),
-            ),
+            refuses_unenforceable_declaration(boxes::NetworkMode::HostNet, true, Some(&narrowing),),
             Some(rules),
             "a per-box host refuses the narrowing over its rules"
         );
         assert_eq!(
-            refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
-                false,
-                Some(&narrowing),
-            ),
+            refuses_unenforceable_declaration(boxes::NetworkMode::HostNet, false, Some(&narrowing),),
             None,
             "a host that cannot decide per box keeps the exception, whatever \
              the declaration names"
         );
         for (mode, why) in [
+            (boxes::NetworkMode::NoNet, "a none box declares no traffic"),
             (
-                sessions::NetworkMode::NoNet,
-                "a none box declares no traffic",
-            ),
-            (
-                sessions::NetworkMode::OwnIp,
+                boxes::NetworkMode::OwnIp,
                 "an own-address box's verdict is its own, on the address it \
                  holds — the declaration is enforced, not refused",
             ),
@@ -3425,7 +3414,7 @@ mod tests {
     /// read as two different failures of the same box.
     #[test]
     fn unenforceable_declaration_refusal_is_one_typed_error_for_create_and_launch() {
-        let deny_a_range = sessions::EgressPolicy {
+        let deny_a_range = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         };
@@ -3458,7 +3447,7 @@ mod tests {
     /// the section form, never in place of it.
     #[test]
     fn unenforceable_refusal_names_the_deny_all_flag() {
-        let declaration = sessions::EgressPolicy {
+        let declaration = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         };
@@ -3495,7 +3484,7 @@ mod tests {
     /// admitted set that is already empty.
     #[test]
     fn unenforceable_rules_empty_for_absent_section_and_deny_all() {
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(
             unenforceable_rules(Some(&deny_all)),
             Vec::new(),
@@ -3506,7 +3495,7 @@ mod tests {
             Vec::new(),
             "an absent section is the default's allow-all"
         );
-        let deny_all_plus_denies = sessions::EgressPolicy {
+        let deny_all_plus_denies = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string(), "192.168.0.0/16".to_string()]),
             ..deny_all.clone()
         };
@@ -3529,11 +3518,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                refuses_unenforceable_declaration(
-                    sessions::NetworkMode::HostNet,
-                    true,
-                    declaration
-                ),
+                refuses_unenforceable_declaration(boxes::NetworkMode::HostNet, true, declaration),
                 None,
                 "{why} is enforceable, so a per-box host refuses it over nothing"
             );
@@ -3707,7 +3692,7 @@ mod tests {
         // The box's declaration is the deny-all one, so its leaf is in the
         // subtree whose chain every rule below is read from — the verdict
         // the launch's own placement would pick for this box.
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(verdict_of(Some(&deny_all)), Verdict::Deny);
 
         // The box's listener, on the loopback a host-address box shares with
@@ -3721,7 +3706,7 @@ mod tests {
         registry
             .write()
             .unwrap()
-            .register_host_net(sessions::SessionId::nil(), "denybox");
+            .register_host_net(boxes::SessionId::nil(), "denybox");
         let router = crate::net::proxy::Router::new(
             std::sync::Arc::clone(&registry),
             crate::net::switch::proxied_request_verdict,
@@ -3862,7 +3847,7 @@ mod tests {
         let mount = standin_mount();
         let root = mount.root.clone();
         installed_cohort(&root);
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(
             verdict_of(Some(&deny_all)),
             Verdict::Deny,
@@ -5533,8 +5518,8 @@ mod tests {
     /// box, whose relay enforces it.
     #[test]
     fn allow_list_host_address_declaration_refused_on_vm_host() {
-        let allow_list = sessions::EgressPolicy {
-            allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        let allow_list = boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
             allow_subnets: Some(Vec::new()),
             allow_dns_hosts: Some(vec!["github.com".to_string()]),
             deny_subnets: None,
@@ -5546,7 +5531,7 @@ mod tests {
         );
         assert_eq!(
             refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
+                boxes::NetworkMode::HostNet,
                 guest_decided.can_decide_per_box(),
                 Some(&allow_list),
             ),
@@ -5560,7 +5545,7 @@ mod tests {
         let guest_undecided = Decision::undecidable(Cause::GuestTableNotLoaded);
         assert_eq!(
             refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
+                boxes::NetworkMode::HostNet,
                 guest_undecided.can_decide_per_box(),
                 Some(&allow_list),
             ),
@@ -5569,7 +5554,7 @@ mod tests {
         );
         assert_eq!(
             refuses_unenforceable_declaration(
-                sessions::NetworkMode::OwnIp,
+                boxes::NetworkMode::OwnIp,
                 guest_decided.can_decide_per_box(),
                 Some(&allow_list),
             ),
@@ -5695,11 +5680,11 @@ mod tests {
             Cause::ProbeUnreadable,
         ] {
             for declaration in [
-                sessions::EgressPolicy::deny_all(),
-                sessions::EgressPolicy::default(),
-                sessions::EgressPolicy {
+                boxes::EgressPolicy::deny_all(),
+                boxes::EgressPolicy::default(),
+                boxes::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                    ..sessions::EgressPolicy::default()
+                    ..boxes::EgressPolicy::default()
                 },
             ] {
                 rendered.push(advisory_text(cause, &declaration));

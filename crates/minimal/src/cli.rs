@@ -667,7 +667,7 @@ pub struct ActivateArgs {
         value_name = "allow|ask|deny",
         value_parser = parse_dynamic_ingress_mode
     )]
-    pub dynamic_ingress: Option<sessions::DynamicIngress>,
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
     /// Inclusive port range `lo-hi` (both ends included) within which
     /// `--dynamic-ingress allow` accepts dynamic ingress requests; outside
     /// it a request is refused with the out-of-range error. Only meaningful
@@ -702,7 +702,7 @@ pub struct ActivateArgs {
     pub deny_subnets: Vec<String>,
     /// Declare deny-all egress: the box reaches no external address. The
     /// section this writes is the deny-all shape — every allow list present
-    /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
+    /// and empty, nothing denied on top (`boxes::EgressPolicy::deny_all()`)
     /// — a declaration, not the default: on a host-address box the host's
     /// classifier decides it per box (NET-079), while a box that declares no
     /// egress at all gets the default NET-074 sets: deny-all for an own-ip
@@ -774,10 +774,10 @@ pub enum SyncMode {
     None,
 }
 
-/// CLI surface for [`sessions::NetworkMode`]. Parsed by hand in
+/// CLI surface for [`boxes::NetworkMode`]. Parsed by hand in
 /// [`parse_network_mode`] rather than derived from a `ValueEnum`: the hand
 /// parser is what accepts the legacy hyphenated spellings with a rename hint,
-/// which a derived enum cannot, and it keeps the `sessions` crate free of a
+/// which a derived enum cannot, and it keeps the `boxes` crate free of a
 /// clap dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliNetworkMode {
@@ -825,23 +825,23 @@ pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
     ))
 }
 
-impl From<CliNetworkMode> for sessions::NetworkMode {
+impl From<CliNetworkMode> for boxes::NetworkMode {
     fn from(m: CliNetworkMode) -> Self {
         match m {
-            CliNetworkMode::NoNet => sessions::NetworkMode::NoNet,
-            CliNetworkMode::HostNet => sessions::NetworkMode::HostNet,
-            CliNetworkMode::OwnIp => sessions::NetworkMode::OwnIp,
+            CliNetworkMode::NoNet => boxes::NetworkMode::NoNet,
+            CliNetworkMode::HostNet => boxes::NetworkMode::HostNet,
+            CliNetworkMode::OwnIp => boxes::NetworkMode::OwnIp,
         }
     }
 }
 
-/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`sessions::PortMapping`].
+/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`boxes::PortMapping`].
 /// PROTO defaults to tcp; only tcp/udp are accepted (gvproxy's static forwarder
 /// exposes no other transport).
-pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, anyhow::Error> {
+pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<boxes::PortMapping, anyhow::Error> {
     let (ports, proto) = match spec.split_once('/') {
         Some((ports, proto)) => (ports, parse_ingress_proto(proto)?),
-        None => (spec, sessions::IpProto::Tcp),
+        None => (spec, boxes::IpProto::Tcp),
     };
     let (ext, int) = ports
         .split_once(':')
@@ -857,17 +857,17 @@ pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping,
             "ingress '{spec}': internal port 0 is reserved — choose an internal port >= 1"
         );
     }
-    Ok(sessions::PortMapping {
+    Ok(boxes::PortMapping {
         external_port,
         internal_port,
         proto,
     })
 }
 
-pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+pub(crate) fn parse_ingress_proto(proto: &str) -> Result<boxes::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
-        "tcp" => Ok(sessions::IpProto::Tcp),
-        "udp" => Ok(sessions::IpProto::Udp),
+        "tcp" => Ok(boxes::IpProto::Tcp),
+        "udp" => Ok(boxes::IpProto::Udp),
         other => Err(anyhow::anyhow!(
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
         )),
@@ -875,7 +875,7 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
 }
 
 /// Parse a `--dynamic-ingress <allow|ask|deny>` value (NET-043) into the
-/// [`sessions::DynamicIngress`] stance the create request carries. The
+/// [`boxes::DynamicIngress`] stance the create request carries. The
 /// snake_case spellings are the record's own — the same words
 /// `min session policy` prints back — so what a person types to create the
 /// box is what they read from it later. `deny` parses the same as an unset
@@ -883,11 +883,11 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
 /// them as, but spelling it is still meaningful — it makes the ingress
 /// declaration, so `min session policy` shows the resolved row rather than
 /// no ingress block at all.
-pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicIngress, String> {
+pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngress, String> {
     match raw {
-        "allow" => Ok(sessions::DynamicIngress::Allow),
-        "deny" => Ok(sessions::DynamicIngress::Deny),
-        "ask" => Ok(sessions::DynamicIngress::Ask),
+        "allow" => Ok(boxes::DynamicIngress::Allow),
+        "deny" => Ok(boxes::DynamicIngress::Deny),
+        "ask" => Ok(boxes::DynamicIngress::Ask),
         other => Err(format!(
             "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
         )),
@@ -898,7 +898,7 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicI
 /// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
 /// A malformed value (no `-`, a non-numeric end, a port outside u16), an
 /// inverted one (`hi` below `lo`), or a privileged one (`lo` below
-/// [`sessions::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
+/// [`boxes::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
 /// rather than a daemon-side refusal after the box's directory exists: the
 /// user sees what they typed named in the error, with no half-created
 /// session behind it.
@@ -921,24 +921,24 @@ pub(crate) fn parse_dynamic_range(raw: &str) -> Result<(u16, u16), String> {
     }
     // The launch check's own bound and wording (`validate_policy`), so a
     // privileged range is refused here, at the flag, in the same words.
-    if lo < sessions::MIN_DYNAMIC_INGRESS_PORT {
+    if lo < boxes::MIN_DYNAMIC_INGRESS_PORT {
         return Err(format!(
             "dynamic range '{raw}': {}",
-            sessions::PolicyError::PrivilegedDynamicRange { lo }
+            boxes::PolicyError::PrivilegedDynamicRange { lo }
         ));
     }
     Ok((lo, hi))
 }
 
-/// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
+/// Parse an `--allow-protocols <PROTO>` spec into an [`boxes::IpProto`].
 /// Egress rules name any transport the policy type carries, so unlike the
 /// ingress parser (whose vocabulary is gvproxy's static forwarder's), icmp is
 /// accepted here.
-pub(crate) fn parse_egress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+pub(crate) fn parse_egress_proto(proto: &str) -> Result<boxes::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
-        "tcp" => Ok(sessions::IpProto::Tcp),
-        "udp" => Ok(sessions::IpProto::Udp),
-        "icmp" => Ok(sessions::IpProto::Icmp),
+        "tcp" => Ok(boxes::IpProto::Tcp),
+        "udp" => Ok(boxes::IpProto::Udp),
+        "icmp" => Ok(boxes::IpProto::Icmp),
         other => Err(anyhow::anyhow!(
             "egress: unsupported protocol '{other}' (use tcp, udp, or icmp)"
         )),

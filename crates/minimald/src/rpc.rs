@@ -1,3 +1,4 @@
+use boxes::SessionId;
 use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
@@ -13,7 +14,6 @@ use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
 };
-use sessions::SessionId;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -562,7 +562,7 @@ fn user_namespace_refusal(restriction: crate::server::UsernsRestriction) -> Stri
 fn refuse_unhanded_vm_box(
     in_microvm: bool,
     network: minimald_rpc::NetworkMode,
-    box_addresses: Option<&sessions::BoxAddresses>,
+    box_addresses: Option<&boxes::BoxAddresses>,
 ) -> std::io::Result<()> {
     if in_microvm && network == minimald_rpc::NetworkMode::OwnIp && box_addresses.is_none() {
         return Err(std::io::Error::new(
@@ -593,7 +593,7 @@ fn create_classifier_advisory(
     in_microvm: bool,
     network: minimald_rpc::NetworkMode,
     cause: Option<classifier::Cause>,
-    egress: Option<&sessions::EgressPolicy>,
+    egress: Option<&boxes::EgressPolicy>,
 ) -> Option<String> {
     if in_microvm || network != minimald_rpc::NetworkMode::HostNet {
         return None;
@@ -1075,29 +1075,26 @@ async fn serve_submit_verdict(
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
     SubmitVerdict
-        .handle_channel(
-            c,
-            async |req: sessions::wire::request::ContributionVerdict| {
-                let mngr = s.sessions_manager().await;
-                let unknown = || {
-                    Errorable::Ok(sessions::wire::request::SessionStep::Fault {
-                        error: sessions::wire::errors::WireError::UnknownSessionId,
-                    })
-                };
-                let handle = mngr
-                    .get_session(SessionKeyPredicate::Id(req.session_id))
-                    .await
-                    .map_err(|e| ConnectionError::Internal(e.to_string()))?;
-                match handle {
-                    None => Ok(unknown()),
-                    Some(h) => match h.submit_verdict(req).await {
-                        Ok(step) => Ok(Errorable::Ok(step)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(unknown()),
-                        Err(e) => Err(ConnectionError::Internal(e.to_string())),
-                    },
-                }
-            },
-        )
+        .handle_channel(c, async |req: boxes::wire::request::ContributionVerdict| {
+            let mngr = s.sessions_manager().await;
+            let unknown = || {
+                Errorable::Ok(boxes::wire::request::SessionStep::Fault {
+                    error: boxes::wire::errors::WireError::UnknownSessionId,
+                })
+            };
+            let handle = mngr
+                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match handle {
+                None => Ok(unknown()),
+                Some(h) => match h.submit_verdict(req).await {
+                    Ok(step) => Ok(Errorable::Ok(step)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(unknown()),
+                    Err(e) => Err(ConnectionError::Internal(e.to_string())),
+                },
+            }
+        })
         .await
 }
 
@@ -1353,17 +1350,17 @@ async fn serve_get_session_policy(
 /// older client keeps reading the rules.
 ///
 /// `phase` is the rollout phase to resolve under — the handler serves
-/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
-/// tests name [`sessions::EgressDefaultPhase::InForce`] so the deny-all
+/// [`boxes::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`boxes::EgressDefaultPhase::InForce`] so the deny-all
 /// posture they prove does not hang on that constant.
 pub(crate) fn effective_policy_reply(
-    policy: &sessions::SessionPolicy,
-    network: sessions::NetworkMode,
-    phase: sessions::EgressDefaultPhase,
+    policy: &boxes::SessionPolicy,
+    network: boxes::NetworkMode,
+    phase: boxes::EgressDefaultPhase,
     opt_out: bool,
 ) -> minimald_rpc::EffectiveSessionPolicy {
     minimald_rpc::EffectiveSessionPolicy {
-        egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
+        egress: boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
     }
@@ -1375,7 +1372,7 @@ pub(crate) fn effective_policy_reply(
 ///
 /// Resolved here rather than in the client because the inputs are this
 /// daemon's own facts: the rollout phase its build ships
-/// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
+/// ([`boxes::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
 /// own-address box with no `egress` section answers `deny_all` with the
 /// default in force (NET-074) and `allow_all` behind the opt-out; a declared
 /// section answers as the gate resolves it — the lists it declared
@@ -1415,7 +1412,7 @@ async fn serve_get_effective_session_policy(
                     Ok(Errorable::Ok(effective_policy_reply(
                         &record.policy,
                         record.network,
-                        sessions::EGRESS_DEFAULT_PHASE,
+                        boxes::EGRESS_DEFAULT_PHASE,
                         opt_out,
                     )))
                 }
@@ -2546,7 +2543,7 @@ async fn unpack_workspace_patches(
 /// `<workspace>/hooks/`.
 ///
 /// Entry paths are the staged paths
-/// [`staged_script_path`](sessions::core::lifecyclehook::staged_script_path)
+/// [`staged_script_path`](boxes::core::lifecyclehook::staged_script_path)
 /// produced on the client; the daemon re-derives the same paths from
 /// the composition when it goes looking for a script, so nothing here
 /// needs a manifest.
@@ -2747,6 +2744,7 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
+    use boxes::{NetworkMode, SessionId};
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
         EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
@@ -2755,7 +2753,6 @@ mod tests {
         ShutdownResponse,
     };
     use paths::HostAbsPath;
-    use sessions::{NetworkMode, SessionId};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -3803,7 +3800,7 @@ mod tests {
                 project_path: Some(HostAbsPath::try_new("/uwu").unwrap()),
                 // A freshly-created session that hasn't been configured yet
                 // sits in `Pending` until `ConfigureLoadout` promotes it.
-                status: sessions::SessionStatus::Pending,
+                status: boxes::SessionStatus::Pending,
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
                 // The same state the create response above carried
@@ -3897,7 +3894,7 @@ mod tests {
         let capture = crate::test_harness::captured_log();
         let deny_all = |name: &str| {
             let mut request = req(name, "/uwu");
-            request.config.policy.egress = Some(sessions::EgressPolicy::deny_all());
+            request.config.policy.egress = Some(boxes::EgressPolicy::deny_all());
             request
         };
 
@@ -5389,7 +5386,7 @@ mod tests {
     #[test]
     fn microvm_create_has_no_classifier_advisory() {
         let cause = Some(classifier::Cause::StepNotInstalled);
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(
             super::create_classifier_advisory(true, NetworkMode::HostNet, cause, Some(&deny_all)),
             None,
@@ -5427,7 +5424,7 @@ mod tests {
             None,
             "a box that declares no egress is told nothing"
         );
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(
             super::create_classifier_advisory(false, NetworkMode::HostNet, cause, Some(&deny_all))
                 .as_deref(),
@@ -5439,9 +5436,9 @@ mod tests {
             ),
             "a deny-all declaration gets the requirement's two lines"
         );
-        let allow_list = sessions::EgressPolicy {
+        let allow_list = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..sessions::EgressPolicy::default()
+            ..boxes::EgressPolicy::default()
         };
         assert_eq!(
             super::create_classifier_advisory(
@@ -5462,7 +5459,7 @@ mod tests {
             "an allow-list declaration asked for limited access, and is not handed \
              the install, which would get the box refused"
         );
-        let lists_nothing = sessions::EgressPolicy::default();
+        let lists_nothing = boxes::EgressPolicy::default();
         assert_eq!(
             super::create_classifier_advisory(
                 false,
@@ -5509,7 +5506,7 @@ mod tests {
             "box not registered with the VM host (no handed addresses); register \
              through minvmd's control socket first"
         );
-        let handed = sessions::BoxAddresses {
+        let handed = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 0, 2),
         };
@@ -5542,7 +5539,7 @@ mod tests {
     /// run; both name the own-address start alone.
     #[test]
     fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         let not_effective =
             classifier::advisory_text(classifier::Cause::TableNotEffective, &deny_all);
         assert!(
@@ -5566,7 +5563,7 @@ mod tests {
         );
         let allowed = classifier::advisory_text(
             classifier::Cause::TableNotEffective,
-            &sessions::EgressPolicy::default(),
+            &boxes::EgressPolicy::default(),
         );
         assert!(
             allowed.contains("so the box can still reach the network"),
@@ -6213,7 +6210,7 @@ mod tests {
         let laned_policy = SessionPolicy {
             egress: None,
             ingress: None,
-            credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
         };
         let laned_id = own_ip_session(&mut client, "laned-egress", laned_policy.clone()).await;
 
@@ -6224,7 +6221,7 @@ mod tests {
             super::effective_policy_reply(
                 &SessionPolicy::default(),
                 NetworkMode::OwnIp,
-                sessions::EgressDefaultPhase::InForce,
+                boxes::EgressDefaultPhase::InForce,
                 false,
             ),
             EffectiveSessionPolicy {
@@ -6262,7 +6259,7 @@ mod tests {
         );
 
         // Over the real wire, the reply follows the phase this build ships:
-        // whatever [`sessions::EGRESS_DEFAULT_PHASE`] resolves for a bare
+        // whatever [`boxes::EGRESS_DEFAULT_PHASE`] resolves for a bare
         // own-address box is what the daemon answers.
         let bare = client
             .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
@@ -6273,7 +6270,7 @@ mod tests {
             super::effective_policy_reply(
                 &SessionPolicy::default(),
                 NetworkMode::OwnIp,
-                sessions::EGRESS_DEFAULT_PHASE,
+                boxes::EGRESS_DEFAULT_PHASE,
                 false,
             ),
             "the wire must answer the shipped phase's resolution for a bare box",
@@ -6324,7 +6321,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             laned.credentialed_upstream,
-            Some(sessions::CredentialedUpstream::default()),
+            Some(boxes::CredentialedUpstream::default()),
             "the wire must answer the lane a declared box carries",
         );
         let lane_wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(laned.clone()))
@@ -6393,9 +6390,9 @@ mod tests {
         // posture it exists to defer whatever the shipped constant says.
         assert_eq!(
             crate::session::effective_egress_section(
-                &sessions::SessionPolicy::default(),
+                &boxes::SessionPolicy::default(),
                 NetworkMode::OwnIp,
-                sessions::EgressDefaultPhase::InForce,
+                boxes::EgressDefaultPhase::InForce,
                 true,
             ),
             None,
@@ -6756,7 +6753,7 @@ mod tests {
         let mut client = server.connect().await;
 
         let resp = client
-            .call::<minimald_rpc::SubmitVerdict>(&sessions::wire::request::ContributionVerdict {
+            .call::<minimald_rpc::SubmitVerdict>(&boxes::wire::request::ContributionVerdict {
                 session_id: SessionId::nil(),
                 vars: vec![],
                 patches: vec![],
@@ -6764,8 +6761,8 @@ mod tests {
             })
             .await;
         match resp {
-            Errorable::Ok(sessions::wire::request::SessionStep::Fault {
-                error: sessions::wire::errors::WireError::UnknownSessionId,
+            Errorable::Ok(boxes::wire::request::SessionStep::Fault {
+                error: boxes::wire::errors::WireError::UnknownSessionId,
             }) => {}
             other => panic!("expected Fault::UnknownSessionId, got {other:?}"),
         }

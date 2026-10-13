@@ -63,7 +63,7 @@ pub(super) async fn run_session_hooks(
     record: &SessionRecordHandle,
     event: crate::hooks::HookEvent,
 ) -> Vec<crate::hooks::HookOutcome> {
-    use sessions::store::SessionObject as _;
+    use boxes::store::SessionObject as _;
 
     let SessionInner::Active {
         composition: Some(composition),
@@ -153,8 +153,8 @@ pub(crate) fn log_hook_outcomes(session: &str, outcomes: &[crate::hooks::HookOut
 ///   would demand an upload that is never sent, and no project could
 ///   ever declare an external hook script.
 pub(crate) fn composition_needs_staged_scripts(composition: &Composition) -> bool {
-    use sessions::core::lifecyclehook::{HookScript, HookScriptBody};
-    use sessions::core::source::{Provenanced, Source};
+    use boxes::core::lifecyclehook::{HookScript, HookScriptBody};
+    use boxes::core::source::{Provenanced, Source};
     composition
         .lifecycle_hooks()
         .iter()
@@ -220,7 +220,7 @@ pub(crate) fn registry_name(record: &Record) -> String {
 /// permitted to forward from its shell into the session (OpenSSH's default
 /// `AcceptEnv LANG LC_*`, plus `TZ`). Everything else the client set on the
 /// channel — e.g. `MINIMAL_SESSION_ID`, `TRACEPARENT`, and the session-key
-/// negotiation vars in `sessions::keys` (`LEADER_ENV`, `DETACH_KEY_ENV`,
+/// negotiation vars in `boxes::keys` (`LEADER_ENV`, `DETACH_KEY_ENV`,
 /// `FORWARD_KEY_ENV`, `BELL_ENV`) — is control plumbing read by the daemon's
 /// `shell_request` (and re-validated as a backstop) and must not leak into the
 /// shell environment, so it is filtered out here.

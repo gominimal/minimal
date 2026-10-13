@@ -394,7 +394,7 @@ mod tests {
 /// around the asserts' failure paths (the `memcmp` lesson in the egress
 /// harness's bound doc).
 ///
-/// Run: `cargo kani -p sessions` (or `./scripts/kani.sh`). Kani pinned at
+/// Run: `cargo kani -p boxes` (or `./scripts/kani.sh`). Kani pinned at
 /// 0.68.0 in CI.
 #[cfg(kani)]
 mod kani_proofs {

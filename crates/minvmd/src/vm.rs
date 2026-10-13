@@ -241,7 +241,7 @@ impl VmConfig {
             // vm_egress is accepted for this mode (a VM boundary exists); validate
             // that each allow_subnets entry is a syntactically valid CIDR prefix,
             // mirroring the per-PTask egress check in
-            // `sessions::Record::validate_policy`, so a misconfigured subnet is
+            // `boxes::Record::validate_policy`, so a misconfigured subnet is
             // named here rather than failing opaquely when #553's enforcement
             // layer parses it.
             if let Some(bad) = vm_egress.first_invalid_subnet() {
@@ -571,7 +571,7 @@ fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::
 
 /// Whether the operator opted the VM out of the deny-all egress default
 /// (NET-077), read from [`EGRESS_DENY_ALL_OPT_OUT_ENV`] through the parse the
-/// guest shares ([`sessions::egress_deny_all_opt_out_from_raw`]):
+/// guest shares ([`boxes::egress_deny_all_opt_out_from_raw`]):
 /// `1`/`true`/`yes`/`on`, case-insensitive; unset or any other value is
 /// `false` — the build's egress default. Read by both processes that need it,
 /// as [`OWN_IP_ENV`] is: the supervisor, for the host-side registry's
@@ -580,7 +580,7 @@ fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::
 /// process that starts `minvmd run`/`boot` reaches each.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn egress_deny_all_opt_out_from_env() -> bool {
-    sessions::egress_deny_all_opt_out_from_raw(
+    boxes::egress_deny_all_opt_out_from_raw(
         std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
     )
 }

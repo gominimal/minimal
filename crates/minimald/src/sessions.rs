@@ -8,9 +8,9 @@ use crate::{
     session_host::HostAttrs,
     store::{RecordPredicate, SessionRecordHandle, Store, StoreHandle},
 };
+use boxes::SessionId;
 use common::SpecHash;
 use paths::DaemonAbsPath;
-use sessions::SessionId;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
@@ -38,7 +38,7 @@ pub struct SessionInfo {
     pub project_path: paths::HostAbsPath,
     /// The session's lifecycle status, surfaced so a client picker can
     /// render a state glyph.
-    pub status: sessions::SessionStatus,
+    pub status: boxes::SessionStatus,
     pub attrs: Option<HostAttrs>,
 }
 
@@ -79,7 +79,7 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
     REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Assemble a [`sessions::Record`] from the out-of-band session
+/// Assemble a [`boxes::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
 /// with the network mode (R2.1) — so an invalid session is never
@@ -92,9 +92,9 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 fn build_record(
     config: minimald_rpc::SessionConfig,
     username: Option<String>,
-    status: sessions::SessionStatus,
-) -> Result<sessions::Record, std::io::Error> {
-    let record = sessions::Record {
+    status: boxes::SessionStatus,
+) -> Result<boxes::Record, std::io::Error> {
+    let record = boxes::Record {
         id: SessionId::nil(),
         name: config.name,
         username,
@@ -164,7 +164,7 @@ struct CreateSessionMsg {
 
 enum ManagerMessage {
     List(Responder<Vec<SessionInfo>>),
-    GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
+    GetRecord(SessionKeyPredicate, Responder<Option<boxes::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
@@ -180,7 +180,7 @@ enum ManagerMessage {
     /// actor, so inspecting a stopped session leaves it stopped.
     GetComposition(
         SessionKeyPredicate,
-        Responder<Option<sessions::core::compose::Composition>>,
+        Responder<Option<boxes::core::compose::Composition>>,
     ),
     /// How many session actors are live. Test-only, and the only way
     /// to observe the read-only-ness of [`GetRecord`](Self::GetRecord)
@@ -908,7 +908,7 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
             }
         };
         match record.status {
-            sessions::SessionStatus::Pending | sessions::SessionStatus::Materializing => {
+            boxes::SessionStatus::Pending | boxes::SessionStatus::Materializing => {
                 let id = *handle.id();
                 let status = record.status;
                 if let Err(e) = handle.delete().await {
@@ -926,7 +926,7 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
                     );
                 }
             }
-            sessions::SessionStatus::Active => {}
+            boxes::SessionStatus::Active => {}
         }
     }
     Ok(())
@@ -1039,10 +1039,10 @@ impl Manager {
                     continue;
                 }
             };
-            if !matches!(record.status, sessions::SessionStatus::Active)
+            if !matches!(record.status, boxes::SessionStatus::Active)
                 || !matches!(
                     record.network,
-                    sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp
+                    boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
                 )
             {
                 continue;
@@ -1163,7 +1163,7 @@ impl Manager {
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
-        let record = build_record(config, username, sessions::SessionStatus::Pending)?;
+        let record = build_record(config, username, boxes::SessionStatus::Pending)?;
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
 
@@ -1729,7 +1729,7 @@ impl ManagerHandle {
     pub async fn get_composition(
         &self,
         pred: SessionKeyPredicate,
-    ) -> Result<Option<sessions::core::compose::Composition>, SessionsError> {
+    ) -> Result<Option<boxes::core::compose::Composition>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1743,7 +1743,7 @@ impl ManagerHandle {
     pub async fn get_record(
         &self,
         pred: SessionKeyPredicate,
-    ) -> Result<Option<sessions::Record>, SessionsError> {
+    ) -> Result<Option<boxes::Record>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1804,7 +1804,7 @@ impl ManagerHandle {
     pub async fn needed_packages(&self) -> Result<HashSet<SpecHash>, SessionsError> {
         let mut out = HashSet::new();
         for info in self.list().await? {
-            if info.status != sessions::SessionStatus::Active {
+            if info.status != boxes::SessionStatus::Active {
                 continue;
             }
             // Deleted between the list and the lookup: gone, so needs nothing.
@@ -1892,9 +1892,9 @@ impl ManagerHandle {
 pub(crate) mod tests {
     use super::*;
     use crate::session::PACKAGE_CHECK_DEADLINE;
+    use boxes::daemon::composer::ComposeOutcome;
+    use boxes::wire::request::{ContributionVerdict, SessionStep, WireContribution};
     use paths::HostAbsPath;
-    use sessions::daemon::composer::ComposeOutcome;
-    use sessions::wire::request::{ContributionVerdict, SessionStep, WireContribution};
     use std::io::ErrorKind;
     use tempfile::TempDir;
 
@@ -1906,11 +1906,11 @@ pub(crate) mod tests {
     }
 
     /// Resolves the session's live actor and peeks its held
-    /// [`Composition`](sessions::core::compose::Composition).
+    /// [`Composition`](boxes::core::compose::Composition).
     async fn peek_composition(
         mngr: &ManagerHandle,
         id: SessionId,
-    ) -> Arc<sessions::core::compose::Composition> {
+    ) -> Arc<boxes::core::compose::Composition> {
         mngr.get_session(SessionKeyPredicate::Id(id))
             .await
             .expect("get_session succeeds")
@@ -1955,7 +1955,7 @@ pub(crate) mod tests {
         TempDir,
         ManagerHandle,
         SessionId,
-        Option<sessions::wire::request::ContributionResponse>,
+        Option<boxes::wire::request::ContributionResponse>,
     ) {
         let (state, cache, mngr) = manager().await;
         let id = mngr.create_session(sample_config(), None).await.unwrap();
@@ -1981,7 +1981,7 @@ pub(crate) mod tests {
         TempDir,
         ManagerHandle,
         SessionId,
-        sessions::wire::request::ContributionResponse,
+        boxes::wire::request::ContributionResponse,
     ) {
         let (state, cache, mngr, id, response) = create_and_configure(PENDING_VAR_MFILE).await;
         let response = response.expect("a daemon-side var should pend, not finalize");
@@ -1991,16 +1991,16 @@ pub(crate) mod tests {
     /// An approve-everything verdict for the given pending response.
     fn approve_all(
         id: SessionId,
-        response: &sessions::wire::request::ContributionResponse,
+        response: &boxes::wire::request::ContributionResponse,
     ) -> ContributionVerdict {
         ContributionVerdict {
             session_id: id,
             vars: response
                 .vars
                 .iter()
-                .map(|pv| sessions::wire::policy::WireVarVerdict::Approved {
+                .map(|pv| boxes::wire::policy::WireVarVerdict::Approved {
                     id: pv.id,
-                    value: sessions::wire::primitives::WireResolvedVar {
+                    value: boxes::wire::primitives::WireResolvedVar {
                         name: pv.name.clone(),
                         value: "info".into(),
                         carries_user_data: true,
@@ -2016,7 +2016,7 @@ pub(crate) mod tests {
         minimald_rpc::SessionConfig {
             name: Some("doomed".to_string()),
             project_path: HostAbsPath::try_new("/proj").unwrap(),
-            network: sessions::NetworkMode::default(),
+            network: boxes::NetworkMode::default(),
             policy: Default::default(),
             task_addresses: Vec::new(),
             box_id: None,
@@ -2208,15 +2208,15 @@ pub(crate) mod tests {
             &mngr,
             sample_config(),
             WireContribution {
-                lifecycle_hooks: vec![sessions::wire::primitives::WireProvenancedHook {
-                    hook: sessions::wire::primitives::WireLifecycleHook {
-                        on_destroy: Some(sessions::wire::primitives::WireHookScript::Inline {
+                lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                    hook: boxes::wire::primitives::WireLifecycleHook {
+                        on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
                             body: format!("echo ran > {}", marker.display()),
                             timeout_secs: 60,
                         }),
                         ..Default::default()
                     },
-                    source: sessions::wire::primitives::WireSource::UserLoadout {
+                    source: boxes::wire::primitives::WireSource::UserLoadout {
                         name: "test".to_string(),
                     },
                 }],
@@ -2334,7 +2334,7 @@ pub(crate) mod tests {
 
     /// A non-empty `WireContribution` from the client is accepted:
     /// the composer produces a non-empty
-    /// [`Composition`](sessions::core::compose::Composition), the
+    /// [`Composition`](boxes::core::compose::Composition), the
     /// create flow holds it on the live [`Session`] actor, and the
     /// record persists as `Active`.
     ///
@@ -2344,8 +2344,8 @@ pub(crate) mod tests {
     /// its composition.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_session_accepts_non_empty_client_contribution() {
-        use sessions::core::source::Source;
-        use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
+        use boxes::core::source::Source;
+        use boxes::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
 
         let (_state, _cache, mngr) = manager().await;
         let mut contribution = WireContribution::default();
@@ -2381,7 +2381,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            sessions::SessionStatus::Materializing,
+            boxes::SessionStatus::Materializing,
         );
     }
 
@@ -2448,7 +2448,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .expect("the Pending record should exist")
                 .status,
-            sessions::SessionStatus::Pending,
+            boxes::SessionStatus::Pending,
         );
 
         let handle = mngr
@@ -2472,7 +2472,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .expect("the record should survive promotion")
                 .status,
-            sessions::SessionStatus::Materializing,
+            boxes::SessionStatus::Materializing,
         );
         let comp = handle
             .peek_composition()
@@ -2507,7 +2507,7 @@ pub(crate) mod tests {
             .expect("actor reply should succeed");
         match step {
             SessionStep::Fault {
-                error: sessions::wire::errors::WireError::WrongState { what },
+                error: boxes::wire::errors::WireError::WrongState { what },
             } => assert!(what.contains("expected Pending"), "got: {what}"),
             other => panic!("expected Fault::WrongState, got {other:?}"),
         }
@@ -2556,7 +2556,7 @@ pub(crate) mod tests {
             vars: response
                 .vars
                 .iter()
-                .map(|pv| sessions::wire::policy::WireVarVerdict::Denied {
+                .map(|pv| boxes::wire::policy::WireVarVerdict::Denied {
                     id: pv.id,
                     name: pv.name.clone(),
                 })
@@ -2578,7 +2578,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .expect("the record should survive a faulted resume")
                 .status,
-            sessions::SessionStatus::Pending,
+            boxes::SessionStatus::Pending,
         );
 
         // The compose state survived the fault: a corrected verdict still
@@ -2612,14 +2612,14 @@ pub(crate) mod tests {
 
         let mut config = sample_config();
         config.name = None;
-        config.network = sessions::NetworkMode::HostNet;
+        config.network = boxes::NetworkMode::HostNet;
         config.project_path = HostAbsPath::try_new(routable_dir.to_str().unwrap()).unwrap();
         // Finalizing the loadout registers the "app" route.
         let _routable_id = create_active_session_with(&mngr, config).await;
 
         let mut config = sample_config();
         config.name = None;
-        config.network = sessions::NetworkMode::NoNet;
+        config.network = boxes::NetworkMode::NoNet;
         config.project_path = HostAbsPath::try_new(unroutable_dir.to_str().unwrap()).unwrap();
         let unroutable_id = create_active_session_with(&mngr, config).await;
         let handle = session(&mngr, unroutable_id).await;
@@ -2795,7 +2795,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            sessions::SessionStatus::Materializing,
+            boxes::SessionStatus::Materializing,
         );
     }
 
@@ -2931,7 +2931,7 @@ pub(crate) mod tests {
         (state, cache, mngr, id, outcome)
     }
 
-    async fn status_of(mngr: &ManagerHandle, id: SessionId) -> sessions::SessionStatus {
+    async fn status_of(mngr: &ManagerHandle, id: SessionId) -> boxes::SessionStatus {
         mngr.get_record(SessionKeyPredicate::Id(id))
             .await
             .unwrap()
@@ -2961,14 +2961,14 @@ pub(crate) mod tests {
             !msg.contains("pkg-ok"),
             "a package that resolves is not reported, got {msg:?}"
         );
-        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+        assert_ne!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
     }
 
     /// The same refusal for a package that arrives through a loadout: the
     /// project resolves, the loadout's package does not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finalize_refuses_an_unknown_loadout_package() {
-        use sessions::wire::primitives::{WirePackageRef, WireSource};
+        use boxes::wire::primitives::{WirePackageRef, WireSource};
 
         let mut contribution = WireContribution::default();
         contribution.requested_packages.push(WirePackageRef {
@@ -2986,7 +2986,7 @@ pub(crate) mod tests {
             msg.contains("no such package: no-such-pkg-qq") && msg.contains("loadout `editor`"),
             "the error should name the package and its loadout, got {msg:?}"
         );
-        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+        assert_ne!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
     }
 
     /// A composition whose every package resolves still finalizes to
@@ -3001,7 +3001,7 @@ pub(crate) mod tests {
             !response.package_check_skipped,
             "a check that ran to a verdict is not skipped"
         );
-        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+        assert_eq!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
     }
 
     /// A check that cannot resolve the graph within its deadline steps
@@ -3033,7 +3033,7 @@ pub(crate) mod tests {
             response.package_check_skipped,
             "an expired check reports the skip so the client can warn"
         );
-        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+        assert_eq!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
     }
 
     /// The held [`Composition`] actually carries the project
@@ -3042,7 +3042,7 @@ pub(crate) mod tests {
     /// a well-shaped-but-empty composition and silently pass the
     /// existing lifecycle tests.
     ///
-    /// [`Composition`]: sessions::core::compose::Composition
+    /// [`Composition`]: boxes::core::compose::Composition
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn created_session_composition_carries_project_packages() {
         let (_state, _cache, mngr, id, _response) =
@@ -3095,7 +3095,7 @@ pub(crate) mod tests {
     /// helper is only responsible for daemon-side additions.
     #[test]
     fn build_composables_no_mfile_yields_nothing() {
-        use sessions::wire::primitives::{WirePackageRef, WireSource};
+        use boxes::wire::primitives::{WirePackageRef, WireSource};
 
         let path = DaemonAbsPath::try_new("/proj").unwrap();
         let mut contribution = WireContribution::default();
@@ -3159,7 +3159,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        use sessions::core::compose::Composable as _;
+        use boxes::core::compose::Composable as _;
         let contribution = project_composable
             .expect("[session] block → ProjectComposable present")
             .contribute(&|_| Err(std::env::VarError::NotPresent))
@@ -3167,11 +3167,11 @@ pub(crate) mod tests {
         let sources: Vec<_> = contribution
             .packages()
             .iter()
-            .map(sessions::core::source::Provenanced::source)
+            .map(boxes::core::source::Provenanced::source)
             .collect();
         assert!(!sources.is_empty(), "fixture should contribute a package");
         for source in sources {
-            let sessions::core::source::Source::Project { path } = source else {
+            let boxes::core::source::Source::Project { path } = source else {
                 panic!("project material should carry Source::Project, got {source:?}");
             };
             assert_eq!(

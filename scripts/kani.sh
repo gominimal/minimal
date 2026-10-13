@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Run the Kani bounded-verification harnesses (#1109) over the proved
-# crates: rcache (index_file untrusted-bytes parse path) and sessions
+# crates: rcache (index_file untrusted-bytes parse path) and boxes
 # (PathDecision combination lattice, the egress frame verdict's
 # admit-iff-declared property, and the publish-verb decision's
 # applied-iff-table-admits property).
@@ -153,5 +153,5 @@ expect() { # crate expected_count
         exit 1
     }
 }
-expect sessions 10
+expect boxes 10
 expect rcache 3

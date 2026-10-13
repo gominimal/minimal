@@ -21,10 +21,10 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use boxes::SessionId;
 use camino::Utf8PathBuf;
 use paths::DaemonAbsPath;
 use russh::keys::PublicKeyOrCertificate;
-use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
 use tracing_subscriber::fmt::MakeWriter;
@@ -220,7 +220,7 @@ impl TestServer {
     /// Bring a session up (make it "live") by looking it up in the
     /// sessions manager. A persisted session is not "live" until
     /// `get_session` is called, which starts the session actor.
-    pub async fn bring_session_up(&self, session_id: sessions::SessionId) {
+    pub async fn bring_session_up(&self, session_id: boxes::SessionId) {
         let mngr = self.state.sessions_manager().await;
         mngr.get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
             .await
@@ -236,7 +236,7 @@ impl TestServer {
     /// *client's* machine. So a test that wants `ConfigureLoadout` to see a
     /// project seeds it here, between `CreateSession` and `ConfigureLoadout`,
     /// exactly where a real client streams its files up.
-    pub async fn seed_workspace_mfile(&self, session_id: sessions::SessionId, contents: &str) {
+    pub async fn seed_workspace_mfile(&self, session_id: boxes::SessionId, contents: &str) {
         let mngr = self.state.sessions_manager().await;
         let paths = mngr
             .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
@@ -570,7 +570,7 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
         config: minimald_rpc::SessionConfig {
             name: Some(name.to_string()),
             project_path: paths::HostAbsPath::try_new(project).unwrap(),
-            network: sessions::NetworkMode::default(),
+            network: boxes::NetworkMode::default(),
             policy: Default::default(),
             task_addresses: Vec::new(),
             box_id: None,

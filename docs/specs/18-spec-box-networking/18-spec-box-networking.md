@@ -439,7 +439,7 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-060** THE SYSTEM SHALL accept `egress.allow_subnets`, `egress.allow_protocols`, `egress.allow_dns_hosts`, and `egress.deny_subnets` in the box spec.
   tier:     T0
-  verify:   cargo nextest run -p sessions spec_accepts_egress_fields
+  verify:   cargo nextest run -p boxes spec_accepts_egress_fields
   <!-- S8a/AC1 + S8b/AC1; prose 39; ubiquitous; NET-066 and NET-067 require `allow_dns_hosts` and the local Box Egress Proxy validates its grants against it; `deny_subnets` is the box's half of NET-067's denied range (design §5.3) -->
 
 - **NET-061** THE SYSTEM SHALL show a box's effective egress rules in `min session policy`.
@@ -476,7 +476,7 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-065** IF a box spec declares `egress` on a `none` box THEN THE SYSTEM SHALL reject it as a validation error.
   tier:     T0
-  verify:   cargo nextest run -p sessions egress_on_none_box_is_validation_error
+  verify:   cargo nextest run -p boxes egress_on_none_box_is_validation_error
   <!-- S8a/AC3; prose 41; unwanted; `none` only: a host-address box's `egress` is accepted (NET-120) -->
 
 - **NET-066** WHEN a box resolves a name matched by its `egress.allow_dns_hosts` THE SYSTEM SHALL admit the answer's addresses for that box for the admission window the architecture defines.
@@ -553,7 +553,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-074** WHERE the deny-all default is in force and the opt-out flag is not set, WHEN a box is created with an `egress` section, or an own-address box with none, THE SYSTEM SHALL give each destination allow list the expanded section leaves absent, `allow_subnets` and `allow_dns_hosts`, no reach in that dimension, so that an own-address box with no `egress` section reaches no external address.
   tier:     T0
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
-  verify:   cargo nextest run -p sessions absent_destination_lists_grant_nothing_once_merged
+  verify:   cargo nextest run -p boxes absent_destination_lists_grant_nothing_once_merged
   <!-- S9a/AC1; prose 47; feature+event; stated per list, not per section: an absent list in the expanded spec grants nothing (the architecture replaces a table wholesale between layers, so an absent list is simply absent), so a section that names only `allow_dns_hosts` reaches its names and no address directly, and allow-all is written out (`0.0.0.0/0` and `::/0` in `allow_subnets`), never left to an absent list; the per-list rule is not mode-qualified, as the architecture's default-deny rule is not: a declared section on a host-address box resolves the same, a host that decides per box reads the resolved shape (NET-079) and refuses a narrowing list it cannot enforce, and only the absent-section default is an own-address box's; `allow_protocols` is a filter over the reach the two destination lists grant and grants none itself, so its absence narrows nothing and `allow_subnets = ["0.0.0.0/0"]` alone is allow-all; `::/0` grants nothing until an IPv6 path exists (NET-082) and is written as the forward-compatible spelling; supersedes the shipped 03-spec R2.1 meaning of an absent `allow_subnets` or `allow_dns_hosts` list, allow-all, in a declared section, and with it R2.1's allow-all for an own-address box with no `egress` section; NET-076 binds the announcement window and NET-077 the opt-out -->
   - WHERE the opt-out flag is not set, WHEN the user activates an own-address box with no `egress` section THE SYSTEM SHALL print one line that names the deny-all default and the flags that declare reach.
     tier:   T0
@@ -639,7 +639,7 @@ included, with every refusal logged (NET-001 to NET-004).
     <!-- S10a/AC1; prose 51; unwanted -->
   - WHERE the host is VM-backed, WHEN the in-VM daemon asks the switch to publish a port or a name THE SYSTEM SHALL apply the request only when the table NET-138 holds the request's switch address for a live box or the node and admits that port or that name for it.
     tier:     T2
-    verify:   cargo nextest run -p sessions switch_request_applied_only_when_table_admits
+    verify:   cargo nextest run -p boxes switch_request_applied_only_when_table_admits
     property: for every switch request and every table, the request is applied exactly when the table holds its switch address for a live box or the node and admits every port and name it carries for that holder
     harness:  kani_switch_request_applied_iff_table_admits; bound and purity constraint under Tiers in Design reasoning
     <!-- S10a/AC1; prose 51; feature+event; the switch's forwarder and zone verbs ride the same channel as the frame relay, so without this rule a process inside the VM publishes any guest address on the host or shadows a zone name; the host-side gate is the one writer toward the switch; a request from a resident address to re-point a sibling's entry among the table's addresses is in-boundary attribution noise, conceded by design §8 item 3; a withdrawal is bound below -->
@@ -806,7 +806,7 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-120** THE SYSTEM SHALL accept an `egress` section on a host-address box.
   tier:     T0
-  verify:   cargo nextest run -p sessions egress_on_host_ip_box_accepted
+  verify:   cargo nextest run -p boxes egress_on_host_ip_box_accepted
   <!-- S9b/AC2; ubiquitous; supersedes the shipped 03-spec R2.1 rule that `egress` on a HostNet PTask is a parse-time error, which the daemon's session RPC still enforces; NET-079 and NET-080 presuppose this; NET-065 keeps the `none` rejection -->
 
 - **NET-140** WHEN a box is activated with `--deny-all-egress` THE SYSTEM SHALL declare every allow list in its `egress` section present and empty.
@@ -1257,7 +1257,7 @@ of 4 over a 40-byte IPv4+L4 header and at most 4 rules; it requires the
 admit-or-drop decision to be a pure function over an owned frame summary and
 owned rules, separate from the relay loop. The switch-request decision
 (NET-081's publish rule) is T2 on the same reasoning and has its own harness,
-`kani_switch_request_applied_iff_table_admits`, in the `sessions` lane beside
+`kani_switch_request_applied_iff_table_admits`, in the `boxes` lane beside
 the frame harness: exhaustive over a request summary of one verb, one switch
 address and at most 4 records, each a port or an index into the table's name
 set, against a table of at most 4 rows with at most 4 admitted ports and 4

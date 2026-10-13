@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use boxes::{EffectiveSessionPolicy, NetworkMode, SessionId, SessionPolicy};
 use minimal_client::Client;
 use minimald_rpc::{
     CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest, Errorable,
@@ -16,7 +17,6 @@ use minimald_rpc::{
     GetSessionRecordRequest, GetVersion, ListSessions, OneshotSshRpc, RenameSession,
     RenameSessionRequest, SessionConfig,
 };
-use sessions::{EffectiveSessionPolicy, NetworkMode, SessionId, SessionPolicy};
 
 /// Deadline for the UI-loop RPCs. The draw loop awaits these inline, so a
 /// wedged-but-connected daemon (a suspended microVM behind libkrun's
@@ -245,7 +245,7 @@ pub async fn fetch_detail(
     id: SessionId,
 ) -> Result<
     (
-        Option<sessions::Record>,
+        Option<boxes::Record>,
         Result<EffectiveSessionPolicy, String>,
     ),
     anyhow::Error,
@@ -284,7 +284,7 @@ pub async fn fetch_screen(
 /// row: a `host_ip` box shares the node's own row, so `min session
 /// activate` and [`activate`] hold its name (NODATA) instead of
 /// registering one.
-fn holds_name(record: &sessions::Record) -> bool {
+fn holds_name(record: &boxes::Record) -> bool {
     record.network == NetworkMode::HostNet && record.box_addresses.is_none()
 }
 
@@ -305,7 +305,7 @@ async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
 /// off the async workers: the control exchange is a blocking socket call.
 /// The pair comes off the session record, which carries no box id, so the
 /// pair is the withdrawal's proof.
-async fn withdraw_box_row(sock: &Path, name: &str, addresses: sessions::BoxAddresses) {
+async fn withdraw_box_row(sock: &Path, name: &str, addresses: boxes::BoxAddresses) {
     let (sock, name) = (sock.to_path_buf(), name.to_string());
     if let Err(error) = tokio::task::spawn_blocking(move || {
         minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
@@ -317,7 +317,7 @@ async fn withdraw_box_row(sock: &Path, name: &str, addresses: sessions::BoxAddre
 }
 
 /// The session's record, best-effort: `None` when it cannot be read.
-pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::Record> {
+pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<boxes::Record> {
     timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .ok()
@@ -353,8 +353,8 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 /// line, and the attach goes on (NET-138), as `min session attach` does.
 pub async fn prepare_attach(
     sock: &Path,
-    record: Option<sessions::Record>,
-) -> anyhow::Result<Option<sessions::BoxAddresses>> {
+    record: Option<boxes::Record>,
+) -> anyhow::Result<Option<boxes::BoxAddresses>> {
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
     Ok(record.and_then(|record| record.box_addresses))
 }
@@ -363,7 +363,7 @@ pub async fn prepare_attach(
 /// `sock`, as `min session destroy` settles it: the row an own-address box
 /// registered is withdrawn with the pair off its record, and a `host_ip`
 /// box's zone hold is released. A session that held neither owes nothing.
-async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &sessions::Record) {
+async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record) {
     let Some(name) = record.name.as_deref() else {
         return;
     };
@@ -436,7 +436,7 @@ pub async fn release_held_name_after_attach(
     provider: &mut Provider,
     id: SessionId,
     name: &str,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
 ) {
     let lookup =
         timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
@@ -481,7 +481,7 @@ pub async fn activate(
     name: Option<String>,
     project_path: paths::HostAbsPath,
     network: NetworkMode,
-    contribution: sessions::wire::request::WireContribution,
+    contribution: boxes::wire::request::WireContribution,
 ) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
@@ -804,9 +804,9 @@ pub struct Activated {
 /// did not report its opt-out (NET-077) — the check `min session
 /// activate` makes before its note.
 fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool {
-    match sessions::EGRESS_DEFAULT_PHASE {
-        sessions::EgressDefaultPhase::Announced => false,
-        sessions::EgressDefaultPhase::InForce => created.deny_all_opt_out != Some(true),
+    match boxes::EGRESS_DEFAULT_PHASE {
+        boxes::EgressDefaultPhase::Announced => false,
+        boxes::EgressDefaultPhase::InForce => created.deny_all_opt_out != Some(true),
     }
 }
 
@@ -844,9 +844,9 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
 /// activation. A hook left with no scripts at all is removed entirely,
 /// since an empty one is not constructible.
 fn without_external_hook_scripts(
-    mut contribution: sessions::wire::request::WireContribution,
-) -> sessions::wire::request::WireContribution {
-    use sessions::wire::primitives::WireHookScript;
+    mut contribution: boxes::wire::request::WireContribution,
+) -> boxes::wire::request::WireContribution {
+    use boxes::wire::primitives::WireHookScript;
     let is_inline =
         |s: &Option<WireHookScript>| !matches!(s, Some(WireHookScript::External { .. }));
     for ph in &mut contribution.lifecycle_hooks {
@@ -1011,7 +1011,7 @@ mod tests {
         );
         assert_eq!(
             config.box_addresses,
-            Some(sessions::BoxAddresses {
+            Some(boxes::BoxAddresses {
                 switch_address: handed.switch_address,
                 loopback_address: handed.loopback_address,
             }),
@@ -1091,7 +1091,7 @@ mod tests {
         let provider = vm_provider_dir(&dir);
         let ssh_sock = provider.join("ssh.sock");
         let box_id = minimald_rpc::BoxId::from_bytes([9; 16]);
-        let addresses = sessions::BoxAddresses {
+        let addresses = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 3),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 1),
         };
@@ -1217,7 +1217,7 @@ mod tests {
     async fn tui_attach_resumes_the_box_first() {
         let dir = tempfile::TempDir::new().unwrap();
         let ssh_sock = dir.path().join("ssh.sock");
-        let addresses = sessions::BoxAddresses {
+        let addresses = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 4),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
         };
@@ -1252,8 +1252,8 @@ mod tests {
     }
 
     /// An own-address record holding `box_addresses`.
-    fn own_ip_record(box_addresses: Option<sessions::BoxAddresses>) -> sessions::Record {
-        sessions::Record {
+    fn own_ip_record(box_addresses: Option<boxes::BoxAddresses>) -> boxes::Record {
+        boxes::Record {
             id: SessionId::nil(),
             name: None,
             username: None,
@@ -1264,7 +1264,7 @@ mod tests {
                 ingress: None,
                 credentialed_upstream: None,
             },
-            status: sessions::SessionStatus::default(),
+            status: boxes::SessionStatus::default(),
             hooks_enabled: true,
             box_addresses,
             task_addresses: Vec::new(),
@@ -1289,7 +1289,7 @@ mod tests {
                 .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
         )
         .unwrap();
-        let handed = sessions::BoxAddresses {
+        let handed = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
@@ -1306,7 +1306,7 @@ mod tests {
                 .unwrap();
             line
         });
-        let record = sessions::Record {
+        let record = boxes::Record {
             id: SessionId::nil(),
             name: Some("web".to_string()),
             username: None,
@@ -1317,7 +1317,7 @@ mod tests {
                 ingress: None,
                 credentialed_upstream: None,
             },
-            status: sessions::SessionStatus::default(),
+            status: boxes::SessionStatus::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(handed),

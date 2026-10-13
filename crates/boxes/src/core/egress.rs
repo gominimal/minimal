@@ -3874,7 +3874,7 @@ mod tests {
 /// concrete length; what is pinned, and why each pin is sound, is
 /// documented there.
 ///
-/// Run: `cargo kani -p sessions` (or `./scripts/kani.sh`). Kani pinned at
+/// Run: `cargo kani -p boxes` (or `./scripts/kani.sh`). Kani pinned at
 /// 0.68.0 in CI.
 #[cfg(kani)]
 mod kani_proofs {

@@ -579,6 +579,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxes"
+version = "0.0.1"
+dependencies = [
+ "camino",
+ "common",
+ "globset",
+ "hex",
+ "indoc",
+ "nutype",
+ "paths",
+ "serde",
+ "serde_json_lenient",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3925,11 +3946,11 @@ name = "mfile"
 version = "0.0.1"
 dependencies = [
  "args",
+ "boxes",
  "common",
  "indoc",
  "paths",
  "serde",
- "sessions",
  "shlex",
  "tempfile",
  "toml",
@@ -3990,6 +4011,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "boxes",
  "camino",
  "chrono",
  "clap",
@@ -4014,7 +4036,6 @@ dependencies = [
  "russh",
  "serde",
  "serde_json_lenient",
- "sessions",
  "sha2 0.11.0",
  "switch",
  "tempfile",
@@ -4035,6 +4056,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "boxes",
  "camino",
  "constcat",
  "indicatif",
@@ -4046,7 +4068,6 @@ dependencies = [
  "russh",
  "serde",
  "serde_json_lenient",
- "sessions",
  "tempfile",
  "tokio",
  "tracing",
@@ -4064,6 +4085,7 @@ name = "minimal-tui"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "boxes",
  "camino",
  "chrono",
  "common",
@@ -4079,7 +4101,6 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json_lenient",
- "sessions",
  "tempfile",
  "tokio",
  "tracing",
@@ -4098,6 +4119,7 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "boringtun",
+ "boxes",
  "bytes",
  "camino",
  "check",
@@ -4134,7 +4156,6 @@ dependencies = [
  "serde",
  "serde_json_lenient",
  "serial_test",
- "sessions",
  "sha2 0.11.0",
  "size",
  "stdlib",
@@ -4160,6 +4181,7 @@ dependencies = [
 name = "minimald-rpc"
 version = "0.0.1"
 dependencies = [
+ "boxes",
  "chrono",
  "constcat",
  "hex",
@@ -4167,7 +4189,6 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json_lenient",
- "sessions",
 ]
 
 [[package]]
@@ -4194,6 +4215,7 @@ name = "minvmd"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "boxes",
  "camino",
  "clap",
  "clap_complete",
@@ -4208,7 +4230,6 @@ dependencies = [
  "serde",
  "serde_json_lenient",
  "serial_test",
- "sessions",
  "sha2 0.11.0",
  "switch",
  "sysinfo",
@@ -6730,27 +6751,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "sessions"
-version = "0.0.1"
-dependencies = [
- "camino",
- "common",
- "globset",
- "hex",
- "indoc",
- "nutype",
- "paths",
- "serde",
- "serde_json_lenient",
- "tempfile",
- "thiserror 2.0.21",
- "toml",
- "tracing",
- "uuid",
- "walkdir",
 ]
 
 [[package]]

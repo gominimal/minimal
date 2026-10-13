@@ -43,7 +43,7 @@
 //! through the gate's rate limiter in the shared refusal format, and the
 //! survivors hold for the shared admission window, under the shared per-name
 //! cap, with the shared used-pin retention past the window — the numbers
-//! read from [`sessions::core::egress`], the one place both admission tables
+//! read from [`boxes::core::egress`], the one place both admission tables
 //! hold them, so neither leg can drift from the other.
 //!
 //! ## Which copy decides
@@ -103,12 +103,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hickory_proto::op::{Message, MessageType, OpCode};
-use hickory_proto::rr::{Name, RData, RecordType};
-use sessions::core::egress::{
+use boxes::core::egress::{
     self, DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME,
     DNS_MAX_FLOWS_PER_BOX, DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, InfrastructureDenySet,
 };
+use hickory_proto::op::{Message, MessageType, OpCode};
+use hickory_proto::rr::{Name, RData, RecordType};
 use switch::SwitchSubnet;
 
 use crate::box_registry::{BoxRecord, BoxTable};
@@ -513,7 +513,7 @@ impl BoxPins {
     /// answers pins nothing — held outstanding under its [`QueryKey`] with
     /// the instant it was observed, for the shared expiry.
     ///
-    /// The bounds are the table's own, read from [`sessions::core::egress`]
+    /// The bounds are the table's own, read from [`boxes::core::egress`]
     /// with the rest of the numbers: an expired entry is swept here, at the
     /// insert that would share its map — the same no-timer discipline the
     /// admitted addresses keep — and past the shared cap a new question is
@@ -1290,7 +1290,7 @@ pub(crate) struct DenyAllRefusal {
 /// `internal`) from passing the way a string-suffix match would.
 fn is_zone_name(name: &Name) -> bool {
     let mut labels = name.iter();
-    sessions::core::zone_answer::ZONE_APEX
+    boxes::core::zone_answer::ZONE_APEX
         .rsplit('.')
         .all(|apex_label| labels.next_back() == Some(apex_label.as_bytes()))
         && labels.next_back().is_some()
@@ -1376,12 +1376,12 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use boxes::EgressPolicy;
+    use boxes::core::egress::{DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_FLOWS_PER_BOX};
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue};
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SVCB};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use sessions::EgressPolicy;
-    use sessions::core::egress::{DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_FLOWS_PER_BOX};
     use switch::SwitchSubnet;
 
     use super::{DnsPins, IPPROTO_TCP, TCP_FIN, deny_all_refusal, udp_datagram};
@@ -1572,7 +1572,7 @@ pub(crate) mod tests {
         registry.register(
             BoxRegistration::new(namespace, Ipv4Addr::from(lease), Ipv4Addr::LOCALHOST)
                 .with_egress_policy(EgressPolicy {
-                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                     allow_subnets: Some(Vec::new()),
                     allow_dns_hosts: Some(names),
                     deny_subnets: (!deny.is_empty()).then_some(deny),
@@ -2998,7 +2998,7 @@ pub(crate) mod tests {
     }
 
     /// The deny-all box: every `allow_*` dimension present and empty, the
-    /// section `sessions::EgressPolicy::deny_all` materializes.
+    /// section `boxes::EgressPolicy::deny_all` materializes.
     fn deny_all_box(registry: &BoxRegistry, namespace: &str, lease: [u8; 4]) {
         registry.register(
             BoxRegistration::new(namespace, Ipv4Addr::from(lease), Ipv4Addr::LOCALHOST)

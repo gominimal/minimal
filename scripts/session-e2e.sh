@@ -11434,8 +11434,8 @@ proof_github_only_allowlist() {
   # TEST-NET-3 (RFC 5737), the same range the own-IP egress proof uses as its
   # can-never-admit-live-traffic allow rule.
   GOA_DEAD_CIDR="203.0.113.0/24"
-  # The toolchain's hosts, verbatim from sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
-  # (crates/sessions/src/lib.rs) — the one list the minimald unit fixture and
+  # The toolchain's hosts, verbatim from boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
+  # (crates/boxes/src/lib.rs) — the one list the minimald unit fixture and
   # the minvmd VM harness share; keep this copy in step with it. Docker Hub
   # serves its image blobs through a 307 redirect that lands on either of
   # its two CDNs, so a container pull needs both.

@@ -10,20 +10,20 @@ use crate::{
     session_delta::{self, DeltaSource},
     session_host::{self, HostAttrs, WinSize},
 };
-use common::SpecHash;
-use mctx::ConfigBuilder;
-use ot::OpTracker;
-use paths::DaemonAbsPath;
-use russh::{Channel, server::Msg};
-use sessions::keys::SessionKeys;
-use sessions::wire::request::ContributionResponse;
-use sessions::{
+use boxes::keys::SessionKeys;
+use boxes::wire::request::ContributionResponse;
+use boxes::{
     Record, SessionStatus,
     core::compose::Composition,
     daemon::composer::{ComposeOutcome, PendingComposeState, resume_from_verdict},
     store::{DiskSession, SessionObject},
     wire::request::{ContributionVerdict, SessionStep, WireContribution},
 };
+use common::SpecHash;
+use mctx::ConfigBuilder;
+use ot::OpTracker;
+use paths::DaemonAbsPath;
+use russh::{Channel, server::Msg};
 use std::collections::HashSet;
 use std::fmt::{self};
 use std::ops::ControlFlow;
@@ -92,7 +92,7 @@ pub enum AttachError {
     ContextCreationFailed(String),
     /// The session's networking policy is incompatible with its network mode
     /// (R2.1): e.g. an egress section on a non-`OwnIp` PTask.
-    InvalidPolicy(sessions::PolicyError),
+    InvalidPolicy(boxes::PolicyError),
     /// Configuring the loadout of an as-yet-unconfigured session, on the way
     /// into the attach, failed.
     LoadoutFailed(std::io::Error),
@@ -261,13 +261,13 @@ pub(crate) struct SessionConfig {
 }
 
 /// The egress *section* the gate compiles for a session: the materialized
-/// form of [`sessions::effective_egress`]'s answer — `None` for the
+/// form of [`boxes::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
 /// in-force default (NET-074), and a declaration with the destination lists
 /// it left absent resolved as that function documents. `phase` is the
 /// rollout phase to resolve under — the launcher and the task path pass
-/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
-/// tests name [`sessions::EgressDefaultPhase::InForce`] so the posture they
+/// [`boxes::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`boxes::EgressDefaultPhase::InForce`] so the posture they
 /// prove does not hang on that constant. `opt_out` is the daemon's deny-all
 /// opt-out (NET-077), threaded from the server config.
 ///
@@ -275,15 +275,15 @@ pub(crate) struct SessionConfig {
 /// ([`crate::exec::task_network`]), so a task runs under the same egress
 /// its session does.
 pub(crate) fn effective_egress_section(
-    policy: &sessions::SessionPolicy,
-    network: sessions::NetworkMode,
-    phase: sessions::EgressDefaultPhase,
+    policy: &boxes::SessionPolicy,
+    network: boxes::NetworkMode,
+    phase: boxes::EgressDefaultPhase,
     opt_out: bool,
-) -> Option<sessions::EgressPolicy> {
-    match sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
-        sessions::EffectiveEgress::DenyAll => Some(sessions::EgressPolicy::deny_all()),
-        sessions::EffectiveEgress::AllowAll => None,
-        sessions::EffectiveEgress::Declared(section) => Some(section),
+) -> Option<boxes::EgressPolicy> {
+    match boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
+        boxes::EffectiveEgress::DenyAll => Some(boxes::EgressPolicy::deny_all()),
+        boxes::EffectiveEgress::AllowAll => None,
+        boxes::EffectiveEgress::Declared(section) => Some(section),
     }
 }
 
@@ -297,12 +297,12 @@ pub(crate) fn effective_egress_section(
 /// declaration on the record is left untouched: the strict `SessionPolicy`
 /// a client reads back stays exactly what the box was launched with.
 pub(crate) fn effective_session_policy(
-    policy: &sessions::SessionPolicy,
-    network: sessions::NetworkMode,
-    phase: sessions::EgressDefaultPhase,
+    policy: &boxes::SessionPolicy,
+    network: boxes::NetworkMode,
+    phase: boxes::EgressDefaultPhase,
     opt_out: bool,
-) -> sessions::SessionPolicy {
-    sessions::SessionPolicy {
+) -> boxes::SessionPolicy {
+    boxes::SessionPolicy {
         egress: effective_egress_section(policy, network, phase, opt_out),
         ingress: policy.ingress.clone(),
         // The credentialed-upstream declaration (NET-134) resolves nothing —
@@ -390,7 +390,7 @@ enum LaunchPhase {
 /// How long *all* of a teardown transition's hooks get, together.
 ///
 /// A hook's own timeout is capped at
-/// [`MAX_HOOK_TIMEOUT`](sessions::core::lifecyclehook::MAX_HOOK_TIMEOUT)
+/// [`MAX_HOOK_TIMEOUT`](boxes::core::lifecyclehook::MAX_HOOK_TIMEOUT)
 /// to keep one from holding a session open, but nothing bounds how many
 /// hooks a composition may carry — so without a total, N of them at the
 /// cap would hold a destroy for N×5 minutes and defeat the point. This
@@ -1239,12 +1239,12 @@ impl Session {
                 session = %record.id,
                 name = ?record.name,
                 network = %record.network.word(),
-                egress_default_phase = ?sessions::EGRESS_DEFAULT_PHASE,
+                egress_default_phase = ?boxes::EGRESS_DEFAULT_PHASE,
                 deny_all_opt_out = conf.deny_all_opt_out,
-                effective_egress = ?sessions::effective_egress(
+                effective_egress = ?boxes::effective_egress(
                     record.policy.egress.as_ref(),
                     record.network,
-                    sessions::EGRESS_DEFAULT_PHASE,
+                    boxes::EGRESS_DEFAULT_PHASE,
                     conf.deny_all_opt_out,
                 ),
                 dynamic_ingress = %record
@@ -1252,7 +1252,7 @@ impl Session {
                     .ingress
                     .as_ref()
                     .and_then(|ingress| ingress.dynamic_ingress)
-                    .unwrap_or(sessions::DynamicIngress::Deny),
+                    .unwrap_or(boxes::DynamicIngress::Deny),
                 dynamic_allowed_range = ?record
                     .policy
                     .ingress
@@ -1353,10 +1353,10 @@ impl Session {
         // is the caller check's copy, not the box's relay opening, which
         // the attach path resolves (and counts) itself.
         let hostname_proxy_port = match record.network {
-            sessions::NetworkMode::OwnIp if wait_for_verdict => {
+            boxes::NetworkMode::OwnIp if wait_for_verdict => {
                 crate::net::hostname_proxy_serving_port(&self.net_switch, None).await
             }
-            sessions::NetworkMode::OwnIp if unsettled => {
+            boxes::NetworkMode::OwnIp if unsettled => {
                 // Said, not silent: this registration keeps no opening at
                 // the node address for the caller check until the session
                 // re-registers (a rename, a re-finalize, a restart).
@@ -1372,7 +1372,7 @@ impl Session {
         };
         let mut shared_port_collisions = Vec::new();
         match record.network {
-            sessions::NetworkMode::OwnIp => {
+            boxes::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
                 // at a host loopback address of its own — the one the VM
                 // host daemon handed the box's registration (T66), or one an
@@ -1592,7 +1592,7 @@ impl Session {
                 // the attach path fails the box with the same fact.
                 reg.register_own_ip(record.id, &name, declared);
             }
-            sessions::NetworkMode::HostNet => {
+            boxes::NetworkMode::HostNet => {
                 let mut reg = self
                     .hostnames
                     .write()
@@ -1611,7 +1611,7 @@ impl Session {
         // the report is a read of the record under its lock file beside a
         // read of the kernel's socket table, and no DNS answer this daemon
         // serves waits behind it.
-        if matches!(record.network, sessions::NetworkMode::OwnIp) {
+        if matches!(record.network, boxes::NetworkMode::OwnIp) {
             self.report_unrecorded_publishes();
         }
         shared_port_collisions
@@ -1820,7 +1820,7 @@ impl Session {
         matches!(self.inner, SessionInner::Active { .. })
             && matches!(
                 record.network,
-                sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp
+                boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
             )
     }
 
@@ -2405,7 +2405,7 @@ impl Session {
     ) -> Result<SessionStep, std::io::Error> {
         let wrong_state = |what: &str| {
             Ok(SessionStep::Fault {
-                error: sessions::wire::errors::WireError::WrongState {
+                error: boxes::wire::errors::WireError::WrongState {
                     what: what.to_string(),
                 },
             })
@@ -2899,7 +2899,7 @@ impl Session {
         // of the setting, and wrong about the port. No decision is made, so
         // nothing is audited (NET-046); the request's one info line says
         // what became of it.
-        if record.network == sessions::NetworkMode::HostNet {
+        if record.network == boxes::NetworkMode::HostNet {
             // Where the port answers: the name always; the host's loopback
             // only natively, since on a VM-backed host the loopback the box
             // shares is the guest's (NET-129).
@@ -2932,7 +2932,7 @@ impl Session {
             .ingress
             .as_ref()
             .and_then(|ingress| ingress.dynamic_ingress)
-            .unwrap_or(sessions::DynamicIngress::Deny);
+            .unwrap_or(boxes::DynamicIngress::Deny);
         // The box's own setting decides first (NET-043), whatever asked: the
         // deny-all default when nothing was declared, the range gate under an
         // `allow`, and an `ask` handed to whoever is attached (NET-045).
@@ -3012,7 +3012,7 @@ impl Session {
                 self.answer_expose(
                     &box_name,
                     port,
-                    sessions::DynamicIngress::Ask,
+                    boxes::DynamicIngress::Ask,
                     crate::audit::DecidedBy::Daemon,
                     Err(crate::net::policy::ExposeFailure::Refused(
                         crate::net::policy::ExposeRefusal::AskNeedsAnswer,
@@ -3035,7 +3035,7 @@ impl Session {
                 self.answer_expose(
                     &box_name,
                     port,
-                    sessions::DynamicIngress::Ask,
+                    boxes::DynamicIngress::Ask,
                     crate::audit::DecidedBy::Daemon,
                     Err(crate::net::policy::ExposeFailure::Refused(
                         crate::net::policy::ExposeRefusal::NotAttached,
@@ -3230,7 +3230,7 @@ impl Session {
         self.answer_expose_because(
             &ask.box_name,
             ask.port,
-            sessions::DynamicIngress::Ask,
+            boxes::DynamicIngress::Ask,
             decided_by,
             outcome,
             because,
@@ -3250,7 +3250,7 @@ impl Session {
         &mut self,
         box_name: &str,
         port: u16,
-        decision: sessions::DynamicIngress,
+        decision: boxes::DynamicIngress,
         decided_by: crate::audit::DecidedBy,
         outcome: Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
         reply: oneshot::Sender<
@@ -3273,7 +3273,7 @@ impl Session {
         &mut self,
         box_name: &str,
         port: u16,
-        decision: sessions::DynamicIngress,
+        decision: boxes::DynamicIngress,
         decided_by: crate::audit::DecidedBy,
         outcome: Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
         because: Option<&'static str>,
@@ -3486,7 +3486,7 @@ impl Session {
         &mut self,
         box_name: &str,
         port: u16,
-        decision: sessions::DynamicIngress,
+        decision: boxes::DynamicIngress,
         error: std::io::Error,
     ) -> crate::net::policy::ExposeFailure {
         tracing::warn!(
@@ -3500,7 +3500,7 @@ impl Session {
         // The surface the publish reported under: an answered ask was
         // recorded at the host as one (NET-045), every other allow is the
         // box's own expose.
-        let source = if decision == sessions::DynamicIngress::Ask {
+        let source = if decision == boxes::DynamicIngress::Ask {
             minimald_rpc::PortReportSource::Ask
         } else {
             minimald_rpc::PortReportSource::Expose
@@ -3760,7 +3760,7 @@ impl Session {
             loopback_address,
             switch_address,
             port,
-            sessions::IpProto::Tcp,
+            boxes::IpProto::Tcp,
             None,
         )
         .await
@@ -3793,7 +3793,7 @@ impl Session {
         let mapping = minimald_rpc::LiveMapping {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
-            proto: sessions::IpProto::Tcp,
+            proto: boxes::IpProto::Tcp,
             // Never pending: the box's relay gate admits the port in the
             // same turn the mapping is recorded (NET-044, below). `Some`,
             // never the unknown `None` that a reply from a daemon older
@@ -4029,7 +4029,7 @@ impl Session {
             self.answer_expose(
                 &ask.box_name,
                 ask.port,
-                sessions::DynamicIngress::Ask,
+                boxes::DynamicIngress::Ask,
                 crate::audit::DecidedBy::Daemon,
                 Err(crate::net::policy::ExposeFailure::Refused(
                     crate::net::policy::ExposeRefusal::AskNeedsAnswer,
@@ -5083,7 +5083,7 @@ impl Session {
         let policy = effective_session_policy(
             &record.policy,
             record.network,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             self.deny_all_opt_out,
         );
         // One publication set for the spawn this launch is about to run:
@@ -5198,7 +5198,7 @@ impl Session {
         // that is not host-address keeps the plain mock — its verdict is
         // decided on address leases, never on the host's cgroup tree, so
         // there is no per-box outcome for its launches to record.
-        let mut launcher = if record.network == sessions::NetworkMode::HostNet {
+        let mut launcher = if record.network == boxes::NetworkMode::HostNet {
             let fact = crate::session_host::host_ip_enforcement_fact();
             let placement = if crate::session_host::fact_places_a_leaf(fact.cause) {
                 minimald_rpc::HostIpEnforcement::PerBox
@@ -5238,7 +5238,7 @@ impl Session {
         // the mock attaches nothing, so this is how a test sees whether a
         // launch found the box's publish already standing (#2070).
         #[cfg(target_os = "linux")]
-        if record.network == sessions::NetworkMode::OwnIp {
+        if record.network == boxes::NetworkMode::OwnIp {
             launch_publish_seam::observe(
                 record.id,
                 crate::net::provider::OwnAddressReporter::new(
@@ -5465,7 +5465,7 @@ impl Session {
                             .map(|e| {
                                 format!(
                                     "{e} (declared by {})",
-                                    sessions::core::source::Provenanced::source(p)
+                                    boxes::core::source::Provenanced::source(p)
                                 )
                             })
                     })
@@ -6222,7 +6222,7 @@ impl WeakSessionHandle {
 fn promote_interim_to_hand(
     reg: &crate::net::dns::HostnameRegistry,
     book: &crate::net::dns::LoopbackLeaseBook,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     name: &str,
     published: Option<std::net::Ipv4Addr>,
     handed: Option<std::net::Ipv4Addr>,
@@ -6251,7 +6251,7 @@ pub(crate) mod launch_publish_seam {
     use std::net::Ipv4Addr;
     use std::sync::Mutex;
 
-    use sessions::SessionId;
+    use boxes::SessionId;
 
     /// What each launch of one session found published, in launch order.
     type Launches = Vec<Option<Ipv4Addr>>;
@@ -6293,7 +6293,7 @@ pub(crate) mod launch_record_seam {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use sessions::SessionId;
+    use boxes::SessionId;
 
     static FAILING: Mutex<Option<HashMap<SessionId, Arc<AtomicBool>>>> = Mutex::new(None);
 
@@ -6354,7 +6354,7 @@ pub(crate) mod mint_attach_seam {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use sessions::SessionId;
+    use boxes::SessionId;
 
     use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle, WedgedMailbox};
 
@@ -6448,7 +6448,7 @@ pub(crate) mod listen_plan_seam {
     use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
 
-    use sessions::SessionId;
+    use boxes::SessionId;
 
     use crate::net::listeners::BoxPublications;
     use crate::net::policy::ControlChannel;

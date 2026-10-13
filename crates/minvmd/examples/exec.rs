@@ -169,7 +169,7 @@ async fn run_session_exec(
                 name: Some(format!("minvmd-demo-{uniq:x}")),
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
-                network: sessions::NetworkMode::default(),
+                network: boxes::NetworkMode::default(),
                 policy: Default::default(),
                 task_addresses: Vec::new(),
                 box_id: None,

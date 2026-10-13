@@ -96,7 +96,7 @@ recipe, add one — the justfile is where local build knowledge lives.
 limit, not a coverage gap. Consequences:
 
 - `just test`, `just clippy`, and `just fix` scope themselves: on macOS they
-  resolve to `-p minvmd -p sessions` automatically (the justfile's `scope`
+  resolve to `-p minvmd -p boxes` automatically (the justfile's `scope`
   variable), on Linux to `--workspace`.
 - `just test-cross` covers the Linux-only crates — `minimald` and the `min`
   CLI's test targets included — by cross-compiling to musl in Docker

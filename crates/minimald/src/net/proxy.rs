@@ -1476,8 +1476,8 @@ mod tests {
     use std::net::SocketAddrV4;
     use std::sync::{Mutex, RwLock};
 
-    use sessions::core::egress::{self, FrameVerdict};
-    use sessions::{EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId, SessionPolicy};
+    use boxes::core::egress::{self, FrameVerdict};
+    use boxes::{EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId, SessionPolicy};
     use tokio::net::TcpSocket;
 
     use crate::net::SwitchSubnet;
@@ -3792,7 +3792,7 @@ mod tests {
             // port 1024+i forwarding to internal port 8000+i.
             published in 0u8..=15,
             // Whether an own-address target declares an ingress section at
-            // all. `sessions::validate_policy` accepts an `OwnIp` record with
+            // all. `boxes::validate_policy` accepts an `OwnIp` record with
             // none, whose posture is deny-all — so the property ranges over
             // the absent declaration too, and every own-address path that
             // fills the registry must carry it as the empty set it is, never
@@ -3978,7 +3978,7 @@ mod tests {
 
     /// The own-address/absent-ingress case the NET-071 property ranges over
     /// and must never lose again: a box that declares no ingress — a
-    /// configuration `sessions::validate_policy` accepts on `own_ip` — is
+    /// configuration `boxes::validate_policy` accepts on `own_ip` — is
     /// deny-all on *every* host form, because `None` on a route is the
     /// *host-address* box's ungated route, and an own-address box with no
     /// declaration is not one. Both registry paths that build its route are

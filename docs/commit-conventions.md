@@ -42,7 +42,7 @@ feat(sessions): add CWD-relative path types
 fix(lcache): handle concurrent rename on the same key
 ```
 
-Multiple crates: `feat(sessions,minimald): ...`.
+Multiple crates: `feat(boxes,minimald): ...`.
 
 ## Breaking changes
 

@@ -15,7 +15,7 @@
 //! The same spike established that gvproxy v0.8.9 has **no per-client egress
 //! ACL API**, so egress *enforcement* (R2.2, NET-062) lives in the relay
 //! layer ([`switch`](super::switch)) — it inspects each frame against the
-//! pure verdict in `sessions::core::egress` and drops what the box did not
+//! pure verdict in `boxes::core::egress` and drops what the box did not
 //! declare. What this module carries for that enforcement is the warning
 //! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
 //! rule, and [`Proto`], the transport a dropped frame is logged under.
@@ -33,8 +33,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_vsock::{VsockAddr, VsockStream};
 
-use sessions::core::egress::{DynamicPortVerdict, IngressRules};
-use sessions::{IngressPolicy, IpProto, PortMapping};
+use boxes::core::egress::{DynamicPortVerdict, IngressRules};
+use boxes::{IngressPolicy, IpProto, PortMapping};
 
 /// The forwarder-expose request body gvproxy's `POST /services/forwarder/expose`
 /// expects: a host-side `local` listen address and the PTask-side `remote` it
@@ -608,11 +608,11 @@ impl ExposeRefusal {
     /// offered. The verdict alone (`Display`) is what the log line and the
     /// audit record carry.
     #[must_use]
-    pub fn for_caller(&self, box_name: &str, network: sessions::NetworkMode, port: u16) -> String {
+    pub fn for_caller(&self, box_name: &str, network: boxes::NetworkMode, port: u16) -> String {
         let forward = format!("min net forward {box_name} <local>:{port}");
         match self {
             Self::DeniedByPolicy => match network {
-                sessions::NetworkMode::NoNet => format!(
+                boxes::NetworkMode::NoNet => format!(
                     "{self}: a --network none box has no address to publish at. Forward it \
                      from the host instead: {forward}"
                 ),
@@ -766,9 +766,9 @@ impl fmt::Display for ExposeFailure {
 pub fn dynamic_ingress_decision(
     ingress: Option<&IngressPolicy>,
     port: u16,
-) -> Result<sessions::DynamicIngress, ExposeRefusal> {
+) -> Result<boxes::DynamicIngress, ExposeRefusal> {
     match IngressRules::from_policy(ingress).dynamic_verdict(port) {
-        DynamicPortVerdict::Allow => Ok(sessions::DynamicIngress::Allow),
+        DynamicPortVerdict::Allow => Ok(boxes::DynamicIngress::Allow),
         DynamicPortVerdict::Deny => Err(ExposeRefusal::DeniedByPolicy),
         DynamicPortVerdict::Ask => Err(ExposeRefusal::AskNeedsAnswer),
         DynamicPortVerdict::NoRange => Err(ExposeRefusal::NoDynamicRange),
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn refusals_name_the_way_forward_for_the_caller() {
-        use sessions::NetworkMode;
+        use boxes::NetworkMode;
 
         // The in-box line carries the verdict and the next command, named
         // with the host-side box name and the port asked for; the verdict
@@ -1579,7 +1579,7 @@ mod tests {
         // deny-all default — the two shapes a request from inside a bare box
         // meets.
         let allow = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1589,7 +1589,7 @@ mod tests {
             "a box that declared no ingress denies every runtime publish"
         );
         let deny = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_ingress: Some(boxes::DynamicIngress::Deny),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1599,7 +1599,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_ingress_decision(Some(&allow), 3000),
-            Ok(sessions::DynamicIngress::Allow),
+            Ok(boxes::DynamicIngress::Allow),
         );
     }
 
@@ -1616,7 +1616,7 @@ mod tests {
             ..Default::default()
         };
         let explicit = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_ingress: Some(boxes::DynamicIngress::Deny),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1648,7 +1648,7 @@ mod tests {
         // opted in — the bounds are inclusive, unset means nothing was opted
         // in, and `ask` fails closed with nobody to answer it.
         let allow = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1665,12 +1665,12 @@ mod tests {
         for port in [3000, 3999] {
             assert_eq!(
                 dynamic_ingress_decision(Some(&allow), port),
-                Ok(sessions::DynamicIngress::Allow),
+                Ok(boxes::DynamicIngress::Allow),
                 "the range's own bounds are inside it"
             );
         }
         let no_range = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             dynamic_allowed_range: None,
             ..Default::default()
         };
@@ -1679,7 +1679,7 @@ mod tests {
             Err(ExposeRefusal::NoDynamicRange),
         );
         let ask = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            dynamic_ingress: Some(boxes::DynamicIngress::Ask),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1702,8 +1702,8 @@ mod tests {
         // every policy below declares nothing: on these rows the verdict is
         // `Publish` or `Deny`, and `Publish` holds exactly where the expose
         // decision allows.
-        use sessions::DynamicIngress;
-        use sessions::core::egress::ListenVerdict;
+        use boxes::DynamicIngress;
+        use boxes::core::egress::ListenVerdict;
 
         const LOW: u16 = 3000;
         const HIGH: u16 = 3010;
