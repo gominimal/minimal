@@ -2951,8 +2951,10 @@ fn answerer_service_unit(install: &AnswererInstall) -> String {
 /// domain is a default-route link implicitly — the flag first means no
 /// partially-run script ever routes non-zone queries here.
 ///
-/// Then the answerer service, beside the resolver it serves
-/// ([`linux_answerer_steps`]): the program copy is the install — the
+/// Where the step installs the answerer, its verified copy runs before all
+/// of the above ([`linux_answerer_copy_steps`]), so a refusal leaves no
+/// resolver link behind, and its units after
+/// ([`linux_answerer_unit_steps`]): the program copy is the install — the
 /// program is the daemon's own binary and cannot ride in the script the way
 /// [`RANGE_PROGRAM_TEMPLATE`] does; the rule the range steps carry (nothing
 /// copied in from anywhere, user-writable or not) is the *destination's*
@@ -2979,7 +2981,15 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
 /// finalize-install script carries for the names item.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
-    let mut script = format!(
+    // The copy goes first: its checks are the ones that can refuse, and
+    // nothing before them changes the host, so a refusal leaves no resolver
+    // link behind.
+    let mut script = String::new();
+    if let Some(install) = install {
+        script.push_str(&linux_answerer_copy_steps(install));
+        script.push('\n');
+    }
+    script.push_str(&format!(
         "# The resolver: a dummy link, {ZONE_LINK}, whose only job is to route\n\
          # *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
          [ -e /sys/class/net/{ZONE_LINK} ] || ip link add {ZONE_LINK} type dummy\n\
@@ -2988,9 +2998,9 @@ pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) ->
          resolvectl default-route {ZONE_LINK} false\n\
          resolvectl dns {ZONE_LINK} 127.0.0.1:{port}\n\
          resolvectl domain {ZONE_LINK} '~{ZONE}'\n",
-    );
+    ));
     if let Some(install) = install {
-        script.push_str(&linux_answerer_steps(install));
+        script.push_str(&linux_answerer_unit_steps(install));
     }
     script
 }
@@ -2999,7 +3009,7 @@ pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) ->
 /// step installed: disable and stop both units (tolerating units that are
 /// not there), remove the unit files and the root-owned program copy, and
 /// reload the manager so it forgets them. Shared by the step's failure
-/// block ([`linux_answerer_steps`]) and the removal script
+/// block ([`linux_answerer_unit_steps`]) and the removal script
 /// ([`linux_undo_command`]), so a failed install and an undo remove the
 /// same files. `indent` prefixes every line.
 #[cfg(any(test, not(target_os = "macos")))]
@@ -3013,9 +3023,31 @@ fn linux_service_removal(indent: &str) -> String {
     )
 }
 
-/// The Linux answerer steps of the privileged script (NET-122's host
-/// service), after the resolver's: copy `minzoned` to the root-owned path,
-/// verified first ([`verified_copy_steps`]); stop a running service; write
+/// The copy half of the Linux answerer steps (NET-122's host service),
+/// ahead of the resolver's: copy `minzoned` to the root-owned path, verified
+/// first ([`verified_copy_steps`]). It runs before anything else in the
+/// script, so a refusal leaves the host as it was.
+/// [`linux_answerer_unit_steps`] is the other half.
+///
+/// A copy that fails its hash pin never reaches the root-owned path, and
+/// the running service is left as it was.
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_answerer_copy_steps(install: &AnswererInstall) -> String {
+    format!(
+        "# The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied to a root-owned\n\
+         # path and checked there, as root, before anything names it.\n\
+         {}",
+        verified_copy_steps(
+            install,
+            ANSWERER_PROGRAM_DIR,
+            LINUX_ANSWERER_PROGRAM_PATH,
+            false
+        ),
+    )
+}
+
+/// The unit half of the Linux answerer steps, after the copy
+/// ([`linux_answerer_copy_steps`]) and the resolver's: stop a running service; write
 /// the socket and service units naming the copy, root's both, and enable
 /// the socket for every boot without starting it; ask this CLI's daemons
 /// to release the hook port (the copy's `release` verb, which waits up to
@@ -3025,11 +3057,8 @@ fn linux_service_removal(indent: &str) -> String {
 /// and removes what the step installed, and exits non-zero naming the
 /// reason, so the host is never left with nobody answering. With no daemon
 /// known, the unit is started directly.
-///
-/// A copy that fails its hash pin never reaches the root-owned path, and
-/// the running service is left as it was.
 #[cfg(any(test, not(target_os = "macos")))]
-fn linux_answerer_steps(install: &AnswererInstall) -> String {
+fn linux_answerer_unit_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install);
     let copy = LINUX_ANSWERER_PROGRAM_PATH;
     let channel = &install.channel;
@@ -3046,10 +3075,6 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
     };
     format!(
         "\n\
-         # The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied to a root-owned\n\
-         # path and checked there, as root, before anything names it.\n\
-         {verified_copy}\
-         \n\
          # The box-name service: a systemd socket and service pair run as {operator},\n\
          # the socket unit holding the answerer's listener on 127.0.0.1 and its\n\
          # channel socket.\n\
@@ -3078,7 +3103,6 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
          systemctl is-active --quiet {unit} || {not_active}\n\
          [ -S \"{channel}\" ] || {not_up}\n",
         handover = handover_comment(&controls, "systemd starts the socket unit"),
-        verified_copy = verified_copy_steps(install, ANSWERER_PROGRAM_DIR, copy, false),
         operator = install.operator,
         answerer_socket = answerer_socket_unit(install),
         answerer_service = answerer_service_unit(install),
@@ -6736,7 +6760,7 @@ exit 0
     // before the step changes anything: a refusal leaves no resolver file
     // and no range unit behind.
     #[test]
-    fn macos_copy_runs_before_anything_changes_the_host() {
+    fn copy_runs_before_anything_changes_the_host() {
         let bare = test_install();
         let bundled = AnswererInstall {
             bundle: vec![BundleFile {
@@ -6759,6 +6783,18 @@ exit 0
                 let at = command.find(&changes).expect("the step is named");
                 assert!(check_at < at, "the check runs before {changes}: {command}");
             }
+        }
+        let command = linux_names_steps(15353, Some(&bare));
+        let check_at = command
+            .find("is not a root-owned directory closed to group and other writes")
+            .expect("the directory check is named");
+        for changes in [
+            format!("ip link add {ZONE_LINK}"),
+            format!("resolvectl dns {ZONE_LINK}"),
+            format!("cat > {ANSWERER_UNIT_SOCKET_PATH}"),
+        ] {
+            let at = command.find(&changes).expect("the step is named");
+            assert!(check_at < at, "the check runs before {changes}: {command}");
         }
     }
 
@@ -7285,8 +7321,8 @@ exit 0
             (
                 &linux,
                 &[
-                    "# The resolver: ",
                     "# The box-name service's program: ",
+                    "# The resolver: ",
                     "# The box-name service: a systemd socket and service pair",
                     "# Free the port for the service: ",
                 ][..],
@@ -7457,8 +7493,9 @@ exit 0
     /// not touch them. Linux takes no range step — `lo` carries the whole
     /// `127/8` — and the dedicated link keeps its address, so the advisory
     /// over the not-needed step says nothing of the range's unit, its
-    /// paths or its install. What follows the resolver steps is the
-    /// answerer service's (NET-122's host service), never the range's.
+    /// paths or its install. What stands around the resolver steps is the
+    /// answerer service's (NET-122's host service), never the range's: its
+    /// verified copy ahead of them, its units after.
     #[test]
     fn linux_advisory_command_is_unchanged() {
         let port = 15353;
@@ -7478,13 +7515,17 @@ resolvectl domain minzone0 '~min.internal'
             "without the answerer step the script is the resolver's alone: {alone}"
         );
         let command = linux_command(port, Some(&test_install()));
-        let (_, answerer_steps) = command
+        let (copy_steps, unit_steps) = command
             .split_once(resolver_steps)
-            .unwrap_or_else(|| panic!("the resolver steps lead unchanged: {command}"));
+            .unwrap_or_else(|| panic!("the resolver steps are unchanged: {command}"));
         assert!(
-            answerer_steps.starts_with("\n# The box-name service's program: ")
-                && answerer_steps.contains("\n[ -d \"/usr/local/lib/minimal\" ] || install -d"),
-            "the answerer service's step follows them: {answerer_steps}"
+            copy_steps.contains("\n# The box-name service's program: ")
+                && copy_steps.contains("\n[ -d \"/usr/local/lib/minimal\" ] || install -d"),
+            "the answerer's verified copy runs ahead of them: {copy_steps}"
+        );
+        assert!(
+            unit_steps.starts_with("\n# The box-name service: a systemd socket and service pair"),
+            "the answerer service's units follow them: {unit_steps}"
         );
         assert!(
             !command.contains(RANGE_UNIT_LABEL) && !command.contains("local-range"),
