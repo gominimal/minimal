@@ -252,9 +252,12 @@ fi
 # installer's +x on every `bin` row changes nothing the signature covers.
 #
 # minzoned is OPTIONAL, with a warning, where every other binary is
-# required: see OPTIONAL_COMPONENTS below. So are the bundle's other files:
-# a release without them still installs the service, listed without the app's
-# name and icon.
+# required: see OPTIONAL_COMPONENTS below. The macOS bundle's files are
+# optional only together: a bundle missing one of its files does not verify
+# against its signature, so a stage that has some of them and not all fails.
+# --allow-missing still stages what is there: a backfill of a release from
+# before the bundle has the program alone, which installs the service
+# listed without the app's name and icon.
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
@@ -359,6 +362,25 @@ stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
     printf '# format: %s\n' "$FORMAT_VERSION"
     printf '# component   os      arch    version   sha256%*s   kind   dest                 src\n' 58 ''
 } >"$manifest"
+
+# The macOS bundle stages whole or not at all: with any of its files present,
+# a missing one fails the stage. --allow-missing keeps its meaning, so the
+# rows that are there stage and the loop below warns about the rest.
+bundle_have=()
+bundle_lack=()
+for entry in "${COMPONENTS[@]}"; do
+    IFS='|' read -r comp os _ _ _ basename <<<"$entry"
+    [ "$os" = darwin ] || continue
+    case "$comp" in minzoned|minzoned-*) ;; *) continue ;; esac
+    if [ -f "$ARTIFACTS_DIR/$basename" ]; then
+        bundle_have+=("$basename")
+    else
+        bundle_lack+=("$basename")
+    fi
+done
+if [ "$ALLOW_MISSING" -eq 0 ] && [ "${#bundle_have[@]}" -gt 0 ] && [ "${#bundle_lack[@]}" -gt 0 ]; then
+    die "incomplete macOS app bundle in $ARTIFACTS_DIR: missing ${bundle_lack[*]} (found ${bundle_have[*]}); its files stage together or not at all"
+fi
 
 # Files to upload, deduped (a basename may back more than one row).
 declare -A upload_seen=()

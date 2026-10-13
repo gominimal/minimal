@@ -356,6 +356,40 @@ else
     bad "darwin still stages a bare bin/minzoned (out: $bundle_out)"
 fi
 
+# The bundle stages whole or not at all: with one of its files missing and
+# the rest present, the stage fails naming the missing file and uploads
+# nothing.
+while IFS=$'\t' read -r _ flat; do
+    mkdir -p "$root/artifacts-partial"
+    rm -f "$root/artifacts-partial"/*
+    cp "$root/artifacts-bundle"/* "$root/artifacts-partial/"
+    rm "$root/artifacts-partial/$flat"
+    : >"$GCLOUD_STUB_ARGS"
+    partial_rc=0
+    partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" \
+        --bucket gs://test-bucket --version 0.6.0 2>&1)" || partial_rc=$?
+    if [ "$partial_rc" -ne 0 ] \
+        && [[ "$partial_out" == *"incomplete macOS app bundle"*"missing $flat "* ]]; then
+        ok "a bundle without $flat fails the stage naming it"
+    else
+        bad "a bundle without $flat staged (rc=$partial_rc, out: $partial_out)"
+    fi
+    expect_calls 0 "gs://test-bucket" "nothing uploads for a bundle without $flat"
+done <<<"$bundle_table"
+# --allow-missing keeps its meaning: a backfill of a release from before the
+# bundle has the program alone, and that row still stages.
+rm -f "$root/artifacts-partial"/minzoned-macos-arm64-*
+printf 'fake minzoned-macos-arm64\n' >"$root/artifacts-partial/minzoned-macos-arm64"
+partial_rc=0
+partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" --bucket gs://test-bucket \
+    --version 0.6.0 --allow-missing --dry-run 2>&1)" || partial_rc=$?
+if [ "$partial_rc" -eq 0 ] && [ -n "$(printf '%s\n' "$partial_out" \
+    | awk '$1 == "minzoned" && $2 == "darwin" && $7 == "bin/Minimal.app/Contents/MacOS/minzoned"')" ]; then
+    ok "--allow-missing stages the program of a release from before the bundle"
+else
+    bad "--allow-missing refused a bundle with the program alone (rc=$partial_rc, out: $partial_out)"
+fi
+
 # Every other binary stays required: the same fixture without minvmd's arm64
 # artifact fails the stage naming it.
 rm "$root/artifacts-no-answerer/minvmd-linux-arm64"
