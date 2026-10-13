@@ -2255,19 +2255,15 @@ mod tests {
             .expect("registry lock")
             .unpublish_own_address(holder);
         assert_eq!(hand_overs.len(), 1, "the box is handed the port");
-        let bind = crate::net::policy::bind_handed_port(
-            &control,
-            SHARED,
-            FIRST_LEASE,
-            &sessions::PortMapping {
-                external_port: 8080,
-                internal_port: 80,
-                proto: sessions::IpProto::Tcp,
-            },
-            None,
-        )
-        .await
-        .expect("the hand-over's bind stands");
+        let handed = sessions::PortMapping {
+            external_port: 8080,
+            internal_port: 80,
+            proto: sessions::IpProto::Tcp,
+        };
+        let bind =
+            crate::net::policy::bind_handed_port(&control, SHARED, FIRST_LEASE, &handed, None)
+                .await
+                .expect("the hand-over's bind stands");
         let crate::net::policy::HandedBind::Bound(forwarder) = bind else {
             panic!("a native host's switch bound the forward");
         };
@@ -2279,7 +2275,7 @@ mod tests {
             "the hand-over's forward delivers to the running spawn's lease: {exposed:?}"
         );
         assert!(runtime.record_handed(forwarder).is_ok());
-        assert!(runtime.holds_handed(&format!("{SHARED}:8080")));
+        assert!(runtime.holds_handed(SHARED, &handed));
 
         // The spawn ends: its teardown unbinds the handed-over forward with
         // the one its attach bound.
@@ -2292,7 +2288,7 @@ mod tests {
             vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
             "the spawn's teardown unbinds both forwards: {unbound:?}"
         );
-        assert!(!runtime.holds_handed(&format!("{SHARED}:8080")));
+        assert!(!runtime.holds_handed(SHARED, &handed));
         assert!(runtime.is_detached());
 
         // The next spawn holds the port of record: its attach binds both

@@ -138,12 +138,17 @@ impl RuntimeIngress {
         Ok(())
     }
 
-    /// Whether a forward bound at a hand-over is held for `local`.
-    pub(crate) fn holds_handed(&self, local: &str) -> bool {
+    /// Whether the forward `mapping` declares at `published` is held as one
+    /// bound at a hand-over.
+    pub(crate) fn holds_handed(
+        &self,
+        published: std::net::Ipv4Addr,
+        mapping: &sessions::PortMapping,
+    ) -> bool {
         self.state()
             .handed
             .iter()
-            .any(|forwarder| forwarder.local() == local)
+            .any(|forwarder| forwarder.is_forward_of(published, mapping))
     }
 
     /// The box stopped: takes the forwards bound at a hand-over, for the

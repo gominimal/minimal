@@ -3965,9 +3965,10 @@ impl Session {
         let control = self.switch_control().await;
         let gate = crate::net::switch::live_gate(switch_address);
         let mut bound_any = false;
+        let mut refused_any = false;
         for mapping in &mappings {
             let local = format!("{address}:{port}");
-            if self.live_ingress.holds_handed(&local) {
+            if self.live_ingress.holds_handed(address, mapping) {
                 continue;
             }
             let bind = crate::net::policy::bind_handed_port(
@@ -3991,6 +3992,7 @@ impl Session {
                         "binding the shared-address port this box took over failed; \
                          the box still holds it, and its next attach binds it"
                     );
+                    refused_any = true;
                     continue;
                 }
             };
@@ -4010,7 +4012,9 @@ impl Session {
                 "bound the shared-address port this box took over while it runs"
             );
         }
-        if !bound_any {
+        // A port one of whose forwards was refused is not recorded as
+        // bound: the box's next attach binds it whole.
+        if !bound_any || refused_any {
             return;
         }
         // The box bound the port, so a restarted daemon gives it back to

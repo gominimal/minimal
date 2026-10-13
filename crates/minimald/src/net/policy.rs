@@ -207,6 +207,15 @@ impl PortForwarder {
         self.mapping.host_port()
     }
 
+    /// Whether this is the forward `mapping` declares at `published`: the
+    /// same listener and the same protocol. TCP and UDP on one port are two
+    /// forwards.
+    #[must_use]
+    pub fn is_forward_of(&self, published: Ipv4Addr, mapping: &PortMapping) -> bool {
+        self.mapping.protocol == protocol_str(mapping.proto)
+            && self.mapping.local == format!("{published}:{}", mapping.external_port)
+    }
+
     /// The internal port the forward delivers to — the port a revocation
     /// refuses at the box's ingress gate.
     #[must_use]
@@ -2497,6 +2506,14 @@ mod tests {
             };
             assert_eq!(tracked.local(), "127.0.64.9:18080");
             assert_eq!(tracked.internal_port(), 80);
+            // TCP and UDP on one port are two forwards: the tracked TCP
+            // one is not the UDP mapping's.
+            assert!(tracked.is_forward_of(PUBLISHED, &mapping()));
+            let udp = PortMapping {
+                proto: sessions::IpProto::Udp,
+                ..mapping()
+            };
+            assert!(!tracked.is_forward_of(PUBLISHED, &udp));
         }
 
         /// The forwarder's own answer for a listener that is already bound.
