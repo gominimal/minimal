@@ -6793,6 +6793,85 @@ async fn shared_address_holder_same_in_any_resume_order() {
     );
 }
 
+/// NET-129 across a daemon restart, when the boxes did not publish in
+/// creation order: a box's id is minted at create and it publishes at
+/// finalize, so a box created later can finalize first and hold the port.
+/// Once that box has launched — bound the port's forward — it holds the
+/// port after a restart too, though the resume starts the older box first.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart() {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let older = create_handed_own_ip_session(
+        &mut client,
+        "older",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let newer = create_handed_own_ip_session(
+        &mut client,
+        "newer",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    assert!(older < newer, "ids are minted in creation order");
+
+    // The newer box finalizes first and launches; the older one finalizes
+    // after it and yields.
+    finalize_session(&mut client, newer).await;
+    let mut channel = client.open_shell(newer).await;
+    await_echo(&mut channel).await;
+    finalize_session(&mut client, older).await;
+    let held_by_newer = vec![crate::net::dns::SharedPortCollision {
+        port: 18080,
+        other: "newer.min.internal".to_string(),
+    }];
+    {
+        let registry = server.state.sessions_manager().await.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(routes.shared_port_collisions(newer).is_empty());
+        assert_eq!(routes.shared_port_collisions(older), held_by_newer);
+    }
+    drop(channel);
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both boxes are resumed"
+    );
+    let registry = manager.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.shared_port_collisions(newer).is_empty(),
+        "the box that bound the port before the restart holds it after"
+    );
+    assert_eq!(
+        routes.shared_port_collisions(older),
+        held_by_newer,
+        "and the older box still yields to it, though it is resumed first"
+    );
+    drop(routes);
+    let record = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(newer))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .record()
+        .await
+        .expect("the record reads back");
+    assert_eq!(
+        record.bound_ports,
+        std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, 18080)]),
+        "the launch recorded the port it bound on the box's record"
+    );
+}
+
 /// The write-lock promotion `register_hostname` runs after its wait, driven
 /// directly with no timers: a registration that took the `127.0.0.1` interim
 /// moves to its hand once the verdict vouches for it — whether the name is

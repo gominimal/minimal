@@ -821,6 +821,7 @@ mod tests {
             box_id: None,
             host_ip_enforcement: None,
             host_row_bound: false,
+            bound_ports: Default::default(),
             attrs: Default::default(),
         }
     }

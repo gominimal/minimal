@@ -119,6 +119,7 @@ fn build_record(
         box_id: config.box_id,
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
+        bound_ports: Default::default(),
         attrs: config.attrs,
     };
     record
@@ -1025,8 +1026,10 @@ impl Manager {
         // Oldest session first (the id is a UUIDv7): each resumed box
         // publishes as its actor starts, and a shared-address port goes to
         // the first box publishing it, so this order gives the port to the
-        // box created earliest — the box a live hand-over elects (NET-129).
-        // The store lists its keys by a random suffix of the id.
+        // box created earliest — the box a live hand-over elects (NET-129)
+        // — unless a later box bound it before the restart, which takes it
+        // back at its own publish (`restore_bound_ports`). The store lists
+        // its keys by a random suffix of the id.
         let mut handles = self.store.handles().await?;
         handles.sort_by_key(|handle| *handle.id());
         for handle in handles {

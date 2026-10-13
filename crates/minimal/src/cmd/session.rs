@@ -6222,6 +6222,7 @@ mod tests {
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: Default::default(),
             attrs: Default::default(),
         };
         let ssh_sock = dir.path().join("ssh.sock");

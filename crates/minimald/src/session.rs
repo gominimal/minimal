@@ -1591,6 +1591,7 @@ impl Session {
                     // the finalize reply so the activating client can warn —
                     // the daemon log line is the only other trace, and a user
                     // reading exit 0 never sees it.
+                    reg.restore_bound_ports(record.id, &record.bound_ports);
                     shared_port_collisions =
                         reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
@@ -4496,6 +4497,17 @@ impl Session {
                 delta
             }
         };
+        // NET-129: the shared-address ports this box holds are the ones
+        // this launch binds forwards for. Marked before the spawn binds
+        // them, so no publish takes one from under the bind, and recorded
+        // below so a restarted daemon gives them back to this box.
+        #[cfg(target_os = "linux")]
+        let bound_ports = matches!(record.network, sessions::NetworkMode::OwnIp).then(|| {
+            self.hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .mark_held_ports_bound(record.id)
+        });
         let spawn = Box::pin(session_host::Host::spawn(
             launcher,
             session_host::HostParams {
@@ -4582,7 +4594,35 @@ impl Session {
             let _ = host.kill(false).await;
             return Err(AttachError::LaunchRecordUnwritable(e));
         }
+        // A write that fails costs only the restart's memory of who bound
+        // the port, never this launch: said, and the box is handed back.
+        #[cfg(target_os = "linux")]
+        if let Some(bound_ports) = bound_ports
+            && let Err(error) = self.record_bound_ports(bound_ports).await
+        {
+            tracing::warn!(
+                session_id = %record.id,
+                %error,
+                "the launch could not record the shared-address ports it bound;                  a daemon restart may hand them to another box"
+            );
+        }
         Ok((channel, (host, task)))
+    }
+
+    /// Records on this session's record the published ports this launch
+    /// bound forwards for (NET-129), when they differ from what the last
+    /// launch recorded.
+    #[cfg(target_os = "linux")]
+    async fn record_bound_ports(
+        &self,
+        bound_ports: std::collections::BTreeSet<std::net::SocketAddrV4>,
+    ) -> Result<(), std::io::Error> {
+        let mut record = self.record.record().await?;
+        if record.bound_ports == bound_ports {
+            return Ok(());
+        }
+        record.bound_ports = bound_ports;
+        self.record.write(record).await
     }
 
     /// Records on this session's record that a launch bound the box's
