@@ -374,9 +374,11 @@ artifact on every platform.
 - **The privileged step checks the root-owned copy again** (design §7.1,
   post-install custody). The rendered root command examines the destination
   directory and each parent directory up to `/`. It stops at the first one
-  that is not owned by root, that group or others can write to, or that has
-  the sticky bit. The message names that directory. Without this check, a
-  user can rename a directory on the path between the check and the rename.
+  that is not owned by root or that group or others can write to. The message
+  names that directory. Without this check, a user can rename a directory on
+  the path between the check and the rename. The sticky bit does not count: it
+  only limits who can rename or remove an entry, and some macOS hosts set it
+  on `/Library/PrivilegedHelperTools`.
   Both destinations pass on a stock host: `/Library/PrivilegedHelperTools` on
   macOS and `/usr/local/lib/minimal` on Linux. The command then runs
   `install` to an exclusive `mktemp` name in that directory and hashes the
