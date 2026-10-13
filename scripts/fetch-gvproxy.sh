@@ -27,20 +27,37 @@ fi
 want="$(sed -n "s/^${asset}=//p" "$lock")"
 [ -n "$want" ] || { echo "fetch-gvproxy: no pinned digest for ${asset}" >&2; exit 1; }
 
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# A binary already at the destination is kept only while it is the pinned one:
+# after the lock moves, the copy an earlier run left behind is fetched again
+# rather than run as if it were the new pin.
+if [ -x "$out" ] && [ "$(sha256_of "$out")" = "$want" ]; then
+  echo "fetch-gvproxy: ${asset} ${ver} already at ${out}"
+  exit 0
+fi
+
 url="https://github.com/containers/gvisor-tap-vsock/releases/download/${ver}/${asset}"
 echo "fetch-gvproxy: downloading ${url}"
-curl -fsSL "$url" -o "$out"
+# Fetched beside the destination and renamed over it, so a switch still running
+# from the old copy keeps its own file.
+tmp="${out}.fetch.$$"
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL "$url" -o "$tmp"
 
-if command -v sha256sum >/dev/null 2>&1; then
-  got="$(sha256sum "$out" | awk '{print $1}')"
-else
-  got="$(shasum -a 256 "$out" | awk '{print $1}')"
-fi
+got="$(sha256_of "$tmp")"
 if [ "$got" != "$want" ]; then
   echo "fetch-gvproxy: SHA-256 mismatch for ${asset}" >&2
   echo "  got:  ${got}" >&2
   echo "  want: ${want}" >&2
-  rm -f "$out"; exit 1
+  exit 1
 fi
-chmod +x "$out"
+chmod +x "$tmp"
+mv -f "$tmp" "$out"
 echo "fetch-gvproxy: ${asset} ${ver} verified (${got})"

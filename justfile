@@ -101,7 +101,7 @@ libkrun-static:
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
     @mkdir -p {{scratch}}
-    @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
+    @scripts/fetch-gvproxy.sh {{gvproxy}}
 
 # Cross-compile minimald → initramfs /init.
 initramfs:
