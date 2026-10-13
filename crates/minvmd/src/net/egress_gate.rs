@@ -2429,8 +2429,9 @@ struct PublishedForwards {
     /// while `applied` is.
     claiming: Mutex<Vec<Listener>>,
     /// The listeners whose standing attribution the gate's own expose bound
-    /// ([`Self::settle_claim`]). A listener leaves when it is attributed
-    /// anew. Locked only while `applied` is.
+    /// ([`Self::settle_claim`]). A listener leaves with its attribution, so
+    /// the set holds no more than the row-held side of `applied` does.
+    /// Locked only while `applied` is.
     handed: Mutex<Vec<Listener>>,
     /// The rowless addresses an applied switch request named as the box's
     /// own — a port publish, a zone name, a retraction alike — oldest first,
@@ -2564,6 +2565,7 @@ impl PublishedForwards {
             return (false, Ok(None));
         };
         applied.remove(at);
+        self.lock_handed().retain(|handed| *handed != listener);
         (true, self.claim_in(&mut applied, listener))
     }
 
@@ -2640,7 +2642,6 @@ impl PublishedForwards {
             return Err(LedgerFull);
         }
         applied.push((listener, next.addr, next.inside, next.proto, Applied::Row));
-        self.lock_handed().retain(|handed| *handed != listener);
         self.lock_claiming().push(listener);
         Ok(Some(next))
     }
@@ -2696,6 +2697,8 @@ impl PublishedForwards {
             return false;
         };
         applied.remove(at);
+        self.lock_handed()
+            .retain(|handed| *handed != forward.listener);
         true
     }
 
@@ -2739,7 +2742,6 @@ impl PublishedForwards {
         match (holder, declared_by) {
             (None, _) => {
                 Self::push_applied(&mut applied, listener, addr, inside, proto, by)?;
-                self.lock_handed().retain(|handed| *handed != listener);
                 waiting.retain(|held| !(held.listener == listener && held.addr == addr));
                 Ok(Admitted::Noted)
             }
@@ -2805,9 +2807,7 @@ impl PublishedForwards {
         if applied.iter().any(|(held, _, _, _, _)| *held == listener) {
             return Ok(false);
         }
-        Self::push_applied(&mut applied, listener, addr, inside, proto, by)?;
-        self.lock_handed().retain(|handed| *handed != listener);
-        Ok(true)
+        Self::push_applied(&mut applied, listener, addr, inside, proto, by).map(|()| true)
     }
 
     /// Adds a publish for a listener nobody holds, under the bounds
@@ -2856,6 +2856,7 @@ impl PublishedForwards {
             .position(|(held, _, _, _, _)| *held == listener)
             .map(|at| {
                 let (_, addr, inside, proto, _) = applied.remove(at);
+                self.lock_handed().retain(|handed| *handed != listener);
                 (addr, inside, proto)
             })
     }
@@ -10201,6 +10202,7 @@ mod tests {
         );
         assert!(forwards.inside_published(WAITER, 18081));
         assert!(forwards.lock_waiting().is_empty());
+        assert_eq!(*forwards.lock_handed(), vec![SHARED]);
 
         // The forward is the waiting box's now: its row's withdrawal unbinds it.
         assert!(registry.withdraw(Ipv4Addr::from(WAITER)).is_some());
@@ -10219,6 +10221,10 @@ mod tests {
         assert_eq!(requests.len(), 1, "one unexpose: {requests:?}");
         assert!(requests[0].ends_with(UNEXPOSE_SHARED));
         assert_eq!(forwards.address_of(SHARED), None);
+        assert!(
+            forwards.lock_handed().is_empty(),
+            "the hand-over's mark goes with its attribution"
+        );
     }
 
     /// Two boxes wait on one listener: exactly one is bound, and it is the
