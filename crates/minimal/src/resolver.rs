@@ -2379,10 +2379,12 @@ pub(crate) const UNDO_SHOWN_BY: &str = "min finalize-install --undo --show --scr
 /// re-applies it at every boot after. A re-run replaces the unit and
 /// re-runs the program rather than dying on a label collision.
 ///
-/// Where the step installs the answerer's app bundle, the order differs
-/// ([`macos_names_steps`]): the bundle is copied and verified first, and
-/// the range unit then runs the program inside it
-/// ([`macos_range_bundle_steps`]) and carries no script of its own.
+/// Where the step installs the answerer, its verified copy runs before all
+/// of the above ([`macos_names_steps`]): the copy's checks are the ones that
+/// can refuse, so a refusal leaves no resolver file and no range behind.
+/// Where that copy is the answerer's app bundle, the range unit runs the
+/// program inside it ([`macos_range_bundle_steps`]) and carries no script
+/// of its own.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_command(port: u16, install: Option<&AnswererInstall>) -> String {
     let what = if install.is_some() {
@@ -2403,29 +2405,33 @@ pub(crate) fn macos_command(port: u16, install: Option<&AnswererInstall>) -> Str
 /// header that script renders for every item.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
-    let mut script = format!(
+    // The copy goes first: its checks are the ones that can refuse, and
+    // nothing before them changes the host, so a refusal leaves no
+    // resolver file and no range behind.
+    let mut script = String::new();
+    if let Some(install) = install {
+        script.push_str(&macos_answerer_copy_steps(install));
+        script.push('\n');
+    }
+    script.push_str(&format!(
         "# The resolver: send *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
          mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR}\n\
          printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE}\n\
          \n",
-    );
+    ));
     match install {
-        // The step installs the app bundle: the bundle goes in first,
-        // because the range unit runs the program inside it.
+        // The step installed the app bundle: the range unit runs the
+        // program inside it.
         Some(install) if !install.bundle.is_empty() => {
-            script.push_str(&macos_answerer_copy_steps(install));
-            script.push('\n');
             script.push_str(&macos_range_bundle_steps());
             script.push('\n');
             script.push_str(&macos_answerer_unit_steps(install));
         }
         // A bare program, or none: the range unit runs the script this
-        // command carries, and needs nothing the answerer's steps install.
+        // command carries.
         _ => {
             script.push_str(&macos_range_script_steps());
             if let Some(install) = install {
-                script.push('\n');
-                script.push_str(&macos_answerer_copy_steps(install));
                 script.push('\n');
                 script.push_str(&macos_answerer_unit_steps(install));
             }
@@ -2553,8 +2559,8 @@ fn answerer_fail_block(
 /// prefix its user can write, so these are the checks that count, run as
 /// root on the root-owned copy before anything names it. In order:
 ///
-/// 1. `dir` and every ancestor of it, up to `/`, must be a root-owned,
-///    non-sticky directory with no group or other write. Otherwise someone
+/// 1. `dir` and every ancestor of it, up to `/`, must be a root-owned
+///    directory with no group or other write. Otherwise someone
 ///    else could swap the copy, or rename a directory on its path away,
 ///    between the check and the rename. The step names the first offender
 ///    and refuses before it copies anything.
@@ -2614,8 +2620,10 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
 /// The first check of the privileged copy ([`verified_copy_steps`],
 /// [`bundle_copy_steps`]): make `dir` root-owned at 0755 when it is not
 /// there, then walk it and every ancestor up to `/`, refusing at the first
-/// that is not a root-owned, non-sticky directory closed to group and other
-/// writes.
+/// that is not a root-owned directory closed to group and other writes. The
+/// sticky bit is not checked: it only narrows who may rename or remove an
+/// entry, and macOS sets it on `/Library/PrivilegedHelperTools` on some
+/// hosts.
 fn root_dir_steps(dir: &str, group: &str) -> String {
     format!(
         "[ -d \"{dir}\" ] || install -d -m 0755 -o root -g {group} \"{dir}\" \
@@ -2624,9 +2632,9 @@ fn root_dir_steps(dir: &str, group: &str) -> String {
          p=\"{dir}\"\n\
          while : ; do\n\
          \x20 find \"$p\" -maxdepth 0 -type d -user root -not -perm -g+w -not -perm -o+w \
-         -not -perm -1000 | grep -q . || {{ echo \"minimal: $p, on the path to {dir}, is not a \
-         root-owned, non-sticky directory closed to group and other writes; Minimal's DNS \
-         service was not installed\" >&2 ; exit 1 ; }}\n\
+         | grep -q . || {{ echo \"minimal: $p, on the path to {dir}, is not a root-owned \
+         directory closed to group and other writes; Minimal's DNS service was not \
+         installed\" >&2 ; exit 1 ; }}\n\
          \x20 if [ \"$p\" = / ] ; then break ; fi\n\
          \x20 p=$(dirname \"$p\")\n\
          done\n"
@@ -2943,8 +2951,10 @@ fn answerer_service_unit(install: &AnswererInstall) -> String {
 /// domain is a default-route link implicitly — the flag first means no
 /// partially-run script ever routes non-zone queries here.
 ///
-/// Then the answerer service, beside the resolver it serves
-/// ([`linux_answerer_steps`]): the program copy is the install — the
+/// Where the step installs the answerer, its verified copy runs before all
+/// of the above ([`linux_answerer_copy_steps`]), so a refusal leaves no
+/// resolver link behind, and its units after
+/// ([`linux_answerer_unit_steps`]): the program copy is the install — the
 /// program is the daemon's own binary and cannot ride in the script the way
 /// [`RANGE_PROGRAM_TEMPLATE`] does; the rule the range steps carry (nothing
 /// copied in from anywhere, user-writable or not) is the *destination's*
@@ -2971,7 +2981,15 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
 /// finalize-install script carries for the names item.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
-    let mut script = format!(
+    // The copy goes first: its checks are the ones that can refuse, and
+    // nothing before them changes the host, so a refusal leaves no resolver
+    // link behind.
+    let mut script = String::new();
+    if let Some(install) = install {
+        script.push_str(&linux_answerer_copy_steps(install));
+        script.push('\n');
+    }
+    script.push_str(&format!(
         "# The resolver: a dummy link, {ZONE_LINK}, whose only job is to route\n\
          # *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
          [ -e /sys/class/net/{ZONE_LINK} ] || ip link add {ZONE_LINK} type dummy\n\
@@ -2980,9 +2998,9 @@ pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) ->
          resolvectl default-route {ZONE_LINK} false\n\
          resolvectl dns {ZONE_LINK} 127.0.0.1:{port}\n\
          resolvectl domain {ZONE_LINK} '~{ZONE}'\n",
-    );
+    ));
     if let Some(install) = install {
-        script.push_str(&linux_answerer_steps(install));
+        script.push_str(&linux_answerer_unit_steps(install));
     }
     script
 }
@@ -2991,7 +3009,7 @@ pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) ->
 /// step installed: disable and stop both units (tolerating units that are
 /// not there), remove the unit files and the root-owned program copy, and
 /// reload the manager so it forgets them. Shared by the step's failure
-/// block ([`linux_answerer_steps`]) and the removal script
+/// block ([`linux_answerer_unit_steps`]) and the removal script
 /// ([`linux_undo_command`]), so a failed install and an undo remove the
 /// same files. `indent` prefixes every line.
 #[cfg(any(test, not(target_os = "macos")))]
@@ -3005,9 +3023,31 @@ fn linux_service_removal(indent: &str) -> String {
     )
 }
 
-/// The Linux answerer steps of the privileged script (NET-122's host
-/// service), after the resolver's: copy `minzoned` to the root-owned path,
-/// verified first ([`verified_copy_steps`]); stop a running service; write
+/// The copy half of the Linux answerer steps (NET-122's host service),
+/// ahead of the resolver's: copy `minzoned` to the root-owned path, verified
+/// first ([`verified_copy_steps`]). It runs before anything else in the
+/// script, so a refusal leaves the host as it was.
+/// [`linux_answerer_unit_steps`] is the other half.
+///
+/// A copy that fails its hash pin never reaches the root-owned path, and
+/// the running service is left as it was.
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_answerer_copy_steps(install: &AnswererInstall) -> String {
+    format!(
+        "# The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied to a root-owned\n\
+         # path and checked there, as root, before anything names it.\n\
+         {}",
+        verified_copy_steps(
+            install,
+            ANSWERER_PROGRAM_DIR,
+            LINUX_ANSWERER_PROGRAM_PATH,
+            false
+        ),
+    )
+}
+
+/// The unit half of the Linux answerer steps, after the copy
+/// ([`linux_answerer_copy_steps`]) and the resolver's: stop a running service; write
 /// the socket and service units naming the copy, root's both, and enable
 /// the socket for every boot without starting it; ask this CLI's daemons
 /// to release the hook port (the copy's `release` verb, which waits up to
@@ -3017,11 +3057,8 @@ fn linux_service_removal(indent: &str) -> String {
 /// and removes what the step installed, and exits non-zero naming the
 /// reason, so the host is never left with nobody answering. With no daemon
 /// known, the unit is started directly.
-///
-/// A copy that fails its hash pin never reaches the root-owned path, and
-/// the running service is left as it was.
 #[cfg(any(test, not(target_os = "macos")))]
-fn linux_answerer_steps(install: &AnswererInstall) -> String {
+fn linux_answerer_unit_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install);
     let copy = LINUX_ANSWERER_PROGRAM_PATH;
     let channel = &install.channel;
@@ -3038,10 +3075,6 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
     };
     format!(
         "\n\
-         # The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied to a root-owned\n\
-         # path and checked there, as root, before anything names it.\n\
-         {verified_copy}\
-         \n\
          # The box-name service: a systemd socket and service pair run as {operator},\n\
          # the socket unit holding the answerer's listener on 127.0.0.1 and its\n\
          # channel socket.\n\
@@ -3070,7 +3103,6 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
          systemctl is-active --quiet {unit} || {not_active}\n\
          [ -S \"{channel}\" ] || {not_up}\n",
         handover = handover_comment(&controls, "systemd starts the socket unit"),
-        verified_copy = verified_copy_steps(install, ANSWERER_PROGRAM_DIR, copy, false),
         operator = install.operator,
         answerer_socket = answerer_socket_unit(install),
         answerer_service = answerer_service_unit(install),
@@ -6723,6 +6755,49 @@ exit 0
         assert!(command.starts_with("#!/bin/sh\n"), "{command}");
     }
 
+    // The answerer's copy can refuse (a directory on its path that fails
+    // custody, a hash that moved, a failed Developer ID check), so it runs
+    // before the step changes anything: a refusal leaves no resolver file
+    // and no range unit behind.
+    #[test]
+    fn copy_runs_before_anything_changes_the_host() {
+        let bare = test_install();
+        let bundled = AnswererInstall {
+            bundle: vec![BundleFile {
+                path: "Contents/Info.plist".to_string(),
+                sha256: "0".repeat(64),
+            }],
+            ..test_install()
+        };
+        for install in [&bare, &bundled] {
+            let command = macos_names_steps(15353, Some(install));
+            let check_at = command
+                .find("is not a root-owned directory closed to group and other writes")
+                .expect("the directory check is named");
+            for changes in [
+                "mkdir -p /etc/resolver".to_string(),
+                RESOLVER_FILE.to_string(),
+                format!("cat > {RANGE_PLIST_PATH}"),
+                format!("launchctl bootstrap system {RANGE_PLIST_PATH}"),
+            ] {
+                let at = command.find(&changes).expect("the step is named");
+                assert!(check_at < at, "the check runs before {changes}: {command}");
+            }
+        }
+        let command = linux_names_steps(15353, Some(&bare));
+        let check_at = command
+            .find("is not a root-owned directory closed to group and other writes")
+            .expect("the directory check is named");
+        for changes in [
+            format!("ip link add {ZONE_LINK}"),
+            format!("resolvectl dns {ZONE_LINK}"),
+            format!("cat > {ANSWERER_UNIT_SOCKET_PATH}"),
+        ] {
+            let at = command.find(&changes).expect("the step is named");
+            assert!(check_at < at, "the check runs before {changes}: {command}");
+        }
+    }
+
     // NET-123's privileged step, in the one script NET-122 already
     // renders (design §7.1): the script's own bytes do the whole install —
     // the program and the plist are written from what the command carries,
@@ -6894,12 +6969,22 @@ exit 0
             bootout_at < bootstrap_at,
             "the old unit is booted out before the new one loads: {command}"
         );
+        // The answerer's copy runs before all of it, and its unit after:
+        // the copy is the part that can refuse, the unit the part that
+        // needs the range.
+        assert!(
+            command
+                .find("\n# The box-name service's program")
+                .expect("the answerer's copy is named")
+                < mkdir_at,
+            "the answerer's copy runs before the step changes the host: {command}"
+        );
         assert!(
             bootstrap_at
                 < command
-                    .find("\n# The box-name service's program")
-                    .expect("the answerer service's step is named"),
-            "the range unit loads before the answerer service's step begins: {command}"
+                    .find("\n# The box-name service: a launchd unit")
+                    .expect("the answerer service's unit step is named"),
+            "the range unit loads before the answerer service's unit: {command}"
         );
         // And the resolver step is still NET-122's: the same file, the same
         // port, in the same one command — the range step stands beside it,
@@ -7226,9 +7311,9 @@ exit 0
             (
                 &mac,
                 &[
+                    "# The box-name service's program: ",
                     "# The resolver: ",
                     "# The local range: ",
-                    "# The box-name service's program: ",
                     "# The box-name service: a launchd unit",
                     "# Free the port for the service: ",
                 ][..],
@@ -7236,8 +7321,8 @@ exit 0
             (
                 &linux,
                 &[
-                    "# The resolver: ",
                     "# The box-name service's program: ",
+                    "# The resolver: ",
                     "# The box-name service: a systemd socket and service pair",
                     "# Free the port for the service: ",
                 ][..],
@@ -7408,8 +7493,9 @@ exit 0
     /// not touch them. Linux takes no range step — `lo` carries the whole
     /// `127/8` — and the dedicated link keeps its address, so the advisory
     /// over the not-needed step says nothing of the range's unit, its
-    /// paths or its install. What follows the resolver steps is the
-    /// answerer service's (NET-122's host service), never the range's.
+    /// paths or its install. What stands around the resolver steps is the
+    /// answerer service's (NET-122's host service), never the range's: its
+    /// verified copy ahead of them, its units after.
     #[test]
     fn linux_advisory_command_is_unchanged() {
         let port = 15353;
@@ -7429,13 +7515,17 @@ resolvectl domain minzone0 '~min.internal'
             "without the answerer step the script is the resolver's alone: {alone}"
         );
         let command = linux_command(port, Some(&test_install()));
-        let (_, answerer_steps) = command
+        let (copy_steps, unit_steps) = command
             .split_once(resolver_steps)
-            .unwrap_or_else(|| panic!("the resolver steps lead unchanged: {command}"));
+            .unwrap_or_else(|| panic!("the resolver steps are unchanged: {command}"));
         assert!(
-            answerer_steps.starts_with("\n# The box-name service's program: ")
-                && answerer_steps.contains("\n[ -d \"/usr/local/lib/minimal\" ] || install -d"),
-            "the answerer service's step follows them: {answerer_steps}"
+            copy_steps.contains("\n# The box-name service's program: ")
+                && copy_steps.contains("\n[ -d \"/usr/local/lib/minimal\" ] || install -d"),
+            "the answerer's verified copy runs ahead of them: {copy_steps}"
+        );
+        assert!(
+            unit_steps.starts_with("\n# The box-name service: a systemd socket and service pair"),
+            "the answerer service's units follow them: {unit_steps}"
         );
         assert!(
             !command.contains(RANGE_UNIT_LABEL) && !command.contains("local-range"),
@@ -8829,7 +8919,7 @@ resolvectl domain minzone0 '~min.internal'
             assert!(!output.status.success(), "refused: {stderr}");
             assert!(
                 stderr.contains(&format!(
-                    "minimal: {}, on the path to {}, is not a root-owned, non-sticky directory",
+                    "minimal: {}, on the path to {}, is not a root-owned directory",
                     offender.display(),
                     self.dest_dir.display()
                 )),
@@ -8903,27 +8993,32 @@ resolvectl domain minzone0 '~min.internal'
     }
 
     /// Every ancestor of the destination counts, not only the directory
-    /// itself: one that others can write, or a sticky one, lets a user
-    /// rename the directory away between the check and the rename, so the
-    /// step refuses and names it before anything is copied.
+    /// itself: one that others can write lets a user rename the directory
+    /// away between the check and the rename, so the step refuses and names
+    /// it before anything is copied. The sticky bit alone refuses nothing:
+    /// on a directory closed to group and other writes it grants no one
+    /// anything, and macOS sets it on `/Library/PrivilegedHelperTools` on
+    /// some hosts.
     #[test]
     fn privileged_copy_refuses_a_user_writable_ancestor() {
         use std::os::unix::fs::PermissionsExt as _;
         let harness = CopyHarness::new();
-        for mode in [0o777, 0o775, 0o757, 0o1755] {
+        for mode in [0o777, 0o775, 0o757, 0o1777] {
             std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(mode))
                 .unwrap();
             let output = harness.run(None);
             harness.assert_refused_at(&output, &harness.ancestor);
         }
-        std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-        let output = harness.run(None);
-        assert!(
-            output.status.success(),
-            "the same tree with the ancestor closed installs: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for mode in [0o755, 0o1755] {
+            std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let output = harness.run(None);
+            assert!(
+                output.status.success(),
+                "the same tree with the ancestor closed ({mode:o}) installs: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// A destination directory root does not own is refused before
