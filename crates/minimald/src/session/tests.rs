@@ -6845,18 +6845,6 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
         2,
         "both boxes are resumed"
     );
-    let registry = manager.hostnames();
-    let routes = registry.read().expect("registry lock");
-    assert!(
-        routes.shared_port_collisions(newer).is_empty(),
-        "the box that bound the port before the restart holds it after"
-    );
-    assert_eq!(
-        routes.shared_port_collisions(older),
-        held_by_newer,
-        "and the older box still yields to it, though it is resumed first"
-    );
-    drop(routes);
     let record = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(newer))
         .await
@@ -6869,6 +6857,17 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
         record.bound_ports,
         std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, 18080)]),
         "the launch recorded the port it bound on the box's record"
+    );
+    let registry = manager.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.shared_port_collisions(newer).is_empty(),
+        "the box that bound the port before the restart holds it after"
+    );
+    assert_eq!(
+        routes.shared_port_collisions(older),
+        held_by_newer,
+        "and the older box still yields to it, though it is resumed first"
     );
 }
 
