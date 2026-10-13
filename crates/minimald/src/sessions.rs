@@ -571,6 +571,35 @@ impl Manager {
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
         let weak_self = handle.downgrade();
+        // NET-129: each shared-address port the registry hands to a new
+        // holder is passed to that box's session, which binds the port's
+        // forward if the box is running. Off the registry's lock and off
+        // the session that made the hand-over, which may be the destroyed
+        // holder this manager is still waiting on.
+        #[cfg(target_os = "linux")]
+        {
+            let (sender, mut hand_overs) = tokio::sync::mpsc::unbounded_channel();
+            hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .notify_hand_overs(sender);
+            let manager = weak_self.clone();
+            tokio::spawn(async move {
+                while let Some(hand_over) = hand_overs.recv().await {
+                    let Some(manager) = manager.upgrade() else {
+                        return;
+                    };
+                    let holder = manager
+                        .get_session(SessionKeyPredicate::Id(hand_over.holder))
+                        .await;
+                    if let Ok(Some(holder)) = holder {
+                        holder
+                            .bind_handed_port(hand_over.address, hand_over.port)
+                            .await;
+                    }
+                }
+            });
+        }
         let mngr = Self {
             in_shutdown,
             receiver,

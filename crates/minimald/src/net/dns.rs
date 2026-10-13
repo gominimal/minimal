@@ -573,6 +573,11 @@ pub struct HostnameRegistry {
     /// port when the box stops publishing it there, and whole with its
     /// publish.
     own_bound: HashMap<SessionId, BTreeSet<SocketAddrV4>>,
+    /// Where each hand-over is sent as it is made ([`Self::hand_over`]),
+    /// for the sessions manager to bind the new holder's forward while its
+    /// box runs ([`Self::notify_hand_overs`]). `None` leaves a hand-over a
+    /// change of record alone, bound at the new holder's next attach.
+    hand_overs: Option<tokio::sync::mpsc::UnboundedSender<PortHandOver>>,
     /// The loopback address a creator handed each own-address box, by stable
     /// session id (T66, NET-123 §7.1): recorded at the box's registration
     /// whether the publish lands at it or at the `127.0.0.1` interim — a
@@ -643,6 +648,7 @@ impl HostnameRegistry {
             own_published: HashMap::new(),
             own_holders: HashMap::new(),
             own_bound: HashMap::new(),
+            hand_overs: None,
             hands: HashMap::new(),
             stopped: HashSet::new(),
             by_host: HashMap::new(),
@@ -661,6 +667,28 @@ impl HostnameRegistry {
     pub fn with_node_address(mut self, node: Ipv4Addr) -> Self {
         self.node = node;
         self
+    }
+
+    /// Sends every hand-over this registry makes from here on to `sender`
+    /// (NET-129): a destroyed holder's, and a holder's that moved off the
+    /// address or stopped naming the port. The receiver binds the new
+    /// holder's forward if its box is running; the send never waits, so the
+    /// registry's lock is held no longer for it.
+    pub fn notify_hand_overs(&mut self, sender: tokio::sync::mpsc::UnboundedSender<PortHandOver>) {
+        self.hand_overs = Some(sender);
+    }
+
+    /// Whether `session_id` holds `port` at `address` now (NET-129): it
+    /// still publishes the port there, and no other box holds it. What a
+    /// hand-over's receiver reads before it binds, since the hand-over may
+    /// be stale by the time it is handled.
+    #[must_use]
+    pub fn holds_shared_port(&self, session_id: SessionId, address: Ipv4Addr, port: u16) -> bool {
+        self.own_holders.get(&(address, port)) == Some(&session_id)
+            && self
+                .own_published
+                .get(&session_id)
+                .is_some_and(|own| own.address == address && own.ports.contains(&port))
     }
 
     /// Sets the node's host loopback address once the answerer granted it —
@@ -1080,8 +1108,9 @@ impl HostnameRegistry {
                 .into_iter()
                 .filter(|port| previous.address != address || !ports.contains(port));
             // A move's hand-overs are logged here and not returned: the new
-            // holder of record is elected now, and its forward is bound at
-            // that box's next attach, the deferral the destroy path makes.
+            // holder of record is elected now, and its forward is bound by
+            // whoever receives the hand-over ([`Self::notify_hand_overs`]),
+            // or at that box's next attach when its box is not running.
             for hand_over in self.hand_over(session_id, previous.address, vacated) {
                 tracing::info!(
                     session_id = %hand_over.holder,
@@ -1198,11 +1227,17 @@ impl HostnameRegistry {
             match next {
                 Some(holder) => {
                     self.own_holders.insert((address, port), holder);
-                    hand_overs.push(PortHandOver {
+                    let hand_over = PortHandOver {
                         holder,
                         address,
                         port,
-                    });
+                    };
+                    // A receiver that is gone binds nothing: the hand-over
+                    // stands as a change of record.
+                    if let Some(sender) = &self.hand_overs {
+                        drop(sender.send(hand_over.clone()));
+                    }
+                    hand_overs.push(hand_over);
                 }
                 None => {
                     self.own_holders.remove(&(address, port));
@@ -3681,6 +3716,76 @@ mod tests {
             ],
             "the third box yields each port to its own holder"
         );
+    }
+
+    /// Every hand-over is sent to the registry's subscriber as it is made:
+    /// a destroyed holder's, a holder's that moved to another address, and
+    /// a holder's that stopped naming the port. A yielding box's destroy
+    /// sends nothing. `holds_shared_port` reads the holder the hand-over
+    /// named, and stops saying so once that box moves on.
+    #[test]
+    fn every_hand_over_is_sent_to_the_subscriber() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let elsewhere = Ipv4Addr::new(127, 0, 64, 9);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let (sender, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        reg.notify_hand_overs(sender);
+        let (first, second, third) = (id("1"), id("2"), id("3"));
+        let both = BTreeSet::from([8080u16, 9090]);
+        for (session, name) in [(first, "first"), (second, "second"), (third, "third")] {
+            reg.publish_own_address(session, name, node, both.clone());
+            reg.register_own_ip(session, name, both.clone());
+        }
+        assert!(sent.try_recv().is_err(), "a publish hands nothing over");
+        assert!(reg.holds_shared_port(first, node, 8080));
+        assert!(!reg.holds_shared_port(second, node, 8080));
+
+        // The holder stops naming one port: that port alone is handed over.
+        reg.publish_own_address(first, "first", node, BTreeSet::from([9090u16]));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(PortHandOver {
+                holder: second,
+                address: node,
+                port: 8080,
+            })
+        );
+        assert!(sent.try_recv().is_err());
+        assert!(reg.holds_shared_port(second, node, 8080));
+        assert!(!reg.holds_shared_port(first, node, 8080));
+
+        // The holder of the other port moves to an address of its own.
+        reg.publish_own_address(first, "first", elsewhere, BTreeSet::from([9090u16]));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(PortHandOver {
+                holder: second,
+                address: node,
+                port: 9090,
+            })
+        );
+        assert!(sent.try_recv().is_err());
+
+        // A yielding box's destroy sends nothing; the holder's sends both
+        // of its ports to the box that is left.
+        let _yielded = reg.unpublish_own_address(first);
+        assert!(sent.try_recv().is_err());
+        let (_, hand_overs) = reg.unpublish_own_address(second);
+        let mut received = vec![
+            sent.try_recv().expect("the first hand-over"),
+            sent.try_recv().expect("the second hand-over"),
+        ];
+        received.sort_by_key(|hand_over| hand_over.port);
+        let mut returned = hand_overs;
+        returned.sort_by_key(|hand_over| hand_over.port);
+        assert_eq!(received, returned, "what is sent is what is returned");
+        assert!(received.iter().all(|hand_over| hand_over.holder == third));
+        assert!(!reg.holds_shared_port(second, node, 8080));
+        assert!(reg.holds_shared_port(third, node, 9090));
+
+        // The subscriber going away costs the registry nothing.
+        drop(sent);
+        let _last = reg.unpublish_own_address(third);
     }
 
     /// The address sweeps list their boxes oldest first whatever order the
