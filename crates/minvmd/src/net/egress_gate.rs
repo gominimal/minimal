@@ -2390,10 +2390,13 @@ struct ControlDecision {
 /// forwards ([`WaitingForward`]): a publish a row admits as a declared port,
 /// for a listener the ledger attributes to another box's address. It is
 /// never relayed. When the holder's row is withdrawn, the step that drops
-/// the holder's attribution gives the listener to one waiting forward — the
-/// one whose box id is lowest, which is the row registered earliest — and
-/// the gate binds it itself ([`unbind_pass`]). A waiting forward goes with
-/// its own row's withdrawal. They are bounded at
+/// the holder's attribution gives the listener to the forward waiting on it
+/// and the gate binds it itself ([`unbind_pass`]). One forward waits on a
+/// listener: the guest's registry elects which box takes a shared port and
+/// publishes for that box alone, so a later publish for the listener from
+/// another row is the guest's newer choice and replaces the one waiting.
+/// The gate makes no choice of its own. A waiting forward goes with its own
+/// row's withdrawal. They are bounded at
 /// [`PUBLISHED_FORWARDS_TRACKED`] too, and past the bound a new one is
 /// refused.
 ///
@@ -2569,13 +2572,14 @@ impl PublishedForwards {
         (true, self.claim_in(&mut applied, listener))
     }
 
-    /// Gives a listener nobody holds to one of the declared forwards waiting
-    /// on it: noted as applied by its row, at its row's address, and handed
-    /// back for the caller to expose. Of several, the one whose box id is
-    /// lowest — the row registered earliest, since the host mints the id as
-    /// a `UUIDv7` at registration, whose bytes order by time — so the choice
-    /// does not depend on the order the guest published them in. `None`
-    /// when the listener is held or nothing waits on it.
+    /// Gives a listener nobody holds to the declared forward waiting on it:
+    /// noted as applied by its row, at its row's address, and handed back
+    /// for the caller to expose. A publish replaces any other row's forward
+    /// waiting on its listener ([`Self::admit_publish`]), so at most one
+    /// waits beside a forward whose own claim the switch refused; of those
+    /// two the one published last is taken, which is the guest's latest
+    /// choice of holder. `None` when the listener is held or nothing waits
+    /// on it.
     ///
     /// A listener held by a waiting forward whose expose went unanswered
     /// ([`Self::keep_unanswered_claim`]) is claimed again by that forward,
@@ -2621,8 +2625,7 @@ impl PublishedForwards {
         let Some(next) = self
             .lock_waiting()
             .iter()
-            .filter(|forward| forward.listener == listener)
-            .min_by_key(|forward| (forward.box_id, forward.addr))
+            .rfind(|forward| forward.listener == listener)
             .copied()
         else {
             return Ok(None);
@@ -2715,9 +2718,12 @@ impl PublishedForwards {
     /// already holds it, answered as bound when the gate's own expose bound
     /// that very forward; and, when another address holds it, kept as a
     /// waiting forward for `declared_by` — the box whose row declared the
-    /// port — or held back with nothing kept when no row declared it. A
-    /// row's later publish for the same listener replaces its waiting
-    /// forward.
+    /// port — or held back with nothing kept when no row declared it. The
+    /// waiting forward replaces every other one waiting on the listener,
+    /// the row's own earlier one and another row's alike: the guest
+    /// publishes a held port for the one box it elected, so the latest
+    /// publish names its choice. The holder's own waiting record, kept
+    /// while the gate's expose for it is unsettled, is left alone.
     ///
     /// # Errors
     ///
@@ -2753,24 +2759,18 @@ impl PublishedForwards {
                 }
             }
             (Some(_), None) => Ok(Admitted::HeldElsewhere),
-            (Some(_), Some(box_id)) => {
-                let forward = WaitingForward {
+            (Some((holder, _)), Some(box_id)) => {
+                waiting.retain(|held| held.listener != listener || held.addr == holder);
+                if waiting.len() >= PUBLISHED_FORWARDS_TRACKED {
+                    return Err(LedgerFull);
+                }
+                waiting.push(WaitingForward {
                     listener,
                     addr,
                     inside,
                     proto,
                     box_id,
-                };
-                if let Some(held) = waiting
-                    .iter_mut()
-                    .find(|held| held.listener == listener && held.addr == addr)
-                {
-                    *held = forward;
-                } else if waiting.len() >= PUBLISHED_FORWARDS_TRACKED {
-                    return Err(LedgerFull);
-                } else {
-                    waiting.push(forward);
-                }
+                });
                 Ok(Admitted::Waiting)
             }
         }
@@ -10227,13 +10227,15 @@ mod tests {
         );
     }
 
-    /// Two boxes wait on one listener: exactly one is bound, and it is the
-    /// one whose box id is lowest, whichever published first. The listener
-    /// is never free in the ledger across the hand-over, so a publish that
-    /// arrives during it is held back, not relayed to a switch that would
-    /// bind it for nobody.
+    /// Two boxes publish one held listener: the later publish replaces the
+    /// earlier one, whichever box id is lower, since the guest publishes a
+    /// held port for the box it elected and the gate does not elect. Exactly
+    /// that one is bound at the hand-over and nothing is left waiting. The
+    /// listener is never free in the ledger across the hand-over, so a
+    /// publish that arrives during it is held back, not relayed to a switch
+    /// that would bind it for nobody.
     #[tokio::test]
-    async fn one_of_two_waiting_forwards_is_bound_and_it_is_the_lowest_box_id() {
+    async fn of_two_publishes_for_a_held_listener_the_later_one_waits_and_is_bound() {
         const LATER: [u8; 4] = [100, 64, 0, 11];
         for later_first in [true, false] {
             let dir = tempfile::TempDir::new().expect("a tempdir");
@@ -10251,13 +10253,23 @@ mod tests {
                     Ok(super::Admitted::Waiting)
                 );
             }
+            let (chosen, _, _) = publishes[1];
+            assert_eq!(
+                forwards
+                    .lock_waiting()
+                    .iter()
+                    .map(|waiting| waiting.addr)
+                    .collect::<Vec<_>>(),
+                vec![chosen],
+                "the later publish replaced the earlier one"
+            );
 
             // The step that drops the holder's attribution names the next
             // one: a publish decided right after it finds the listener held.
             let (dropped, next) = forwards.hand_over_at(SHARED, LEASE);
             assert!(dropped);
             let next = next.expect("the ledger has room");
-            assert_eq!(next.map(|next| next.addr), Some(WAITER));
+            assert_eq!(next.map(|next| next.addr), Some(chosen));
             assert_eq!(
                 forwards.admit_publish(
                     SHARED,
@@ -10299,17 +10311,14 @@ mod tests {
                 .filter(|request| request.starts_with("POST /services/forwarder/expose "))
                 .collect();
             assert_eq!(exposes.len(), 1, "exactly one waiting forward is bound");
-            assert!(exposes[0].contains(r#""remote":"100.64.0.10:18081""#));
-            assert_eq!(forwards.address_of(SHARED), Some(WAITER));
-            assert_eq!(
-                forwards
-                    .lock_waiting()
-                    .iter()
-                    .map(|waiting| waiting.addr)
-                    .collect::<Vec<_>>(),
-                vec![LATER],
-                "the other box still waits"
-            );
+            let remote = if later_first {
+                r#""remote":"100.64.0.10:18081""#
+            } else {
+                r#""remote":"100.64.0.11:18082""#
+            };
+            assert!(exposes[0].contains(remote), "{exposes:?}");
+            assert_eq!(forwards.address_of(SHARED), Some(chosen));
+            assert!(forwards.lock_waiting().is_empty(), "nothing still waits");
         }
     }
 
@@ -10406,49 +10415,70 @@ mod tests {
         assert_eq!(forwards.address_of(SHARED), None);
     }
 
-    /// The waiting forwards are bounded as the ledger is: past the bound a
-    /// new one is refused, and neither the holder's attribution nor an
-    /// earlier waiting forward is evicted for it. A box publishing again
-    /// replaces its own waiting forward and takes no second slot.
+    /// The waiting forwards are bounded as the ledger is: one waits on each
+    /// held listener, and past the bound a new one is refused, with neither
+    /// a holder's attribution nor an earlier waiting forward evicted for
+    /// it. A later publish for a listener replaces the forward waiting on
+    /// it and takes no second slot.
     #[test]
     fn waiting_forwards_are_refused_past_the_ledger_bound() {
+        use sessions::core::switch_request::Applied;
+        const OTHER: [u8; 4] = [100, 64, 0, 11];
         let forwards = PublishedForwards::new();
-        assert_eq!(
-            publish_shared(&forwards, LEASE, 18080, box_id(1)),
-            Ok(super::Admitted::Noted)
-        );
-        let addr = |n: usize| -> [u8; 4] {
+        let listener = |n: usize| -> super::Listener {
             let n = u16::try_from(n).expect("the bound fits sixteen bits");
-            let [high, low] = n.to_be_bytes();
-            [100, 65, high, low]
+            ([127, 0, 0, 1], 10_000 + n)
         };
+        let publish = |n: usize, addr: [u8; 4], inside: u16, by: Applied, id| {
+            forwards.admit_publish(
+                listener(n),
+                addr,
+                inside,
+                super::egress::IPPROTO_TCP,
+                by,
+                id,
+            )
+        };
+        // Every row-held slot holds a listener, and the interim holds one
+        // more, so there is one listener more to wait on than the bound.
         for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
             assert_eq!(
-                publish_shared(&forwards, addr(n), 18081, box_id(2)),
+                publish(n, LEASE, 18080, Applied::Row, Some(box_id(1))),
+                Ok(super::Admitted::Noted)
+            );
+        }
+        let past = super::PUBLISHED_FORWARDS_TRACKED;
+        assert_eq!(
+            publish(past, LEASE, 18080, Applied::Interim, None),
+            Ok(super::Admitted::Noted)
+        );
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                publish(n, WAITER, 18081, Applied::Row, Some(box_id(2))),
                 Ok(super::Admitted::Waiting)
             );
         }
         assert_eq!(
-            publish_shared(
-                &forwards,
-                addr(super::PUBLISHED_FORWARDS_TRACKED),
-                18081,
-                box_id(2)
-            ),
+            publish(past, WAITER, 18081, Applied::Row, Some(box_id(2))),
             Err(super::LedgerFull),
             "the waiting forward past the bound is refused"
         );
         assert_eq!(
-            publish_shared(&forwards, addr(0), 18099, box_id(2)),
+            publish(0, OTHER, 18099, Applied::Row, Some(box_id(3))),
             Ok(super::Admitted::Waiting),
-            "a box's later publish replaces its own waiting forward"
+            "a later publish replaces the forward waiting on its listener"
         );
         let waiting = forwards.lock_waiting();
         assert_eq!(waiting.len(), super::PUBLISHED_FORWARDS_TRACKED);
-        assert_eq!(waiting[0].inside, 18099);
+        let on_first: Vec<_> = waiting
+            .iter()
+            .filter(|forward| forward.listener == listener(0))
+            .map(|forward| (forward.addr, forward.inside))
+            .collect();
+        assert_eq!(on_first, vec![(OTHER, 18099)]);
         drop(waiting);
         assert_eq!(
-            forwards.address_of(SHARED),
+            forwards.address_of(listener(0)),
             Some(LEASE),
             "the holder's attribution is never evicted for a waiting forward"
         );
