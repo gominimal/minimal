@@ -610,6 +610,41 @@ pub(crate) struct RangeFacts {
     /// The program path the loaded job's `Program`/`ProgramArguments`
     /// names, when a job is loaded under the unit's label.
     pub loaded_program: Option<String>,
+    /// The first address of the range that lo0 carries with a mask other
+    /// than `/32` ([`wide_range_alias`]), when it carries one. `None` also
+    /// when lo0 could not be read: a read that did not happen claims
+    /// nothing.
+    pub wide_alias: Option<String>,
+}
+
+/// The mask `ifconfig` prints for a `/32` alias: the mask the range step
+/// gives every address of the range.
+const RANGE_ALIAS_MASK: &str = "0xffffffff";
+
+/// The first address of the reserved local range that `ifconfig lo0 inet`
+/// output lists with a mask other than `/32`, as `<address> with netmask
+/// <mask>`. `None` when every listed range address reads `/32`.
+///
+/// An earlier range step added each alias without the `netmask` keyword,
+/// so each took the `/8` of its class. Such an address still binds, so the
+/// bind probe reads the range present. The root-owned program that added it
+/// runs again at every boot, and this is the read that tells an installed
+/// unit from one whose program still applies the wrong mask. An address
+/// listed twice, once at `/32` and once wider, counts as wide. Pure over
+/// the output, so the parse is unit-tested on every platform the suite
+/// runs on.
+pub(crate) fn wide_range_alias(present: &str) -> Option<String> {
+    present.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        let (Some("inet"), Some(addr), Some("netmask"), Some(mask)) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
+            return None;
+        };
+        let parsed: Ipv4Addr = addr.parse().ok()?;
+        (mask != RANGE_ALIAS_MASK && switch::loopback::range_hosts().any(|host| host == parsed))
+            .then(|| format!("{addr} with netmask {mask}"))
+    })
 }
 
 /// Every directory component of `path`, from `/` down: the walk the
@@ -841,12 +876,40 @@ async fn launchctl_print_program() -> Option<String> {
     launchctl_program_path(&String::from_utf8(output.stdout).ok()?).map(str::to_string)
 }
 
+/// [`wide_range_alias`] over this host's lo0: one read-only call of the
+/// absolute-path system tool the aliases are added with, run with an empty
+/// environment and bounded by [`LAUNCHCTL_BOUND`]. `None` when the call
+/// does not run, fails or outlives the bound, the same as a loopback that
+/// carries no wide alias: an unread interface is never a reason to offer
+/// the step again.
+async fn lo0_wide_range_alias() -> Option<String> {
+    let output = tokio::time::timeout(
+        LAUNCHCTL_BOUND,
+        tokio::process::Command::new("/sbin/ifconfig")
+            .args(["lo0", "inet"])
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    wide_range_alias(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// The range unit's state on this host, read where the hook is detected:
 /// both files' presence, owner and mode; every directory component of both
 /// their paths, from `/` down; the program path the plist's
 /// `ProgramArguments` names; and the program path the loaded job's
-/// `Program`/`ProgramArguments` names in `launchctl print` — the facts
-/// [`range_step_over`] decides custody over. Read-only, and nothing
+/// `Program`/`ProgramArguments` names in `launchctl print`; and whether lo0
+/// carries an address of the range with a mask other than `/32` — the facts
+/// [`range_step_over`] decides the step over. Read-only, and nothing
 /// prompts: the same discipline as the hook detection it sits beside, and
 /// the command that fixes what it finds is the user's to run, never the
 /// session start's (NET-122).
@@ -862,6 +925,7 @@ pub(crate) async fn range_unit_state() -> RangeStep {
         plist: file_custody(RANGE_PLIST_PATH).await,
         plist_program,
         loaded_program: launchctl_print_program().await,
+        wide_alias: lo0_wide_range_alias().await,
     };
     range_step_over(&facts)
 }
@@ -5103,6 +5167,7 @@ mod tests {
             }),
             plist_program: Some(RANGE_PROGRAM_PATH.to_string()),
             loaded_program: Some(RANGE_PROGRAM_PATH.to_string()),
+            wide_alias: None,
         }
     }
 
@@ -7309,6 +7374,137 @@ exit 0
         );
         // The macOS script's paths are absolute, never shell-expanded.
         assert!(!mac.contains('~'), "{mac}");
+    }
+
+    /// The read that tells a `/32` range from one an earlier step added
+    /// without the `netmask` keyword: only an address of the range counts,
+    /// only a mask other than `/32` makes it wide, and the first such
+    /// address is the one named.
+    #[test]
+    fn wide_range_alias_names_the_first_range_address_off_the_host_mask() {
+        let lo0 = |range_mask: &str| {
+            let mut out = String::from(
+                "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+                 \toptions=1203<RXCSUM,TXCSUM,TXSTATUS,SW_TIMESTAMP>\n\
+                 \tinet 127.0.0.1 netmask 0xff000000\n",
+            );
+            for addr in switch::loopback::range_hosts() {
+                out.push_str(&format!("\tinet {addr} netmask {range_mask}\n"));
+            }
+            out
+        };
+        // The healthy host: 127.0.0.1 keeps its own /8, which is not the
+        // range's business.
+        assert_eq!(wide_range_alias(&lo0("0xffffffff")), None);
+        // A bare loopback carries no range address, so none is wide.
+        assert_eq!(
+            wide_range_alias("\tinet 127.0.0.1 netmask 0xff000000\n"),
+            None
+        );
+        // The host an earlier step left: every range address at /8.
+        assert_eq!(
+            wide_range_alias(&lo0("0xff000000")).as_deref(),
+            Some("127.0.64.1 with netmask 0xff000000")
+        );
+        // One address still wide among 253 repaired ones.
+        let mixed = lo0("0xffffffff").replace(
+            "inet 127.0.64.10 netmask 0xffffffff",
+            "inet 127.0.64.10 netmask 0xff000000",
+        );
+        assert_eq!(
+            wide_range_alias(&mixed).as_deref(),
+            Some("127.0.64.10 with netmask 0xff000000")
+        );
+        // An address listed at /32 and again at /8 is still wide.
+        let twice = format!(
+            "{}\tinet 127.0.64.1 netmask 0xff000000\n",
+            lo0("0xffffffff")
+        );
+        assert_eq!(
+            wide_range_alias(&twice).as_deref(),
+            Some("127.0.64.1 with netmask 0xff000000")
+        );
+    }
+
+    /// A unit that passes every custody check over a range lo0 carries with
+    /// the wrong mask is not a finished step. The bind probe reads that
+    /// range present, so without this the names item reads done and the
+    /// root-owned program that applies the wrong mask is never replaced.
+    /// The advisory comes back, says the mask is wrong in plain words, and
+    /// carries the script that writes the program again. It falls quiet
+    /// once the range reads `/32`.
+    #[test]
+    fn range_alias_with_a_wide_mask_resurfaces_the_advisory() {
+        let port = 15353;
+        let configured = routing_hook();
+        let mut facts = root_owned_facts();
+        facts.wide_alias = Some("127.0.64.1 with netmask 0xff000000".to_string());
+        let wide = range_step_over(&facts);
+        assert!(
+            !wide.custody_holds(),
+            "a range carried with the wrong mask is not an installed step: {wide:?}"
+        );
+        assert!(
+            wide.failed_check
+                .as_deref()
+                .is_some_and(|check| check.contains("127.0.64.1 with netmask 0xff000000")),
+            "the bundle's record names the address and its mask: {wide:?}"
+        );
+        let advisory = advisory_at(
+            &configured,
+            port,
+            false,
+            Some(true),
+            &wide,
+            &AnswererStep::Installed,
+            None,
+        )
+        .expect("a wide mask re-surfaces the advisory over a probe that reads present");
+        assert!(
+            advisory.contains(&format!(
+                "the loopback IPs boxes use ({}) have the wrong network mask, which can \
+                 slow name lookups on this machine",
+                range_text()
+            )),
+            "the advisory says the mask is wrong: {advisory}"
+        );
+        assert!(
+            !advisory.contains("safety check"),
+            "a wrong mask is not a custody failure: {advisory}"
+        );
+        // The script the names step carries on macOS writes the program
+        // again, with the mask keyword, and reloads the unit that runs it.
+        let script = macos_command(port, None);
+        assert!(
+            script.contains(&format!("cat > {RANGE_PROGRAM_PATH} <<"))
+                && script.contains("alias \"$addr\" netmask 255.255.255.255")
+                && script.contains(&format!("launchctl bootstrap system {RANGE_PLIST_PATH}")),
+            "{script}"
+        );
+        // Custody failing on the same host is still the fact that is said
+        // first: the reinstall is the same script either way.
+        facts.plist_program = Some("/Users/runner/pwned".to_string());
+        assert_eq!(range_step_over(&facts).state, RangeStepState::CustodyFailed);
+        // The repaired host: quiet again.
+        assert!(
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &installed_range_step(),
+                &AnswererStep::Installed,
+                None
+            )
+            .is_none(),
+            "a range at /32 behind an installed unit is the quiet arm"
+        );
+        // A unit that is not installed stays absent, whatever lo0 carries.
+        let absent = range_step_over(&RangeFacts {
+            wide_alias: Some("127.0.64.1 with netmask 0xff000000".to_string()),
+            ..RangeFacts::default()
+        });
+        assert_eq!(absent.state, RangeStepState::Absent);
     }
 
     /// NET-123's re-surface clause, the custody half: the advisory that
@@ -9585,6 +9781,7 @@ resolvectl domain minzone0 '~min.internal'
             plist: Some(root(0o644)),
             plist_program: Some(MACOS_ANSWERER_PROGRAM_PATH.to_string()),
             loaded_program: Some(MACOS_ANSWERER_PROGRAM_PATH.to_string()),
+            wide_alias: None,
         };
         assert_eq!(range_step_over(&facts).state, RangeStepState::Installed);
         assert_eq!(installed_range_step().state, RangeStepState::Installed);
