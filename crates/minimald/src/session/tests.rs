@@ -6871,6 +6871,272 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     );
 }
 
+/// Two boxes handed one loopback address, both declaring port 18080: the
+/// first to finalize holds it and the second yields. Returns the manager,
+/// the two ids, and the shared address the registry publishes them at.
+#[cfg(target_os = "linux")]
+async fn shared_port_pair(
+    server: &TestServer,
+    client: &mut TestClient,
+) -> (
+    crate::sessions::ManagerHandle,
+    SessionId,
+    SessionId,
+    std::net::Ipv4Addr,
+) {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let manager = server.state.sessions_manager().await;
+    let holder = finalize_handed_own_ip_session(
+        client,
+        "holder",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let yielder = finalize_handed_own_ip_session(
+        client,
+        "yielder",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    let published = {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(routes.shared_port_collisions(holder).is_empty());
+        assert_eq!(routes.shared_port_collisions(yielder).len(), 1);
+        routes
+            .published_own_address(yielder)
+            .expect("the yielding box publishes")
+    };
+    (manager, holder, yielder, published)
+}
+
+/// Waits until the stand-in forwarder has served `count` requests.
+#[cfg(target_os = "linux")]
+async fn await_served(served: &std::sync::Mutex<Vec<String>>, count: usize) -> Vec<String> {
+    for _ in 0..1_000 {
+        {
+            let served = served.lock().expect("served lock");
+            if served.len() >= count {
+                return served.clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "the switch was asked fewer than {count} request(s): {:?}",
+        served.lock().expect("served lock")
+    );
+}
+
+/// NET-129, live: when the box holding a shared-address port is destroyed,
+/// the running box that takes the port over has its forward bound at once,
+/// with no new attach. The daemon posts the expose the box's own attach
+/// would have posted, toward its lease at the inside port its declaration
+/// maps, records the port on the box's record as one it bound, and unbinds
+/// the forward when that box stops.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes_it() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (manager, holder, yielder, published) = shared_port_pair(&server, &mut client).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the yielding box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    destroy_session(&mut client, holder).await;
+
+    let requests = await_served(&served, 1).await;
+    let (line, body) = requests[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the hand-over binds the new holder's forward: {requests:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 18080,
+            internal_port: 80,
+            proto: sessions::IpProto::Tcp,
+        },
+        published,
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the expose is the one the box's own attach posts for the port"
+    );
+    {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(
+            routes.shared_port_collisions(yielder).is_empty(),
+            "the box holds the port of record"
+        );
+    }
+    let bound = std::collections::BTreeSet::from([std::net::SocketAddrV4::new(published, 18080)]);
+    let mut recorded = false;
+    for _ in 0..1_000 {
+        if handle
+            .record()
+            .await
+            .expect("the record reads back")
+            .bound_ports
+            == bound
+        {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        recorded,
+        "the box's record names the port it bound at the hand-over"
+    );
+
+    // The box stops for good: the forward bound at the hand-over comes down
+    // with it, as the forwards its own attach bound do.
+    destroy_session(&mut client, yielder).await;
+    let requests = await_served(&served, 2).await;
+    forwarder.abort();
+    let (line, body) = requests[1]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/unexpose "),
+        "the stop unbinds the handed-over forward: {requests:?}"
+    );
+    assert!(
+        body.contains(&format!("\"local\":\"{published}:18080\"")),
+        "the unexpose names the handed-over listener: {body}"
+    );
+    assert_eq!(requests.len(), 2, "nothing else was asked: {requests:?}");
+}
+
+/// NET-129: a box that takes a shared-address port over while it is not
+/// running has nothing bound for it. It holds the port of record, and its
+/// next attach binds the forward, as before.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_destroyed_holders_shared_port_is_not_bound_for_a_box_that_is_not_running() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (manager, holder, yielder, _published) = shared_port_pair(&server, &mut client).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    destroy_session(&mut client, holder).await;
+
+    {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(
+            routes.shared_port_collisions(yielder).is_empty(),
+            "the box holds the port of record"
+        );
+    }
+    // The hand-over reaches the box's actor behind the destroy; an answer
+    // from the actor after it proves the hand-over was handled first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _record = handle.record().await.expect("the record reads back");
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a box with no host running asks the switch nothing"
+    );
+}
+
+/// NET-129: a hand-over's bind the switch refuses loses nothing. The box
+/// still holds the port of record, no forward is tracked for it, and its
+/// record names no port it did not bind, so its next attach binds the port
+/// as it would have without the hand-over.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hand_over_bind_the_switch_refuses_leaves_the_election_standing() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (manager, holder, yielder, _published) = shared_port_pair(&server, &mut client).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the yielding box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 500).await;
+
+    destroy_session(&mut client, holder).await;
+
+    let requests = await_served(&served, 1).await;
+    assert!(
+        requests[0].starts_with("POST /services/forwarder/expose "),
+        "the hand-over asked for the bind: {requests:?}"
+    );
+    // An answer from the actor after the refused bind was served proves the
+    // hand-over's turn has ended.
+    let record = handle.record().await.expect("the record reads back");
+    assert!(
+        record.bound_ports.is_empty(),
+        "a refused bind is not recorded as bound"
+    );
+    {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(
+            routes.shared_port_collisions(yielder).is_empty(),
+            "the election stands: the box still holds the port of record"
+        );
+    }
+
+    // Nothing is tracked for the refused bind: the box's stop unbinds nothing.
+    destroy_session(&mut client, yielder).await;
+    forwarder.abort();
+    let requests = served.lock().expect("served lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the stop asks the switch for nothing: {requests:?}"
+    );
+}
+
 /// The write-lock promotion `register_hostname` runs after its wait, driven
 /// directly with no timers: a registration that took the `127.0.0.1` interim
 /// moves to its hand once the verdict vouches for it — whether the name is
