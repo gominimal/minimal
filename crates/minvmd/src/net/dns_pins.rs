@@ -170,6 +170,14 @@ pub(crate) struct L4Packet {
     pub(crate) proto: u8,
     /// TCP flags byte; `0` for UDP.
     pub(crate) tcp_flags: u8,
+    /// TCP sequence number; `0` for UDP.
+    pub(crate) tcp_seq: u32,
+    /// TCP acknowledgement number; `0` for UDP.
+    pub(crate) tcp_ack: u32,
+    /// TCP payload length in bytes — the IPv4 total length less both
+    /// headers, bounded by the bytes the frame carries; `0` for UDP and for
+    /// a TCP header too short to say.
+    pub(crate) tcp_payload_len: u16,
 }
 
 /// Parses an Ethernet II + IPv4 + TCP/UDP frame into its L4 addressing, or
@@ -206,6 +214,20 @@ pub(crate) fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
     if l4.len() < need {
         return None;
     }
+    let tcp_word = |at: usize| -> u32 {
+        l4.get(at..at + 4)
+            .and_then(|word| word.try_into().ok())
+            .map_or(0, u32::from_be_bytes)
+    };
+    let (tcp_seq, tcp_ack, tcp_payload_len) = if proto == IPPROTO_TCP {
+        let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+        let data_offset = usize::from(l4[12] >> 4) * 4;
+        let carried = l4.len().min(total.saturating_sub(ihl));
+        let payload = u16::try_from(carried.saturating_sub(data_offset)).unwrap_or(u16::MAX);
+        (tcp_word(4), tcp_word(8), payload)
+    } else {
+        (0, 0, 0)
+    };
     Some(L4Packet {
         src: SocketAddrV4::new(
             Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
@@ -217,6 +239,9 @@ pub(crate) fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
         ),
         proto,
         tcp_flags: if proto == IPPROTO_TCP { l4[13] } else { 0 },
+        tcp_seq,
+        tcp_ack,
+        tcp_payload_len,
     })
 }
 

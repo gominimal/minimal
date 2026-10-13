@@ -33,10 +33,20 @@ use crate::net::{PtaskLease, SwitchClient};
 /// `OwnIp` PTask leaves — and releasing the lease with the count, handed or
 /// drawn alike; a handed lease released with it is what lets the same box's
 /// re-attach re-hand its address, T66). It is **explicit** — driven on a
-/// live runtime by the owner — rather than a `Drop` schedule, so it cannot be
-/// lost to a stopped runtime. Dropping the held [`SwitchRelay`] aborts the
-/// frame relay either way.
+/// live runtime by the owner — so the normal path cannot be lost to a stopped
+/// runtime. A guard dropped without it — a task run whose future was aborted
+/// mid-await, say — schedules the same release on the runtime it drops on,
+/// so the lease never outlives the attach: a task slot held by a leaked lease
+/// would read as busy until the daemon restarts (NET-138). Dropping the held
+/// [`SwitchRelay`] aborts the frame relay either way.
 pub(crate) struct OwnIpGuard {
+    /// The attach this guard holds until its release; `None` once
+    /// [`NetGuard::teardown`] has taken it, so the drop owes nothing.
+    attach: Option<OwnIpAttach>,
+}
+
+/// What an own-IP attach holds until its release ([`OwnIpGuard`]).
+struct OwnIpAttach {
     /// Held for its `Drop`, which aborts the relay tasks; never read.
     _relay: SwitchRelay,
     /// The shared switch, locked on teardown to detach this PTask.
@@ -61,6 +71,69 @@ pub(crate) struct OwnIpGuard {
     runtime_ingress: Option<crate::net::provider::RuntimeIngress>,
 }
 
+impl OwnIpAttach {
+    /// The release [`NetGuard::teardown`] drives, and a dropped guard
+    /// schedules: forwards down, then the lease back with the count.
+    async fn release(self) {
+        // Remove ingress forwards (R2.3 teardown) before detaching: detach
+        // may stop gvproxy once the last PTask leaves, so the unexpose must
+        // reach a still-running switch first. On a VM-backed host the
+        // declared forwards are the host's to unbind at box end, so this
+        // asks the switch for nothing there.
+        let Self {
+            _relay: relay,
+            switch,
+            control,
+            exposed,
+            runtime_ingress,
+            lease,
+        } = self;
+        if !exposed.is_empty() {
+            crate::net::policy::release_declared_ingress(&control, &exposed).await;
+        }
+        // The runtime publishes deliver to the same lease, so they take
+        // the same path down — and the box refuses new ones until its
+        // next spawn attaches.
+        if let Some(runtime_ingress) = &runtime_ingress {
+            let runtime = runtime_ingress.detach();
+            if !runtime.is_empty() {
+                crate::net::policy::remove_ingress(&control, &runtime).await;
+            }
+        }
+        // Release before reuse: the relay and the forwarders hold the
+        // box's gate, so dropping them first ends its gate row, its flows
+        // and its admission windows before the lease goes back to the
+        // allocator.
+        drop(relay);
+        drop(exposed);
+        if let Err(e) = switch.lock().await.detach(lease).await {
+            tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
+        }
+    }
+}
+
+impl Drop for OwnIpGuard {
+    fn drop(&mut self) {
+        let Some(attach) = self.attach.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                tracing::debug!(
+                    ip = %attach.lease.ip,
+                    "own-IP attach dropped without its teardown; releasing it"
+                );
+                runtime.spawn(attach.release());
+            }
+            Err(_) => tracing::warn!(
+                ip = %attach.lease.ip,
+                "own-IP attach dropped off any runtime; its lease stays held \
+                 until the daemon restarts"
+            ),
+        }
+    }
+}
+
 impl OwnIpGuard {
     /// Revokes one declared port's ingress (NET-121): unbinds the
     /// forwarder(s) bound for `external_port` — terminating the connections
@@ -81,7 +154,13 @@ impl OwnIpGuard {
     /// error when the forwarder's own unbind failed.
     #[allow(dead_code)] // No policy-update trigger drives this yet; the NET-121 proof does.
     pub(crate) async fn revoke_ingress(&self, external_port: u16) -> io::Result<()> {
-        let matching: Vec<&PortForwarder> = self
+        let Some(attach) = self.attach.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no forwarder bound for external port {external_port}"),
+            ));
+        };
+        let matching: Vec<&PortForwarder> = attach
             .exposed
             .iter()
             .filter(|forwarder| !forwarder.is_revoked())
@@ -106,7 +185,7 @@ impl OwnIpGuard {
         // stands. The matching forwarders cannot appear here: two live
         // forwards cannot bind the same `host:port`, so no live forwarder of
         // another external port shares one with them.
-        let keep_admitted: std::collections::HashSet<u16> = self
+        let keep_admitted: std::collections::HashSet<u16> = attach
             .exposed
             .iter()
             .filter(|forwarder| !forwarder.is_revoked())
@@ -119,7 +198,7 @@ impl OwnIpGuard {
             .collect();
         let mut last_err = None;
         for forwarder in matching {
-            if let Err(e) = forwarder.revoke(&self.control, &keep_admitted).await {
+            if let Err(e) = forwarder.revoke(&attach.control, &keep_admitted).await {
                 last_err = Some(e);
             }
         }
@@ -131,41 +210,11 @@ impl OwnIpGuard {
 }
 
 impl NetGuard for OwnIpGuard {
-    fn teardown(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn teardown(mut self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let attach = self.attach.take();
         Box::pin(async move {
-            // Remove ingress forwards (R2.3 teardown) before detaching: detach
-            // may stop gvproxy once the last PTask leaves, so the unexpose must
-            // reach a still-running switch first. On a VM-backed host the
-            // declared forwards are the host's to unbind at box end, so this
-            // asks the switch for nothing there.
-            let Self {
-                _relay: relay,
-                switch,
-                control,
-                exposed,
-                runtime_ingress,
-                lease,
-            } = *self;
-            if !exposed.is_empty() {
-                crate::net::policy::release_declared_ingress(&control, &exposed).await;
-            }
-            // The runtime publishes deliver to the same lease, so they take
-            // the same path down — and the box refuses new ones until its
-            // next spawn attaches.
-            if let Some(runtime_ingress) = &runtime_ingress {
-                let runtime = runtime_ingress.detach();
-                if !runtime.is_empty() {
-                    crate::net::policy::remove_ingress(&control, &runtime).await;
-                }
-            }
-            // Release before reuse: the relay and the forwarders hold the
-            // box's gate, so dropping them first ends its gate row, its flows
-            // and its admission windows before the lease goes back to the
-            // allocator.
-            drop(relay);
-            drop(exposed);
-            if let Err(e) = switch.lock().await.detach(lease).await {
-                tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
+            if let Some(attach) = attach {
+                attach.release().await;
             }
         })
     }
@@ -475,12 +524,15 @@ async fn finish_own_ip_attach(
     }
 
     Ok(OwnIpGuard {
-        _relay: relay,
-        switch: Arc::clone(switch),
-        control,
-        exposed,
-        lease,
-        runtime_ingress: own_address.map(crate::net::provider::OwnAddressReporter::runtime_ingress),
+        attach: Some(OwnIpAttach {
+            _relay: relay,
+            switch: Arc::clone(switch),
+            control,
+            exposed,
+            lease,
+            runtime_ingress: own_address
+                .map(crate::net::provider::OwnAddressReporter::runtime_ingress),
+        }),
     })
 }
 
@@ -751,7 +803,19 @@ mod tests {
     /// an attach's own address alike.
     #[tokio::test]
     async fn own_ip_attach_uses_handed_address() {
-        let switch = vm_host_switch();
+        // The draw below stands in for a native one: a VM host's switch
+        // refuses every draw in production (NET-138,
+        // `host_shuttle_switch_refuses_self_allocation`), and this test
+        // lets it draw so the reserve's disjointness stays pinned here.
+        let switch = Arc::new(Mutex::new(
+            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_host_id("aaaa1")
+                .with_transport(SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                })
+                .allowing_self_allocation(),
+        ));
         // The handed address comes from the hand-out run — the plan run's
         // upper half, above the daemon's self-allocation reserve, which is
         // where a real host's registrations hand from.
@@ -803,8 +867,8 @@ mod tests {
             "the abandon releases the handed lease with the count"
         );
 
-        // The next box — one the activating client did not register —
-        // self-allocates from the daemon's reserve: the plan run's lower
+        // The next box — one the activating client did not register — draws
+        // from the daemon's reserve, as a native one does: the plan run's lower
         // half, a sub-run disjoint from the hand-out run the handed address
         // came from, so the two allocators cannot meet and the handed
         // address is never drawn.
@@ -1469,8 +1533,7 @@ mod tests {
         // The forwarders are held until stop: the guard's teardown unbinds
         // them, one unexpose per bound port. Teardown is explicit — the
         // sandbox layer drives it at the box's end — so the proof drives it
-        // too: a bare drop would only abort the frame relay and leave the
-        // forwards standing.
+        // too; a bare drop only schedules the same release on the runtime.
         Box::new(guard).teardown().await;
         let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
         assert_eq!(
@@ -1933,6 +1996,69 @@ mod tests {
             vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "teardown unbinds what the hand addressed: {unbound:?}"
         );
+        fake.abort();
+    }
+
+    /// NET-138: a task run's guard dropped without its teardown — the Env
+    /// actor's abort cancelling an in-box `min run` mid-await — still
+    /// releases its task slot, so the session's next run finds the slot free
+    /// rather than refused as busy until the daemon restarts.
+    #[tokio::test]
+    async fn a_dropped_guard_releases_its_task_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let slots = [Ipv4Addr::new(100, 64, 128, 20)];
+        let attached = switch
+            .lock()
+            .await
+            .attach_task_slot(&slots)
+            .await
+            .expect("the slot is free");
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            attached.lease,
+            "web",
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("the task's attach completes");
+        assert!(
+            matches!(
+                switch.lock().await.attach_task_slot(&slots).await,
+                Err(crate::net::NetError::TaskSlotsBusy { slots: 1 })
+            ),
+            "the run holds its slot"
+        );
+
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while switch.lock().await.attached() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped guard's release never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let again = switch
+            .lock()
+            .await
+            .attach_task_slot(&slots)
+            .await
+            .expect("the dropped run's slot is free again");
+        assert_eq!(again.lease.ip, slots[0]);
         fake.abort();
     }
 

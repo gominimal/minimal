@@ -275,10 +275,12 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
-            // A read-only lookup after an attach the gated `cmd_attach` already
-            // made: it only asks whether the session is gone, to release a
-            // `host_ip` name hold, and builds nothing a skew could half-make.
-            "cmd/session.rs::release_held_name_after_attach = ungated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/session.rs::session_record_by = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -1038,38 +1040,61 @@ fn provider_local_minimald_is_the_host_backend() {
 }
 
 #[test]
-fn net_setup_parses_to_the_setup_command() {
+fn finalize_install_parses_its_flags() {
     use clap::Parser as _;
-    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: false,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: false,
+            script: false,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: true
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: false,
+            json: true,
+            undo: false
         }))
     ));
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--undo", "--show", "--script"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: true
+        }))
+    ));
+    // `--script` and `--json` need `--show`; `--json` describes an install,
+    // not a removal; the two outputs exclude each other.
+    for args in [
+        &["min", "finalize-install", "--script"][..],
+        &["min", "finalize-install", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--undo"],
+        &["min", "finalize-install", "--undo", "--show", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--script"],
+        &["min", "net", "setup"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
 }
 
 #[test]
@@ -1741,6 +1766,88 @@ fn both_creators_share_the_composition_failure_message() {
     }
 }
 
+/// A daemon refusal is printed in the daemon's own words. The RPC's name
+/// is the wire's vocabulary, not the person's, so no creator, verdict
+/// submitter, finalizer or renamer may prefix the daemon's error with
+/// it. Asserted over the function bodies, the way the composition
+/// message is, because the prefix had crept into five sites across three
+/// files before anyone noticed it on a terminal.
+#[test]
+fn daemon_refusals_print_without_rpc_names() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func) in [
+        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/session.rs", "cmd_rename"),
+        ("src/task.rs", "cmd_task_run"),
+        ("src/cmd/mod.rs", "submit_verdict_and_wait"),
+        ("src/cmd/mod.rs", "upload_and_finalize"),
+    ] {
+        let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body =
+            function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        for bare in [
+            "CreateSession failed",
+            "RenameSession failed",
+            "SubmitVerdict failed",
+            "SubmitVerdict faulted",
+            "FinalizeSession failed",
+        ] {
+            assert!(
+                !body.contains(bare),
+                "{func} still prefixes the daemon's refusal with an RPC name ({bare})"
+            );
+        }
+    }
+
+    // The daemon's side of the same surface: its refusals are printed
+    // verbatim, at finalize through `upload_and_finalize` and at attach,
+    // so none of them may name the RPC a person would have to retry. The
+    // scan is over the string literals of the daemon's session module,
+    // which covers the refusals and the log lines alike; the module has
+    // no log-only RPC name left to exempt. The RPC names stay legitimate
+    // in type paths and comments, which the scan does not read. A literal
+    // is tracked across lines — the refusals are wrapped with `\` — so a
+    // continuation line with no quote of its own is still read.
+    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
+        .expect("readable daemon source");
+    let mut in_literal = false;
+    for (number, line) in daemon.lines().enumerate() {
+        if !in_literal && line.trim_start().starts_with("//") {
+            continue;
+        }
+        let in_string = in_literal || line.contains('"');
+        // Toggle on every unescaped quote, so the state at the line's end
+        // says whether the next line continues a literal.
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_literal = !in_literal,
+                _ => {}
+            }
+        }
+        if !in_string {
+            continue;
+        }
+        for rpc in [
+            "CreateSession",
+            "ConfigureLoadout",
+            "SubmitVerdict",
+            "FinalizeSession",
+            "RenameSession",
+            "WorkspacePatchesTarZst",
+        ] {
+            assert!(
+                !line.contains(rpc),
+                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
+                number + 1
+            );
+        }
+    }
+}
+
 /// A project outside a VCS root that declares lifecycle hooks must be
 /// detected as hook-carrying, so the headless activation path refuses
 /// rather than silently dropping the hooks with the skipped tree
@@ -1902,6 +2009,235 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
     cmd_stop(&global, StopArgs { force: false })
         .await
         .expect("an already-stopped daemon is the goal state, not an error");
+}
+
+/// The wedged-VM recovery: with a VM backend whose state says Running under a
+/// live alive-lock but no bridge socket to answer, `min stop --force` must
+/// stop the VM from the host — signal the VMM the state names, write
+/// `Stopped` — and exit 0, rather than failing on the refused connect and
+/// leaving the only recovery a hand-killed VMM.
+#[tokio::test]
+async fn stop_force_stops_a_wedged_vm_from_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    // The alive lock is held the way a real VM holds it: by the VMM process,
+    // through the inherited fd, so it is released when that process dies and
+    // not before.
+    let lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+    let mut vmm_cmd = std::process::Command::new("sleep");
+    vmm_cmd.arg("30");
+    lock.inherit_into(&mut vmm_cmd);
+    let mut vmm = vmm_cmd.spawn().expect("spawn sleep");
+    drop(lock);
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(vmm.id()),
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    assert!(
+        state_dir.daemon_alive().unwrap(),
+        "the stand-in VMM must hold the alive lock"
+    );
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    cmd_stop(&global, StopArgs { force: true })
+        .await
+        .expect("a wedged VM stopped from the host is the goal state");
+
+    assert_eq!(
+        state_dir.read_state().unwrap().lifecycle,
+        minvmd::lifecycle::Lifecycle::Stopped
+    );
+    assert!(
+        !state_dir.daemon_alive().unwrap(),
+        "the stop must not return while the alive lock is held: a `min start` would refuse"
+    );
+    // SIGTERM'd by the host-side stop; reaped here so the test leaves no stray.
+    let status = vmm.wait().unwrap();
+    assert!(
+        status.code().is_none(),
+        "expected a signalled VMM child, got {status:?}"
+    );
+}
+
+/// A VM that is still booting has no VMM pid to signal, so `min stop --force`
+/// must not report a host-side stop it did not make: it refuses with the
+/// retry, and leaves the boot's `Starting` state for the supervisor to finish.
+#[tokio::test]
+async fn stop_force_refuses_a_booting_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
+            vmm_pid: None,
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: true })
+        .await
+        .expect_err("a booting VM was not stopped from the host");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("still booting") && chain.contains("`min stop`"),
+        "expected the retry hint, got: {chain}"
+    );
+    assert_eq!(
+        state_dir.read_state().unwrap().lifecycle,
+        minvmd::lifecycle::Lifecycle::Starting
+    );
+}
+
+/// Without `--force`, a VM that is still booting is not told to use `--force`,
+/// which refuses a booting VM: the hint names the retry, and the failure stays
+/// the typed host-unreachable one.
+#[tokio::test]
+async fn stop_without_force_on_a_booting_vm_names_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
+            vmm_pid: None,
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: false })
+        .await
+        .expect_err("a booting VM that does not answer keeps failing");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("still booting") && !chain.contains("--force"),
+        "expected the retry hint and no --force, got: {chain}"
+    );
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
+    );
+}
+
+/// The wait a host-side stop ends on is the alive lock, not the lifecycle
+/// file: it fails while a minvmd still holds the lock, even over a `Stopped`
+/// state, and passes once the lock is released.
+#[test]
+fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = minvmd::state::StateDir::new(dir.path().to_path_buf()).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State::stopped())
+        .unwrap();
+    let lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
+        .expect_err("a held alive lock is not a finished stop");
+    assert!(
+        format!("{err:#}").contains("still holds the VM's alive lock"),
+        "got: {err:#}"
+    );
+
+    drop(lock);
+    wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
+        .expect("a released alive lock is a finished stop");
+}
+
+/// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
+/// VM that may still be draining is not the default behaviour — but the error
+/// names the recovery instead of a bare connect failure, and is the typed
+/// host-unreachable failure the binary exits 7 on.
+#[tokio::test]
+async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(std::process::id()),
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: false })
+        .await
+        .expect_err("a wedged VM without --force must keep failing");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("the VM is not answering") && chain.contains("--force"),
+        "expected the recovery hint, got: {chain}"
+    );
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
+    );
 }
 
 /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
@@ -2314,6 +2650,8 @@ async fn create_box_on(
                     .expect("the test cwd as a host path"),
                 network: sessions::NetworkMode::NoNet,
                 policy: sessions::SessionPolicy::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),
@@ -3113,9 +3451,15 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("default")
     );
 
-    // Session start: one line naming the VM the session landed on and the
-    // same port, so the two surfaces agree on the address to point at.
-    let start = hostname_proxy_start_line(Some("alpha"), NEXT_RUNG);
+    // Session start: the one host line names the same port as the routing
+    // line's `via 127.0.0.1:<port>`, so the two surfaces agree on the
+    // address to point at (NET-026 on the activate surface).
+    let start = crate::resolver::host_line(
+        "web",
+        &crate::resolver::LiveSurface::Proxy,
+        Some(NEXT_RUNG),
+        crate::resolver::HostInstall::default(),
+    );
     let address = format!("127.0.0.1:{NEXT_RUNG}");
     assert!(
         routing("alpha").contains(&address) && start.contains(&address),
@@ -3124,73 +3468,9 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("alpha")
     );
     assert!(
-        start.contains("VM alpha"),
-        "on a two-VM host the start line must say whose port it is: {start}"
+        !start.contains(&RECIPES_PORT.to_string()),
+        "the start line must not name the port the recipes assume: {start}"
     );
-
-    // And the wiring: the start line names a VM exactly when the backend hosts
-    // them — the selected VM on the VM backend, nothing on the native one,
-    // whose single daemon has no VM to name. This test process never publishes
-    // a `--vm` name, so the selected VM is the default one.
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    assert_eq!(
-        hostname_proxy_start_vm(&vm_globals(state.path(), None)),
-        Some(paths::DEFAULT_VM_NAME),
-        "the VM backend names the selected VM"
-    );
-    let native = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinimald),
-        no_input: true,
-        vm: None,
-    };
-    // Which backend `--provider local-minimald` selects is the platform's
-    // call: on Linux it is the native one, while macOS has no native backend
-    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
-    // there — the same rule every VM-backed gate keys on, flag or no flag.
-    // The expectation is therefore the kind's, not a constant.
-    let native_names_a_vm = cfg!(target_os = "macos");
-    assert_eq!(
-        hostname_proxy_start_vm(&native),
-        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
-        "the backend the flag selects names a VM exactly where that backend \
-         is the VM one"
-    );
-
-    // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one. A fact
-    // about the native backend, so it is asserted only where that backend
-    // exists: a host whose every backend is minvmd renders its routing lines
-    // through the VM listing, which names the VM the start line names above.
-    if !native_names_a_vm {
-        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-        let mut single = Vec::new();
-        let mut native_resp = reply.clone();
-        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-        format_ls(
-            &mut single,
-            &LsArgs {
-                raw: false,
-                json: false,
-            },
-            &native_resp,
-            None,
-            None,
-        )
-        .expect("rendering the single-VM listing");
-        let single = String::from_utf8(single).expect("the listing is UTF-8");
-        assert_eq!(
-            single
-                .lines()
-                .find(|l| l.starts_with("HOSTNAME PROXY:"))
-                .expect("the single-VM listing prints a routing line"),
-            native_start.as_str(),
-            "the native start line and `min ls`'s routing line must be the same \
-             line"
-        );
-    }
 }
 
 /// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and

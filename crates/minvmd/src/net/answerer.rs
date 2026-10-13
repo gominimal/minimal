@@ -646,17 +646,28 @@ impl AddressBook {
                 .values()
                 .map(|(_, at)| REUSE_QUARANTINE.saturating_sub(now.saturating_duration_since(*at)))
                 .min();
+            // The counts the refusal names: live, quarantined, and the
+            // range's capacity, so the line tells a full machine from one
+            // that frees an address in seconds.
+            let capacity = u32::from(last)
+                .saturating_sub(u32::from(first))
+                .saturating_add(1);
+            let (held, quarantined) = (self.held.len(), self.released.len());
             return Err(match next {
                 Some(wait) => format!(
-                    "every box address in {first}-{last} is held or was released less than \
-                     {} s ago (the answer TTL a host resolver may still serve it under); the \
-                     next one frees in {} s",
+                    "{} {first}-{last} is held or was released less than \
+                     {} s ago (the answer TTL a host resolver may still serve it under): \
+                     {held} of {capacity} are held by live boxes and {quarantined} are \
+                     quarantined; the next one frees in {} s",
+                    minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                     REUSE_QUARANTINE.as_secs(),
                     wait.as_secs().max(1)
                 ),
-                None => {
-                    format!("every box address in {first}-{last} is held; none remains to hand out")
-                }
+                None => format!(
+                    "{} {first}-{last} is held ({held} of {capacity} by \
+                     live boxes); none remains to hand out",
+                    minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
+                ),
             });
         };
         self.released.remove(&free);
@@ -1762,6 +1773,21 @@ fn serve_channel(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                // On macOS (and the BSDs) an accepted socket inherits the
+                // listener's O_NONBLOCK, so the hello's bounded read would
+                // answer WouldBlock at once whenever the node's hello had
+                // not arrived yet, and the connection would be dropped
+                // unanswered. The connection's reads are bounded by their
+                // own timeouts, so it is put back in blocking mode first.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    tracing::warn!(
+                        component = COMPONENT,
+                        %error,
+                        "could not put a channel connection into blocking mode; \
+                         dropped the connection"
+                    );
+                    continue;
+                }
                 // The uid gate, before any byte of the peer is read: a
                 // foreign process is refused on what it is, not on what
                 // it says, and the refusal is a warn naming its uid —
@@ -1801,10 +1827,12 @@ fn serve_channel(
                         refuse_foreign_peer(stream, uid, expected_uid);
                     }
                     Err(error) => {
-                        tracing::debug!(
+                        // A dropped connect loses that node's publishes
+                        // until it reconnects, so the drop is a warn.
+                        tracing::warn!(
                             component = COMPONENT,
                             %error,
-                            "could not read a channel peer's uid"
+                            "could not read a channel peer's uid; dropped the connection"
                         );
                     }
                 }
@@ -4794,6 +4822,62 @@ mod tests {
         handle
             .join()
             .expect("the gate's thread ends when its stop is set");
+    }
+
+    /// A node whose hello reaches the channel after the connect is accepted
+    /// is still served: the accepted connection blocks on its bounded hello
+    /// read rather than inheriting the poll-mode listener's O_NONBLOCK (the
+    /// macOS default), which would drop the connect unanswered.
+    #[test]
+    fn answerer_channel_serves_a_late_hello() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        // SAFETY: geteuid only reads the process's own uid.
+        let expected_uid = unsafe { libc::geteuid() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-late-hello".to_string())
+            .spawn(move || {
+                serve_channel(
+                    listener,
+                    Arc::new(RegisteredTables::new()),
+                    expected_uid,
+                    None,
+                    SERVICE_HOLDER,
+                    gate,
+                );
+            })
+            .expect("the channel's thread spawns");
+
+        let mut stream = UnixStream::connect(&channel).expect("the channel accepts");
+        // Longer than one accept poll slice, so the answerer has accepted
+        // the connect and started its hello read before the hello is sent.
+        std::thread::sleep(CONNECTION_POLL * 2);
+        stream
+            .set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT))
+            .expect("the read bound arms");
+        write_line(
+            &mut stream,
+            &Hello {
+                node: "vm-late".to_string(),
+                version: CHANNEL_PROTOCOL_VERSION,
+            },
+        )
+        .expect("the hello is written");
+        let reply = read_reply_line(&mut stream)
+            .expect("the hello reply reads")
+            .expect("the answerer answered the late hello");
+        let reply: RegistrationReply =
+            serde_json_lenient::from_str(reply.trim()).expect("the hello reply parses");
+        assert!(reply.ok, "the late hello is acked: {:?}", reply.error);
+
+        drop(stream);
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the channel's thread ends when its stop is set");
     }
 
     #[test]

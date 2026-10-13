@@ -39,6 +39,26 @@ pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
 /// holder's entry. Change it with the smoltcp version.
 pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a released switch address waits before it may be handed again,
+/// by either allocator that hands them: the in-VM or native daemon's
+/// self-allocation reserve and the VM host daemon's hand-out run. One value
+/// for both, because both hand addresses that wear the same derived MAC
+/// ([`MacAddr::for_switch_ip`]) on the one switch.
+///
+/// It must outlast every record that can still name a released address once
+/// its holder is gone: [`BEP_NEIGHBOUR_CACHE_LIFETIME`] (asserted below), and
+/// each allocator's own flow and admission timers, which each side asserts
+/// against this constant where those timers live. Waiting it out is
+/// necessary, not sufficient: each allocator also skips an address its own
+/// live state still names.
+pub const SWITCH_ADDRESS_REUSE_QUARANTINE: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+const _: () = assert!(
+    SWITCH_ADDRESS_REUSE_QUARANTINE.as_millis() > BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
+    "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
+);
+
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
 /// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
 /// host gvproxy switch (DM1/3/4).

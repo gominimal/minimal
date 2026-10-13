@@ -283,6 +283,8 @@ async fn run_session_exec(
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 // The serde default, and what every non-`--no-hooks`
                 // activation sends. This session only runs an exec, so

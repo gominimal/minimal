@@ -382,7 +382,9 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
 /// phase, modeled on [`crate::arm_activation_interrupt`]: the primary
 /// connection is parked in the exec bridge, so the handler works over a
 /// fresh connection. Without `--keep` the first Ctrl-C best-effort
-/// `DestroySession`s the box; with it the session is left alive and the
+/// `DestroySession`s the box and releases the name hold an attach or exec
+/// may have re-made for it ([`release_task_name_hold`]); with it the
+/// session is left alive and the
 /// handler says how to reach it. Either way the process exits 130. The
 /// destroy leg is bounded: the connect-and-destroy runs under the same
 /// 10-second cleanup ceiling as [`crate::best_effort_destroy`], and a
@@ -412,6 +414,10 @@ fn arm_task_run_interrupt(
 ) -> TaskRunInterrupt {
     let sock =
         crate::client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    let control_sock = crate::vm_host_control_sock(
+        crate::daemon_provider_kind(global),
+        global.minimal_dir.as_deref(),
+    );
     let task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
@@ -443,6 +449,9 @@ fn arm_task_run_interrupt(
                     .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
                     .await;
             }
+            // The run's own return never comes on this path, so the release
+            // it owes is made here, inside the same bound.
+            release_task_name_hold(control_sock, session_id, &session_name, false).await;
         };
         tokio::select! {
             res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
@@ -645,6 +654,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         project_path: abs_path.clone(),
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
+        task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         // Same default as an activate with no flags, matching the
         // loadout handling below. `min task run` has no `--no-hooks` of
@@ -725,7 +736,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                     config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
-                bail!("CreateSession failed: {error}");
+                bail!("{error}");
             }
         }
     };
@@ -785,16 +796,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches
     // approved through a Pending gate are appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
+    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     let configured = client
         .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
@@ -874,8 +876,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     }
     let _ = initial_policy;
 
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    minimal_client::dedup_patch_uploads(&mut collected_patches);
     if let Err(e) = crate::upload_and_finalize(
         &mut client,
         id,
@@ -924,9 +925,42 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
     }
+    release_task_name_hold(
+        crate::vm_host_control_sock(
+            crate::daemon_provider_kind(global),
+            global.minimal_dir.as_deref(),
+        ),
+        id,
+        &session_name,
+        args.keep,
+    )
+    .await;
     drop(run_guard);
 
     exit_outcome(outcome?)
+}
+
+/// Releases the name hold a finished run's session may carry on the VM
+/// host daemon, best-effort. A task run holds no name of its own, but a
+/// `min session attach` or `min exec` into its running session re-makes
+/// one (`rehold_held_name_before_attach` cannot tell a task session
+/// apart), and the daemon ends the session with the run, where no client
+/// destroy releases it; an interrupted run's raw `DestroySession` releases
+/// nothing either, so its handler calls this too. The release is by the
+/// session's `id`, so it frees
+/// only this session's hold, and a name nothing held is the goal state
+/// already holding. `keep` withholds it: a kept session lives on, and its
+/// destroy releases its hold.
+pub(crate) async fn release_task_name_hold(
+    control_sock: Option<std::path::PathBuf>,
+    id: sessions::SessionId,
+    name: &str,
+    keep: bool,
+) {
+    if keep {
+        return;
+    }
+    crate::release_held_box_name(control_sock, id, Some(name), None).await;
 }
 
 #[cfg(test)]

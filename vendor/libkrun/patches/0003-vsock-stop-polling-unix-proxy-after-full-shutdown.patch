@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Karl Godard <karl@minimal.dev>
+Date: Thu, 8 Oct 2026 21:53:07 +0000
+Subject: [PATCH] virtio/vsock: stop polling a unix proxy closed by a full
+ shutdown
+
+When the guest shuts down both directions of a stream mapped to a host
+unix socket, UnixProxy::shutdown() shuts down the host socket, marks the
+proxy Closed and returns the release update, but leaves the fd registered
+for EventSet::IN until the reaper removes the proxy.
+
+On Linux the shut-down socket reports EPOLLHUP, process_event() takes the
+HANG_UP arm, and that arm disarms the fd. The macOS epoll emulation maps
+an EOF on EVFILT_READ to IN | READ_HANG_UP, never HANG_UP, and
+process_event() ignores IN on a proxy that is not Connected. The
+level-triggered read filter therefore stays ready, and the muxer thread
+wakes on it in a tight loop until the reaper drops the proxy.
+
+Disarm the fd in the full-shutdown branch, as the other paths that close
+a proxy already do.
+
+Upstream: https://github.com/libkrun/libkrun/pull/916
+Signed-off-by: Karl Godard <karl@minimal.dev>
+Assisted-by: Claude Code: claude-opus-5-5
+---
+ src/devices/src/virtio/vsock/unix.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
+index d50269f..90550de 100644
+--- a/src/devices/src/virtio/vsock/unix.rs
++++ b/src/devices/src/virtio/vsock/unix.rs
+@@ -614,6 +614,7 @@ impl Proxy for UnixProxy {
+         self.push_reset();
+         let mut update = self.release();
+         self.status = ProxyStatus::Closed;
++        update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+         update.signal_queue = true;
+         update
+     }
+-- 
+2.55.0
+

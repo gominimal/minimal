@@ -537,7 +537,7 @@ impl BoxSession {
             // activate` files it: a box with no row is an unregistered
             // source the gate drops unconditionally (NET-085), so a box
             // whose own declared traffic is a positive control must hold one.
-            let addresses = common::register_box(control_sock, &name, Some(egress))?;
+            let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress))?;
             let req = CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
                     name: Some(name),
@@ -547,6 +547,8 @@ impl BoxSession {
                     policy,
                     // The addresses the registration handed back, so the
                     // in-VM daemon attaches the box at its row's lease.
+                    task_addresses: Vec::new(),
+                    box_id: Some(box_id),
                     box_addresses: Some(addresses),
                     // The serde default, and what every non-`--no-hooks`
                     // activation sends. This session only runs execs, so it

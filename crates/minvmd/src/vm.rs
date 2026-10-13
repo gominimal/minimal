@@ -379,11 +379,9 @@ impl VmConfig {
         // only what the shared frame verdict admits on to the gvproxy switch (the
         // single gVisor stack). Per-box egress rules are thereby applied **outside
         // the VM**, where nothing inside the escape boundary can change them, and
-        // a frame whose source address no namespace holds is dropped outside the
-        // plan's lease block — everywhere, once the per-box default binds; under
-        // the announced interim this build ships, an in-plan source no row holds
-        // is admitted, every admit warned (`egress_gate` carries the phase and
-        // why). Registered for every VM, not just own-IP: the guest's root netns (the
+        // a frame whose source address no namespace holds is dropped, wherever
+        // it is headed (NET-085; `egress_gate` carries the rules and the egress
+        // default's phase). Registered for every VM, not just own-IP: the guest's root netns (the
         // daemon) attaches a primary tap here for egress, and own-IP PTasks
         // attach further taps as additional clients on the same switch. If the
         // gate (or the switch behind it) did not come up, the guest's connect

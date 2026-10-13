@@ -199,12 +199,14 @@ fn fetch_cached(workspace: &Path, lock: &GvproxyLock) -> PathBuf {
 /// Registers one box with the VM host daemon over its control socket: one
 /// request line in, one reply line out, the exchange `min session activate`
 /// makes before it creates the session. Returns the addresses the host's
-/// table allocated for the row.
+/// table allocated for the row and the box id it assigned, which the
+/// session's config must carry: the in-VM daemon checks the row by that id
+/// before each exec and refuses a box without one.
 pub fn register_box(
     control_sock: &Path,
     name: &str,
     egress: Option<sessions::EgressPolicy>,
-) -> Result<minimald_rpc::BoxAddresses, String> {
+) -> Result<(minimald_rpc::BoxAddresses, minimald_rpc::BoxId), String> {
     let request = minimald_rpc::BoxControlRequest::Register(minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),
         ingress_ports: Vec::new(),
@@ -213,6 +215,7 @@ pub fn register_box(
         dynamic_ingress: None,
         dynamic_allowed_range: None,
         hold: false,
+        task_slots: 0,
     });
     let mut line = serde_json_lenient::to_string(&request)
         .map_err(|e| format!("serialize the box registration: {e}"))?;
@@ -232,11 +235,13 @@ pub fn register_box(
     match serde_json_lenient::from_str(reply.trim())
         .map_err(|e| format!("parse the box registration's reply {reply:?}: {e}"))?
     {
-        minimald_rpc::BoxControlReply::Registered(registered) => Ok(minimald_rpc::BoxAddresses {
-            switch_address: registered.switch_address,
-            loopback_address: registered.loopback_address,
-        }),
-        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
+        minimald_rpc::BoxControlReply::Registered(registered) => Ok((
+            minimald_rpc::BoxAddresses {
+                switch_address: registered.switch_address,
+                loopback_address: registered.loopback_address,
+            },
+            registered.box_id,
+        )),
         other => Err(format!(
             "the VM host refused the box registration: {other:?}"
         )),

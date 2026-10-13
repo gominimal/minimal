@@ -86,6 +86,8 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
+    FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
     /// naming the canonical `min task run <task>` (host) and
     /// `min session attach --command 'min task run <task>'` (in-box) forms.
@@ -703,9 +705,10 @@ pub struct ActivateArgs {
     /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
     /// — a declaration, not the default: on a host-address box the host's
     /// classifier decides it per box (NET-079), while a box that declares no
-    /// egress at all keeps the default the rollout phase resolves
-    /// (NET-074). Valid wherever the egress rule flags are; conflicts with
-    /// every one of them, because deny-all admits no exceptions.
+    /// egress at all gets the default NET-074 sets: deny-all for an own-ip
+    /// box, unless the host opts out. Valid wherever the egress rule flags
+    /// are; conflicts with every one of them, because deny-all admits no
+    /// exceptions.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
     /// Declare a credentialed upstream for this box (NET-134): the Box
@@ -1011,8 +1014,6 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
-    /// Set this host up to resolve and reach boxes by name (runs one privileged script; `--print` only prints it, `--undo` removes it)
-    Setup(NetSetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1028,18 +1029,26 @@ pub struct NetForwardArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct NetSetupArgs {
-    /// Print the setup script instead of running it
+pub struct FinalizeInstallArgs {
+    /// Name what is missing on this host and run nothing
     #[arg(long)]
-    pub print: bool,
-    /// Remove everything the setup step installs on this host (with --print, print the removal script)
+    pub show: bool,
+    /// With --show, also print the script a run would execute, on stdout
+    #[arg(long, requires = "show", conflicts_with = "json")]
+    pub script: bool,
+    /// With --show, print the report as JSON (schema `min/v1/finalize-install`); exits non-zero while any part is missing
+    #[arg(long, requires = "show", conflicts_with = "undo")]
+    pub json: bool,
+    /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one).
+    /// On a VM backend whose in-guest daemon does not answer, stops the VM from the host;
+    /// data not yet flushed inside the VM can then be lost
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }

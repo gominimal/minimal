@@ -374,6 +374,54 @@ pub(crate) fn reports_to_vm_host(control: &ControlChannel) -> bool {
     box_report_channel(control).is_some()
 }
 
+/// Whether the VM host daemon holds a row at `switch_address` (NET-138):
+/// the host's own table, read over the report door before this daemon
+/// relaunches a registered box whose host ended, so the box rejoins the
+/// switch only while the host's row stands for it — through its detach
+/// grace, or once its creator resumed it. `None` when the host could not be
+/// asked: a native host, which holds no rows, or a door that did not answer
+/// within [`REPORT_DEADLINE`] over its attempts. The caller reads `None` as
+/// no row, fail-closed. The host answers for `box_id` alone: a row it
+/// handed another box at the address is not this box's.
+pub(crate) async fn host_row_standing(
+    control: &ControlChannel,
+    switch_address: Ipv4Addr,
+    box_id: minimald_rpc::BoxId,
+) -> Option<bool> {
+    let channel = box_report_channel(control)?;
+    let request = minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+        switch_address,
+        box_id: Some(box_id),
+    });
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    for attempt in 1..=REPORT_ATTEMPTS {
+        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
+        match report_exchange(&channel, &request, bound).await {
+            Ok(minimald_rpc::BoxControlReply::RowStanding { row_standing, .. }) => {
+                return Some(row_standing);
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    %switch_address,
+                    reply = ?other,
+                    "the VM host daemon answered the row read with another verb's reply"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::debug!(%switch_address, attempt, %error, "the row read was not answered");
+            }
+        }
+        if attempt < REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    None
+}
+
 /// Raise one ask with the VM host daemon (NET-045): an expose decided `ask`
 /// on a VM-backed host is answered by the human attached on the host, not
 /// by a dialog this daemon renders, so the ask crosses the report door as

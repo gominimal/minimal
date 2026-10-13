@@ -1208,6 +1208,7 @@ mod tests {
             // `None`/`true`, so a fixture using those would round-trip
             // green even if the field were dropped on write.
             hooks_enabled: false,
+            task_addresses: Vec::new(),
             box_addresses: Some(crate::BoxAddresses {
                 switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
                 loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
@@ -1219,6 +1220,7 @@ mod tests {
             // record, which a client reads back through `GetSessionRecord`.
             host_ip_enforcement: None,
             // Non-default too, for the same reason: `false` is its serde default.
+            box_id: None,
             host_row_bound: true,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()

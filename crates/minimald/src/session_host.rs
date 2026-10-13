@@ -62,12 +62,12 @@ pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activatio
 pub(crate) const SHELL_EXIT_KEEP: &str =
     "Exit, leaving the session filesystem in place and recoverable";
 
-/// The Keep item for a registered box, whose host-side row ended with its
-/// shell (NET-138): the session keeps its files but can only be destroyed.
-/// Removed when the host-side re-registration lands (inbox#1020).
+/// The Keep item for a registered box, whose host-side row ends with its
+/// shell (NET-138): the client resumes the row before its next attach or
+/// exec, so the kept session comes back under the same addresses.
 pub(crate) const SHELL_EXIT_KEEP_REGISTERED: &str = "Exit, keeping the session's files. Its \
-     network registration ended with the shell, so you can only destroy this session, not \
-     attach to it or run commands in it.";
+     network registration ends with the shell and is restored when you attach or exec into \
+     the session again.";
 
 /// Header of the dialog a runtime port-publish request decided `ask` renders
 /// over the channel (NET-045), asking the attached human whether the box may
@@ -1165,11 +1165,14 @@ impl Binding {
             reason = "a client that cannot take the lead-in line cannot take the dialog either; \
                       the dialog's own result is the answer to relay"
         )]
+        // The same frame the VM-backed host's dialog draws
+        // (`minimal_client::ask_dialog`): the protocol on the lead-in — a
+        // runtime publish is TCP — and the `? ` the question leads with.
         let _ = w
-            .write_all(format!("\r\n{name} asks to publish port {port}.\r\n").as_bytes())
+            .write_all(format!("\r\n{name} asks to publish port {port}/tcp.\r\n").as_bytes())
             .await;
         let select = async_dialog::Select::new()
-            .with_prompt(ASK_PROMPT)
+            .with_prompt(format!("? {ASK_PROMPT}"))
             .items(["Deny", "Allow"])
             // Deny stands highlighted: the answer the box's own posture
             // would have given, so nothing publishes because someone held
@@ -1269,10 +1272,9 @@ impl Binding {
             Delete,
         }
 
-        // A registered box's host-side row ended with its shell (NET-138), and
-        // the daemon refuses to hand it a rowless host, so keeping it keeps its
-        // files and nothing else. This wording is removed when the host-side
-        // re-registration lands (inbox#1020).
+        // A registered box's host-side row ends with its shell (NET-138); the
+        // client resumes it before the next attach or exec, so the Keep item
+        // says the registration comes back rather than that nothing does.
         let keep_item = if holds_host_row {
             SHELL_EXIT_KEEP_REGISTERED
         } else {
@@ -1637,6 +1639,12 @@ pub(crate) struct Launched<P, G> {
     /// is this launch's own from the moment it is built: it never survives
     /// to a spawn that did not gather it.
     listen_plan: Option<crate::net::listeners::ListenPlan>,
+    /// The gate holding the launched shell before it execs, on a launch
+    /// minted only for lifecycle hooks (see [`SandboxLauncher::for_hooks`]):
+    /// the box exists for the hooks to run in, while the shell — whose
+    /// startup files are the user's — waits for the first attach. `None` on
+    /// every other launch, whose shell starts at once.
+    start_gate: Option<sandbox2::StartGate>,
 }
 
 /// Actor messages to a [`Host`].
@@ -2329,6 +2337,10 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     #[cfg_attr(test, allow(dead_code))]
     leaf: Option<sandbox2::config::ClassifierLeaf>,
 
+    /// The launch's start gate, held until the first attach; see
+    /// [`Launched::start_gate`] and [`Self::attach`].
+    start_gate: Option<sandbox2::StartGate>,
+
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
     session_name: String,
@@ -2937,7 +2949,8 @@ pub(crate) struct SandboxLauncher {
     /// attaches with instead of drawing one, and the published loopback
     /// address the host side names the box by. Ignored by every other
     /// network mode; `None` for a session the activating client did not
-    /// register, which self-allocates as it always has.
+    /// register, which self-allocates on a native host and is refused on a
+    /// VM host, where the in-VM daemon draws nothing (NET-138).
     pub(crate) box_addresses: Option<sessions::BoxAddresses>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
@@ -3938,8 +3951,10 @@ fn refused_unenforced_host_address_box(
                  is not in force, so a deny-all box's connections would not be \
                  refused: the box's declaration promises a verdict nothing here \
                  enforces, and the box was refused rather than run unenforced \
-                 (the table's refusal is not in force — {} reloads it)",
-                sandbox2::classifier::install_hint()
+                 (the table's refusal is not in force — the marker says loaded, so \
+                 {install} alone is a no-op; {install} --undo, then {install}, \
+                 reloads it)",
+                install = sandbox2::classifier::install_hint()
             )),
             Some(crate::net::classifier::Cause::ProbeUnreadable) => Some(
                 "this host's classifier table's effect could not be read, so \
@@ -4313,6 +4328,31 @@ impl SessionLauncher for SandboxLauncher {
                 "the session's host-address box runs unenforced on this host",
             );
         }
+        // The banner is the advisory's in-box surface, and follows the
+        // advisory's rule (NET-079): a native daemon only — per-box
+        // enforcement is a native-host fact, and the guest's state is the
+        // interim's, said in the record above — only while the box declares
+        // egress, because a box that declared nothing asked for no
+        // enforcement, and only over a decision that names a cause: a box
+        // nothing placed on a host that decides per box runs unenforced for
+        // a reason the record above names (the placement's own failure),
+        // not one an install or an own-address start ends, so the advisory
+        // would hand out a command that changes nothing. Its text is the
+        // create reply's own, which carries none without a cause either, so
+        // the terminal the start printed into and the shell it opens say the
+        // same thing.
+        let banner = match (
+            advise && !guest,
+            policy.egress.as_ref(),
+            decision
+                .as_ref()
+                .and_then(crate::net::classifier::Decision::cause),
+        ) {
+            (true, Some(egress), Some(cause)) => {
+                Some(crate::net::classifier::advisory_text(cause, egress))
+            }
+            _ => None,
+        };
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
@@ -4469,6 +4509,19 @@ impl SessionLauncher for SandboxLauncher {
                 .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
             container.set_session_leader();
+            // A launch minted only for hooks holds its shell at the gate: the
+            // hooks need the box, not the shell, and the shell's startup —
+            // the user's rc files and prompt commands — must not run ahead of
+            // the activate hooks it may depend on. The first attach releases
+            // it (see [`Host::attach`]).
+            let start_gate = if for_hooks {
+                Some(
+                    env.hold_start(&mut container)
+                        .map_err(|e| io::Error::other(format!("start gate: {e}")))?,
+                )
+            } else {
+                None
+            };
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
@@ -4487,14 +4540,17 @@ impl SessionLauncher for SandboxLauncher {
             // per box yet is told so at its own start, like any host's.
             // And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
-            if advise {
-                let notice = unenforced_placement_notice(guest, leaf.as_ref());
+            if let Some(notice) = &banner {
                 // The same write the shell fallback notice uses, for the
-                // same reasons: onto the pty's slave, best-effort, CRLF —
-                // see the comment there.
+                // same reasons: onto the pty's slave, best-effort, CRLF on
+                // each of the advisory's two lines — see the comment there.
+                let text = notice
+                    .lines()
+                    .map(|line| format!("minimal: {line}\r\n"))
+                    .collect::<String>();
                 let written = pty.dup_slave_fd().and_then(|fd| {
                     use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                    std::fs::File::from(fd).write_all(text.as_bytes())
                 });
                 if let Err(e) = written {
                     tracing::debug!(
@@ -4570,11 +4626,11 @@ impl SessionLauncher for SandboxLauncher {
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd))
+            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd, start_gate))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd) = match build_and_spawn {
+        let (env, master, process, tty_path, late_notice_fd, start_gate) = match build_and_spawn {
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
@@ -4773,6 +4829,7 @@ impl SessionLauncher for SandboxLauncher {
             // host that runs the box: taken when the host builds, so a
             // cancelled launch's plan never reaches any host at all.
             listen_plan,
+            start_gate,
         })
     }
 }
@@ -4974,6 +5031,9 @@ impl SessionLauncher for MockLauncher {
             // The plan the launch gathered, riding to the host the way a
             // real launch's plan rides: taken when the host builds.
             listen_plan: self.listen_plan,
+            // The mock's process is a plain host child with no pre-exec
+            // closure to hold it.
+            start_gate: None,
         })
     }
 }
@@ -5300,6 +5360,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             leaf,
             host_ip_enforcement,
             listen_plan,
+            start_gate,
         } = launcher
             .launch(
                 crate::guest::is_microvm_daemon(),
@@ -5400,6 +5461,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             home_dir,
             seal_injection,
             leaf,
+            start_gate,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
             chord_flush_deadline: None,
             guard,
@@ -6194,6 +6256,19 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         }
 
         self.set_size(sz);
+
+        // A host minted for hooks holds its shell at the start gate until a
+        // client is here for it: released now, with the binding installed and
+        // the pty sized, so the shell's startup runs after the activate hooks
+        // and on the terminal that attached — the order a shell minted by an
+        // attach has always had.
+        if let Some(gate) = self.start_gate.take() {
+            tracing::info!(
+                session = %self.session_name,
+                "released the hook-launched session shell to start for the attaching client"
+            );
+            gate.release();
+        }
 
         // After the binding is installed and sized, so a hook writing to
         // the terminal reaches the client that just attached.

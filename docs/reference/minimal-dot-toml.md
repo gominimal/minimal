@@ -98,7 +98,7 @@ See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
 `use` is an accepted alias for the canonical `name` key, and both parse.
 `[harness]`, the name of this section before v0.5.0, is no longer accepted:
-a file that still uses it warns that the key is unknown, so rename the
+a file that still uses it fails to load, naming the rename, so rename the
 section to `[stack]`.
 
 The environment variables and packages configured on a stack are inherited on all tasks in this repository.

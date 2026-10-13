@@ -11,6 +11,7 @@ license.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
+camino.workspace = true
 constcat.workspace = true
 indicatif.workspace = true
 # `libc` is only for the winsize ioctls (TIOCGWINSZ/TIOCSWINSZ) in

@@ -27,238 +27,18 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     activate_session(global, args, true).await
 }
 
-/// How long a box control request — a registration, or the withdrawal of
-/// the row a registration bought — may take before this invocation gives
-/// up on it. The control socket answers with map writes and an allocation,
-/// so healthy is milliseconds; the bound exists so a hung VM host daemon
-/// cannot hang the activation or destroy the user asked for.
-const BOX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// One control-socket exchange with the VM host daemon (T66): one JSON
-/// line in — the verb's request — and one line out — the untagged reply
-/// the verb is answered with.
-///
-/// The control socket lives beside the ssh socket in the minvmd
-/// provider-instance dir — the dir the daemon connection resolves through.
-/// A refusal (an exhausted address plan, a malformed declaration, a pair
-/// that is not the row's) surfaces here as an error naming the reason; a
-/// failed registration fails the activation it was for — the session does
-/// not start with the box unregistered — while a failed withdrawal
-/// degrades to a warning rather than failing the destroy it rides on.
-async fn control_request_with_vm_host(
-    sock_path: &std::path::Path,
-    request: minimald_rpc::BoxControlRequest,
-) -> anyhow::Result<minimald_rpc::BoxControlReply> {
-    control_exchange_with_vm_host(sock_path, request)
-        .await
-        .map(|(reply, _stream)| reply)
-}
-
-/// [`control_request_with_vm_host`] that hands the connection back beside
-/// the reply, for a verb whose connection outlives its one exchange — the
-/// held registration's lease ([`BoxLease`]).
-async fn control_exchange_with_vm_host(
-    sock_path: &std::path::Path,
-    request: minimald_rpc::BoxControlRequest,
-) -> anyhow::Result<(minimald_rpc::BoxControlReply, tokio::net::UnixStream)> {
-    use tokio::io::AsyncBufReadExt as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    let mut stream = tokio::net::UnixStream::connect(sock_path)
-        .await
-        .with_context(|| {
-            format!(
-                "connecting to the VM host daemon's box control socket at {}",
-                sock_path.display()
-            )
-        })?;
-    let mut line =
-        serde_json_lenient::to_string(&request).context("serializing the box control request")?;
-    line.push('\n');
-    stream
-        .write_all(line.as_bytes())
-        .await
-        .context("writing the box control request")?;
-    let mut reply = String::new();
-    // The daemon writes nothing past its one reply line until the client
-    // writes again, so the reader buffers nothing the connection still owes.
-    tokio::io::BufReader::new(&mut stream)
-        .read_line(&mut reply)
-        .await
-        .context("reading the box control reply")?;
-    if reply.trim().is_empty() {
-        anyhow::bail!(
-            "the VM host daemon closed its control socket without answering the box control request"
-        );
-    }
-    let reply: minimald_rpc::BoxControlReply = serde_json_lenient::from_str(reply.trim())
-        .with_context(|| {
-            format!("the VM host daemon's box control reply did not parse: {reply}")
-        })?;
-    Ok((reply, stream))
-}
-
-/// A held registration's lease ([`minimald_rpc::RegisterBoxRequest::hold`]):
-/// the connection the registration was answered on, kept open while the
-/// activation runs. Dropping it uncommitted — an activation that fails, is
-/// interrupted, or dies — closes the connection, and the VM host daemon
-/// withdraws the row on that close, so a row whose activation never went
-/// active does not hold its name until the daemon restarts. [`Self::commit`]
-/// keeps the row once the session is active.
-#[derive(Debug)]
-struct BoxLease {
-    stream: tokio::net::UnixStream,
-}
-
-impl BoxLease {
-    /// Commit the lease: write the one commit line and close, so the row
-    /// stays when the connection does. A commit that cannot be written is
-    /// a daemon that already closed the lease — one that predates leases
-    /// and answered one-shot, or one that went away — and is logged, not
-    /// fatal: the session is already active.
-    async fn commit(mut self) {
-        use tokio::io::AsyncWriteExt as _;
-        let line = format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE);
-        match tokio::time::timeout(BOX_CONTROL_TIMEOUT, self.stream.write_all(line.as_bytes()))
-            .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::debug!(%error, "could not commit the box's registration lease");
-            }
-            Err(_) => tracing::debug!(
-                "the box's registration lease commit did not complete in {BOX_CONTROL_TIMEOUT:?}"
-            ),
-        }
-    }
-}
-
-/// Run `finalize` — the step that makes the session active — with the
-/// registration's lease held across it, and commit the lease only when it
-/// succeeds. A failure drops the lease uncommitted, so the VM host daemon
-/// withdraws the row with the activation.
-async fn finalize_holding_lease<T>(
-    lease: Option<BoxLease>,
-    finalize: impl std::future::Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
-    let finalized = finalize.await;
-    if finalized.is_ok()
-        && let Some(lease) = lease
-    {
-        lease.commit().await;
-    }
-    finalized
-}
-
-/// What a successful registration with the VM host daemon hands the
-/// activating client back (T66, NET-133): the addresses the create request
-/// carries, and the box's own id when the daemon's reply named one — the
-/// id the host minted for this creation, which the published row holds and
-/// its attachment carries. This is the client's record of that id; the
-/// client never sends one. A reply that carries no id — from a daemon that
-/// predates ids — is still a successful registration: the client simply
-/// records no id, and the row and its attachment name the box host-side as
-/// ever.
-#[derive(Debug)]
-struct RegisteredWithVmHost {
-    /// The addresses the create request carries, so the in-VM daemon
-    /// attaches with the handed switch address instead of drawing its own.
-    addresses: sessions::BoxAddresses,
-    /// The box's own id the reply returned — 32 hex digits on the wire,
-    /// the one spelling the row, the attachment and a diagnostic all name
-    /// it by — or `None` when the answering daemon predates ids.
-    box_id: Option<minimald_rpc::BoxId>,
-    /// The registration's lease, held until the session is active and
-    /// committed then; `None` from a daemon that predates ids, which
-    /// predates leases too and answered one-shot.
-    lease: Option<BoxLease>,
-}
-
-/// Registers an own-address box with the VM host daemon over its control
-/// socket (T66), returning what it handed back.
-async fn register_box_with_vm_host(
-    sock_path: &std::path::Path,
-    request: minimald_rpc::RegisterBoxRequest,
-) -> anyhow::Result<RegisteredWithVmHost> {
-    let (reply, stream) = control_exchange_with_vm_host(
-        sock_path,
-        minimald_rpc::BoxControlRequest::Register(request),
-    )
-    .await?;
-    match reply {
-        // The answer a daemon this build boots beside sends: the addresses
-        // beside the id the published row holds, on the connection a held
-        // registration keeps as its lease.
-        minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
-            addresses: sessions::BoxAddresses {
-                switch_address: web.switch_address,
-                loopback_address: web.loopback_address,
-            },
-            box_id: Some(web.box_id),
-            lease: Some(BoxLease { stream }),
-        }),
-        // A daemon that predates ids answers with the bare pair the
-        // registration has always been answered with.
-        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
-            addresses,
-            box_id: None,
-            lease: None,
-        }),
-        minimald_rpc::BoxControlReply::Error { error } => {
-            anyhow::bail!("the VM host daemon refused the box registration: {error}")
-        }
-        // The reply shapes are disjoint, so this arm is a daemon speaking
-        // another verb's answer to a register — not an address pair either
-        // way, so the registration did not happen.
-        minimald_rpc::BoxControlReply::Status(status) => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with its \
-                 answerer status {status:?}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::Row(row) => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the box \
-                 row {row:?}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::NoRow { name, .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the no-row \
-                 marker for {name:?}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::NameHeld { name, .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the name-hold \
-                 marker for {name:?}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::PortRecorded { port, .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with the port \
-                 report {port}; the registration did not happen"
-            )
-        }
-        minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with an \
-                 answerer release reply; the registration did not happen"
-            )
-        }
-        other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
-        | minimald_rpc::BoxControlReply::PendingAskOffer(_)
-        | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
-        | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
-        | minimald_rpc::BoxControlReply::AskAdmit(_)
-        | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
-            anyhow::bail!(
-                "the VM host daemon answered the box registration with an ask \
-                 verb's reply {other:?}; the registration did not happen"
-            )
-        }
-    }
-}
+// The box registration exchange with the VM host daemon (T66) — the
+// register, its lease, the withdrawal and the resume — is the client
+// library's, shared with `min dash` so the two front-ends cannot drift.
+pub(crate) use minimal_client::box_registration::withdraw_box_row;
+use minimal_client::box_registration::{
+    BOX_CONTROL_TIMEOUT, control_request_with_vm_host, finalize_holding_lease,
+    register_box_reminting_autogen, resume_box_row,
+};
+#[cfg(test)]
+use minimal_client::box_registration::{
+    RegisteredWithVmHost, register_box_for_activation, register_box_with_vm_host,
+};
 
 /// The provider kind this invocation's daemon connection resolves through:
 /// `client_provider_kind`, the same key the socket resolution itself and the
@@ -310,7 +90,7 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
-/// The host reads `min net setup` decides its script from (NET-122): this
+/// The host reads `min finalize-install` decides its script from (NET-122): this
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
 /// for the render.
@@ -423,181 +203,6 @@ pub(crate) fn vm_host_answerer_start_line(
     crate::resolver::vm_host_answerer_line(status).map(|line| format!("zone answerer: {line}"))
 }
 
-/// Withdraws the box's host row (T66) when the session that registered it
-/// is gone — destroyed, or an activation that failed after registering:
-/// the row has no holder left, so its creator presents the pair the
-/// registration handed back and the daemon stops the pair's addresses
-/// admitting anything.
-///
-/// Always quiet when it owes nothing: a session that registered no box — a
-/// native host, a host-ip box sharing the node's own row, a refused
-/// registration — withdraws nothing and says nothing. In particular it
-/// never releases a held `host_ip` name: an activation that failed holds
-/// none (the hold is made only once the session is active), and the name
-/// may be a live session's — an autogen collision is exactly that — so
-/// only the destroy of the session that held it releases it
-/// ([`release_held_box_name`]). A withdrawal that cannot be made — no
-/// control socket, a daemon that predates the verb and refuses the line,
-/// the deadline — leaves the row published and warns rather than failing
-/// the destroy or the activation error it rides on; the daemon restarting
-/// between registration and withdrawal answers the withdrawal as already
-/// gone, which is the goal state either way.
-pub(crate) async fn withdraw_box_row(
-    control_sock: Option<std::path::PathBuf>,
-    name: Option<&str>,
-    box_addresses: Option<sessions::BoxAddresses>,
-) {
-    let Some(name) = name else { return };
-    let Some(addresses) = box_addresses else {
-        return;
-    };
-    let Some(sock_path) = control_sock else {
-        tracing::warn!(
-            box = %name,
-            "cannot resolve the VM host daemon's control socket; the box's \
-             host row stays published until the daemon next restarts"
-        );
-        return;
-    };
-    let request = minimald_rpc::WithdrawBoxRequest {
-        name: name.to_string(),
-        switch_address: addresses.switch_address,
-        loopback_address: addresses.loopback_address,
-    };
-    let withdrawn = tokio::time::timeout(
-        BOX_CONTROL_TIMEOUT,
-        control_request_with_vm_host(
-            &sock_path,
-            minimald_rpc::BoxControlRequest::Withdraw(request),
-        ),
-    )
-    .await;
-    match withdrawn {
-        Ok(Ok(reply)) => match reply {
-            // The daemon answers the withdrawal with the pair it went by; a
-            // pair back that is not the pair asked is a daemon speaking
-            // another protocol's answer — the row asked for is not
-            // withdrawn, so say so.
-            minimald_rpc::BoxControlReply::Addresses(handed) if handed == addresses => {
-                tracing::info!(
-                    box = %name,
-                    switch_address = %handed.switch_address,
-                    loopback_address = %handed.loopback_address,
-                    "withdrew the box's host row; its addresses admit nothing"
-                );
-            }
-            minimald_rpc::BoxControlReply::Addresses(handed) => {
-                tracing::warn!(
-                    box = %name,
-                    switch_address = %handed.switch_address,
-                    "the VM host daemon answered the withdrawal with a different \
-                     address pair; the row asked for stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::Error { error } => {
-                tracing::warn!(
-                    box = %name,
-                    %error,
-                    "the VM host daemon refused the box row withdrawal; the row \
-                     stays published"
-                );
-            }
-            // A status reply is another verb's answer on a wire whose
-            // reply shapes are disjoint: the row asked for was not
-            // withdrawn, so say so and leave it published.
-            minimald_rpc::BoxControlReply::Status(status) => {
-                tracing::warn!(
-                    box = %name,
-                    status = ?status,
-                    "the VM host daemon answered the box row withdrawal with its \
-                     answerer status; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with an \
-                     answerer release reply; the row stays published"
-                );
-            }
-            // A withdrawal is never answered with a registered box — but a
-            // daemon that speaks another shape here is still not answering
-            // the withdrawal, so the row stays published and the line says
-            // so.
-            minimald_rpc::BoxControlReply::Registered(_) => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     registration; the row stays published"
-                );
-            }
-            // The read-only and report replies are other verbs' answers on
-            // a wire whose shapes are disjoint: none of them says the row
-            // went, so the row stays published and the line says so.
-            minimald_rpc::BoxControlReply::Row(_) => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     row read; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::NoRow { .. } => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     no-row marker; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::NameHeld {
-                name: held_name, ..
-            } => {
-                tracing::warn!(
-                    box = %name,
-                    held_name = %held_name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     name-hold reply; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::PortRecorded { port, .. } => {
-                tracing::warn!(
-                    box = %name,
-                    port,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     port report; the row stays published"
-                );
-            }
-            other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
-            | minimald_rpc::BoxControlReply::PendingAskOffer(_)
-            | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
-            | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
-            | minimald_rpc::BoxControlReply::AskAdmit(_)
-            | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
-                tracing::warn!(
-                    box = %name,
-                    reply = ?other,
-                    "the VM host daemon answered the box row withdrawal with an \
-                     ask verb's reply; the row stays published"
-                );
-            }
-        },
-        Ok(Err(error)) => {
-            tracing::warn!(
-                box = %name,
-                %error,
-                "the box row withdrawal failed; the row stays published"
-            );
-        }
-        Err(_) => {
-            tracing::warn!(
-                after = ?BOX_CONTROL_TIMEOUT,
-                box = %name,
-                "the VM host daemon did not answer the box row withdrawal in \
-                 time; the row stays published"
-            );
-        }
-    }
-}
-
 /// Releases the zone hold a destroyed session's activation made, when the
 /// session registered no row (`box_addresses` is `None` — a `host_ip` box
 /// holds its name in place of a row): the destroy-side twin of the hold
@@ -619,51 +224,173 @@ pub(crate) async fn release_held_box_name(
     hold_box_name_with_vm_host(control_sock, name, Some(id), false).await;
 }
 
-/// Releases a session's held name once an interactive attach on a
-/// VM-backed host has ended with the session gone: the shell-exit prompt's
-/// Delete destroys the session daemon-side, so neither `min session attach`
-/// nor `activate --attach` passes through [`destroy_session`], and this is
-/// the release that destroy would have made. The lookup and the release are
-/// both by the session's `id`: a session still there — a detach, a Keep —
-/// keeps its hold, a newer session that took the name keeps its own, and a
-/// hold a rename moved to another name is freed with its session.
-/// Best-effort: a lookup that fails or times out releases nothing, and a
-/// session that held nothing (an own-address box, a `none` box) is the
-/// goal state already holding.
-///
-/// A destroy no client of this host issues — the daemon's own reap — still
-/// leaves the hold until the VM host daemon restarts: holds carry no
-/// liveness signal of their own.
-pub(crate) async fn release_held_name_after_attach(
+/// A session's record by its `id`, bounded by [`BOX_CONTROL_TIMEOUT`]:
+/// `None` once the session is gone. An interactive attach on a VM-backed
+/// host reads it twice — before the attach, for the pair the box's row was
+/// registered with, and after, to tell whether the attach ended in a
+/// daemon-side destroy ([`release_held_name_after_attach`]).
+async fn attached_session_record(
     sock: &std::path::Path,
     id: sessions::SessionId,
-    name: &str,
-) {
-    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
-    let lookup = tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
+) -> anyhow::Result<Option<sessions::Record>> {
+    session_record_by(sock, minimald_rpc::GetSessionRecordRequest::Id(id)).await
+}
+
+/// A session's record by `request`, bounded by [`BOX_CONTROL_TIMEOUT`]:
+/// `None` when no session answers to it.
+async fn session_record_by(
+    sock: &std::path::Path,
+    request: minimald_rpc::GetSessionRecordRequest,
+) -> anyhow::Result<Option<sessions::Record>> {
+    use minimald_rpc::GetSessionRecord;
+    tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
         let mut client = client::Client::connect(sock).await?;
         let resp = client
-            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+            .oneshot_rpc::<GetSessionRecord>(request)
             .await
             .context("GetSessionRecord RPC failed")?;
         anyhow::Ok(resp.record)
     })
-    .await;
-    match lookup {
-        Ok(Ok(None)) => {
-            hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
-        }
-        Ok(Ok(Some(_))) => {}
-        Ok(Err(error)) => tracing::debug!(
+    .await
+    .map_err(|_| anyhow::anyhow!("no session lookup answer within {BOX_CONTROL_TIMEOUT:?}"))?
+}
+
+/// Releases what a session held on the VM host daemon once an interactive
+/// attach on a VM-backed host has ended with the session gone: the
+/// shell-exit prompt's Delete destroys the session daemon-side, so neither
+/// `min session attach` nor `activate --attach` passes through
+/// [`destroy_session`], and this is the release that destroy would have
+/// made — the row's withdrawal (T66) for a box that registered one, whose
+/// pair `box_addresses` was read off the record before the attach, and the
+/// name hold's release for one that did not. The lookup and the release
+/// are both by the session's `id`: a session still there — a detach, a
+/// Keep — keeps its row and its hold, a newer session that took the name
+/// keeps its own, and a hold a rename moved to another name is freed with
+/// its session. Best-effort: a lookup that fails or times out releases
+/// nothing, and a session that held nothing (a `none` box) is the goal
+/// state already holding.
+///
+/// A destroy no client of this host issues — the daemon's own reap —
+/// releases nothing: the in-VM daemon sends no hold verb. That hold, like
+/// one whose release was lost, stands until the VM host daemon's next
+/// restart, after which it is dropped unless a client's attach or exec
+/// re-makes it. The hold blocks nothing meanwhile — a
+/// registration under the name is checked against rows and creations,
+/// never holds, and a new session's hold of the name takes it over — so
+/// all it keeps is the name answering NODATA, not NXDOMAIN.
+pub(crate) async fn release_held_name_after_attach(
+    sock: &std::path::Path,
+    id: sessions::SessionId,
+    name: &str,
+    box_addresses: Option<sessions::BoxAddresses>,
+) {
+    match attached_session_record(sock, id).await {
+        Ok(None) => match box_addresses {
+            // The record carries no box id, so the pair is the proof.
+            Some(addresses) => {
+                let (ssh_sock, box_name) = (sock.to_path_buf(), name.to_string());
+                let _ = tokio::task::spawn_blocking(move || {
+                    minimal_client::attach::withdraw_box_row_beside(
+                        &ssh_sock, &box_name, addresses, None,
+                    )
+                })
+                .await;
+            }
+            None => {
+                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
+            }
+        },
+        Ok(Some(_)) => {}
+        Err(error) => tracing::debug!(
             box = %name,
             error = %format!("{error:#}"),
-            "could not tell whether the attached session is gone; its name hold stays"
-        ),
-        Err(_) => tracing::debug!(
-            box = %name,
-            "no session lookup answer within {BOX_CONTROL_TIMEOUT:?}; the name hold stays"
+            "could not tell whether the attached session is gone; its row and name hold stay"
         ),
     }
+}
+
+/// Re-sends the name hold an interactive attach or exec on a VM-backed
+/// host depends on, best-effort, before the attach or the exec passes.
+/// A VM host daemon restarts quickly and holds lived only in its memory
+/// before they were persisted, so a hold this session bought — or a hold
+/// a persisted registry failed to carry, its write a warn line — may be
+/// gone by the time the attach lands; the re-hold is idempotent, so it
+/// remakes the hold and the name answers NODATA through the attach
+/// either way. Only a named `host_ip` session without a box row needs
+/// it: a box that registered a row owns its name through the row, which
+/// `resume_box_row` re-sends, and a `none` or `own_ip` session holds
+/// nothing.
+///
+/// The record was read before the hold, so a destroy another client
+/// issues in between can release the session's holds first and leave
+/// this one standing for a session that is gone — until the VM host
+/// daemon's next restart, which drops a reloaded hold nothing re-makes.
+/// The session is looked up again once the hold
+/// is made, and a session gone by then has the hold undone: a destroy
+/// that lands after that lookup releases it itself. A live session that
+/// took the name over in between had its hold taken over by this one, so
+/// the undo hands the hold back to it rather than releasing the name; with
+/// no such session, the hold is released by the gone session's id; a name
+/// lookup that fails tells neither, and the hold is left as made. A hold the
+/// VM host daemon did not make — one that predates the verbs, or did not
+/// answer — leaves nothing to undo, so neither the second lookup nor the
+/// release is made.
+pub(crate) async fn rehold_held_name_before_attach(
+    sock: &std::path::Path,
+    id: sessions::SessionId,
+    record: Option<&sessions::Record>,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    if record.network != sessions::NetworkMode::HostNet {
+        return;
+    }
+    if record.box_addresses.is_some() {
+        return;
+    }
+    let Some(name) = record.name.as_deref() else {
+        return;
+    };
+    if !hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), true).await {
+        return;
+    }
+    if let Ok(None) = attached_session_record(sock, id).await {
+        let by_name = session_record_by(
+            sock,
+            minimald_rpc::GetSessionRecordRequest::Name(name.to_string()),
+        )
+        .await;
+        match rehold_undo(id, by_name) {
+            Some((holder, hold)) => {
+                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(holder), hold)
+                    .await;
+            }
+            None => tracing::debug!(
+                box = %name,
+                "could not tell who answers to the name now; the re-hold stays"
+            ),
+        }
+    }
+}
+
+/// The undo of a re-hold made for session `id`, found gone since, from the
+/// lookup of its name (`by_name`): the session to send the verb for and
+/// whether the verb is a hold. A live `host_ip` session without a row that
+/// answers to the name now is handed the hold back; no such session, and
+/// the hold is released by `id`. A lookup that failed tells neither, so
+/// nothing is undone (`None`): a release there could take the name from a
+/// live session, and a hold left standing blocks nothing.
+fn rehold_undo(
+    id: sessions::SessionId,
+    by_name: anyhow::Result<Option<sessions::Record>>,
+) -> Option<(sessions::SessionId, bool)> {
+    let taken_over_by = by_name.ok()?.filter(|other| {
+        other.id != id
+            && other.network == sessions::NetworkMode::HostNet
+            && other.box_addresses.is_none()
+    });
+    Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
 }
 
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
@@ -675,13 +402,15 @@ pub(crate) async fn release_held_name_after_attach(
 /// verbs refuses them and the session goes on exactly as it did before —
 /// the name answers NXDOMAIN there, which is never a state a session
 /// fails over. Both carry the session `id` the hold is for, so a release
-/// frees only that session's hold.
+/// frees only that session's hold. Returns whether the VM host daemon
+/// answered the verb: `false` for no VM host daemon to ask, a refusal, or
+/// no answer.
 async fn hold_box_name_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     name: &str,
     id: Option<sessions::SessionId>,
     hold: bool,
-) {
+) -> bool {
     let request = minimald_rpc::HoldBoxNameRequest {
         name: name.to_string(),
         session_id: id,
@@ -698,20 +427,29 @@ async fn hold_box_name_with_vm_host(
         )
     };
     let Some(sock_path) = control_sock else {
-        return;
+        return false;
     };
     let sent = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
         control_request_with_vm_host(&sock_path, verb),
     )
     .await;
+    // The reply's fields are not checked against the request: minvmd
+    // builds `NameHeld` from the request itself — `hold_box_name` answers
+    // `{name: request.name, held: true}` and `release_box_name` answers
+    // `{name: request.name, held: false}`, unconditionally
+    // (crates/minvmd/src/control.rs) — so a reply naming another name or
+    // state cannot come from a VM host daemon that answered this request;
+    // it would be a protocol bug on that side, which a client-side check
+    // would not repair. Any other verb's reply, a refusal, or no answer
+    // is reported as a failure below.
     let failure = match sent {
         Ok(Ok(minimald_rpc::BoxControlReply::NameHeld { .. })) => None,
         Ok(Ok(other)) => Some(format!("another verb's reply: {other:?}")),
         Ok(Err(error)) => Some(error.to_string()),
         Err(_) => Some(format!("no answer within {BOX_CONTROL_TIMEOUT:?}")),
     };
-    if let Some(reason) = failure {
+    if let Some(reason) = &failure {
         tracing::warn!(
             box = %name,
             operation,
@@ -719,159 +457,7 @@ async fn hold_box_name_with_vm_host(
              answers as it did before"
         );
     }
-}
-
-/// Registers this activation's box with the VM host daemon, when the daemon
-/// this invocation talks to is minvmd-backed (T66), returning what it handed
-/// back — `Ok(None)` when there is nothing to register.
-///
-/// The box this activation creates is registerable only when the daemon
-/// connection resolves through minvmd — [`daemon_provider_kind`], never
-/// `use_minvmd()`: the flag is how Linux asks for the VM host, and macOS
-/// reaches it with no flag at all, so keying on the flag would leave a macOS
-/// box with no row and its declared egress applied nowhere — and only when
-/// it is an own-address box: a `host_ip` box shares the node's own row in
-/// the host table, and a `none` box has no switch address at all — both
-/// register nothing and attach exactly as they always have. A `host_ip`
-/// box's name is held in the zone instead (best-effort, NODATA rather than
-/// NXDOMAIN), but only once its session is active ([`activate_session`]).
-///
-/// The box's own id comes back with it (NET-133): the request carries no
-/// id, the host mints one for this creation, and the reply returns the id
-/// the published row holds, which the client records — so the CLI, the row
-/// and the attachment all carry the one id per box: the id a delivered
-/// connection is attributed by. Every registration is a new creation with a
-/// new id, the autospawn retry's re-registration included. A daemon that
-/// predates ids answers with the bare pair; that registration succeeded
-/// too, and the client records no id.
-///
-/// A registration that cannot be made — an unresolvable provider dir, a
-/// refusal, the deadline — fails the activation with its cause rather than
-/// degrading to a warning: a box that went on to create unregistered would
-/// run with no host-side row holding it (NET-138), its frames unattributed
-/// and its declared egress decided by no row the host gate (NET-081) reads,
-/// so the session does not start half-admitted. The error is the one line
-/// session start owes this failure.
-async fn register_box_for_activation(
-    kind: paths::ProviderKind,
-    minimal_dir: Option<&std::path::Path>,
-    network: sessions::NetworkMode,
-    name: &str,
-    policy: &sessions::SessionPolicy,
-) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    if kind != paths::ProviderKind::Minvmd || network != sessions::NetworkMode::OwnIp {
-        return Ok(None);
-    }
-    // The control socket sits beside the ssh socket in the provider dir the
-    // daemon connection resolves through, so the client finds both by the
-    // same rule — named VMs included, since the resolution reads the same
-    // process-global VM name.
-    let ssh_sock = client::resolve_socket_path(minimal_dir, true)
-        .context("resolving the VM host provider dir to register the box's host row")?;
-    let sock_path = ssh_sock
-        .parent()
-        .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
-        .ok_or_else(|| anyhow::anyhow!("no provider dir resolved for the ssh socket"))?;
-    // The declaration, as this activation expanded it: the ingress rules
-    // reduced to the external ports they admit — the shape the host row
-    // holds — and the egress policy verbatim. No box id: the host mints
-    // one for this creation (NET-133).
-    let request = minimald_rpc::RegisterBoxRequest {
-        name: name.to_string(),
-        ingress_ports: policy
-            .ingress
-            .as_ref()
-            .map(|ingress| {
-                ingress
-                    .port_mappings
-                    .iter()
-                    .map(|mapping| mapping.external_port)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        egress: policy.egress.clone(),
-        credentialed_upstream: policy.credentialed_upstream.clone(),
-        // The dynamic-ingress grant (NET-045, NET-138), from the same
-        // create inputs the session record holds: the stance and the range
-        // the host-side row holds every runtime port report against — the
-        // half of the grant the host decides by, never something the guest
-        // could bring with its report. Absent fields carry the deny
-        // default the host's row fills in: nothing is permitted.
-        dynamic_ingress: policy
-            .ingress
-            .as_ref()
-            .and_then(|ingress| ingress.dynamic_ingress),
-        dynamic_allowed_range: policy
-            .ingress
-            .as_ref()
-            .and_then(|ingress| ingress.dynamic_allowed_range),
-        // The row is held as a lease until the session is active: an
-        // activation that dies before then — an interrupt, a crash, a
-        // withdrawal that never lands — leaves no row holding its name.
-        hold: true,
-    };
-    let registration = tokio::time::timeout(
-        BOX_CONTROL_TIMEOUT,
-        register_box_with_vm_host(&sock_path, request),
-    )
-    .await;
-    match registration {
-        Ok(Ok(web)) => {
-            tracing::info!(
-                box = %name,
-                box_id = %web
-                    .box_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-                switch_address = %web.addresses.switch_address,
-                loopback_address = %web.addresses.loopback_address,
-                "registered the box with the VM host daemon; its addresses are \
-                 the host table's to decide by"
-            );
-            Ok(Some(web))
-        }
-        Ok(Err(error)) => Err(error.context(
-            "registering the box with the VM host daemon failed; the session \
-             does not start with the box unregistered",
-        )),
-        Err(_) => Err(anyhow::anyhow!(
-            "the VM host daemon did not answer the box registration in \
-             {BOX_CONTROL_TIMEOUT:?}; the session does not start with the box \
-             unregistered"
-        )),
-    }
-}
-
-/// [`register_box_for_activation`] for an activation whose session name may
-/// be autogen. The VM host daemon refuses a registration whose name folds
-/// to one a live row already holds; for an autogen `name` that refusal is a
-/// name collision like the create's, so the name is re-minted with `remint`
-/// and registered again, within the bounded budget ([`should_retry_autogen`])
-/// the `CreateSession` collision retry spends — `attempts` is shared with
-/// it. A refused registration publishes no row, so nothing is withdrawn
-/// between attempts. A user-supplied name, any other failure, and a spent
-/// budget surface the error unchanged. The refusal is matched across the
-/// whole error chain: the daemon's reason is its innermost cause.
-#[allow(clippy::too_many_arguments)]
-async fn register_box_reminting_autogen(
-    kind: paths::ProviderKind,
-    minimal_dir: Option<&std::path::Path>,
-    network: sessions::NetworkMode,
-    name: &mut String,
-    policy: &sessions::SessionPolicy,
-    autogen: bool,
-    attempts: &mut u32,
-    mut remint: impl FnMut() -> String,
-) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    loop {
-        match register_box_for_activation(kind, minimal_dir, network, name, policy).await {
-            Err(error) if should_retry_autogen(autogen, *attempts, &format!("{error:#}")) => {
-                *attempts += 1;
-                *name = remint();
-            }
-            registered => return registered,
-        }
-    }
+    failure.is_none()
 }
 
 /// The session-start line for a box the activation registered with the VM
@@ -883,7 +469,7 @@ async fn register_box_reminting_autogen(
 /// show for its own boxes.
 ///
 /// `vm` is the VM host the line names, by the same rule
-/// [`hostname_proxy_start_line`] names the proxy's: the selected VM on the VM
+/// [`hostname_proxy_vm`] names the proxy's: the selected VM on the VM
 /// backend, `None` on a backend that hosts no VMs. A registered box only ever
 /// exists on the former, so the `None` shape is the defensive one, mirroring
 /// the sibling start line's.
@@ -1063,6 +649,8 @@ pub(crate) async fn activate_session(
         project_path: abs_path.clone(),
         network,
         policy,
+        task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
@@ -1240,6 +828,13 @@ pub(crate) async fn activate_session(
     config.box_addresses = registered
         .as_ref()
         .map(|registration| registration.addresses);
+    config.task_addresses = registered
+        .as_ref()
+        .map(|registration| registration.task_addresses.clone())
+        .unwrap_or_default();
+    config.box_id = registered
+        .as_ref()
+        .and_then(|registration| registration.box_id);
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -1271,6 +866,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 return Err(error.context("CreateSession RPC failed"));
@@ -1289,6 +887,9 @@ pub(crate) async fn activate_session(
                         control_sock.clone(),
                         config.name.as_deref(),
                         config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
                     )
                     .await;
                     // The abandoned row's lease goes with it, uncommitted.
@@ -1296,10 +897,9 @@ pub(crate) async fn activate_session(
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
                     // A registered box's row carries the name it was
                     // registered under (T66), so the re-mint re-registers;
-                    // the abandoned row's addresses stay spent by design
-                    // (the host's cursors never regress), but its
-                    // admissions are withdrawn above, and the retry leaves
-                    // no row behind. The re-registration can itself fail —
+                    // the abandoned row is withdrawn above, by its id, which
+                    // returns its addresses to the host's hand-out books,
+                    // and the retry leaves no row behind. The re-registration can itself fail —
                     // the plan can be exhausted by then — and that failure
                     // ends the retry loop the same way the first one would
                     // have, with its cause. The first registration's id is
@@ -1321,6 +921,13 @@ pub(crate) async fn activate_session(
                     config.box_addresses = registered
                         .as_ref()
                         .map(|registration| registration.addresses);
+                    config.task_addresses = registered
+                        .as_ref()
+                        .map(|registration| registration.task_addresses.clone())
+                        .unwrap_or_default();
+                    config.box_id = registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id);
                     continue;
                 }
                 // A create failure that is not a retryable autogen collision
@@ -1329,9 +936,12 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
-                bail!("CreateSession failed: {error}");
+                bail!("{error}");
             }
         }
     };
@@ -1348,6 +958,9 @@ pub(crate) async fn activate_session(
             control_sock.clone(),
             config.name.as_deref(),
             config.box_addresses,
+            registered
+                .as_ref()
+                .and_then(|registration| registration.box_id),
         )
         .await;
         return Err(error);
@@ -1419,35 +1032,28 @@ pub(crate) async fn activate_session(
                 None,
             ),
         };
-    // The proxy and surface lines below never name the reported port as
-    // serving while the reply carries a proxy-down sibling, and its cause
-    // prints exactly once: folded into a Proxy verdict's NAME SURFACE line
-    // (`ProxyNotServing`), or on a line of its own beside a Native verdict
-    // or no verdict — never both, and never beside a "still serves" or
-    // "routes through it".
+    // The host line below never names the reported port as serving while
+    // the reply carries a proxy-down sibling, and the cause — the sibling's,
+    // or a native daemon's own report — prints exactly once, in place of
+    // the line's resolution half whatever the verdict (NET-020), never
+    // beside a `via 127.0.0.1:<port>` and never as a line of its own.
     let proxy_down_sibling = vm_answerer
         .as_ref()
         .and_then(|reply| reply.proxy_down.as_ref());
+    let proxy_cause = crate::resolver::host_line_proxy_cause(
+        proxy_down_sibling,
+        created.hostname_routing_unavailable.as_deref(),
+    );
+    // The port this daemon's hostnames route through (NET-026's discovery on
+    // this surface) is the `via 127.0.0.1:<port>` of the one host line
+    // below: a VM whose host port the host already held walked to one of
+    // its own (NET-059), a native daemon whose default was busy asked the OS
+    // for a free one (NET-025), so a walked port is never a log line alone.
+    // Absent while the proxy is still coming up, or from a daemon that
+    // predates the field, and beside a proxy-down sibling, whose cause
+    // names itself in the line instead.
     let serving_proxy_port =
         crate::resolver::serving_proxy_port(created.hostname_proxy_port, proxy_down_sibling);
-    // The other routing fact the create reply carries: the port this daemon's
-    // hostnames route through, printed where the session started — the same
-    // fact `min ls` prints on its routing line. NET-026's discovery on this
-    // surface; and the report a port has to carry when it is *not* the one the
-    // recipes assume — a VM whose host port the host already held walked to
-    // one of its own (NET-059), a native daemon whose default was busy asked
-    // the OS for a free one (NET-025) — so a walked port is never a log line
-    // alone. Absent while the proxy is still coming up, or from a daemon that
-    // predates the field: nothing to print for it then, exactly as in `min
-    // ls`. Not printed beside a proxy-down sibling either: the VM host
-    // daemon's verdict is that the proxy is not serving, and the cause
-    // names itself below.
-    if let Some(port) = serving_proxy_port {
-        eprintln!(
-            "{}",
-            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
-        );
-    }
     // The interim itself, named at every session start on a VM-backed host
     // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
     // below — because who answers the zone is the machine fact the names
@@ -1464,7 +1070,18 @@ pub(crate) async fn activate_session(
     {
         eprintln!("{line}");
     }
-    if held_no_channel && let Some(answerer_port) = answerer_port {
+    // NET-018: the one host line, naming the box, at the moment the user is
+    // about to rely on the names. Its surface half is decided in the one
+    // function both verbs share (`resolver`) and its install clause lists
+    // this host's missing finalize-install items — names while the surface
+    // is not native, the classifier while a native daemon's host says so
+    // (`host_install_for_this_host`, the same scoping `min finalize-install`
+    // applies) — so the two verbs print the same words (NET-122's pointer
+    // is the line's tail). Host DNS is opt-in: the start never prints the
+    // privileged step, only the command that runs it. The host's items are
+    // probed only once a line is going to print: a start with no surface to
+    // name has no clause to end it with.
+    let surface = if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
         // fails is the one it explains, and a piped activate is as owed
@@ -1479,24 +1096,17 @@ pub(crate) async fn activate_session(
         // user is the proxy's (NET-019 keeps it serving). Logged as the
         // same session-start record the native arm logs, with the fact
         // that decided it.
-        let surface = crate::resolver::surface_beside_proxy_down(
-            crate::resolver::LiveSurface::Proxy,
-            proxy_down_sibling,
-        );
+        let surface = crate::resolver::LiveSurface::Proxy;
         tracing::info!(
             surface = ?surface,
             held_no_channel = true,
             answerer_bound = false,
             answerer_port = answerer_port,
+            hostname_proxy_down = ?proxy_down,
             "session start decided the live name surface for this host"
         );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(surface, serving_proxy_port)
-        );
-    } else if answerer_port.is_none()
-        && let Some((port, cause)) = proxy_down
-    {
+        Some(surface)
+    } else if answerer_port.is_none() && proxy_down.is_some() {
         // T93: the VM host daemon's own verdict on the hostname proxy's
         // publication — a terminal publish failure, named with the port it
         // is about and its cause instead of a bare "not serving" — printed
@@ -1511,111 +1121,101 @@ pub(crate) async fn activate_session(
         // answerer verdict and the sibling cause has its surface decided
         // by the answerer arm below: the cause has already named the
         // proxy's half on the line of its own above, and the answerer's
-        // half is the detection's to read.
-        let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
+        // half is the detection's to read. The verdict is the proxy's; the
+        // cause rides the host line in place of its resolution half.
+        let surface = crate::resolver::LiveSurface::Proxy;
         tracing::info!(
             surface = ?surface,
+            hostname_proxy_down = ?proxy_down,
             "session start decided the live name surface for this host"
         );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
-        );
+        Some(surface)
     } else if let Some(answerer_port) = answerer_port {
-        // NET-018: name the live surface at the moment the user is about to
-        // rely on the names — decided in the one function both verbs share
-        // (`resolver`), from this host's detection: its hook (and the
-        // stub-bypass blocker that says whether its lookups consult what the
-        // hook configures), the answerer-bound proof this start holds — the
-        // daemon's report on a native host, this CLI's own query on a
-        // VM-backed one — and the reserved range on this host's own
-        // loopback. `None` — the answerer not bound — prints the proxy's
-        // line: there is no native surface to name. A proxy-down sibling
-        // folds into a Proxy surface (`ProxyNotServing`) and otherwise
-        // prints on a line of its own, ahead of the surface's. The proxy's
-        // half is said with the native arm either way (NET-019): the
-        // `HTTP(S)_PROXY` recipes this activation prints keep working beside
-        // native DNS, so nothing already captured goes stale.
-        //
-        // Host DNS is opt-in (NET-122): the start never prints the
-        // privileged step. While the host is not set up the proxy is the
-        // live surface, and its line names `min net setup`, which prints or
-        // runs the step from its own reads of the host.
+        // The surface half, decided from this host's detection: its hook
+        // (and the stub-bypass blocker that says whether its lookups
+        // consult what the hook configures), the answerer-bound proof this
+        // start holds — the daemon's report on a native host, this CLI's
+        // own query on a VM-backed one — and the reserved range on this
+        // host's own loopback. `None` — the answerer not bound — is the
+        // proxy's surface: there is no native surface to name. A
+        // proxy-down cause never moves the verdict — it replaces the host
+        // line's resolution half beside whichever verdict this read
+        // decides. The proxy keeps serving beside native DNS (NET-019): the
+        // `HTTP(S)_PROXY` recipes this activation prints keep working, so
+        // nothing already captured goes stale.
         let detection = crate::resolver::session_detection().await;
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
             answerer_bound,
         )
-        .await
-        .map(|verdict| crate::resolver::LiveSurfaceVerdict {
-            surface: crate::resolver::surface_beside_proxy_down(
-                verdict.surface,
-                proxy_down_sibling,
-            ),
-            ..verdict
-        });
-        // With no verdict the proxy is the live surface, folded with the
-        // sibling the same way, so the cause still prints exactly once.
-        let unbound_surface = crate::resolver::surface_beside_proxy_down(
-            crate::resolver::LiveSurface::Proxy,
-            proxy_down_sibling,
+        .await;
+        // With no verdict the proxy is the live surface.
+        let unbound_surface = crate::resolver::LiveSurface::Proxy;
+        match surface_verdict {
+            Some(verdict) => {
+                // The host-side record of that verdict, the half the
+                // daemon's own log cannot make: a daemon can name only the
+                // answerer *it* binds (see the daemon's
+                // `log_live_name_surface`), so the surface this host's own
+                // reads decided — and the three facts behind it, with the
+                // range as the one fact only this read holds — is logged
+                // here, at the start that printed it, beside the daemon's
+                // line. `min` filters at `warn` unless `RUST_LOG` is set, so
+                // the line is visible under `RUST_LOG=info`. Logged, never
+                // printed: the line below is the user's. `min ls` does not
+                // log its verdict — a list re-reads the host every run, and
+                // the record that matters is the one at the starts that
+                // rely on the names.
+                tracing::info!(
+                    surface = ?verdict.surface,
+                    hook_routes = detection.0.routes(answerer_port),
+                    blocker = ?detection.1,
+                    answerer_bound = answerer_bound,
+                    range_present = ?verdict.range_present,
+                    range_unit_state = ?detection.2.state,
+                    range_unit_check = ?detection.2.failed_check,
+                    hostname_proxy_down = ?proxy_down,
+                    "session start decided the live name surface for this host, \
+                     with the range unit's state beside it"
+                );
+                Some(verdict.surface)
+            }
+            None => {
+                // The answerer is reported but not bound yet: no native
+                // surface to name, so the proxy is the live one.
+                tracing::info!(
+                    surface = ?unbound_surface,
+                    answerer_bound = false,
+                    answerer_port = answerer_port,
+                    hostname_proxy_down = ?proxy_down,
+                    "session start decided the live name surface for this host"
+                );
+                Some(unbound_surface)
+            }
+        }
+    } else {
+        // No answerer reported and no VM sibling — a daemon that predates
+        // the field, or the VM-backed pre-acquisition state: the proxy is
+        // the surface the names route through while it serves, or the
+        // daemon's own report says why it does not, and nothing is said
+        // while nothing serves yet and nothing is reported.
+        (serving_proxy_port.is_some() || proxy_cause.is_some())
+            .then_some(crate::resolver::LiveSurface::Proxy)
+    };
+    if let Some(surface) = surface {
+        let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
+        let box_name = config.name.as_deref().unwrap_or("-");
+        eprintln!(
+            "{}",
+            crate::resolver::host_line_beside(
+                box_name,
+                &surface,
+                serving_proxy_port,
+                host_install,
+                proxy_cause.as_deref(),
+            )
         );
-        if let Some(line) = crate::resolver::proxy_down_line_beside(
-            Some(
-                surface_verdict
-                    .as_ref()
-                    .map_or(&unbound_surface, |verdict| &verdict.surface),
-            ),
-            proxy_down_sibling,
-        ) {
-            eprintln!("{line}");
-        }
-        if let Some(verdict) = surface_verdict {
-            // The host-side record of that verdict, the half the daemon's own
-            // log cannot make: a daemon can name only the answerer *it* binds
-            // (see the daemon's `log_live_name_surface`), so the surface this
-            // host's own reads decided — and the three facts behind it, with
-            // the range as the one fact only this read holds — is logged here,
-            // at the start that printed it, beside the daemon's line. `min`
-            // filters at `warn` unless `RUST_LOG` is set, so the line is visible
-            // under `RUST_LOG=info`. Logged, never printed: the line
-            // below is the user's. `min ls` does not log its verdict — a list
-            // re-reads the host every run, and the record that matters is the
-            // one at the starts that rely on the names.
-            tracing::info!(
-                surface = ?verdict.surface,
-                hook_routes = detection.0.routes(answerer_port),
-                blocker = ?detection.1,
-                answerer_bound = answerer_bound,
-                range_present = ?verdict.range_present,
-                range_unit_state = ?detection.2.state,
-                range_unit_check = ?detection.2.failed_check,
-                hostname_proxy_down = ?proxy_down,
-                "session start decided the live name surface for this host, \
-                 with the range unit's state beside it"
-            );
-            eprintln!(
-                "{}",
-                crate::resolver::start_name_surface_line(Some(verdict.surface), serving_proxy_port)
-            );
-        } else {
-            // The answerer is reported but not bound yet: no native surface
-            // to name, so the proxy is the live one, and its line carries the
-            // `min net setup` pointer NET-122 owes every start on a host not
-            // set up — or, beside a proxy-down sibling, the cause instead.
-            tracing::info!(
-                surface = ?unbound_surface,
-                answerer_bound = false,
-                answerer_port = answerer_port,
-                hostname_proxy_down = ?proxy_down,
-                "session start decided the live name surface for this host"
-            );
-            eprintln!(
-                "{}",
-                crate::resolver::start_name_surface_line(Some(unbound_surface), serving_proxy_port)
-            );
-        }
     }
     let id = created.id;
 
@@ -1632,25 +1232,20 @@ pub(crate) async fn activate_session(
     // runs there and not only in a log the person was not reading.
     print_classifier_advisory(&mut std::io::stderr(), &created);
 
-    // The coming-change notice (NET-076), printed while the deny-all egress
-    // default is announced but not yet in force. Scoped to the box it would
-    // change — an own-address session that declared no egress — on a daemon
-    // that has not opted out of the change (NET-077): the opt-out is the
-    // one rollout fact this side cannot know, so it is read off the create
-    // reply above, and a daemon that has already set the flag has already
-    // taken the remedy the notice names. Silent once the phase turns (see
-    // [`deny_all_default_notice`]). Printed after the session exists and
-    // before the work on it, so the warning is not lost above a failed
-    // activate's output.
+    // The in-force note (NET-074): one line naming the default an
+    // own-address session that declared no egress now has, and how to
+    // declare reach. Scoped to the box the default binds — an own-address
+    // session with no egress section — on a daemon that has not opted out
+    // (NET-077): the opt-out is the daemon's own fact, so it is read off the
+    // create reply above, and an opted-out daemon's box keeps allow-all and
+    // needs no note. Printed after the session exists and before the work
+    // on it, so it is not lost above a failed activate's output.
     if config.network == minimald_rpc::NetworkMode::OwnIp
         && config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
-        && let Some(notice) = deny_all_default_notice(
-            sessions::EGRESS_DEFAULT_PHASE,
-            kind == paths::ProviderKind::Minvmd,
-        )
+        && let Some(note) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
     {
-        eprintln!("{notice}");
+        eprintln!("{note}");
     }
 
     // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
@@ -1776,6 +1371,9 @@ pub(crate) async fn activate_session(
                         control_sock.clone(),
                         config.name.as_deref(),
                         config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
                     )
                     .await;
                     return Err(error.context("Failed to upload project files"));
@@ -1796,16 +1394,7 @@ pub(crate) async fn activate_session(
     // client is authoritative for them. Any daemon-side patches
     // that come back through a `Pending` response's `SubmitVerdict`
     // get appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
+    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     // The session exists but has no loadout yet; composing it is a
     // second round-trip because the daemon's composer reads the
@@ -1824,6 +1413,9 @@ pub(crate) async fn activate_session(
                 control_sock.clone(),
                 config.name.as_deref(),
                 config.box_addresses,
+                registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
             )
             .await;
             return Err(error.context("ConfigureLoadout RPC failed"));
@@ -1840,6 +1432,9 @@ pub(crate) async fn activate_session(
                 control_sock.clone(),
                 config.name.as_deref(),
                 config.box_addresses,
+                registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
             )
             .await;
             bail!(composition_failure_message(&utf8_path, &error));
@@ -1879,6 +1474,9 @@ pub(crate) async fn activate_session(
                         control_sock.clone(),
                         config.name.as_deref(),
                         config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
                     )
                     .await;
                     // The route an activation actually reaches today: the
@@ -1897,6 +1495,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 let count = summary.count();
@@ -1919,6 +1520,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 return Err(error);
@@ -1967,6 +1571,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
             }
@@ -1986,8 +1593,7 @@ pub(crate) async fn activate_session(
     // from `<workspace>/patches/`. Dedup by sandbox destination:
     // the composer's post-gate check guarantees any duplicates
     // are exact matches (same source), so collapsing is safe.
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    minimal_client::dedup_patch_uploads(&mut collected_patches);
     // The registration's lease is held across the finalize and committed
     // only once the session is active: until then an activation that dies
     // leaves the VM host daemon to withdraw the row on the lease's close.
@@ -2015,6 +1621,9 @@ pub(crate) async fn activate_session(
             control_sock.clone(),
             config.name.as_deref(),
             config.box_addresses,
+            registered
+                .as_ref()
+                .and_then(|registration| registration.box_id),
         )
         .await;
         return Err(e);
@@ -2031,13 +1640,28 @@ pub(crate) async fn activate_session(
     // the session is active, so an activation that dies or fails earlier
     // — its unfinalized session reaped with the connection — leaves no
     // hold behind; the destroy releases it ([`release_held_box_name`]).
-    // Only this activate/destroy pair holds: `min task run` (task.rs) mints
-    // an ephemeral, auto-generated host_ip session through raw
-    // `CreateSession`/`DestroySession` RPCs and never passes through here,
-    // so its name is neither held nor released — a task box's name is not
-    // meant to be reached, and widening the interim to that path is a
-    // design ruling for the name-registry work, not a change a review
-    // pass may make in passing.
+    // Only this activate/destroy pair holds on the client's own account:
+    // `min task run` (task.rs) mints an ephemeral, auto-generated host_ip
+    // session through raw `CreateSession`/`DestroySession` RPCs and never
+    // passes through here, so its run neither holds nor releases its name
+    // — a task box's name is not meant to be reached, and widening the
+    // interim to that path is a design ruling for the name-registry work,
+    // not a change a review pass may make in passing. The re-hold before
+    // an attach or exec ([`rehold_held_name_before_attach`]) does not tell
+    // a task session apart, though: it holds the name of any named host_ip
+    // session without a box row that a client attaches to or execs into.
+    // A task run releases such a hold by its session's id once the run
+    // returns or is interrupted (`release_task_name_hold`); a run whose
+    // client is killed outright releases nothing, and that hold is
+    // dropped after the VM host daemon's next restart, when nothing
+    // re-makes it.
+    //
+    // Every hold is made by a client over the host's control socket, as
+    // this one and that re-hold are; the in-VM daemon makes none. So
+    // after a VM host daemon restart, the hold of a session nobody
+    // attaches to or execs into is dropped once the daemon's reconfirm
+    // bound passes, and the name answers NXDOMAIN until the session's
+    // next attach or exec.
     if kind == paths::ProviderKind::Minvmd
         && config.network == sessions::NetworkMode::HostNet
         && let Some(name) = config.name.as_deref()
@@ -2396,10 +2020,45 @@ pub(crate) async fn session_via_ssh(
     let mut ssh =
         minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
 
+    // The session's record, read before the attach or the exec on a
+    // VM-backed host — one with a VM host daemon's control socket beside
+    // `sock` — for the pair its box's row was registered with. A lookup
+    // that fails reads as no row, and says so: the row is then not asked
+    // back, and the in-VM daemon's own row check decides the launch.
+    let record = match control_sock_beside(sock).filter(|control| control.exists()) {
+        Some(_) => match attached_session_record(sock, id).await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    "could not read the session's record ({error:#}); its box row \
+                     is not asked back first"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    // A VM host that cannot be reached fails the attach or the exec
+    // closed (#1790); one that answers late or refuses is a warn line, and
+    // the attach or the exec goes on (NET-138).
+    resume_box_row(sock, record.as_ref()).await?;
+    // The name hold a `host_ip` session without a row depends on may not
+    // have survived a VM host daemon restart; re-make it before the
+    // attach or the exec, idempotently.
+    rehold_held_name_before_attach(sock, id, record.as_ref()).await;
+
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
         let host_asks = host_asks_for
             .and_then(|name| control_sock_beside(sock).map(|control| (control, name.to_string())));
+        // The pair the box's row was registered with, read before the
+        // attach: an attach that ends in a daemon-side destroy leaves no
+        // record to read it from, and the row is still this client's to
+        // withdraw.
+        let box_addresses = match host_asks_for {
+            Some(_) => record.and_then(|record| record.box_addresses),
+            None => None,
+        };
         // The relay blocks its thread until ssh exits, so it runs off the
         // runtime's workers.
         let code = tokio::task::spawn_blocking(move || {
@@ -2413,9 +2072,10 @@ pub(crate) async fn session_via_ssh(
         .await
         .context("the interactive attach's thread failed")??;
         // The attach may have ended in the shell-exit prompt's Delete, a
-        // destroy made daemon-side: release the name a `host_ip` box held.
+        // destroy made daemon-side: withdraw the row an own-address box
+        // registered, or release the name a `host_ip` box held.
         if let Some(name) = host_asks_for {
-            release_held_name_after_attach(sock, id, name).await;
+            release_held_name_after_attach(sock, id, name, box_addresses).await;
         }
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an
@@ -2703,40 +2363,24 @@ pub async fn cmd_session_policy(
     }
 }
 
-/// The coming-change notice `min session activate` prints while the
-/// deny-all egress default is announced but not yet in force (NET-076):
-/// what changes for an own-address box that declares no egress, and how a
-/// deployment keeps the shipped default while it moves. `None` in every
-/// other phase — once the default is in force the change is no longer
-/// coming, and a box that reaches nothing needs no note about it.
+/// The one-line note `min session activate` prints for an own-address box
+/// that declares no egress while the deny-all default is in force
+/// (NET-074): the default the box now has, and the flags that declare its
+/// reach. `None` under [`sessions::EgressDefaultPhase::Announced`]: the
+/// announcement that phase printed (NET-076) is retired with it, and an
+/// absent section still allows all there, so there is nothing to note.
 ///
 /// The opt-out half of the scope is the caller's to check: the daemon, not
-/// the client, knows whether it set `--egress-deny-all-opt-out` (NET-077),
-/// so [`activate_session`] reads it off the create reply and stays silent
-/// for a deployment the change is not coming for.
-///
-/// `vm_backed` picks the remedy the host can actually take: a native daemon
-/// takes the `--egress-deny-all-opt-out` flag, while on a VM-backed host the
-/// daemon is the VM's pid-1 and has no flags to read, so the opt-out is
-/// `MINVMD_EGRESS_DENY_ALL_OPT_OUT`, set for the VM host daemon's next start.
-pub fn deny_all_default_notice(
-    phase: sessions::EgressDefaultPhase,
-    vm_backed: bool,
-) -> Option<&'static str> {
-    match (phase, vm_backed) {
-        (sessions::EgressDefaultPhase::Announced, false) => Some(
-            "Heads-up: the next release denies all external reach for an own-address \
-             session that declares no egress. Declare what the session needs with the \
-             activate egress flags, or start the daemon with \
-             --egress-deny-all-opt-out to keep this default.",
+/// the client, knows whether it set its opt-out (NET-077), so
+/// [`activate_session`] reads it off the create reply and stays silent for
+/// a box the default does not bind.
+pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
+    match phase {
+        sessions::EgressDefaultPhase::Announced => None,
+        sessions::EgressDefaultPhase::InForce => Some(
+            "egress: deny-all (default for an own-ip box with no egress section); declare \
+             reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags",
         ),
-        (sessions::EgressDefaultPhase::Announced, true) => Some(
-            "Heads-up: the next release denies all external reach for an own-address \
-             session that declares no egress. Declare what the session needs with the \
-             activate egress flags, or restart the VM host daemon (minvmd) with \
-             MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 to keep this default.",
-        ),
-        (sessions::EgressDefaultPhase::InForce, _) => None,
     }
 }
 
@@ -3719,7 +3363,12 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
-/// resolves to when the dimension is unset.
+/// resolves to when the dimension is unset. Writes comma-separated entries
+/// to `out`, using `default` for an unset list and `(none)` for an empty list.
+///
+/// # Errors
+///
+/// Propagates errors from writing the row to `out`.
 fn write_rules(
     out: &mut impl std::io::Write,
     label: &str,
@@ -3728,6 +3377,11 @@ fn write_rules(
 ) -> Result<(), anyhow::Error> {
     match rules {
         None => writeln!(out, "  {label}  {default}")?,
+        // A list that is present and empty grants nothing in its dimension
+        // — the shape an absent destination list resolves to on a box of
+        // any network mode (NET-074) — and is spelled out, never printed as
+        // a blank value in the egress display.
+        Some(rules) if rules.is_empty() => writeln!(out, "  {label}  (none)")?,
         Some(rules) => writeln!(out, "  {label}  {}", rules.join(", "))?,
     }
     Ok(())
@@ -4237,7 +3891,7 @@ pub(crate) async fn destroy_session(
         // way.
         let control_sock =
             vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
-        withdraw_box_row(control_sock.clone(), name, box_addresses).await;
+        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
         release_held_box_name(control_sock, id, name, box_addresses).await;
     } else {
         bail!("DestroySession returned an error from the daemon");
@@ -4267,16 +3921,85 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 
     // Racy by nature: the daemon may go down between the probe and this connect
     // (or `--provider` may point the probe and the client at different backends),
-    // so a connect failure is still a real error, not something to swallow.
+    // so a connect failure is still a real error for a native backend. On a VM
+    // backend the connect failing is the wedged-guest symptom itself, so
+    // `--force` falls back to stopping the VM from the host rather than leaving
+    // the only recovery a hand-killed VMM.
     // Unchecked: stopping a version-skewed daemon is exactly what the version
     // gate tells the operator to do, so this command must never be gated by it.
-    let mut client = connect_daemon_unchecked(global).await?;
+    let mut client = match connect_daemon_unchecked(global).await {
+        Ok(client) => client,
+        Err(connect_err) => {
+            if daemon_provider_kind(global) != paths::ProviderKind::Minvmd {
+                return Err(connect_err);
+            }
+            // The VM may have gone down between the probe and the connect:
+            // that is the goal state, not a wedged guest to stop from the
+            // host. Same cheap state-file read as the probe above.
+            if !autospawn::is_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
+                .unwrap_or(true)
+            {
+                println!("Daemon is not running.");
+                return Ok(());
+            }
+            // The CLI never reached the guest, so `minvmd stop`'s own guest
+            // Shutdown is still worth its bounded 5 s connect attempt.
+            return if args.force {
+                stop_wedged_vm_from_host(global.minimal_dir.clone(), true).await
+            } else {
+                Err(wedged_vm_unreachable(
+                    connect_err,
+                    global.minimal_dir.as_deref(),
+                ))
+            };
+        }
+    };
 
+    // The guest acknowledges Shutdown only after it has drained every session
+    // and quiesced its volume, which is unbounded real work. On a VM backend a
+    // failed RPC can end in a host-side kill, so the guest gets the same
+    // budget `minvmd stop` gives it before signalling the VMM: a healthy guest
+    // still draining past the generic RPC deadline must not be killed sooner
+    // than minvmd itself would kill it. A native daemon keeps the generic
+    // deadline (a zero extra budget).
+    let drain_budget = if daemon_provider_kind(global) == paths::ProviderKind::Minvmd {
+        minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
+    } else {
+        std::time::Duration::ZERO
+    };
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
-        .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
+        .oneshot_rpc_with_hook_budget::<Shutdown>(
+            ShutdownRequest { force: args.force },
+            drain_budget,
+        )
         .await
         .context("Shutdown RPC failed");
+
+    // A wedged guest can fail the Shutdown RPC as surely as the connect, and
+    // `stop_outcome` only recovers a failed RPC when the daemon is observably
+    // down. On a VM backend with `--force`, a daemon that cannot be confirmed
+    // down is stopped from the host instead — the same fallback the connect
+    // error takes, reached by the same evidence.
+    let resp = match resp {
+        Err(rpc_err)
+            if daemon_provider_kind(global) == paths::ProviderKind::Minvmd
+                && !daemon_confirmed_stopped(global.use_minvmd(), global.minimal_dir.clone())
+                    .await =>
+        {
+            if !args.force {
+                return Err(wedged_vm_unreachable(
+                    rpc_err,
+                    global.minimal_dir.as_deref(),
+                ));
+            }
+            // The guest has just been asked to shut down and was given the
+            // full drain budget to acknowledge. Asking again would only add
+            // up to two more minutes of waiting before the host-side stop.
+            return stop_wedged_vm_from_host(global.minimal_dir.clone(), false).await;
+        }
+        resp => resp,
+    };
 
     // Drop our connection before waiting: the daemon holds the shutdown open
     // for its drain grace period while a client is still attached, and we are
@@ -4301,6 +4024,164 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
         async move || daemon_confirmed_stopped(use_minvmd, probe_dir).await,
     )
     .await
+}
+
+/// Stop a VM whose guest cannot be asked to shut down: the in-guest daemon
+/// did not answer, so the host stops the VMM itself. This is `minvmd stop`'s
+/// own path — best-effort guest Shutdown over the bridge socket (5 s connect
+/// deadline, so a wedged guest cannot stall this recovery), then SIGTERM to
+/// the VMM, SIGKILL after the 5 s grace, then `Stopped` — run against the
+/// provider dir the CLI resolved for *this* VM, then waited on until minvmd
+/// has released the VM's alive lock.
+///
+/// The lifecycle file cannot be that wait: the stop writes `Stopped` itself,
+/// before the supervisor has reaped the VMM and exited, and a `min start` in
+/// that window finds the alive lock still held and refuses to boot.
+///
+/// Worst case, after the CLI's own attempt on the guest has given up: the
+/// 5 s grace plus the [`HOST_STOP_RELEASE_WAIT`] when the guest is not asked
+/// again, about 25 s; and when it is asked, the 5 s connect deadline on top,
+/// about 30 s — or, for a guest that completes the handshake and then hangs,
+/// the 120 s Shutdown deadline on top of that, about 150 s.
+///
+/// The CLI's own attempt comes first. A guest that accepts the connection and
+/// then never acknowledges holds `min stop --force` for the 120 s drain
+/// budget, then the 20 s wait for the VM to stop on its own, then the 25 s
+/// above: about 165 s from start to finish.
+///
+/// Only reached on a minvmd backend with `--force`, once the guest is proven
+/// unreachable; a native minimald is not a VM and keeps its own error.
+/// `quiesce_guest` is false when the CLI's own Shutdown RPC has just failed,
+/// so the guest is not asked a second time.
+///
+/// A VM that is still booting has no VMM pid the host could signal, and its
+/// supervisor would write `Running` over a `Stopped` this wrote, so that case
+/// is refused rather than reported as a host-side stop.
+async fn stop_wedged_vm_from_host(
+    minimal_dir: Option<PathBuf>,
+    quiesce_guest: bool,
+) -> Result<(), anyhow::Error> {
+    let provider_dir = client::resolve_provider_dir(minimal_dir.as_deref(), true)
+        .context("resolving the VM's provider dir for a host-side stop")?;
+
+    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
+    // so both go on the blocking pool rather than stalling an async worker
+    // (rust-coding-standards: no blocking in an async context).
+    let outcome = tokio::task::spawn_blocking(move || {
+        let state_dir = minvmd::state::StateDir::new(provider_dir.clone())
+            .context("opening the VM's state dir for a host-side stop")?;
+        let state = state_dir
+            .effective_state()
+            .context("reading the VM's state for a host-side stop")?;
+        // Checked first: the VM going down on its own (or a dead supervisor's
+        // stale state being repaired by the read above) since the caller's
+        // liveness probe is the goal state, not a boot to wait out.
+        if !state.lifecycle.is_active() {
+            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
+        }
+        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
+            anyhow::bail!(
+                "the VM is still booting; retry `{}` once it is up",
+                stop_command()
+            );
+        }
+        let outcome = minvmd::cmd::stop::stop_at(provider_dir, quiesce_guest)
+            .context("stopping the VM from the host")?;
+        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
+        Ok(outcome)
+    })
+    .await
+    .context("the host-side stop of the VM panicked")??;
+
+    // stderr, so it survives the `>/dev/null` every scripted caller wraps
+    // `stop` in. The loss caveat is only true of a guest that was killed: one
+    // that acknowledged Shutdown drained its sessions and quiesced its volume
+    // first.
+    use minvmd::cmd::stop::HostStop;
+    match outcome {
+        HostStop::NothingSignalled => println!("Daemon is not running."),
+        HostStop::GuestAcknowledged => {
+            eprintln!("the VM was stopped from the host after its guest shut down cleanly");
+        }
+        HostStop::GuestUnacknowledged => eprintln!("{UNACKNOWLEDGED_STOP_CAVEAT}"),
+    }
+    Ok(())
+}
+
+/// What `min stop --force` says after killing a VM whose guest did not
+/// acknowledge Shutdown. The volume's journal keeps its filesystem metadata
+/// consistent across the kill; it does not keep the data.
+const UNACKNOWLEDGED_STOP_CAVEAT: &str = "the guest did not acknowledge shutdown; the VM was killed from the host. \
+     Running sessions were killed without their stop path, and data not yet flushed inside \
+     the VM can be lost (files truncated or empty). The volume's journal keeps its \
+     filesystem metadata consistent.";
+
+/// How long a host-side stop waits for minvmd to release the VM's alive lock
+/// once the VMM has been signalled: the supervisor has to reap the VMM child
+/// and exit. The same ceiling an acknowledged shutdown is given to reach
+/// `Stopped`.
+const HOST_STOP_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait until no minvmd (supervisor or VMM child) holds `state_dir`'s alive
+/// lock, so the next `min start` can take it.
+pub(crate) fn wait_for_alive_lock_released(
+    state_dir: &minvmd::state::StateDir,
+    timeout: std::time::Duration,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + timeout;
+    while state_dir
+        .daemon_alive()
+        .context("probing the VM's alive lock after a host-side stop")?
+    {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "minvmd still holds the VM's alive lock after {timeout:?}; \
+                 starting it again will fail until that minvmd exits"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// `min stop` for the VM this command drives: a bare `min stop` targets the
+/// default VM, so a named one must carry its `--vm` (NET-052).
+fn stop_command() -> String {
+    match client::vm_name() {
+        paths::DEFAULT_VM_NAME => "min stop".to_owned(),
+        vm => format!("min --vm {vm} stop"),
+    }
+}
+
+/// The failure `min stop` ends with when the VM's guest does not answer and
+/// `--force` was not given: `cause` under the recovery, typed so the run exits
+/// with the reserved host-unreachable code (7) rather than the unspecified 1.
+///
+/// A VM that is still booting is not answering either, but `--force` refuses
+/// it, so the hint names the retry instead of a recovery that would not work.
+fn wedged_vm_unreachable(
+    cause: anyhow::Error,
+    minimal_dir: Option<&std::path::Path>,
+) -> anyhow::Error {
+    // Same cheap state-file read as `cmd_stop`'s liveness probe; a state that
+    // cannot be read leaves the `--force` hint.
+    let booting = client::resolve_provider_dir(minimal_dir, true)
+        .ok()
+        .and_then(|dir| minvmd::state::StateDir::new(dir).ok())
+        .and_then(|state_dir| state_dir.read_state().ok())
+        .is_some_and(|state| state.lifecycle == minvmd::lifecycle::Lifecycle::Starting);
+    let hint = if booting {
+        format!(
+            "the VM is still booting; retry `{}` once it is up",
+            stop_command()
+        )
+    } else {
+        format!(
+            "the VM is not answering; `{} --force` stops it from the host",
+            stop_command()
+        )
+    };
+    client::box_registration::HostUnreachable::over(cause, hint)
 }
 
 /// Whether the daemon can be *observed* to have stopped — the question the
@@ -4438,7 +4319,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             Ok(())
         }
         minimald_rpc::Errorable::Err { error } => {
-            bail!("RenameSession failed: {error}")
+            bail!("{error}")
         }
     }
 }
@@ -5184,6 +5065,33 @@ mod tests {
             not_deny_all_json["rules"]["allow_subnets"][0], "10.0.0.0/8",
             "the named subnet rides the declared section: {not_deny_all_json}"
         );
+
+        // A names-only declaration on an own-address box resolves its
+        // absent `allow_subnets` to present and empty (NET-074): the row is
+        // spelled out as `(none)`, never printed blank, and the section is
+        // not deny-all, since its names grant reach.
+        let names_only = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec!["github.com".to_string()]),
+                allow_protocols: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &names_only, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  subnets  (none)\n")
+                && rendered.contains("  dns hosts  github.com\n"),
+            "a resolved-empty list is spelled out beside the names: {rendered}"
+        );
+        assert!(
+            !rendered.contains("egress\n  deny-all\n"),
+            "a names-only section grants reach and is not deny-all: {rendered}"
+        );
     }
 
     #[test]
@@ -5465,15 +5373,10 @@ mod tests {
         // is the command, verbatim.
         let step_missing = create_reply(
             Some(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: the classifier's privileged step is not installed on this \
-                 host. While it cannot, its host-address boxes run unenforced — \
-                 whatever the boxes' declarations say. Install the classifier's \
-                 privileged step with:\n  run: curl -fsSLO \
-                 https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
-                 install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
-                 --user runner --cohort-address 10.0.0.0/16 --node-plane-address \
-                 10.0.1.0/24",
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  \
+                 Enforce it: min finalize-install   (or start the box with --network \
+                 own_ip, which enforces it now)",
             ),
             Some("none"),
         );
@@ -5482,24 +5385,20 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.starts_with(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: the classifier's privileged step is not installed on this \
-                 host. While it cannot, its host-address boxes run unenforced — \
-                 whatever the boxes' declarations say."
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n"
             ),
             "the start prints the daemon's spelling verbatim, so the log, the \
              reply, and the terminal cannot disagree, got: {rendered}"
         );
         assert!(
             rendered.ends_with(
-                "  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
-                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
-                 ./install-host-classifier.sh --user runner --cohort-address \
-                 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
+                "  Enforce it: min finalize-install   (or start the box with --network \
+                 own_ip, which enforces it now)\n"
             ),
             "the missing privileged step is the cause, so the render carries \
-             the exact command that installs it, on the last line with \
-             nothing after it: {rendered}"
+             the remedy that installs it, on the last line with nothing after \
+             it: {rendered}"
         );
         assert!(
             !rendered.contains('?'),
@@ -5507,14 +5406,16 @@ mod tests {
         );
 
         // A host that cannot confine: the cause is still named, and no
-        // install can end it, so the line names none.
+        // install can end it, so the line hands out the own-address start
+        // alone and says why.
         let cannot_confine = create_reply(
             Some(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: no cgroup2 mount with nsdelegate covers the classifier \
-                 tree, so a box could migrate out of its leaf. While it cannot, \
-                 its host-address boxes run unenforced — whatever the boxes' \
-                 declarations say.",
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  \
+                 Enforce it: start the box with --network own_ip, which enforces it \
+                 now   (min finalize-install can't fix this: no cgroup2 mount with \
+                 nsdelegate covers the classifier tree, so a box could migrate out \
+                 of its leaf)",
             ),
             Some("none"),
         );
@@ -5526,13 +5427,13 @@ mod tests {
             "the advisory must name this cause in words too: {rendered}"
         );
         assert!(
-            rendered.ends_with("declarations say.\n"),
-            "no command ends this cause, so the advisory must end with the \
-             state it named: {rendered}"
+            rendered.ends_with("out of its leaf)\n"),
+            "the render ends where the daemon's text ends, with the newline \
+             that closes the last line: {rendered}"
         );
         assert!(
-            !rendered.contains("install-host-classifier"),
-            "no command ends this cause, so the advisory must name none: {rendered}"
+            !rendered.contains("Enforce it: min finalize-install"),
+            "no install ends this cause, so the advisory must not hand it out: {rendered}"
         );
         assert!(
             !rendered.contains('?'),
@@ -5588,9 +5489,10 @@ mod tests {
     fn classifier_advisory_print_is_best_effort() {
         let step_missing = create_reply(
             Some(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: the classifier's privileged step is not installed on this \
-                 host. While it cannot, its host-address boxes run unenforced.",
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  \
+                 Enforce it: min finalize-install   (or start the box with --network \
+                 own_ip, which enforces it now)",
             ),
             Some("none"),
         );
@@ -6170,6 +6072,7 @@ mod tests {
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
                 hold: false,
+                task_slots: 0,
             },
         )
         .await
@@ -6177,6 +6080,175 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-138: an own-address activation asks the VM host for its box's
+    /// task addresses in the same registration, and is handed them back for
+    /// the create to carry, so the in-VM daemon draws nothing for a task
+    /// run either.
+    #[tokio::test]
+    async fn activation_registers_task_slots_for_own_ip_box() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join("control.sock"),
+            r#"{"switch_address":"100.64.128.0","loopback_address":"127.0.64.0","box_id":"0123456789abcdef0123456789abcdef","task_addresses":["100.64.128.1","100.64.128.2"]}"#
+                .to_string(),
+        )
+        .await;
+        let handed = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            NetworkMode::OwnIp,
+            "web",
+            &sessions::SessionPolicy::default(),
+        )
+        .await
+        .expect("the registration is answered")
+        .expect("an own-address box on a VM-backed host registers");
+        assert_eq!(
+            handed.task_addresses,
+            vec![
+                std::net::Ipv4Addr::new(100, 64, 128, 1),
+                std::net::Ipv4Addr::new(100, 64, 128, 2),
+            ],
+            "the task addresses the host handed come back for the create"
+        );
+        let seen = requests.lock().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Register(request) = request else {
+            panic!("a registration is carried by the register verb");
+        };
+        assert_eq!(
+            request.task_slots,
+            minimald_rpc::TASK_SLOTS_PER_BOX,
+            "the activation asks for its box's task addresses"
+        );
+    }
+
+    /// The CLI and `min dash` register a box through one exchange: the
+    /// activation's registration, resolved by provider kind, and the
+    /// dashboard's, resolved beside the ssh socket it holds, put the same
+    /// request line on the same control socket — so the two front-ends
+    /// cannot drift in what they declare or hold.
+    #[tokio::test]
+    async fn cli_and_dash_register_through_one_exchange() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![PortMapping {
+                    external_port: 8080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            credentialed_upstream: None,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let cli = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("the CLI's registration is answered")
+        .expect("an own-address box on a VM-backed host registers");
+        let ssh_sock = client::resolve_socket_path(Some(dir.path()), true).unwrap();
+        let dash = minimal_client::box_registration::register_box_beside(
+            &ssh_sock,
+            NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("the dashboard's registration is answered")
+        .expect("the dashboard finds the control socket beside its ssh socket");
+        assert_eq!(cli.addresses, dash.addresses);
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one registration from each front-end");
+        assert_eq!(
+            seen[0], seen[1],
+            "both front-ends send the one request line"
+        );
+    }
+
+    /// NET-138: before an attach or an exec the CLI asks the VM host daemon
+    /// beside the daemon's ssh socket for the box's row back, through the
+    /// client library the dashboard's attach resumes through — one resume
+    /// line naming the box and the pair off its record. A record with no
+    /// row asks nothing.
+    #[tokio::test]
+    async fn cli_attach_resumes_the_box_through_the_shared_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0","box_id":"07070707070707070707070707070707"}"#
+                .to_string(),
+        )
+        .await;
+        let addresses = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        let mut record = sessions::Record {
+            id: sessions::SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: sessions::SessionPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+            },
+            status: sessions::SessionStatus::default(),
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(addresses),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            attrs: Default::default(),
+        };
+        let ssh_sock = dir.path().join("ssh.sock");
+        resume_box_row(&ssh_sock, Some(&record))
+            .await
+            .expect("the VM host answers the resume");
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one resume before the attach");
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            let minimald_rpc::BoxControlRequest::ResumeBox(request) = request else {
+                panic!("the row is asked back by the resume verb");
+            };
+            assert_eq!(request.name, "web");
+            assert_eq!(request.switch_address, addresses.switch_address);
+            assert_eq!(request.loopback_address, addresses.loopback_address);
+        }
+
+        record.box_addresses = None;
+        resume_box_row(&ssh_sock, Some(&record))
+            .await
+            .expect("a session with no row asks nothing");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "a session with no row asks nothing"
         );
     }
 
@@ -6342,9 +6414,16 @@ mod tests {
         );
 
         // The autospawn retry's shape: the row is withdrawn — its creator
-        // presents the pair it was handed — and the re-registration under
-        // the re-minted name is a new creation the host mints a new id for.
-        withdraw_box_row(Some(sock_path.clone()), Some("web"), Some(first.addresses)).await;
+        // presents the pair and the id it was handed — and the
+        // re-registration under the re-minted name is a new creation the
+        // host mints a new id for.
+        withdraw_box_row(
+            Some(sock_path.clone()),
+            Some("web"),
+            Some(first.addresses),
+            Some(id),
+        )
+        .await;
         let again = register_box_for_activation(
             paths::ProviderKind::Minvmd,
             global.minimal_dir.as_deref(),
@@ -6364,7 +6443,7 @@ mod tests {
         );
         assert_ne!(
             again.addresses.switch_address, first.addresses.switch_address,
-            "the recreation spent the run's next address, never a spent one again"
+            "the recreation draws a never-drawn address before any returned one"
         );
 
         // The CLI's record, the new row and the new attachment agree on the
@@ -6488,84 +6567,6 @@ mod tests {
             "the refusal names the held spelling: {refused}"
         );
         assert_eq!(user, "PROJ-9C1E", "the user's name is left as given");
-    }
-
-    /// The registration's lease is held across the finalize — the daemon
-    /// sees neither a byte nor a close while it runs — and committed only
-    /// when it succeeds: one commit line, then the close. A failed finalize
-    /// closes the lease with no commit, the close the daemon withdraws on.
-    #[tokio::test]
-    async fn finalize_holding_lease_commits_only_on_success() {
-        use tokio::io::AsyncReadExt as _;
-
-        async fn lease_pair(
-            listener: &tokio::net::UnixListener,
-            sock_path: &std::path::Path,
-        ) -> (BoxLease, tokio::net::UnixStream) {
-            let (client, accepted) = tokio::join!(
-                tokio::net::UnixStream::connect(sock_path),
-                listener.accept()
-            );
-            (
-                BoxLease {
-                    stream: client.expect("the lease connects"),
-                },
-                accepted.expect("the daemon side accepts").0,
-            )
-        }
-
-        /// Whether the daemon side has seen nothing — no byte, no close —
-        /// within a short wait.
-        async fn untouched(daemon: &mut tokio::net::UnixStream) -> bool {
-            let mut buf = [0u8; 16];
-            tokio::time::timeout(std::time::Duration::from_millis(50), daemon.read(&mut buf))
-                .await
-                .is_err()
-        }
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let sock_path = dir.path().join("control.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-
-        let (lease, mut daemon) = lease_pair(&listener, &sock_path).await;
-        let finalized = finalize_holding_lease(Some(lease), async {
-            assert!(
-                untouched(&mut daemon).await,
-                "the lease is held, uncommitted, while the finalize runs"
-            );
-            Ok(7)
-        })
-        .await
-        .expect("the finalize succeeds");
-        assert_eq!(finalized, 7);
-        let mut seen = String::new();
-        daemon.read_to_string(&mut seen).await.unwrap();
-        assert_eq!(
-            seen,
-            format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE),
-            "a finalized session commits its lease, then closes it"
-        );
-
-        let (lease, mut daemon) = lease_pair(&listener, &sock_path).await;
-        let failed = finalize_holding_lease(Some(lease), async {
-            assert!(
-                untouched(&mut daemon).await,
-                "the lease is held, uncommitted, while the finalize runs"
-            );
-            Err::<(), _>(anyhow::anyhow!("finalize failed"))
-        })
-        .await;
-        assert!(failed.is_err(), "the finalize's failure surfaces unchanged");
-        let mut seen = String::new();
-        daemon.read_to_string(&mut seen).await.unwrap();
-        assert!(
-            seen.is_empty(),
-            "a failed finalize closes the lease uncommitted, got {seen:?}"
-        );
-
-        finalize_holding_lease(None, async { Ok(()) })
-            .await
-            .expect("a registration with no lease finalizes as ever");
     }
 
     /// Against the real control server: a registration the activation
@@ -6792,6 +6793,7 @@ mod tests {
             minimal_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
+        let box_id = minimald_rpc::BoxId::from_bytes([7; 16]);
         let handed = sessions::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
@@ -6804,6 +6806,7 @@ mod tests {
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
             Some(handed),
+            Some(box_id),
         )
         .await;
         {
@@ -6817,6 +6820,11 @@ mod tests {
             assert_eq!(request.name, "web");
             assert_eq!(request.switch_address, handed.switch_address);
             assert_eq!(request.loopback_address, handed.loopback_address);
+            assert_eq!(
+                request.box_id,
+                Some(box_id),
+                "a withdrawal that holds the id names it"
+            );
         }
 
         // And a session that registered nothing owes nothing: no pair, no
@@ -6824,6 +6832,7 @@ mod tests {
         withdraw_box_row(
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
+            None,
             None,
         )
         .await;
@@ -6836,6 +6845,7 @@ mod tests {
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             None,
             Some(handed),
+            None,
         )
         .await;
         assert_eq!(
@@ -6847,6 +6857,7 @@ mod tests {
             vm_host_control_sock(paths::ProviderKind::Minimald, None),
             Some("web"),
             Some(handed),
+            None,
         )
         .await;
         assert_eq!(
@@ -6881,7 +6892,7 @@ mod tests {
         };
 
         // A failed activation's withdrawal of a row-less box: nothing sent.
-        withdraw_box_row(control_sock(), Some("web"), None).await;
+        withdraw_box_row(control_sock(), Some("web"), None, None).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "a row-less withdrawal never releases a name a live session may hold"
@@ -6933,6 +6944,45 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 2, "nothing to release by");
     }
 
+    /// A finished task run releases the hold an attach or exec into its
+    /// session may have re-made: one release naming the session and its
+    /// id, since the daemon ends that session with no client destroy to
+    /// release it. A kept session's hold is left for its destroy.
+    #[tokio::test]
+    async fn a_finished_task_run_releases_its_sessions_name_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join("control.sock"),
+            r#"{"name":"task-build-9c1e","held":false}"#.to_string(),
+        )
+        .await;
+        let control_sock = || vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path()));
+        let id = sessions::SessionId::nil();
+
+        crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", true).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a kept session keeps its hold"
+        );
+
+        crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", false).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one release, one request");
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("the run's end is carried by the release verb");
+        };
+        assert_eq!(request.name, "task-build-9c1e");
+        assert_eq!(
+            request.session_id,
+            Some(id),
+            "the release names its session"
+        );
+    }
+
     /// The `host_ip` hold's attach-exit side: the shell-exit prompt's
     /// Delete destroys the session daemon-side, so the attach's own exit is
     /// where the name is released — one release request naming it and its
@@ -6959,7 +7009,7 @@ mod tests {
         .await;
 
         // The attach ended with the session still there: nothing released.
-        release_held_name_after_attach(&ssh_sock, id, "web").await;
+        release_held_name_after_attach(&ssh_sock, id, "web", None).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "a session still holding the name keeps its hold"
@@ -6973,7 +7023,7 @@ mod tests {
             minimald_rpc::Errorable::Ok(_) => {}
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
-        release_held_name_after_attach(&ssh_sock, id, "web").await;
+        release_held_name_after_attach(&ssh_sock, id, "web", None).await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 1, "one release, one request");
         let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
@@ -6987,6 +7037,269 @@ mod tests {
             Some(id),
             "the release names the session, so it frees only that session's hold"
         );
+    }
+
+    /// The `host_ip` hold's attach side: a session's record is read before
+    /// the attach or the exec on a VM-backed host, and its name hold —
+    /// which a VM host daemon restart may have dropped — is re-made
+    /// idempotently first: one hold request naming it and its session. A
+    /// record the lookup did not give, or one that owns a row or holds no
+    /// name, sends nothing; a session destroyed between the record's read
+    /// and the hold has the hold released again.
+    #[tokio::test]
+    async fn an_attach_reholds_its_held_name_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":false}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        assert_eq!(record.name.as_deref(), Some("web"));
+        assert_eq!(record.network, sessions::NetworkMode::HostNet);
+        assert!(record.box_addresses.is_none());
+
+        // A record that is not there: nothing to re-hold by.
+        rehold_held_name_before_attach(&ssh_sock, id, None).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no record read, no hold re-made"
+        );
+
+        // The session's own hold, re-made before the attach.
+        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one hold, one request");
+            let minimald_rpc::BoxControlRequest::HoldBoxName(request) =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+            else {
+                panic!("the re-hold is carried by the hold verb");
+            };
+            assert_eq!(request.name, "web");
+            assert_eq!(
+                request.session_id,
+                Some(id),
+                "the re-hold names the session, so it frees only that session's hold"
+            );
+        }
+
+        // A destroy that lands between the record's read and the re-hold:
+        // the hold is made for a session that is gone, and released again
+        // by its id once the second lookup finds no session.
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 3, "a hold, then its release");
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
+            serde_json_lenient::from_str(&seen[2]).expect("the request is the wire type")
+        else {
+            panic!("a gone session's re-hold is undone by the release verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.session_id, Some(id));
+    }
+
+    /// A destroy, then a new session under the same name, both landing
+    /// between the record's read and the re-hold: the gone session's hold
+    /// took the name over from the live one, so the undo hands it back to
+    /// the live session by its id rather than releasing the name.
+    #[tokio::test]
+    async fn a_gone_sessions_rehold_hands_the_name_back_to_its_new_holder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":true}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let gone = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, gone)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id: gone })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+        let live = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+
+        rehold_held_name_before_attach(&ssh_sock, gone, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        let holds: Vec<_> = seen
+            .iter()
+            .map(|line| {
+                match serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line)
+                    .expect("the request is the wire type")
+                {
+                    minimald_rpc::BoxControlRequest::HoldBoxName(request) => {
+                        (request.name, request.session_id)
+                    }
+                    other => panic!("only holds are sent: {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            holds,
+            vec![
+                ("web".to_string(), Some(gone)),
+                ("web".to_string(), Some(live)),
+            ],
+            "the gone session's re-hold, then the name handed back to the live one"
+        );
+    }
+
+    /// The undo of a gone session's re-hold, by what the lookup of its name
+    /// gave: a release by its id when no session answers to the name, and
+    /// nothing at all when the lookup failed — a release there could free
+    /// the name a live session holds.
+    #[test]
+    fn a_failed_name_lookup_undoes_no_rehold() {
+        let id = sessions::SessionId::nil();
+        assert_eq!(rehold_undo(id, Ok(None)), Some((id, false)));
+        assert_eq!(
+            rehold_undo(id, Err(anyhow::anyhow!("no answer"))),
+            None,
+            "a lookup that failed releases nothing"
+        );
+    }
+
+    /// A re-hold the VM host daemon does not make — one that predates the
+    /// hold verbs and refuses them — leaves nothing to undo: no second
+    /// lookup and no release follow it, even for a session gone by then.
+    #[tokio::test]
+    async fn a_refused_rehold_is_not_undone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"error":"unknown verb"}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+
+        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the refused hold, and nothing after it");
+        assert!(matches!(
+            serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(&seen[0])
+                .expect("the request is the wire type"),
+            minimald_rpc::BoxControlRequest::HoldBoxName(_)
+        ));
+    }
+
+    /// T66's attach-exit side: an own-address box whose attach ended in the
+    /// shell-exit prompt's Delete has its row withdrawn by the attach's own
+    /// exit, with the pair read off the record before the attach — one
+    /// withdraw request naming the box and the pair, with no box id, which
+    /// the record does not carry — and nothing while the session is still
+    /// there.
+    #[tokio::test]
+    async fn an_attach_that_ends_with_the_session_gone_withdraws_its_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+
+        release_held_name_after_attach(&ssh_sock, id, "web", Some(handed)).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a session still there keeps its row"
+        );
+
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+        release_held_name_after_attach(&ssh_sock, id, "web", Some(handed)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one withdrawal, one request");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("a gone session's row is withdrawn by the withdraw verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, handed.switch_address);
+        assert_eq!(request.loopback_address, handed.loopback_address);
+        assert_eq!(request.box_id, None, "the record carries no box id");
     }
 
     /// The macOS shape of every VM-backed gate (NET-081's other half): the

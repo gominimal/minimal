@@ -18,6 +18,8 @@ walkdir.workspace = true
 common.workspace = true
 hex.workspace = true
 sha2.workspace = true
+# Shell-quotes the paths the mip AppArmor remedy spells as a command.
+shlex.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

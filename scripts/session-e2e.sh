@@ -80,8 +80,8 @@
 #   own_ip                           `--network own_ip` tap + switch attach
 #   own_ip_egress_declared_and_enforced
 #                                    the four egress fields declared, allowed
-#                                    and disallowed connections, the coming
-#                                    deny-all announcement, and the opt-out;
+#                                    and disallowed connections, the in-force
+#                                    deny-all default and its note;
 #                                    a deny-all box's names outside the box
 #                                    zone are REFUSED fast at its relay, a
 #                                    zone TXT is NODATA there, while
@@ -458,6 +458,13 @@ NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # not leave a host's packet filter deciding behind it, so the teardown unloads
 # whatever this flag says is ours.
 NET080_CLASSIFIER_INSTALLED=""
+# The classifier install a native case's setup script made: on a host with no
+# classifier, the script `min finalize-install --show --script` prints carries
+# the classifier's block beside the names', so a case that runs it whole also
+# installs the tree, the table, the step's copy and its systemd units. The case
+# removes them before it returns (setup_classifier_teardown), and the teardown
+# does for a run that died first.
+SETUP_CLASSIFIER_INSTALLED=""
 # The same three for the host_ip_deny_all proof: the two project seeds its two
 # halves activate against (removed on teardown like every other seed), and the
 # classifier tree+table its decided half installs (its own, removed before the
@@ -933,6 +940,8 @@ teardown() {
   # Every proof that runs the advisory as root also installs the answerer
   # host service; a run that died after that must not leave it behind.
   answerer_service_teardown
+  # Nor the classifier install the same script made on a host with none.
+  setup_classifier_teardown || true
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
@@ -1652,14 +1661,17 @@ published_loopback_host() {
 # (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
 # through an own-address box, checks that `min session policy` shows the
 # effective rules, proves an allowed connection completes and a disallowed one
-# is dropped silently and logged, and records the deny-all default story around
-# it: while the default is only announced this build still allows a bare
-# own-address box and prints the coming change; an explicit deny-all declaration
-# stands in for the in-force default to show the box reaching nothing; and the
-# announcement names the opt-out flag that keeps the prior default. The same
-# deny-all box carries NET-141's deny-all case: its relay answers a name
+# is dropped silently and logged, and proves the deny-all default in force
+# (NET-074/NET-075): a bare own-address box is told its default on one line at
+# activate, `min session policy` shows `deny-all (default)`, and the box
+# reaches nothing — not a literal destination an explicitly allowing box
+# reaches in the same run, and not an external name, which fails fast at
+# resolution while host.min.internal still resolves. An explicit deny-all
+# declaration carries NET-141's deny-all case: its relay answers a name
 # outside the box zone REFUSED, fast, while host.min.internal still resolves,
-# and its TCP to the resolver's port is dropped.
+# and its TCP to the resolver's port is dropped. NET-077's opt-out is not
+# driven here (it needs a daemon restarted with it); it stays with the unit
+# test deny_all_opt_out_keeps_prior_default.
 proof_own_ip_egress_declared_and_enforced() {
   echo "::group::own-IP egress: declared and enforced (NET T20)"
 
@@ -1705,41 +1717,45 @@ proof_own_ip_egress_declared_and_enforced() {
     return 1
   }
 
-  # ---- NET-076: the coming deny-all default is announced -------------------
-  # A bare own-address box still allows everything while the default is only
-  # announced, but the user is told what is coming and how to keep the current
-  # behaviour.
-  announce_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-egress-announce --network own_ip 2>"$WORK/egress-announce.err")" || {
-    echo "::error::'min session activate --network own_ip' (announcement probe) failed"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  # ---- NET-074/NET-075/NET-076: a bare own-address box has deny-all --------
+  # The default is in force: an own-address box with no egress section is
+  # told so on one line at activate (and the retired announcement, NET-076,
+  # no longer prints), and `min session policy` names the default it got.
+  # This daemon runs without the opt-out, so the default binds. The box is
+  # kept for the reach legs below, which need a live control first.
+  egress_in_force_note="egress: deny-all (default for an own-ip box with no egress section)"
+  bare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-bare --network own_ip 2>"$WORK/egress-bare.err")" || {
+    echo "::error::'min session activate --network own_ip' (bare box) failed"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   }
-  announce_sid="$(printf '%s\n' "$announce_sid" | tail -n1 | tr -d '\r')"
-  if ! grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-announce.err"; then
-    echo "::error::activate did not announce the coming deny-all default (NET-076)"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  bare_sid="$(printf '%s\n' "$bare_sid" | tail -n1 | tr -d '\r')"
+  bare_note_count="$(grep -cF -- "$egress_in_force_note" "$WORK/egress-bare.err" || true)"
+  if [ "$bare_note_count" != 1 ]; then
+    echo "::error::NET-074: activate of a bare own-address box did not print the in-force note once (got ${bare_note_count:-0})"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   fi
-  # A VM-backed lane names the VM host's variable, never the native flag:
-  # the flag does not reach the guest's egress default.
-  if [ "$min_daemon" = minvmd ]; then
-    if ! grep -qF -- "MINVMD_EGRESS_DENY_ALL_OPT_OUT=1" "$WORK/egress-announce.err"; then
-      echo "::error::the deny-all announcement did not name MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 (VM lane)"
-      cat "$WORK/egress-announce.err" 2>/dev/null || true
-      fail
-    fi
-    if grep -qF -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
-      echo "::error::the VM-lane deny-all announcement named the native --egress-deny-all-opt-out flag"
-      cat "$WORK/egress-announce.err" 2>/dev/null || true
-      fail
-    fi
-  elif ! grep -qF -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
-    echo "::error::the deny-all announcement did not name the --egress-deny-all-opt-out flag"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  if grep -q "Heads-up" "$WORK/egress-bare.err"; then
+    echo "::error::NET-076: the retired deny-all announcement still printed at activate"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   fi
-  echo "NET-076 OK: activate announced the coming default and named the opt-out"
+  echo "NET-076 OK: no announcement; activate printed the in-force note once"
+
+  bare_policy="$(mnl session policy "$bare_sid" 2>"$WORK/egress-bare-policy.err")" || {
+    echo "::error::'min session policy' failed for the bare box"
+    cat "$WORK/egress-bare-policy.err" 2>/dev/null || true
+    fail
+  }
+  echo "effective policy of the bare box:"
+  printf '%s\n' "$bare_policy" | sed 's/^/  /'
+  if ! grep -qF "deny-all (default)" <<<"$bare_policy"; then
+    echo "::error::NET-075: 'min session policy' did not show the deny-all default for a bare own-address box"
+    fail
+  fi
+  echo "NET-075 OK: the bare box's policy shows deny-all (default)"
 
   # The remaining probes exercise allowed/disallowed flows against the public
   # internet, so they follow the same weather-aware policy as
@@ -1793,23 +1809,39 @@ proof_own_ip_egress_declared_and_enforced() {
     return 1
   }
 
-  if egress_reachability_probe "$announce_sid" "announce" example.com example.org; then
-    echo "allowed-connection OK: a bare box still reaches the network during the announcement"
+  # The control box: an own-address box that declares reach to every
+  # address, so it reaches what the lane reaches. It declares egress, so no
+  # in-force note prints for it.
+  open_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-open --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/egress-open.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed"
+    cat "$WORK/egress-open.err" 2>/dev/null || true
+    fail
+  }
+  open_sid="$(printf '%s\n' "$open_sid" | tail -n1 | tr -d '\r')"
+  if grep -qF -- "$egress_in_force_note" "$WORK/egress-open.err"; then
+    echo "::error::a box that declared egress was given the in-force note for a box with no egress section"
+    cat "$WORK/egress-open.err" 2>/dev/null || true
+    fail
+  fi
+
+  if egress_reachability_probe "$open_sid" "open" example.com example.org; then
+    echo "allowed-connection OK: a box that declares reach to every address reaches the network"
   else
-    echo "allowed-connection WARNING: the bare box could not prove external reachability; the announcement text and opt-out were still verified above"
+    echo "allowed-connection WARNING: the allowing box could not prove external reachability; the note and policy were still verified above"
   fi
 
   # ---- the destination the declared box must be refused, proven live first --
   # NET-062's drop is only meaningful against a destination this lane can
   # actually reach: a connection nobody could have completed reads as a
   # "silent drop" on a networkless lane, which is enforcement nobody enforced.
-  # So the SAME run first asks a box with NO egress section — the announce box
-  # above, which the announcement phase still leaves unrestricted — to
-  # complete the exact connection the declared box must be refused. Its
-  # completing proves the destination is live and reachable through this
-  # switch fabric, so the declared box's non-completion below can only be its
-  # own rules — and it doubles as the reach the coming deny-all default takes
-  # away (NET-074).
+  # So the SAME run first asks the allowing box above — its egress admits
+  # every address — to complete the exact connection the declared box must
+  # be refused. Its completing proves the destination is live and reachable
+  # through this switch fabric, so the declared box's non-completion below
+  # can only be its own rules — and so is the bare box's, which is the reach
+  # the deny-all default takes away (NET-074).
   #
   # The destination is a LITERAL public address, and it is chosen so nothing
   # the declared box admits can ever cover it. Its allow subnets are a
@@ -1828,21 +1860,21 @@ proof_own_ip_egress_declared_and_enforced() {
   # name this box pins (example.com) can never resolve to — and being
   # literals, no resolver has to agree with anything for the probe to run.
   # Two of them, because a lane whose network blocks one still deserves the
-  # proof: the first the bare box reaches is the one the declared box must be
-  # refused.
+  # proof: the first the allowing box reaches is the one the declared box
+  # must be refused.
   egress_disallowed_dst=""
   for egress_dst_candidate in 1.1.1.1 9.9.9.9; do
     for egress_dst_try in 1 2 3; do
-      egress_dst_out="$(mnl session exec "$announce_sid" \
+      egress_dst_out="$(mnl session exec "$open_sid" \
         "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_dst_candidate/" \
         2>"$WORK/egress-dst-live.err")"
       egress_dst_rc=$?
       if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
         egress_disallowed_dst="$egress_dst_candidate"
-        echo "control GET https://$egress_dst_candidate/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        echo "control GET https://$egress_dst_candidate/ from the allowing box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
         break
       fi
-      echo "control GET https://$egress_dst_candidate/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+      echo "control GET https://$egress_dst_candidate/ from the allowing box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
       cat "$WORK/egress-dst-live.err" 2>/dev/null || true
       if [ "$egress_dst_try" -lt 3 ]; then
         sleep 3
@@ -1853,9 +1885,59 @@ proof_own_ip_egress_declared_and_enforced() {
     fi
   done
   if [ -z "$egress_disallowed_dst" ]; then
-    echo "::warning::the bare box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+    echo "::warning::the allowing box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
-  mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
+
+  # ---- NET-074: the bare box reaches nothing outside itself ----------------
+  # The literal destination the allowing box just completed a connection to
+  # must not complete from the bare box: same run, same fabric, so a
+  # non-completion is the default's doing, not a dead route.
+  if [ -z "$egress_disallowed_dst" ]; then
+    echo "::warning::NET-074: the bare box's reach assertion is skipped as a weather warning (the allowing box reached no candidate destination above)"
+  else
+    mnl session exec "$bare_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$egress_disallowed_dst/" \
+      >"$WORK/egress-bare-ip.out" 2>"$WORK/egress-bare-ip.err"
+    bare_ip_rc=$?
+    bare_ip_status="$(cat "$WORK/egress-bare-ip.out" 2>/dev/null)"
+    echo "bare-box GET https://$egress_disallowed_dst/ -> rc=$bare_ip_rc status=${bare_ip_status:-<none>} curl: $(tr '\n' ' ' < "$WORK/egress-bare-ip.err" 2>/dev/null)"
+    if egress_curl_answered "$bare_ip_rc" "${bare_ip_status:-}"; then
+      echo "::error::NET-074: a bare own-address box completed a connection to $egress_disallowed_dst, which the allowing box reached in this run; the deny-all default did not bind"
+      cat "$WORK/egress-bare-ip.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-074 OK: the bare box did not reach $egress_disallowed_dst, which the allowing box reached in this run"
+  fi
+
+  # An external name fails fast at resolution: the relay refuses every name
+  # outside the box zone for a deny-all box, so the lookup is answered, never
+  # left to time out. Timed inside the box, so the exec's own round trip is
+  # not counted; single-quoted so the box's shell, not this one, expands it.
+  # The zone still resolves: host.min.internal answers from the same box.
+  # shellcheck disable=SC2016
+  bare_lookup="$(mnl session exec "$bare_sid" \
+    's=$(date +%s%N); getent ahostsv4 example.com; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>"$WORK/egress-bare-getent.err" | tr -d '\r' | tail -n1)" || true
+  echo "NET-074: getent ahostsv4 example.com from the bare box -> ${bare_lookup:-<none>}"
+  bare_lookup_rc="$(printf '%s' "$bare_lookup" | sed -n 's/^rc=\([0-9]*\) .*/\1/p')"
+  bare_lookup_ms="$(printf '%s' "$bare_lookup" | sed -n 's/.* ms=\([0-9]*\)$/\1/p')"
+  if [ -z "$bare_lookup_rc" ] || [ "$bare_lookup_rc" = 0 ] || [ -z "$bare_lookup_ms" ] \
+     || [ "$bare_lookup_ms" -ge 5000 ]; then
+    echo "::error::NET-074: the bare box's lookup of example.com did not fail fast (want a non-zero getent exit inside 5000 ms, got '${bare_lookup:-none}')"
+    cat "$WORK/egress-bare-getent.err" 2>/dev/null || true
+    fail
+  fi
+  bare_host="$(mnl session exec "$bare_sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/egress-bare-host.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "NET-074: host.min.internal from the bare box -> ${bare_host:-<none>}"
+  if ! printf '%s' "$bare_host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::NET-074: host.min.internal did not resolve from the bare box (got '${bare_host:-none}')"
+    cat "$WORK/egress-bare-host.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-074 OK: the bare box's external name fails fast at resolution and host.min.internal resolves"
+  mnl session destroy --force "$bare_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$open_sid" >/dev/null 2>&1 || true
 
   # ---- NET-060/061/062/063: four-field declaration, effective rules, drop --
   # The allowed list is intentionally narrow: one non-loopback documentation
@@ -1880,8 +1962,8 @@ proof_own_ip_egress_declared_and_enforced() {
     fail
   }
   declare_sid="$(printf '%s\n' "$declare_sid" | tail -n1 | tr -d '\r')"
-  if grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-declared.err"; then
-    echo "::error::a declared box was announced as if it had no egress section"
+  if grep -qF -- "$egress_in_force_note" "$WORK/egress-declared.err"; then
+    echo "::error::a declared box was given the in-force note for a box with no egress section"
     cat "$WORK/egress-declared.err" 2>/dev/null || true
     fail
   fi
@@ -1911,7 +1993,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # lane's network and the allowed path — and, on the SAME run, separates a
   # policy drop from a dead network, which is what lets the fast-failure
   # branches below be hard fails instead of weather warnings. The control's
-  # result is kept for the deny-all stand-in further down, whose own
+  # result is kept for the declared deny-all box further down, whose own
   # reachability cannot be probed from itself (it reaches nothing by
   # construction, so a guard run from it could never pass).
   declared_reach_ok=0
@@ -1924,15 +2006,15 @@ proof_own_ip_egress_declared_and_enforced() {
     # name outside `allow_dns_hosts` is a resolver matter (design §5.3 refuses
     # non-matching names at resolution), so the drop is proven against a
     # destination ADDRESS no rule and no pin admits — the literal chosen and
-    # proven live further up, from the bare box, in this same run. Two
-    # controls bracket it: the bare box's completed connection to the very
+    # proven live further up, from the allowing box, in this same run. Two
+    # controls bracket it: the allowing box's completed connection to the very
     # destination (a live destination on this lane, reached through the same
     # fabric) and this box's own completed connection to example.com above
     # (this box's network and its allowed path), so a non-completion here is
     # neither a dead route nor a dead box, and a fast refusal is the box's own
     # doing rather than weather.
     if [ -z "$egress_disallowed_dst" ]; then
-      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box reached no candidate destination above, so a drop here would prove nothing about the rules)"
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the allowing box reached no candidate destination above, so a drop here would prove nothing about the rules)"
     else
       deny_start_ms="$(now_ms)"
       mnl session exec "$declare_sid" \
@@ -1944,7 +2026,7 @@ proof_own_ip_egress_declared_and_enforced() {
       deny_err="$(tr '\n' ' ' < "$WORK/egress-deny-ip.err" 2>/dev/null)"
       echo "disallowed-address GET https://$egress_disallowed_dst/ -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
       if egress_curl_answered "$deny_rc" "${deny_status:-}"; then
-        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the bare box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
+        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the allowing box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1954,11 +2036,11 @@ proof_own_ip_egress_declared_and_enforced() {
         fail
       fi
       if [ "$deny_elapsed_ms" -ge 6000 ]; then
-        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the bare box completed the same connection in this run"
+        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the allowing box completed the same connection in this run"
         assert_egress_drop_logged
         echo "NET-062 (rate-limited warning) OK: the drop is logged"
       else
-        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the bare box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
+        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the allowing box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1997,15 +2079,11 @@ proof_own_ip_egress_declared_and_enforced() {
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
 
-  # ---- NET-074 stand-in: no egress section reaches nothing once the default
-  # is in force. The shipped phase is announced, so we exercise the
-  # enforcement shape with an explicit deny-all declaration
-  # (`--deny-all-egress`, every allow list present and empty — the very
-  # section the in-force default materializes); the unit and CLI tests
-  # already cover the in-force resolution, and the announcement above covers
-  # the transition notice. This is a stand-in for NET-074's REACH only:
-  # NET-075's `deny-all` rendering in `min session policy` stays with the CLI
-  # tests that pin it.
+  # ---- a declared deny-all box: `--deny-all-egress`, every allow list
+  # present and empty — the very section the in-force default materializes
+  # for the bare box above (NET-074), here declared, so the box carries it
+  # whatever the daemon's opt-out says. It carries NET-141's deny-all case
+  # below, and reaches nothing.
   deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-deny-all --network own_ip \
     --deny-all-egress \
@@ -2143,7 +2221,7 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
   # the control — a hard assertion when it passed, a weather warning when it
   # did not — and probe the same endpoint the control just proved answers.
   if [ "$declared_reach_ok" != 1 ]; then
-    echo "::warning::NET-074: the declared box could not prove external reachability in this run, so the deny-all stand-in's reach assertion is skipped as a weather warning"
+    echo "::warning::the declared box could not prove external reachability in this run, so the declared deny-all box's reach assertion is skipped as a weather warning"
   else
     deny_all_start_ms="$(now_ms)"
     mnl session exec "$deny_all_sid" \
@@ -2169,11 +2247,11 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     fi
     echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
     if [ "$deny_all_outcome" != "fast resolver refusal" ]; then
-      echo "::error::NET-074/NET-141: the deny-all box's GET https://example.com did not fail at resolution — its relay refuses every name outside the box zone, so no connection should have been tried"
+      echo "::error::NET-141: the deny-all box's GET https://example.com did not fail at resolution — its relay refuses every name outside the box zone, so no connection should have been tried"
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
-    echo "NET-074 OK: a box with no effective external reach gets nothing (explicit deny-all stand-in for the in-force default)"
+    echo "declared deny-all OK: a box that declared no external reach gets nothing"
   fi
 
   mnl session destroy --force "$declare_sid" >/dev/null 2>&1 || true
@@ -2405,12 +2483,14 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --pid step is the supported placement, and the placement probe is per
-    # launch, so the next box this daemon launches is decided on a leaf of
-    # its own. Found off /proc, keyed on comm (a cmdline match would take an
-    # editor holding a file under crates/minimald for the daemon itself)
-    # and on this account, so another account's daemon is never placed in
-    # this case's tree.
+    # --place-listener step is the placement the path unit `min
+    # finalize-install` installs makes at every daemon start: it finds the
+    # daemon by the socket it holds, never by a pid anyone names, and the
+    # placement probe is per launch, so the next box this daemon launches
+    # is decided on a leaf of its own. The pid is still read here, off
+    # /proc, keyed on comm (a cmdline match would take an editor holding a
+    # file under crates/minimald for the daemon itself) and on this account,
+    # to check the step placed THAT process and no other.
     hida_daemons=""
     for hida_proc in /proc/[0-9]*; do
       [ -r "$hida_proc/comm" ] || continue
@@ -2424,20 +2504,31 @@ proof_host_ip_deny_all() {
       echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${hida_daemons:-none}"
       fail
     fi
+    hida_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+    if [ ! -S "$hida_sock" ]; then
+      echo "::error::the daemon's listener is not at $hida_sock, so the placement unit's step has nothing to find it by"
+      fail
+    fi
     # shellcheck disable=SC2024
-    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$hida_pid" \
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+        --place-listener "$hida_sock" \
         >"$WORK/hida-place.out" 2>"$WORK/hida-place.err"; then
-      echo "::error::the installer's --pid step could not place $min_daemon $hida_pid in its leaf"
+      echo "::error::the installer's --place-listener step could not place $min_daemon $hida_pid in its leaf"
       echo "--- installer stderr ---"; cat "$WORK/hida-place.err" 2>/dev/null || true
       fail
     fi
     hida_place_out="$(cat "$WORK/hida-place.out" 2>/dev/null || true)"
     if [[ "$hida_place_out" != *"placed $hida_pid in"* ]]; then
-      echo "::error::the --pid step did not report placing $min_daemon $hida_pid"
+      echo "::error::the --place-listener step did not report placing $min_daemon $hida_pid (the holder of $hida_sock)"
       echo "--- installer output ---"; printf '%s\n' "$hida_place_out"
       fail
     fi
-    echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
+    if ! grep -qx "$hida_pid" /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null; then
+      echo "::error::$min_daemon $hida_pid is not a member of /sys/fs/cgroup/minimald.slice/daemon after the --place-listener step"
+      echo "--- daemon leaf members ---"; cat /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null || true
+      fail
+    fi
+    echo "place: $min_daemon $hida_pid, found as the holder of $hida_sock, is inside the slice's daemon leaf, so the box this case launches is decided on a leaf of its own"
 
     # ---- the daemon's own fact, turned the one way it is: a launch. A
     # create answers from the last read the host gave it — the start-up
@@ -2464,7 +2555,7 @@ proof_host_ip_deny_all() {
     }
     hida_warm_sid="$(printf '%s\n' "$hida_warm_sid" | tail -n1 | tr -d '\r')"
     hida_warm_activate_err="$(cat "$WORK/hida-warm-activate.err" 2>/dev/null || true)"
-    if [[ "$hida_warm_activate_err" == *"cannot decide a host-address box's"* ]]; then
+    if [[ "$hida_warm_activate_err" == *"can't enforce it yet"* ]]; then
       echo "warm create: the throwaway box's start printed the advisory the start-up read left the fact carrying — the placement above clears the cause for reads after it, and the launch that turns the fact is the next beat:"
       printf '%s\n' "$hida_warm_activate_err" | sed 's/^/  /'
     fi
@@ -2525,7 +2616,7 @@ proof_host_ip_deny_all() {
     }
     hida_sid="$(printf '%s\n' "$hida_sid" | tail -n1 | tr -d '\r')"
     hida_activate_err="$(cat "$WORK/hida-activate.err" 2>/dev/null || true)"
-    if [[ "$hida_activate_err" == *"cannot decide a host-address box's"* ]]; then
+    if [[ "$hida_activate_err" == *"can't enforce it yet"* ]]; then
       echo "::error::the activation on a decided host printed the classifier advisory anyway: the create reply carried a cause the refresh launch above just ruled out of the fact"
       printf '%s\n' "$hida_activate_err"
       fail
@@ -2967,18 +3058,18 @@ proof_host_ip_deny_all() {
   }
   hida_un_sid="$(printf '%s\n' "$hida_un_sid" | tail -n1 | tr -d '\r')"
   hida_un_activate_err="$(cat "$WORK/hida-un-activate.err" 2>/dev/null || true)"
-  if [[ "$hida_un_activate_err" != *"note: this host cannot decide a host-address box's egress verdict per box:"* ]]; then
-    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes the session start the cause in words"
+  if [[ "$hida_un_activate_err" != *"note: you asked this box for no network access, but this machine can't enforce it yet, so the box can still reach the network."* ]]; then
+    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes a session start that declared egress the first line (what was asked, that it is not enforced, what the box does instead)"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
-  if [[ "$hida_un_activate_err" != *"While it cannot, its host-address boxes run unenforced"* ]]; then
-    echo "::error::the advisory does not say the boxes run unenforced — the outcome a native host's advisory owes"
+  if [[ "$hida_un_activate_err" != *"  Enforce it: "* ]]; then
+    echo "::error::the advisory does not carry its second line naming how to enforce the declaration"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
-  if [[ "$hida_un_activate_err" != *"whatever the boxes' declarations say"* ]]; then
-    echo "::error::the advisory does not carry the clause that says the declaration is not what is running here"
+  if [[ "$hida_un_activate_err" != *"--network own_ip, which enforces it now"* ]]; then
+    echo "::error::the advisory does not name the own-address start that enforces the declaration now"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
@@ -3004,10 +3095,10 @@ proof_host_ip_deny_all() {
   fi
   # The cause, from the record's own field — the two a native host's start
   # can carry, each with its own rule for the install command: the missing
-  # step names the one command that ends it, a mount that cannot confine a
-  # box names none (installing the step over that tree would leave the
-  # cause standing). The stderr advisory must name the same cause, and its
-  # install command must follow the same rule.
+  # step names `min finalize-install` as the remedy, a mount that cannot
+  # confine a box names the own-address start alone and says why the
+  # install cannot help (installing the step over that tree would leave the
+  # cause standing). The stderr advisory must follow the same rule.
   hida_un_cause=""
   case "$hida_un_create" in
     *"the classifier's privileged step is not installed on this host"*)
@@ -3021,27 +3112,32 @@ proof_host_ip_deny_all() {
       fail
       ;;
   esac
-  if [[ "$hida_un_activate_err" != *"$hida_un_cause"* ]]; then
-    echo "::error::the advisory's cause does not match the create record's own (expected: $hida_un_cause)"
-    printf '%s\n' "$hida_un_activate_err"
-    fail
-  fi
   case "$hida_un_cause" in
     "the classifier's privileged step is not installed on this host")
-      if [[ "$hida_un_activate_err" != *"install-host-classifier.sh"* ]]; then
-        echo "::error::the advisory names the missing step but not the command that installs it"
+      if [[ "$hida_un_activate_err" != *"Enforce it: min finalize-install"* ]]; then
+        echo "::error::the advisory's cause is the missing step but it does not name min finalize-install as the remedy"
         printf '%s\n' "$hida_un_activate_err"
         fail
       fi
-      echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
+      if [[ "$hida_un_activate_err" == *"curl"* || "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+        echo "::error::the advisory names a script or a fetch instead of min finalize-install"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the missing step, and the advisory names min finalize-install as the remedy"
       ;;
     *)
-      if [[ "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
-        echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
+      if [[ "$hida_un_activate_err" == *"Enforce it: min finalize-install"* ]]; then
+        echo "::error::the advisory hands out the install for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
         printf '%s\n' "$hida_un_activate_err"
         fail
       fi
-      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names no command — none would end it"
+      if [[ "$hida_un_activate_err" != *"min finalize-install can't fix this: $hida_un_cause"* ]]; then
+        echo "::error::the advisory does not say why the install cannot help, in the create record's own cause words (expected: $hida_un_cause)"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names the own-address start alone and says why the install cannot help"
       ;;
   esac
   printf '%s\n' "$hida_un_activate_err" | sed 's/^/  /'
@@ -3730,7 +3826,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 # lands. So the case freezes the CLI instead. It single-steps the activation
 # under SIGSTOP/SIGCONT, so the CLI never runs more than a few milliseconds
 # unobserved. It stops for good once the CLI has printed the deny-all
-# announcement (the same NET-076 text the egress proof above asserts, printed
+# in-force note (the same NET-076 text the egress proof above asserts, printed
 # immediately before the guard is armed) AND holds the fixture's bulk data
 # open. That combination means the project upload is under way: after the
 # guard, before the configure. Then the SIGINT lands while the CLI is
@@ -3790,8 +3886,12 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   mnl stop --force >/dev/null 2>&1 || true
 
   # ---- (a) create registers the box with the VM host daemon ----------------
+  # The box declares reach to every address: it is the live control for the
+  # declared box's refusal below, and a bare own-address box now has the
+  # deny-all default (NET-074), so it could not be one.
   boxreg_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . \
-    --no-prompt --name e2e-box-reg --network own_ip 2>"$WORK/boxreg-activate.err")" || {
+    --no-prompt --name e2e-box-reg --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/boxreg-activate.err")" || {
     echo "::error::'min session activate --network own_ip' (no provider flag) failed"
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
     fail
@@ -3803,7 +3903,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
     fail
   fi
-  echo "bare own-address box: $boxreg_sid (activated with no provider flag)"
+  echo "own-address box: $boxreg_sid (activated with no provider flag; egress open to every address)"
 
   # The registration, straight from the VM host daemon's record: one INFO
   # line per box, naming it and the address pair it allocated. The CLI could
@@ -3856,8 +3956,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # ---- the destination the declared box below must be refused, proven live --
   # Same doctrine as the egress proof above: a non-completion only means
   # enforcement if this lane can reach the destination at all, so the SAME
-  # connection is first completed from the box with NO egress section
-  # (allow-all while the shipped default is only announced). The destination
+  # connection is first completed from the box above, whose declared egress
+  # admits every address. The destination
   # is a literal public anycast endpoint, live on 443 and chosen so nothing
   # the declared box admits can ever cover it — no resolver has to agree with
   # anything for the probe to run. curl always writes its -w line, and
@@ -3872,17 +3972,17 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
       if [ "$boxreg_dst_rc" -eq 0 ] \
         || { [ -n "${boxreg_dst_out:-}" ] && [ "$boxreg_dst_out" != "HTTP:000" ]; }; then
         boxreg_live_dst="$boxreg_dst"
-        echo "control GET https://$boxreg_dst/ from the bare box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        echo "control GET https://$boxreg_dst/ from the allowing box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
         break
       fi
-      echo "control GET https://$boxreg_dst/ from the bare box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
+      echo "control GET https://$boxreg_dst/ from the allowing box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
       cat "$WORK/boxreg-dst-live.err" 2>/dev/null || true
       [ "$boxreg_try" -lt 3 ] && sleep 3
     done
     [ -n "$boxreg_live_dst" ] && break
   done
   if [ -z "$boxreg_live_dst" ]; then
-    echo "::warning::the bare box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+    echo "::warning::the allowing box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
 
   # ---- (b) destroy withdraws the row ---------------------------------------
@@ -3922,7 +4022,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # that an interrupt would kill it with the row still published — and drops
   # the guard once the session is Active. The guard aborts the half-built
   # session, withdraws the box row, and exits 130. What the HOST can see of
-  # "the create returned" is the deny-all announcement a box with no egress
+  # "the create returned" is the deny-all in-force note a box with no egress
   # section prints to stderr immediately before the guard is armed, and of
   # "the upload is under way" is the bulk file held open. This half freezes
   # the backgrounded activation once both are true (see the header comment)
@@ -3938,7 +4038,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   BOXREG_CTRLC_PID=$!
   # Single-step the activation until it is frozen inside the window (see the
   # header comment): each step stops the CLI, looks, and lets it run ~10 ms
-  # more. Once the deny-all announcement is on stderr the guard is armed, and
+  # more. Once the deny-all in-force note is on stderr the guard is armed, and
   # once the bulk file is also open the project upload is under way. The CLI
   # is left stopped there, so nothing it does next can race the interrupt.
   # lsof reports the resolved path on macOS (/tmp is /private/tmp), so the
@@ -3950,7 +4050,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
     kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
     if [ -z "$boxreg_ctrlc_armed" ] \
-      && grep -q "Heads-up: the next release denies all external reach" \
+      && grep -qF -- "egress: deny-all (default for an own-ip box with no egress section)" \
         "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
     fi
@@ -3968,7 +4068,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     sleep 0.01
   done
   if [ -z "$boxreg_ctrlc_armed" ]; then
-    echo "::error::the interrupted activation never announced the deny-all default on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    echo "::error::the interrupted activation never printed the deny-all in-force note on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
     BOXREG_CTRLC_PID=""
@@ -4160,7 +4260,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   if [ "$boxreg_declared_reach_ok" -ne 1 ]; then
     echo "::warning::the declared box's allowed connection to https://example.com did not complete, so the refusal below is skipped as a weather warning (the row is registered; the behavioural half needs the public internet)"
   elif [ -z "$boxreg_live_dst" ]; then
-    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the bare box above)"
+    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the allowing box above)"
   else
     # The refusal, hard-failed on every shape that is not a silent drop: an
     # answer, a reset, or a fast failure — bracketed by the two controls that
@@ -4176,7 +4276,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     echo "undeclared GET https://$boxreg_live_dst/ from the declared box -> rc=$boxreg_refuse_rc status=${boxreg_refuse_status:-<none>} elapsed=${boxreg_refuse_elapsed_ms}ms curl: ${boxreg_refuse_err:-<none>}"
     if [ "$boxreg_refuse_rc" -eq 0 ] \
       || { [ -n "${boxreg_refuse_status:-}" ] && [ "$boxreg_refuse_status" != "HTTP:000" ]; }; then
-      echo "::error::the declared box's connection to $boxreg_live_dst answered — the bare box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
+      echo "::error::the declared box's connection to $boxreg_live_dst answered — the allowing box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
       cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
       fail
     fi
@@ -4186,11 +4286,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
       fail
     fi
     if [ "$boxreg_refuse_elapsed_ms" -lt 6000 ]; then
-      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the bare box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
+      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the allowing box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
       cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
       fail
     fi
-    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the bare box completed the same connection and this box completed its allowed one"
+    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the allowing box completed the same connection and this box completed its allowed one"
 
     # The host-side gate's own account, where the frame reached it. An honest
     # box's in-guest egress leg applies the same declared policy and refuses
@@ -4874,11 +4974,12 @@ echo "::endgroup::"
 #     refused from inside the box, fast, and a public host is
 #     unreachable too. The stock posture (host_ip, the default) completes
 #     an outbound request (NET-107).
-#   * from the fresh install, `--network own_ip --ingress 8080:8080`
-#     answers ON THE HOST at the box's own loopback address with the box's
-#     own server's response (NET-040, NET-010) — and that box completes an
-#     outbound request through the switch the installer shipped (NET-107's
-#     switch half).
+#   * from the fresh install, `--network own_ip --allow-subnets 0.0.0.0/0
+#     --ingress 8080:8080` answers ON THE HOST at the box's own loopback
+#     address with the box's own server's response (NET-040, NET-010) — and
+#     that box completes an outbound request through the switch the
+#     installer shipped (NET-107's switch half). The egress is declared
+#     because a bare own-address box is deny-all by NET-074.
 #
 # Lane gating, decided by where the proof's pieces actually run:
 #   * Native Linux only: the install pair lives host-side on a VM lane
@@ -5447,8 +5548,12 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       mkdir -p "$np_ownip_seed"
       hook_seed_preamble >"$np_ownip_seed/minimal.toml"
       mkdir "$np_ownip_seed/.git"
+      # The box declares its egress: a bare own-address box is deny-all by
+      # NET-074 and reaches nothing outside itself, and this half proves the
+      # own-IP posture's outbound request (NET-107) beside its ingress.
       np_own_sid="$(cd "$np_ownip_seed" && mnl session activate . --no-prompt \
-        --name e2e-posture-ownip --network own_ip --ingress "$np_hport2":8080 \
+        --name e2e-posture-ownip --network own_ip --allow-subnets 0.0.0.0/0 \
+        --ingress "$np_hport2":8080 \
         2>"$np_own_err")" || {
         echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
         echo "--- stderr ---"
@@ -5456,7 +5561,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         exit 1
       }
       np_own_sid="$(printf '%s\n' "$np_own_sid" | tail -n1 | tr -d '\r')"
-      echo "step: min session activate --network own_ip --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
+      echo "step: min session activate --network own_ip --allow-subnets 0.0.0.0/0 --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
       if grep -q -- 'note: --network' "$np_own_err"; then
         echo "::error::the current spelling --network own_ip printed a legacy hint"
         echo "--- stderr ---"
@@ -5962,8 +6067,12 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # -- own-IP (native only): its own namespace beside the session's box ----
   tn_own_proven=""
   if [ -z "$E2E_VM" ]; then
+  # The session declares reach to every address: an own-address box with no
+  # egress section gets the deny-all default (NET-074), and the egress leg
+  # below needs a task that can reach example.com.
   tn_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-tn-ownip --network own_ip 2>"$WORK/tn-activate.err")" || {
+    --name e2e-tn-ownip --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/tn-activate.err")" || {
     echo "::error::'min session activate --network own_ip' failed for the task-network proof"
     echo "--- stderr ---"; cat "$WORK/tn-activate.err" 2>/dev/null || true
     kill "$TN_LISTENER_PID" 2>/dev/null || true
@@ -7084,10 +7193,10 @@ fi
 # Native host-OS resolution of a box name, with no proxy settings anywhere
 # (NET-009, with the client halves of NET-122 and NET-123).
 #
-# `min net setup --print` (NET-122) must print, on a host whose resolver is
+# `min finalize-install --show --script` (NET-122) must print, on a host whose resolver is
 # not configured for the zone, the EXACT script that points it at the
 # daemon's zone answerer — this case runs the file it printed, under one
-# `sudo sh`, not a reconstruction of it, so what `min net setup` would run is
+# `sudo sh`, not a reconstruction of it, so what `min finalize-install` would run is
 # what is proved. And session start must never prompt: this case drives `min session
 # activate` from a script with no answers to give, so the activate completing
 # at all is half the proof. The other half, where this host can run it: after
@@ -7128,14 +7237,14 @@ fi
 #     the quiet was right.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# NET-123's macOS half: the one privileged script `min net setup` runs
+# NET-123's macOS half: the one privileged script `min finalize-install` runs
 # installs the boot-time unit that reserves the local range (design §7.1) —
 # the same script that writes the resolver file, so both halves of the
 # host's configuration land in one elevation, never two commands the user
 # runs separately.
 #
-# The proof runs the exact script `min net setup --print` printed — the
-# bytes `min net setup` runs under `sudo sh`, including the two files'
+# The proof runs the exact script `min finalize-install --show --script` printed — the
+# bytes `min finalize-install` runs under `sudo sh`, including the two files'
 # bodies riding inside it as quoted heredocs — and then asserts what the spec promises:
 # both files root-owned at their exact modes, the plist's ProgramArguments
 # naming the root-owned program, the whole reserved range present on this
@@ -7232,27 +7341,33 @@ proof_local_range_reserved_by_privileged_step() {
   }
   echo "activated $RANGE_NAME ($(printf '%s' "$range_sid" | tail -n1 | tr -d '\r')); answerer on 127.0.0.1:$range_port"
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
-  range_setup="$WORK/range-net-setup.out"
-  mnl net setup --print >"$range_setup" 2>"$range_setup.note" || true
+  range_setup="$WORK/range-finalize-install.out"
+  mnl finalize-install --show --script >"$range_setup" 2>"$range_setup.note" || true
 
-  # The script `min net setup` runs, exactly as `--print` wrote it: the two
-  # files' bytes ride inside it as quoted heredocs, and its header says
-  # what it configures — on macOS the resolver and the local range together.
+  # The script `min finalize-install` runs, exactly as `--show --script` wrote
+  # it: the two files' bytes ride inside it as quoted heredocs, and its header
+  # names the names item it finishes — on macOS the resolver and the local
+  # range together, each step under its own comment.
   range_cmd="$(setup_script_from "$range_setup")"
   case "$range_cmd" in
     '#!/bin/sh'*) ;;
     *)
-      echo "::error::no setup script from 'min net setup --print' (got: '$range_cmd')"
+      echo "::error::no setup script from 'min finalize-install --show --script' (got: '$range_cmd')"
       echo "--- activate stderr ---"; cat "$range_err" 2>/dev/null || true
-      echo "--- min net setup --print ---"; cat "$range_setup" "$range_setup.note" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$range_setup" "$range_setup.note" 2>/dev/null || true
       fail
       ;;
   esac
-  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Configure the host's resolver, reserve the local range"; then
-    echo "::error::the setup script's header does not say it configures the resolver and reserves the range"
+  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: box names for every host program"; then
+    echo "::error::the setup script's header does not name the names item it finishes"
     echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,4p'
+    fail
+  fi
+  if ! printf '%s\n' "$range_cmd" | grep -qF -- "# The resolver: " || ! printf '%s\n' "$range_cmd" | grep -qF -- "# The local range: "; then
+    echo "::error::the setup script does not carry both the resolver step and the local-range step"
+    echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,12p'
     fail
   fi
   # The script the header promised: one elevation for the resolver and the
@@ -7385,7 +7500,7 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'native DNS is the live name surface' "$range2_err"; then
+  if ! grep -q -- 'resolves in any browser on this machine' "$range2_err"; then
     echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
@@ -7578,11 +7693,75 @@ answerer_channel_of() {
     -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
 }
 
-# The setup script `min net setup --print` wrote to $1 (its stdout), whole,
+# Called on the setup script file $1 just before a case runs it as root:
+# records that the run is about to install the classifier, when the script
+# carries the classifier's block (its ownership-record line) and this host
+# has no classifier yet. A host that already carries one — its tree, or the
+# record of an earlier install — is the host's own: the block only refreshes
+# it, and nothing here removes it afterwards.
+setup_classifier_note() {
+  grep -q '^: > /var/lib/minimal/finalize-install-classifier$' "$1" 2>/dev/null || return 0
+  if [ -e /sys/fs/cgroup/minimald.slice ] \
+     || [ -e /var/lib/minimal/finalize-install-classifier ]; then
+    return 0
+  fi
+  SETUP_CLASSIFIER_INSTALLED=1
+}
+
+# Prints what the manager recorded for the units a setup script installs. A
+# failed `systemctl start` says only that the unit failed; the reason is in
+# the unit's journal, which this run's own output never carries.
+setup_units_journal() {
+  command -v journalctl >/dev/null 2>&1 || return 0
+  for unit in minimald-classifier.service minimald-place.path minimald-place.service; do
+    echo "--- journal: $unit ---"
+    sudo -n journalctl --no-pager -n 40 -u "$unit" 2>&1 || true
+  done
+}
+
+# Removes the classifier install a setup script made (see
+# SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
+# and the two classifier proofs later in the lane install their own and refuse
+# a host that already carries one, so the host must be as the case found it.
+# The order is the installer's: the daemon stops first (the path unit placed
+# it in the tree's daemon leaf, and the uninstall refuses while a process or
+# a live leaf holds the tree), the units go before the tree so no later
+# daemon start is placed and no boot re-installs it, then the step's own
+# --uninstall, then the files the block wrote. A no-op until a case recorded
+# an install. Returns non-zero when the tree is still there.
+setup_classifier_teardown() {
+  [ -n "${SETUP_CLASSIFIER_INSTALLED:-}" ] || return 0
+  mnl stop --force >/dev/null 2>&1 || true
+  sudo -n systemctl disable --now minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  # A box's leaf can outlive the stop by a moment; the uninstall is retried
+  # over a bounded wait rather than failed on the first refusal.
+  for _ in $(seq 1 20); do
+    [ -e /sys/fs/cgroup/minimald.slice ] || break
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  sudo -n rm -f /etc/systemd/system/minimald-place.path \
+    /etc/systemd/system/minimald-place.service \
+    /etc/systemd/system/minimald-classifier.service \
+    /usr/local/lib/minimal/install-host-classifier.sh \
+    /usr/local/lib/minimal/install-host-classifier.sh.new >/dev/null 2>&1 || true
+  sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
+  sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+  sudo -n systemctl reset-failed minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    return 1
+  fi
+  sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
+  SETUP_CLASSIFIER_INSTALLED=""
+}
+
+# The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
 # when that is a script — its first line `#!/bin/sh` — and nothing otherwise
 # (a host with nothing to run, or a blocker, prints only its note on
 # stderr). The proof runs this file with one `sudo -n sh`, the way
-# `min net setup` itself runs it.
+# `min finalize-install` itself runs it.
 setup_script_from() {
   if [ "$(head -n1 "$1" 2>/dev/null)" = '#!/bin/sh' ]; then
     cat "$1"
@@ -7699,12 +7878,12 @@ proof_native_resolution_without_proxy_env() {
   native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
   echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
-  native_setup="$WORK/native-net-setup.out"
-  mnl net setup --print >"$native_setup" 2>"$native_setup.note" || true
+  native_setup="$WORK/native-finalize-install.out"
+  mnl finalize-install --show --script >"$native_setup" 2>"$native_setup.note" || true
 
-  # The script `min net setup` runs, whole, exactly as `--print` wrote it.
+  # The script `min finalize-install` runs, whole, exactly as `--show --script` wrote it.
   # On macOS it carries the range step NET-123 folds into it too.
   native_cmd="$(setup_script_from "$native_setup")"
 
@@ -7748,7 +7927,7 @@ proof_native_resolution_without_proxy_env() {
       echo "--- script ---"; printf '%s\n' "$native_cmd"
       fail
     fi
-    echo "min net setup --print named the setup script ($(printf '%s\n' "$native_cmd" | wc -l | tr -d ' ') lines)"
+    echo "min finalize-install --show --script named the setup script ($(printf '%s\n' "$native_cmd" | wc -l | tr -d ' ') lines)"
     native_proved="advised"
 
     # NET-123's present arm, client side: a probe that found the reserved
@@ -7785,8 +7964,8 @@ proof_native_resolution_without_proxy_env() {
     # daemon before. CI's fresh runners never see it, which is why it is an
     # error there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::'min net setup --print' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- min net setup --print ---"; cat "$native_setup" "$native_setup.note" 2>/dev/null || true
+      echo "::error::'min finalize-install --show --script' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min finalize-install --show --script ---"; cat "$native_setup" "$native_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -7869,11 +8048,13 @@ proof_native_resolution_without_proxy_env() {
       esac
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
+      setup_classifier_note "$native_setup"
       # shellcheck disable=SC2024 # the output files are this user's, not root's
       if ! sudo -n sh "$native_setup" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
         echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
         echo "--- command ---"; echo "$native_cmd"
         echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
+        setup_units_journal
         fail
       fi
       echo "ran the advisory's command"
@@ -7970,6 +8151,12 @@ proof_native_resolution_without_proxy_env() {
   fi
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
   echo "::endgroup::"
 }
@@ -8501,14 +8688,14 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_sid="$(printf '%s\n' "$bn_sid" | tail -n1 | tr -d '\r')"
   echo "activated $BN_WEB_NAME ($bn_sid); answerer on 127.0.0.1:$bn_port"
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
   bn_setup="$WORK/bn-net-setup.out"
-  mnl net setup --print >"$bn_setup" 2>"$bn_setup.note" || true
+  mnl finalize-install --show --script >"$bn_setup" 2>"$bn_setup.note" || true
   # The surface the activation reports — printed, not asserted: before the
   # advisory's command runs it is the proxy's surface, and the verdict the
   # command is about to move is the second box's to report (NET-018).
-  bn_surface="$(grep -F -- 'live name surface' "$bn_err" 2>/dev/null | head -n1 || true)"
+  bn_surface="$(grep -F -- 'names: ' "$bn_err" 2>/dev/null | head -n1 || true)"
   echo "activate reported the surface: ${bn_surface:-<none>}"
 
   # Polls the pair of records that own a box's address — the finalize lease
@@ -8556,7 +8743,7 @@ proof_box_name_resolves_natively_without_proxy() {
   echo "$BN_WEB_NAME's address: $bn_web_ip, leased at finalize (NET-010) — registered for its name there (NET-011)"
   echo "daemon log: $bn_box_reg"
 
-  # NET-122: the setup script `min net setup --print` prints — the exact
+  # NET-122: the setup script `min finalize-install --show --script` prints — the exact
   # script, no prompt anywhere in the path. It must name this platform's
   # mechanism and THIS daemon's answerer, and run whole under one sudo.
   bn_cmd="$(setup_script_from "$bn_setup")"
@@ -8582,7 +8769,7 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "--- script ---"; printf '%s\n' "$bn_cmd"
       fail
     fi
-    echo "min net setup --print named the setup script ($(printf '%s\n' "$bn_cmd" | wc -l | tr -d ' ') lines)"
+    echo "min finalize-install --show --script named the setup script ($(printf '%s\n' "$bn_cmd" | wc -l | tr -d ' ') lines)"
   elif grep -q -- 'bypass systemd-resolved' "$bn_setup.note" 2>/dev/null; then
     # An advisory that names no command: this host's lookups never reach
     # systemd-resolved's stub, so the routing-domain command would configure
@@ -8604,8 +8791,8 @@ proof_box_name_resolves_natively_without_proxy() {
     # right. CI's fresh runners never see it, which is why it is an error
     # there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::'min net setup --print' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- min net setup --print ---"; cat "$bn_setup" "$bn_setup.note" 2>/dev/null || true
+      echo "::error::'min finalize-install --show --script' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min finalize-install --show --script ---"; cat "$bn_setup" "$bn_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -8780,11 +8967,13 @@ proof_box_name_resolves_natively_without_proxy() {
         fi
         ;;
     esac
+    setup_classifier_note "$bn_setup"
     # shellcheck disable=SC2024 # the output files are this user's, not root's
     if ! sudo -n sh "$bn_setup" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
       echo "--- command ---"; echo "$bn_cmd"
       echo "--- output ---"; cat "$WORK/bn-cmd.out" "$WORK/bn-cmd.err" 2>/dev/null || true
+      setup_units_journal
       fail
     fi
     echo "ran the setup script under one sudo"
@@ -8792,7 +8981,7 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'native DNS is the live name surface' \
+  bn_api_surface="$(grep -F -- 'resolves in any browser on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
     echo "::error::the second box's activate does not report native DNS as the live name surface (NET-018) — the command ran, so the verdict must have moved"
@@ -8800,10 +8989,13 @@ proof_box_name_resolves_natively_without_proxy() {
     fail
   fi
   echo "activate reported the surface (NET-018): $bn_api_surface"
+  # The activate line is the one host line, naming the box (NET-142). That
+  # the hostname proxy still serves beside native DNS (NET-019) is `min
+  # ls`'s to say, on its NAME SURFACE row, asserted below.
   case "$bn_api_surface" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    "names: $BN_API_NAME.min.internal resolves in any browser on this machine"*) ;;
     *)
-      echo "::error::the native surface line does not say the hostname proxy still serves (NET-019)"
+      echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
       fail
       ;;
@@ -9098,6 +9290,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   rm -rf "$BN_SEED_DIR" "$BN_API_SEED_DIR"
   BN_SEED_DIR=""; BN_API_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "box names resolve natively in any browser OK (each lookup with its answer, each record, and the surface — printed)"
   echo "::endgroup::"
 }
@@ -9113,7 +9311,7 @@ proof_box_name_resolves_natively_without_proxy() {
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port.
-#   2. `min net setup --print` prints the setup script; run as root, it
+#   2. `min finalize-install --show --script` prints the setup script; run as root, it
 #      asks A to release the port, installs the service, and starts it. A
 #      becomes a channel client of the manager-held service, and its box
 #      name still answers on the host.
@@ -9390,10 +9588,10 @@ for row in json.load(open(sys.argv[1])):
   local asr_a_sid asr_a_err="$WORK/asr-a-activate.err"
   asr_a_sid="$(asr_activate mnl e2e-asr-a "$asr_a_err")" || fail
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
   local asr_a_setup="$WORK/asr-a-net-setup.out"
-  mnl net setup --print >"$asr_a_setup" 2>"$asr_a_setup.note" || true
+  mnl finalize-install --show --script >"$asr_a_setup" 2>"$asr_a_setup.note" || true
   local asr_a_ip
   asr_a_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a.min.internal)"
   if [ -z "$asr_a_ip" ]; then
@@ -9452,7 +9650,7 @@ for row in json.load(open(sys.argv[1])):
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
-      echo "--- min net setup --print ---"; cat "$asr_a_setup" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$asr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9738,7 +9936,7 @@ for row in json.load(open(sys.argv[1])):
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port; its box name answers there.
-#   2. `min net setup --print` prints the setup script; run as root, it
+#   2. `min finalize-install --show --script` prints the setup script; run as root, it
 #      asks A's own control socket to release the port, installs the
 #      service and starts it. A becomes a client of the manager-held
 #      answerer, no minimald holds the port, and A's name keeps answering
@@ -9914,10 +10112,10 @@ proof_native_answerer_survives_session_stop() {
   local nasr_a_sid nasr_a_err="$WORK/nasr-a-activate.err" nasr_a_ip
   nasr_a_sid="$(nasr_activate mnl e2e-nasr-a "$nasr_a_err")" || fail
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
   local nasr_a_setup="$WORK/nasr-a-net-setup.out"
-  mnl net setup --print >"$nasr_a_setup" 2>"$nasr_a_setup.note" || true
+  mnl finalize-install --show --script >"$nasr_a_setup" 2>"$nasr_a_setup.note" || true
   nasr_a_ip="$(nasr_address e2e-nasr-a.min.internal)"
   if [ -z "$nasr_a_ip" ]; then
     echo "::error::e2e-nasr-a.min.internal does not answer from node A's interim on 127.0.0.1:$nasr_port"
@@ -9934,7 +10132,7 @@ proof_native_answerer_survives_session_stop() {
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
-      echo "--- min net setup --print ---"; cat "$nasr_a_setup" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$nasr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9963,6 +10161,7 @@ proof_native_answerer_survives_session_stop() {
   local nasr_released_before nasr_service_before
   nasr_released_before="$(nasr_count "$nasr_base_a" 'released the interim answerer')"
   nasr_service_before="$(nasr_count "$nasr_base_a" 'the manager-held answerer service')"
+  setup_classifier_note "$nasr_a_setup"
   # shellcheck disable=SC2024 # the output files are this user's, not root's
   if ! sudo -n sh "$nasr_a_setup" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
     echo "::error::the advisory's command did not run"
@@ -10049,6 +10248,12 @@ proof_native_answerer_survives_session_stop() {
     echo "::warning::could not remove the dedicated link $NASR_REVERT_LINK"
   fi
   rm -rf "$NASR_SEED_DIR"; NASR_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native answerer survives session stop OK (interim, handover, second node, session and daemon stop — each printed)"
   echo "::endgroup::"
 }
@@ -13127,7 +13332,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
 #     that declared the lane reaches the proxy's acceptor on its listener
 #     port, and nothing else on the host answers it.
 #   * box_without_credentialed_lane_cannot_reach_proxy — a box with no
-#     lane, allow-all rules included so only the lane's absence can refuse
+#     lane, rules open to every address so only the lane's absence can refuse
 #     the address, has every frame to the proxy's address dropped at the
 #     FIRST gate, its own relay, inside the guest: the connect runs out its
 #     window with no reset, and the host gate's log stays silent, because
@@ -13421,8 +13626,8 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   echo "::endgroup::"
 }
 
-# The refusal's half: a box with NO lane — allow-all rules, so nothing but
-# the lane's absence can refuse the proxy's address — gets silence at the
+# The refusal's half: a box with NO lane — rules open to every address, so
+# nothing but the lane's absence can refuse the proxy's address — gets silence at the
 # proxy's address and one rate-limited warn line in the daemon's log, the
 # refused frame's source (the box's own switch address) and the rule that
 # dropped it named. The control runs first: the same box's probe to a
@@ -13450,13 +13655,16 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
   mkdir "$CRED_NO_LANE_SEED_DIR/.git"
 
-  # No lane and no rules: the allow-all default. Any rules at all would
-  # give the refusal a second author; this box's declaration is empty, so
-  # the only thing that can refuse the proxy's address is the lane's
-  # absence.
+  # No lane, and rules open to every address. A narrower declaration would
+  # give the refusal a second author, and so would no section at all: an
+  # own-address box with no egress section gets the deny-all default
+  # (NET-074), which would also drop the sibling control below. With
+  # 0.0.0.0/0 the only thing that can refuse the proxy's address is the
+  # lane's absence.
   nolane_sid="$(cd "$CRED_NO_LANE_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-cred-nolane --network own_ip 2>"$WORK/cred-nolane.err")" || {
-    echo "::error::'min session activate --network own_ip' failed for the no-lane case"
+    --name e2e-cred-nolane --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/cred-nolane.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed for the no-lane case"
     cat "$WORK/cred-nolane.err" 2>/dev/null || true
     cred_fail
   }
@@ -13477,7 +13685,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   # The control: a sibling own-address box's lease, at a port the sibling
   # publishes (so its ingress gate admits the SYN) and nothing in it
-  # listens on. An allow-all row admits the lease, so the frame crosses the
+  # listens on. A row open to every address admits the lease, so the frame crosses the
   # box's relay, the gate and the switch to the sibling, whose kernel
   # resets the connect. A reset here proves the fabric and the gates' admit
   # path are live for this box; the proxy's address is a whole different
@@ -13597,8 +13805,8 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 #     ahead of the box's first delivered connection, and the ended box's
 #     withdrawn with its row while its sibling's second connection is
 #     still answered from its own address;
-#   * the lane's necessity (NET-134): a third box with no lane — allow-all
-#     rules, so only the lane's absence can refuse — gets silence at the
+#   * the lane's necessity (NET-134): a third box with no lane — rules open
+#     to every address, so only the lane's absence can refuse — gets silence at the
 #     proxy's address while its control probe to the node's own address is
 #     reset through the same fabric, the host gate's log says nothing, and
 #     no delivery is ever recorded for its address;
@@ -13693,8 +13901,10 @@ proof_proxy_sees_boxes_by_address() {
   # (the box's own relay admitting the proxy's address as the lane's
   # infrastructure under 0.0.0.0/0, and the VM host's gate under the row's
   # declared lane) and still arrives attributed to the box's own address; C
-  # declares nothing — no lane, allow-all rules — so nothing but the lane's
-  # absence can refuse the proxy's address for it.
+  # declares no lane and rules open to every address (with no section it
+  # would get the deny-all default, NET-074, and its sibling control would
+  # drop), so nothing but the lane's absence can refuse the proxy's address
+  # for it.
   PSBA_SEED_DIR_A="$(hook_mktemp /tmp/mnlpsba.XXXXXX)"
   hook_seed_preamble > "$PSBA_SEED_DIR_A/minimal.toml"
   mkdir "$PSBA_SEED_DIR_A/.git"
@@ -13728,8 +13938,9 @@ proof_proxy_sees_boxes_by_address() {
   psba_sid_b="$(printf '%s\n' "$psba_sid_b" | tail -n1 | tr -d '\r')"
   cred_wait_registered "the proxy-views case's box B" "e2e-psba-b"
   psba_sid_c="$(cd "$PSBA_SEED_DIR_C" && mnl session activate . --no-prompt \
-    --name e2e-psba-nolane --network own_ip 2>"$WORK/psba-box-c.err")" || {
-    echo "::error::'min session activate --network own_ip' failed for the proxy-views case's laneless box"
+    --name e2e-psba-nolane --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/psba-box-c.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed for the proxy-views case's laneless box"
     cat "$WORK/psba-box-c.err" 2>/dev/null || true
     cred_fail
   }
@@ -13988,7 +14199,7 @@ proof_proxy_sees_boxes_by_address() {
     cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  echo "the laneless box ($psba_ip_c, allow-all, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
+  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
 
   # The host process's leg: NET-132's IF-clause, end to end. A process
   # outside every box connects straight to the acceptor's own unix socket
@@ -15673,10 +15884,14 @@ proof_min_internal_names_through_proxy() {
     PROXY_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpo.XXXXXX)"
     hook_seed_preamble > "$PROXY_OWN_SEED_DIR/minimal.toml"
     mkdir "$PROXY_OWN_SEED_DIR/.git"
+    # Rules open to every address: with no egress section the box would get
+    # the deny-all default (NET-074), which drops the NET-004 connect below
+    # on its own, so the leg would pass whatever the infrastructure deny set
+    # did. With 0.0.0.0/0 that set is the only thing left to drop it.
     PROXY_OWN_SID="$(cd "$PROXY_OWN_SEED_DIR" && mnl session activate . --no-prompt \
-      --name "$PROXY_OWN_NAME" --network own_ip \
+      --name "$PROXY_OWN_NAME" --network own_ip --allow-subnets 0.0.0.0/0 \
       --ingress "$PROXY_OWN_EXTERNAL_PORT:$PROXY_BOX_PORT" 2>"$WORK/proxy-own.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress ...' failed"
+      echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0 --ingress ...' failed"
       echo "--- stderr ---"; cat "$WORK/proxy-own.err" 2>/dev/null || true
       fail
     }
@@ -15741,7 +15956,9 @@ proof_min_internal_names_through_proxy() {
 
     # NET-004: the deprecated literal itself. Box→host reach over the alias
     # is default-deny except configured host exposures (design §7.1), and
-    # none is configured, so the box's own relay drops the connect: no
+    # none is configured, so the box's own relay drops the connect — though
+    # its egress rules admit every address (0.0.0.0/0 above), so the drop
+    # is the infrastructure deny set's and not the deny-all default's: no
     # answer and no reset until the timeout, and the relay names the drop
     # under the infrastructure deny set's rule. The deprecation notice is
     # not asserted: the relay emits it only for a frame its verdict admits,
@@ -16165,10 +16382,14 @@ proof_own_ip_deny_all_box_answers_published_port() {
     DA_SIBLING_SEED_DIR="$(hook_mktemp /tmp/mnlds.XXXXXX)"
     hook_seed_preamble > "$DA_SIBLING_SEED_DIR/minimal.toml"
     mkdir "$DA_SIBLING_SEED_DIR/.git"
+    # The sibling declares the fabric: leg 3 has it dial the deny-all box's
+    # lease, and with no egress section it would get the deny-all default
+    # (NET-074) and drop its own dial.
     da_sibling_sid="$(cd "$DA_SIBLING_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$DA_SIBLING_NAME" --network own_ip \
+      --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
       --ingress "$DA_SIB_EXT:$DA_SIB_INT" 2>"$WORK/da-sibling-activate.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress ...' for the sibling box failed"
+      echo "::error::'min session activate --network own_ip --allow-subnets ... --ingress ...' for the sibling box failed"
       echo "--- stderr ---"; cat "$WORK/da-sibling-activate.err" 2>/dev/null || true
       fail
     }
@@ -18527,23 +18748,33 @@ eib_vm_ask_legs() {
 
 # The shell-exit leg of a registered box, on a VM lane (NET-138): an own_ip
 # box's first host holds its host-side row, and the row ends with that host's
-# shell. Attach, `exit`, and answer the session-exit prompt Keep: the Keep
-# item says the kept session can only be destroyed, and an exec into it is
-# then refused with the row-ended error instead of being handed a rowless
-# host. The attach runs through the real pty driver: only a tty can answer
-# the session-exit prompt.
+# shell. Attach, look up a box-zone name (an admitted DNS frame, so the
+# host's relay carries the box's address and its end detaches the row; a
+# row no frame ever reached waits out the longer resume bound instead),
+# `exit`, and answer the session-exit prompt Keep: the Keep item says the
+# registration ends with the shell and is restored on the next attach or
+# exec. The leg then waits out the detach grace until the VM host daemon
+# withdraws the row (`minvmd status --row` answers no row), and an exec into
+# the kept box succeeds: the CLI resumes the row before the exec, and the
+# host's read of it afterwards is the same row as before the exit — the same
+# box id, switch address and allow-list — with the box itself holding that
+# switch address (read from /proc/net/fib_trie: a session rootfs has no
+# iproute2) and its frames decided by the row again: the same zone lookup
+# resolves, where the gate would drop a rowless source's. The attach runs
+# through the real pty driver: only a tty can answer the session-exit prompt.
 # $1 = box name. Echoes the session it created on fd 3, for the caller's
 # teardown.
-eib_vm_rowless_leg() {
-  local name="$1" seed="" sid="" rc=0 err=""
+eib_vm_kept_box_resumes_leg() {
+  local name="$1" seed="" sid="" rc=0 err="" row_before="" row_after="" switch=""
+  local row_rc=0 row="" gone="" fib_ip="" zone=""
   seed="$(hook_mktemp /tmp/mnlevr.XXXXXX)"
   hook_seed_preamble > "$seed/minimal.toml"
   mkdir "$seed/.git"
   if ! sid="$(cd "$seed" && mnl session activate . --no-prompt \
       --name "$name" --network own_ip \
-      2>"$WORK/eib-vm-rowless-activate.err")"; then
+      2>"$WORK/eib-vm-kept-activate.err")"; then
     echo "::error::the VM-backed own_ip create for $name failed"
-    cat "$WORK/eib-vm-rowless-activate.err" 2>/dev/null || true
+    cat "$WORK/eib-vm-kept-activate.err" 2>/dev/null || true
     rm -rf "$seed"
     return 1
   fi
@@ -18552,34 +18783,100 @@ eib_vm_rowless_leg() {
   echo "$sid" >&3
   echo "registered box (VM lane): $sid ($name, own_ip)"
 
-  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-  if ! E2E_PTY_COMMANDS="exit" E2E_PTY_ANSWER=keep \
-      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$sid" \
-      >"$WORK/eib-vm-rowless-attach.out" 2>"$WORK/eib-vm-rowless-attach.err"; then
-    echo "::error::the pty attach to the registered box $name failed"
-    cat "$WORK/eib-vm-rowless-attach.out" "$WORK/eib-vm-rowless-attach.err" 2>/dev/null || true
+  # The host's own read of the row before the shell exits: the box id, the
+  # switch address and the allow-list the resumed row must carry again.
+  for _ in $(seq 1 10); do
+    if row_before="$(minvmd status --row "$name" --json 2>"$WORK/eib-vm-kept-row.err")"; then
+      break
+    fi
+    row_before=""
+    sleep 0.25
+  done
+  echo "minvmd status --row $name --json (before exit) -> '${row_before:-<no answer>}'"
+  switch="$(printf '%s\n' "$row_before" | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  if [ -z "$switch" ]; then
+    echo "::error::the VM host daemon holds no row naming a switch address for the registered box $name"
+    cat "$WORK/eib-vm-kept-row.err" 2>/dev/null || true
     return 1
   fi
-  if ! grep -qF "network registration ended with the shell" "$WORK/eib-vm-rowless-attach.out"; then
-    echo "::error::the registered box's session-exit prompt does not say its network registration ended with the shell (NET-138)"
-    sed 's/^/  /' "$WORK/eib-vm-rowless-attach.out" 2>/dev/null || true
-    return 1
-  fi
-  echo "the registered box's Keep item says the kept session can only be destroyed (NET-138)"
 
-  mnl session exec "$sid" "true" \
-    >"$WORK/eib-vm-rowless-exec.out" 2>"$WORK/eib-vm-rowless-exec.err" || rc=$?
-  err="$(cat "$WORK/eib-vm-rowless-exec.out" "$WORK/eib-vm-rowless-exec.err" 2>/dev/null | tr '\n' ' ')"
-  echo "exec into the kept registered box -> exit $rc: ${err:-<no output>}"
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::an exec into a registered box whose shell exited succeeded — the daemon handed it a rowless host (NET-138)"
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  if ! E2E_PTY_COMMANDS="getent ahostsv4 host.min.internal
+exit" E2E_PTY_ANSWER=keep \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$sid" \
+      >"$WORK/eib-vm-kept-attach.out" 2>"$WORK/eib-vm-kept-attach.err"; then
+    echo "::error::the pty attach to the registered box $name failed"
+    cat "$WORK/eib-vm-kept-attach.out" "$WORK/eib-vm-kept-attach.err" 2>/dev/null || true
     return 1
   fi
-  case "$err" in
-    *"host-side network registration"*) ;;
-    *) echo "::error::the refused exec does not name the ended host-side network registration (got: '$err')"; return 1 ;;
-  esac
-  echo "an exec into the kept registered box is refused with the row-ended error, not run rowless (NET-138)"
+  if ! grep -qF "network registration ends with the shell and is restored when you attach or exec into the session again" \
+      "$WORK/eib-vm-kept-attach.out"; then
+    echo "::error::the registered box's session-exit prompt does not say its network registration is restored on the next attach or exec (NET-138)"
+    sed 's/^/  /' "$WORK/eib-vm-kept-attach.out" 2>/dev/null || true
+    return 1
+  fi
+  echo "the registered box's Keep item says its registration is restored on the next attach or exec (NET-138)"
+
+  # The row detaches with the shell and is withdrawn after the detach grace
+  # (45 s, swept every second; NET-138 bounds it at 60 s). Waiting it out
+  # makes the exec below resume a withdrawn row, not merely a detached one.
+  for _ in $(seq 1 150); do
+    rc=0
+    minvmd status --row "$name" >"$WORK/eib-vm-kept-row-gone.out" 2>/dev/null || rc=$?
+    row="$(cat "$WORK/eib-vm-kept-row-gone.out" 2>/dev/null || true)"
+    if [ "$rc" -eq 1 ] && [ "$row" = "no row for $name" ]; then
+      gone=1
+      break
+    fi
+    sleep 0.5
+  done
+  echo "minvmd status --row $name (after exit) -> exit $rc: '${row:-<no answer>}'"
+  if [ -z "$gone" ]; then
+    echo "::error::the kept box's row was not withdrawn within 75 s of its shell's exit (NET-138 bounds it at 60 s)"
+    return 1
+  fi
+  echo "the kept box's row was withdrawn after the detach grace (NET-138)"
+
+  rc=0
+  mnl session exec "$sid" "true" \
+    >"$WORK/eib-vm-kept-exec.out" 2>"$WORK/eib-vm-kept-exec.err" || rc=$?
+  err="$(cat "$WORK/eib-vm-kept-exec.out" "$WORK/eib-vm-kept-exec.err" 2>/dev/null | tr '\n' ' ')"
+  echo "exec into the kept registered box -> exit $rc: ${err:-<no output>}"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::an exec into the kept registered box failed — the CLI must resume its row before the exec (NET-138)"
+    return 1
+  fi
+
+  row_rc=0
+  row_after="$(minvmd status --row "$name" --json 2>"$WORK/eib-vm-kept-row.err")" || row_rc=$?
+  echo "minvmd status --row $name --json (after exec) -> exit $row_rc: '${row_after:-<no answer>}'"
+  if [ "$row_rc" -ne 0 ] || [ "$row_after" != "$row_before" ]; then
+    echo "::error::the resumed row is not the row the box held before its shell exited (want: '$row_before')"
+    return 1
+  fi
+
+  if ! mnl session exec "$sid" sh -c 'cat /proc/net/fib_trie' \
+      >"$WORK/eib-vm-kept-fib.out" 2>"$WORK/eib-vm-kept-fib.err"; then
+    echo "::error::could not read /proc/net/fib_trie from the resumed box $name"
+    cat "$WORK/eib-vm-kept-fib.err" 2>/dev/null || true
+    return 1
+  fi
+  fib_ip="$(awk '/\|--/ { addr = $2 }
+                 /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' "$WORK/eib-vm-kept-fib.out")"
+  echo "the resumed box's own address (fib_trie): ${fib_ip:-<none>}"
+  if [ "$fib_ip" != "$switch" ]; then
+    echo "::error::the resumed box does not hold its row's switch address $switch (got: '${fib_ip:-<none>}')"
+    return 1
+  fi
+  zone="$(mnl session exec "$sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/eib-vm-kept-zone.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "host.min.internal from the resumed box -> ${zone:-<none>}"
+  if ! printf '%s' "$zone" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::host.min.internal did not resolve from the resumed box — its frames are not decided by a row (got '${zone:-none}')"
+    cat "$WORK/eib-vm-kept-zone.err" 2>/dev/null || true
+    return 1
+  fi
+  echo "an exec into the kept box resumed its row: the same box id, switch address $switch and allow-list, held by the box, and its frames pass the gate again (NET-138)"
 }
 
 # ---------------------------------------------------------------------------
@@ -18651,7 +18948,7 @@ proof_expose_from_inside_box() {
   local eib_reached="" eib_policy_row=""
   local eib_allow_name="e2e-inside-allow" eib_yes_name="e2e-inside-ask-yes"
   local eib_no_name="e2e-inside-ask-no" eib_nobody_name="e2e-inside-ask-nobody"
-  local eib_rowless_name="e2e-inside-rowless"
+  local eib_kept_name="e2e-inside-kept"
   local eib_deny_name="e2e-inside-deny"
   local eib_port=3000                  # the port every box asks for
   local eib_lo=3000 eib_hi=3005        # the range every create declares
@@ -18887,8 +19184,8 @@ proof_expose_from_inside_box() {
     eib_vm_ask_legs "$((eib_port + 1))" "$eib_lo" "$eib_hi" \
       "$eib_yes_name" "$eib_no_name" "$eib_nobody_name" 3>>"$eib_vm_sids"
 
-    # ---- a registered box's shell exits: the kept box is refused (NET-138) --
-    eib_vm_rowless_leg "$eib_rowless_name" 3>>"$eib_vm_sids" || fail
+    # ---- a registered box's shell exits: the kept box resumes (NET-138) ---
+    eib_vm_kept_box_resumes_leg "$eib_kept_name" 3>>"$eib_vm_sids" || fail
 
     # ---- the deny box: refused inside the box, recorded nowhere -------------
     EIB_DENY_SEED_DIR="$(hook_mktemp /tmp/mnlevd.XXXXXX)"
@@ -19521,7 +19818,7 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
   fi
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-yes-attach.out" 2>/dev/null || true
-  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-yes-attach.out" 2>/dev/null; then
+  if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-yes-attach.out" 2>/dev/null; then
     echo "::error::the ask dialog never rendered on the attached terminal — the request was not routed to the attached human (NET-045)"
     eib_restore_log
     fail
@@ -19611,7 +19908,7 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
   fi
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-no-attach.out" 2>/dev/null || true
-  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-no-attach.out" 2>/dev/null; then
+  if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-no-attach.out" 2>/dev/null; then
     echo "::error::the ask dialog never rendered on the second ask box's terminal — the request was not routed to the attached human (NET-045)"
     eib_restore_log
     fail

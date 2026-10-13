@@ -182,8 +182,8 @@ impl Exec for TaskExec {
 /// The network a task gets: the provider for its session's mode (017-005),
 /// carrying the session's *effective* egress (NET-074) — a task in an
 /// own-address session runs under whatever the session's own gate enforces:
-/// the deny-all default once it is in force, the shipped allow-all while it
-/// is only announced — and none of its ingress. Shared by the two ways a
+/// the deny-all default in force, allow-all behind the opt-out — and none of
+/// its ingress. Shared by the two ways a
 /// task starts — over an exec channel here, and from inside the session
 /// (`env::SessionChannel::run_task`).
 ///
@@ -194,9 +194,8 @@ impl Exec for TaskExec {
 /// handle either: a task owns no proxy route of its own, so no lease is ever
 /// reported for it. `phase` is the rollout phase to resolve the egress under
 /// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
-/// build ships, while the tests pass the phase by name so the posture the
-/// rollout ends at stays proven while the default is only announced
-/// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// build ships, while the tests pass the phase by name so each arm's posture
+/// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
 /// the launcher did. It carries no classifier decision either (NET-079):
 /// a task places no leaf in the cohort's subtrees, so no per-box verdict
@@ -205,11 +204,11 @@ impl Exec for TaskExec {
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
 /// or the box's own declaration. An absent section — the allow-all the
-/// announced phase and the opt-out both leave in place — passes `None`, as
+/// opt-out (or the announced phase) leaves in place — passes `None`, as
 /// every task did before the deny-all default: a gate with no ingress
 /// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
-/// so attaching one where nothing needs gating would change behaviour an
-/// announcement is not allowed to.
+/// so attaching one where nothing needs gating would change behaviour the
+/// opt-out exists to keep.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -224,33 +223,61 @@ pub(crate) fn task_network(
         phase,
         deny_all_opt_out,
     );
-    crate::net::provider::network_for(
+    crate::net::provider::task_network_for(
         record.network,
         switch,
         &format!("{session}-task"),
         egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
-        None,
-        // Deliberately not the record's handed addresses (T66): the task's
-        // sandbox is not the box the registration named — attaching it at the
+        // Never the record's handed box addresses (T66): the task's sandbox
+        // is not the box the registration named — attaching it at the
         // session box's address would key its frames to the session's row.
-        // A task's sandbox self-allocates, as it always has.
-        //
-        // The interim, stated plainly: task sandboxes self-allocate from the
-        // daemon's reserve — the plan run's lower half
-        // (`crate::net::self_allocation_run`) — until the task registering
-        // every live box host-side (NET-138) retires self-allocation, after
-        // which no daemon-side draw happens once a control socket exists.
-        // The VM host daemon hands registered boxes only from the run above
-        // the reserve, so the two allocators cannot meet; the daemon-side
-        // refusals (`IpAllocator::hand`) stay the guard against a pair that
-        // disagrees about the split.
-        None,
-        // Deliberately no classifier decision (NET-079): a task places no
-        // leaf in the cohort's subtrees, so there is no per-box verdict for
-        // a task's plan to follow — the session's own launch carries the
-        // decision its reader read, and this one has none to carry.
-        None,
+        // A task attaches at one of the task addresses the same
+        // registration filed with the box (NET-138), each a host-side row
+        // carrying the box's id and egress, so no daemon-side draw happens
+        // once a control socket exists. A native daemon, whose record holds
+        // none, draws from its reserve (`crate::net::self_allocation_run`);
+        // an in-VM one refuses the draw (`SwitchClient::attach`). There is
+        // no classifier decision to carry (NET-079): a task places no leaf
+        // in the cohort's subtrees.
+        record.task_addresses.clone(),
     )
+}
+
+/// Refuses a task run of a registered box whose host-side row is not its
+/// own any more (NET-138): a task attaches at one of the task addresses
+/// filed with the box's row, and those task rows stand exactly as long as
+/// the box's row, so the run asks the VM host daemon whether the row of
+/// the box's id still stands at its switch address before it attaches. A
+/// row the host handed another box at that address answers no, so the run
+/// never attaches under another box's row. A record that names no box id,
+/// and a host that cannot be asked, read as no row: fail-closed. A box the
+/// host registered nothing for (a native host, a `host_ip` or `none` box)
+/// asks nothing.
+async fn ensure_task_rows_stand(
+    record: &sessions::Record,
+    switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
+) -> io::Result<()> {
+    let Some(addresses) = record.box_addresses else {
+        return Ok(());
+    };
+    let standing = match record.box_id {
+        Some(box_id) => {
+            let control = crate::session::switch_control_of(switch).await;
+            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
+                .await
+                == Some(true)
+        }
+        None => false,
+    };
+    if standing {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "box {}'s row on the VM host has ended, so a task run in it would reach \
+             nothing; destroy and re-activate the session",
+            record.name.as_deref().unwrap_or("(unnamed)")
+        )))
+    }
 }
 
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
@@ -387,9 +414,12 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
+        let record = session.record().await?;
+        let switch = session.net_switch().await?;
+        ensure_task_rows_stand(&record, &switch).await?;
         let network = task_network(
-            &session.record().await?,
-            &session.net_switch().await?,
+            &record,
+            &switch,
             sessions::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
         );
@@ -1245,9 +1275,9 @@ where
 /// why the branches stay unbiased rather than ranking `process.wait()`
 /// last. The cost is that `wait` can win a race against readable
 /// output; step 1 is what makes that harmless. Nothing is lost to the
-/// branches `select!` cancels either way: `read` is cancel-safe, and
-/// the SSH writes live in branch *handlers*, which run after the
-/// `select!` has already resolved.
+/// branches `select!` cancels either way: `read` and the child-stdin
+/// `write` are cancel-safe, and the SSH-channel writes live in branch
+/// *handlers*, which run after the `select!` has already resolved.
 ///
 /// On an SSH-channel write failure or client disconnect we stop and
 /// `start_kill` the child: with no one reading its output the pipe
@@ -1296,6 +1326,10 @@ where
     // Cleared once the client-loss sender is dropped without signalling:
     // `changed()` would then resolve `Err` on every poll and spin the loop.
     let mut client_watch_open = true;
+    // A stdin read parked behind a full child pipe. The bytes are copied
+    // out of `stdin_buf` because the read branch borrows it on the next
+    // iteration. Cleared by the write branch as it drains the slice.
+    let mut pending: Option<(Vec<u8>, usize)> = None;
 
     while (stdout_open || stderr_open) && !ssh_write_failed && child_exit.is_none() {
         tokio::select! {
@@ -1303,8 +1337,11 @@ where
             // stdin pipe broke mid-step (write failure below) we stop
             // reading from `r` for the rest of this step, but leave
             // `*stdin_open` set so the next child in the sequence picks
-            // up where we left off.
-            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() => {
+            // up where we left off. Gated on a drained `pending` so at
+            // most one chunk the child has not accepted is ever queued.
+            // `select!` evaluates every gate before it builds any branch
+            // future, so a gate may borrow what a future later holds.
+            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() && pending.is_none() => {
                 match read_res {
                     Ok(0) => {
                         *stdin_open = false;
@@ -1321,56 +1358,43 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        // A child that stops reading stdin parks this
-                        // write; race it against client loss so the
-                        // disconnect still reaches the kill path below.
-                        //
-                        // `write_all` is not cancel-safe: if the
-                        // client-loss branch wins the select, dropping
-                        // the write future mid-flight loses the bytes it
-                        // had already accepted. Pin the write and loop
-                        // the select until it completes, so a dropped
-                        // client-loss sender only disables that branch
-                        // and never discards stdin data.
-                        if let Some(cs) = child_stdin.as_mut() {
-                            let write_failed = {
-                                let write = cs.write_all(&stdin_buf[..n]);
-                                tokio::pin!(write);
-                                let mut write_failed = false;
-                                loop {
-                                    tokio::select! {
-                                        res = &mut write => {
-                                            if let Err(err) = res {
-                                                tracing::warn!(
-                                                    %channel_id, error = %err,
-                                                    "exec: failed to write stdin to child; closing child stdin",
-                                                );
-                                                write_failed = true;
-                                            }
-                                            break;
-                                        }
-                                        res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
-                                            if res.is_err() {
-                                                // Sender dropped without signalling:
-                                                // stop polling this branch so a
-                                                // dropped sender cannot spin the loop.
-                                                client_watch_open = false;
-                                            } else {
-                                                tracing::warn!(
-                                                    %channel_id,
-                                                    "exec: ssh client disconnected; killing child",
-                                                );
-                                                ssh_write_failed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                write_failed
-                            };
-                            if write_failed {
-                                child_stdin = None;
-                            }
+                        pending = Some((stdin_buf[..n].to_vec(), 0));
+                    }
+                }
+            }
+            // Drives a parked stdin write to the child from inside the
+            // select, so a slow child cannot keep the loop from polling
+            // the child's stdout and stderr. `write` is cancel-safe: a
+            // branch that loses the select loses nothing the child has
+            // not already accepted, which the offset below accounts for.
+            write_res = async {
+                match (child_stdin.as_mut(), pending.as_mut()) {
+                    (Some(cs), Some((data, offset))) => cs.write(&data[*offset..]).await,
+                    _ => std::future::pending::<io::Result<usize>>().await,
+                }
+            }, if pending.is_some() && child_stdin.is_some() => {
+                match write_res {
+                    Ok(0) => {
+                        tracing::warn!(
+                            %channel_id,
+                            "exec: child accepted zero bytes of stdin; closing child stdin",
+                        );
+                        child_stdin = None;
+                        pending = None;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            %channel_id, error = %err,
+                            "exec: failed to write stdin to child; closing child stdin",
+                        );
+                        child_stdin = None;
+                        pending = None;
+                    }
+                    Ok(n) => {
+                        let (data, offset) = pending.as_mut().expect("gated on a pending write");
+                        *offset += n;
+                        if *offset >= data.len() {
+                            pending = None;
                         }
                     }
                 }
@@ -1440,6 +1464,8 @@ where
             }
         }
     }
+    // Stdin still in `pending` when the child exits or both output pipes
+    // close is dropped here, as bytes left unread in the child's pipe are.
 
     // Nobody is reading the child's output any more, so it would wedge
     // on a full pipe and never be reapable. Kill, then fall through to
@@ -2669,15 +2695,52 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
             policy: sessions::SessionPolicy::default(),
+            task_addresses: Vec::new(),
             box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         }
+    }
+
+    /// NET-138: a task run of a registered box whose record names no box
+    /// id is refused before anything attaches — the host cannot be asked
+    /// for that box's row, and an address-only answer could be another
+    /// box's — while a box the host registered nothing for asks nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
+        let switch = tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        );
+        let unregistered = record_with(sessions::NetworkMode::OwnIp);
+        super::ensure_task_rows_stand(&unregistered, &switch)
+            .await
+            .expect("a box with no host registration asks nothing");
+
+        let mut registered = record_with(sessions::NetworkMode::OwnIp);
+        registered.name = Some("web".to_string());
+        registered.box_addresses = Some(sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        });
+        registered.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
+        let refused = super::ensure_task_rows_stand(&registered, &switch)
+            .await
+            .expect_err("a registered box with no id is never answered as standing");
+        assert!(
+            refused.to_string().contains("row on the VM host has ended"),
+            "{refused}"
+        );
     }
 
     /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
@@ -2716,6 +2779,9 @@ mod tests {
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
+        // A VM host's switch draws nothing (NET-138): the task attaches at a
+        // task address its box's registration filed.
+        record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
         let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
@@ -2758,27 +2824,100 @@ mod tests {
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
     }
 
+    /// A VM host's switch, which hands every address and draws none
+    /// (NET-138).
+    #[cfg(target_os = "linux")]
+    fn vm_host_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ))
+    }
+
+    /// NET-138 for a task run, whichever door started it — `min run` from
+    /// inside the box and a task run over exec both plan through
+    /// [`super::task_network`]: the task's sandbox attaches at a task
+    /// address its box's registration filed, the first one no run holds,
+    /// and never draws one of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn in_box_run_task_draws_a_task_slot() {
+        let switch = vm_host_switch();
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.task_addresses = vec![
+            std::net::Ipv4Addr::new(100, 64, 128, 2),
+            std::net::Ipv4Addr::new(100, 64, 128, 3),
+        ];
+        let first = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        first.plan().await.expect("a free task address");
+        let second = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        second.plan().await.expect("a second free task address");
+        let held: Vec<_> = switch
+            .lock()
+            .await
+            .leases()
+            .iter()
+            .map(|lease| lease.ip)
+            .collect();
+        assert_eq!(
+            held, record.task_addresses,
+            "each run holds one task address"
+        );
+
+        let third = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = third.plan().await.expect_err("every task address is held");
+        assert!(
+            err.to_string()
+                .contains("2 task runs already in progress for this session"),
+            "{err}"
+        );
+        first.abandon().await;
+        third
+            .plan()
+            .await
+            .expect("the address the first run held is free again");
+    }
+
+    /// A VM session record from before task addresses were registered
+    /// carries none: its task run is refused, naming the remedy, rather
+    /// than drawn an address no host row is keyed by.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
+        let switch = vm_host_switch();
+        let record = record_with(sessions::NetworkMode::OwnIp);
+        let task = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = task.plan().await.expect_err("nothing is drawn");
+        assert!(
+            err.to_string()
+                .contains("destroy the session and re-activate it"),
+            "{err}"
+        );
+        assert!(switch.lock().await.leases().is_empty());
+    }
+
     /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
     /// egress default its session does, and nothing else changes with it. A
     /// gate is attached only where the effective egress has rules to enforce,
     /// because a gate with no ingress declaration blocks a task's *inbound*
-    /// too — so under Announced, with no opt-out, a bare own-address task
-    /// attaches ungated exactly as every task did before the deny-all
-    /// default: the announcement may change nothing yet. Under InForce the
-    /// same bare box's task carries the deny-all gate.
+    /// too. Under InForce, the shipped phase, a bare own-address task with no
+    /// opt-out carries the deny-all gate. The retired announced arm, pinned
+    /// here by name, attaches the same task ungated, as every task did before
+    /// the deny-all default.
     ///
-    /// What the announcement defers is the *default* for a box that declared
-    /// nothing. A box that declared an `egress` section is enforced on its
-    /// session's own PTask in every phase, so a task in such a session
-    /// carries that declaration's gate even now, under the phase this build
-    /// ships — the same inbound posture the in-force case below already
-    /// accepts: a task PTask holds no ingress of its own, so its gate
-    /// default-blocks unsolicited inbound.
+    /// The phase decides only the *default* for a box that declared nothing.
+    /// A box that declared an `egress` section is enforced on its session's
+    /// own PTask in every phase, so a task in such a session carries that
+    /// declaration's gate under either phase — the same inbound posture the
+    /// in-force case below accepts: a task PTask holds no ingress of its own,
+    /// so its gate default-blocks unsolicited inbound.
     ///
     /// The phase is passed by name, not read from the shipped constant, so
-    /// the in-force posture stays proven while the default is only
-    /// announced. `own_ip_default_deny_all` proves what the deny-all section
-    /// itself enforces.
+    /// both arms stay proven whichever one ships. `own_ip_default_deny_all`
+    /// proves what the deny-all section itself enforces.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_task_gate_follows_the_egress_default() {
@@ -2846,17 +2985,26 @@ mod tests {
         // the task path attaches a gate, and the announcement does not defer
         // it: the declaration is enforced on the session's own PTask in every
         // phase, so a task in that session resolves the same section its
-        // session's gate did — the declaration verbatim, not the deny-all
-        // section and not nothing — even under the phase this build ships.
+        // session's gate did — the declaration, not the deny-all section and
+        // not nothing — under either phase. In force, the default also
+        // decides the destination list the declaration left absent
+        // (`allow_dns_hosts`): present and empty, granting nothing
+        // (NET-074); announced, the section is carried as declared.
         let section = sessions::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..sessions::EgressPolicy::default()
         };
         let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
         declared_record.policy.egress = Some(section.clone());
-        for phase in [
-            sessions::EgressDefaultPhase::Announced,
-            sessions::EgressDefaultPhase::InForce,
+        for (phase, expected) in [
+            (sessions::EgressDefaultPhase::Announced, section.clone()),
+            (
+                sessions::EgressDefaultPhase::InForce,
+                sessions::EgressPolicy {
+                    allow_dns_hosts: Some(Vec::new()),
+                    ..section.clone()
+                },
+            ),
         ] {
             assert_eq!(
                 crate::session::effective_egress_section(
@@ -2865,9 +3013,9 @@ mod tests {
                     phase,
                     false,
                 ),
-                Some(section.clone()),
-                "a declared egress section reaches the task's gate verbatim \
-                 while the default is {phase:?}",
+                Some(expected),
+                "a declared egress section reaches the task's gate as the \
+                 default resolves it while the default is {phase:?}",
             );
         }
         let declared = super::task_network(
@@ -3045,6 +3193,236 @@ mod tests {
         assert_eq!(err, b"err!");
 
         assert!(!ctrl.was_killed());
+    }
+
+    /// A child that stops reading stdin must not stop the bridge from
+    /// relaying the child's output to the client, nor from delivering the
+    /// queued stdin once the child reads again. The child's stdin pipe
+    /// holds 64 KiB; a 256 KiB write to it parks, and with the write
+    /// parked inside the loop's select the child's stdout would never be
+    /// polled and this test would time out.
+    #[tokio::test]
+    async fn bridge_relays_output_while_a_stdin_write_is_blocked() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                mut stdin_reader,
+                mut stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        // Far more than the child's stdin pipe holds; this writer blocks
+        // once both pipes are full, which is the point.
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 256 * 1024]).await;
+        });
+
+        // Reads the child's output as the bridge relays it; the final
+        // read_exact would hang if any of the payload stalled behind the
+        // blocked stdin write.
+        let reader = tokio::spawn(async move {
+            let mut received = vec![0u8; 256 * 1024];
+            client_stdout.read_exact(&mut received).await.unwrap();
+            received
+        });
+
+        // With a stdin write parked behind a full pipe, output from the
+        // child must still reach the client.
+        let payload = vec![b'o'; 256 * 1024];
+        timeout(Duration::from_secs(10), stdout_writer.write_all(&payload))
+            .await
+            .expect("child output must keep flowing while a stdin write is blocked")
+            .unwrap();
+
+        let out = timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the client must receive child output while a stdin write is blocked")
+            .unwrap();
+        assert_eq!(out, payload);
+
+        // The queued stdin reaches the child as soon as it reads.
+        let mut received_stdin = vec![0u8; 256 * 1024];
+        timeout(
+            Duration::from_secs(10),
+            stdin_reader.read_exact(&mut received_stdin),
+        )
+        .await
+        .expect("queued stdin must reach the child once it reads")
+        .unwrap();
+        assert_eq!(received_stdin, vec![b'x'; 256 * 1024]);
+        feeder.await.unwrap();
+
+        // Both output pipes at EOF end the loop; the child then exits.
+        drop(stdout_writer);
+        ctrl.signal_exit(0).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("the bridge must end once both output pipes close and the child exits")
+            .unwrap();
+        assert_eq!(exit, 0);
+        assert!(!ctrl.was_killed());
+    }
+
+    /// A real child that writes its output before it reads more input
+    /// (`cat`) gets several MB streamed through it in both directions at
+    /// once: every byte comes back in order, and the child sees EOF only
+    /// after the queued stdin has drained. With the stdin write parked
+    /// inside the loop's select, `cat` blocks on a full stdout pipe, stops
+    /// reading stdin, and the bridge never finishes.
+    #[tokio::test]
+    async fn bridge_streams_megabytes_through_cat() {
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        use futures::stream;
+        use tokio::time::timeout;
+
+        use super::TokioProcess;
+
+        const LEN: usize = 4 * 1024 * 1024;
+
+        let child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning cat");
+        let processes = stream::iter(vec![Ok::<_, std::io::Error>(TokioProcess::new(child))]);
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                processes,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let sent = payload.clone();
+        // Dropping the write half once the payload is in is the client's EOF.
+        let feeder = tokio::spawn(async move {
+            client_stdin.write_all(&sent).await.unwrap();
+        });
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(LEN);
+            client_stdout.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let exit = timeout(Duration::from_secs(60), bridge_task)
+            .await
+            .expect("cat must finish while its stdin and stdout stream at once")
+            .unwrap();
+        assert_eq!(exit, 0);
+        feeder.await.unwrap();
+        let received = reader.await.unwrap();
+        assert_eq!(received.len(), LEN);
+        assert!(received == payload, "cat must echo the payload in order");
+    }
+
+    /// A child that exits with stdin still queued behind its full pipe
+    /// drops the queued bytes and still reports its own exit status.
+    ///
+    /// Every pipe end stays open until the bridge returns, so the only
+    /// way out of the loop is the `wait` branch with a chunk still
+    /// queued: closing the child's stdin first would instead end the
+    /// parked write with `BrokenPipe` and take the write-failure path.
+    #[tokio::test]
+    async fn bridge_reports_exit_when_child_exits_with_stdin_queued() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                // Not read until the bridge returns: the child's stdin
+                // pipe fills and a chunk queues behind it.
+                mut stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
+        });
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        // Let the bridge fill the child's stdin pipe and queue a chunk.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        // The child is reaped while every pipe end is still open.
+        ctrl.signal_exit(3).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a child exiting with stdin queued must end the bridge")
+            .unwrap();
+        assert_eq!(exit, 3);
+        assert!(!ctrl.was_killed());
+
+        // The child's stdin holds exactly what fit in its pipe, then EOF:
+        // the queued chunk was dropped, not delivered late.
+        let mut delivered = Vec::new();
+        timeout(
+            Duration::from_secs(10),
+            stdin_reader.read_to_end(&mut delivered),
+        )
+        .await
+        .expect("the bridge must close the child's stdin on return")
+        .unwrap();
+        assert_eq!(delivered.len(), 64 * 1024);
+
+        drop(stdout_writer);
+        drop(stderr_writer);
+        feeder.abort();
     }
 
     /// An exec the daemon's shutdown ends tells the client why on stderr,
