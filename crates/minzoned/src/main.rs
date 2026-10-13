@@ -65,13 +65,27 @@ enum Command {
     ReserveLocalRange,
 }
 
+/// The mask `ifconfig` prints for a `/32` alias.
+#[cfg(any(test, target_os = "macos"))]
+const HOST_MASK: &str = "0xffffffff";
+
 /// The reserved range's addresses that `ifconfig lo0 inet` output does not
-/// list: the ones the verb still has to add. An address is carried when it
-/// is a whole word of the output, so `127.0.64.1` is not found in
-/// `127.0.64.10`.
+/// list with the `/32` mask: the ones the verb still has to apply. An
+/// address is carried when a line reads `inet <address> netmask 0xffffffff`,
+/// so `127.0.64.1` is not found in `127.0.64.10`, and an address carried
+/// with any other mask is applied again.
 #[cfg(any(test, target_os = "macos"))]
 fn missing_range_addresses(present: &str) -> Vec<std::net::Ipv4Addr> {
-    let carried: std::collections::HashSet<&str> = present.split_whitespace().collect();
+    let carried: std::collections::HashSet<&str> = present
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next(), words.next()) {
+                (Some("inet"), Some(addr), Some("netmask"), Some(HOST_MASK)) => Some(addr),
+                _ => None,
+            }
+        })
+        .collect();
     switch::loopback::range_hosts()
         .filter(|addr| !carried.contains(addr.to_string().as_str()))
         .collect()
@@ -79,12 +93,16 @@ fn missing_range_addresses(present: &str) -> Vec<std::net::Ipv4Addr> {
 
 /// The `reserve-local-range` verb: add every address of the reserved local
 /// range that lo0 does not carry yet, one `/32` alias each, and fail on the
-/// first address that cannot be added. The range is compiled in, and the verb
+/// first address that cannot be added. The mask is given with `netmask`:
+/// without the keyword `ifconfig` reads it as a destination address and the
+/// alias takes the `/8` of its class. The range is compiled in, and the verb
 /// takes no argument and reads no environment variable and no file: its one
 /// read is the interface's own state, from the same absolute-path system tool
 /// the aliases are added with, run with an empty environment. So nothing a
 /// user can write changes what root applies. An address lo0 already carries
-/// is skipped, so a re-run adds only the missing ones and removes nothing.
+/// with the `/32` mask is skipped, so a re-run adds only the missing ones and
+/// removes nothing; one carried with another mask is applied again, which
+/// sets its mask.
 #[cfg(target_os = "macos")]
 fn reserve_local_range() -> Result<()> {
     use anyhow::{Context as _, ensure};
@@ -101,7 +119,13 @@ fn reserve_local_range() -> Result<()> {
     );
     for addr in missing_range_addresses(&String::from_utf8_lossy(&present.stdout)) {
         let status = std::process::Command::new(IFCONFIG)
-            .args(["lo0", "alias", &addr.to_string(), "255.255.255.255"])
+            .args([
+                "lo0",
+                "alias",
+                &addr.to_string(),
+                "netmask",
+                "255.255.255.255",
+            ])
             .env_clear()
             .status()
             .with_context(|| format!("{IFCONFIG} did not run"))?;
@@ -146,7 +170,8 @@ mod tests {
     use super::*;
 
     /// The verb adds exactly the reserved range's addresses that lo0 does
-    /// not carry: all 254 on a bare loopback, none on a complete one, and an
+    /// not carry with the /32 mask: all 254 on a bare loopback, none on a
+    /// complete one, all 254 again where they carry a wider mask, and an
     /// address is carried only as a whole word, never as a prefix of another.
     #[test]
     fn reserve_local_range_adds_only_missing_addresses() {
@@ -167,5 +192,13 @@ mod tests {
         assert_eq!(missing.len(), 253);
         assert!(missing.contains(&std::net::Ipv4Addr::new(127, 0, 64, 1)));
         assert!(!missing.contains(&std::net::Ipv4Addr::new(127, 0, 64, 10)));
+
+        // An address carried with the /8 an earlier install gave it is
+        // applied again.
+        let wide: String = all
+            .iter()
+            .map(|addr| format!("\tinet {addr} netmask 0xff000000\n"))
+            .collect();
+        assert_eq!(missing_range_addresses(&wide), all);
     }
 }

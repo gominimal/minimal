@@ -473,12 +473,13 @@ const ANSWERER_SERVICE_HEREDOC: &str = "MINIMAL_ANSWERER_SERVICE_EOF";
 /// interface's own state, reported by the same absolute-path system tool
 /// the aliases are added with, so nothing user-writable can change what it
 /// applies — and it applies exactly the reserved range and nothing else:
-/// each address is one `/32` lo0 alias by the two-address `ifconfig` form
-/// the loopback-alias spike verified against lo0, and an address `lo0`
-/// already carries is skipped rather than re-added, so a re-run over a
-/// fully- or partially-applied range adds only what is missing (the spike
-/// never measured a re-add, so the program does not rely on one exiting
-/// zero).
+/// each address is one `/32` lo0 alias, the mask given with `ifconfig`'s
+/// `netmask` keyword (without it the alias takes the `/8` of its class), and
+/// an address `lo0` already carries with that mask is skipped rather than
+/// re-added, so a re-run over a fully- or partially-applied range adds only
+/// what is missing. An address carried with any other mask is applied
+/// again, to set its mask: the one case where the program relies on
+/// `ifconfig` accepting an address the interface already carries.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn range_program() -> String {
     let addresses = switch::loopback::range_hosts()
@@ -6953,11 +6954,12 @@ exit 0
         // the /32 mask, guarded by the skip over what lo0 already carries.
         assert!(
             program.contains(
-                "case \" $present \" in *\" $addr \"*) ;; *) /sbin/ifconfig lo0 alias \
-                 \"$addr\" 255.255.255.255 ;; esac"
+                "case \"$present\" in *\"inet $addr netmask 0xffffffff\"*) ;; *) \
+                 /sbin/ifconfig lo0 alias \"$addr\" netmask 255.255.255.255 ;; esac"
             ),
-            "each address is applied as one /32 lo0 alias by absolute path, skipped \
-             when lo0 already carries it: {program}"
+            "each address is applied as one /32 lo0 alias by absolute path, the mask \
+             given with the netmask keyword, skipped when lo0 already carries it at \
+             /32: {program}"
         );
         assert_eq!(
             program.matches("/sbin/ifconfig").count(),
