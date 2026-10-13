@@ -595,7 +595,9 @@ jobs:
                     -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"$MINIMAL_ZONED_IDENTIFIER\"" \
                     target/release/Minimal.app
             - name: Re-check minzoned links on the signed artifact
-              # The last check before upload, on the signed bytes.
+              # The link check on the signed bytes, before notarization. The
+              # "Staple and flatten the minzoned app bundle" step repeats it on
+              # the rebuilt bundle, which is the last check before upload.
               run: scripts/check-zoned-links.sh target/release/Minimal.app/Contents/MacOS/minzoned
             - name: Notarize binaries
               # Submit each signed binary, and the signed minzoned app bundle,
