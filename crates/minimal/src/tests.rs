@@ -762,10 +762,13 @@ fn duplicate_session_warning_reuses_unnamed_session_by_id() {
     );
 }
 
-/// Attach refuses a `Materializing` session, so the warning must not point
-/// at it; the duplicate is still flagged, just without an attach hint.
+/// Attach refuses a `Materializing` session, so the warning's reuse step
+/// must not point at it yet: the guidance says to wait for `min ls` to
+/// report the session active and only then attach. The attach command shows
+/// its argument as a placeholder, so no printed command names the session
+/// attach would refuse right now.
 #[test]
-fn duplicate_session_warning_skips_attach_for_materializing() {
+fn duplicate_session_warning_waits_before_attach_for_materializing() {
     let entries = vec![twin_entry(
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
@@ -777,8 +780,20 @@ fn duplicate_session_warning_skips_attach_for_materializing() {
     let warning = duplicate_session_warning(&entries, &taken)
         .expect("a session on the target path must warn");
     assert!(
-        !warning.contains("min session attach"),
-        "no attach hint for a non-attachable session, got: {warning}"
+        warning.contains("run `min ls` until its status is active"),
+        "the wait guidance names the command to watch, got: {warning}"
+    );
+    assert!(
+        warning.contains("then attach to it with `min session attach <session>`"),
+        "attach is the step after the wait and shows its argument, got: {warning}"
+    );
+    assert!(
+        !warning.contains("min session attach web"),
+        "no command names a session attach would refuse, got: {warning}"
+    );
+    assert!(
+        !warning.contains("To reuse it instead"),
+        "no attach hint to take now for a non-attachable session, got: {warning}"
     );
 }
 
@@ -2184,7 +2199,7 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect_err("a held alive lock is not a finished stop");
     assert!(
-        format!("{err:#}").contains("still holds the VM's alive lock"),
+        format!("{err:#}").contains("the VM host daemon (minvmd) is still running"),
         "got: {err:#}"
     );
 
@@ -2785,35 +2800,40 @@ async fn ls_shows_vm_per_box() {
     let surface_line_of = |vm: &str| {
         table
             .lines()
-            .find(|l| l.starts_with("NAME SURFACE:") && l.contains(vm))
-            .unwrap_or_else(|| panic!("a NAME SURFACE line for {vm} in:\n{table}"))
+            .find(|l| l.starts_with("BOX NAMES:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a BOX NAMES line for {vm} in:\n{table}"))
             .to_string()
     };
     assert!(
-        surface_line_of("default").contains("the hostname proxy is the live name surface"),
+        surface_line_of("default")
+            .contains("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:")
+            || surface_line_of("default")
+                .contains("the hostname proxy is not serving, and box names open only through it"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
-        surface_line_of("alpha").contains("native DNS is the live name surface"),
+        surface_line_of("alpha").contains("resolves through this machine's DNS"),
         "the VM the hook routes to is named native:\n{table}"
     );
     let answerer_row_of = |vm: &str| {
         table
             .lines()
-            .find(|l| l.starts_with("ZONE ANSWERER:") && l.contains(vm))
-            .unwrap_or_else(|| panic!("a ZONE ANSWERER line for {vm} in:\n{table}"))
+            .find(|l| l.starts_with("DNS SERVICE:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a DNS SERVICE line for {vm} in:\n{table}"))
             .to_string()
     };
     assert!(
-        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        answerer_row_of("default")
+            .contains("this VM's host daemon answers its box names on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
-        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        answerer_row_of("alpha")
+            .contains("another VM host daemon answers this VM's box names on 127.0.0.1:7656"),
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(
-        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        !answerer_row_of("alpha").contains("this VM's host daemon answers"),
         "a VM registered with another daemon must not claim its own minvmd \
          holds the port:\n{table}"
     );

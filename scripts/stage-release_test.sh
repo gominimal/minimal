@@ -244,8 +244,9 @@ expect 1 "--extra needs an existing file" "--extra with a missing file fails bef
 
 # --- minzoned stages beside min; optional until release.yml ships it -----
 
-# The answerer row: bin/minzoned beside bin/min on every platform the
-# manifest ships min for, hashed and uploaded with the rest — it is the copy
+# The answerer row: bin/minzoned beside bin/min on every Linux platform the
+# manifest ships min for (macOS ships it inside bin/Minimal.app, checked
+# further down), hashed and uploaded with the rest — it is the copy
 # source NET-122's session advisory finds, so a release without it is a
 # release whose advisory cannot offer the host service.
 answerer_out="$(with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 2>&1)"
@@ -317,6 +318,77 @@ fi
 expect_calls 1 "/components gs://test-bucket/versions/0.6.0/components$" \
     "the manifest still uploads when only the answerer is missing"
 expect_calls 0 "minzoned" "no answerer artifact is uploaded when it is missing"
+
+# --- the macOS bundle rows match scripts/build-app-bundle.sh ----------------
+
+# On macOS minzoned ships inside bin/Minimal.app, one manifest row per bundle
+# file. Each file's flat artifact name is build-app-bundle.sh's: a row naming
+# another artifact, or a bundle file with no row, would lay down a bundle
+# whose signature does not verify.
+mkdir -p "$root/artifacts-bundle"
+cp "$root/artifacts-no-answerer"/* "$root/artifacts-bundle/"
+bundle_table="$("$here/build-app-bundle.sh" table)"
+while IFS=$'\t' read -r _ flat; do
+    printf 'fake %s\n' "$flat" >"$root/artifacts-bundle/$flat"
+done <<<"$bundle_table"
+bundle_out="$("$script" --artifacts-dir "$root/artifacts-bundle" --bucket gs://test-bucket \
+    --version 0.6.0 --dry-run 2>&1)"
+bundle_files=0
+while IFS=$'\t' read -r path flat; do
+    bundle_files=$((bundle_files + 1))
+    if [ -n "$(printf '%s\n' "$bundle_out" | awk -v dest="bin/Minimal.app/$path" \
+        -v src="versions/0.6.0/$flat" \
+        '$2 == "darwin" && $6 == "file" && $7 == dest && $8 == src')" ]; then
+        ok "the darwin manifest installs $flat at bin/Minimal.app/$path"
+    else
+        bad "no darwin row installs $flat at bin/Minimal.app/$path (out: $bundle_out)"
+    fi
+done <<<"$bundle_table"
+bundle_rows="$(printf '%s\n' "$bundle_out" | awk '$7 ~ /^bin\/Minimal\.app\// { n++ } END { print n + 0 }')"
+if [ "$bundle_rows" -eq "$bundle_files" ]; then
+    ok "the manifest carries exactly the bundle's $bundle_files files under bin/Minimal.app"
+else
+    bad "the manifest carries $bundle_rows rows under bin/Minimal.app, the bundle has $bundle_files files"
+fi
+if [ -z "$(printf '%s\n' "$bundle_out" | awk '$2 == "darwin" && $7 == "bin/minzoned"')" ]; then
+    ok "darwin stages no bare bin/minzoned beside the bundle"
+else
+    bad "darwin still stages a bare bin/minzoned (out: $bundle_out)"
+fi
+
+# The bundle stages whole or not at all: with one of its files missing and
+# the rest present, the stage fails naming the missing file and uploads
+# nothing.
+while IFS=$'\t' read -r _ flat; do
+    mkdir -p "$root/artifacts-partial"
+    rm -f "$root/artifacts-partial"/*
+    cp "$root/artifacts-bundle"/* "$root/artifacts-partial/"
+    rm "$root/artifacts-partial/$flat"
+    : >"$GCLOUD_STUB_ARGS"
+    partial_rc=0
+    partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" \
+        --bucket gs://test-bucket --version 0.6.0 2>&1)" || partial_rc=$?
+    if [ "$partial_rc" -ne 0 ] \
+        && [[ "$partial_out" == *"incomplete macOS app bundle"*"missing $flat "* ]]; then
+        ok "a bundle without $flat fails the stage naming it"
+    else
+        bad "a bundle without $flat staged (rc=$partial_rc, out: $partial_out)"
+    fi
+    expect_calls 0 "gs://test-bucket" "nothing uploads for a bundle without $flat"
+done <<<"$bundle_table"
+# --allow-missing keeps its meaning: a backfill of a release from before the
+# bundle has the program alone, and that row still stages.
+rm -f "$root/artifacts-partial"/minzoned-macos-arm64-*
+printf 'fake minzoned-macos-arm64\n' >"$root/artifacts-partial/minzoned-macos-arm64"
+partial_rc=0
+partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" --bucket gs://test-bucket \
+    --version 0.6.0 --allow-missing --dry-run 2>&1)" || partial_rc=$?
+if [ "$partial_rc" -eq 0 ] && [ -n "$(printf '%s\n' "$partial_out" \
+    | awk '$1 == "minzoned" && $2 == "darwin" && $7 == "bin/Minimal.app/Contents/MacOS/minzoned"')" ]; then
+    ok "--allow-missing stages the program of a release from before the bundle"
+else
+    bad "--allow-missing refused a bundle with the program alone (rc=$partial_rc, out: $partial_out)"
+fi
 
 # Every other binary stays required: the same fixture without minvmd's arm64
 # artifact fails the stage naming it.

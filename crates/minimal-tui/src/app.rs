@@ -560,9 +560,10 @@ fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) ->
     }
     if egress_deny_all_default {
         status.push_str(
-            "; egress: deny-all (default for an own-ip box with no egress section); \
-             declare reach with `min session activate --allow-subnets`, \
-             --allow-dns-hosts or --allow-protocols",
+            "; This box can reach no external address: a --network own_ip box with no \
+             egress rules gets the deny-all default. To allow outbound traffic, activate a \
+             new session with --allow-subnets or --allow-dns-hosts, for example \
+             --allow-dns-hosts github.com.",
         );
     }
     status
@@ -1404,7 +1405,12 @@ mod tests {
         );
         let status = model.status.clone().unwrap_or_default();
         assert!(
-            status.contains("egress: deny-all (default for an own-ip box with no egress section)"),
+            status.ends_with(
+                "; This box can reach no external address: a --network own_ip box with no \
+                 egress rules gets the deny-all default. To allow outbound traffic, activate \
+                 a new session with --allow-subnets or --allow-dns-hosts, for example \
+                 --allow-dns-hosts github.com."
+            ),
             "{status}"
         );
         update(

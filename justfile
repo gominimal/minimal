@@ -101,7 +101,7 @@ libkrun-static:
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
     @mkdir -p {{scratch}}
-    @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
+    @scripts/fetch-gvproxy.sh {{gvproxy}}
 
 # Cross-compile minimald → initramfs /init.
 initramfs:
@@ -168,6 +168,16 @@ zoned-link-check: zoned-build
 [macos]
 app-icon:
     scripts/build-app-icon.sh
+
+# The bundle is unsigned: only the release workflow signs it. It lands under
+# target/app-bundle, not beside `min`, so a debug `min` keeps installing the
+# bare program until the bundle is copied beside it on purpose
+# (`cp -R target/app-bundle/Minimal.app target/debug/`).
+#
+# Assemble the unsigned macOS app bundle minzoned ships in.
+[macos]
+app-bundle: zoned-build
+    scripts/build-app-bundle.sh assemble target/debug/minzoned target/app-bundle/Minimal.app
 
 # Build the `min` CLI.
 minimal-cli:

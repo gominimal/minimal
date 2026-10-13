@@ -1222,6 +1222,7 @@ mod tests {
             // Non-default too, for the same reason: `false` is its serde default.
             box_id: None,
             host_row_bound: true,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),

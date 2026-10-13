@@ -13,6 +13,12 @@
 //! step runs as root, `release` and `release-cancel`, each over the control
 //! sockets the step names: they talk to the operator's VM host daemons, and
 //! never to anything on the hooked port.
+//!
+//! On macOS the same copy carries one more verb, `reserve-local-range`: the
+//! program of the boot-time unit that adds the reserved local range to the
+//! host loopback, as root. It is a verb of this program, not a script of its
+//! own, because macOS lists a launchd job under an app's name only when the
+//! job's program is signed code inside that app's bundle.
 
 use std::path::PathBuf;
 
@@ -53,10 +59,68 @@ enum Command {
         #[arg(long = "control", value_name = "SOCK", required = true)]
         controls: Vec<PathBuf>,
     },
+    /// Add the loopback IPs boxes use to lo0, skipping the ones it already
+    /// carries.
+    #[cfg(target_os = "macos")]
+    ReserveLocalRange,
+}
+
+/// The reserved range's addresses that `ifconfig lo0 inet` output does not
+/// list: the ones the verb still has to add. An address is carried when it
+/// is a whole word of the output, so `127.0.64.1` is not found in
+/// `127.0.64.10`.
+#[cfg(any(test, target_os = "macos"))]
+fn missing_range_addresses(present: &str) -> Vec<std::net::Ipv4Addr> {
+    let carried: std::collections::HashSet<&str> = present.split_whitespace().collect();
+    switch::loopback::range_hosts()
+        .filter(|addr| !carried.contains(addr.to_string().as_str()))
+        .collect()
+}
+
+/// The `reserve-local-range` verb: add every address of the reserved local
+/// range that lo0 does not carry yet, one `/32` alias each, and fail on the
+/// first address that cannot be added. The range is compiled in, and the verb
+/// takes no argument and reads no environment variable and no file: its one
+/// read is the interface's own state, from the same absolute-path system tool
+/// the aliases are added with, run with an empty environment. So nothing a
+/// user can write changes what root applies. An address lo0 already carries
+/// is skipped, so a re-run adds only the missing ones and removes nothing.
+#[cfg(target_os = "macos")]
+fn reserve_local_range() -> Result<()> {
+    use anyhow::{Context as _, ensure};
+    const IFCONFIG: &str = "/sbin/ifconfig";
+    let present = std::process::Command::new(IFCONFIG)
+        .args(["lo0", "inet"])
+        .env_clear()
+        .output()
+        .with_context(|| format!("{IFCONFIG} did not run"))?;
+    ensure!(
+        present.status.success(),
+        "{IFCONFIG} lo0 inet exited with {}",
+        present.status
+    );
+    for addr in missing_range_addresses(&String::from_utf8_lossy(&present.stdout)) {
+        let status = std::process::Command::new(IFCONFIG)
+            .args(["lo0", "alias", &addr.to_string(), "255.255.255.255"])
+            .env_clear()
+            .status()
+            .with_context(|| format!("{IFCONFIG} did not run"))?;
+        ensure!(
+            status.success(),
+            "{IFCONFIG} lo0 alias {addr} exited with {status}"
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Before the log setup, which reads its filter from the environment:
+    // this verb runs as root and reads no environment variable.
+    #[cfg(target_os = "macos")]
+    if matches!(cli.command, Some(Command::ReserveLocalRange)) {
+        return reserve_local_range();
+    }
     // The service's lines go to stderr, which the service manager's journal
     // reads; the verbs print their own sentences there too.
     tracing_subscriber::registry()
@@ -71,6 +135,37 @@ fn main() -> Result<()> {
             minvmd::cmd::answerer::release_cancel(&controls);
             Ok(())
         }
+        #[cfg(target_os = "macos")]
+        Some(Command::ReserveLocalRange) => reserve_local_range(),
         None => minvmd::cmd::answerer::run(cli.protocol_version),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The verb adds exactly the reserved range's addresses that lo0 does
+    /// not carry: all 254 on a bare loopback, none on a complete one, and an
+    /// address is carried only as a whole word, never as a prefix of another.
+    #[test]
+    fn reserve_local_range_adds_only_missing_addresses() {
+        let bare = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+                    \tinet 127.0.0.1 netmask 0xff000000\n";
+        let all: Vec<_> = switch::loopback::range_hosts().collect();
+        assert_eq!(all.len(), 254);
+        assert_eq!(missing_range_addresses(bare), all);
+
+        let complete: String = all
+            .iter()
+            .map(|addr| format!("\tinet {addr} netmask 0xffffffff\n"))
+            .collect();
+        assert!(missing_range_addresses(&complete).is_empty());
+
+        let partial = "\tinet 127.0.64.10 netmask 0xffffffff\n";
+        let missing = missing_range_addresses(partial);
+        assert_eq!(missing.len(), 253);
+        assert!(missing.contains(&std::net::Ipv4Addr::new(127, 0, 64, 1)));
+        assert!(!missing.contains(&std::net::Ipv4Addr::new(127, 0, 64, 10)));
     }
 }

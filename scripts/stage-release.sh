@@ -230,7 +230,7 @@ fi
 # scripts/fetch-gvproxy.sh); only the installed name is ours, and
 # `switch::GVPROXY_FILE` is the resolver's matching definition.
 #
-# minzoned stages as `bin/minzoned` beside `min` on every platform
+# minzoned stages as `bin/minzoned` beside `min` on every Linux platform
 # that stages `min` — exactly where the session advisory's `answerer_source`
 # looks for it (beside the running `min` first, then PATH). The staged copy is
 # only the COPY SOURCE for NET-122's one privileged step: the advisory's
@@ -241,8 +241,23 @@ fi
 # and the macOS build links only system libraries (the rule
 # scripts/check-zoned-links.sh gates before the binary can leave the build).
 #
+# On macOS minzoned stages inside an app bundle, `bin/Minimal.app`, still
+# beside `min`: macOS lists a launchd job under an app's name and icon only
+# when the job's program belongs to an app bundle signed with the vendor's
+# Developer ID. A release carries flat files, so the signed, stapled bundle
+# stages as one row per file, each under the flat name
+# scripts/build-app-bundle.sh gives it (`build-app-bundle.sh table` prints
+# the mapping, and stage-release_test.sh fails when these rows disagree with
+# it). The signature seals the bundle's files, not their modes, so the
+# installer's +x on every `bin` row changes nothing the signature covers.
+#
 # minzoned is OPTIONAL, with a warning, where every other binary is
-# required: see OPTIONAL_COMPONENTS below.
+# required: see OPTIONAL_COMPONENTS below. The macOS bundle's files are
+# optional only together: a bundle missing one of its files does not verify
+# against its signature, so a stage that has some of them and not all fails.
+# --allow-missing still stages what is there: a backfill of a release from
+# before the bundle has the program alone, which installs the service
+# listed without the app's name and icon.
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
@@ -268,7 +283,11 @@ COMPONENTS=(
     "vmlinuz|linux|arm64|file|data/vmlinuz|vmlinuz-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
-    "minzoned|darwin|arm64|file|bin/minzoned|minzoned-macos-arm64"
+    "minzoned|darwin|arm64|file|bin/Minimal.app/Contents/MacOS/minzoned|minzoned-macos-arm64"
+    "minzoned-info|darwin|arm64|file|bin/Minimal.app/Contents/Info.plist|minzoned-macos-arm64-Info.plist"
+    "minzoned-icon|darwin|arm64|file|bin/Minimal.app/Contents/Resources/AppIcon.icns|minzoned-macos-arm64-AppIcon.icns"
+    "minzoned-seal|darwin|arm64|file|bin/Minimal.app/Contents/_CodeSignature/CodeResources|minzoned-macos-arm64-CodeSignature"
+    "minzoned-ticket|darwin|arm64|file|bin/Minimal.app/Contents/CodeResources|minzoned-macos-arm64-ticket"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
@@ -302,7 +321,7 @@ COMPONENTS=(
 # ("this release ships no minzoned; the DNS service install is unavailable")
 # instead of offering the step. Once releases with the artifact are the norm,
 # empty this list so a missing answerer fails the stage like any other binary.
-OPTIONAL_COMPONENTS=(minzoned)
+OPTIONAL_COMPONENTS=(minzoned minzoned-info minzoned-icon minzoned-seal minzoned-ticket)
 
 # is_optional <component> — whether a missing artifact for it only warns.
 is_optional() {
@@ -343,6 +362,25 @@ stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
     printf '# format: %s\n' "$FORMAT_VERSION"
     printf '# component   os      arch    version   sha256%*s   kind   dest                 src\n' 58 ''
 } >"$manifest"
+
+# The macOS bundle stages whole or not at all: with any of its files present,
+# a missing one fails the stage. --allow-missing keeps its meaning, so the
+# rows that are there stage and the loop below warns about the rest.
+bundle_have=()
+bundle_lack=()
+for entry in "${COMPONENTS[@]}"; do
+    IFS='|' read -r comp os _ _ _ basename <<<"$entry"
+    [ "$os" = darwin ] || continue
+    case "$comp" in minzoned|minzoned-*) ;; *) continue ;; esac
+    if [ -f "$ARTIFACTS_DIR/$basename" ]; then
+        bundle_have+=("$basename")
+    else
+        bundle_lack+=("$basename")
+    fi
+done
+if [ "$ALLOW_MISSING" -eq 0 ] && [ "${#bundle_have[@]}" -gt 0 ] && [ "${#bundle_lack[@]}" -gt 0 ]; then
+    die "incomplete macOS app bundle in $ARTIFACTS_DIR: missing ${bundle_lack[*]} (found ${bundle_have[*]}); its files stage together or not at all"
+fi
 
 # Files to upload, deduped (a basename may back more than one row).
 declare -A upload_seen=()
