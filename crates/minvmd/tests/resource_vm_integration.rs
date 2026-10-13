@@ -16,6 +16,8 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -59,8 +61,8 @@ fn json(out: &Output) -> serde_json_lenient::Value {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires libkrun + kernel/rootfs/initramfs"]
 fn resource_metrics_and_config_consumed_at_boot() {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("resource_vm_integration: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("resource_vm_integration", "MINVMD_E2E != 1");
         return;
     }
     for var in [

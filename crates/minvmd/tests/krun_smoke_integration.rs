@@ -27,6 +27,8 @@
 
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::process::Command;
 
 /// Markers the helper must print before any branch.
@@ -39,8 +41,8 @@ const BRING_UP_MARKERS: &[&str] = &[
 #[test]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun"]
 fn krun_smoke_bring_up() {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("krun_smoke: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("krun_smoke", "MINVMD_E2E != 1");
         return;
     }
 

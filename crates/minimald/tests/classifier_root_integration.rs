@@ -6,7 +6,7 @@
 //! before it is loaded, and a request through the proxy is answered before
 //! anything refused it.
 //!
-//! Six proofs, all `#[ignore]`d so the default suite and the surveyed
+//! Seven proofs, all `#[ignore]`d so the default suite and the surveyed
 //! nextest lines never run them. The native lane's
 //! `minimald-root-integration` job runs this binary, and its recipe
 //! (`just test-root-integration`) runs it unprivileged — the same posture
@@ -27,20 +27,25 @@
 //! `sudo cargo nextest run -p minimald --run-ignored all --no-tests=fail \
 //! -E 'binary(/classifier_root_integration$/)'`.
 //!
-//! Beyond the two NET-079 refusal proofs, four prove the classification
-//! itself, live on the kernel that loads it: that the installer's whole
-//! transaction — the classify chain at output's mangle priority, the
-//! mark-keyed postrouting — loads where the socket-keyed postrouting it
-//! replaces was refused (`classifier_table_loads_on_this_kernel`); that
-//! the two source identities are what a peer behind a veth actually
-//! sees, one per subtree and loopback untouched
-//! (`snat_identity_is_seen_by_the_peer`); that a foreign component's
-//! ct-mark bits survive classification, so only the mask's bits move
-//! (`foreign_ct_mark_bits_survive_classification`); and that the install
-//! refuses over a host already classing with the default bits, naming
-//! the rule and the override that escapes it
+//! Beyond the two NET-079 refusal proofs, one proves NET-080 the same way
+//! — that the daemon's own fetch of a package server's object, from its
+//! own leaf, completes while the same deny-all box's own connect to the
+//! same server is refused, and that the fetch is recorded as the
+//! node-plane traffic it is, naming that box
+//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — and
+//! four prove the classification itself, live on the kernel that loads
+//! it: that the installer's whole transaction — the classify chain at
+//! output's mangle priority, the mark-keyed postrouting — loads where
+//! the socket-keyed postrouting it replaces was refused
+//! (`classifier_table_loads_on_this_kernel`); that the two source
+//! identities are what a peer behind a veth actually sees, one per
+//! subtree and loopback untouched (`snat_identity_is_seen_by_the_peer`);
+//! that a foreign component's ct-mark bits survive classification, so
+//! only the mask's bits move (`foreign_ct_mark_bits_survive_classification`);
+//! and that the install refuses over a host already classing with the
+//! default bits, naming the rule and the override that escapes it
 //! (`install_refuses_an_overlapping_ct_mark_user`). The identity proof
-//! drives a seventh `#[ignore]`d test as its observer — the half of
+//! drives an eighth `#[ignore]`d test as its observer — the half of
 //! itself that runs re-exec'd inside the peer's namespace — which passes
 //! on its own, with nothing to observe.
 //!
@@ -57,11 +62,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use minimald::net::classifier::{Family, Observed, Reading, decide_now, read_filter};
+use minimald::net::classifier::{
+    Family, Observed, Reading, decide_now, read_filter, record_node_plane_fetch,
+};
 use minimald::net::dns::HostnameRegistry;
 use minimald::net::proxy::{Router, serve};
 use minimald::net::switch::proxied_request_verdict;
-use sandbox2::classifier::{self, create_box_leaf, daemon_leaf, place_pid, remove_box_leaf};
+use sandbox2::classifier::{
+    self, DAEMON_LEAF as THE_DAEMON_LEAF, create_box_leaf, daemon_leaf, place_pid, remove_box_leaf,
+};
 use sandbox2::config::{ALLOW_DIR, DENY_DIR, Verdict};
 use sessions::SessionId;
 
@@ -644,6 +653,82 @@ unsafe fn backend_child_role(report: libc::c_int, target_port: u16) -> ! {
     unsafe { libc::_exit(0) };
 }
 
+/// The deny-leaf child's whole life, raw syscalls only: this runs between a
+/// `fork` and its `_exit`, where only async-signal-safe calls belong — the
+/// same discipline the backend child keeps, because the process that forked
+/// it may hold threads the child must not run code against. It waits for the
+/// proof's placement ack, then opens its own connect to the package server's
+/// loopback port — a flow this leaf itself originates, the original
+/// direction the loaded chain refuses — and reports the errno that connect
+/// met, zero for one that completed, over the same nineteen-byte
+/// `connect-errno=` spelling the backend's answer carries.
+///
+/// # Safety
+///
+/// `report` is the child's end of a live socketpair whose other end the
+/// parent holds; the function never returns.
+unsafe fn deny_leaf_connect_role(report: libc::c_int, server_port: u16) -> ! {
+    // The placement ack, one byte: the parent's word that this process is
+    // in its deny leaf. A parent that died first is heard as the end of the
+    // channel, and the child ends rather than report a connect made out of
+    // no leaf at all.
+    let mut ack = [0u8; 1];
+    // SAFETY: `read(2)` writes into `ack` from the socketpair end `report` reads.
+    if unsafe { libc::read(report, ack.as_mut_ptr().cast(), 1) } != 1 {
+        // SAFETY: the child ends here.
+        unsafe { libc::_exit(1) };
+    }
+    // The box's own connect: a flow this leaf originates, to the package
+    // server's loopback port — the original direction the loaded chain
+    // refuses, from the leaf a launched deny-all box's processes run in.
+    // SAFETY: `socket(2)` makes the one descriptor this child connects with.
+    let out = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let mut errno = 0;
+    if out == -1 {
+        // `Error::last_os_error` is `Error::Os(RawOsError)` around this
+        // thread's errno — no allocation, so it belongs to the
+        // async-signal-safe set the child may run.
+        errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+    } else {
+        // SAFETY: `sockaddr_in` zeroed is its init.
+        let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        to.sin_family = libc::AF_INET as libc::sa_family_t;
+        to.sin_port = server_port.to_be();
+        to.sin_addr = libc::in_addr {
+            s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+        };
+        // SAFETY: `connect(2)` reads the `sockaddr_in` filled in above.
+        if unsafe {
+            libc::connect(
+                out,
+                (&raw const to).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+        }
+        // SAFETY: the connecting descriptor, done with either way.
+        unsafe { libc::close(out) };
+    }
+    // The report, the errno the connect met: `connect-errno=` and four
+    // zero-padded digits, the same spelling the backend's answer carries,
+    // so the proof reads both legs off one format. The three pushes fill
+    // the nineteen bytes exactly, so the whole array is the report.
+    let mut answer = [0u8; 19];
+    let mut answer_len = 0;
+    push(&mut answer, &mut answer_len, b"connect-errno=");
+    push_dec4(&mut answer, &mut answer_len, errno);
+    push(&mut answer, &mut answer_len, b"\n");
+    let wrote = write_all(report, &answer);
+    if !wrote {
+        // SAFETY: the child ends here.
+        unsafe { libc::_exit(2) };
+    }
+    // SAFETY: `_exit(2)` never returns, so the child ends here.
+    unsafe { libc::_exit(0) };
+}
+
 /// The request through the hostname proxy, driven the way the daemon
 /// serves one: the registry that routes the box's name, the proxy's own
 /// `serve` loop, and a plain client reading the answer whole. The proxy's
@@ -928,9 +1013,304 @@ fn deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table() {
     );
 }
 
+/// The proof's capture of what a bundle's daemon-log tail reads: a writer
+/// tracing's formatter can be pointed at, so the record a proof asserts on
+/// is read off the subscriber it installs rather than off this process's
+/// stderr — the way the tail reads it, a line at a time, with nothing else
+/// the proof's own process prints able to make one.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("the record capture's lock").clone())
+            .expect("the record capture holds what the formatter wrote, which is utf-8")
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The one failure the capture knows: a lock poisoned by a panic
+        // inside the proof itself, handed back as the write error it is
+        // rather than ended on.
+        let mut captured = self
+            .0
+            .lock()
+            .map_err(|poisoned| std::io::Error::other(poisoned.to_string()))?;
+        captured.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// NET-080, live over the loaded table: the deny-all box's own connect to
+/// a package server on this host is refused with EHOSTUNREACH while the
+/// daemon's own fetch of the same server's one object, from its own leaf,
+/// completes with the object's own bytes — and is recorded as the
+/// node-plane traffic it is, naming that box. The box's half is a forked
+/// child placed in a real `boxes/deny` leaf the way a launch places a box,
+/// so its connect meets the same chain a resident deny-all box's does;
+/// the package server is a loopback listener this proof holds, standing
+/// in for the cache a daemon's packages come from, and the daemon's half
+/// is this proof process in the daemon leaf the placement above put it in
+/// — the sibling-of-the-cohort leaf the refusing chain's match cannot
+/// reach, which is why the one loaded table refuses one leg and not the
+/// other. The record is read through a tracing subscriber the proof
+/// installs, the way a bundle's tail reads it: one line, at the level the
+/// tail reads, naming the host fetched with the port it left for, the
+/// leaf the fetch left from, the box it was made for, and the object.
+///
+/// `#[ignore]`d for the lane's sake, and declined like the proofs above
+/// on a runner with no `nft`; every other precondition it names is the
+/// lane's own to hold.
+#[test]
+#[ignore = "loads the installer's table and runs a real boxes/deny leaf's own connect against a local package server while the daemon's own fetch completes; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table() {
+    if !nft_present() {
+        eprintln!(
+            "skipping daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table: \
+             no nft on this host — the install's nftables transaction is \
+             the artifact under proof (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+
+    // The scratch tree this proof installs over, and the deny-all box's
+    // leaf in the deny subtree — made by the same call a launch makes, so
+    // the leaf is a real leaf of the loaded table's refusing chain and not
+    // a stand-in.
+    let scratch = mountpoint.join(format!("minimald-proof-fetch-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    // In the tree before the box child is forked in it: the child is born
+    // in this process's cgroup — the daemon leaf the placement puts this
+    // proof process in, the leaf the daemon's own half below leaves from —
+    // and a migration's permission is checked at the common ancestor of
+    // its ends.
+    place_this_process_in_the_tree(&scratch);
+    let leaf = create_box_leaf(&scratch, "fetchbox", Verdict::Deny)
+        .expect("the step's deny subtree takes a box leaf");
+    install.leaf = Some(leaf.clone());
+
+    // The package server: one loopback listener this proof holds, standing
+    // in for the cache a daemon's packages come from — the one destination
+    // both legs below reach for, so the only thing that can differ between
+    // them is the leaf each left from.
+    const PACKAGE_OBJECT: &str = "jq-1.8.0";
+    let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("binding the package server's loopback port");
+    let server_addr = server.local_addr().expect("the package server's address");
+    let server_port = server_addr.port();
+
+    // The box's half: a forked child, placed in its deny leaf before it
+    // owns a single socket, opening its own connect to the package server.
+    // The socketpair is its whole control channel — the placement ack in,
+    // the errno its connect met out.
+    let mut pair = [0 as libc::c_int; 2];
+    // SAFETY: `socketpair(2)` writes two descriptors into `pair` and
+    // touches nothing else.
+    let made = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    };
+    assert_eq!(made, 0, "making the box child's control channel");
+    // SAFETY: `fork(2)` runs in this process — single-threaded here, the
+    // whole proof drives blocking sockets — and the child runs raw
+    // syscalls only between the fork and its `_exit`, so no allocator or
+    // lock can be held across the fork by the child itself.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "forking the deny-leaf box child");
+    if pid == 0 {
+        // SAFETY: the parent's end of the pair, closed so the child's
+        // channel is its own.
+        unsafe { libc::close(pair[0]) };
+        // SAFETY: the child never returns; `pair[1]` is its end of the
+        // live socketpair, per the function's contract.
+        unsafe { deny_leaf_connect_role(pair[1], server_port) };
+    }
+    install.child = Some(pid);
+    // SAFETY: the child's end of the pair, closed here so the parent's
+    // half of the channel is held by the parent alone.
+    unsafe { libc::close(pair[1]) };
+    // SAFETY: `pair[0]` is the parent's end of that same live socketpair,
+    // handed to the stream that now owns it.
+    let mut box_leg = unsafe { std::os::unix::net::UnixStream::from_raw_fd(pair[0]) };
+    box_leg
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("the box child channel's read deadline");
+
+    // The one migration the box's half rests on: the child enters its deny
+    // leaf before it owns a single socket, the way a launched box's
+    // processes do.
+    place_pid(
+        &leaf.join("cgroup.procs"),
+        u32::try_from(pid).expect("the forked box child's pid"),
+    )
+    .expect("placing the box child in its deny leaf");
+    box_leg
+        .write_all(b"p")
+        .expect("telling the box child it is placed");
+    let mut report = [0u8; 19];
+    box_leg
+        .read_exact(&mut report)
+        .expect("the box child reporting the errno its connect met");
+    let refused = backend_connect_errno(&String::from_utf8_lossy(&report))
+        .unwrap_or_else(|| panic!("the box child reported its connect's errno: {report:?}"));
+    assert_eq!(
+        refused,
+        libc::EHOSTUNREACH,
+        "the deny-all box's own connect to the package server is refused \
+         with EHOSTUNREACH over IPv4 loopback, the loaded chain's own \
+         rejection"
+    );
+
+    // The daemon's half: this proof process, in the daemon leaf the
+    // placement put it in, fetching the same server's one object — the leg
+    // the requirement is about, completing beside a box whose own connect
+    // the same loaded table just refused.
+    let mut fetched = TcpStream::connect(server_addr).expect(
+        "the daemon's own fetch connects from its own leaf, beside the \
+         cohort: the loaded chain's refusing match takes the deny subtree \
+         alone",
+    );
+    fetched
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("the fetch leg's read deadline");
+    let get = format!(
+        "GET /{PACKAGE_OBJECT} HTTP/1.1\r\nHost: cache.min.internal\r\nConnection: close\r\n\r\n"
+    );
+    fetched
+        .write_all(get.as_bytes())
+        .expect("sending the fetch's request");
+    let (mut served, _) = server
+        .accept()
+        .expect("the package server answers the daemon's fetch");
+    let mut head = [0u8; 1024];
+    let read = served.read(&mut head).expect("reading the fetch's request");
+    let head = String::from_utf8_lossy(&head[..read]);
+    assert!(
+        head.starts_with(&format!("GET /{PACKAGE_OBJECT} ")),
+        "the package server serves the object the fetch asked for, got: {head}"
+    );
+    let answer = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        PACKAGE_OBJECT.len(),
+    );
+    served
+        .write_all(answer.as_bytes())
+        .expect("the package server answers the fetch");
+    served
+        .write_all(PACKAGE_OBJECT.as_bytes())
+        .expect("the package server serves the object");
+    drop(served);
+    let mut body = Vec::new();
+    fetched
+        .read_to_end(&mut body)
+        .expect("reading the fetched object whole");
+    assert!(
+        body.starts_with(b"HTTP/1.1 200 OK"),
+        "the daemon's own fetch is answered, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        &body[body.len() - PACKAGE_OBJECT.len()..],
+        PACKAGE_OBJECT.as_bytes(),
+        "the daemon's own fetch completes with the object's own bytes"
+    );
+
+    // The record: the fetch above is the one the daemon makes for the box,
+    // and this is how a person reads that it was node-plane traffic —
+    // captured through a tracing subscriber this proof installs, the way a
+    // bundle's daemon-log tail reads the line, never off this process's
+    // stderr. The leaf the line names is read live, over this real cgroup2,
+    // from the placement the step's `--pid` half made of this process before
+    // the box child was forked — the record's leaf claim is a fact the tree
+    // states, not a constant it asserts on hosts that carry no tree. One
+    // line, at the level the tail reads, naming the host fetched with the
+    // port it left for, the leaf the fetch left from, the box it was made
+    // for, and the object.
+    let box_id = leaf
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the box's leaf is named with its id")
+        .to_owned();
+    let fetched_from = minimald::net::classifier::daemon_fetch_leaf(&scratch);
+    assert_eq!(
+        fetched_from,
+        Some(THE_DAEMON_LEAF),
+        "the proof process the step placed in the scratch tree's daemon leaf \
+         reads back as in it, over this host's real cgroup2"
+    );
+    let log = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    record_node_plane_fetch(
+        &box_id,
+        fetched_from,
+        &server_addr.to_string(),
+        PACKAGE_OBJECT,
+    );
+    let recorded = log.contents();
+    let lines: Vec<&str> = recorded
+        .lines()
+        .filter(|line| line.contains("node-plane traffic"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the daemon's own fetch is recorded once, as node-plane traffic: {recorded}"
+    );
+    let line = lines[0];
+    assert!(
+        line.contains("INFO"),
+        "the record is at the level a bundle's tail reads: {line}"
+    );
+    assert!(
+        line.contains(&server_addr.to_string()),
+        "the record names the host fetched, the port it left for beside it: {line}"
+    );
+    assert!(
+        line.contains(THE_DAEMON_LEAF),
+        "the record names the leaf the fetch left from: {line}"
+    );
+    assert!(
+        line.contains(&box_id),
+        "the record names the box the fetch was made for: {line}"
+    );
+    assert!(
+        line.contains(PACKAGE_OBJECT),
+        "the record names the object fetched: {line}"
+    );
+}
+
 // ── The classification's own proofs ─────────────────────────────────────────
 //
-// The two proofs above read the table's refusal; the four below read its
+// The three proofs above read the table's refusal; the four below read its
 // classification — the ct-mark bits the classify chain writes, the
 // identities the postrouting chain translates to, and the bits of the
 // connection mark the step shares with nobody.

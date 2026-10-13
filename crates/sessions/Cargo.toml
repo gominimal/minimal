@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 common.workspace = true
 globset.workspace = true
+hex.workspace = true
 camino.workspace = true
 nutype.workspace = true
 paths.workspace = true

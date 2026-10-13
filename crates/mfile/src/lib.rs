@@ -861,8 +861,9 @@ pub struct File {
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
     ///
-    /// TODO: Remove `harness` alias after July 2026.
-    #[serde(default, alias = "harness")]
+    /// `[harness]`, the pre-v0.5.0 name of this table, no longer parses: it
+    /// errors at load, so an old config has to rename the table.
+    #[serde(default)]
     pub stack: Option<Stack>,
 
     /// Task definitions, invoked with `minimal run <task name>`.
@@ -990,13 +991,39 @@ impl File {
     /// # Errors
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
-    /// no `default` field.
+    /// no `default` field, [`Error::HarnessTable`] if the file names the
+    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
                 if s.default.is_none() {
                     return Err(Error::MissingParamDefault(n.clone()));
                 }
+            }
+        }
+        // `[harness]` stopped parsing in v0.5.0 and now lands in `extra`,
+        // setting no stack: the toolchain its name promised is silently
+        // absent, and the gap only surfaces much later, as a bare
+        // `linker 'cc' not found` from a build inside the session. Refuse
+        // the load here, at the config, where the fix is still visible.
+        if self.extra.contains_key("harness") {
+            return Err(Error::HarnessTable(self.mfile_path.clone()));
+        }
+        // serde takes one action key as `task.action` and leaves any other in
+        // `task.extra`. Refuse the task here, before `warn_unknown_fields`
+        // would misreport the extra action key as unknown and suggest an
+        // upgrade.
+        for (task_name, task) in &self.tasks {
+            let extra_actions = TaskAction::KEYS
+                .iter()
+                .filter(|k| task.extra.contains_key(**k))
+                .map(|k| k.to_string());
+            let keys: Vec<String> = std::iter::once(task.action.key().to_string())
+                .chain(extra_actions)
+                .collect();
+            if keys.len() > 1 {
+                return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
         }
         self.warn_unknown_fields();
@@ -1218,9 +1245,18 @@ impl File {
     ///  - default profile if set (and not set on the task)
     ///  - default state_key if set (and not set on the task)
     ///  - additional build_packages & runtime_packages set on the stack
+    ///  - repo-wide `[params]` as args, unless the task declares an arg of the same name
     ///
     /// The returned task will not have had any string interpolations applied.
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
+        if let Some(params) = &self.params {
+            for (name, spec) in &params.0 {
+                task.args
+                    .0
+                    .entry(name.clone())
+                    .or_insert_with(|| spec.clone());
+            }
+        }
         if let Some(default_profile) = &self.defaults.profile
             && task.profile.is_none()
         {
@@ -1870,6 +1906,39 @@ mod tests {
         );
     }
 
+    /// Repo-wide `[params]` reach every task as defaulted args, and a task
+    /// arg of the same name shadows the repo param.
+    #[test]
+    fn task_inherits_repo_params_as_args() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [params]
+            greeting = { type = "string", default = "hi" }
+            name = { type = "string", default = "repo" }
+
+            [tasks.useparam]
+            bash = "echo %{greeting} %{name}"
+            args.name = { type = "string", default = "task" }
+            "#
+        })
+        .unwrap();
+
+        let task = mf.task("useparam").unwrap();
+        assert_eq!(
+            task.args.0.get("greeting"),
+            Some(&args::ArgSpec {
+                spec: args::ArgSchema::Scalar(args::PrimitiveSpec::String),
+                help: None,
+                default: Some("hi".to_string()),
+            })
+        );
+        assert_eq!(
+            task.args.0.get("name").and_then(|a| a.default.as_deref()),
+            Some("task"),
+            "a task arg must not be replaced by a repo param of the same name"
+        );
+    }
+
     #[test]
     fn output_arch_defaults_to_none() {
         let mf: File = toml::from_str(indoc! {
@@ -2490,6 +2559,105 @@ mod tests {
         assert_eq!(count_unknown_warnings(&capture), 2);
 
         drop(guard);
+    }
+
+    /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
+    /// a file that still uses it is refused at load — before any build runs
+    /// and misses its toolchain — and pointed at the rename. The refusal
+    /// names the offending file, so a layer pulled from upstream can be
+    /// located without re-reading every candidate.
+    #[test]
+    fn harness_table_no_longer_parses() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
+
+        let err = File::from_dir(dir.path()).unwrap_err();
+        let path = dir.path().join(MFILE_NAME);
+        assert!(
+            matches!(&err, Error::HarnessTable(Some(p)) if *p == path),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Replace it with a `[stack]` table"), "{msg}");
+        assert!(msg.starts_with(&path.display().to_string()), "{msg}");
+    }
+
+    /// The pre-v0.5.0 `harness` key can also arrive as a bare string, not a
+    /// table; it lands in `extra` all the same and is refused identically.
+    #[test]
+    fn harness_scalar_key_is_refused_like_the_table() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "harness = \"rust\"\n").unwrap();
+
+        let err = File::from_dir(dir.path()).unwrap_err();
+        let path = dir.path().join(MFILE_NAME);
+        assert!(
+            matches!(&err, Error::HarnessTable(Some(p)) if *p == path),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("the `harness` key"), "{msg}");
+        assert!(msg.contains("`name = \"x\"` under `[stack]`"), "{msg}");
+        assert!(msg.starts_with(&path.display().to_string()), "{msg}");
+    }
+
+    /// A file parsed without a path (the wire/fuzz entry point) is still
+    /// refused, with wording that stands on its own without one.
+    #[test]
+    fn harness_key_without_a_path_names_no_file() {
+        let file = File::from_toml_bytes(b"harness = \"rust\"\n").unwrap();
+        let err = file.validate().expect_err("`harness` must be refused");
+
+        assert!(matches!(err, Error::HarnessTable(None)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("the `harness` key"), "{msg}");
+    }
+
+    /// A task with two action keys is refused with an error naming the task
+    /// and both keys, instead of running one and calling the other unknown.
+    #[test]
+    fn task_with_two_actions_is_refused() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.both]\nexec = [\"echo\", \"from-exec\"]\nbash = \"echo from-bash\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let err = File::from_dir(dir.path()).expect_err("two actions must be refused");
+        drop(guard);
+
+        assert!(matches!(err, Error::MultipleTaskActions(..)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("task `both` sets more than one action ("),
+            "{msg}"
+        );
+        assert!(msg.contains("exec") && msg.contains("bash"), "{msg}");
+        assert!(msg.ends_with("); set exactly one"), "{msg}");
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields in task"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    #[test]
+    fn task_with_one_action_passes_validate() {
+        for action in [
+            "exec = [\"echo\", \"hi\"]",
+            "bash = \"echo hi\"",
+            "echo = \"hi\"",
+            "cmdcmd = [\"gen\"]",
+        ] {
+            let file: File = toml::from_str(&format!("[tasks.one]\n{action}\n")).unwrap();
+            file.validate().unwrap_or_else(|e| panic!("{action}: {e}"));
+            assert!(file.tasks["one"].extra.is_empty(), "{action}");
+        }
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {

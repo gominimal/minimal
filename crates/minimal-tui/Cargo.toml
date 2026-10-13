@@ -29,6 +29,9 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# `term` for the pty that stands in for the user's terminal in the attach
+# test.
+nix = { workspace = true, features = ["term"] }
 tempfile.workspace = true
 
 [lints]

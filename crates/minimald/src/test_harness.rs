@@ -121,11 +121,10 @@ impl TestServer {
 
     /// [`Self::new_in`] on a daemon that opted out of the deny-all egress
     /// default (NET-077): the same server, but one whose boxes with no
-    /// `egress` section keep the shipped allow-all. Every other harness
-    /// server runs the default this build ships — as announced (NET-076), so
-    /// its boxes with no `egress` section still allow all too; the tests that
-    /// need the deny-all posture pass `EgressDefaultPhase::InForce` by name
-    /// rather than asking a harness server for it.
+    /// `egress` section keep the earlier allow-all. Every other harness
+    /// server runs the default this build ships — in force (NET-074), so its
+    /// own-address boxes with no `egress` section reach nothing outside
+    /// themselves.
     pub async fn new_opted_out_in(temp: TempDir) -> Self {
         Self::over(config_in(&temp, true), temp).await
     }
@@ -289,6 +288,12 @@ fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
         // runtime-dir lock, deriving the octet from the per-start id.
         daemon_identity_dir: None,
         deny_all_opt_out,
+        // Off, not live: the harness runs unconfined on hosts that are
+        // themselves restricted (CI's Ubuntu runners, the lima guest) and
+        // never starts a sandbox, so a live probe would refuse every create
+        // here for a reason no test is about. A gate test fixes a verdict
+        // through `ServerStateHandle::set_user_namespace_gate`.
+        user_namespace_gate: crate::server::UsernsGate::Off,
     }
 }
 
@@ -567,6 +572,8 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             project_path: paths::HostAbsPath::try_new(project).unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -626,7 +633,10 @@ pub async fn create_configured_session(
     // circuits the marker check in that case (there's nothing to
     // upload), so calling it directly is fine.
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         minimald_rpc::Errorable::Ok(_) => {}

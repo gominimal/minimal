@@ -3,7 +3,7 @@ repo = "https://github.com/gominimal/pkgs"
 branch = "main"
 locked_commit = "fc9feab386409702428705543ff0cd3df6c61082"
 
-[harness]
+[stack]
 use = "rust"
 
 [defaults]

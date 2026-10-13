@@ -1,5 +1,6 @@
 //! CLI subcommand implementations for `minvmd`.
 
+pub mod answerer;
 pub mod boot;
 pub mod config;
 pub mod run;

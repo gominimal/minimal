@@ -136,9 +136,22 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
     if dirs.mesh_group == MeshGroup::Config {
         rows.push(mesh_row());
     }
+    rows.extend([("State", "State dir", Some(dirs.state.clone()), None).into_row()]);
+    // The session store lives inside the VM on minvmd-backed hosts, so the
+    // host sessions path is never created there; show the in-VM note instead.
+    rows.push(match dirs.provider {
+        paths::ProviderKind::Minvmd => (
+            "State",
+            "Sessions",
+            None,
+            Some("inside the VM; not on this host".to_string()),
+        )
+            .into_row(),
+        paths::ProviderKind::Minimald => {
+            ("State", "Sessions", Some(dirs.state.join("sessions")), None).into_row()
+        }
+    });
     rows.extend([
-        ("State", "State dir", Some(dirs.state.clone()), None).into_row(),
-        ("State", "Sessions", Some(dirs.state.join("sessions")), None).into_row(),
         (
             "State",
             "Daemon logs",
@@ -370,6 +383,49 @@ mod tests {
         assert_eq!(
             daemon_logs.note.as_deref(),
             Some("daily-rotated: minimald.log*, minvmd.log*"),
+        );
+    }
+
+    /// On a minvmd-backed host the session store lives inside the VM, so the
+    /// Sessions row must carry no host path and the in-VM note; the native
+    /// provider keeps the host sessions path.
+    #[test]
+    fn build_dir_rows_sessions_row_depends_on_provider() {
+        let native = DirsLookup {
+            config: PathBuf::from("/c"),
+            #[cfg(feature = "remote-access")]
+            mesh_enrolment: PathBuf::from("/c/mesh-enrolment"),
+            #[cfg(feature = "remote-access")]
+            mesh_group: MeshGroup::Config,
+            state: PathBuf::from("/s"),
+            cache: PathBuf::from("/x"),
+            provider: paths::ProviderKind::Minimald,
+        };
+        let native_sessions = build_dir_rows(&native)
+            .into_iter()
+            .find(|r| r.name == "Sessions")
+            .unwrap();
+        assert_eq!(native_sessions.path_display(), "/s/sessions");
+        assert_eq!(native_sessions.note, None);
+
+        let vm = DirsLookup {
+            config: PathBuf::from("/c"),
+            #[cfg(feature = "remote-access")]
+            mesh_enrolment: PathBuf::from("/c/mesh-enrolment"),
+            #[cfg(feature = "remote-access")]
+            mesh_group: MeshGroup::Config,
+            state: PathBuf::from("/s"),
+            cache: PathBuf::from("/x"),
+            provider: paths::ProviderKind::Minvmd,
+        };
+        let vm_sessions = build_dir_rows(&vm)
+            .into_iter()
+            .find(|r| r.name == "Sessions")
+            .unwrap();
+        assert_eq!(vm_sessions.path, None);
+        assert_eq!(
+            vm_sessions.note.as_deref(),
+            Some("inside the VM; not on this host"),
         );
     }
 

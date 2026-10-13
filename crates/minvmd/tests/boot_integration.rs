@@ -17,8 +17,11 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use serial_test::serial;
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
@@ -42,8 +45,8 @@ fn minvmd_bin() -> std::ffi::OsString {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, and rootfs"]
 fn boot_integration_ready_marker_round_trip() {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("boot_integration: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("boot_integration", "MINVMD_E2E != 1");
         return;
     }
 
@@ -68,6 +71,10 @@ fn boot_integration_ready_marker_round_trip() {
         // the tempdir, never the developer's real state dir.
         .env("HOME", state_dir.path())
         .env("XDG_STATE_HOME", state_dir.path())
+        // Its own process group, so teardown reaches the VMM child too; stdin
+        // off the terminal, or libkrun's console setup stops the group.
+        .process_group(0)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -88,8 +95,7 @@ fn boot_integration_ready_marker_round_trip() {
 
     let got_vm_up = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    common::kill_group(&mut child);
 
     assert!(
         got_vm_up,

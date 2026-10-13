@@ -24,6 +24,8 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -140,8 +142,8 @@ fn kill9(pid: i64) {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires libkrun + kernel/rootfs/initramfs"]
 fn supervised_restart_cycle_and_dirty_kill_repair() {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("supervision_integration: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("supervision_integration", "MINVMD_E2E != 1");
         return;
     }
     for var in [

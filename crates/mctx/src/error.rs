@@ -315,18 +315,39 @@ impl From<common::HardlinkError> for Error {
 
 impl From<rcache::Error<common::fetchers::AnyRespError>> for Error {
     fn from(value: rcache::Error<common::fetchers::AnyRespError>) -> Self {
-        // The two arms are NOT interchangeable, though they look it:
-        // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
-        // Debug-formats itself — so the fallback arm renders a `Config` as
-        // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
-        // variant name and escaped quotes included. Destructuring `Config` and
-        // formatting the inner `msg` is what yields the clean, user-facing
-        // message; collapsing this to one arm reintroduces the panic-era output
-        // it replaced.
-        match value {
-            rcache::Error::Config(msg) => Self::Other(anyhow::anyhow!("{msg}")),
-            other => Self::Other(anyhow::anyhow!("{other}")),
-        }
+        Self::Other(rcache_cause(value))
+    }
+}
+
+/// Renders an `rcache::Error` as a user-facing cause.
+fn rcache_cause(value: rcache::Error<common::fetchers::AnyRespError>) -> anyhow::Error {
+    // The two arms are NOT interchangeable, though they look it:
+    // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
+    // Debug-formats itself — so the fallback arm renders a `Config` as
+    // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
+    // variant name and escaped quotes included. Destructuring `Config` and
+    // formatting the inner `msg` is what yields the clean, user-facing
+    // message; collapsing this to one arm reintroduces the panic-era output
+    // it replaced.
+    match value {
+        rcache::Error::Config(msg) => anyhow::anyhow!("{msg}"),
+        other => anyhow::anyhow!("{other}"),
+    }
+}
+
+/// The error for a failed remote artifact cache setup: the rcache cause under
+/// a fixed context line, with `hint` in parentheses when the caller's user
+/// has a switch to name. Render it with `{:#}` to keep the cause.
+pub fn remote_cache_setup_error(
+    e: rcache::Error<common::fetchers::AnyRespError>,
+    hint: Option<&str>,
+) -> anyhow::Error {
+    let cause = rcache_cause(e);
+    match hint {
+        Some(hint) => cause.context(format!(
+            "failed to set up the remote artifact cache ({hint})"
+        )),
+        None => cause.context("failed to set up the remote artifact cache"),
     }
 }
 
@@ -343,6 +364,31 @@ mod tests {
         assert_eq!(
             Error::MFile(mfile::Error::NotFound).to_string(),
             "minimal.toml: not found",
+        );
+    }
+
+    /// A remote cache setup failure keeps its cause under `{:#}`, rendered
+    /// from rcache's `Config` message rather than its Debug form.
+    #[test]
+    fn remote_cache_setup_error_keeps_clean_cause() {
+        let err = remote_cache_setup_error(rcache::Error::Config("bad url".into()), None);
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to set up the remote artifact cache: bad url",
+        );
+    }
+
+    /// The caller's hint lands in parentheses on the context line.
+    #[test]
+    fn remote_cache_setup_error_carries_hint() {
+        let err = remote_cache_setup_error(
+            rcache::Error::Config("bad url".into()),
+            Some("pass --no-fetch to build without it"),
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to set up the remote artifact cache \
+             (pass --no-fetch to build without it): bad url",
         );
     }
 }

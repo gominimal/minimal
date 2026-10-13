@@ -8,11 +8,13 @@
 use async_dialog::Selection;
 use russh::Channel;
 use russh::server::Msg;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
@@ -28,6 +30,10 @@ use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
 use sessions::NetworkMode;
 use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
+// The one per-box egress enforcement type (NET-079): shared with the session
+// record that carries a box's own launch outcome, so a launch's decision and
+// the record it lands on are one type with no conversion between them.
+use minimald_rpc::HostIpEnforcement;
 use std::sync::Arc;
 
 mod pty;
@@ -51,6 +57,105 @@ const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(5
 /// changed since activation. Exposed for the same test-await purpose as
 /// [`SHELL_EXIT_PROMPT`].
 pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
+
+/// The shell-exit prompt's Keep item.
+pub(crate) const SHELL_EXIT_KEEP: &str =
+    "Exit, leaving the session filesystem in place and recoverable";
+
+/// The Keep item for a registered box, whose host-side row ends with its
+/// shell (NET-138): the client resumes the row before its next attach or
+/// exec, so the kept session comes back under the same addresses.
+pub(crate) const SHELL_EXIT_KEEP_REGISTERED: &str = "Exit, keeping the session's files. Its \
+     network registration ends with the shell and is restored when you attach or exec into \
+     the session again.";
+
+/// Header of the dialog a runtime port-publish request decided `ask` renders
+/// over the channel (NET-045), asking the attached human whether the box may
+/// publish the port. Exposed so tests can await its appearance in the
+/// channel output before answering, for the same purpose as
+/// [`SHELL_EXIT_PROMPT`]. The lead-in line above it names the box and the
+/// port.
+pub(crate) const ASK_PROMPT: &str = "Allow the publish to the host?";
+
+/// How much session output one ask dialog (NET-045) parks on the binding's
+/// behalf while the human thinks. The dialog runs beside a drain of the
+/// binding's mailbox rather than on top of it — a dialog that let the mailbox
+/// fill would wedge the pty feed behind it (see [`Binding::run`]) — but a
+/// drain is still a park, so it has a bound. Past it the mailbox fills as it
+/// does for any client that stopped keeping up, and the host's stall bound
+/// ([`OUTPUT_STALL_TIMEOUT`]) — not this park — decides what happens to the
+/// binding. This side has no byte park of its own to compare against; the
+/// size is a memory bound chosen so that a dialog with a slow human survives
+/// anything a session realistically prints while one is up, without letting a
+/// chatty box hold an unbounded buffer hostage to an answer.
+const ASK_HELD_OUTPUT: usize = 4 * 1024 * 1024;
+
+/// What the attached human answered to the ask dialog (NET-045): the box's
+/// `dynamic_ingress` is `ask`, so the request belongs to whoever is bound to
+/// this host's channel.
+///
+/// Every answer short of an explicit allow is
+/// [`Refused`](Self::Refused) — a picked deny, or a keyed cancel: an ask
+/// never publishes unconfirmed. A client that went away mid-prompt is not an
+/// answer at all: the dialog ends carrying no `AskAnswer`, and the `None`
+/// around it is the daemon's fail-closed refusal, not the human's, and the
+/// audit says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskAnswer {
+    /// The human picked allow: the request proceeds to the publish it came
+    /// for.
+    Allowed,
+    /// The human picked deny or keyed a cancel: the request fails closed.
+    Refused,
+}
+
+/// The ask dialog's input, wrapped so [`Binding::ask_prompt`] can tell an
+/// input EOF from a keyed cancel: `Selection::Cancelled` reports both, and
+/// the two mean different deciders. A keyed cancel — Ctrl-C, `q`, Escape —
+/// is the human's own deny, and stays one. An input EOF is the client's
+/// channel or connection going away with the dialog standing — under a raw
+/// `ssh -tt` tty no keystroke produces it — so it is a terminal that can no
+/// longer carry the dialog, an un-asked ask rather than an answered one. The
+/// wrapper changes nothing about the bytes and records only that: the dialog
+/// reads through it as through the bare channel, and the asking code consults
+/// the flag once the dialog has ended.
+struct AskDialogInput<R> {
+    inner: R,
+    eof: bool,
+}
+
+impl<R> AskDialogInput<R> {
+    /// Wraps the dialog's reader.
+    fn new(inner: R) -> Self {
+        Self { inner, eof: false }
+    }
+
+    /// Whether the wrapped input reached EOF.
+    fn input_eof(&self) -> bool {
+        self.eof
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AskDialogInput<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            // A ready read that moved nothing forward is the reader's EOF —
+            // the `AsyncRead` contract allows a zero only at the end — which
+            // is the one thing this wrapper exists to remember.
+            Poll::Ready(Ok(())) if buf.filled().len() == filled => {
+                this.eof = true;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
 
 /// How many changed-file rows the shell-exit prompt lists before folding the
 /// rest into an "and N more" line, keeping the prompt readable on a 24-row
@@ -162,8 +267,70 @@ fn log_session_contents(
     }
 }
 
+/// Why the binding's mainloop ended. Declared at module scope because the
+/// loop's head — the ask dialog (NET-045) — can end it too: a teardown that
+/// arrives mid-dialog renders through [`Binding::render_farewell`], which
+/// names the exit it ends in.
+#[derive(Debug, PartialEq, Eq)]
+enum MainloopExitReason {
+    /// The host is gone: no session left to relay for.
+    HostGone,
+    /// The client detached.
+    Detach,
+    /// Another connection attached, superseding this one.
+    Superceded,
+    /// The session process ended; the shell-exit prompt was raised.
+    ProcessExited,
+    /// The daemon is shutting down.
+    Shutdown,
+    /// The host shed this binding: its mailbox stopped taking session output
+    /// within [`OUTPUT_STALL_TIMEOUT`].
+    Shed,
+}
+
+impl MainloopExitReason {
+    /// The exit status the binding reports to its client, which `min session
+    /// attach` exits with. An end the user chose — a detach, or the session
+    /// process exiting — is 0. An end the daemon imposed is not, so a script
+    /// can tell the two apart.
+    fn exit_status(&self) -> u32 {
+        match self {
+            Self::Detach | Self::ProcessExited => 0,
+            Self::HostGone | Self::Superceded | Self::Shutdown => DAEMON_ENDED_EXIT_STATUS,
+            Self::Shed => SHED_EXIT_STATUS,
+        }
+    }
+}
+
+/// What a binding told to end itself renders, and the mainloop exit it ends
+/// in — the one rendering the four [`BindingMsg`] teardown variants share,
+/// written once so the mainloop's own arm and the ask dialog a teardown
+/// interrupts (NET-045) say the same farewell whichever side of a dialog the
+/// message lands on.
+enum Farewell {
+    /// The session process ended; the shell-exit prompt follows.
+    ProcessExit {
+        cause: TeardownCause,
+        unwind_codes: Vec<u8>,
+    },
+    /// Another connection attached; this one stands down.
+    Superceded(Vec<u8>),
+    /// The daemon is shutting down.
+    DaemonShutdown(Vec<u8>),
+    /// The client detached.
+    Detach(Vec<u8>),
+}
+
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// Ask the attached human whether the box may publish `port` at runtime
+    /// (NET-045): the box's `dynamic_ingress` is `ask`, so this binding
+    /// renders the exit prompt's dialog on the bound client and replies with
+    /// the answer it brought. See [`Binding::ask_prompt`].
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<AskAnswer>,
+    },
     /// The session was renamed while this binding is attached, so the archive
     /// the shell-exit prompt's save-then-delete lane writes carries the new
     /// name rather than the one cloned in at [`Binding::spawn`].
@@ -363,6 +530,10 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// Whether the box is registered (see [`HostParams::holds_host_row`]):
+    /// the shell-exit prompt's Keep item says the session cannot be
+    /// attached to again.
+    holds_host_row: bool,
     /// Cancelled by the host when it sheds this binding (see
     /// [`Host::shed_binding`]). A separate signal rather than a
     /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
@@ -388,6 +559,18 @@ const SHED_NOTICE: &[u8] =
 /// unwind codes followed it.
 const SHED_EXIT_STATUS: u32 = 255;
 
+/// The exit status of an attach the daemon ended: the session was destroyed
+/// (or otherwise went away), another connection took it over, or the daemon
+/// is shutting down. Non-zero so a script does not read it as a detach, and
+/// not ssh's 255, because the daemon still spoke for itself: these ends send
+/// their own unwind codes or none are owed, so the client's blind unwind (see
+/// [`SHED_EXIT_STATUS`]) stays off.
+const DAEMON_ENDED_EXIT_STATUS: u32 = 254;
+
+/// The line a binding whose host went away leaves on the terminal: the
+/// session is gone, so there is no farewell from the host to render.
+const HOST_GONE_NOTICE: &[u8] = b"\r\nDisconnecting - the session is gone\r\n";
+
 /// Hands a departing binding its teardown message and waits for it to
 /// finish, so its farewell lands before whatever comes next.
 ///
@@ -412,6 +595,10 @@ async fn retire_binding((tx, mut task, shed): BindingSlot, msg: BindingMsg) {
 impl Binding {
     /// Spawns a new binding task for a given channel, returning objects
     /// which the owning [`Host`] should own to communicate with it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site, which hands over the host's per-binding facts by name"
+    )]
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
@@ -420,6 +607,7 @@ impl Binding {
         delta: Option<Arc<DeltaSource>>,
         name: String,
         archives_dir: std::path::PathBuf,
+        holds_host_row: bool,
     ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
         let shed = CancellationToken::new();
@@ -433,6 +621,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            holds_host_row,
             shed: shed.clone(),
         };
 
@@ -473,20 +662,187 @@ impl Binding {
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
-        #[derive(Debug, PartialEq, Eq)]
-        enum MainloopExitReason {
-            HostGone,
-            Detach,
-            Superceded,
-            ProcessExited,
-            Shutdown,
-            Shed,
-        }
-
         // Reading from the remote stops once it sends EOF;
         // the loop lives on to keep forwarding stdout.
         let mut remote_open = true;
+        // The asks whose dialogs this loop's head renders one at a time
+        // (NET-045), stashed by the select arm below because a dialog needs
+        // the channel halves the select's own futures are borrowing.
+        let mut pending_asks: VecDeque<(u16, oneshot::Sender<AskAnswer>)> = VecDeque::new();
         let exit_reason = loop {
+            if let Some((port, reply)) = pending_asks.pop_front() {
+                tracing::info!(
+                    port,
+                    "asking the attached client to allow a runtime port publish"
+                );
+                // The lead-in names the box as it stood when the dialog
+                // started: a rename that lands mid-dialog takes effect for
+                // what follows it, not for a line already on the screen.
+                let dialog_name = self.name.clone();
+                // The session output that arrives while the human thinks,
+                // parked — see the drain below — and flushed once the
+                // terminal is the relay's again.
+                let mut held: Vec<u8> = Vec::new();
+                // A teardown cannot wait for a human: the one that arrived
+                // mid-dialog is taken aside here and rendered, through
+                // [`Self::render_farewell`], once the ask it interrupted is
+                // answered.
+                let mut farewell: Option<Farewell> = None;
+                // No answer until a human gives one. A dialog that ends
+                // without the human's choice — the shed below, a teardown,
+                // the host going away, a terminal that could not carry the
+                // dialog — is the daemon's refusal, not the human's: the
+                // reply sender drops unsent, the host reads no answer, and
+                // `resume_ask` records the daemon as the decider with the
+                // typed nobody-is-attached refusal. Only a dialog that
+                // completed with a choice in hand is the human's answer.
+                let mut answer: Option<AskAnswer> = None;
+                // Whether the dialog's last write was cut short, presumed
+                // yes until the arm that ran the dialog to completion says
+                // otherwise: every other way out of the select below drops
+                // the dialog future wherever it stood, mid-write included.
+                // That matters because russh's channel writer keeps an
+                // interrupted write's state — `ChannelTx` parks its send in
+                // `send_fut` and answers the next `write_all` with the
+                // *interrupted* write's byte count, a count that can run
+                // past a shorter buffer's end and panics tokio's
+                // `write_all` there (`split_at`: mid > len). The shed
+                // notice and every farewell are shorter buffers, so the
+                // binding would die mid-epilogue and leave the client
+                // hanging on a channel that never closes. The state is
+                // per-writer, so the writer is replaced rather than
+                // trusted: see the refresh below.
+                let mut interrupted_write = true;
+                {
+                    // Pinned outside the loop below, not rebuilt inside it: a
+                    // select arm's future is re-created on every iteration
+                    // the loop takes, and a dialog re-created per parked
+                    // chunk would re-render from scratch under the human's
+                    // hands — lead-in and all — for every burst the drain
+                    // took.
+                    let dialog = Self::ask_prompt(&dialog_name, port, rs.make_reader(), &mut w);
+                    tokio::pin!(dialog);
+                    loop {
+                        tokio::select! {
+                            // Raced against the shed: a client that stopped
+                            // reading is not a client to wait on, and the
+                            // host has already discarded this binding — so
+                            // the ask fails closed here and the next
+                            // iteration's shed arm closes the channel.
+                            answered = &mut dialog => {
+                                answer = answered;
+                                // The dialog ran to completion: its writes
+                                // all drained, so the writer beneath it is
+                                // clean.
+                                interrupted_write = false;
+                                break;
+                            }
+                            () = self.shed.cancelled() => break,
+                            // The drain beside the dialog. The host keeps
+                            // feeding the pty into this binding's mailbox,
+                            // and stops reading the pty while the mailbox is
+                            // full — so a dialog that let the mailbox fill
+                            // would wedge the box behind it and shed the
+                            // human after [`OUTPUT_STALL_TIMEOUT`], the one
+                            // client the dialog exists for. Instead the
+                            // output parks in `held`, bounded by
+                            // [`ASK_HELD_OUTPUT`]: past it the mailbox fills
+                            // as it does for any client that stopped keeping
+                            // up, and the stall bound — not an unbounded
+                            // park — decides what happens to this binding.
+                            msg = self.receiver.recv(), if held.len() < ASK_HELD_OUTPUT => {
+                                match msg {
+                                    Some(BindingMsg::Stdin(b)) => held.extend_from_slice(&b),
+                                    Some(BindingMsg::Rename(name)) => self.name = name,
+                                    Some(BindingMsg::AskExpose { port, reply }) => {
+                                        pending_asks.push_back((port, reply));
+                                    }
+                                    Some(BindingMsg::TeardownDueToProcessExit { cause, unwind_codes }) => {
+                                        farewell = Some(Farewell::ProcessExit { cause, unwind_codes });
+                                        break;
+                                    }
+                                    Some(BindingMsg::TeardownDueToSuperceded(unwind_codes)) => {
+                                        farewell = Some(Farewell::Superceded(unwind_codes));
+                                        break;
+                                    }
+                                    Some(BindingMsg::TeardownDueToDaemonShutdown(unwind_codes)) => {
+                                        farewell = Some(Farewell::DaemonShutdown(unwind_codes));
+                                        break;
+                                    }
+                                    Some(BindingMsg::TeardownDueToDetach(unwind_codes)) => {
+                                        farewell = Some(Farewell::Detach(unwind_codes));
+                                        break;
+                                    }
+                                    // The host is gone: no session left to
+                                    // publish for, and nobody to answer for.
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                if interrupted_write {
+                    // A fresh writer from the same channel half, because the
+                    // interrupted one may still hold a write the select
+                    // dropped mid-send. Its cost is that chunk alone: it goes
+                    // unsent with its window space, at most
+                    // `max_packet_size` bytes, and only ever on a client that
+                    // stopped reading.
+                    w = ws.make_writer();
+                }
+                // The output that arrived while the human thought, delivered
+                // now the terminal is the relay's again — raced against the
+                // shed like every other write, so a client that stopped
+                // reading cannot park the binding in its own flush.
+                if !held.is_empty() {
+                    let flushed = tokio::select! {
+                        _ = w.write_all(&held) => true,
+                        () = self.shed.cancelled() => false,
+                    };
+                    if !flushed {
+                        // The flush may have been dropped mid-send, and the
+                        // shed notice is the shorter buffer that would trip
+                        // the interrupted write's stale byte count: a fresh
+                        // writer, then the shed exit.
+                        w = ws.make_writer();
+                        // The shed ends the dialog without the human's
+                        // answer unless the dialog had already completed
+                        // under them: send the answer if there is one,
+                        // and none otherwise — the dropped sender is what
+                        // the host reads as the nobody-attached case.
+                        if let Some(answer) = answer {
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "the asker may be gone; its reply's fate was always its own"
+                            )]
+                            let _ = reply.send(answer);
+                        }
+                        break MainloopExitReason::Shed;
+                    }
+                }
+                // The asker going away before the answer is not an error to
+                // relay: the reply's fate was always the asker's. A dialog
+                // that ended without one — a teardown that could not wait
+                // for a human, a host already gone, a terminal that could
+                // not carry the dialog — drops the sender instead, which is
+                // the nobody-attached answer the host turns into the
+                // daemon's own fail-closed refusal.
+                if let Some(answer) = answer {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the asker may be gone; its reply's fate was always its own"
+                    )]
+                    let _ = reply.send(answer);
+                }
+                if let Some(farewell) = farewell {
+                    break Self::render_farewell(farewell, &mut w).await;
+                }
+                // The dialog's drain may have taken another ask while this
+                // one stood, and nothing more arrives to wake the select
+                // below — so the next dialog renders off this turn, not off
+                // a message that is already spent.
+                continue;
+            }
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
@@ -553,57 +909,44 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             // Raced against the shed: this is where a client
                             // that stopped draining parks the binding.
-                            tokio::select! {
-                                _ = w.write_all(&b) => {},
-                                () = self.shed.cancelled() => break MainloopExitReason::Shed,
+                            let delivered = tokio::select! {
+                                _ = w.write_all(&b) => true,
+                                () = self.shed.cancelled() => false,
+                            };
+                            if !delivered {
+                                // Dropped mid-send like the dialog and the
+                                // held flush: a fresh writer, so the shed
+                                // notice is not answered with the
+                                // interrupted write's byte count.
+                                w = ws.make_writer();
+                                break MainloopExitReason::Shed;
                             }
+                        },
+                        BindingMsg::AskExpose { port, reply } => {
+                            // Stashed rather than rendered here: the select's
+                            // own arms borrow the channel halves (`rs.wait()`
+                            // among them), and the dialog needs both — so the
+                            // ask suspends the relay for the next iteration's
+                            // head, where no arm's future is alive. One at a
+                            // time, front to back: a second ask queues behind
+                            // the first and takes its turn.
+                            pending_asks.push_back((port, reply));
                         },
                         BindingMsg::Rename(name) => self.name = name,
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
-                            // Before the notices below and before the
-                            // shell-exit prompt further down: both render into
-                            // the terminal the session process just left, and
-                            // it may well have left mouse reporting on (#1210).
-                            let _ = w.write_all(&unwind_codes).await;
-                            // `shown` records whether the user was told
-                            // anything beyond the prompt itself: a suppressed
-                            // notice leaves no other trace, and the expected
-                            // case is deliberately silent.
-                            let notices = cause.notices();
-                            let errno = cause.pty_err.as_ref().and_then(std::io::Error::raw_os_error);
-                            tracing::info!(
-                                cause = if cause.pty_err.is_some() { "pty-error" } else { "process-reaped" },
-                                ?errno,
-                                abnormal = cause.exit.as_ref().is_some_and(ExitReason::is_abnormal),
-                                exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
-                                exit_code = ?cause.exit.as_ref().map(|r| r.code),
-                                shown = !notices.is_empty(),
-                                "raising the shell-exit prompt",
-                            );
-                            // `\r\n`: the remote terminal is in raw mode, so a
-                            // bare newline stair-steps off the right margin.
-                            if !notices.is_empty() {
-                                let _ = w.write_all(b"\r\n").await;
-                                for notice in &notices {
-                                    let _ = w.write_all(format!("{notice}\r\n").as_bytes()).await;
-                                }
-                            }
-                            break MainloopExitReason::ProcessExited;
+                            break Self::render_farewell(
+                                Farewell::ProcessExit { cause, unwind_codes },
+                                &mut w,
+                            ).await;
                         }
                         BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
-                            let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
-                            break MainloopExitReason::Superceded;
+                            break Self::render_farewell(Farewell::Superceded(unwind_codes), &mut w).await;
                         }
                         BindingMsg::TeardownDueToDaemonShutdown(unwind_codes) => {
-                            let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDisconnecting - minimald is shutting down\r\n").await;
-                            break MainloopExitReason::Shutdown;
+                            break Self::render_farewell(Farewell::DaemonShutdown(unwind_codes), &mut w).await;
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
-                            let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
-                            break MainloopExitReason::Detach;
+                            break Self::render_farewell(Farewell::Detach(unwind_codes), &mut w).await;
                         }
                     };
 
@@ -625,6 +968,7 @@ impl Binding {
                     self.control.as_ref(),
                     &self.archives_dir,
                     &self.name,
+                    self.holds_host_row,
                     rs.make_reader(),
                     &mut w,
                 )
@@ -668,20 +1012,26 @@ impl Binding {
             control.detached().await;
         }
 
-        let shed = exit_reason == MainloopExitReason::Shed;
-        if shed {
-            // Bounded: the client stopped draining, so this write can park
-            // exactly as the one that got the binding shed. The notice is
-            // lost then, but the close below still goes out.
+        let notice = match exit_reason {
+            MainloopExitReason::Shed => Some(SHED_NOTICE),
+            MainloopExitReason::HostGone => Some(HOST_GONE_NOTICE),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            // Bounded: after a shed the client stopped draining, so this
+            // write can park exactly as the one that got the binding shed.
+            // The notice is lost then, but the close below still goes out.
+            // The writer is a fresh one whenever a write was cut short
+            // mid-send — the mainloop replaces it at every race it drops,
+            // because russh's channel writer otherwise answers this short
+            // buffer with the interrupted write's byte count and tokio's
+            // `write_all` panics past its end.
             let _ =
-                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(SHED_NOTICE))
-                    .await;
+                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(notice)).await;
         }
 
         let _ = ws.eof().await;
-        let _ = ws
-            .exit_status(if shed { SHED_EXIT_STATUS } else { 0 })
-            .await;
+        let _ = ws.exit_status(exit_reason.exit_status()).await;
         let _ = ws.close().await; // needed to release the remote
     }
 
@@ -720,6 +1070,138 @@ impl Binding {
         delta.archive_changed(files, dest.to_path_buf()).await
     }
 
+    /// Renders a farewell — the unwind codes first, then whatever it has to
+    /// say — and names the mainloop exit it ends in. The one rendering shared
+    /// by the mainloop's four teardown arms and by the ask dialog
+    /// (NET-045) a teardown interrupts, so the client sees the same farewell
+    /// whichever side of a dialog the message lands on. An associated fn
+    /// taking the writer piecewise, exactly like [`Self::ask_prompt`], because
+    /// [`Self::run`] holds the channel halves as locals.
+    async fn render_farewell<W>(farewell: Farewell, w: &mut W) -> MainloopExitReason
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        match farewell {
+            Farewell::ProcessExit {
+                cause,
+                unwind_codes,
+            } => {
+                // Before the notices below and before the shell-exit prompt
+                // that follows the mainloop: both render into the terminal
+                // the session process just left, and it may well have left
+                // mouse reporting on (#1210).
+                let _ = w.write_all(&unwind_codes).await;
+                // `shown` records whether the user was told anything beyond
+                // the prompt itself: a suppressed notice leaves no other
+                // trace, and the expected case is deliberately silent.
+                let notices = cause.notices();
+                let errno = cause
+                    .pty_err
+                    .as_ref()
+                    .and_then(std::io::Error::raw_os_error);
+                tracing::info!(
+                    cause = if cause.pty_err.is_some() { "pty-error" } else { "process-reaped" },
+                    ?errno,
+                    abnormal = cause.exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                    exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
+                    exit_code = ?cause.exit.as_ref().map(|r| r.code),
+                    shown = !notices.is_empty(),
+                    "raising the shell-exit prompt",
+                );
+                // `\r\n`: the remote terminal is in raw mode, so a bare
+                // newline stair-steps off the right margin.
+                if !notices.is_empty() {
+                    let _ = w.write_all(b"\r\n").await;
+                    for notice in &notices {
+                        let _ = w.write_all(format!("{notice}\r\n").as_bytes()).await;
+                    }
+                }
+                MainloopExitReason::ProcessExited
+            }
+            Farewell::Superceded(unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                let _ = w
+                    .write_all(
+                        b"\r\nDisconnecting - session attached to from a different connection\r\n",
+                    )
+                    .await;
+                MainloopExitReason::Superceded
+            }
+            Farewell::DaemonShutdown(unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                let _ = w
+                    .write_all(b"\r\nDisconnecting - minimald is shutting down\r\n")
+                    .await;
+                MainloopExitReason::Shutdown
+            }
+            Farewell::Detach(unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
+                MainloopExitReason::Detach
+            }
+        }
+    }
+
+    /// The ask a runtime port-publish request decided `ask` renders to the
+    /// attached human (NET-045): the exit prompt's own dialog, over the same
+    /// channel halves, offering deny first so that a reflexive Enter — or any
+    /// way the dialog can end without an explicit choice — fails the request
+    /// closed. Answers with the answer the human gave; `None` when the
+    /// dialog could not be carried — a render or read that failed on I/O, or
+    /// an input EOF, the client's channel going away with the dialog
+    /// standing — which is no answer rather than a deny, so the daemon owns
+    /// the refusal it becomes. An associated fn taking the facts piecewise,
+    /// exactly like [`Self::shell_exit_prompt`], because [`Self::run`]
+    /// holds the channel halves as locals.
+    async fn ask_prompt<R, W>(name: &str, port: u16, r: R, mut w: W) -> Option<AskAnswer>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // `\r\n`: the remote terminal is in raw mode, so a bare newline
+        // stair-steps off the right margin.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a client that cannot take the lead-in line cannot take the dialog either; \
+                      the dialog's own result is the answer to relay"
+        )]
+        // The same frame the VM-backed host's dialog draws
+        // (`minimal_client::ask_dialog`): the protocol on the lead-in — a
+        // runtime publish is TCP — and the `? ` the question leads with.
+        let _ = w
+            .write_all(format!("\r\n{name} asks to publish port {port}/tcp.\r\n").as_bytes())
+            .await;
+        let select = async_dialog::Select::new()
+            .with_prompt(format!("? {ASK_PROMPT}"))
+            .items(["Deny", "Allow"])
+            // Deny stands highlighted: the answer the box's own posture
+            // would have given, so nothing publishes because someone held
+            // Enter.
+            .default(0);
+        // The dialog reads through the EOF-telling wrapper, because
+        // `Selection::Cancelled` says both a keyed cancel and an input EOF,
+        // and the two mean different deciders.
+        let mut r = AskDialogInput::new(r);
+        let outcome = select.interact(&mut r, &mut w).await;
+        match outcome {
+            Ok(async_dialog::Selection::At(1)) => Some(AskAnswer::Allowed),
+            // An explicit deny — Enter on the highlighted deny — or a keyed
+            // cancel (Ctrl-C, `q`, Escape): the human's own deny — the
+            // fail-closed answer, now in their hand, of an ask that never
+            // publishes unconfirmed.
+            Ok(_) if !r.input_eof() => Some(AskAnswer::Refused),
+            // An input EOF is not any of that: under a raw `ssh -tt` tty no
+            // keystroke produces channel EOF, so it means the connection
+            // or the client went away with the dialog standing — a terminal
+            // that can no longer carry it. That, like a render or read that
+            // failed on I/O (the other way this arm is reached), is the
+            // daemon's refusal, not the human's deny, so it comes back as
+            // no answer: the dropped reply makes `resume_ask` record the
+            // daemon as the decider.
+            _ => None,
+        }
+    }
+
     /// The shell-exit prompt, run after the session process ends: leads with
     /// the files changed since activation (when `delta` is available), then
     /// offers keep / save-then-delete / delete and drives the chosen
@@ -733,6 +1215,7 @@ impl Binding {
         control: Option<&SessionControl>,
         archives_dir: &std::path::Path,
         name: &str,
+        holds_host_row: bool,
         mut r: R,
         mut w: W,
     ) -> ExitDisposition
@@ -789,8 +1272,15 @@ impl Binding {
             Delete,
         }
 
-        let mut items =
-            vec!["Exit, leaving the session filesystem in place and recoverable".to_string()];
+        // A registered box's host-side row ends with its shell (NET-138); the
+        // client resumes it before the next attach or exec, so the Keep item
+        // says the registration comes back rather than that nothing does.
+        let keep_item = if holds_host_row {
+            SHELL_EXIT_KEEP_REGISTERED
+        } else {
+            SHELL_EXIT_KEEP
+        };
+        let mut items = vec![keep_item.to_string()];
         let mut choices = vec![ExitChoice::Keep];
         // Destination for the save-then-delete lane, fixed while the prompt
         // is up so the rendered path is the path written — including across
@@ -1140,6 +1630,21 @@ pub(crate) struct Launched<P, G> {
     /// box. Carried to the host's attributes so a session can say which it
     /// runs under — the launch's own decision, not a re-derivation.
     host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The listen plan the launch gathered for the box it launched: the
+    /// lease, the published address, the switch control channel, the gate
+    /// and the publication set its watcher publishes through. `None` when
+    /// the launch could build no plan — no lease, no published address or no
+    /// live gate — and a mock launch that builds none starts no watcher at
+    /// all. The plan rides here rather than a table between the two, so it
+    /// is this launch's own from the moment it is built: it never survives
+    /// to a spawn that did not gather it.
+    listen_plan: Option<crate::net::listeners::ListenPlan>,
+    /// The gate holding the launched shell before it execs, on a launch
+    /// minted only for lifecycle hooks (see [`SandboxLauncher::for_hooks`]):
+    /// the box exists for the hooks to run in, while the shell — whose
+    /// startup files are the user's — waits for the first attach. `None` on
+    /// every other launch, whose shell starts at once.
+    start_gate: Option<sandbox2::StartGate>,
 }
 
 /// Actor messages to a [`Host`].
@@ -1177,9 +1682,36 @@ enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Ask the attached human whether the box may publish `port` at runtime
+    /// (NET-045): the box's `dynamic_ingress` is `ask`, so the bound client
+    /// decides. Answered with the answer the human gave, or `None` when
+    /// nobody is attached — a box outlives its client, and an unanswered ask
+    /// is a refusal, never a publish.
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<Option<AskAnswer>>,
+    },
+
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
+    /// Test-only: shorten this host's stall bound ([`OUTPUT_STALL_TIMEOUT`])
+    /// so a test can prove in milliseconds what the real bound would take the
+    /// full 30 s to decide. The bound lives on the host, not the binding, so
+    /// a test whose host was built inside a session reaches it through its
+    /// [`HostHandle`].
+    #[cfg(test)]
+    SetOutputStallTimeout(std::time::Duration),
+    /// Test-only: feed bytes into the session's pty as though a client had
+    /// typed them, but without going through the ssh channel — which is the
+    /// point: an ask dialog holds the channel's reader, so a test that needs
+    /// the session to print *while a dialog is up* has no keystroke to do it
+    /// with. The bytes queue straight into the pty's write buffer (see
+    /// [`queue_stdin`]); queued writes, never awaited ones, so the actor's
+    /// loop stays free to keep serving — exactly what a test relying on the
+    /// stall bound needs it to keep doing.
+    #[cfg(test)]
+    FeedStdin(Vec<u8>),
 }
 
 /// Renders a vt100 cell color into the string form the
@@ -1550,6 +2082,59 @@ impl HostHandle {
         recv.await
             .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
     }
+
+    /// Asks the attached human whether the box may publish `port` at runtime
+    /// (NET-045), and answers with what they said: the bound client renders
+    /// the exit prompt's own dialog and picks. `None` when nobody is
+    /// attached — no binding, a binding that cannot take the ask, or a host
+    /// that went away before answering — which is the caller's fail-closed
+    /// case, not an error to report: the typed refusal the request ends with
+    /// says nobody is attached to answer.
+    ///
+    /// Unbounded by design: the human's answer is the only bound an ask has,
+    /// so callers that must not park on it await this off the actor the
+    /// request belongs to (see how [`crate::session`] routes the ask).
+    pub(crate) async fn ask_expose(&self, port: u16) -> Option<AskAnswer> {
+        let (send, recv) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::AskExpose { port, reply: send })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        // A dropped answer means the host tore its binding down mid-prompt:
+        // nobody is attached to answer any more.
+        recv.await.ok().flatten()
+    }
+
+    /// Test-only: shorten this host's stall bound so a test can prove in
+    /// milliseconds what [`OUTPUT_STALL_TIMEOUT`] would otherwise take the
+    /// full 30 s to decide.
+    #[cfg(test)]
+    pub(crate) async fn set_output_stall_timeout(&self, timeout: std::time::Duration) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the host may already be gone; the test's own bound then decides"
+        )]
+        let _ = self
+            .sender
+            .send(Message::SetOutputStallTimeout(timeout))
+            .await;
+    }
+
+    /// Test-only: feed bytes into the session's pty as though a client had
+    /// typed them, without going through the ssh channel — so a test can have
+    /// the session print while an ask dialog holds the channel's reader.
+    #[cfg(test)]
+    pub(crate) async fn feed_stdin(&self, bytes: Vec<u8>) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the host may already be gone; the test's own bounds then decide"
+        )]
+        let _ = self.sender.send(Message::FeedStdin(bytes)).await;
+    }
 }
 
 /// Various attributes about the running terminal.
@@ -1569,67 +2154,55 @@ pub struct HostAttrs {
     /// When the last byte was sent to the process from a binding.
     pub(crate) stdin_last: Option<SystemTime>,
 
-    /// What the launch decided about this session's box and the host's
-    /// address (NET-079, design §7.2's "declared and enforced" attribute):
-    /// `Enforced` when the box's egress verdict is decided on a classifier
-    /// leaf of its own, `Unenforced` when the host could not decide per box
-    /// and the box runs with the host's address and no verdict of its own —
-    /// the state a session-start notice says to the person in the terminal.
-    ///
-    /// A launch-time attribute, set once by the launch and never updated:
-    /// `None` for a none box or an own-IP box, whose verdicts are decided on
-    /// address leases rather than the host's cgroup tree.
+    /// The launch's own placement outcome for this session's host-address
+    /// box (NET-079, design §7.2's "declared and enforced" attribute):
+    /// `PerBox` when the launch placed the box in a classifier leaf of its
+    /// own, `None` when the box ran with the host's address and no leaf —
+    /// the value the session records on the box's record, which the read
+    /// surfaces then show lowered by the host's current fact
+    /// ([`displayed_host_ip_enforcement`]), never the node fact re-read at
+    /// launch. Nothing for a none box or an own-IP box, whose verdicts are
+    /// decided on address leases rather than the host's cgroup tree.
     pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
 }
 
-/// What a host-address box's launch decided about its egress verdict
-/// (NET-079): whether the box is classified in a cgroup leaf of its own, or
-/// runs with the host's address and no verdict of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HostIpEnforcement {
-    /// The box was placed in a classifier leaf; its verdict is decided there.
-    Enforced,
-    /// The host could not decide per box; the box runs unenforced.
-    Unenforced,
-}
-
-impl HostIpEnforcement {
-    /// The spelling the machine-readable surfaces carry for this decision:
-    /// `per_box` when the box's verdict is decided on a classifier leaf of
-    /// its own, `none` when the host could not decide per box and the box
-    /// runs with the host's address and no verdict of its own — the state
-    /// the session-start notice names. The launch's diagnostic record spells
-    /// it with this, so a script or a bundle reads the decision as data and
-    /// not by parsing the prose around it.
-    pub(crate) fn machine_str(self) -> &'static str {
-        match self {
-            Self::Enforced => "per_box",
-            Self::Unenforced => "none",
-        }
-    }
-}
-
-/// What the launch's leaf decision means for the box's egress verdict:
-/// a host-address box with a leaf is enforced — but only while this host
-/// can decide per box at all, the fresh fact the probe read at this
-/// launch: a leaf placed on a host whose table is not loaded decides
-/// nothing while looking decided, so a box in it runs
-/// unenforced and is recorded as such, never reported as enforced over a
-/// refusal that is not there. A host-address box without a leaf runs with
-/// the host's address and no verdict of its own, and any other network
-/// mode has no host address to decide on at all.
+/// What the launch's leaf placement means for the box's egress record: the
+/// placement is the outcome the launch records — `per_box` when this launch
+/// placed this host-address box in a classifier leaf of the host's tree,
+/// `none` when it did not — never the node fact re-read beside it, because
+/// the record is the box's own launch outcome, not the host's state as it
+/// stands now. A leaf placed over a table that is not refusing still carries
+/// the leaf: the reads lower it to the state the host can currently honour
+/// ([`displayed_host_ip_enforcement`]), and when the table comes back the
+/// box is in the leaf its launch placed it in, so the record says so without
+/// a relaunch. A host-address box without a leaf ran with the host's address
+/// and no verdict of its own, and any other network mode has no host address
+/// to decide on at all.
+///
+/// The box's declaration is the placement's other half (NET-079): a leaf
+/// is only an enforcement while the declaration is one the classifier can
+/// enforce, so the record is derived from the placement *plus*
+/// [`classifier::unenforceable_rules`] — never from the placement or the
+/// node fact alone — and a placed box whose declaration names a rule the
+/// loaded table cannot enforce is recorded `none`, the state it ran in, on
+/// whatever host it ran on. That is the shape the launch gate above refuses
+/// when the host decides per box; this derivation is what keeps the record
+/// honest for the one host that cannot decide, where the box still runs and
+/// the record must not promise a verdict its rules never had.
 ///
 /// Pure over its inputs, so the mapping is pinned where it is written.
 fn host_ip_enforcement(
     network_mode: NetworkMode,
     leaf: Option<&sandbox2::config::ClassifierLeaf>,
-    can_decide_per_box: bool,
+    declaration: Option<&sessions::EgressPolicy>,
 ) -> Option<HostIpEnforcement> {
     match network_mode {
-        NetworkMode::HostNet => match (leaf, can_decide_per_box) {
-            (Some(_), true) => Some(HostIpEnforcement::Enforced),
-            _ => Some(HostIpEnforcement::Unenforced),
-        },
+        NetworkMode::HostNet => Some(match leaf {
+            Some(_) if crate::net::classifier::unenforceable_rules(declaration).is_empty() => {
+                HostIpEnforcement::PerBox
+            }
+            _ => HostIpEnforcement::None,
+        }),
         _ => None,
     }
 }
@@ -1701,6 +2274,16 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // net-guard-less tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 
+    /// The box's listen-publication watcher (NET-016, NET-017): publishes
+    /// the ports its processes listen on when the box's ingress rules
+    /// permit them, and withdraws each one whose listener closed. Started
+    /// in `build` from the plan the launch staged, stopped in `mainloop`
+    /// before the network attachment tears down — so every
+    /// runtime-published forward is gone before the switch's tap does.
+    /// `None` for boxes with nothing to publish on (tests, `HostNet`/`NoNet`,
+    /// and any launch that staged no plan).
+    listen_watcher: Option<crate::net::listeners::ListenWatcher>,
+
     /// The session's hostname-registry marker (NET-128): marked running when
     /// this host's `mainloop` starts and stopped when it returns, so a name
     /// the box shares with its node answers NODATA while no host is running.
@@ -1754,6 +2337,10 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     #[cfg_attr(test, allow(dead_code))]
     leaf: Option<sandbox2::config::ClassifierLeaf>,
 
+    /// The launch's start gate, held until the first attach; see
+    /// [`Launched::start_gate`] and [`Self::attach`].
+    start_gate: Option<sandbox2::StartGate>,
+
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
     session_name: String,
@@ -1772,6 +2359,10 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // Daemon-side directory the save-then-delete lane archives into, handed
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
+
+    // Whether the box is registered (see [`HostParams::holds_host_row`]),
+    // handed to each binding for its shell-exit prompt.
+    holds_host_row: bool,
 
     // The per-channel session-key chord matcher: the negotiated leader chord
     // that enters command mode, the detach/forward subcommand keys, the bell
@@ -2358,7 +2949,8 @@ pub(crate) struct SandboxLauncher {
     /// attaches with instead of drawing one, and the published loopback
     /// address the host side names the box by. Ignored by every other
     /// network mode; `None` for a session the activating client did not
-    /// register, which self-allocates as it always has.
+    /// register, which self-allocates on a native host and is refused on a
+    /// VM host, where the in-VM daemon draws nothing (NET-138).
     pub(crate) box_addresses: Option<sessions::BoxAddresses>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
@@ -2399,6 +2991,17 @@ pub(crate) struct SandboxLauncher {
     /// answers, it never fabricates one — no client or box input reaches
     /// it, and production passes `None`.
     pub(crate) classifier_mountinfo: Option<String>,
+    /// The box's runtime publications, built fresh for the spawn this
+    /// launcher is about to run: the one set this launch's listen plan and
+    /// the session actor's runtime expose path both read, so a port the
+    /// one published is never bound by the other (NET-047's never-contend
+    /// half, and the answer `min net expose` gets when the listener
+    /// watcher published its port first).
+    pub(crate) publications: crate::net::listeners::BoxPublications,
+    /// The daemon's state directory, handed to this launch's listen plan:
+    /// its watcher appends each listen it publishes to the audit log under
+    /// it, the one the session's runtime expose path audits in (NET-046).
+    pub(crate) state_dir: std::path::PathBuf,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -2545,6 +3148,336 @@ fn launch_mountinfo(knob: Option<String>) -> Option<String> {
     knob.or_else(sandbox2::classifier::own_mountinfo)
 }
 
+/// The daemon's one node fact about per-box egress enforcement (NET-079):
+/// whether this host can decide a host-address box's egress verdict per box,
+/// and — while it cannot — the cause it cannot. One fact for the whole node,
+/// because nothing it rests on is a session's: the decision reads the host's
+/// own cgroup tree, its mount table, and the loaded table's effect, and the
+/// cause names a state of the host, not of any box on it. The daemon's
+/// start-up read seeds it ([`set_host_ip_enforcement_fact`]'s caller in
+/// `main`) and every host-address launch's [`re_read_classifier_fact`]
+/// refreshes it, because the fact it rests on is the table's *effect*
+/// (design §7.4) — a marker survives whatever emptied the table and the
+/// refusal does not.
+///
+/// Held as a process-global rather than a field on the server's state for
+/// the same reason: the start-up read that seeds it runs before any server
+/// exists. It is the node's half of every surface that shows a session: the
+/// create reply states it outright (no box has launched yet to have its own
+/// outcome), each read surface's refusal gate answers over its cause, and
+/// the listing and the runtime-facts reply lower a box's own launch record
+/// by its state — never raise one to it.
+///
+/// `cause` rides beside the state because the two are one fact: the state a
+/// display shows and the advice the create reply carries both come from the
+/// one decision the probe read — the cause is `None` only while the host
+/// decides — and a fact that held the state alone could not say why.
+#[derive(Clone, Copy)]
+pub(crate) struct HostIpEnforcementFact {
+    /// The state itself, in the enum the listing's entries carry.
+    pub(crate) enforcement: minimald_rpc::HostIpEnforcement,
+    /// Why the host cannot decide per box; `None` while it can, and on a
+    /// fact no read has set yet (the cell's default, below), where the
+    /// cause is as unread as the state.
+    pub(crate) cause: Option<crate::net::classifier::Cause>,
+}
+
+impl HostIpEnforcementFact {
+    /// The fact as a [`classifier::Decision`], for the gate that refuses a
+    /// box over a cause. Lossless in the one direction that matters: a
+    /// `per_box` state is a decided verdict with no cause, and a cause
+    /// carries its own state — while a cause-less `none` state (the cell's
+    /// default, before any read has set it) is not a decision at all, so it
+    /// is `None`: a daemon that has not read its host refuses nothing over
+    /// it, and its displays show the state without claiming a cause.
+    fn decision(&self) -> Option<crate::net::classifier::Decision> {
+        match (self.enforcement, self.cause) {
+            (minimald_rpc::HostIpEnforcement::PerBox, _) => {
+                Some(crate::net::classifier::Decision::decided())
+            }
+            (_, Some(cause)) => Some(crate::net::classifier::Decision::undecidable(cause)),
+            (_, None) => None,
+        }
+    }
+
+    /// Whether the host this fact stands for can decide a host-address
+    /// box's egress verdict per box (NET-079) — the one bit of the node
+    /// fact the create path reads, taking the fact exactly as the create
+    /// response does rather than re-probing the host itself: a create is
+    /// not a place that decides a box, and the launch that follows reads
+    /// the host again for its own gate. A fact no read has set yet — the
+    /// cell's default — answers `false`, so a daemon that has not read its
+    /// host creates what it is handed and leaves the verdicts to its
+    /// launches.
+    pub(crate) fn can_decide_per_box(&self) -> bool {
+        self.enforcement == minimald_rpc::HostIpEnforcement::PerBox
+    }
+}
+
+/// The fact itself: the cell every surface that shows a session reads, in
+/// the state the daemon's start-up read left it — `none`, with no cause, the
+/// state of a daemon that has not read its host yet. Const-initializable,
+/// so the one lock it sits behind is taken only by the reads and writes
+/// that swap or copy a fact two machine words wide.
+static HOST_IP_ENFORCEMENT_FACT: std::sync::Mutex<HostIpEnforcementFact> =
+    std::sync::Mutex::new(HostIpEnforcementFact {
+        enforcement: minimald_rpc::HostIpEnforcement::None,
+        cause: None,
+    });
+
+/// Sets the fact from a decision the classifier read — the one write path
+/// both its writers go through: the daemon's start-up read, which owns the
+/// host before any session exists, and each host-address launch's
+/// [`re_read_classifier_fact`], whose re-read keeps the fact current in the
+/// face of the table's own effect changing under it. `pub` because the
+/// start-up read is the daemon binary's (`main`), which owns the fact before
+/// any of this crate's servers exist.
+pub fn set_host_ip_enforcement_fact(decision: &crate::net::classifier::Decision) {
+    let mut fact = HOST_IP_ENFORCEMENT_FACT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fact.enforcement = if decision.can_decide_per_box() {
+        minimald_rpc::HostIpEnforcement::PerBox
+    } else {
+        minimald_rpc::HostIpEnforcement::None
+    };
+    fact.cause = decision.cause();
+}
+
+/// The fact as it stands, copied out for a surface that shows a session —
+/// the copy is two machine words, so the lock is held for the copy alone and
+/// never across a decision a re-read is making.
+pub(crate) fn host_ip_enforcement_fact() -> HostIpEnforcementFact {
+    *HOST_IP_ENFORCEMENT_FACT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Puts the fact back to its start-up default — no read, no cause — so a
+/// test that set a fact of its own leaves the daemon it shares a process
+/// with as it found it.
+#[cfg(test)]
+pub(crate) fn clear_host_ip_enforcement_fact() {
+    let mut fact = HOST_IP_ENFORCEMENT_FACT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fact.enforcement = minimald_rpc::HostIpEnforcement::None;
+    fact.cause = None;
+}
+
+/// The per-box egress enforcement a session's display surfaces show
+/// (NET-079): the box's own launch record — what the launch that produced
+/// this box decided about it, `per_box` if it placed the box in a classifier
+/// leaf and `none` if it did not — for a host-address box the classifier did
+/// not refuse, and nothing for any other box. An own-address or none box's
+/// verdict is decided on address leases, never on the host's cgroup tree, and
+/// a box the classifier refused at placement has no state to show, because
+/// the refusal is what its launch said.
+///
+/// The record is lowered by the daemon's one node fact, never raised above
+/// either half: a box whose launch placed it shows `per_box` only while
+/// this host can decide per box, and `none` whenever it cannot — whether
+/// the table stopped deciding after the placement or had not decided when
+/// the placement was made, because a leaf over a table that is not
+/// refusing decides nothing until it refuses again. A box its launch left
+/// unplaced stays `none` for its life, whatever a later launch of another
+/// box decided, because the outcome belongs to the launch that produced
+/// it, not to the node as it stands now. Only a host-address box that has
+/// not launched yet — a created session, or one whose launch never minted
+/// a host — shows the fact alone.
+///
+/// The refusal half is the launch's own gate —
+/// [`refused_unenforced_host_address_box`] — so a display cannot disagree
+/// with a launch over which box is refused: the gate's `placed` fact, which a
+/// launch knows from its own placement, is inferred here from the fact's
+/// cause ([`fact_places_a_leaf`]), because the causes are what place or
+/// refuse the box natively and in the guest. A cause-less fact — the cell's
+/// default — places, and its gate refuses nothing, so the state shows as it
+/// stands.
+///
+/// Pure over its inputs, so the gate and its lowering are pinned where they
+/// are written.
+pub(crate) fn displayed_host_ip_enforcement(
+    guest: bool,
+    network_mode: NetworkMode,
+    verdict: sandbox2::config::Verdict,
+    fact: &HostIpEnforcementFact,
+    launch_record: Option<HostIpEnforcement>,
+) -> Option<minimald_rpc::HostIpEnforcement> {
+    if refused_unenforced_host_address_box(
+        guest,
+        network_mode,
+        verdict,
+        fact_places_a_leaf(fact.cause),
+        fact.decision().as_ref(),
+    )
+    .is_some()
+    {
+        return None;
+    }
+    match network_mode {
+        NetworkMode::HostNet => Some(match launch_record {
+            // The box's own launch outcome: shown as recorded while the host
+            // can still decide per box, lowered to the undecidable state the
+            // host is in when it cannot — never raised above either.
+            Some(recorded) => match (recorded, fact.enforcement) {
+                (HostIpEnforcement::PerBox, HostIpEnforcement::PerBox) => HostIpEnforcement::PerBox,
+                _ => HostIpEnforcement::None,
+            },
+            // No box of this session has launched yet, so there is no
+            // outcome to show: the node's state is the best either half of
+            // the daemon knows about a box that does not exist yet.
+            None => fact.enforcement,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a fact's cause says the step's tree is there to place a leaf in:
+/// the causes that imply a box nothing places are the step's absence and the
+/// mount that cannot confine, and every other cause — the two probe causes,
+/// the guest's unloaded table — arises only over a tree the step already
+/// installed (the marker and the delegated subtrees gate the probe), which is
+/// also where a decided fact's box goes. `None` — a decided fact, or the
+/// cell's default — places, so a display's refusal inference reads a decided
+/// host as the placement its launches make.
+///
+/// `pub(crate)`: the test launcher's mock models its placement's outcome
+/// from the same cause the displays infer a launch's placement over, so
+/// the two never disagree about which causes place.
+pub(crate) fn fact_places_a_leaf(cause: Option<crate::net::classifier::Cause>) -> bool {
+    !matches!(
+        cause,
+        Some(
+            crate::net::classifier::Cause::StepNotInstalled
+                | crate::net::classifier::Cause::CannotConfine
+        )
+    )
+}
+
+/// Serializes the window in which a process-global test stand-in is
+/// installed, or the enforcement fact a test sets: a loopback-probe one
+/// (`net::loopback`), the classifier reading's (below), or the fact a launch
+/// or a test wrote — under libtest, where every test in this binary shares
+/// one process, a create, launch, or listing driven by another test would
+/// answer over it too. Nextest runs each test in its own process; the mutex
+/// keeps the in-process runner as safe.
+///
+/// Lives here — the module that owns the fact and the reading stand-in — so
+/// the launch tests that write the fact and the RPC tests that read it share
+/// one guard.
+#[cfg(test)]
+pub(crate) static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The test stand-in for the probe's reading: a `Reading` a test hands the
+/// decision in place of the live probe's, so the decision logic itself still
+/// runs over the facts a test laid out — the tree and mount table a test
+/// spells — and the one thing a stand-in tree cannot model, a table whose
+/// effect the probe reads, is the one thing a test injects. The same
+/// stand-in discipline the session-host knobs use: a fact in, never an
+/// answer.
+#[cfg(test)]
+static CLASSIFIER_READING_STANDIN: std::sync::Mutex<Option<crate::net::classifier::Reading>> =
+    std::sync::Mutex::new(None);
+
+/// Points the decision's probe at `reading` for the rest of this process —
+/// the stand-in state a test built. See [`CLASSIFIER_READING_STANDIN`].
+///
+/// The tests that use this take the probe-test mutex in this module for the
+/// whole install→read→assert→clear window: the stand-in is process-global,
+/// so under libtest — where the tests of one binary share a process — a
+/// launch driven by another test would read it too.
+#[cfg(test)]
+pub(crate) fn install_classifier_reading_standin(reading: crate::net::classifier::Reading) {
+    *CLASSIFIER_READING_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reading);
+}
+
+/// Withdraws the reading stand-in [`install_classifier_reading_standin`]
+/// installed, so later reads probe the table for real again.
+#[cfg(test)]
+pub(crate) fn clear_classifier_reading_standin() {
+    *CLASSIFIER_READING_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// The probe's reading the decision answers over: the live probe, except
+/// under test, where a stand-in reading may be installed over the same tree
+/// facts the test laid out.
+#[cfg(test)]
+fn classifier_reading(root: &std::path::Path, guest: bool) -> crate::net::classifier::Reading {
+    let standin = CLASSIFIER_READING_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    standin.unwrap_or_else(|| live_classifier_reading(root, guest))
+}
+
+/// The probe's reading the decision answers over: the live probe, always —
+/// the non-test twin of [`classifier_reading`], spelled separately so the
+/// test arm's lock is never compiled into a daemon that cannot install a
+/// stand-in.
+#[cfg(not(test))]
+fn classifier_reading(root: &std::path::Path, guest: bool) -> crate::net::classifier::Reading {
+    live_classifier_reading(root, guest)
+}
+
+/// The live probe a launch reads: a guest connects to the listener its boot
+/// holds, so the port the probe is refused at is one the daemon held all
+/// along, never one bound for this reading (NET-079, design §7.4); a native
+/// host binds a listener per reading.
+fn live_classifier_reading(root: &std::path::Path, guest: bool) -> crate::net::classifier::Reading {
+    if guest {
+        crate::net::classifier::read_held_filter(root)
+    } else {
+        crate::net::classifier::read_filter(root)
+    }
+}
+
+/// The classifier fact every host-address launch reads the host for,
+/// freshly, on the blocking pool: the mount table the tree answers over —
+/// the knob's when one was set, the daemon's own, read live, when none was
+/// ([`launch_mountinfo`]) — and the decision over the tree and that one
+/// table (NET-079), returned together because the two are one fact: a
+/// launch that decides a box over a table and then places it over another
+/// has read nothing.
+///
+/// The launch's read — the decision the placement and the refusal answer
+/// over — and the write that keeps the daemon's
+/// one node fact ([`HOST_IP_ENFORCEMENT_FACT`]) current, in one move: the
+/// read is fresh rather than a kept start-time reading, because the fact
+/// the decision rests on is the table's *effect* (design §7.4) — a marker
+/// survives whatever emptied the table and the refusal does not, and a
+/// kept reading would survive it the same way — and the surfaces that show
+/// a session read the fact, so they show this read's state and not one a
+/// re-read has replaced.
+///
+/// The mount table rides back out beside the decision because the launch
+/// answers its placement over the same one table the decision just read —
+/// one blocking hop, so the live mount-table read never runs on the async
+/// worker a session is being created on. `Err` says the read did not run
+/// at all — the blocking task was lost or panicked — which is the launch's
+/// own cause to name: a launch that cannot read the fact cannot place a
+/// box.
+pub(crate) async fn re_read_classifier_fact(
+    root: std::path::PathBuf,
+    mountinfo_knob: Option<String>,
+    guest: bool,
+) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
+    tokio::task::spawn_blocking(move || {
+        let mountinfo = launch_mountinfo(mountinfo_knob);
+        let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
+            classifier_reading(&root, guest)
+        });
+        set_host_ip_enforcement_fact(&decision);
+        (mountinfo, decision)
+    })
+    .await
+    .map_err(std::io::Error::other)
+}
+
 /// Creates the classifier leaf this session's host-address box is placed in
 /// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
@@ -2666,7 +3599,7 @@ async fn create_session_leaf(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
-                    host_ip_enforcement = %HostIpEnforcement::Enforced.machine_str(),
+                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     "the host-address box's egress verdict is decided on its \
                      classifier leaf, in the {} subtree",
                     verdict.dir_name()
@@ -2676,7 +3609,7 @@ async fn create_session_leaf(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
-                    host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
+                    host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
                     "the host-address box's leaf is placed in the {} subtree, \
                      but this host's classifier table is not loaded, so its \
                      egress verdict is not decided per box",
@@ -2795,16 +3728,19 @@ async fn report_box_closure(
     watch: std::time::Duration,
 ) {
     let deadline = std::time::Instant::now() + watch;
-    // The last line this closure left, so a replacement is logged as the
-    // new finding it is rather than skipped as a repeat.
-    let mut seen: Option<String> = None;
+    // The lines this closure has left so far, so a replacement or an
+    // appended line is logged as the new finding it is rather than skipped
+    // as a repeat — and a line already said is not said twice.
+    let mut seen: Vec<String> = Vec::new();
     loop {
         match tokio::fs::read_to_string(&report).await {
-            Ok(line) => {
-                let line = line.trim().to_string();
-                if seen.as_deref() != Some(line.as_str()) {
-                    seen = Some(line.clone());
-                    if say_closure_line(&line, &session) {
+            Ok(content) => {
+                for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if seen.iter().any(|s| s == line) {
+                        continue;
+                    }
+                    seen.push(line.to_string());
+                    if say_closure_line(line, &session) {
                         // The box's fate is known: the closure died, and it
                         // died having said so. The daemon owes the tree one
                         // line per launch, not a file per session.
@@ -2824,7 +3760,7 @@ async fn report_box_closure(
             }
         }
         if std::time::Instant::now() > deadline {
-            if seen.is_none() {
+            if seen.is_empty() {
                 tracing::warn!(
                     session = %session,
                     report = %report.display(),
@@ -2857,7 +3793,13 @@ const CLOSURE_REPORT_WATCH: std::time::Duration = std::time::Duration::from_secs
 /// the line settles the box's fate: `true` for a `failed` line, which the
 /// closure writes on its way to `_exit(127)` and nothing follows; `false`
 /// for a `cover` line, which it writes while still heading for its exec.
+/// A cover line may carry a refused devpts remount after a `; `, since the
+/// report holds one line; each part is said on its own.
 fn say_closure_line(line: &str, session: &str) -> bool {
+    if let Some((cover, devpts)) = line.split_once("; ") {
+        let settled = say_closure_line(cover, session);
+        return say_closure_line(devpts, session) || settled;
+    }
     if line == "cover cgroup2" {
         tracing::info!(
             session = %session,
@@ -2885,6 +3827,23 @@ fn say_closure_line(line: &str, session: &str) -> bool {
             cover = "tmpfs-fallback",
             "the box's classifier cover was forced onto its recorded \
              fallback — a launch in a test posture, never a production one",
+        );
+    } else if let Some(rest) = line.strip_prefix("devpts max=") {
+        let (max, errno) = rest.rsplit_once(" errno ").unwrap_or((rest, "unreported"));
+        tracing::warn!(
+            session = %session,
+            max,
+            errno,
+            "remounting the box's /dev/pts with a per-instance max failed; \
+             the box runs on the shared PTY pool",
+        );
+    } else if let Some(errno) = line.strip_prefix("lo-down errno ") {
+        tracing::warn!(
+            session = %session,
+            errno = errno,
+            "the box could not bring up the loopback interface of its own \
+             network namespace: it runs, but nothing in it can reach \
+             127.0.0.1 or ::1",
         );
     } else if let Some(failed) = line.strip_prefix("failed ") {
         let (step, errno) = failed
@@ -2992,8 +3951,10 @@ fn refused_unenforced_host_address_box(
                  is not in force, so a deny-all box's connections would not be \
                  refused: the box's declaration promises a verdict nothing here \
                  enforces, and the box was refused rather than run unenforced \
-                 (the table's refusal is not in force — {} reloads it)",
-                sandbox2::classifier::install_hint()
+                 (the table's refusal is not in force — the marker says loaded, so \
+                 {install} alone is a no-op; {install} --undo, then {install}, \
+                 reloads it)",
+                install = sandbox2::classifier::install_hint()
             )),
             Some(crate::net::classifier::Cause::ProbeUnreadable) => Some(
                 "this host's classifier table's effect could not be read, so \
@@ -3022,22 +3983,34 @@ fn refused_unenforced_host_address_box(
 /// The counterpart of [`refused_unenforced_host_address_box`]: an unenforced
 /// host-address box is the advisory posture on *either* kind of host —
 /// natively NET-079's exception, in the guest the interim's own state — so
-/// every *session* launch the record says `none` for says so, once per
-/// launch like the resolver advisory it is modelled on (design §7.1), never
-/// once per daemon. The refusals stand untouched beside it: a box the guest
-/// cannot place is refused and advises nothing (the refusal is that state's
-/// surface), and so is a deny-all box on a table the guest has not loaded,
-/// and natively a deny-all box over either probe cause — the advisory is the
-/// *other* host-address boxes' state, the ones that need no verdict
-/// enforced to run, and the ruling's ask is that their state be said at
-/// every session start, not left as a daemon log line alone. What this
-/// predicate does not carry is the launch's audience — a launch minted for
-/// lifecycle hooks advises nobody (a hook run is not a session start),
-/// which the launch itself folds in over
+/// every *session* launch whose box runs without a verdict of its own says
+/// so, once per launch like the resolver advisory it is modelled on
+/// (design §7.1), never once per daemon. The refusals stand untouched
+/// beside it: a box the guest cannot place is refused and advises nothing
+/// (the refusal is that state's surface), and so is a deny-all box on a
+/// table the guest has not loaded, and natively a deny-all box over either
+/// probe cause — the advisory is the *other* host-address boxes' state, the
+/// ones that need no verdict enforced to run, and the ruling's ask is that
+/// their state be said at every session start, not left as a daemon log
+/// line alone.
+///
+/// The state is read from the placement and the decision, not from the
+/// launch's record: the record carries the placement — `per_box` for a
+/// placed box, whatever the table decides — while the advisory is the box's
+/// *current* state, the one the notice names, so a leaf placed over a table
+/// that is not deciding advises exactly like a box nothing placed. What
+/// this predicate does not carry is the launch's audience — a launch
+/// minted for lifecycle hooks advises nobody (a hook run is not a session
+/// start), which the launch itself folds in over
 /// [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate is
 /// pinned where it is written.
-fn advises_unenforced_placement(enforcement: Option<HostIpEnforcement>) -> bool {
-    enforcement == Some(HostIpEnforcement::Unenforced)
+fn advises_unenforced_placement(
+    network_mode: NetworkMode,
+    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    decision: Option<&crate::net::classifier::Decision>,
+) -> bool {
+    matches!(network_mode, NetworkMode::HostNet)
+        && !(leaf.is_some() && decision.is_some_and(|d| d.can_decide_per_box()))
 }
 
 /// The advisory text for a launch whose host-address box runs unenforced:
@@ -3117,6 +4090,13 @@ impl SessionLauncher for SandboxLauncher {
         // leaf is named by. The declaration is fixed at create, so a launch
         // decides it once and a box is never re-verdicted mid-flight.
         let classifier_verdict = crate::net::classifier::verdict_of(policy.egress.as_ref());
+        // Whether the declaration lets a listen publish at all (NET-016):
+        // `allow` with a range. Read now, before the policy moves into the
+        // network plan, for the missing-listen-plan line below.
+        let listens_can_publish = policy.ingress.as_ref().is_some_and(|ingress| {
+            ingress.dynamic_ingress == Some(sessions::DynamicIngress::Allow)
+                && ingress.dynamic_allowed_range.is_some()
+        });
         let network_mode = self.network_mode;
         // The classifier tree this daemon places boxes in, moved out before
         // the rest of `self` is consumed (see the field's doc).
@@ -3179,24 +4159,67 @@ impl SessionLauncher for SandboxLauncher {
         // The whole decision is kept, not only its verdict bit: the refusal
         // and the advice below say which box they are for out of the cause
         // that produced it, so the launch's words and the start-up line
-        // name the same ground. The knob's `None` — every production path —
-        // is the daemon's own mount table read live here, never "no table
-        // at all": a launch that answered over no table would read even a
-        // guest's `nsdelegate` cgroup2 as not real and refuse every
-        // host-address box in it as a broken image, so the live read and
-        // the decision share this one blocking hop, and the same one table
-        // is what the placement below answers over too.
+        // name the same ground. The read itself is the one shared fact
+        // every host-address path answers over — [`re_read_classifier_fact`],
+        // the same read the create response answers over — and the knob's
+        // `None` — every production path — is the daemon's own mount table
+        // read live inside it, never "no table at all": a launch that
+        // answered over no table would read even a guest's `nsdelegate`
+        // cgroup2 as not real and refuse every host-address box in it as a
+        // broken image, so the live read and the decision share that one
+        // blocking hop, and the same one table is what the placement below
+        // answers over too.
         let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
-            let root = classifier_root.clone();
-            let knob = classifier_mountinfo.clone();
-            let (mountinfo, decision) = tokio::task::spawn_blocking(move || {
-                let mountinfo = launch_mountinfo(knob);
-                let decision =
-                    crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest);
-                (mountinfo, decision)
-            })
-            .await
-            .map_err(io::Error::other)?;
+            let (mountinfo, decision) = re_read_classifier_fact(
+                classifier_root.clone(),
+                classifier_mountinfo.clone(),
+                guest,
+            )
+            .await?;
+            // NET-079: the other half of what a host that decides per box
+            // refuses — the declaration's own rules. The create path refuses
+            // the same declaration over the same predicate while the fact
+            // says the host decides, but a box created before that was true —
+            // a create the fact read `none` on, or a record persisted before
+            // this gate existed — still lands here, and the launch is the
+            // last place that can refuse it before the box runs placed and
+            // looking decided while its rules go unenforced. Gated on the
+            // decision this launch has just re-read, not the node fact: the
+            // fact is what a display shows, the launch's own fresh read is
+            // what refuses a box. Refused *before* the leaf below is
+            // allocated — a box this launch refuses to run never lands in
+            // `boxes/allow` — and whatever the launch is for: a hook run of
+            // the same box would run the same rules unenforced, so it is
+            // refused on the same ground as any other launch. On a host that
+            // cannot decide per box the gate answers nothing — NET-079's
+            // exception is that host's to keep, and the refusal below is the
+            // other one's.
+            if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+                network_mode,
+                decision.can_decide_per_box(),
+                policy.egress.as_ref(),
+            ) {
+                // The one typed error the create returns over the same
+                // rules: `InvalidInput`, not an `other` failure, so the
+                // refusal is the same machine-mode failure wherever a
+                // client meets it — the create's RPC arm keys on this
+                // kind, and the kind is what an `io::Error` carries to
+                // whatever downstream reads it. A launch hits the boxes
+                // the create's gate never saw — created before the host
+                // could decide per box, persisted from before the gate
+                // existed — so the two refusals must not read as two
+                // different failures of the same declaration.
+                let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
+                tracing::info!(
+                    session = %session_name,
+                    network_mode = %network_mode.word(),
+                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
+                    refusal = %refusal,
+                    "refusing a host-address box whose declaration names rules \
+                     this host's classifier cannot enforce"
+                );
+                return Err(refusal);
+            }
             let leaf = create_session_leaf(
                 &classifier_root,
                 mountinfo.as_deref(),
@@ -3213,17 +4236,17 @@ impl SessionLauncher for SandboxLauncher {
         };
         let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
 
-        // What this launch's leaf decision means for the box's egress
-        // verdict: enforced only while this host can decide per box at all
-        // — the fresh fact the probe just read, the table's refusal in
-        // force — so a leaf placed on a host whose table is not loaded is
-        // recorded as the unenforced state it is, and the refusal and the
-        // advice below read the one decision.
-        let enforcement = host_ip_enforcement(
-            network_mode,
-            leaf.as_ref(),
-            decision.as_ref().is_some_and(|d| d.can_decide_per_box()),
-        );
+        // What this launch's placement means for the box's egress record:
+        // the leaf itself, never the node fact re-read beside it — the
+        // record is this box's own launch outcome, and the reads lower it by
+        // the fact (`displayed_host_ip_enforcement`), so a leaf placed over
+        // a table that is not refusing shows `none` while the host cannot
+        // decide and `per_box` once it can again, without a relaunch. The
+        // declaration is the placement's other half: a box whose rules the
+        // classifier cannot enforce is recorded `none` even placed, so the
+        // record never promises `per_box` for rules no verdict enforces.
+        // The refusal and the advice below read the one decision.
+        let enforcement = host_ip_enforcement(network_mode, leaf.as_ref(), policy.egress.as_ref());
 
         // A host-address box this host cannot give a verdict of its own is
         // refused where the box's own declaration is the thing that cannot
@@ -3254,7 +4277,7 @@ impl SessionLauncher for SandboxLauncher {
         ) {
             tracing::error!(
                 session = %session_name,
-                network_mode = ?network_mode,
+                network_mode = %network_mode.word(),
                 tree = %classifier_root.display(),
                 placed = leaf.is_some(),
                 refusal = %refusal,
@@ -3294,28 +4317,58 @@ impl SessionLauncher for SandboxLauncher {
         // A launch minted for lifecycle hooks advises on neither surface: a
         // hook run is not a session start, and its record would count one
         // hook run as one. The placement itself is not gated with it.
-        let advise = advises_unenforced_placement(enforcement) && !for_hooks;
+        let advise = advises_unenforced_placement(network_mode, leaf.as_ref(), decision.as_ref())
+            && !for_hooks;
         if advise {
             let notice = unenforced_placement_notice(guest, leaf.as_ref());
             tracing::info!(
                 session = %session_name,
-                host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
+                host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
                 notice = %notice,
                 "the session's host-address box runs unenforced on this host",
             );
         }
+        // The banner is the advisory's in-box surface, and follows the
+        // advisory's rule (NET-079): a native daemon only — per-box
+        // enforcement is a native-host fact, and the guest's state is the
+        // interim's, said in the record above — only while the box declares
+        // egress, because a box that declared nothing asked for no
+        // enforcement, and only over a decision that names a cause: a box
+        // nothing placed on a host that decides per box runs unenforced for
+        // a reason the record above names (the placement's own failure),
+        // not one an install or an own-address start ends, so the advisory
+        // would hand out a command that changes nothing. Its text is the
+        // create reply's own, which carries none without a cause either, so
+        // the terminal the start printed into and the shell it opens say the
+        // same thing.
+        let banner = match (
+            advise && !guest,
+            policy.egress.as_ref(),
+            decision
+                .as_ref()
+                .and_then(crate::net::classifier::Decision::cause),
+        ) {
+            (true, Some(egress), Some(cause)) => {
+                Some(crate::net::classifier::advisory_text(cause, egress))
+            }
+            _ => None,
+        };
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
-        // says what it is. `PlannedLaunch` owns the release from here: an early
-        // `Err` return or a cancelled launch gives the lease back.
+        // says what it is. The decision this launch itself read above goes in
+        // with them, carried rather than memoized, so the plan below follows
+        // this launch's verdict fact and never a concurrent launch's.
+        // `PlannedLaunch` owns the release from here: an early `Err` return
+        // or a cancelled launch gives the lease back.
         let planned = sandbox2::PlannedLaunch::begin(crate::net::provider::network_for(
             network_mode,
             &net_switch,
             &session_name,
             Some(policy),
-            own_address,
+            own_address.clone(),
             box_addresses,
+            decision,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
@@ -3456,6 +4509,19 @@ impl SessionLauncher for SandboxLauncher {
                 .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
             container.set_session_leader();
+            // A launch minted only for hooks holds its shell at the gate: the
+            // hooks need the box, not the shell, and the shell's startup —
+            // the user's rc files and prompt commands — must not run ahead of
+            // the activate hooks it may depend on. The first attach releases
+            // it (see [`Host::attach`]).
+            let start_gate = if for_hooks {
+                Some(
+                    env.hold_start(&mut container)
+                        .map_err(|e| io::Error::other(format!("start gate: {e}")))?,
+                )
+            } else {
+                None
+            };
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
@@ -3474,14 +4540,17 @@ impl SessionLauncher for SandboxLauncher {
             // per box yet is told so at its own start, like any host's.
             // And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
-            if advise {
-                let notice = unenforced_placement_notice(guest, leaf.as_ref());
+            if let Some(notice) = &banner {
                 // The same write the shell fallback notice uses, for the
-                // same reasons: onto the pty's slave, best-effort, CRLF —
-                // see the comment there.
+                // same reasons: onto the pty's slave, best-effort, CRLF on
+                // each of the advisory's two lines — see the comment there.
+                let text = notice
+                    .lines()
+                    .map(|line| format!("minimal: {line}\r\n"))
+                    .collect::<String>();
                 let written = pty.dup_slave_fd().and_then(|fd| {
                     use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                    std::fs::File::from(fd).write_all(text.as_bytes())
                 });
                 if let Err(e) = written {
                     tracing::debug!(
@@ -3539,6 +4608,14 @@ impl SessionLauncher for SandboxLauncher {
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             let tty_path = pty.slave_path().to_path_buf();
+            // Kept for one notice written after the switch attach below (an
+            // own-address box the hostname proxy stranded), so it is said in
+            // the terminal, not only in the daemon's log. Never for a hook
+            // launch: its pty is read by nobody. Dropped before the launch
+            // returns, so it never outlives the shell's own slave fds.
+            let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
+                .then(|| pty.dup_slave_fd().ok())
+                .flatten();
             let (master, slave) = pty.into_fds();
             command.stderr(hakoniwa::Stdio::from(slave));
 
@@ -3549,11 +4626,11 @@ impl SessionLauncher for SandboxLauncher {
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process, tty_path))
+            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd, start_gate))
         }
         .await;
 
-        let (env, master, process, tty_path) = match build_and_spawn {
+        let (env, master, process, tty_path, late_notice_fd, start_gate) = match build_and_spawn {
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
@@ -3624,6 +4701,110 @@ impl SessionLauncher for SandboxLauncher {
             }
         };
 
+        // Step 4 (post-attach): gather the listen-publication plan (NET-016,
+        // NET-017) — everything the box's listener watcher needs, from what
+        // this launch alone holds: the box's lease on the switch, the gvproxy
+        // control channel its forwarder verbs ride (built the way the
+        // provider's own-IP plan builds it), the published address the
+        // switch granted this session (NET-010), the ingress gate the
+        // attach just registered for the relay, and the box's publication
+        // set, shared with the runtime expose surface so neither binds a
+        // port the other already holds. The plan rides [`Launched`] to the
+        // host that runs the box, which starts the watcher when it builds
+        // and stops it with the session — so a box with no lease, no
+        // published address or no live gate carries no plan, and its ports
+        // stay unpublishable by listening.
+        //
+        // Read here, after `planned.attach` above returned: a successful
+        // attach has already reported this spawn's lease
+        // (`complete_own_ip_attach` reports it before it returns `Ok`), and
+        // every launch — a respawn included — runs this step afresh, so the
+        // lease the plan carries is always this spawn's own.
+        let lease = crate::net::provider::attached_lease(&plan, own_address.as_ref());
+        let published = own_address
+            .as_ref()
+            .and_then(|reporter| reporter.published_address());
+        let gate = lease.and_then(crate::net::switch::live_gate);
+        // Design §7.1: a box that attached while the hostname proxy was not
+        // serving past the settle was compiled with no node-address opening
+        // (fail closed rather than at a port the proxy may not hold), so it
+        // cannot reach the hostname proxy until it restarts. Said in the
+        // session's own terminal — the person whose `HTTP(S)_PROXY` requests
+        // will not route is told why and what clears it — beside the
+        // daemon's warning. Best-effort, like the banner notices above.
+        if let (Some(fd), Some(lease)) = (late_notice_fd, lease)
+            && net_switch.lock().await.hostname_proxy_stranded(lease)
+        {
+            use std::io::Write as _;
+            let written = std::fs::File::from(fd).write_all(
+                b"minimal: the hostname proxy was not serving yet when this session's \
+                  box attached, so the box cannot reach it (*.min.internal requests \
+                  through HTTP(S)_PROXY will not route); restart the session once the \
+                  daemon's hostname proxy serves\r\n",
+            );
+            if let Err(e) = written {
+                tracing::debug!(
+                    error = %e,
+                    "could not print the hostname-proxy notice to the terminal"
+                );
+            }
+        }
+        if matches!(network_mode, NetworkMode::OwnIp)
+            && (lease.is_none() || published.is_none() || gate.is_none())
+        {
+            // An own-address box whose listens will never publish: said once
+            // per launch, naming the fact that is missing, so a listen that
+            // never publishes is not silent (NET-016) — a warning where the
+            // declaration allows listens to publish, since one it allows will
+            // not.
+            if listens_can_publish {
+                tracing::warn!(
+                    session = %session_label,
+                    lease = ?lease,
+                    published = ?published,
+                    gate = gate.is_some(),
+                    "the box carries no listen plan; its listens are not published"
+                );
+            } else {
+                tracing::info!(
+                    session = %session_label,
+                    lease = ?lease,
+                    published = ?published,
+                    gate = gate.is_some(),
+                    "the box carries no listen plan; its listens are not published"
+                );
+            }
+        }
+        let listen_plan = match (lease, published, gate) {
+            (Some(lease), Some(published), Some(gate)) => {
+                tracing::debug!(
+                    session = %session_label,
+                    %lease,
+                    %published,
+                    "built the box's listen plan"
+                );
+                let switch = net_switch.lock().await;
+                let control = match switch.transport() {
+                    crate::net::SwitchTransport::LocalSpawn => {
+                        crate::net::policy::ControlChannel::Unix(switch.control_socket())
+                    }
+                    crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                        crate::net::policy::ControlChannel::Vsock { cid, port }
+                    }
+                };
+                Some(crate::net::listeners::ListenPlan::new(
+                    session_label,
+                    lease,
+                    published,
+                    control,
+                    gate,
+                    self.publications,
+                    self.state_dir,
+                ))
+            }
+            _ => None,
+        };
+
         Ok(Launched {
             master,
             process: SandboxProcess::new(SandboxBackend {
@@ -3637,13 +4818,18 @@ impl SessionLauncher for SandboxLauncher {
             net_guard,
             tty_path,
             seal_injection,
-            // The launch's own decision about this box's egress verdict, so
-            // the session can say which it runs under without re-deriving
-            // it from things a person never sees.
+            // The launch's own placement outcome for this box, so the
+            // session can record it without re-deriving it from things a
+            // person never sees.
             host_ip_enforcement: enforcement,
             // The copy the host keeps, so every process injected into the
             // session can join the same leaf.
             leaf,
+            // The box's listen plan, and with it the one handoff to the
+            // host that runs the box: taken when the host builds, so a
+            // cancelled launch's plan never reaches any host at all.
+            listen_plan,
+            start_gate,
         })
     }
 }
@@ -3728,6 +4914,21 @@ pub(crate) struct MockLauncher {
     /// observe network teardown; `None` for the plain mock (mirroring
     /// `HostNet`/`NoNet`).
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// The placement outcome this mock launch reports (NET-079): seeded by
+    /// the session's test launcher from the daemon's one node fact —
+    /// `per_box` when the fact's cause says the tree is there to place a
+    /// leaf in (`fact_places_a_leaf`), `none` when it does not — so a test
+    /// that injects a classifier reading and re-reads the fact has the
+    /// launches it drives record each box's own placement outcome over it.
+    /// The mock has no sandbox, so it places nothing and models the
+    /// placement's outcome; the real launcher's placement-to-record mapping
+    /// is pinned where it is written, in this module's launch proofs.
+    host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The listen plan this mock launch carries in its [`Launched`], so a
+    /// test can drive the host's listener watcher over the mock box the way
+    /// a real launch drives one over a sandboxed box — and, left `None`,
+    /// prove a launch that carries no plan starts no watcher at all.
+    listen_plan: Option<crate::net::listeners::ListenPlan>,
 }
 
 #[cfg(test)]
@@ -3736,7 +4937,44 @@ impl MockLauncher {
     pub(crate) fn with_net_guard(net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
         Self {
             net_guard: Some(net_guard),
+            host_ip_enforcement: None,
+            listen_plan: None,
         }
+    }
+
+    /// A mock whose launch carries `host_ip_enforcement` as its placement
+    /// outcome — the value the session's test launcher seeds from the
+    /// daemon's node fact, so a test's launches record each box's own
+    /// outcome over the fact a test's injected reading set.
+    pub(crate) fn with_host_ip_enforcement(host_ip_enforcement: HostIpEnforcement) -> Self {
+        Self {
+            host_ip_enforcement: Some(host_ip_enforcement),
+            ..Default::default()
+        }
+    }
+
+    /// This mock with `net_guard` attached as well, so a test can observe
+    /// the teardown of a host-address box's launch.
+    pub(crate) fn and_net_guard(self, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+        Self {
+            net_guard: Some(net_guard),
+            ..self
+        }
+    }
+
+    /// This mock with `listen_plan` attached, so a test can drive a box's
+    /// listener watcher under whatever else its launch mirrors. The mock has
+    /// no sandbox and no network namespace of its own, so the watcher
+    /// resolves the box's leader as the sole child its shell runs — the
+    /// shape a real container's supervisor gives the resolution — and the
+    /// leader's socket table is the daemon's own, where the listening
+    /// sockets the test binds in its process are the box's.
+    pub(crate) fn and_listen_plan(
+        mut self,
+        listen_plan: crate::net::listeners::ListenPlan,
+    ) -> Self {
+        self.listen_plan = Some(listen_plan);
+        self
     }
 }
 
@@ -3756,8 +4994,19 @@ impl SessionLauncher for MockLauncher {
     ) -> io::Result<Launched<MockProcess, ()>> {
         let pty = Pty::open(sz)?;
 
+        // A launch that carries a listen plan starts a watcher that
+        // resolves its box's leader, and a mock box's leader is the sole
+        // child of its shell — so the script runs one (`sleep`, doing
+        // nothing but holding the shape) beside its echo loop. The child
+        // is never a job-control one — the mock's shell is not interactive
+        // — so it reads no tty and touches no foreground rights.
+        let leader_child = if self.listen_plan.is_some() {
+            "sleep 60 & "
+        } else {
+            ""
+        };
         let script = format!(
-            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+            r#"{leader_child}while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
         );
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg(&script);
@@ -3778,7 +5027,13 @@ impl SessionLauncher for MockLauncher {
             seal_injection: false,
             // The mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
-            host_ip_enforcement: None,
+            host_ip_enforcement: self.host_ip_enforcement,
+            // The plan the launch gathered, riding to the host the way a
+            // real launch's plan rides: taken when the host builds.
+            listen_plan: self.listen_plan,
+            // The mock's process is a plain host child with no pre-exec
+            // closure to hold it.
+            start_gate: None,
         })
     }
 }
@@ -3797,6 +5052,10 @@ pub(crate) struct HostParams {
     pub control: Option<SessionControl>,
     pub delta: Option<Arc<DeltaSource>>,
     pub archives_dir: std::path::PathBuf,
+    /// Whether the session's record carries host-handed addresses (T66): the
+    /// box is registered, so its host-side row ends with this host's shell
+    /// (NET-138). The shell-exit prompt words its Keep item for that.
+    pub holds_host_row: bool,
     pub session_id: sessions::SessionId,
     pub composition: Option<Arc<sessions::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
@@ -4024,17 +5283,32 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     ///
     /// Returns the [`HostHandle`] alongside the [`JoinHandle`] of the runtime
     /// loop, so the owner can await full teardown (process reaped, sandbox guard
-    /// dropped) after issuing a [`HostHandle::kill`].
+    /// dropped) after issuing a [`HostHandle::kill`], and the per-box egress
+    /// enforcement this launch placed the box under (NET-079) — the launch's
+    /// own outcome, carried out beside the host it produced so the session
+    /// can record it on the box's behalf without asking the running host
+    /// back for what its launch already decided.
     pub async fn spawn<L>(
         launcher: L,
         params: HostParams,
-    ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
+    ) -> Result<
+        (
+            HostHandle,
+            JoinHandle<Result<i32, std::io::Error>>,
+            Option<HostIpEnforcement>,
+        ),
+        std::io::Error,
+    >
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
         let (host, handle) = Self::build(launcher, params).await?;
+        // Read out before `mainloop` takes the host: the value is the
+        // launch's own, set once by `build` and never updated, and the
+        // host's attrs stay what `get_attrs` serves for the session's life.
+        let host_ip_enforcement = host.attrs.host_ip_enforcement;
         let task = tokio::spawn(host.mainloop());
-        Ok((handle, task))
+        Ok((handle, task, host_ip_enforcement))
     }
 
     /// Builds the host and its handle from a launcher without spawning the
@@ -4053,6 +5327,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             control,
             delta,
             archives_dir,
+            holds_host_row,
             session_id,
             composition,
             connection_env,
@@ -4084,6 +5359,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             seal_injection,
             leaf,
             host_ip_enforcement,
+            listen_plan,
+            start_gate,
         } = launcher
             .launch(
                 crate::guest::is_microvm_daemon(),
@@ -4094,6 +5371,35 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 sz,
             )
             .await?;
+
+        // The listen-publication watcher (NET-016, NET-017): the plan this
+        // launch gathered is the box's whole publication surface — its
+        // lease, the switch's published address, the gvproxy control
+        // channel, the ingress gate the attach registered, and the
+        // publication set it shares with the runtime expose path. It polls
+        // the listening sockets of the process the launch names the box's
+        // leader (whose `/proc` entry reads the whole box's network
+        // namespace) and keeps the box's published ports in step with them
+        // until the session ends. A launch that carried no plan — no
+        // lease, no published address — starts no watcher, and none of its
+        // ports is published by listening.
+        //
+        // The leader itself is the watcher's to resolve, not this build's to
+        // have resolved: a resolution that fails here — a shell that is
+        // mid-spawn, a `/proc` that cannot answer for the moment — would
+        // otherwise drop the plan with it and silently cost the box its
+        // whole listen-published surface, so the build hands the container
+        // PID it holds and the watcher asks on every poll until the box's
+        // program is there to be found (the module's nothing-is-one-shot
+        // contract, held of its start).
+        let listen_watcher = listen_plan.map(|plan| {
+            crate::net::listeners::ListenWatcher::start(
+                plan,
+                crate::net::listeners::Leader::Pending {
+                    container_pid: process.container_pid(),
+                },
+            )
+        });
 
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };
@@ -4137,6 +5443,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            listen_watcher,
             #[cfg(target_os = "linux")]
             name_marker,
             tty_path,
@@ -4149,10 +5456,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
+            holds_host_row,
             connection_env,
             home_dir,
             seal_injection,
             leaf,
+            start_gate,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
             chord_flush_deadline: None,
             guard,
@@ -4250,6 +5559,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no prompt at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
+                // Read before `take_if` below can empty `pending`: with no
+                // stashed pty error, the only way `step` errs is
+                // `Message::Kill`, so the end was asked for.
+                let requested = pending.is_none();
 
                 // Notify *before* the reap when the process may still be
                 // running, because `wait` below is unbounded — see
@@ -4272,14 +5585,29 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // hakoniwa's own account is logged from the process handle,
                 // which has no span and so names no session, and the binding's
                 // prompt line never happens with nothing attached.
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    session = %self.session_name,
-                    ?code,
-                    abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
-                    exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
-                    "session process reaped after pty/step error",
-                );
+                //
+                // A requested teardown is logged at info: its SIGKILL reaps
+                // with the same abnormal reason an OOM kill does, and a warn
+                // for every destroy would bury the deaths nobody asked for.
+                if requested {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after requested teardown",
+                    );
+                } else {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after pty/step error",
+                    );
+                }
 
                 // Otherwise notify *after* it, which is the whole point: only
                 // the reap can say whether that shell exited or was killed, and
@@ -4302,6 +5630,17 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         #[cfg(target_os = "linux")]
         if let Some(marker) = self.name_marker.take() {
             marker.mark_stopped();
+        }
+
+        // Stop the listen-publication watcher (NET-017's last half) before
+        // the network attachment tears down: the stop withdraws every port
+        // the box's processes published by listening — the gate refusing
+        // each first, the forward after — so no runtime-published forward
+        // outlives the tap it delivers through, and no session ends with a
+        // port published on its address. Declared forwards are not this
+        // call's: they come down with the attachment below (NET-121).
+        if let Some(watcher) = self.listen_watcher.take() {
+            watcher.stop().await;
         }
 
         // Tear down the per-sandbox network attachment explicitly (own-IP switch
@@ -4503,6 +5842,83 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Message::GetScreen(s) => {
                         let _ = s.send(self.screen_snapshot());
                     }
+                    // NET-045: forward the ask to the attached client, whose
+                    // binding renders the exit prompt's own dialog. Nobody
+                    // attached — no binding, or one whose mailbox is wedged —
+                    // answers `None` so the session refuses with the typed
+                    // nobody-is-attached error rather than hanging on a
+                    // dialog nobody can see.
+                    Message::AskExpose { port, reply } => match self.remote.as_ref() {
+                        None => {
+                            // The plan's observability line: one info line per
+                            // refusal for want of a client, naming the box and
+                            // the port — and the one line the session-level
+                            // no-host shortcut never says, so a refusal read
+                            // off the log can be told to have come from a
+                            // live host that found nobody on it.
+                            tracing::info!(
+                                session = %self.session_name,
+                                port,
+                                "refusing the runtime port publish ask for want of a client to answer it"
+                            );
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "the asker may already be gone; there is nothing to answer then"
+                            )]
+                            let _ = reply.send(None);
+                        }
+                        Some((tx, ..)) => {
+                            let (binding_reply, binding_recv) = oneshot::channel();
+                            match tx
+                                .send_timeout(
+                                    BindingMsg::AskExpose {
+                                        port,
+                                        reply: binding_reply,
+                                    },
+                                    crate::session::HOST_PROBE_TIMEOUT,
+                                )
+                                .await
+                            {
+                                // The human may sit at the dialog for as long
+                                // as they like, so only the hand-off is
+                                // bounded. The answer is awaited on a spawned
+                                // task, never inside this loop: a host parked
+                                // on a human stops pumping the pty and stops
+                                // answering probes, and the probes that
+                                // decide `is_alive` would report a live host
+                                // dead.
+                                Ok(()) => {
+                                    tokio::spawn(async move {
+                                        // The binding dropping mid-prompt — a
+                                        // detach, a shed, a daemon shutdown —
+                                        // is the nobody-attached case again.
+                                        let answer = binding_recv.await.ok();
+                                        tracing::info!(port, answer = ?answer, "the attached client answered the runtime port publish ask");
+                                        #[expect(
+                                            clippy::let_underscore_must_use,
+                                            reason = "the asker may already be gone; there is nothing to answer then"
+                                        )]
+                                        let _ = reply.send(answer);
+                                    });
+                                }
+                                Err(send_error) => {
+                                    // The ask never reached a human. On a
+                                    // timeout the message comes back here
+                                    // (binding-level reply and all) and drops
+                                    // with this arm; on a closed mailbox the
+                                    // binding is already gone. Either way the
+                                    // host-level answer below is what the
+                                    // asker sees: nobody is attached.
+                                    tracing::warn!(port, error = %send_error, "the ask could not reach the attached client");
+                                    #[expect(
+                                        clippy::let_underscore_must_use,
+                                        reason = "the asker may already be gone; there is nothing to answer then"
+                                    )]
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        }
+                    },
                     Message::CommandInSession {
                         program,
                         args,
@@ -4521,6 +5937,18 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         tokio::spawn(async move {
                             let _ = s.send(crate::session_delta::assess(root, delta).await);
                         });
+                    }
+                    #[cfg(test)]
+                    Message::SetOutputStallTimeout(timeout) => {
+                        self.output_stall_timeout = timeout;
+                    }
+                    #[cfg(test)]
+                    Message::FeedStdin(bytes) => {
+                        // Queued, not awaited: a pty whose input side is
+                        // wedged (the shell is blocked on an output side that
+                        // nobody is draining) must not park this loop, which
+                        // a test may be relying on to shed a binding on time.
+                        queue_stdin(&mut self.stdin_buf, bytes);
                     }
                 }
             },
@@ -4812,6 +6240,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             self.delta.clone(),
             self.session_name.clone(),
             self.archives_dir.clone(),
+            self.holds_host_row,
         )
         .await;
 
@@ -4827,6 +6256,19 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         }
 
         self.set_size(sz);
+
+        // A host minted for hooks holds its shell at the start gate until a
+        // client is here for it: released now, with the binding installed and
+        // the pty sized, so the shell's startup runs after the activate hooks
+        // and on the terminal that attached — the order a shell minted by an
+        // attach has always had.
+        if let Some(gate) = self.start_gate.take() {
+            tracing::info!(
+                session = %self.session_name,
+                "released the hook-launched session shell to start for the attaching client"
+            );
+            gate.release();
+        }
 
         // After the binding is installed and sized, so a hook writing to
         // the terminal reaches the client that just attached.

@@ -386,16 +386,22 @@ pub async fn logs(
         }
     }
 
-    // Provider-scoped logs. run.log: the detached supervisor's stderr
+    // Provider-scoped files. run.log: the detached supervisor's stderr
     // redirect (panics, the final error print of a failed boot). boot.log:
     // the VMM's hvc0 console capture — kernel prints and the guest pid-1's
     // stdout, the only evidence when the guest wedges before (or its
-    // transport dies after) the daemon is reachable.
+    // transport dies after) the daemon is reachable. zone.json: the VM
+    // host daemon's zone-table dump (NET-138) — the table its answerer
+    // answered from, written at start and on every change — so a bundle
+    // holds the table the answers were given by, not only its name in the
+    // dir listing. Absent the same way a log that never appeared is: a
+    // provider dir with no daemon (or a daemon predating the dump) records
+    // absence, not an error.
     for (name, dir) in provider_dirs(&paths.state).await? {
-        for log_name in ["run.log", "boot.log"] {
-            let dest = format!("providers/{name}/{log_name}");
+        for file_name in ["run.log", "boot.log", minvmd::diag::ZONE_TABLE_FILE] {
+            let dest = format!("providers/{name}/{file_name}");
             match w
-                .add_file_tail(&dest, &dir.join(log_name), tail_bytes)
+                .add_file_tail(&dest, &dir.join(file_name), tail_bytes)
                 .await
             {
                 Ok(()) => {}

@@ -27,12 +27,11 @@ DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
   reason=write("/proc/self/uid_map", ..) => Operation not permitted (os error 1)
 ```
 
-`min session attach` shows this as a session that closes
-immediately. The `minimald` daemon and `mip` both check this at
-startup: on a host that will refuse the namespace they log a warning
-naming the restriction and this fix, so check the daemon log or the
-`mip` output first. Confirm the host is the cause using stock tools,
-no Minimal involved:
+On such a host `min session activate` fails before any session exists.
+The daemon checks the namespace on every create and refuses with the
+cause and its fix, which `min` prints as its error. `mip` prints the
+same cause and the fix for its own binary when a task starts. Make sure
+that the host is the cause with stock tools, no Minimal involved:
 
 ```console
 $ cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
@@ -41,75 +40,77 @@ $ unshare --user --map-root-user id
 unshare: write failed /proc/self/uid_map: Operation not permitted
 ```
 
-## Option 1: enable unprivileged user namespace creation host-wide
+## The fix, by cause
 
-The following disables the restriction for every program on the host until the next reboot:
+The refusal names one of two causes. Each has its own fix. Minimal
+does not suggest `kernel.apparmor_restrict_unprivileged_userns=0`: that
+sysctl turns the protection off for every program on the host.
 
-```console
-$ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-```
+### Ubuntu restricts unprivileged user namespaces
 
-To persist this change across reboots, create a file in `/etc/sysctl.d/`:
+This is the AppArmor restriction above. An AppArmor profile that grants
+`userns` to one binary lifts it for that binary alone, and the profile
+attaches by binary path.
 
-```console
-$ sudo sh -c "echo 'kernel.apparmor_restrict_unprivileged_userns=0' > /etc/sysctl.d/enable-user-ns.conf"
-```
-
-## Option 2: install minimald's AppArmor profile
-
-If you installed Minimal with the `curl … | sh` installer, you can
-grant user namespace creation to minimald alone instead of
-system-wide:
+For `minimald`, installed with the `curl … | sh` installer, finish the
+install. The step loads the profile for the installed daemon:
 
 ```console
-$ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh
-loaded the minimald AppArmor profile (/etc/apparmor.d/minimald)
+$ min finalize-install --show
+$ min finalize-install
 ```
 
-The only change to your system is allowing minimald to create user
-namespaces. To remove the profile run:
+The profile takes effect when the daemon next starts. Run `min stop`,
+then your command again. To remove the profile run:
 
 ```console
-$ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh --uninstall
+$ min finalize-install --undo
 ```
 
-If you built minimald from source on an Ubuntu system, run
-the following script in the source directory to allow it to create
-user namespaces:
+For a `minimald` built from source, run the loader from the checkout
+with the binary's path:
 
 ```console
 $ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"
 ```
 
-To remove the AppArmor profile:
+For `mip`, which builds every task in the same kind of sandbox, attach
+the profile to the `mip` binary with `--path`. `min finalize-install`
+covers the daemon alone. The installer places the loader under the
+Minimal data directory:
 
 ```console
-$ sudo scripts/install-apparmor-profile.sh --uninstall   # from a checkout
+$ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh --path "$(command -v mip)"
 ```
 
-### Attaching the profile to `mip`
-
-`mip` builds every task in the same kind of sandbox, so a standalone
-`mip` on Ubuntu 24.04+ needs the same allowance. The profile above
-grants `userns` to whichever binary it is attached to, so attach it to
-`mip` the same way — pass the binary's path with `--path`:
+From a checkout, the same loader is `scripts/install-apparmor-profile.sh`,
+and one run can take several `--path` flags:
 
 ```console
 $ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald" --path "$PWD/target/debug/mip"
 ```
 
-The installer's `--path` accepts any binary path, so this works for a
-source build, a custom install prefix, or a binary installed elsewhere
-on the host. The sysctl in Option 1 also covers `mip` if you prefer a
-host-wide change.
+To remove a profile the loader installed:
 
-## User namespaces disabled entirely
+```console
+$ sudo scripts/install-apparmor-profile.sh --uninstall   # from a checkout
+```
 
-Separately from the AppArmor restriction, user namespaces cannot be
-created at all on a kernel built without `CONFIG_USER_NS`, on a host
-with `user.max_user_namespaces` set to `0`, or on Debian-derived
-kernels that ship `kernel.unprivileged_userns_clone` with it set to
-`0`. The daemon's startup logs report this as its own error. The fix
-matches the cause: use a kernel with user namespaces enabled, raise
-`user.max_user_namespaces` via sysctl, or set
-`kernel.unprivileged_userns_clone=1`.
+### User namespaces switched off
+
+Separately from the AppArmor restriction, no program can create a user
+namespace on a kernel built without `CONFIG_USER_NS`, or on a host with
+`user.max_user_namespaces` set to `0`. No profile lifts this. The daemon
+reads the sysctl on every create, so the first command below clears the
+refusal at once. The second keeps it across reboots:
+
+```console
+$ sudo sysctl -w user.max_user_namespaces=15000
+$ sudo sh -c "echo 'user.max_user_namespaces=15000' > /etc/sysctl.d/60-minimal-userns.conf"
+```
+
+On a kernel built without `CONFIG_USER_NS`, use a kernel with user
+namespaces enabled. Debian-derived kernels that carry
+`kernel.unprivileged_userns_clone` need it set to `1` too. The daemon
+does not read that key, so it does not refuse the create. The session
+then fails at attach with the `uid_map` error above.

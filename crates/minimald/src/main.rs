@@ -244,11 +244,16 @@ pub struct ListenArgs {
     #[arg(long)]
     hostname_proxy_port: Option<u16>,
 
-    /// Port the box-zone answerer must listen on (UDP), when this deployment
-    /// pins one — the port the host's resolver is pointed at to answer
-    /// `*.min.internal`, whose documented default is 7656. Unset (the
-    /// default) gives it the same try-the-default-then-select treatment the
-    /// hostname proxy's flag documents.
+    /// Port the machine's box-zone answerer serves on (UDP), when this
+    /// deployment pins one — the port the host's resolver is pointed at to
+    /// answer `*.min.internal`, whose documented default is 7656. On a
+    /// native host the daemon is first a client of the installed
+    /// `minzoned` service (its rows publish over the machine-global
+    /// channel and it hosts nothing); the port is the hook port it hosts
+    /// the single-operator interim on while no service serves, and
+    /// unlike the hostname proxy there is no select-when-busy for it: the
+    /// address is the one the host's resolver is routed to, so a held
+    /// hook port is a surfaced error, never a move.
     #[arg(long)]
     zone_answerer_port: Option<u16>,
 
@@ -266,17 +271,36 @@ pub struct ListenArgs {
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
 
-    /// Keep the shipped allow-all egress default for a box that declares no
-    /// `egress` section (NET-077). While the deny-all default is in force
-    /// (see [`sessions::EGRESS_DEFAULT_PHASE`]), an own-address box created
-    /// with no egress declaration reaches nothing outside itself (NET-074)
-    /// and shows `deny all` in `min session policy` (NET-075). Opt out to
-    /// keep the prior default — a deployment that cannot carry the change in
-    /// this release — and retire the flag once yours declares its boxes'
-    /// egress. A box that declares its own egress section is unaffected
-    /// either way.
+    /// Keep the earlier allow-all egress default for a box that declares no
+    /// `egress` section (NET-077). With the deny-all default in force (see
+    /// [`sessions::EGRESS_DEFAULT_PHASE`]), an own-address box created with
+    /// no egress declaration reaches nothing outside itself (NET-074) and
+    /// shows `deny-all (default)` in `min session policy` (NET-075). Opt out
+    /// to keep the prior default — a deployment that cannot carry the change
+    /// yet — and retire the flag once yours declares its boxes' egress. A
+    /// box that declares its own egress section is unaffected either way.
+    /// `MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment opts out too,
+    /// and survives the restarts `min` makes without the flag.
     #[arg(long, default_value_t = false)]
     egress_deny_all_opt_out: bool,
+}
+
+/// The environment fallback for `run --egress-deny-all-opt-out` (NET-077).
+/// `min` auto-starts the native daemon with no flags of its own, and the
+/// spawned daemon inherits the environment it was started from, so an
+/// operator who exports this keeps the opt-out across every restart `min`
+/// makes — the native counterpart of `MINVMD_EGRESS_DENY_ALL_OPT_OUT`. The
+/// spelling is the boot token a VM host hands its guest daemon
+/// ([`minimald::guest::HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN`]), so the one name means
+/// the one thing on either side.
+const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = minimald::guest::HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN;
+
+/// The daemon's deny-all opt-out (NET-077): the `run` flag, or the
+/// [`EGRESS_DENY_ALL_OPT_OUT_ENV`] value `env` read through the one parse
+/// every opt-out reader shares — `1`, `true`, `yes` or `on`; anything else,
+/// or unset, keeps the deny-all default.
+fn egress_deny_all_opt_out(flag: bool, env: Option<&str>) -> bool {
+    flag || sessions::egress_deny_all_opt_out_from_raw(env)
 }
 
 /// An error at the top level of minimald.
@@ -334,6 +358,16 @@ fn main() -> Result<(), MainError> {
         std::process::exit(code);
     }
 
+    // As the microVM's init, fork the daemon off before anything else, while
+    // this process is still single-threaded: pid 1 stays behind and reaps
+    // the orphans every process in the guest is reparented to, which the
+    // daemon cannot do without stealing its own children's exit statuses
+    // (see `minimald::reaper`). Returns in the daemon only.
+    #[cfg(target_os = "linux")]
+    if is_minimal_microvm() {
+        minimald::reaper::split_init();
+    }
+
     let runtime = Builder::new_multi_thread()
         .thread_name("minimald-worker")
         .thread_stack_size(8 * 1024 * 1024)
@@ -342,8 +376,10 @@ fn main() -> Result<(), MainError> {
         .unwrap();
     let result = runtime.block_on(async_main());
 
-    // As the microVM's pid-1 we must not return: exiting init panics the guest
-    // kernel and wedges the VM (#730). Take the VM down instead — a clean
+    // As the microVM's daemon we must not return: exiting init panics the
+    // guest kernel and wedges the VM (#730), and when the daemon runs as pid
+    // 1's fork, pid 1 would only take the VM down after it, without this
+    // log line. Take the VM down here instead — a clean
     // shutdown (the `Shutdown` RPC drained the server) and a failed one alike,
     // since either way there is no init left to run. Diverges on success.
     #[cfg(target_os = "linux")]
@@ -493,11 +529,12 @@ async fn async_main() -> Result<(), MainError> {
                 // construction has nowhere to raise.
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
-                // The microVM's pid-1 has no flags to read: the guest runs
-                // the egress default its host's build ships — the rollout
-                // phase [`sessions::EGRESS_DEFAULT_PHASE`] carries — not
-                // opted out.
-                egress_deny_all_opt_out: false,
+                // The microVM's pid-1 has no flags to read, but the host
+                // hands it the operator's opt-out on the boot line (NET-077):
+                // the guest runs the egress default its host was started with
+                // — the rollout phase [`sessions::EGRESS_DEFAULT_PHASE`]
+                // carries — unless the operator opted out.
+                egress_deny_all_opt_out: guest::handed_egress_deny_all_opt_out(),
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -539,23 +576,34 @@ async fn async_main() -> Result<(), MainError> {
 
     let listen_args = cli.listen_args().unwrap();
 
-    // The node ports this daemon listens on, resolved once: the tokens the
-    // VM host handed on the boot line in a microVM, the CLI's otherwise.
-    // The read lives here, once the log sink is live, because a token
-    // present but unusable is a surfaced boot failure, not a fallback: the
-    // daemon would otherwise publish a listener the host's box table does
-    // not name (NET-025, NET-138) and strand every client pointed at the
-    // handed one. A handed pair that cannot bind — something in the guest
-    // already holds a port — fails the boot here too, probed in the bind
-    // base the daemon's own listeners use, rather than surfacing after
-    // READY, when the host already believes the VM healthy.
+    // The node ports this daemon listens on, resolved once: the hostname
+    // proxy's port from the token the VM host handed on the boot line in a
+    // microVM, the CLI's otherwise. The read lives here, once the log sink
+    // is live, because a token present but unusable is a surfaced boot
+    // failure, not a fallback: the daemon would otherwise publish a
+    // listener the host's box table does not name (NET-025, NET-138) and
+    // strand every client pointed at the handed one. A handed port that
+    // cannot bind — something in the guest already holds it — fails the
+    // boot here too, probed in the bind base the daemon's own listeners
+    // use, rather than surfacing after READY, when the host already
+    // believes the VM healthy.
+    //
+    // The answerer's half is `None` on a VM boot by construction, not by
+    // read: a VM-hosted daemon starts no zone answerer — the VM host
+    // daemon's host answerer owns the zone (NET-138) — so the boot line
+    // carries no answerer token and no port exists to report.
     let (hostname_proxy_port, zone_answerer_port) = if is_minimal_microvm() {
         let proxy = guest::handed_proxy_port().map_err(|e| MainError::Other(e.to_string()))?;
-        let answerer =
-            guest::handed_answerer_port().map_err(|e| MainError::Other(e.to_string()))?;
-        guest::probe_handed_node_ports(proxy, answerer)
-            .map_err(|e| MainError::IO(e, "binding the handed node ports"))?;
-        (proxy, answerer)
+        guest::probe_handed_node_port(proxy)
+            .map_err(|e| MainError::IO(e, "binding the handed node port"))?;
+        // The egress opt-out was read off the boot line once, at `Cli`
+        // construction; say what the guest runs with, so a diag bundle shows
+        // whether the deny-all default was opted out (NET-077).
+        tracing::info!(
+            egress_deny_all_opt_out = listen_args.egress_deny_all_opt_out,
+            "guest egress deny-all opt-out from the boot line"
+        );
+        (proxy, None)
     } else {
         (
             listen_args.hostname_proxy_port,
@@ -640,6 +688,11 @@ async fn async_main() -> Result<(), MainError> {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
+    // VM-wide kernel settings every session on the VM shares, before any box
+    // starts. Never on a native daemon: those are the host's to set.
+    if is_minimal_microvm() {
+        guest::apply_microvm_sysctls();
+    }
 
     // NET-079: the daemon's own classifier leaf, entered at start so its own
     // traffic is decided as the daemon's (NET-080), never classed with a
@@ -705,6 +758,53 @@ async fn async_main() -> Result<(), MainError> {
         ),
     }
 
+    // NET-079: the guest's own classifier boot, after the tree above exists
+    // and before the decision below reads it — the one host whose table this
+    // daemon loads itself, because its kernel is its image's alone and no
+    // person can run an installer inside a microVM. [`boot_guest_classifier`]
+    // runs it in the one order its halves can keep: loopback up first —
+    // nothing else in the boot has brought `lo` up by this point, and the
+    // probe's listener on 127.0.0.1 is a bind on an address a guest without
+    // its loopback up does not carry — then the listeners the effect probe
+    // connects to, held for the daemon's life because the probe's evidence
+    // is a port that is refused whenever a launch looks, not one the probe
+    // brings with it, then the load itself: the installer's table rendered
+    // for the tree this daemon just entered its own leaf of, checked with
+    // `nft -c`, loaded in one transaction, the presence marker written only
+    // once it loaded. The load logs its own outcome — check line and load
+    // line with the digest of the exact bytes it piped — and nothing here
+    // branches on it: the decision below is the fact's own reader, and a
+    // boot whose load failed reports the guest as unable to decide per box
+    // exactly as a native host without the step does.
+    if guest::is_microvm_daemon() {
+        // NET-078's two source identities are the guest's own address on a
+        // guest — the cohort and the node plane share it — but the render is
+        // told them as the two inputs they are, never left to assume.
+        let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
+        let render = minimald::net::classifier::GuestRender {
+            tree_root,
+            // The resolver every host-address box on the guest is pointed
+            // at, deny-all ones included: the node's DNS layer at the switch
+            // gateway, which the deny subtree's carve-out admits (NET-003).
+            gateway_resolver: minimald::net::DEFAULT_SUBNET.dns_server(),
+            cohort_address: identity,
+            node_plane_address: identity,
+            ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
+            mountinfo_override: None,
+        };
+        minimald::net::classifier::boot_guest_classifier(
+            guest::bring_up_loopback,
+            minimald::net::classifier::hold_probe_listeners,
+            || {
+                minimald::net::classifier::load_guest_table(
+                    std::path::Path::new(minimald::net::classifier::GUEST_BASH),
+                    std::path::Path::new(minimald::net::classifier::GUEST_NFT),
+                    &render,
+                )
+            },
+        );
+    }
+
     // NET-079: the start-time fact this daemon answers every create with —
     // whether this host can decide a host-address box's egress verdict per
     // box, and why not when it cannot. Read here with its probe attached,
@@ -731,6 +831,13 @@ async fn async_main() -> Result<(), MainError> {
         sandbox2::classifier::own_mountinfo().as_deref(),
         guest::is_microvm_daemon(),
     );
+    // The daemon's node half of per-box egress enforcement (NET-079): seeded
+    // here from the start-up read, so the daemon's first create answer
+    // already names this host, and refreshed by each host-address launch's
+    // own re-read — the state the create reply carries, the cause every
+    // surface's refusal gate answers over, and what lowers a box's own
+    // launch record to `none` when the host can no longer decide per box.
+    minimald::session_host::set_host_ip_enforcement_fact(&classifier_decision);
     if let Some(cause) = classifier_decision.cause() {
         tracing::info!(
             tree = sandbox2::classifier::TREE_ROOT,
@@ -905,7 +1012,7 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     // Setup the server config (shared by the UDS and vsock transports).
-    let config = Config {
+    let mut config = Config {
         host_key: HostKey::OnDisk {
             path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
                 .as_utf8_path()
@@ -937,11 +1044,18 @@ async fn async_main() -> Result<(), MainError> {
         // its own identity and with it its own /24 across restarts.
         daemon_identity_dir: Some(cli.client_instance_dir()),
         // NET-077: the deployment's opt-out of the deny-all egress default —
-        // the one daemon-side knob the default has.
-        deny_all_opt_out: cli
-            .listen_args()
-            .expect("the daemon path is `run`, which carries listen args")
-            .egress_deny_all_opt_out,
+        // the one daemon-side knob the default has: the flag, or its
+        // environment fallback, which a daemon `min` auto-starts inherits.
+        deny_all_opt_out: egress_deny_all_opt_out(
+            cli.listen_args()
+                .expect("the daemon path is `run`, which carries listen args")
+                .egress_deny_all_opt_out,
+            std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
+        ),
+        // Live: the create gate probes this process on every create
+        // (NET-141). The preflight below switches it off under
+        // `MINIMALD_USERNS_GATE=off`.
+        user_namespace_gate: minimald::server::UsernsGate::Live,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -965,50 +1079,40 @@ async fn async_main() -> Result<(), MainError> {
         known_hosts.as_utf8_path(),
     )?;
 
-    // Preflight (advisory): every session sandbox starts by unsharing an
-    // unprivileged user namespace, forked from this process with no exec in
-    // between — so this process's own privileges and AppArmor label are what
-    // the kernel will check. On a restricted host (stock Ubuntu 24.04+ with
-    // an unconfined daemon) that denial otherwise surfaces only when the
-    // first attach dies writing /proc/self/uid_map, with nothing useful in
-    // this log. Warn once at startup instead, with the fix. The in-guest
-    // microVM daemon runs as root, where no restriction binds, so this stays
-    // silent on the vsock path.
+    // Preflight: every session sandbox starts by unsharing an unprivileged
+    // user namespace, forked from this process with no exec in between — so
+    // this process's own privileges and AppArmor label are what the kernel
+    // will check. On a restricted host (stock Ubuntu 24.04+ with an
+    // unconfined daemon) that denial otherwise surfaces only when the first
+    // attach dies writing /proc/self/uid_map. The create gate (NET-141)
+    // refuses every session with the cause and the remedy before allocating
+    // anything, re-probing on each create so a remedy applied to the running
+    // host takes effect without a restart; this start-up read only warns
+    // once in the log. `MINIMALD_USERNS_GATE=off` switches the gate off for
+    // a daemon that must run anyway — the escape hatch for a probe that
+    // misreads a host — and is itself warned about, since the session then
+    // fails at its first attach instead. The in-guest microVM daemon runs
+    // as root, where no restriction binds, so this stays silent on the
+    // vsock path.
     #[cfg(target_os = "linux")]
-    if let Some(restriction) = sandbox2::user_namespaces_restriction() {
-        let fix = match restriction {
-            sandbox2::UsernsRestriction::ApparmorUnconfined => {
-                // The loader lands under the installer's `data` prefix, which
-                // resolves through $XDG_DATA_HOME exactly like
-                // `paths::minimal_data_dir` — don't hardcode ~/.local/share.
-                // A daemon at a path outside the profile's tunable (a custom
-                // MINIMAL_BIN, a dev build) needs the binary attached too.
-                format!(
-                    "install minimald's AppArmor profile (one-time, needs root): sudo bash \
-                     {data}/apparmor/install-apparmor-profile.sh --path {bin} (from a checkout: \
-                     sudo scripts/install-apparmor-profile.sh --path {bin})",
-                    data = paths::minimal_data_dir(),
-                    bin = std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.to_str().map(str::to_owned))
-                        .unwrap_or_else(|| "<path to this minimald binary>".to_string()),
-                )
-            }
-            sandbox2::UsernsRestriction::Disabled => {
-                "re-enable user namespaces, e.g. sudo sysctl -w user.max_user_namespaces=15000"
-                    .to_string()
-            }
-            // `UsernsRestriction` is #[non_exhaustive]; future variants get
-            // the docs pointer until a matching remediation lands here.
-            _ => "see the linux-host-setup doc".to_string(),
-        };
-        tracing::warn!(
-            reason = %restriction,
-            fix,
-            docs = "https://docs.minimal.dev/reference/linux-host-setup",
-            "sessions will fail to start: this host refuses the unprivileged user \
-             namespace every session sandbox needs"
-        );
+    {
+        const USERNS_GATE_ENV: &str = "MINIMALD_USERNS_GATE";
+        if std::env::var(USERNS_GATE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
+            config.user_namespace_gate = minimald::server::UsernsGate::Off;
+            tracing::warn!(
+                env = USERNS_GATE_ENV,
+                "user-namespace gate switched off: a session this host refuses the namespace \
+                 for fails at its first attach instead of at create"
+            );
+        } else if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+            tracing::warn!(
+                reason = %restriction,
+                fix = minimald::userns_restriction_fix(restriction),
+                docs = "https://docs.minimal.dev/reference/linux-host-setup",
+                "sessions will fail to start: this host refuses the unprivileged user \
+                 namespace every session sandbox needs"
+            );
+        }
     }
 
     // Track the host's wall clock, when configured.
@@ -1178,33 +1282,20 @@ fn set_vsock_rx_window(listener: &VsockListener, bytes: u64) -> std::io::Result<
         .ok_or_else(std::io::Error::last_os_error)
 }
 
-/// Whether this process is the microVM's init: the kernel runs the initramfs
-/// `/init` (this binary) as pid-1.
+/// Whether this process is the microVM's daemon: the initramfs `/init` the
+/// kernel ran as pid-1, or the daemon it forked off (see
+/// [`minimald::reaper`]).
 ///
-/// Both halves are load-bearing, because this now also gates `reboot(2)` (see
-/// [`minimald::guest::shut_down_vm`]). `argv[0]` is caller-controlled — a host
-/// could run `exec -a init minimald`, and with `CAP_SYS_BOOT` that would reset
-/// the machine on exit — so it cannot be trusted alone. pid-1 cannot be spoofed
-/// from userspace, but a native daemon running as a container's init would
-/// satisfy it, so it is not sufficient alone either. Only the microVM's init
-/// satisfies both.
+/// This also gates `reboot(2)` (see [`minimald::guest::shut_down_vm`]), so
+/// it must not be spoofable: [`minimald::guest::is_microvm_daemon`] requires
+/// pid-1 *and* an `argv[0]` of `init`, or the mark only that process sets.
 fn is_minimal_microvm() -> bool {
-    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
-}
-
-/// Pure form of [`is_minimal_microvm`], so the spoofing cases are testable —
-/// neither a process's pid nor its `argv[0]` can be set from within a test.
-fn is_microvm_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
-    pid == 1
-        && argv0
-            .map(|a0| std::path::Path::new(a0).file_name() == Some(std::ffi::OsStr::new("init")))
-            .unwrap_or(false)
+    minimald::guest::is_microvm_daemon()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
     /// Builds a `Cli` for a native (UDS) daemon with deterministic state and
     /// cache overrides, so path-derived assertions do not depend on the
@@ -1238,6 +1329,23 @@ mod tests {
                 num_parallel_builds: None,
             },
         }
+    }
+
+    /// NET-077: a native daemon `min` auto-starts with no flag keeps an
+    /// opt-out the operator exported, through the shared parse; the flag
+    /// alone still opts out, and any other value keeps the default.
+    #[test]
+    fn egress_opt_out_falls_back_to_the_environment() {
+        assert_eq!(
+            EGRESS_DENY_ALL_OPT_OUT_ENV,
+            "MINIMALD_EGRESS_DENY_ALL_OPT_OUT"
+        );
+        assert!(egress_deny_all_opt_out(true, None));
+        assert!(egress_deny_all_opt_out(false, Some("1")));
+        assert!(egress_deny_all_opt_out(false, Some(" On ")));
+        assert!(!egress_deny_all_opt_out(false, None));
+        assert!(!egress_deny_all_opt_out(false, Some("0")));
+        assert!(!egress_deny_all_opt_out(false, Some("off")));
     }
 
     #[test]
@@ -1286,28 +1394,5 @@ mod tests {
             sock.as_str(),
             "/tmp/minimald-test-state/providers/local-minimald3/ssh.sock"
         );
-    }
-
-    #[test]
-    fn the_microvm_init_is_pid_1_named_init() {
-        assert!(is_microvm_init(1, Some(OsStr::new("/init"))));
-        assert!(is_microvm_init(1, Some(OsStr::new("init"))));
-    }
-
-    /// The guard gates `reboot(2)`: a host process that merely *claims* to be
-    /// init (`exec -a init minimald`) must not reach it.
-    #[test]
-    fn a_spoofed_argv0_on_the_host_is_not_the_microvm_init() {
-        assert!(!is_microvm_init(4242, Some(OsStr::new("/init"))));
-        assert!(!is_microvm_init(4242, Some(OsStr::new("init"))));
-    }
-
-    /// pid-1 alone is not enough either: a native daemon can be a container's
-    /// init, and it must keep exiting normally rather than resetting the box.
-    #[test]
-    fn pid_1_under_another_name_is_not_the_microvm_init() {
-        assert!(!is_microvm_init(1, Some(OsStr::new("/usr/bin/minimald"))));
-        assert!(!is_microvm_init(1, Some(OsStr::new("minimald"))));
-        assert!(!is_microvm_init(1, None));
     }
 }

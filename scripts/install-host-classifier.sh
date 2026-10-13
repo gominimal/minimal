@@ -17,11 +17,12 @@
 # point of the barrier.
 #
 # Usage:
-#   sudo scripts/install-host-classifier.sh [--user NAME] [--root DIR]
+#   sudo scripts/install-host-classifier.sh [--user NAME|UID] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
-#         [--ct-mark-mask 0x30000000]
-#         --cohort-address ADDR --node-plane-address ADDR
+#         [--gateway-resolver ADDR] [--ct-mark-mask 0x30000000]
+#         [--cohort-address ADDR --node-plane-address ADDR]
 #   sudo scripts/install-host-classifier.sh --pid PID
+#   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
 #   sudo scripts/install-host-classifier.sh --uninstall
 #        scripts/install-host-classifier.sh --check           # unprivileged
 #        scripts/install-host-classifier.sh --print-ruleset   # unprivileged
@@ -32,7 +33,11 @@
 # stand-in tree. --pid places the running daemon in the slice's daemon
 # leaf: the one migration the delegated account cannot make itself,
 # because the common ancestor of the cgroup the daemon starts in and the
-# slice is the root-owned hierarchy root.
+# slice is the root-owned hierarchy root. --place-listener makes the same
+# placement for every process of the delegated account that holds the unix
+# socket at SOCK — the daemon's own listener — so a manager-held path unit
+# watching that socket (`min finalize-install` installs one) places each
+# daemon the account starts, and no restart needs a root step of its own.
 #
 # The install also lays out the cohort's two subtrees, boxes/deny and
 # boxes/allow — a box's declaration, not its session name, decides which
@@ -57,10 +62,13 @@
 # only the mask's two bits, so bits another component already classes
 # with survive untouched. Its postrouting chain translates by that
 # mark, giving the boxes cohort and the rest of the slice their two
-# source identities (--cohort-address and --node-plane-address, both
-# required: they are this host's to know, and a table that refuses a
-# deny-all box's connections while its cohort keeps the host's own
-# source identity is half of the classification), each with a `lo`
+# source identities (--cohort-address and --node-plane-address, given
+# together or not at all: an un-enrolled native host has no egress
+# gateway reading a source address, so it translates nothing and the two
+# identities are the classify chain's two matches alone — the cgroup
+# subtree and the slice's remainder — while an association later adds the
+# reserved addresses to those same matches; one identity without the
+# other is half of the classification and is refused), each with a `lo`
 # guard so a packet to the answerer is never rewritten. Rules are keyed
 # on the cgroups' paths and the connection mark alone — never a uid or
 # pid, which a box could change about itself — and nothing is per-box:
@@ -100,10 +108,32 @@ readonly TABLE_NAME=minimal_class
 # way, so the two read one fact — and an uninstall and a check read it
 # back by prefix, never by the default value.
 readonly MASK_RECORD_PREFIX=ct-mark-mask-
+# The resolver carve-out the loaded table admits, recorded beside the
+# marker as "$CARVE_OUT_RECORD_PREFIX<address>-<port>" so the daemon can
+# refuse a deny-all box whose carve-out no longer names its live answerer.
+# A table rendered with --gateway-resolver carves out the node's DNS layer
+# at the gateway, not an answerer, and records none.
+readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
+
+# sha256_of <text> — the digest of exactly the bytes handed to it: the hex
+# field alone, because sha256sum spells its output "<hex>  -" and shasum
+# "<hex> -". shasum is the macOS spelling of the same sum, so a rehearsal
+# on a Mac digests like an install on a Linux host; neither being there is
+# this step's own failure to name, before anything loads.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum="$(printf '%s' "$1" | sha256sum)"
+    elif command -v shasum >/dev/null 2>&1; then
+        sum="$(printf '%s' "$1" | shasum -a 256)"
+    else
+        die "cannot digest the ruleset: this step needs sha256sum (or shasum) to name the sha256 of the bytes it loads"
+    fi
+    printf '%s' "${sum%% *}"
+}
 
 # Rehearsal posture (set iff the stand-in mountinfo below is in play): the
 # caller created the stand-in tree, so the one fact it cannot represent is
@@ -122,12 +152,27 @@ tree_root=$DEFAULT_TREE_ROOT
 # carve-out is by address and port, never loopback-wide).
 answerer_address=127.0.0.1
 answerer_port=7656
+# --gateway-resolver ADDR renders the carve-out a VM-backed guest needs
+# instead of the answerer's: the resolver Minimal owns for a box there is
+# the node's DNS layer at the switch gateway (NET-003), which every box's
+# lookups reach on DNS's own port, so deny_out admits ADDR on port 53 over
+# UDP and TCP (a truncated answer retries over TCP) and nothing is
+# retargeted, because the box already asks the address the rule admits.
+# The address and port, never the address alone: the gateway is also the
+# switch's control surface, and the carve-out is the resolver, not it.
+gateway_resolver=
+answerer_given=
 # The cohort's and the node plane's source identities (NET-078). They are
-# this host's to know, not the script's to guess: each SNAT rule is rendered
-# only when its address was given, and the two go together — half a
-# classification is one identity wearing two names.
+# this host's to know, not the script's to guess: the SNAT rules are
+# rendered only when the addresses were given, and the two go together —
+# half a classification is one identity wearing two names. Neither given
+# is the un-enrolled host: the identities are the classify chain's two
+# cgroup matches, translated to nothing.
 cohort_address=
 node_plane_address=
+# The unix socket --place-listener reads the daemon's pid from: every
+# process of the delegated account holding it is placed in the daemon leaf.
+listener=
 # The two ct-mark bits the classify chain classifies with (see the
 # constants above); require_mask checks the value and derives every
 # spelling the ruleset renders from it.
@@ -151,6 +196,7 @@ while [ $# -gt 0 ]; do
         --answerer-address)
             [ $# -ge 2 ] || die "--answerer-address needs an address"
             answerer_address=$2
+            answerer_given=1
             shift 2
             ;;
         --answerer-port)
@@ -159,6 +205,7 @@ while [ $# -gt 0 ]; do
                 die "--answerer-port needs a numeric port, got: $2" ;;
             esac
             answerer_port=$2
+            answerer_given=1
             shift 2
             ;;
         --cohort-address)
@@ -176,6 +223,11 @@ while [ $# -gt 0 ]; do
             ct_mark_mask=$2
             shift 2
             ;;
+        --gateway-resolver)
+            [ $# -ge 2 ] || die "--gateway-resolver needs an address"
+            gateway_resolver=$2
+            shift 2
+            ;;
         --uninstall) mode=uninstall; shift ;;
         --check)     mode=check; shift ;;
         --print-ruleset) mode=print_ruleset; shift ;;
@@ -188,21 +240,48 @@ while [ $# -gt 0 ]; do
             mode=place
             shift 2
             ;;
+        --place-listener)
+            [ $# -ge 2 ] || die "--place-listener needs a socket path"
+            listener=$2
+            mode=place_listener
+            shift 2
+            ;;
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,77p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,85p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+# A render whose carve-out is the gateway's resolver has no answerer to
+# name, so a call that names one asked for two carve-outs at once.
+if [ -n "$gateway_resolver" ] && [ -n "$answerer_given" ]; then
+    die "--gateway-resolver carves out the gateway's resolver, not an answerer: drop --answerer-address and --answerer-port"
+fi
 
 # The account the tree is delegated to, and the one whose boxes it is:
 # --user wins, else the account that ran sudo, else there is no default worth
 # guessing — delegating to root would hand every box a way to write the tree.
 resolve_owner() {
     if [ -n "$user" ]; then
-        owner_uid="$(id -u "$user")" || die "no such account: $user"
-        owner_gid="$(id -g "$user")" || die "no such account: $user"
+        case "$user" in ''|*[!0-9]*)
+            owner_uid="$(id -u "$user")" || die "no such account: $user"
+            owner_gid="$(id -g "$user")" || die "no such account: $user"
+            ;;
+        *)
+            # A numeric uid needs no passwd entry for its uid, but its group
+            # is the account's own: take it from the account when there is
+            # one, and from the caller only when the caller is that uid (an
+            # unprivileged rehearsal under a uid with no passwd entry).
+            owner_uid=$user
+            if ! owner_gid="$(id -g "$user" 2>/dev/null)"; then
+                [ "$user" = "$(id -u)" ] ||
+                    die "no account with uid $user to take a group from: pass --user NAME"
+                owner_gid="$(id -g)"
+            fi
+            ;;
+        esac
     elif [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
         owner_uid=$SUDO_UID
         owner_gid=$SUDO_GID
@@ -285,18 +364,29 @@ do_check() {
     resolve_owner
     # The fix for a missing tree is the install, not a re-check: hint the
     # caller's own invocation with --check dropped, keeping whatever --root
-    # and --user they asked about. The two source identities the install
-    # refuses to run without (see require_identities) are appended for
-    # whichever this check was not told — the hint must be the command an
-    # install would accept, so copy-pasting it lands on the refusal the
-    # install makes of a half-told classification, never a refusal of the
-    # hint's own shape.
+    # and --user they asked about. Nothing is appended for it: an install
+    # told no source identity is the un-enrolled host's own, so the hint is
+    # a command the install accepts as it stands, never one with a
+    # placeholder the caller has no value for. A lone identity is one the
+    # install refuses, so the hint drops it too rather than hint a command
+    # that dies.
+    lone_identity=
+    if { [ -n "$cohort_address" ] && [ -z "$node_plane_address" ]; } ||
+        { [ -z "$cohort_address" ] && [ -n "$node_plane_address" ]; }; then
+        lone_identity=1
+    fi
     hint_args=()
-    for a in "${original_args[@]}"; do [ "$a" = --check ] || hint_args+=("$a"); done
-    [ -n "$cohort_address" ] ||
-        hint_args+=(--cohort-address "<cohort address>")
-    [ -n "$node_plane_address" ] ||
-        hint_args+=(--node-plane-address "<node-plane address>")
+    skip_value=
+    for a in "${original_args[@]}"; do
+        if [ -n "$skip_value" ]; then skip_value=; continue; fi
+        case "$a" in
+        --check) continue ;;
+        --cohort-address | --node-plane-address)
+            if [ -n "$lone_identity" ]; then skip_value=1; continue; fi
+            ;;
+        esac
+        hint_args+=("$a")
+    done
     hint="sudo $0${hint_args[0]+ }${hint_args[*]-}"
     if covering="$(covering_mount "$tree_root")"; then
         read -r covering_point nsdel nsroot <<<"$covering"
@@ -385,7 +475,7 @@ place_daemon() {
     verify_mount
     procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
     if [ ! -e "$procs" ]; then
-        die "$tree_root/$DAEMON_LEAF is not installed (run: sudo $0 --user <the account minimald runs as>)"
+        die "$tree_root/$DAEMON_LEAF is not installed (run: min finalize-install)"
     fi
     kill -0 "$pid" 2>/dev/null ||
         die "no process $pid: pass the pid of the running minimald (its startup line names the tree it is outside)"
@@ -393,7 +483,126 @@ place_daemon() {
         die "cannot place $pid in $procs (is $pid a process root may move, and is it the running minimald?)"
     note "placed $pid in $tree_root/$DAEMON_LEAF"
     note "the running minimald is inside the slice now: the placement probe runs per launch, so the next box it launches is placed in a leaf of its own"
-    note "a plain restart loses this placement — a new minimald starts in its starter's cgroup unless a Delegate=yes unit starts it in the slice, so pass --pid again afterwards"
+    note "a plain restart loses this placement — a new minimald starts in its starter's cgroup unless a Delegate=yes unit starts it in the slice or the placement unit \`min finalize-install\` installs places it, so pass --pid again afterwards where neither is in force"
+}
+
+# The process table --place-listener reads: the real one, or a stand-in a
+# rehearsal lays out in the shape of /proc — <pid>/status, <pid>/fd/* and
+# net/unix — so an unprivileged test can pin which holder is placed and
+# which is left alone without a kernel to hold a socket.
+readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
+
+# place_listener — the --pid placement for every process of the delegated
+# account that holds the unix socket at $listener: the daemon's own
+# listener names the daemon without anyone having to read its pid, so the
+# manager-held path unit `min finalize-install` installs can make the
+# placement at every start the socket announces. The holders are read the
+# way the kernel states them — the socket's inode from net/unix, then every
+# process whose fd table carries it — never from a pidfile the account
+# could write any pid into. Only the delegated account's own processes are
+# placed: root moving a process of uid U into a cgroup delegated to U gives
+# U nothing it does not already own, and nothing of anyone else's is ever
+# moved. And only a process standing OUTSIDE the slice is moved: a box runs
+# as the same account and could bind a socket spelled like the listener,
+# so a holder already anywhere under the slice — a box in its leaf first of
+# all — is left where it is, because moving it into the daemon's leaf would
+# lift it out of its verdict (design §4.1: a box's placement is
+# inescapable, by root's hand as much as its own). A socket nobody holds is
+# nothing to place and exits 0: the unit fires on the socket's removal too,
+# and that is not a failure.
+place_listener() {
+    verify_mount
+    resolve_owner
+    compute_cgroup_paths
+    procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
+    [ -e "$procs" ] ||
+        die "$tree_root/$DAEMON_LEAF is not installed (run: min finalize-install)"
+    [ -r "$PROC/net/unix" ] || die "cannot read the unix socket table at $PROC/net/unix"
+    # net/unix: "Num RefCount Protocol Flags Type St Inode Path"; the
+    # listener's path may be bound more than once over a daemon's life (a
+    # stale entry outlives nothing here, but the match is by inode, so each
+    # live one is placed and a dead one simply has no holder).
+    inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
+    if [ -z "$inodes" ]; then
+        note "no process holds $listener: nothing to place"
+        return 0
+    fi
+    # The holders, one pass over every fd table per inode (find walks it
+    # without a fork per descriptor; the unit runs this as root on every
+    # start, so the scan must be cheap). A daemon that restarts while the
+    # scan runs is a holder that vanishes under it, and the manager does
+    # not watch the path while the oneshot is active, so a vanished holder
+    # is noted, never fatal, and a socket whose holder was not found is
+    # looked for once more after a moment before it reads as unheld.
+    holders="$(listener_holders)"
+    if [ -z "$holders" ]; then
+        sleep 1
+        holders="$(listener_holders)"
+        note "no holder of $listener was found on the first pass; scanned again"
+    fi
+    placed=0
+    for holder_pid in $holders; do
+        dir="$PROC/$holder_pid"
+        # The real uid, the first of the four status reports.
+        holder_uid="$(awk '$1 == "Uid:" { print $2 }' "$dir/status" 2>/dev/null || true)"
+        if [ "$holder_uid" != "$owner_uid" ]; then
+            note "left $holder_pid alone: it holds $listener but runs as uid ${holder_uid:-?}, not the delegated account $owner_uid"
+            continue
+        fi
+        if grep -qx "$holder_pid" "$procs" 2>/dev/null; then
+            note "$holder_pid is already in $tree_root/$DAEMON_LEAF"
+            placed=$((placed + 1))
+            continue
+        fi
+        # Where the holder stands now, as the kernel states it (the unified
+        # hierarchy's one "0::" line). Unreadable is unknown, and unknown
+        # is not moved.
+        holder_cgroup="$(awk -F: '$1 == "0" { print $3 }' "$dir/cgroup" 2>/dev/null || true)"
+        if [ -z "$holder_cgroup" ]; then
+            note "left $holder_pid alone: it holds $listener but its cgroup could not be read"
+            continue
+        fi
+        case "$holder_cgroup" in
+        "/$rel" | "/$rel/"*)
+            note "left $holder_pid alone: it holds $listener but already stands inside the slice at $holder_cgroup, and nothing under $rel is ever moved"
+            continue
+            ;;
+        esac
+        if printf '%s\n' "$holder_pid" >"$procs" 2>/dev/null; then
+            note "placed $holder_pid in $tree_root/$DAEMON_LEAF (it holds $listener)"
+            placed=$((placed + 1))
+        else
+            note "could not place $holder_pid in $procs: it has gone, or is not a process root may move"
+        fi
+    done
+    # The closing line is the one a person reads last, so it states what
+    # happened: an unheld socket, or holders that were each left alone for
+    # the reason noted above.
+    if [ -z "$holders" ]; then
+        note "no process holds $listener: nothing to place"
+    elif [ "$placed" -eq 0 ]; then
+        note "every holder of $listener was left where it stands, for the reasons above: nothing placed"
+    fi
+}
+
+# listener_holders — the pids whose fd tables carry one of $inodes, found by
+# one find per inode over every process's fd directory (the pid is the path
+# component after $PROC), each printed once. The brackets are escaped: a
+# find -lname pattern is a glob.
+listener_holders() {
+    for inode in $inodes; do
+        # find's exit status is not evidence here: a process that exits, or a
+        # descriptor any process closes, between find listing an fd table and
+        # reading an entry of it makes find exit non-zero, on a host where
+        # nothing is wrong. Under pipefail that status would end the unit,
+        # so it is dropped; what find printed is the scan.
+        find "$PROC"/[0-9]*/fd -lname "socket:\\[$inode\\]" 2>/dev/null || true
+    done | awk -v proc="$PROC/" '
+        index($0, proc) == 1 {
+            rest = substr($0, length(proc) + 1)
+            split(rest, part, "/")
+            if (!(part[1] in seen)) { seen[part[1]] = 1; print part[1] }
+        }'
 }
 
 # The cgroups' paths as the packet filter spells them: relative to the
@@ -436,7 +645,9 @@ cgroup_level() {
 # retargets the deny subtree's DNS-port lookups on the answerer's address
 # onto the answerer's own port: a deny-all box resolves through the
 # answerer (NET-079) by asking DNS's port like any resolver would, and the
-# one destination its deny rule admits is the one its lookups reach.
+# one destination its deny rule admits is the one its lookups reach. A
+# render with --gateway-resolver has no dstnat chain: the box's lookups
+# already go to the gateway's port 53, the destination deny_out admits.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -470,8 +681,32 @@ cgroup_level() {
 # The postrouting chain translates by the mark, not the socket, with a
 # `lo` guard on each SNAT: a packet to the answerer never leaves the host,
 # so translating its source would rewrite the reply the conntrack entry
-# already knows.
+# already knows. Rendered with no source identity it holds no rule: the
+# un-enrolled host's two identities are the classify chain's matches and
+# nothing is translated, and the chain stands so an association can add
+# the reserved addresses to the same two marks without a reinstall.
 render_ruleset() {
+    carve_out_rule=
+    dstnat_chain=
+    snat_rules=
+    if [ -n "$cohort_address" ]; then
+        snat_rules="
+        ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
+        ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
+    fi
+    if [ -n "$gateway_resolver" ]; then
+        carve_out_rule="
+        ip daddr $gateway_resolver udp dport 53 accept
+        ip daddr $gateway_resolver tcp dport 53 accept"
+    else
+        carve_out_rule="
+        ip daddr $answerer_address udp dport $answerer_port accept"
+        dstnat_chain="
+    chain dstnat {
+        type nat hook output priority dstnat; policy accept;
+        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
+    }"
+    fi
     cat <<RULES
 add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
@@ -482,38 +717,34 @@ table inet $TABLE_NAME {
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
     }
     chain deny_out {
-        ct state established,related ct direction reply accept
-        ip daddr $answerer_address udp dport $answerer_port accept
+        ct state established,related ct direction reply accept$carve_out_rule
         limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
         reject with icmpx admin-prohibited
-    }
-    chain dstnat {
-        type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
-    }
+    }$dstnat_chain
     chain classify {
         type filter hook output priority mangle; policy accept;
         ct state new socket cgroupv2 level $(cgroup_level "$boxes_path") "$boxes_path" ct mark set ct mark and $clear_hex or $cohort_hex
         ct state new ct mark and $mask_hex == 0 socket cgroupv2 level $(cgroup_level "$rel") "$rel" ct mark set ct mark and $clear_hex or $node_hex
     }
     chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ct mark and $mask_hex == $cohort_hex oifname != "lo" snat ip to $cohort_address
-        ct mark and $mask_hex == $node_hex oifname != "lo" snat ip to $node_plane_address
+        type nat hook postrouting priority srcnat; policy accept;$snat_rules
     }
 }
 RULES
 }
 
 # require_identities — the cohort's and the node plane's source identities
-# are this host's to know, not the script's to guess, and not optional to the
-# classification: a table that refuses a deny-all box's connections while its
-# cohort leaves with the host's own source identity is half of NET-078
-# wearing the other half's name, so an install refuses to render half of
-# it. They go together or the install does not run.
+# are this host's to know, not the script's to guess, and they go together:
+# a table that translates its cohort while the rest of the slice leaves
+# with the host's own source identity is half of NET-078 wearing the other
+# half's name, so an install refuses to render half of it. Neither given is
+# whole too — the un-enrolled host, whose identities are the classify
+# chain's two cgroup matches with no translation, because no egress gateway
+# reads a source address until an association exists.
 require_identities() {
-    if [ -z "$cohort_address" ] || [ -z "$node_plane_address" ]; then
-        die "the install needs both source identities: pass --cohort-address ADDR (what the boxes cohort leaves as) and --node-plane-address ADDR (what the rest of the slice leaves as)"
+    if { [ -z "$cohort_address" ] && [ -n "$node_plane_address" ]; } ||
+        { [ -n "$cohort_address" ] && [ -z "$node_plane_address" ]; }; then
+        die "the install needs both source identities or neither: pass --cohort-address ADDR (what the boxes cohort leaves as) and --node-plane-address ADDR (what the rest of the slice leaves as) together, or neither for an un-enrolled host"
     fi
 }
 
@@ -692,6 +923,11 @@ if [ "$mode" = place ]; then
     exit 0
 fi
 
+if [ "$mode" = place_listener ]; then
+    place_listener
+    exit 0
+fi
+
 if [ "$mode" = uninstall ]; then
     # The table first: it is this step's own artifact and it outlives the
     # cgroups it is keyed on — a table left loaded over a removed tree
@@ -711,7 +947,7 @@ if [ "$mode" = uninstall ]; then
     # The mask records go with the marker they were written beside, read
     # back by prefix so whatever mask an install chose comes away with its
     # install, never a record left vouching for a table that is gone.
-    for record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
+    for record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
         [ -d "$record" ] || continue
         rmdir "$record" 2>/dev/null || true
     done
@@ -800,18 +1036,20 @@ fi
 # loaded table classifies with reads the step as not installed — so a
 # re-install that cannot remove the records it is about to replace dies
 # before touching the table, exactly as it does for the marker.
-for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
+for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
     [ -d "$stale_record" ] || continue
     rmdir "$stale_record" 2>/dev/null ||
-        die "cannot remove the previous ct-mark mask record at $stale_record: a re-install must leave no record beside a table it did not load"
+        die "cannot remove the previous record at $stale_record: a re-install must leave no record beside a table it did not load"
 done
-ruleset="$(mktemp)"
-render_ruleset >"$ruleset"
-if ! nft -f "$ruleset"; then
-    rm -f "$ruleset"
-    die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
-fi
-rm -f "$ruleset"
+# Render into a variable first, so nothing that touches a disk can sit between
+# rendering and loading. The captured text is byte for byte what render_ruleset
+# wrote: `read -d ''` with an empty delimiter reads without a terminator, so
+# every trailing newline survives (a command substitution would strip them and
+# the digest below would then cover different bytes than nft received).
+IFS= read -r -d '' ruleset < <(render_ruleset) || true
+ruleset_sha256="$(sha256_of "$ruleset")"
+printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
+note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over exactly the bytes piped to nft"
 
 # The presence marker the daemon probes at start, and the ct-mark mask
 # recorded beside it: on real cgroupfs a plain file cannot exist, so each
@@ -824,6 +1062,12 @@ rm -f "$ruleset"
 # at. The record is written first and the marker last, so the marker is
 # the commit point: it is never there without the mask beside it, and a
 # daemon that reads it also reads the one value the table classifies by.
+if [ -z "$gateway_resolver" ]; then
+    carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
+    mkdir "$carve_out_record" 2>/dev/null ||
+        [ -d "$carve_out_record" ] ||
+        die "cannot record the table's resolver carve-out at $carve_out_record"
+fi
 mask_record="$tree_root/$MASK_RECORD_PREFIX$mask_hex"
 mkdir "$mask_record" 2>/dev/null ||
     [ -d "$mask_record" ] ||
@@ -834,13 +1078,25 @@ mkdir "$tree_root/$TABLE_MARKER" 2>/dev/null ||
 
 note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
-note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+if [ -n "$gateway_resolver" ]; then
+    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the node's DNS layer at $gateway_resolver:53"
+else
+    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+fi
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
-note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
-note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
+if [ -n "$gateway_resolver" ]; then
+    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the gateway's resolver at $gateway_resolver:53 over udp and tcp, and the refusal is active, never a silent drop"
+else
+    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
+fi
+if [ -n "$cohort_address" ]; then
+    note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
+else
+    note "no source identity was given, so nothing is translated: the boxes cohort and the rest of the slice are the two classifier matches, and an association adds the reserved addresses to them without a reinstall"
+fi
 note "classified the cohort and the node plane on the ct-mark bits $mask_hex: the ruleset this host carried used neither, and a re-install rescans before it loads"
 note "wrote the table's presence marker at $tree_root/$TABLE_MARKER with the ct-mark mask $mask_hex recorded beside it: minimald records a per-box verdict only while both are there"
 note "the cgroup2 mount above the slice stays root-owned"
-note "place the running daemon next: sudo $0 --pid <pid of minimald> (or start it from a Delegate=yes unit)"
+note "place the running daemon next: sudo $0 --pid <pid of minimald>, or let the placement unit \`min finalize-install\` installs place it at every start (or start it from a Delegate=yes unit)"
 note "once minimald is in the slice, each box it launches runs in a leaf of its own; its launch log names the leaf each box entered"

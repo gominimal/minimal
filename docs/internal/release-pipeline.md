@@ -209,6 +209,7 @@ meet the policy yet.
 | Artifact | How the release run tests it |
 | --- | --- |
 | Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
+| `minzoned` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-zoned-links.sh`](../../scripts/check-zoned-links.sh)) on the binary it built. The release workflow runs the gate again on every renamed and signed artifact before upload. On macOS it also checks the signature against the designated requirement that `min` uses. |
 | amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
 | arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
 | macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
@@ -290,11 +291,13 @@ whose `package.version` is stale or not above the newest `v*` tag.
   The job checks that each binary is static and that `minvmd` contains the
   KVM backend.
 - `build-release-macos-arm64` runs on the self-hosted Apple Silicon runner
-  when `RUN_MACOS_CI` is not `false`. It builds `minvmd` and `min`, changes
-  the libkrun link path in `minvmd` to `@rpath`
+  when `RUN_MACOS_CI` is not `false`. It builds `minvmd`, `min`, and
+  `minzoned`, changes the libkrun link path in `minvmd` to `@rpath`
   ([`scripts/rewrite-macos-linkage.sh`](../../scripts/rewrite-macos-linkage.sh)),
-  and checks that `min` links only system libraries. It signs both binaries
-  with the Developer ID, the hardened runtime, and a timestamp.
+  and checks that `min` and `minzoned` link only system libraries. It
+  signs `minvmd`, `min`, and `minzoned` with the Developer ID, the
+  hardened runtime, and a timestamp. Then it notarizes all of them. See the
+  **Notarization** paragraph below.
 - `build-libkrun-macos-arm64` builds the `libkrun.1.dylib` for macOS users on
   a hosted runner. `sign-macos-artifacts` signs it and the macOS `gvproxy`
   with the Developer ID on the self-hosted runner.
@@ -306,6 +309,145 @@ whose `package.version` is stale or not above the newest `v*` tag.
 - `compute-version-string` reads the version from a built binary. The GitHub
   Release name uses it. On a versioned run, the job checks that it equals the
   release version.
+
+**minzoned.** Every release that publishes `min` must also publish the
+box-zone answerer binary. The session-start advisory (NET-122) copies it
+into a root-owned host-service path. The scripts in this repository do their
+half of the work:
+
+- [`scripts/dist-build.sh`](../../scripts/dist-build.sh) builds `minzoned`
+  in its own cargo invocation. A build beside `-p minvmd` or a `--workspace`
+  build unifies the KVM backend into the binary, and a root host service must
+  never contain it. The script then runs the link gate
+  ([`scripts/check-zoned-links.sh`](../../scripts/check-zoned-links.sh))
+  on the binary. Every library must resolve from a system directory. The
+  binary must have no embedded search path, and its interpreter must be a
+  system loader. If the gate fails, the build fails.
+- [`scripts/stage-release.sh`](../../scripts/stage-release.sh) stages
+  `bin/minzoned` beside `bin/min` on every platform that has `min`. The
+  staged copy is only the source that the advisory copies. No unit file and
+  no `launchd` property list refers to it at its user-writable path.
+- [`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) and
+  [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) put
+  `/usr/bin/minzoned` in every `.deb`, `.rpm`, and `.apk`. The packages
+  do not install a service. The advisory's privileged command is the only
+  privileged step.
+- [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
+  and replaces it on upgrade, like every other `bin` row.
+
+*Still optional in the scripts.* The release workflow uploads `minzoned`
+on every platform, but `stage-release.sh` and `package-nfpm.sh` still accept
+a missing `minzoned` artifact with a warning that names the omitted row.
+They stage or package all other artifacts. A release staged without it gives
+no `minzoned` to the host. The advisory then shows the state `this release
+ships no minzoned; the answerer service step is unavailable` and does not
+offer the step. Both optional lists go after a release publishes the
+artifact on every platform.
+
+*Identity model.* Each check runs where it has meaning:
+
+- **The release proves link-cleanliness.** The link gate runs on the binary
+  that `dist-build.sh` built. The release workflow runs it again on every signed
+  and renamed artifact, as the last check before upload. The uploaded bytes
+  are then the bytes that the gate checked. The user's machine does not run
+  the gate.
+- **The user side checks identity.** The source is beside `min` in a prefix
+  that its user can write, so each user-side check is only a pre-check. On
+  macOS, the advisory runs `codesign --verify --strict -R` with the Developer
+  ID designated requirement. The requirement names Apple's Developer ID chain,
+  the team in `subject.OU`, and the signing identifier.
+- The release build of `min` gets the team ID and the identifier at compile
+  time, from `MINIMAL_ZONED_TEAMID` and `MINIMAL_ZONED_IDENTIFIER`.
+  Without them, a release `min` does not offer the step, and it gives the
+  reason `this build carries no signing identity`. It never falls back to
+  `codesign --strict` alone, because any ad-hoc signature passes that check.
+  Debug and test builds skip the check.
+- On both operating systems, the advisory then pins the SHA-256 of the bytes
+  that it checked.
+- **The privileged step checks the root-owned copy again** (design §7.1,
+  post-install custody). The rendered root command examines the destination
+  directory and each parent directory up to `/`. It stops at the first one
+  that is not owned by root, that group or others can write to, or that has
+  the sticky bit. The message names that directory. Without this check, a
+  user can rename a directory on the path between the check and the rename.
+  Both destinations pass on a stock host: `/Library/PrivilegedHelperTools` on
+  macOS and `/usr/local/lib/minimal` on Linux. The command then runs
+  `install` to an exclusive `mktemp` name in that directory and hashes the
+  copy. If the hash is different, it removes the copy and exits with both
+  hashes in the message. On macOS it runs the `codesign -R` check on the copy
+  again. Then it renames the copy into place. Only after that does it write
+  the unit or property list that names the copy.
+
+The release workflow
+([`.github/workflows/release.yml`](../../.github/workflows/release.yml))
+handles `minzoned` with the same steps that the other binaries have:
+
+- `build-release-linux-{amd64,arm64}`: the shared entry point builds and
+  link-gates `minzoned` already. The rename step adds
+  `mv minzoned minzoned-linux-<arch>`. A new step runs the link gate
+  on the renamed file, and one `upload-artifact` step uploads it.
+- `build-release-macos-arm64`: the job's `env` gets
+  `MINIMAL_ZONED_TEAMID` and `MINIMAL_ZONED_IDENTIFIER`, so the `min`
+  that it builds has the signing identity. The job builds `minzoned` in
+  its own invocation, link-gates it, and renames it to
+  `minzoned-macos-arm64`.
+- The job signs it with the Developer ID, the hardened runtime, a timestamp,
+  and `--identifier "$MINIMAL_ZONED_IDENTIFIER"`. The signature has no
+  entitlements, unlike the `minvmd` signature. There is no hypervisor
+  entitlement, no `disable-library-validation`, no
+  `allow-dyld-environment-variables`, and no JIT. The job then checks the
+  signature with the designated requirement that `min` uses.
+- After the signature check, the link gate runs again on the signed
+  artifact, and the job uploads it.
+- The job notarizes `minzoned` with the other macOS binaries. See
+  the **Notarization** paragraph below.
+- The release job and the stage-installer job stay the same. They collect
+  artifacts by the platform-suffixed names, so the new names go into the
+  GitHub Release, the `components` manifest, and the packages. The SHA-256
+  columns of the manifest are the checksums.
+
+This section does not close these residuals:
+
+- A shell-installer install on Linux, into the user's prefix, has no
+  signature. The privileged step accepts the copy only up to the hash pin.
+  That limit is inside the single-operator premise of design §7.1.
+- A `.deb` or `.rpm` install copies from the root-owned `/usr/bin`. That
+  closes the residual on packaged hosts.
+- `answerer_survives_session_stop` is the e2e proof that the installed
+  answerer service continues after a session stops. It installs a root-run
+  unit, and no macOS lane can run `sudo` without a password.
+  [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh) skips it there. A
+  privileged macOS e2e runner is still necessary for that proof.
+
+**Notarization.** After the signature checks and the last link gate,
+`build-release-macos-arm64` sends `min`, `minvmd`, and `minzoned` to
+the Apple notary service before it uploads them. The step puts each binary
+in a zip made with `ditto`, because `notarytool` does not take a bare
+Mach-O file. It runs `xcrun notarytool submit --wait` on each zip. The
+release fails unless each result is `Accepted`. On any other result, the
+step prints the notary log for that submission. Notarization does not
+change the file, so the job uploads the same signed bytes.
+
+The job does not staple. The release publishes each binary as a bare Mach-O
+file, and `stapler` can attach a ticket only to an app bundle, a `.pkg`, or
+a `.dmg`. Gatekeeper gets the ticket from Apple online when it checks a
+binary.
+
+The step needs two things that the workflow cannot set up:
+
+- A `notarytool` keychain profile in the signing keychain
+  (`minimal-signing.keychain-db`) on the self-hosted macOS runner. Create it
+  as the runner user with
+  `xcrun notarytool store-credentials <profile> --keychain
+  ~/Library/Keychains/minimal-signing.keychain-db`. Give it an App Store
+  Connect API key (`--key`, `--key-id`, `--issuer`), or an Apple ID with an
+  app-specific password and team `3G47C5HY64`. The step unlocks the keychain
+  with the `KC_PW` secret, as the signing steps do.
+- The repository variable `MACOS_NOTARY_PROFILE`, set to the profile name.
+  If the variable is empty, the step fails before it submits anything.
+
+`libkrun.1.dylib` and the macOS `gvproxy`, which `sign-macos-artifacts`
+signs, are not notarized.
 
 **release job.** This job downloads all build outputs. It writes the release
 notes with `scripts/next-version.sh --notes` and generates shell completions
@@ -430,14 +572,20 @@ installer, in strict POSIX `sh`. It works in these steps:
 
 The components come from the `COMPONENTS` table in `stage-release.sh`:
 
-- Linux amd64 and arm64: `bin/min`, `bin/mip`, `bin/minimald`, `bin/minvmd`,
-  `bin/gvproxy-min`, a `git-remote-min` symlink, the guest files
-  (`data/vmlinuz`, `data/rootfs.img`, `data/initramfs.cpio`), and the AppArmor
-  profile, tunable, and loader under `data/`.
-- macOS arm64: `bin/min`, `bin/minvmd`, `bin/gvproxy-min`,
-  `lib/libkrun.1.dylib`, the `git-remote-min` symlink, and the same guest
-  files. Only macOS has a `lib/` folder, because the Linux `minvmd` links
-  libkrun statically.
+- Linux amd64 and arm64: `bin/min`, `bin/minzoned`, `bin/mip`,
+  `bin/minimald`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min` symlink,
+  the guest files (`data/vmlinuz`, `data/rootfs.img`, `data/initramfs.cpio`),
+  and the AppArmor profile, tunable, and loader under `data/`.
+- macOS arm64: `bin/min`, `bin/minzoned`, `bin/minvmd`,
+  `bin/gvproxy-min`, `lib/libkrun.1.dylib`, the `git-remote-min` symlink, and
+  the same guest files. Only macOS has a `lib/` folder, because the Linux
+  `minvmd` links libkrun statically.
+
+`bin/minzoned` is the box-zone answerer binary that the session-start
+advisory copies into its root-owned service path. The installer puts it
+beside `min`, and nothing else refers to it there. Manifest rows write no
+unit file and no `launchd` property list. None of them names the root-owned
+service path that the advisory's privileged command creates.
 
 The installer also adds shell setup: PATH init files, `min` completions, and
 one marked block in the shell rc file. `--uninstall` removes all of it with no
