@@ -530,9 +530,9 @@ particularly important if the attach/detach leader chord (F1, default
 ## Verification
 
 **Proof artifact 1 (Test):**
-`cargo test -p minimal` passes, covering `update` unit tests and `view`
-snapshot tests (insta). The `GetSessionScreen` integration test in
-`minimald` passes: `cargo test -p minimald -- get_session_screen`.
+`just test` passes, covering `update` unit tests and `view` snapshot tests
+(insta). The `GetSessionScreen` integration test in `minimald` passes:
+`just test-one get_session_screen -p minimald`.
 
 **Proof artifact 2 (File):**
 `grep -q 'Command::Dash' crates/minimal/src/lib.rs` — the subcommand exists.
