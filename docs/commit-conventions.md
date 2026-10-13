@@ -38,7 +38,7 @@ Every commit message MUST follow this format.
 The scope is the affected crate or subsystem, in parentheses. Use crate names.
 
 ```
-feat(sessions): add CWD-relative path types
+feat(boxes): add CWD-relative path types
 fix(lcache): handle concurrent rename on the same key
 ```
 

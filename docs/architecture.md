@@ -84,8 +84,8 @@ contributions and routes anything needing approval back to the client; the
 client gates those pending items and returns verdicts; the daemon assembles the
 final `Composition` (vars, file patches, packages, lifecycle hooks) for the
 apply layer. User policy is enforced only on the client; the daemon never runs
-it. The **sessions** crate holds these primitives; the full data flow is
-documented in [Sessions composition](internal/sessions-composition.md) (source: `crates/boxes/docs/COMPOSITION.md`).
+it. The **boxes** crate holds these primitives. [Sessions composition](internal/sessions-composition.md)
+documents the full data flow (source: `crates/boxes/docs/COMPOSITION.md`).
 
 ### VM internals
 
