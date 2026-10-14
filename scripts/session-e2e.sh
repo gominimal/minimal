@@ -7511,7 +7511,7 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'resolves in any browser on this machine' "$range2_err"; then
+  if ! grep -q -- 'resolves on this machine' "$range2_err"; then
     echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
@@ -9008,10 +9008,10 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'resolves in any browser on this machine' \
+  bn_api_surface="$(grep -F -- 'resolves on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not say its name resolves in any browser on this machine (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its name resolves on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
@@ -9020,7 +9020,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # the hostname proxy still serves beside native DNS (NET-019) is `min
   # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
-    "names: $BN_API_NAME.min.internal resolves in any browser on this machine"*) ;;
+    "names: $BN_API_NAME.min.internal resolves on this machine"*) ;;
     *)
       echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
