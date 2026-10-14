@@ -213,7 +213,7 @@ jobs:
 
   beta-canary:
     # Run the workspace suite on beta rustc to catch upcoming-toolchain
-    # breakage ahead of the 1.97.0 pin. Non-blocking (the pin is the gate);
+    # breakage ahead of the 1.99.0 pin. Non-blocking (the pin is the gate);
     # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for this job only.
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -323,7 +323,7 @@ jobs:
     # the declared floor is a promise — so it feeds `notify`.
     runs-on: ubuntu-latest
     # cargo-hack --rust-version does a full cold workspace check under the 1.95
-    # toolchain (separate from the 1.97 build cache), which is slow on a first
+    # toolchain (separate from the 1.99 build cache), which is slow on a first
     # run; give it room so it isn't killed mid-compile.
     timeout-minutes: 60
     steps:
@@ -354,7 +354,7 @@ jobs:
     timeout-minutes: 45
     continue-on-error: true
     env:
-      # rust-toolchain.toml pins 1.97.0, which has no miri component; override it
+      # rust-toolchain.toml pins 1.99.0, which has no miri component; override it
       # for this job so `cargo miri` resolves the nightly installed below (same
       # mechanism the beta/nightly-rustc canaries use).
       RUSTUP_TOOLCHAIN: nightly
