@@ -351,7 +351,7 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
     loop {
         let (client, peer) = listener.accept().await?;
         let router = router.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             if let Err(error) = handle_connection_io(client, Some(peer), &router).await {
                 tracing::debug!(
                     component = "dns-proxy",
@@ -1441,9 +1441,9 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
 pub(crate) async fn spawn_backend() -> u16 {
     let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = backend.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    crate::traced::spawn(async move {
         while let Ok((mut sock, _)) = backend.accept().await {
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 let mut scratch = [0u8; 1024];
                 let _ = sock.read(&mut scratch).await;
                 let _ = sock
@@ -1509,7 +1509,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let authority = format!("myservice.min.internal:{backend_port}");
         let routed = proxy_get(proxy_addr, &authority).await;
@@ -1600,7 +1600,7 @@ mod tests {
         let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let routed = proxy_get(proxy_addr, &format!("web.min.internal:{backend_port}")).await;
         assert!(
@@ -1648,7 +1648,7 @@ mod tests {
         // box's internal listener.
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let routed = proxy_get(proxy_addr, "web.min.internal:18080").await;
         assert!(
@@ -1694,7 +1694,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let refused = proxy_get(proxy_addr, "web.min.internal:9000").await;
         assert!(
@@ -1796,7 +1796,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // Nothing owns the name: a no-route refusal.
         let no_route = proxy_get(proxy_addr, "ghost.min.internal").await;
@@ -2354,7 +2354,7 @@ mod tests {
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap();
@@ -2370,7 +2370,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let request_line = format!("GET http://web.min.internal:{backend_port}/path HTTP/1.1");
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2407,7 +2407,7 @@ mod tests {
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap();
@@ -2425,7 +2425,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // URI authority is `real.min.internal`, `Host:` header is a different
         // host that is not registered — the request must route by the URI.
@@ -2484,7 +2484,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // HTTP: a plain request routes to the registered PTask and returns
         // its response.
@@ -2541,7 +2541,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -2592,7 +2592,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // The h2c offer in RFC 7540 §3.2's wire shape, with an unrelated
         // header riding along.
@@ -2725,7 +2725,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // First request: box-a.
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2797,7 +2797,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!(
@@ -2828,7 +2828,7 @@ mod tests {
     async fn bare_lf_response_is_passed_through_when_the_upstream_closes() {
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut scratch = [0u8; 1024];
             let _ = sock.read(&mut scratch).await;
@@ -2841,7 +2841,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
@@ -2859,9 +2859,9 @@ mod tests {
         // A backend that answers without a `Connection` header.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     let _ = sock.read(&mut scratch).await;
                     let _ = sock
@@ -2877,7 +2877,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
@@ -2905,9 +2905,9 @@ mod tests {
         // echoes back whatever the client sends after the upgrade.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 2048];
                     let n = sock.read(&mut scratch).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&scratch[..n]);
@@ -2937,7 +2937,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!(
@@ -2997,10 +2997,10 @@ mod tests {
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 let sink = Arc::clone(&sink);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let mut continued = !interim;
                     let mut answered = false;
@@ -3056,7 +3056,7 @@ mod tests {
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
         proxy_addr
     }
 
@@ -3507,7 +3507,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // The direct half: the relay's own gate for the same declaration —
         // the shared `declared_ingress_ports` derivation — admits the port
@@ -3616,7 +3616,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -4718,10 +4718,10 @@ mod tests {
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 let sink = Arc::clone(&sink);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     sink.lock().unwrap().extend_from_slice(&buf[..n]);
@@ -4761,9 +4761,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_backend_on(addr: SocketAddr, body: &'static str) {
         let backend = TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     // Neither the read's count nor the answer's fate is what
                     // this backend exists for; the drop that follows closes
@@ -4797,9 +4797,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_forward(local: SocketAddr, remote: SocketAddr) {
         let listener = TcpListener::bind(local).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let Ok(mut upstream) = TcpStream::connect(remote).await else {
                         return;
                     };
@@ -4882,7 +4882,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_udp_forward(local: SocketAddr, remote: SocketAddr) {
         let listener = tokio::net::UdpSocket::bind(local).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
                 let Ok((len, reply_to)) = listener.recv_from(&mut buf).await else {

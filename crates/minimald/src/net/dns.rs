@@ -4013,7 +4013,7 @@ mod tests {
         pending.reset_hand_verdict_deadline(30_000);
         let waiting = {
             let pending = std::sync::Arc::clone(&pending);
-            tokio::spawn(async move { pending.await_vouch_for(handed).await })
+            crate::traced::spawn(async move { pending.await_vouch_for(handed).await })
         };
         // Landed only once the waiter is parked, so the landing is what
         // answers it — not a verdict it read before it began to wait.
@@ -4080,7 +4080,7 @@ mod tests {
         let mut waiters = Vec::new();
         for _ in 0..WAITERS {
             let book = std::sync::Arc::clone(&never);
-            waiters.push(tokio::spawn(async move {
+            waiters.push(crate::traced::spawn(async move {
                 let began = std::time::Instant::now();
                 let vouched = book.await_vouch_for(handed).await;
                 (vouched, began.elapsed())
@@ -4113,7 +4113,7 @@ mod tests {
         let waiters: Vec<_> = (0..WAITERS)
             .map(|_| {
                 let book = std::sync::Arc::clone(&pending);
-                tokio::spawn(async move { book.await_vouch_for(handed).await })
+                crate::traced::spawn(async move { book.await_vouch_for(handed).await })
             })
             .collect();
         while pending.verdict_waiters() < WAITERS {

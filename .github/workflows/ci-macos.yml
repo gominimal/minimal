@@ -563,9 +563,9 @@ jobs:
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets --locked -- -D warnings
             - name: Unit tests (justfile darwin scope)
-              # The crates are the justfile's darwin `scope` (minvmd + sessions
-              # today); rename or add one there, not here. sessions is
-              # platform-sensitive surface: std::fs::canonicalize
+              # The crates are the justfile's darwin `scope`; rename or add one
+              # there, not here. The session-types crate is platform-sensitive
+              # surface: std::fs::canonicalize
               # behavior on prefix-symlinked roots (/tmp → /private/tmp on
               # macOS) and the follow_symlinks dual-path policy logic. The
               # `_integration` harnesses are excluded here — they are the

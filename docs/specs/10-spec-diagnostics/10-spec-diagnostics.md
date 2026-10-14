@@ -896,8 +896,9 @@ read both pre-convergence (`errors.json`) and post-convergence
   opentelemetry-rust is pre-1.0 (traces Beta), the OTLP file-exporter spec
   is a placeholder with no durability semantics, and the bundle path's
   correctness criterion is "works when everything else is dead". Unit 4's
-  conventions are the seam; an OTLP exporter layer is additive later work
-  (future spec; see Design Considerations). Two OTEL-orbit crates carrying
+  conventions are the seam; an OTLP exporter layer is additive later work,
+  now specified in [spec 25](../25-spec-telemetry/25-spec-telemetry.md)
+  (see Design Considerations). Two OTEL-orbit crates carrying
   no runtime machinery are deliberately in scope and are not exceptions to
   this rejection: `opentelemetry-semantic-conventions` (consts only) and
   `json-subscriber` (a tracing-ecosystem formatting layer whose dependency
