@@ -5,7 +5,7 @@ status: draft
 owner: bryan-minimal
 epic: gominimal/inbox#583
 arch: https://github.com/gominimal/arch/blob/d77725b6dcca73918efb66f0e15e97120db62a0e/architecture.md#d31--the-build-spec-hash-keyspace-contract-and-epochs
-updated: 2026-10-06
+updated: 2026-10-14
 ---
 
 # EPOCH — spec-hash epoch 1: an injective, machine-checked BuildSpec encoding
@@ -35,10 +35,16 @@ This document uses these terms. A spec's **canonical form** is the set of
 fields the epoch-0 encoder covers (`spec_hasher.rs`). In that form the
 dependency edges form a set and every number takes its normal form
 (EPOCH-002, EPOCH-006). A spec's `tests` are outside its canonical form
-(EPOCH-010). Specs with different canonical forms are **canonically
-distinct**. Every **bounded spec** has at most 3 elements in any list and
-at most 8 bytes in any string. Its dependency depth is at most 2. Harnesses
-that are exhaustive over bounded specs state nothing beyond that domain.
+(EPOCH-010). A **container's canonical form** is the set of fields
+`ContainerHasher` covers (`spec_hasher.rs`, minimal#1331): its name, the
+set of keys of its member packages, and its image configuration. Specs or
+containers with different canonical forms are **canonically distinct**.
+Every **bounded spec** has at most 3 elements in any list and at most 8
+bytes in any string. Its dependency depth is at most 2. A **bounded
+container** has at most 3 elements in any list, set or map, at most 8
+bytes in any string, and bounded specs as members. Harnesses that are
+exhaustive over bounded specs or containers state nothing beyond that
+domain.
 The **epoch-1 context** is the Blake3 `derive_key` context string
 `minimal.dev spec-hash epoch 1`. The **epoch-0 defect catalog** is the list
 of nine collision-witness classes in minimal#1246.
@@ -70,6 +76,9 @@ build-infra operator. Release manager.
 - AS A build-infra operator I WANT the epoch flip to change only which keys
   exist — same 32-byte hashes, same index/snapshot/provenance formats — SO
   THAT migration is one cold catalog rebuild, not a format migration
+- AS A security engineer I WANT the Container Spec Hash to carry the same
+  guarantee as the package key SO THAT an OCI Archive fetched by key is as
+  safe from substitution as a package tarball (D3.1, AT2)
 - AS A release manager I WANT additive evolution (reserved tags,
   absent-means-epoch-1) after this change SO THAT this is the last breaking
   keyspace change I ever schedule
@@ -178,6 +187,30 @@ build-infra operator. Release manager.
   property: for all subsets u of spec s: epoch(key(u)) == epoch(key(s)), and
     for all distinct output sets a, b of s: key(u_a) != key(u_b)
 
+- **EPOCH-013** THE SYSTEM SHALL encode canonically distinct containers to
+  distinct byte strings.
+  tier:     T2
+  verify:   cargo nextest run -p graph epoch1_container_injectivity_bounded
+  property: for all canonical containers a, b: a != b implies
+    encode(a) != encode(b)
+  harness:  kani_epoch1_container_injectivity_bounded, exhaustive over
+    bounded containers (3 elements per list, set or map, 8 bytes per
+    string)
+  - THE SYSTEM SHALL encode the epoch-0 container witness (minimal#1331:
+    `env_vars` `{Av: B}` against `{A: vB}`) to distinct outputs.
+    tier:   T1
+    verify: cargo nextest run -p graph epoch1_container_witness_refuted
+    property: encode({Av: B}) != encode({A: vB})
+
+- **EPOCH-014** WHEN the system computes a container key THE SYSTEM SHALL
+  enter each member package by its key under the container's epoch, as a
+  set.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_container_members_by_key_as_set
+  property: for all containers c, permutations p of c's members:
+    encode(c) == encode(p(c)); and for all members m of c: the member bytes
+    of encode(c) are hash_e(m) for the epoch e of c's key
+
 ## Non-goals
 
 - Changing the hash's size or algorithm: minimal#1246 interaction inventory
@@ -186,6 +219,9 @@ build-infra operator. Release manager.
 - Wire varint work: minimal#1109 set 2
 - The slots feature: gominimal/inbox#350. This spec only guarantees that
   the name axis is sound.
+- Publishing OCI Archives to the Registry Build Cache with their index
+  records, Container Provenance and Container SBOM: build-servers#371. This
+  spec fixes the container key those records use, and nothing more.
 - Merging the Lean proof: minimal#1109, harness set 6. EPOCH-001's proof
   line is the stated target, and Kani holds the property until the proof
   merges.
@@ -211,9 +247,11 @@ formal-verification path.
 
 D3.1 has four commitments, and each maps to requirements:
 
-- injective over the closure's meaning: EPOCH-001, EPOCH-002 and EPOCH-004
+- injective over the closure's meaning: EPOCH-001, EPOCH-002, EPOCH-004
+  and EPOCH-013
 - epochs by domain-separated context at a fixed 32 bytes, declared by the
-  index and followed by consumers: EPOCH-005, EPOCH-009 and EPOCH-012
+  index and followed by consumers: EPOCH-005, EPOCH-009, EPOCH-012 and
+  EPOCH-014
 - keyspace rotation as a migration class: the Rollout section and the
   migration non-goal
 - additive evolution, with an unknown tag as a hard error: EPOCH-007
@@ -251,6 +289,18 @@ The subset key (EPOCH-011) follows the spec key's epoch because witness
 class 9 is its collision family. A subset computed under another epoch
 cannot find the index of its spec.
 
+The container key (EPOCH-013, EPOCH-014) is the same codec with container
+tags, so EPOCH-003 and EPOCH-007 cover container encodings as they cover
+spec encodings. `ContainerHasher` chooses its encoder at its own call site,
+so the flip must move that site together with `SpecHasher` and
+`SubsetHasher`, or containers stay on epoch 0 with the witness minimal#1331
+pinned. A container is a declaration over packages. Its members enter by
+key, and a key carries its epoch through the context, so a container key is
+well-defined only when every member key is of the container's epoch. An
+index declares one epoch (EPOCH-009, EPOCH-012), so a mixed container
+cannot be sealed into one. Today no index holds a container record
+(build-servers#371), so the container keyspace has nothing to rotate.
+
 **Generality:** a second epoch is additive by construction, through
 reserved tags and a new `derive_key` context. A second hash algorithm is
 out of scope by decision and will be a new epoch. The codec's proofs bind
@@ -263,7 +313,7 @@ reuses them.
   specs the same cache key except through a Blake3 collision.
   enforced by: prefix-free TLV encoding, with machine-checked bounded
   injectivity and witness refutations
-  covered by: EPOCH-001, EPOCH-004, EPOCH-011
+  covered by: EPOCH-001, EPOCH-004, EPOCH-011, EPOCH-013
 - **Invariant:** THE SYSTEM SHALL never silently absorb unknown structure
   into a hash preimage.
   enforced by: strict decoding, unknown tag = hard error
@@ -280,7 +330,8 @@ reuses them.
   index. Then the producing side flips at one config-plumbed call site. The
   producing side is build infrastructure, remote execution and the hosts
   that seal new indices. Consumers never flip. They follow the epoch their
-  pinned index declares. The catalog rebuilds cold under epoch-1 keys on
+  pinned index declares. The container call site flips with the producing
+  side (EPOCH-014). The catalog rebuilds cold under epoch-1 keys on
   the first pkgs CI cycle at that release. That is a full world rebuild,
   and build-infra schedules it on purpose (build-servers#271 and #272 hold
   the operational lessons). A staged catalog rebuild on the staging cache
