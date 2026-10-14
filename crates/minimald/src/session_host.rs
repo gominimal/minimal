@@ -3719,7 +3719,7 @@ fn create_or_reclaim_box_leaf(
 /// appears is itself a finding — a box that could not say what it did still
 /// ran — and it is warned, not debugged: a leaf-bearing box whose closure
 /// could not write `/run` is exactly the state this channel exists to
-/// catch. Runs off the launch's critical path (it is `tokio::spawn`ed), so
+/// catch. Runs off the launch's critical path (`crate::traced::spawn`ed), so
 /// a session is never held up by what its box did in its first
 /// milliseconds.
 ///
