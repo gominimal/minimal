@@ -7,9 +7,13 @@
 #   MODE      full    every collector; the nightly run and `just metrics`
 #             static  no compiler: layers, size, unused deps, hotspots from
 #                     history. What the gate tier and a cold sandbox can afford.
+#             mutants [BASE]
+#                     the static collectors plus cargo-mutants over the lines
+#                     changed since the merge-base with BASE (default
+#                     origin/main). Linux only (QM-017).
 #   --out DIR         where snapshot.json, clippy-hits.json and meta.json land
 #                     (default .scratch/metrics/<mode>)
-#   --no-coverage, --no-modules, --no-clippy, --no-hotspots, --no-experimental
+#   --no-coverage, --no-modules, --no-clippy, --no-hotspots, --no-experimental, --no-mutants
 #                     skip one collector; it is recorded as not measured
 #   -p CRATE          pin the compiling collectors to these crates (the
 #                     justfile does this on macOS); repeatable
@@ -36,14 +40,28 @@ cd "$(git rev-parse --show-toplevel)"
 here="scripts/metrics"
 mode="${1:-}"
 case "$mode" in
-    full|static) shift ;;
-    "") echo "usage: $0 full|static [--out DIR] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [-p CRATE]..." >&2; exit 1 ;;
+    full|static|mutants) shift ;;
+    "") echo "usage: $0 full|static|mutants [BASE] [--out DIR] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [--no-mutants] [-p CRATE]..." >&2; exit 1 ;;
     *) echo "metrics: unknown mode '$mode'" >&2; exit 1 ;;
 esac
 command -v python3 >/dev/null 2>&1 || { echo "metrics: python3 is required" >&2; exit 127; }
 
+base=""
+if [ "$mode" = "mutants" ]; then
+    # cargo-mutants runs the baseline suite before any mutant and stops when
+    # it fails; the suite is green only on Linux (.minimal/minimal.toml).
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "metrics: mutants mode needs Linux: cargo-mutants wants the baseline suite green, and it is green only there" >&2
+        exit 1
+    fi
+    # The justfile passes BASE through even when it is empty.
+    if [ "$#" -gt 0 ]; then
+        case "$1" in -*) ;; *) base="$1"; shift ;; esac
+    fi
+fi
+
 out=".scratch/metrics/$mode"
-want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1 want_experimental=1
+want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1 want_experimental=1 want_mutants=1
 scope=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -53,14 +71,16 @@ while [ "$#" -gt 0 ]; do
         --no-clippy) want_clippy=0; shift ;;
         --no-hotspots) want_hotspots=0; shift ;;
         --no-experimental) want_experimental=0; shift ;;
+        --no-mutants) want_mutants=0; shift ;;
         -p) scope+=("$2"); shift 2 ;;
         -p*) scope+=("${1#-p}"); shift ;;
         *) echo "metrics: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
-if [ "$mode" = "static" ]; then
-    want_coverage=0 want_modules=0 want_clippy=0 want_experimental=0
-fi
+case "$mode" in
+    static) want_coverage=0 want_modules=0 want_clippy=0 want_experimental=0 want_mutants=0 ;;
+    mutants) want_coverage=0 want_modules=0 want_clippy=0 want_experimental=0 ;;
+esac
 
 work="$out/raw"
 mkdir -p "$work"
@@ -101,6 +121,8 @@ add_tool cargo-nextest "$(tool_version cargo-nextest cargo nextest --version)"
 add_tool clippy "$(tool_version cargo-clippy cargo clippy --version)"
 add_tool rustqual "$(tool_version rustqual rustqual --version)"
 add_tool cargo-anatomy "$(tool_version cargo-anatomy cargo anatomy -V)"
+add_tool cargo-mutants "$(tool_version cargo-mutants cargo mutants --version)"
+add_tool cargo-crap "$(tool_version cargo-crap cargo crap --version)"
 printf '%s}\n' "${tools_json%, }" > "$work/tools.json"
 
 # ----------------------------------------------------------------- metadata
@@ -183,18 +205,44 @@ else
 fi
 
 # ----------------------------------------------------------------- coverage
+# run_crap <lcov> <out>: CRAP per function, from the sources and the lcov
+# file coverage wrote. A hook after coverage rather than a collector of its
+# own, so whichever mode produces an lcov.info gets it.
+run_crap() {
+    local lcov="$1" out="$2" t0 status=0
+    if ! command -v cargo-crap >/dev/null 2>&1; then
+        skip crap "cargo-crap not installed (scripts/metrics/install-tools.sh)"
+    elif [ ! -s "$lcov" ]; then
+        skip crap "coverage wrote no lcov.info"
+    else
+        t0="$(now)"
+        cargo crap "${cargo_scope[@]}" --lcov "$lcov" --format json > "$out/raw/crap.json" 2> "$out/raw/crap.err" || status=$?
+        if [ "$status" -eq 0 ] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$out/raw/crap.json" 2>/dev/null; then
+            collect_args+=(--crap "$out/raw/crap.json")
+        else
+            fail_collector crap "cargo crap exited $status ($(head -c 200 "$out/raw/crap.err"))"
+        fi
+        durations+=("crap=$(since "$t0")")
+    fi
+}
+
+rm -f "$out/lcov.info"
 if [ "$want_coverage" -eq 0 ]; then
     skip coverage "$mode mode"
+    skip crap "$mode mode"
 elif ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     skip coverage "cargo-llvm-cov not installed (scripts/metrics/install-tools.sh)"
+    skip crap "coverage not measured"
 elif ! command -v cargo-nextest >/dev/null 2>&1; then
     skip coverage "cargo-nextest not installed"
+    skip crap "coverage not measured"
 elif ! ls "$(rustc --print target-libdir 2>/dev/null)"/libprofiler_builtins-*.rlib >/dev/null 2>&1; then
     # A toolchain built without the profiler runtime cannot compile with
     # -C instrument-coverage (rustc E0463 on every build script). rustup's
     # toolchains ship it; some distribution builds do not. Say so up front
     # rather than after a cold instrumented build fails.
     skip coverage "toolchain has no profiler runtime (libprofiler_builtins); use a rustup toolchain"
+    skip crap "coverage not measured"
 else
     # Without rustup's llvm-tools-preview, a matching system LLVM works when
     # named through the environment cargo-llvm-cov reads.
@@ -216,10 +264,13 @@ else
     if [ "$status" -eq 0 ]; then
         collect_args+=(--coverage "$work/llvm-cov.json")
         cargo llvm-cov report --lcov --output-path "$out/lcov.info" >/dev/null 2>&1 || true
+        durations+=("coverage=$(since "$t0")")
+        run_crap "$out/lcov.info" "$out"
     else
         fail_collector coverage "cargo llvm-cov nextest exited $status (see $work/coverage.err)"
+        skip crap "coverage not measured"
+        durations+=("coverage=$(since "$t0")")
     fi
-    durations+=("coverage=$(since "$t0")")
 fi
 
 # ------------------------------------------------------------------ modules
@@ -322,6 +373,78 @@ else
         durations+=("experimental.anatomy=$(since "$t0")")
     else
         skip experimental.anatomy "cargo-anatomy not installed (scripts/metrics/install-tools.sh --experimental)"
+    fi
+fi
+
+# ------------------------------------------------------------------ mutants
+# A mutant survives when the suite still passes with it in, so the suite has
+# to pass without it first; cargo-mutants runs that baseline itself and stops
+# when it fails. The baseline is green only on Linux (.minimal/minimal.toml).
+if [ "$want_mutants" -eq 0 ]; then
+    skip mutants "$mode mode"
+elif [ "$(uname -s)" = "Darwin" ]; then
+    skip mutants "darwin host: the baseline suite is green only on Linux"
+elif ! command -v cargo-mutants >/dev/null 2>&1; then
+    skip mutants "cargo-mutants not installed (scripts/metrics/install-tools.sh)"
+elif ! command -v cargo-nextest >/dev/null 2>&1; then
+    skip mutants "cargo-nextest not installed"
+else
+    mutants_args=(--test-tool nextest --timeout-multiplier 1.5 --output "$out/mutants")
+    scope_args=()
+    run_mutants=1
+    if [ "$mode" = "mutants" ]; then
+        # The changed lines, computed as scripts/clippy-strict.sh computes
+        # them (the base-ref reasoning is there): the merge-base with
+        # origin/main unless BASE says otherwise, the working tree rather
+        # than HEAD so an uncommitted edit counts, -U0 so a hunk is the
+        # lines the change touched and nothing around them (QM-017). A
+        # brand-new file is untracked, so it is not in the diff; it is listed
+        # as outside the scope instead.
+        [ -n "$base" ] || base="$(git merge-base origin/main HEAD 2>/dev/null || git merge-base main HEAD)"
+        merge_base="$(git merge-base "$base" HEAD)"
+        git diff -U0 --no-color --no-ext-diff --no-textconv --diff-filter=d \
+            "$merge_base" -- '*.rs' > "$work/mutants.diff"
+        git ls-files --others --exclude-standard -- '*.rs' > "$work/mutants-untracked.txt"
+        collect_args+=(--mutants-untracked "$work/mutants-untracked.txt")
+        if [ -s "$work/mutants.diff" ]; then
+            mutants_args+=(--in-diff "$work/mutants.diff")
+            scope_args=(--mutants-scope in-diff)
+        else
+            skip mutants "no Rust changes since $base"
+            run_mutants=0
+        fi
+    else
+        # One seventh of the workspace a night, Monday first, so a week of
+        # nightlies covers the tree once.
+        shard="$(( $(date +%u) - 1 ))/7"
+        mutants_args+=("${cargo_scope[@]}" --shard "$shard")
+        scope_args=(--mutants-scope shard --mutants-shard "$shard")
+    fi
+    if [ "$run_mutants" -eq 1 ]; then
+        t0="$(now)"
+        status=0
+        rm -rf "$out/mutants/mutants.out"
+        cargo mutants "${mutants_args[@]}" > "$work/mutants.log" 2> "$work/mutants.err" || status=$?
+        outcomes="$out/mutants/mutants.out/outcomes.json"
+        # Exit 2 is missed mutants, 3 timeouts, 4 unviable ones: results, not
+        # failures. 4 is also a failed baseline, so the proof that the run
+        # happened is the baseline's own outcome in the file. A diff that
+        # reaches no mutant (comments, signatures) exits 0 and writes no
+        # mutants.out at all: nothing was measured, and nothing failed.
+        if [ "$status" -eq 0 ] && [ ! -f "$outcomes" ]; then
+            skip mutants "no mutants in the changed lines"
+        elif [ -f "$outcomes" ] && python3 - "$outcomes" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+ok = any(o.get("scenario") == "Baseline" and o.get("summary") == "Success" for o in doc["outcomes"])
+sys.exit(0 if ok else 1)
+PY
+        then
+            collect_args+=(--mutants "$outcomes" "${scope_args[@]}")
+        else
+            fail_collector mutants "cargo mutants exited $status (see $work/mutants.err)"
+        fi
+        durations+=("mutants=$(since "$t0")")
     fi
 fi
 

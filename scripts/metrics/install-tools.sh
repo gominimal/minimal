@@ -28,6 +28,8 @@ pins=(
     "cargo-modules   cargo-modules   0.27.0  cargo modules --version"
     "cargo-shear     cargo-shear     1.14.0  cargo shear --version"
     "cargo-nextest   cargo-nextest   0.9.148 cargo nextest --version"
+    "cargo-mutants   cargo-mutants   27.1.0  cargo mutants --version"
+    "cargo-crap      cargo-crap      0.7.0   cargo crap --version"
     "tokei           tokei           15.0.0  tokei --version"
 )
 # The experimental collectors (metrics/README.md, "Experimental coupling

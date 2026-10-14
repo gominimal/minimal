@@ -372,6 +372,16 @@ metrics-dashboard HISTORY=".scratch/metrics/history":
 # Prune a snapshot history to daily for ninety days, then monthly.
 metrics-prune HISTORY=".scratch/metrics/history" *args:
     python3 scripts/metrics/prune.py {{HISTORY}} {{args}}
+# cargo-mutants over the lines this branch changed since BASE (default
+# origin/main), nextest as the runner; the snapshot lands in
+# .scratch/metrics/mutants/. Linux only: cargo-mutants runs the baseline
+# suite first, and it is green only here. A brand-new, untracked file is
+# outside the diff and listed as such. Minutes for a small change.
+#
+# Mutation-test this branch's changed lines (metrics/README.md, "Test quality").
+[linux]
+metrics-mutants BASE="":
+    scripts/metrics/run.sh mutants "{{BASE}}"
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).

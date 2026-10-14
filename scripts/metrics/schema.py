@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-MODES = ("full", "static", "gate", "diff", "darwin")
+MODES = ("full", "static", "gate", "diff", "darwin", "mutants")
 RESULTS = ("pass", "warn", "fail", "not_evaluated")
 GATE_KINDS = ("floor", "ceiling", "ratchet")
 

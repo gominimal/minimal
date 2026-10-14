@@ -19,6 +19,9 @@ schema = 1
 # commit sets it from a snapshot.
 [floors]
 "coverage.lines_pct" = 0.0
+# Unseeded: the nightly shards have to go round the week once before the
+# workspace score means anything.
+"mutants.score_pct" = 0.0
 
 [ceilings]
 "layers.unexcepted" = 0
@@ -35,6 +38,9 @@ schema = 1
 "clippy.complexity.total" = { direction = "down", tolerance = 0 }
 "layers.exceptions" = { direction = "down", tolerance = 0 }
 "deps.unused.total" = { direction = "down", tolerance = 0 }
+# A ratchet, not a ceiling of zero: the tree carries functions over the
+# CRAP threshold today, and a gate that is red on day one is ignored.
+"crap.over_threshold" = { direction = "down", tolerance = 0 }
 
 # Per-crate floors override the workspace floor of the same name for one
 # crate. The VM-gated suites of these two run only on a KVM host, so their
@@ -50,6 +56,13 @@ schema = 1
 cognitive-complexity-threshold = 25
 too-many-lines-threshold = 100
 too-many-arguments-threshold = 7
+
+# CRAP (metrics/README.md, "Test quality"): a function scores
+# complexity^2 x (1 - coverage)^3 + complexity. Above the threshold it is
+# both complex and untested; the threshold itself is the last acceptable
+# score. cargo-crap's own default is the same number.
+[crap]
+threshold = 30
 
 # Hotspots (QM-018): files ranked by commits in the window multiplied by
 # their findings (complexity hits + strict hits + uncovered lines / 100).
