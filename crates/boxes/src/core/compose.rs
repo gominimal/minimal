@@ -387,7 +387,6 @@ impl Contribution {
 pub type StoredEnv = Box<dyn Fn(&str) -> Result<String, std::env::VarError> + Send + Sync>;
 
 /// Default env lookup used when callers don't override.
-#[must_use]
 pub fn default_env() -> StoredEnv {
     Box::new(|name| std::env::var(name))
 }
@@ -400,7 +399,6 @@ pub fn default_env() -> StoredEnv {
 /// [`contribution_to_pending`] ships the preserved spec so the client
 /// re-resolves against the *user's* env. (`Specified` vars never call
 /// the lookup, so their literals are untouched.)
-#[must_use]
 pub fn deferring_env() -> StoredEnv {
     Box::new(|_name| Ok(String::new()))
 }
@@ -1018,7 +1016,6 @@ impl Composition {
     /// Exposed as its own accessor rather than left to each caller to
     /// `.rev()`: a caller that forgets would silently tear down in setup
     /// order, which no test of a single-contributor session would catch.
-    #[must_use]
     pub fn lifecycle_hooks_teardown(&self) -> impl DoubleEndedIterator<Item = &ProvenancedHook> {
         self.lifecycle_hooks.iter().rev()
     }

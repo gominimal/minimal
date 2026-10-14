@@ -27,6 +27,12 @@
 #   --history-ref REF gate and diff: the ref holding history/*.json baselines
 #                     (default origin/metrics-data)
 #   --coverage        diff: run llvm-cov over the scope too
+#   --since REF       full: mutation-test the lines changed since REF (default
+#                     `auto`: the newest snapshot in --history, else the
+#                     merge-base with origin/main); MINIMAL_METRICS_MUTANTS_BUDGET_SECS
+#                     caps the run (default 2700)
+#   --history DIR     full: where the history snapshots are (default
+#                     .scratch/metrics/history, what the nightly fetches)
 #   --no-coverage, --no-modules, --no-clippy, --no-hotspots, --no-experimental, --no-mutants
 #                     skip one collector; it is recorded as not measured
 #   -p CRATE          pin the compiling collectors to these crates (the
@@ -66,7 +72,7 @@ here="scripts/metrics"
 mode="${1:-}"
 case "$mode" in
     full|static|gate|diff|mutants) shift ;;
-    "") echo "usage: $0 full|static|gate|diff|mutants [BASE] [--out DIR] [--history-ref REF] [--coverage] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [--no-mutants] [-p CRATE]..." >&2; exit 1 ;;
+    "") echo "usage: $0 full|static|gate|diff|mutants [BASE] [--out DIR] [--history-ref REF] [--coverage] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [--no-mutants] [--since REF] [--history DIR] [-p CRATE]..." >&2; exit 1 ;;
     *) echo "metrics: unknown mode '$mode'" >&2; exit 1 ;;
 esac
 command -v python3 >/dev/null 2>&1 || { echo "metrics: python3 is required" >&2; exit 127; }
@@ -93,6 +99,11 @@ fi
 
 out=".scratch/metrics/$mode"
 history_ref="origin/metrics-data"
+# full mode's mutants: the reference commit (`auto`: newest history snapshot,
+# then the merge-base with origin/main) and the wall-clock budget.
+mutants_since="auto"
+history_dir=".scratch/metrics/history"
+mutants_budget="${MINIMAL_METRICS_MUTANTS_BUDGET_SECS:-2700}"
 want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1 want_deps=1 want_experimental=1 want_mutants=1
 opt_coverage=0
 scope=()
@@ -107,6 +118,8 @@ while [ "$#" -gt 0 ]; do
         --no-hotspots) want_hotspots=0; shift ;;
         --no-experimental) want_experimental=0; shift ;;
         --no-mutants) want_mutants=0; shift ;;
+        --since) mutants_since="$2"; shift 2 ;;
+        --history) history_dir="$2"; shift 2 ;;
         -p) scope+=("$2"); shift 2 ;;
         -p*) scope+=("${1#-p}"); shift ;;
         *) echo "metrics: unknown argument '$1'" >&2; exit 1 ;;
@@ -512,24 +525,65 @@ else
             run_mutants=0
         fi
     else
-        # One seventh of the workspace a night, Monday first, so a week of
-        # nightlies covers the tree once.
-        shard="$(( $(date +%u) - 1 ))/7"
-        mutants_args+=("${cargo_scope[@]}" --shard "$shard")
-        scope_args=(--mutants-scope shard --mutants-shard "$shard")
+        # The nightly tests the lines changed since the previous snapshot: a
+        # workspace shard is thousands of mutants and a night is not enough
+        # for one, while yesterday's changes are bounded and are what the
+        # history should say something about (QM-017). `--since` names the
+        # reference; `auto` takes the newest snapshot in the history dir,
+        # then the merge-base with origin/main on a branch, and skips when
+        # neither names a commit other than HEAD.
+        ref=""
+        if [ "$mutants_since" = "auto" ]; then
+            newest="$(find "$history_dir" -maxdepth 1 -name '*.json' 2>/dev/null | sort | tail -n1 || true)"
+            if [ -n "$newest" ]; then
+                sha7="$(basename "$newest" .json | sed 's/^[0-9-]*-//')"
+                git rev-parse --verify --quiet "$sha7^{commit}" >/dev/null 2>&1 && ref="$sha7"
+            fi
+            if [ -z "$ref" ]; then
+                mb="$(git merge-base origin/main HEAD 2>/dev/null || git merge-base main HEAD 2>/dev/null || true)"
+                [ -n "$mb" ] && [ "$mb" != "$(git rev-parse HEAD)" ] && ref="$mb"
+            fi
+        else
+            git rev-parse --verify --quiet "$mutants_since^{commit}" >/dev/null 2>&1 && ref="$mutants_since"
+        fi
+        if [ -z "$ref" ]; then
+            skip mutants "no reference commit for the nightly diff (--since)"
+            run_mutants=0
+        else
+            git diff -U0 --no-color --no-ext-diff --no-textconv --diff-filter=d \
+                "$ref" -- '*.rs' > "$work/mutants.diff"
+            if [ -s "$work/mutants.diff" ]; then
+                mutants_args+=(--in-diff "$work/mutants.diff")
+                scope_args=(--mutants-scope since --mutants-since "$(git rev-parse --short=7 "$ref")")
+            else
+                skip mutants "no Rust changes since $ref"
+                run_mutants=0
+            fi
+        fi
     fi
     if [ "$run_mutants" -eq 1 ]; then
         t0="$(now)"
         status=0
         rm -rf "$out/mutants/mutants.out"
-        cargo mutants "${mutants_args[@]}" > "$work/mutants.log" 2> "$work/mutants.err" || status=$?
+        # A time budget, so one large change cannot take the whole run with
+        # it. cargo-mutants rewrites outcomes.json after every mutant, so an
+        # interrupted run still reports what it tested, marked as partial.
+        budget_cmd=()
+        if command -v timeout >/dev/null 2>&1; then
+            budget_cmd=(timeout --signal=INT --kill-after=60 "$mutants_budget")
+        fi
+        "${budget_cmd[@]}" cargo mutants "${mutants_args[@]}" > "$work/mutants.log" 2> "$work/mutants.err" || status=$?
         outcomes="$out/mutants/mutants.out/outcomes.json"
+        if [ "$status" -eq 124 ]; then
+            echo "metrics: mutants stopped at the ${mutants_budget}s budget; partial result" >&2
+            scope_args+=(--mutants-budget-exhausted)
+        fi
         # Exit 2 is missed mutants, 3 timeouts, 4 unviable ones: results, not
         # failures. 4 is also a failed baseline, so the proof that the run
         # happened is the baseline's own outcome in the file. A diff that
         # reaches no mutant (comments, signatures) exits 0 and writes no
         # mutants.out at all: nothing was measured, and nothing failed.
-        if [ "$status" -eq 0 ] && [ ! -f "$outcomes" ]; then
+        if { [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; } && [ ! -f "$outcomes" ]; then
             skip mutants "no mutants in the changed lines"
         elif [ -f "$outcomes" ] && python3 - "$outcomes" <<'PY'
 import json, sys

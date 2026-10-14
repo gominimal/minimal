@@ -1081,6 +1081,7 @@ impl PatchDest {
     }
 
     /// Borrow the underlying sandbox-home-relative path.
+    #[must_use]
     pub fn as_sandbox_path(&self) -> &SandboxRelPath {
         &self.0
     }
@@ -1297,12 +1298,14 @@ impl ResolvedPatch {
     }
 
     /// The absolute host path of the file being copied.
+    #[must_use]
     pub fn host_path(&self) -> &HostAbsPath {
         &self.host_path
     }
 
     /// The destination the file is copied to, relative to the sandbox
     /// user's home directory.
+    #[must_use]
     pub fn destination(&self) -> &SandboxRelPath {
         &self.destination
     }
