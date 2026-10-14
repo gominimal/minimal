@@ -542,8 +542,11 @@ is left for this command, which runs it in one `sudo` call. Until it runs,
 the hostname proxy serves box names. The host line that
 `min session activate` prints says where the box name resolves:
 `names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`
-while the proxy serves the names, or `names: <box>.min.internal resolves in any browser on this machine`
-once this host resolves the zone natively. While any item is not done, the
+while the proxy serves the names, or
+`names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>`
+once this host resolves the zone natively. Native names resolve to a reserved
+local address. A browser opens the box through the hostname proxy, which
+keeps serving. While any item is not done, the
 line ends with `; finish setup: min finalize-install`. When the proxy failed
 to bind, the cause replaces the resolution and the box stays named:
 `names: <box>.min.internal: the hostname proxy is not serving: <cause>`, with
