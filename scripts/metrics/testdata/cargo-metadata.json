@@ -1,0 +1,2477 @@
+{
+ "packages": [
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "shlex"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    }
+   ],
+   "description": "Types for the argument schema of tasks and sideload parameters.",
+   "id": "path+file:///workbench/minimal/crates/args#0.0.1",
+   "manifest_path": "<root>/crates/args/Cargo.toml",
+   "name": "args"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio"
+    }
+   ],
+   "description": "Interactive terminal prompts over any async reader/writer (no TTY required).",
+   "id": "path+file:///workbench/minimal/crates/async-dialog#0.0.1",
+   "manifest_path": "<root>/crates/async-dialog/Cargo.toml",
+   "name": "async-dialog"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "blake3"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "path-absolutize"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    }
+   ],
+   "description": "Local cache of built artifacts, keyed by SpecHash.",
+   "id": "path+file:///workbench/minimal/crates/lcache#0.0.1",
+   "manifest_path": "<root>/crates/lcache/Cargo.toml",
+   "name": "lcache"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "blake3"
+    },
+    {
+     "kind": null,
+     "name": "bytes"
+    },
+    {
+     "kind": null,
+     "name": "bzip2"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting"
+    },
+    {
+     "kind": null,
+     "name": "copy_dir"
+    },
+    {
+     "kind": null,
+     "name": "either"
+    },
+    {
+     "kind": null,
+     "name": "flate2"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "globset"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-auth"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-storage"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "jaq-all"
+    },
+    {
+     "kind": null,
+     "name": "lzma-rs"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "rand"
+    },
+    {
+     "kind": null,
+     "name": "reqwest"
+    },
+    {
+     "kind": null,
+     "name": "resolv-conf"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "tar"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "url"
+    },
+    {
+     "kind": null,
+     "name": "walkdir"
+    },
+    {
+     "kind": null,
+     "name": "zstd"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    }
+   ],
+   "description": "Common types and utilities (e.g. SpecHash) used across the codebase.",
+   "id": "path+file:///workbench/minimal/crates/common#0.0.1",
+   "manifest_path": "<root>/crates/common/Cargo.toml",
+   "name": "common"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "indicatif"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio"
+    }
+   ],
+   "description": "Operation tracking for progress rendering (render-agnostic core + drivers).",
+   "id": "path+file:///workbench/minimal/crates/ot#0.0.1",
+   "manifest_path": "<root>/crates/ot/Cargo.toml",
+   "name": "ot"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "arbitrary"
+    },
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "blake3"
+    },
+    {
+     "kind": null,
+     "name": "checkouts"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "decode"
+    },
+    {
+     "kind": null,
+     "name": "generational-arena"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "smallvec"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    }
+   ],
+   "description": "The in-memory, semantic dependency graph; the planner module orders builds.",
+   "id": "path+file:///workbench/minimal/crates/graph#0.0.1",
+   "manifest_path": "<root>/crates/graph/Cargo.toml",
+   "name": "graph"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "rand"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    }
+   ],
+   "description": "Git repository checkout management for source operations (upstream layers at pinned versions).",
+   "id": "path+file:///workbench/minimal/crates/checkouts#0.0.1",
+   "manifest_path": "<root>/crates/checkouts/Cargo.toml",
+   "name": "checkouts"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    },
+    {
+     "kind": null,
+     "name": "shlex"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": "dev",
+     "name": "tracing-subscriber"
+    }
+   ],
+   "description": "Finding and reading the minimal.toml file.",
+   "id": "path+file:///workbench/minimal/crates/mfile#0.0.1",
+   "manifest_path": "<root>/crates/mfile/Cargo.toml",
+   "name": "mfile"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "dirs"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": "dev",
+     "name": "toml"
+    }
+   ],
+   "description": "Realm-tagged path types distinguishing host, sandbox, and daemon filesystems.",
+   "id": "path+file:///workbench/minimal/crates/paths#0.0.1",
+   "manifest_path": "<root>/crates/paths/Cargo.toml",
+   "name": "paths"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "globset"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "nutype"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "uuid"
+    },
+    {
+     "kind": null,
+     "name": "walkdir"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    }
+   ],
+   "description": "Session domain types shared by min and minimald: loadouts, lifecycle hooks and the client/daemon composition pipeline, the session's network mode and policy (including the pure egress verdict), on-disk session state, and the JSON wire forms of all of these.",
+   "id": "path+file:///workbench/minimal/crates/sessions#0.0.1",
+   "manifest_path": "<root>/crates/sessions/Cargo.toml",
+   "name": "sessions"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "blake3"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "either"
+    },
+    {
+     "kind": null,
+     "name": "generational-arena"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core"
+    },
+    {
+     "kind": null,
+     "name": "regex"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "shlex"
+    },
+    {
+     "kind": null,
+     "name": "smallvec"
+    },
+    {
+     "kind": null,
+     "name": "stdlib"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    }
+   ],
+   "description": "Evaluates a Nickel config layer into in-memory packages/profiles/stacks.",
+   "id": "path+file:///workbench/minimal/crates/decode#0.0.1",
+   "manifest_path": "<root>/crates/decode/Cargo.toml",
+   "name": "decode"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "fd-lock"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    }
+   ],
+   "description": "The embedded Minimal standard library.",
+   "id": "path+file:///workbench/minimal/crates/stdlib#0.0.21",
+   "manifest_path": "<root>/crates/stdlib/Cargo.toml",
+   "name": "stdlib"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "bytes"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-storage"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "lcache"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "reqwest"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": "dev",
+     "name": "mockall"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio"
+    }
+   ],
+   "description": "Remote cache: fetch/upload build artifacts over the network.",
+   "id": "path+file:///workbench/minimal/crates/rcache#0.0.1",
+   "manifest_path": "<root>/crates/rcache/Cargo.toml",
+   "name": "rcache"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "decode"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "lcache"
+    },
+    {
+     "kind": null,
+     "name": "moka"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core"
+    },
+    {
+     "kind": null,
+     "name": "object"
+    },
+    {
+     "kind": null,
+     "name": "op"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "path-absolutize"
+    },
+    {
+     "kind": null,
+     "name": "regex"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "url"
+    }
+   ],
+   "description": "mip check linting of minimal.toml, packages, profiles, and stacks.",
+   "id": "path+file:///workbench/minimal/crates/check#0.0.1",
+   "manifest_path": "<root>/crates/check/Cargo.toml",
+   "name": "check"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "base64"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "decode"
+    },
+    {
+     "kind": null,
+     "name": "flate2"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "globset"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "lcache"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "oci-spec"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "rayon"
+    },
+    {
+     "kind": null,
+     "name": "rcache"
+    },
+    {
+     "kind": null,
+     "name": "sandbox"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "shlex"
+    },
+    {
+     "kind": null,
+     "name": "size"
+    },
+    {
+     "kind": null,
+     "name": "tar"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "toml_edit"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "url"
+    },
+    {
+     "kind": null,
+     "name": "walkdir"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    },
+    {
+     "kind": "dev",
+     "name": "smallvec"
+    }
+   ],
+   "description": "Complex operations over the graph and packages (builds, cache object construction).",
+   "id": "path+file:///workbench/minimal/crates/op#0.0.1",
+   "manifest_path": "<root>/crates/op/Cargo.toml",
+   "name": "op"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "globset"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "shlex"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "walkdir"
+    },
+    {
+     "kind": null,
+     "name": "hakoniwa"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "nix"
+    }
+   ],
+   "description": "The sandbox layer: namespaced (user, mount, network) process launch on Linux via hakoniwa, with the plan \u2192 container \u2192 spawn \u2192 attach sequence every box and package build goes through; network wiring is supplied by the consumer as an impl Network.",
+   "id": "path+file:///workbench/minimal/crates/sandbox#0.0.1",
+   "manifest_path": "<root>/crates/sandbox/Cargo.toml",
+   "name": "sandbox"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "async-compression"
+    },
+    {
+     "kind": null,
+     "name": "async-tar"
+    },
+    {
+     "kind": null,
+     "name": "chrono"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": null,
+     "name": "walkdir"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio-stream"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    }
+   ],
+   "description": "App-agnostic machinery for diagnostic support bundles.",
+   "id": "path+file:///workbench/minimal/crates/diagnostics#0.0.1",
+   "manifest_path": "<root>/crates/diagnostics/Cargo.toml",
+   "name": "diagnostics"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "check"
+    },
+    {
+     "kind": null,
+     "name": "checkouts"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-auth"
+    },
+    {
+     "kind": null,
+     "name": "google-cloud-storage"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "lcache"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "op"
+    },
+    {
+     "kind": null,
+     "name": "orchestrator"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "rcache"
+    },
+    {
+     "kind": null,
+     "name": "sandbox"
+    },
+    {
+     "kind": null,
+     "name": "stdlib"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": null,
+     "name": "toml_edit"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": "dev",
+     "name": "decode"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test"
+    }
+   ],
+   "description": "Top-level 'minimal context' API tying configuration, decoding, graph, and cache together.",
+   "id": "path+file:///workbench/minimal/crates/mctx#0.0.1",
+   "manifest_path": "<root>/crates/mctx/Cargo.toml",
+   "name": "mctx"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "decode"
+    },
+    {
+     "kind": null,
+     "name": "either"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "generational-arena"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "lcache"
+    },
+    {
+     "kind": null,
+     "name": "op"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "rcache"
+    },
+    {
+     "kind": null,
+     "name": "sandbox"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    }
+   ],
+   "description": "Runtime orchestration of builds behind a pluggable Backend.",
+   "id": "path+file:///workbench/minimal/crates/orchestrator#0.0.1",
+   "manifest_path": "<root>/crates/orchestrator/Cargo.toml",
+   "name": "orchestrator"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "blake3"
+    },
+    {
+     "kind": null,
+     "name": "check"
+    },
+    {
+     "kind": null,
+     "name": "checkouts"
+    },
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete"
+    },
+    {
+     "kind": null,
+     "name": "codespan-reporting"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "decode"
+    },
+    {
+     "kind": null,
+     "name": "dirs"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "lcache"
+    },
+    {
+     "kind": null,
+     "name": "mctx"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "nickel-lang-core"
+    },
+    {
+     "kind": null,
+     "name": "op"
+    },
+    {
+     "kind": null,
+     "name": "orchestrator"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "petgraph"
+    },
+    {
+     "kind": null,
+     "name": "rayon"
+    },
+    {
+     "kind": null,
+     "name": "rcache"
+    },
+    {
+     "kind": null,
+     "name": "remote-client"
+    },
+    {
+     "kind": null,
+     "name": "sandbox"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "smallvec"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test"
+    }
+   ],
+   "description": "The Minimal package/build CLI.",
+   "id": "path+file:///workbench/minimal/crates/mip#0.8.0",
+   "manifest_path": "<root>/crates/mip/Cargo.toml",
+   "name": "mip"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "bytes"
+    },
+    {
+     "kind": null,
+     "name": "check"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "http-body"
+    },
+    {
+     "kind": null,
+     "name": "orchestrator"
+    },
+    {
+     "kind": null,
+     "name": "remote-proto"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-stream"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tonic"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    }
+   ],
+   "description": "Client for the Remote Execution Service, driving remote builds against the graph.",
+   "id": "path+file:///workbench/minimal/crates/remote-client#0.0.1",
+   "manifest_path": "<root>/crates/remote-client/Cargo.toml",
+   "name": "remote-client"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "prost"
+    },
+    {
+     "kind": null,
+     "name": "prost-types"
+    },
+    {
+     "kind": null,
+     "name": "tonic"
+    },
+    {
+     "kind": null,
+     "name": "tonic-prost"
+    },
+    {
+     "kind": "build",
+     "name": "prost-build"
+    },
+    {
+     "kind": "build",
+     "name": "tonic-prost-build"
+    }
+   ],
+   "description": "Protobuf / wire types for the Remote Execution Service (RES).",
+   "id": "path+file:///workbench/minimal/crates/remote-proto#0.0.1",
+   "manifest_path": "<root>/crates/remote-proto/Cargo.toml",
+   "name": "remote-proto"
+  },
+  {
+   "dependencies": [],
+   "description": "Shared build-time version identity for min, mip, minimald, and minvmd.",
+   "id": "path+file:///workbench/minimal/crates/version#0.8.0",
+   "manifest_path": "<root>/crates/version/Cargo.toml",
+   "name": "version"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "async-compression"
+    },
+    {
+     "kind": null,
+     "name": "async-tar"
+    },
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "chrono"
+    },
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete"
+    },
+    {
+     "kind": null,
+     "name": "diagnostics"
+    },
+    {
+     "kind": null,
+     "name": "dirs"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "hickory-proto"
+    },
+    {
+     "kind": null,
+     "name": "inquire"
+    },
+    {
+     "kind": null,
+     "name": "mctx"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "minimal-client"
+    },
+    {
+     "kind": null,
+     "name": "minimal-tui"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc"
+    },
+    {
+     "kind": null,
+     "name": "minvmd"
+    },
+    {
+     "kind": null,
+     "name": "mlog"
+    },
+    {
+     "kind": null,
+     "name": "nix"
+    },
+    {
+     "kind": null,
+     "name": "op"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "reqwest"
+    },
+    {
+     "kind": null,
+     "name": "russh"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "switch"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-stream"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": null,
+     "name": "toml_edit"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "url"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": "dev",
+     "name": "minimald"
+    },
+    {
+     "kind": "dev",
+     "name": "minvmd"
+    },
+    {
+     "kind": "dev",
+     "name": "nix"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio"
+    }
+   ],
+   "description": "The min CLI: sessions, tasks, loadouts, packages, networking, diagnostics and project setup, over SSH to minimald, auto-spawning minvmd where the daemon lives in a microVM.",
+   "id": "path+file:///workbench/minimal/crates/minimal#0.8.0",
+   "manifest_path": "<root>/crates/minimal/Cargo.toml",
+   "name": "minimal"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "async-compression"
+    },
+    {
+     "kind": null,
+     "name": "async-tar"
+    },
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "constcat"
+    },
+    {
+     "kind": null,
+     "name": "indicatif"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc"
+    },
+    {
+     "kind": null,
+     "name": "nix"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "russh"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio"
+    }
+   ],
+   "description": "SSH client transport for talking to minimald over the UDS bridge, shared by the min CLI and the TUI",
+   "id": "path+file:///workbench/minimal/crates/minimal-client#0.8.0",
+   "manifest_path": "<root>/crates/minimal-client/Cargo.toml",
+   "name": "minimal-client"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "chrono"
+    },
+    {
+     "kind": null,
+     "name": "constcat"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "rand"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    }
+   ],
+   "description": "The client/daemon wire contract: minimald's oneshot SSH RPC request/response types, the tagged exec-channel vocabulary, and the task-env and trace propagation keys. Transport-free (no russh, no tokio); the one contract both min and minimald build against.",
+   "id": "path+file:///workbench/minimal/crates/minimald-rpc#0.0.1",
+   "manifest_path": "<root>/crates/minimald-rpc/Cargo.toml",
+   "name": "minimald-rpc"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "chrono"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "crossterm"
+    },
+    {
+     "kind": null,
+     "name": "dirs"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "minimal-client"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "ratatui"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "unicode-width"
+    },
+    {
+     "kind": "dev",
+     "name": "insta"
+    },
+    {
+     "kind": "dev",
+     "name": "nix"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    }
+   ],
+   "description": "min dash \u2014 interactive session manager TUI for minimald sessions",
+   "id": "path+file:///workbench/minimal/crates/minimal-tui#0.8.0",
+   "manifest_path": "<root>/crates/minimal-tui/Cargo.toml",
+   "name": "minimal-tui"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete"
+    },
+    {
+     "kind": null,
+     "name": "fd-lock"
+    },
+    {
+     "kind": null,
+     "name": "hickory-proto"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc"
+    },
+    {
+     "kind": null,
+     "name": "mlog"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "russh"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    },
+    {
+     "kind": null,
+     "name": "switch"
+    },
+    {
+     "kind": null,
+     "name": "sysinfo"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "toml"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "uuid"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": "dev",
+     "name": "camino"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk"
+    },
+    {
+     "kind": "dev",
+     "name": "russh-sftp"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test"
+    },
+    {
+     "kind": "dev",
+     "name": "sha2"
+    },
+    {
+     "kind": "dev",
+     "name": "switch"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": "dev",
+     "name": "tracing-opentelemetry"
+    }
+   ],
+   "description": "Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock.",
+   "id": "path+file:///workbench/minimal/crates/minvmd#0.8.0",
+   "manifest_path": "<root>/crates/minvmd/Cargo.toml",
+   "name": "minvmd"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "json-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-appender-tracing"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-http"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-otlp"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-semantic-conventions"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry_sdk"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "reqwest"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender"
+    },
+    {
+     "kind": null,
+     "name": "tracing-opentelemetry"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk"
+    },
+    {
+     "kind": "dev",
+     "name": "serde_json"
+    },
+    {
+     "kind": "dev",
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    }
+   ],
+   "description": "JSON file-log layer both minimald and minvmd write through; one definition of the on-disk log format.",
+   "id": "path+file:///workbench/minimal/crates/mlog#0.0.1",
+   "manifest_path": "<root>/crates/mlog/Cargo.toml",
+   "name": "mlog"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "smoltcp"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": "dev",
+     "name": "switch"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    }
+   ],
+   "description": "gvproxy-switch primitives: subnet arithmetic, MAC derivation, vsock constants, config rendering.",
+   "id": "path+file:///workbench/minimal/crates/switch#0.0.1",
+   "manifest_path": "<root>/crates/switch/Cargo.toml",
+   "name": "switch"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "args"
+    },
+    {
+     "kind": null,
+     "name": "async-compression"
+    },
+    {
+     "kind": null,
+     "name": "async-dialog"
+    },
+    {
+     "kind": null,
+     "name": "async-tar"
+    },
+    {
+     "kind": null,
+     "name": "base64"
+    },
+    {
+     "kind": null,
+     "name": "blake3"
+    },
+    {
+     "kind": null,
+     "name": "boringtun"
+    },
+    {
+     "kind": null,
+     "name": "bytes"
+    },
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "check"
+    },
+    {
+     "kind": null,
+     "name": "chrono"
+    },
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "clap_complete"
+    },
+    {
+     "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "constcat"
+    },
+    {
+     "kind": null,
+     "name": "diagnostics"
+    },
+    {
+     "kind": null,
+     "name": "fd-lock"
+    },
+    {
+     "kind": null,
+     "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "graph"
+    },
+    {
+     "kind": null,
+     "name": "hakoniwa"
+    },
+    {
+     "kind": null,
+     "name": "hex"
+    },
+    {
+     "kind": null,
+     "name": "hickory-proto"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "mctx"
+    },
+    {
+     "kind": null,
+     "name": "mfile"
+    },
+    {
+     "kind": null,
+     "name": "minimald-rpc"
+    },
+    {
+     "kind": null,
+     "name": "mlog"
+    },
+    {
+     "kind": null,
+     "name": "nix"
+    },
+    {
+     "kind": null,
+     "name": "op"
+    },
+    {
+     "kind": null,
+     "name": "orchestrator"
+    },
+    {
+     "kind": null,
+     "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "rand_core"
+    },
+    {
+     "kind": null,
+     "name": "russh"
+    },
+    {
+     "kind": null,
+     "name": "russh-sftp"
+    },
+    {
+     "kind": null,
+     "name": "sandbox"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": null,
+     "name": "sessions"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "size"
+    },
+    {
+     "kind": null,
+     "name": "stdlib"
+    },
+    {
+     "kind": null,
+     "name": "switch"
+    },
+    {
+     "kind": null,
+     "name": "sysinfo"
+    },
+    {
+     "kind": null,
+     "name": "tar"
+    },
+    {
+     "kind": null,
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "uuid"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": null,
+     "name": "vt100"
+    },
+    {
+     "kind": null,
+     "name": "walkdir"
+    },
+    {
+     "kind": null,
+     "name": "zstd"
+    },
+    {
+     "kind": "dev",
+     "name": "decode"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc"
+    },
+    {
+     "kind": "dev",
+     "name": "lcache"
+    },
+    {
+     "kind": "dev",
+     "name": "libc"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk"
+    },
+    {
+     "kind": "dev",
+     "name": "proptest"
+    },
+    {
+     "kind": "dev",
+     "name": "serial_test"
+    },
+    {
+     "kind": "dev",
+     "name": "tokio"
+    },
+    {
+     "kind": "dev",
+     "name": "tracing-opentelemetry"
+    },
+    {
+     "kind": null,
+     "name": "tokio-vsock"
+    },
+    {
+     "kind": null,
+     "name": "vsock"
+    }
+   ],
+   "description": "The session daemon: a russh SSH server that dispatches to per-subsystem mailbox actors (session manager, one actor per session, the session host, maintenance), owns the gvproxy switch, DNS and hostname proxy for own-address boxes, and runs as pid-1 inside the minvmd microVM.",
+   "id": "path+file:///workbench/minimal/crates/minimald#0.8.0",
+   "manifest_path": "<root>/crates/minimald/Cargo.toml",
+   "name": "minimald"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "anyhow"
+    },
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "minvmd"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    }
+   ],
+   "description": "The host's box-name service (DNS and addresses for boxes), linked without libkrun, that the privileged step installs.",
+   "id": "path+file:///workbench/minimal/crates/minzoned#0.8.0",
+   "manifest_path": "<root>/crates/minzoned/Cargo.toml",
+   "name": "minzoned"
+  }
+ ],
+ "workspace_members": [
+  "path+file:///workbench/minimal/crates/args#0.0.1",
+  "path+file:///workbench/minimal/crates/async-dialog#0.0.1",
+  "path+file:///workbench/minimal/crates/lcache#0.0.1",
+  "path+file:///workbench/minimal/crates/common#0.0.1",
+  "path+file:///workbench/minimal/crates/ot#0.0.1",
+  "path+file:///workbench/minimal/crates/graph#0.0.1",
+  "path+file:///workbench/minimal/crates/checkouts#0.0.1",
+  "path+file:///workbench/minimal/crates/mfile#0.0.1",
+  "path+file:///workbench/minimal/crates/paths#0.0.1",
+  "path+file:///workbench/minimal/crates/sessions#0.0.1",
+  "path+file:///workbench/minimal/crates/decode#0.0.1",
+  "path+file:///workbench/minimal/crates/stdlib#0.0.21",
+  "path+file:///workbench/minimal/crates/rcache#0.0.1",
+  "path+file:///workbench/minimal/crates/check#0.0.1",
+  "path+file:///workbench/minimal/crates/op#0.0.1",
+  "path+file:///workbench/minimal/crates/sandbox#0.0.1",
+  "path+file:///workbench/minimal/crates/diagnostics#0.0.1",
+  "path+file:///workbench/minimal/crates/mctx#0.0.1",
+  "path+file:///workbench/minimal/crates/orchestrator#0.0.1",
+  "path+file:///workbench/minimal/crates/mip#0.8.0",
+  "path+file:///workbench/minimal/crates/remote-client#0.0.1",
+  "path+file:///workbench/minimal/crates/remote-proto#0.0.1",
+  "path+file:///workbench/minimal/crates/version#0.8.0",
+  "path+file:///workbench/minimal/crates/minimal#0.8.0",
+  "path+file:///workbench/minimal/crates/minimal-client#0.8.0",
+  "path+file:///workbench/minimal/crates/minimald-rpc#0.0.1",
+  "path+file:///workbench/minimal/crates/minimal-tui#0.8.0",
+  "path+file:///workbench/minimal/crates/minvmd#0.8.0",
+  "path+file:///workbench/minimal/crates/mlog#0.0.1",
+  "path+file:///workbench/minimal/crates/switch#0.0.1",
+  "path+file:///workbench/minimal/crates/minimald#0.8.0",
+  "path+file:///workbench/minimal/crates/minzoned#0.8.0"
+ ]
+}

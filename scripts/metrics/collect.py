@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""Turn raw tool output into one snapshot document (spec 30).
+
+`run.sh` runs the tools and hands their files here; this file knows the
+shape of each tool's output, attributes every finding to a crate, evaluates
+the gates in metrics/thresholds.toml and writes:
+
+  snapshot.json      the v1 snapshot (metrics/README.md; schema.py validates)
+  clippy-hits.json   every strict/complexity diagnostic as (path, line, code),
+                     for the diff grader to intersect with changed lines
+  meta.json          wall-clock data: start time, durations, hostname
+
+Times live in meta.json and nowhere else, so snapshot.json is byte-identical
+for an identical tree, baseline and thresholds (QM-006). A collector whose
+file was not given is recorded under `run.not_measured` with the reason
+`run.sh` passed, and its blocks are null (QM-001).
+
+Exit 0 when the verdict is pass or warn, 2 when it is fail, 1 for a crash or
+an unreadable input. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import tomllib
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import layers as layers_mod  # noqa: E402
+import schema as schema_mod  # noqa: E402
+
+GATE_EXIT = 2
+COMPLEXITY_LINTS = (
+    "clippy::cognitive_complexity",
+    "clippy::too_many_lines",
+    "clippy::too_many_arguments",
+)
+# Snapshot blocks every crate carries; null when not measured.
+BLOCKS = ("size", "clippy", "coverage", "modules", "deps", "mutants", "crap", "experimental")
+RANK = {"pass": 0, "not_evaluated": 0, "warn": 1, "fail": 2}
+
+
+# ----------------------------------------------------------------- inputs
+
+
+def read_json(path: Path | None):
+    if path is None:
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_lines(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    return [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def git_info() -> dict:
+    sha = git("rev-parse", "HEAD")
+    ref = git("rev-parse", "--abbrev-ref", "HEAD")
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    return {"sha": sha, "sha7": sha[:7], "ref": ref, "dirty": dirty}
+
+
+def members_of(meta: dict, root: Path) -> dict[str, str]:
+    """crate name -> its directory relative to the repo root (e.g. crates/graph)."""
+    out = {}
+    for pkg in meta["packages"]:
+        parent = Path(pkg["manifest_path"]).parent
+        try:
+            rel = parent.relative_to(root)
+        except ValueError:
+            # A fixture, or metadata from another checkout: keep the path from
+            # the `crates` component on, which is how every tool names files.
+            parts = parent.parts
+            rel = Path(*parts[parts.index("crates"):]) if "crates" in parts else Path(parent.name)
+        out[pkg["name"]] = rel.as_posix()
+    return out
+
+
+class Attributor:
+    """Map a workspace-relative path to the crate whose directory contains it."""
+
+    def __init__(self, members: dict[str, str], root: Path):
+        self.root = root
+        # Longest directory first so a nested crate wins over its parent.
+        self.dirs = sorted(((d, n) for n, d in members.items()), key=lambda x: -len(x[0]))
+
+    def relative(self, path: str) -> str:
+        p = Path(path)
+        if p.is_absolute():
+            try:
+                p = p.relative_to(self.root)
+            except ValueError:
+                # Another checkout's absolute path (llvm-cov reports them that
+                # way): keep the path from the `crates` component on.
+                parts = p.parts
+                p = Path(*parts[parts.index("crates"):]) if "crates" in parts else p
+        return p.as_posix()
+
+    def crate(self, path: str) -> str | None:
+        rel = self.relative(path)
+        for directory, name in self.dirs:
+            if rel == directory or rel.startswith(directory + "/"):
+                return name
+        return None
+
+
+def is_test_path(rel: str) -> bool:
+    parts = rel.split("/")
+    return any(p in ("tests", "benches", "fuzz", "examples") for p in parts[:-1]) or rel.endswith(
+        "build.rs"
+    )
+
+
+# --------------------------------------------------------------- collectors
+
+
+def collect_clippy(path: Path | None, strict: list[str], attr: Attributor):
+    """Per-crate lint counts, the hit list, and per-file counts for hotspots."""
+    if path is None:
+        return None, [], {}
+    strict_set = set(strict)
+    complexity_set = set(COMPLEXITY_LINTS)
+    per_crate: dict[str, dict] = defaultdict(
+        lambda: {
+            "workspace_lints": 0,
+            "strict": {lint: 0 for lint in strict},
+            "complexity": {lint.split("::", 1)[1]: 0 for lint in COMPLEXITY_LINTS},
+        }
+    )
+    per_file: dict[str, Counter] = defaultdict(Counter)
+    hits = []
+    seen = set()
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            if '"compiler-message"' not in raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("reason") != "compiler-message":
+                continue
+            body = msg.get("message", {})
+            if body.get("level") not in ("warning", "error"):
+                continue
+            code = (body.get("code") or {}).get("code") or ""
+            if not code:
+                continue
+            span = next((s for s in body.get("spans", []) if s.get("is_primary")), None)
+            if span is None or span.get("line_start") is None:
+                continue
+            rel = attr.relative(span["file_name"])
+            key = (rel, span["line_start"], code)
+            if key in seen:
+                continue
+            seen.add(key)
+            crate = attr.crate(rel) or "<workspace>"
+            bucket = per_crate[crate]
+            if code in strict_set:
+                bucket["strict"][code] += 1
+                per_file[rel]["strict"] += 1
+            elif code in complexity_set:
+                bucket["complexity"][code.split("::", 1)[1]] += 1
+                per_file[rel]["complexity"] += 1
+            else:
+                bucket["workspace_lints"] += 1
+            hits.append({"path": rel, "line": span["line_start"], "code": code})
+    hits.sort(key=lambda h: (h["path"], h["line"], h["code"]))
+    return per_crate, hits, per_file
+
+
+def collect_coverage(path: Path | None, attr: Attributor):
+    """Per-crate line/function/region totals and per-file uncovered lines."""
+    doc = read_json(path)
+    if doc is None:
+        return None, None, {}
+    data = doc["data"][0]
+    per_crate: dict[str, dict] = defaultdict(
+        lambda: {k: {"covered": 0, "total": 0} for k in ("lines", "functions", "regions")}
+    )
+    uncovered: dict[str, int] = {}
+    for f in data.get("files", []):
+        rel = attr.relative(f["filename"])
+        crate = attr.crate(rel)
+        if crate is None or is_test_path(rel):
+            continue
+        s = f["summary"]
+        for k in ("lines", "functions", "regions"):
+            per_crate[crate][k]["covered"] += s[k]["covered"]
+            per_crate[crate][k]["total"] += s[k]["count"]
+        uncovered[rel] = s["lines"]["count"] - s["lines"]["covered"]
+    for crate in per_crate.values():
+        for k in crate.values():
+            k["pct"] = pct(k["covered"], k["total"])
+    totals = data.get("totals", {})
+    workspace = {
+        k: {
+            "covered": totals[k]["covered"],
+            "total": totals[k]["count"],
+            "pct": pct(totals[k]["covered"], totals[k]["count"]),
+        }
+        for k in ("lines", "functions", "regions")
+        if k in totals
+    }
+    return per_crate, workspace, uncovered
+
+
+def collect_size(path: Path | None, attr: Attributor):
+    doc = read_json(path)
+    if doc is None:
+        return None
+    per_crate: dict[str, dict] = defaultdict(
+        lambda: {"files": 0, "code": 0, "comments": 0, "blanks": 0, "test_code": 0}
+    )
+    for report in doc.get("Rust", {}).get("reports", []):
+        rel = attr.relative(report["name"])
+        crate = attr.crate(rel)
+        if crate is None:
+            continue
+        stats = report["stats"]
+        bucket = per_crate[crate]
+        bucket["files"] += 1
+        bucket["code"] += stats["code"]
+        bucket["comments"] += stats["comments"]
+        bucket["blanks"] += stats["blanks"]
+        if is_test_path(rel):
+            bucket["test_code"] += stats["code"]
+    return per_crate
+
+
+def collect_modules(path: Path | None):
+    """run.sh writes one JSON object per crate: {crate, acyclic, orphans, error}."""
+    if path is None:
+        return None
+    out = {}
+    for line in read_lines(path):
+        rec = json.loads(line)
+        out[rec["crate"]] = {
+            "acyclic": rec.get("acyclic"),
+            "orphans": rec.get("orphans"),
+            "error": rec.get("error"),
+        }
+    return out
+
+
+UNUSED_RE = re.compile(r"unused (?:workspace )?dependency `([^`]+)`")
+
+
+def collect_shear(path: Path | None, attr: Attributor):
+    doc = read_json(path)
+    if doc is None:
+        return None, None
+    per_crate: dict[str, list] = defaultdict(list)
+    workspace_unused = []
+    for finding in doc.get("findings", []):
+        m = UNUSED_RE.search(finding.get("message", ""))
+        if not m:
+            continue
+        if finding["code"] == "shear/unused_workspace_dependency":
+            workspace_unused.append(m.group(1))
+            continue
+        if finding["code"] != "shear/unused_dependency":
+            continue
+        crate = attr.crate(finding["file"])
+        if crate is not None:
+            per_crate[crate].append(m.group(1))
+    return per_crate, sorted(workspace_unused)
+
+
+def churn(window_days: int) -> Counter:
+    """Commits touching each Rust file in the window, from the current history."""
+    out = subprocess.run(
+        ["git", "log", f"--since={window_days}.days", "--format=", "--name-only", "--", "*.rs"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return Counter(l.strip() for l in out.splitlines() if l.strip())
+
+
+def hotspots(
+    window_days: int,
+    top: int,
+    per_file_clippy: dict[str, Counter],
+    uncovered: dict[str, int],
+    coverage_measured: bool,
+    attr: Attributor,
+    root: Path,
+) -> dict:
+    """Rank files by churn x findings (QM-018).
+
+    findings = complexity hits + strict hits + uncovered lines / 100. Each
+    component is monotone, so a file that is worse on every axis never ranks
+    below one that is better on every axis. Files outside a crate, test
+    sources and files no longer in the tree are left out.
+
+    With no findings source at all (static mode: no clippy, no coverage) the
+    ranking is churn alone and says so: the hot files are still the ones a
+    refactor should look at first, only unweighted.
+    """
+    findings_included = bool(per_file_clippy) or coverage_measured
+    changes = churn(window_days)
+    files = set(changes) | set(per_file_clippy) | set(uncovered)
+    rows = []
+    for rel in files:
+        if attr.crate(rel) is None or is_test_path(rel) or not (root / rel).is_file():
+            continue
+        c = changes.get(rel, 0)
+        complexity = per_file_clippy.get(rel, Counter()).get("complexity", 0)
+        strict = per_file_clippy.get(rel, Counter()).get("strict", 0)
+        unc = uncovered.get(rel, 0) if coverage_measured else None
+        findings = complexity + strict + ((unc or 0) / 100.0)
+        score = round(c * findings, 3) if findings_included else float(c)
+        if score <= 0:
+            continue
+        rows.append(
+            {
+                "path": rel,
+                "crate": attr.crate(rel),
+                "churn": c,
+                "complexity": complexity,
+                "strict": strict,
+                "uncovered_lines": unc,
+                "score": score,
+            }
+        )
+    rows.sort(key=lambda r: (-r["score"], r["path"]))
+    return {
+        "window_days": window_days,
+        "coverage_included": coverage_measured,
+        "findings_included": findings_included,
+        "candidates": len(rows),
+        "files": rows[:top],
+    }
+
+
+# ------------------------------------------------------------------- gates
+
+
+def pct(covered: int, total: int) -> float:
+    return round(100.0 * covered / total, 2) if total else 0.0
+
+
+def metric(snapshot: dict, name: str, crate: str | None = None):
+    """Resolve a gate name to a value; None when the block was not measured."""
+    ws = snapshot["crates"][crate] if crate else snapshot["workspace"]
+    layers = snapshot["layers"]
+    table = {
+        "coverage.lines_pct": lambda: (ws["coverage"] or {}).get("lines", {}).get("pct"),
+        "clippy.workspace_lints": lambda: (ws["clippy"] or {}).get("workspace_lints"),
+        "clippy.strict.total": lambda: (ws["clippy"] or {}).get("strict_total"),
+        "clippy.complexity.total": lambda: (ws["clippy"] or {}).get("complexity_total"),
+        "modules.cycles": lambda: (ws["modules"] or {}).get("cycles"),
+        "modules.orphans": lambda: (ws["modules"] or {}).get("orphans"),
+        "deps.unused.total": lambda: (ws["deps"] or {}).get("unused_total"),
+        "size.code": lambda: (ws["size"] or {}).get("code"),
+        "layers.unexcepted": lambda: layers["unexcepted"],
+        "layers.unassigned": lambda: len(layers["unassigned"]),
+        "layers.exceptions": lambda: layers["exceptions"],
+    }
+    if name not in table:
+        raise SystemExit(f"thresholds: unknown gate {name!r}")
+    try:
+        return table[name]()
+    except (KeyError, TypeError):
+        return None
+
+
+def evaluate_gates(snapshot: dict, thresholds: dict, baseline: dict | None) -> dict:
+    gates = {}
+
+    def absolute(kind: str, name: str, limit, crate=None):
+        value = metric(snapshot, name, crate)
+        # One metric may carry a floor and a ratchet; the kind keeps the keys apart.
+        key = f"{kind}:crates.{crate}.{name}" if crate else f"{kind}:{name}"
+        if value is None:
+            result = "not_evaluated"
+        elif kind == "floor":
+            result = "pass" if value >= limit else "fail"
+        else:
+            result = "pass" if value <= limit else "fail"
+        gates[key] = {"kind": kind, "value": value, "threshold": limit, "result": result}
+
+    for name, limit in thresholds.get("floors", {}).items():
+        absolute("floor", name, limit)
+    for name, limit in thresholds.get("ceilings", {}).items():
+        absolute("ceiling", name, limit)
+    for crate, table in thresholds.get("crates", {}).items():
+        if crate not in snapshot["crates"]:
+            continue
+        for name, limit in table.get("floors", {}).items():
+            absolute("floor", name, limit, crate)
+        for name, limit in table.get("ceilings", {}).items():
+            absolute("ceiling", name, limit, crate)
+
+    for name, spec in thresholds.get("ratchet", {}).items():
+        value = metric(snapshot, name)
+        base_value = metric(baseline, name) if baseline else None
+        gate = {
+            "kind": "ratchet",
+            "value": value,
+            "baseline": base_value,
+            "baseline_sha7": (baseline or {}).get("git", {}).get("sha7"),
+            "direction": spec["direction"],
+            "tolerance": spec.get("tolerance", 0),
+        }
+        if value is None or base_value is None:
+            gate["result"] = "not_evaluated"
+        else:
+            worse = value - base_value if spec["direction"] == "down" else base_value - value
+            if worse <= 0:
+                gate["result"] = "pass"
+            elif worse <= spec.get("tolerance", 0):
+                gate["result"] = "warn"
+            else:
+                gate["result"] = "fail"
+        gates[f"ratchet:{name}"] = gate
+    return gates
+
+
+def verdict(gates: dict) -> str:
+    worst = max((RANK[g["result"]] for g in gates.values()), default=0)
+    return ("pass", "warn", "fail")[worst]
+
+
+# -------------------------------------------------------------------- main
+
+
+def parse_kv(items: list[str]) -> dict[str, str]:
+    out = {}
+    for item in items:
+        key, _, value = item.partition("=")
+        out[key] = value
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--mode", choices=schema_mod.MODES, required=True)
+    ap.add_argument("--root", type=Path, default=Path.cwd())
+    ap.add_argument("--metadata", type=Path, required=True)
+    ap.add_argument("--rules", type=Path, default=Path("metrics/layers.toml"))
+    ap.add_argument("--thresholds", type=Path, default=Path("metrics/thresholds.toml"))
+    ap.add_argument("--baseline", type=Path, help="base ref's snapshot, for the ratchets")
+    ap.add_argument("--clippy", type=Path)
+    ap.add_argument("--clippy-complete", action="store_true", help="clippy covered the whole workspace")
+    ap.add_argument("--strict-lints", type=Path, help="one lint name per line")
+    ap.add_argument("--coverage", type=Path)
+    ap.add_argument("--tokei", type=Path)
+    ap.add_argument("--modules", type=Path)
+    ap.add_argument("--shear", type=Path)
+    ap.add_argument("--tools", type=Path, help="JSON: tool name -> version")
+    ap.add_argument("--toolchain", type=Path, help="JSON: channel, rustc, cargo")
+    ap.add_argument("--scope", type=Path, help="one crate name per line that compiling collectors covered")
+    ap.add_argument("--not-measured", action="append", default=[], metavar="COLLECTOR=REASON")
+    ap.add_argument("--excluded", action="append", default=[], metavar="CRATE=REASON")
+    ap.add_argument("--duration", action="append", default=[], metavar="STEP=SECONDS")
+    ap.add_argument("--started", help="ISO-8601 start time, written to meta.json only")
+    ap.add_argument("--no-hotspots", action="store_true", help="skip the git history walk")
+    args = ap.parse_args(argv)
+
+    root = args.root.resolve()
+    meta = read_json(args.metadata)
+    rules = layers_mod.load_rules(args.rules)
+    with args.thresholds.open("rb") as fh:
+        thresholds = tomllib.load(fh)
+    baseline = read_json(args.baseline)
+    members = members_of(meta, root)
+    attr = Attributor(members, root)
+    not_measured = parse_kv(args.not_measured)
+    strict = read_lines(args.strict_lints)
+
+    clippy, hits, per_file_clippy = collect_clippy(args.clippy, strict, attr)
+    coverage, coverage_ws, uncovered = collect_coverage(args.coverage, attr)
+    size = collect_size(args.tokei, attr)
+    modules = collect_modules(args.modules)
+    shear, workspace_unused = collect_shear(args.shear, attr)
+    layer_result = layers_mod.analyse(meta, rules)
+    layer_of = {c: l for l, cs in rules["layers"].items() for c in cs}
+    scope = read_lines(args.scope) or sorted(members)
+
+    crates = {}
+    for name in sorted(members):
+        crate: dict = {"layer": layer_of.get(name)}
+        pkg = next(p for p in meta["packages"] if p["name"] == name)
+        internal = sorted(
+            d["name"] for d in pkg["dependencies"] if d["name"] in members and d.get("kind") is None
+        )
+        crate["size"] = size.get(name, collect_size.__defaults__ and None) if size is not None else None
+        if size is not None and crate["size"] is None:
+            crate["size"] = {"files": 0, "code": 0, "comments": 0, "blanks": 0, "test_code": 0}
+        if clippy is not None and name in scope:
+            bucket = clippy.get(name) or {
+                "workspace_lints": 0,
+                "strict": {lint: 0 for lint in strict},
+                "complexity": {lint.split("::", 1)[1]: 0 for lint in COMPLEXITY_LINTS},
+            }
+            bucket = dict(bucket)
+            bucket["strict_total"] = sum(bucket["strict"].values())
+            bucket["complexity_total"] = sum(bucket["complexity"].values())
+            crate["clippy"] = bucket
+        else:
+            crate["clippy"] = None
+        if coverage is not None and name in scope:
+            crate["coverage"] = coverage.get(name) or {
+                k: {"covered": 0, "total": 0, "pct": 0.0} for k in ("lines", "functions", "regions")
+            }
+        else:
+            crate["coverage"] = None
+        crate["modules"] = modules.get(name) if modules is not None else None
+        if shear is not None:
+            crate["deps"] = {"internal": internal, "unused": sorted(shear.get(name, []))}
+        else:
+            crate["deps"] = {"internal": internal, "unused": None}
+        crate["mutants"] = None
+        crate["crap"] = None
+        crate["experimental"] = None
+        crates[name] = crate
+
+    measured = [c for c in crates.values()]
+    workspace: dict = {"crates": len(crates)}
+    if size is not None:
+        workspace["size"] = {
+            k: sum(c["size"][k] for c in measured if c["size"]) for k in ("files", "code", "comments", "blanks", "test_code")
+        }
+    else:
+        workspace["size"] = None
+    if clippy is not None:
+        strict_counts = Counter()
+        complexity_counts = Counter()
+        wl = 0
+        for c in measured:
+            if c["clippy"]:
+                strict_counts.update(c["clippy"]["strict"])
+                complexity_counts.update(c["clippy"]["complexity"])
+                wl += c["clippy"]["workspace_lints"]
+        strict_counts.update({lint: 0 for lint in strict})
+        workspace["clippy"] = {
+            "workspace_lints": wl,
+            "strict": dict(sorted(strict_counts.items())),
+            "complexity": dict(sorted(complexity_counts.items())),
+            "strict_total": sum(strict_counts.values()),
+            "complexity_total": sum(complexity_counts.values()),
+            "scope_complete": bool(args.clippy_complete),
+        }
+        workspace["strict_promotable"] = (
+            sorted(l for l, n in strict_counts.items() if n == 0) if args.clippy_complete else None
+        )
+    else:
+        workspace["clippy"] = None
+        workspace["strict_promotable"] = None
+    workspace["coverage"] = coverage_ws
+    if modules is not None:
+        workspace["modules"] = {
+            "cycles": sum(1 for m in modules.values() if m.get("acyclic") is False),
+            "orphans": sum(m.get("orphans") or 0 for m in modules.values()),
+            "errors": sorted(k for k, m in modules.items() if m.get("error")),
+        }
+    else:
+        workspace["modules"] = None
+    if shear is not None:
+        per_crate_unused = sum(len(c["deps"]["unused"]) for c in measured)
+        workspace["deps"] = {
+            "unused_total": per_crate_unused + len(workspace_unused),
+            "unused_workspace": workspace_unused,
+        }
+    else:
+        workspace["deps"] = None
+
+    hotspot_cfg = thresholds.get("hotspots", {})
+    if args.no_hotspots:
+        hot = None
+        not_measured.setdefault("hotspots", "disabled")
+    else:
+        hot = hotspots(
+            int(hotspot_cfg.get("window_days", 90)),
+            int(hotspot_cfg.get("top", 25)),
+            per_file_clippy,
+            uncovered,
+            coverage is not None,
+            attr,
+            root,
+        )
+
+    tools = read_json(args.tools) or {}
+    toolchain = read_json(args.toolchain) or {}
+    snapshot = {
+        "schema_version": schema_mod.SCHEMA_VERSION,
+        "kind": "snapshot",
+        "run": {
+            "mode": args.mode,
+            "host": {"os": platform.system().lower(), "arch": platform.machine()},
+            "not_measured": dict(sorted(not_measured.items())),
+        },
+        "git": git_info(),
+        "toolchain": toolchain,
+        "tools": dict(sorted(tools.items())),
+        "scope": {"crates": sorted(scope), "excluded": dict(sorted(parse_kv(args.excluded).items()))},
+        "crates": crates,
+        "workspace": workspace,
+        "layers": layer_result,
+        "hotspots": hot,
+        "gates": {},
+        "verdict": "pass",
+    }
+    snapshot["gates"] = evaluate_gates(snapshot, thresholds, baseline)
+    snapshot["verdict"] = verdict(snapshot["gates"])
+
+    problems = schema_mod.validate(snapshot)
+    if problems:
+        for p in problems:
+            print(f"collect: schema: {p}", file=sys.stderr)
+        return 1
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "snapshot.json").write_text(
+        json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (args.out / "clippy-hits.json").write_text(json.dumps(hits, indent=1) + "\n", encoding="utf-8")
+    durations = {k: float(v) for k, v in parse_kv(args.duration).items()}
+    (args.out / "meta.json").write_text(
+        json.dumps(
+            {"started": args.started, "hostname": platform.node(), "durations": durations, "pid": os.getpid()},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    failing = [k for k, g in snapshot["gates"].items() if g["result"] == "fail"]
+    warning = [k for k, g in snapshot["gates"].items() if g["result"] == "warn"]
+    print(
+        f"metrics: {args.mode} snapshot {snapshot['git']['sha7']} verdict={snapshot['verdict']}"
+        + (f" fail={','.join(failing)}" if failing else "")
+        + (f" warn={','.join(warning)}" if warning else "")
+        + (f" not_measured={','.join(sorted(not_measured))}" if not_measured else "")
+    )
+    return GATE_EXIT if snapshot["verdict"] == "fail" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

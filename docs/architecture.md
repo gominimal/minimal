@@ -206,12 +206,17 @@ execution:
 **session** covers the CLIs and daemons behind a running session, on the host
 and inside the microVM:
 
-`async-dialog`, `minimal`, `minimal-client`, `minimald`,
-`minimald-rpc`, `minvmd`, `boxes`, `switch`
+`async-dialog`, `boxes`, `minimal`, `minimal-client`, `minimald`,
+`minimald-rpc`, `minvmd`, `minzoned`, `switch`
 
 **shared** covers the utilities the other planes draw on:
 
 `common`, `diagnostics`, `mctx`, `mlog`, `ot`, `paths`, `version`
+
+The planes are descriptive. The dependency directions that are enforced, with
+finer layers and the edges the tree still carries as dated exceptions, live in
+[metrics/layers.toml](../metrics/layers.toml); `just metrics-layers` checks
+them against `cargo metadata`.
 
 ## 4. Cache & hashing
 
