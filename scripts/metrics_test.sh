@@ -202,7 +202,7 @@ experimental_missing_tool_is_not_measured() {   # QM-005 with QM-001's failure c
     clean_path="$(python3 -c 'import os; print(":".join(d for d in os.environ["PATH"].split(":") if not any(os.path.exists(os.path.join(d, t)) for t in ("rustqual", "cargo-anatomy"))))')"
     local status=0 snap="$tmp/run-exp/snapshot.json"
     (cd "$root" && PATH="$clean_path" bash "$here/metrics/run.sh" full --out "$tmp/run-exp" \
-        --no-coverage --no-modules --no-clippy --no-hotspots >/dev/null 2>&1) || status=$?
+        --no-coverage --no-modules --no-clippy --no-hotspots --no-mutants >/dev/null 2>&1) || status=$?
     [ -f "$snap" ] || { bad "run.sh full wrote no snapshot (exit $status)"; return; }
     [ "$(py "$snap" "s['run']['not_measured'].get('experimental.rustqual', '').startswith('rustqual not installed')")" = "True" ] \
         && ok "experimental.rustqual is under run.not_measured with its reason" || bad "rustqual reason: $(py "$snap" "s['run']['not_measured']")"
@@ -511,6 +511,141 @@ PY
     grep -q '2026-10-02-bad0bad.json' "$tmp/dash-skip/index.html" && ok "an invalid snapshot is skipped and listed" || bad "invalid snapshot not listed"
 }
 
+# The mutants cases share one throwaway repo: a main branch, a feature commit
+# that edits a Rust file, an untracked new Rust file, and a fake cargo whose
+# `mutants` subcommand logs its argv and copies the fixture outcomes.json
+# where a real run would write it. Nothing compiles. run.sh resolves its
+# helpers from the repo root, so scripts/ and metrics/ are copied in.
+mutants_repo() {
+    local repo="$tmp/mut"
+    [ -d "$repo" ] && return
+    mkdir -p "$repo/crates/graph/src" "$repo/metrics" "$repo/fakebin"
+    cp -R "$root/scripts" "$repo/scripts"
+    cp "$root/rust-toolchain.toml" "$repo/rust-toolchain.toml"
+    cp "$data/small-layers.toml" "$repo/metrics/layers.toml"
+    cp "$data/thresholds-basic.toml" "$repo/metrics/thresholds.toml"
+    git -c init.templateDir= init -q -b main "$repo" 2>/dev/null
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
+    printf 'pub fn a() -> u8 { 1 }\n' > "$repo/crates/graph/src/lib.rs"
+    git -C "$repo" add -A; git -C "$repo" commit -q -m base
+    git -C "$repo" checkout -q -b feat
+    printf 'pub fn a() -> u8 { 2 }\n' > "$repo/crates/graph/src/lib.rs"
+    git -C "$repo" commit -q -am change
+    printf 'pub fn b() {}\n' > "$repo/crates/graph/src/new.rs"
+    cat > "$repo/fakebin/cargo" <<EOF
+#!/bin/sh
+case "\$1" in
+    metadata) cat "$data/small-metadata.json" ;;
+    mutants)
+        [ "\$2" = "--version" ] && { echo "cargo-mutants 27.1.0"; exit 0; }
+        printf '%s\n' "\$@" > "$tmp/mut-argv"
+        while [ "\$#" -gt 0 ]; do [ "\$1" = "--output" ] && out="\$2"; shift; done
+        mkdir -p "\$out/mutants.out" && cp "$data/outcomes.json" "\$out/mutants.out/outcomes.json" ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "$repo/fakebin/cargo"
+    for stub in cargo-mutants cargo-nextest; do
+        printf '#!/bin/sh\nexit 0\n' > "$repo/fakebin/$stub"; chmod +x "$repo/fakebin/$stub"
+    done
+}
+
+# run_mutants_mode: run.sh in mutants mode over the throwaway repo, once.
+run_mutants_mode() {
+    mutants_repo
+    local repo="$tmp/mut"
+    [ -f "$repo/.scratch/mut/snapshot.json" ] && return
+    (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh mutants main --out "$repo/.scratch/mut" >/dev/null 2>&1) || true
+}
+
+mutants_scope_follows_mode() {   # QM-017
+    # collect.py: per-crate counts and the score over the fixture, scope as given.
+    run_collect "$tmp/mut-diff" --mutants "$data/outcomes.json" --mutants-scope in-diff >/dev/null 2>&1 || true
+    local snap="$tmp/mut-diff/snapshot.json"
+    [ -f "$snap" ] || { bad "no snapshot with --mutants"; return; }
+    [ "$(py "$snap" "s['crates']['graph']['mutants']")" = "{'caught': 3, 'missed': 2, 'score_pct': 50.0, 'tested': 6, 'timeout': 1, 'unviable': 0}" ] \
+        && ok "graph: caught, missed and timeout make up tested; score is caught over tested" \
+        || bad "graph mutants: $(py "$snap" "s['crates']['graph']['mutants']")"
+    [ "$(py "$snap" "(s['crates']['decode']['mutants']['unviable'], s['crates']['decode']['mutants']['score_pct'])")" = "(1, 66.67)" ] \
+        && ok "decode: an unviable mutant is counted but stays out of the score" || bad "decode mutants"
+    [ "$(py "$snap" "s['crates']['common']['mutants']")" = "None" ] \
+        && ok "a crate the run generated no mutants for is null, not a perfect score" || bad "common mutants not null"
+    [ "$(py "$snap" "(s['workspace']['mutants']['scope'], s['workspace']['mutants']['tested'], s['workspace']['mutants']['score_pct'])")" = "('in-diff', 9, 55.56)" ] \
+        && ok "the workspace sums the crates and records the in-diff scope" || bad "workspace mutants"
+    [ "$(py "$snap" "s['gates']['floor:mutants.score_pct']['value']")" = "55.56" ] \
+        && ok "the mutants.score_pct floor reads the workspace score" || bad "mutants floor"
+    run_collect "$tmp/mut-shard" --mutants "$data/outcomes.json" --mutants-scope shard --mutants-shard 2/7 >/dev/null 2>&1 || true
+    [ "$(py "$tmp/mut-shard/snapshot.json" "(s['workspace']['mutants']['scope'], s['workspace']['mutants']['shard'])")" = "('shard', '2/7')" ] \
+        && ok "a nightly run records its shard" || bad "shard not recorded"
+    # run.sh: the mode decides what cargo-mutants is told to test.
+    run_mutants_mode
+    local repo="$tmp/mut"
+    snap="$repo/.scratch/mut/snapshot.json"
+    [ -f "$snap" ] || { bad "mutants mode wrote no snapshot"; return; }
+    grep -qx -- '--in-diff' "$tmp/mut-argv" && ok "mutants mode passes --in-diff" || bad "no --in-diff in argv: $(tr '\n' ' ' < "$tmp/mut-argv")"
+    grep -qx -- '--shard' "$tmp/mut-argv" && bad "mutants mode passed --shard" || ok "mutants mode passes no shard"
+    grep -q '^+pub fn a() -> u8 { 2 }$' "$repo/.scratch/mut/raw/mutants.diff" \
+        && ok "the diff carries the changed line from the merge-base" || bad "changed line not in the diff"
+    [ "$(py "$snap" "(s['run']['mode'], s['workspace']['mutants']['scope'])")" = "('mutants', 'in-diff')" ] \
+        && ok "the snapshot says mutants mode, in-diff scope" || bad "mode/scope: $(py "$snap" "(s['run']['mode'], s['workspace']['mutants']['scope'])")"
+    rm -f "$tmp/mut-argv"
+    (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh full --no-coverage --no-modules --no-clippy --out "$repo/.scratch/full" >/dev/null 2>&1) || true
+    snap="$repo/.scratch/full/snapshot.json"
+    [ -f "$snap" ] || { bad "full mode wrote no snapshot"; return; }
+    grep -qx -- '--shard' "$tmp/mut-argv" && ok "full mode passes --shard" || bad "no --shard in argv: $(tr '\n' ' ' < "$tmp/mut-argv")"
+    grep -qE '^[0-6]/7$' "$tmp/mut-argv" && ok "the shard is the weekday over seven" || bad "shard argument"
+    grep -qx -- '--in-diff' "$tmp/mut-argv" && bad "full mode passed --in-diff" || ok "full mode passes no diff"
+    [ "$(py "$snap" "s['workspace']['mutants']['scope']")" = "shard" ] && ok "the nightly snapshot records the shard scope" || bad "full scope"
+    rm -f "$tmp/mut-argv"
+    (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh full --no-coverage --no-modules --no-clippy --no-mutants --out "$repo/.scratch/nomut" >/dev/null 2>&1) || true
+    [ ! -f "$tmp/mut-argv" ] && [ "$(py "$repo/.scratch/nomut/snapshot.json" "s['workspace']['mutants']")" = "None" ] \
+        && ok "--no-mutants runs nothing and leaves the block null" || bad "--no-mutants"
+}
+
+untracked_file_is_listed() {   # QM-017 untracked clause
+    run_mutants_mode
+    local repo="$tmp/mut" snap="$tmp/mut/.scratch/mut/snapshot.json"
+    [ -f "$snap" ] || { bad "mutants mode wrote no snapshot"; return; }
+    [ "$(py "$snap" "s['workspace']['mutants']['untracked_outside_scope']")" = "['crates/graph/src/new.rs']" ] \
+        && ok "the untracked file is listed as outside the mutation scope" || bad "untracked list: $(py "$snap" "s['workspace']['mutants']['untracked_outside_scope']")"
+    grep -q 'new.rs' "$repo/.scratch/mut/raw/mutants.diff" && bad "the untracked file leaked into the diff" || ok "the diff never names it, so cargo-mutants never saw it"
+    # collect.py alone: the list is a fact about the change, so it is written
+    # even when cargo-mutants did not run.
+    printf 'crates/graph/src/new.rs\n' > "$tmp/untracked.txt"
+    run_collect "$tmp/mut-untracked" --mutants-untracked "$tmp/untracked.txt" --not-measured "mutants=no Rust changes since main" >/dev/null 2>&1 || true
+    [ "$(py "$tmp/mut-untracked/snapshot.json" "s['workspace']['mutants']")" = "{'untracked_outside_scope': ['crates/graph/src/new.rs']}" ] \
+        && ok "with no run the block carries the list alone" || bad "list without a run"
+    [ "$(py "$tmp/mut-untracked/snapshot.json" "s['gates']['floor:mutants.score_pct']['result']")" = "not_evaluated" ] \
+        && ok "no score, so the floor is not evaluated" || bad "floor evaluated without a score"
+}
+
+crap_counts_over_threshold() {   # CRAP per crate against [crap] threshold
+    local out="$tmp/crap"
+    run_collect "$out" "${standard[@]}" --crap "$data/crap.json" >/dev/null 2>&1 || true
+    local snap="$out/snapshot.json"
+    [ -f "$snap" ] || { bad "no snapshot with --crap"; return; }
+    # graph: 48.2 and 31.5 are over; 30.0 is the threshold itself; tests/it.rs is excluded.
+    [ "$(py "$snap" "s['crates']['graph']['crap']")" = "{'functions': 4, 'max': 48.2, 'over_threshold': 2}" ] \
+        && ok "graph: strictly over the threshold counts; the threshold itself and test sources do not" \
+        || bad "graph crap: $(py "$snap" "s['crates']['graph']['crap']")"
+    [ "$(py "$snap" "s['crates']['decode']['crap']")" = "{'functions': 2, 'max': 12.0, 'over_threshold': 0}" ] \
+        && ok "decode: functions counted, none over" || bad "decode crap"
+    [ "$(py "$snap" "s['crates']['common']['crap']")" = "{'functions': 0, 'max': 0.0, 'over_threshold': 0}" ] \
+        && ok "a crate in scope with no functions reported is zeros, not null" || bad "common crap"
+    [ "$(py "$snap" "s['workspace']['crap']")" = "{'functions': 6, 'max': 48.2, 'over_threshold': 2, 'threshold': 30.0}" ] \
+        && ok "the workspace sums the crates and records the threshold" || bad "workspace crap: $(py "$snap" "s['workspace']['crap']")"
+    [ "$(py "$snap" "(s['gates']['ratchet:crap.over_threshold']['value'], s['gates']['ratchet:crap.over_threshold']['result'])")" = "(2, 'not_evaluated')" ] \
+        && ok "the ratchet reads the count and waits for a baseline" || bad "crap ratchet"
+    python3 - "$snap" "$tmp/crap-base.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1])); s["workspace"]["crap"]["over_threshold"] = 1
+json.dump(s, open(sys.argv[2], "w"))
+PY
+    run_collect "$tmp/crap2" "${standard[@]}" --crap "$data/crap.json" --baseline "$tmp/crap-base.json" >/dev/null 2>&1 || true
+    [ "$(py "$tmp/crap2/snapshot.json" "s['gates']['ratchet:crap.over_threshold']['result']")" = "fail" ] \
+        && ok "one more function over the threshold than the baseline fails the ratchet" || bad "crap ratchet against baseline"
+}
+
 clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors clippy.toml
     python3 - "$root" <<'PY'
 import sys, tomllib
@@ -552,6 +687,9 @@ all_cases=(
     darwin_scope_lists_uncovered_crates
     prune_keeps_daily_then_monthly
     dashboard_renders_offline_with_tables
+    mutants_scope_follows_mode
+    untracked_file_is_listed
+    crap_counts_over_threshold
     clippy_thresholds_agree
 )
 cases=("${all_cases[@]}")

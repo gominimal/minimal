@@ -25,6 +25,7 @@ edits: the thresholds and the layer table. The code is under
 | `just metrics-tools` | Installs the pinned tools (`scripts/metrics/install-tools.sh`); `scripts/metrics/install-tools.sh --experimental` adds the experimental collectors. |
 | `just metrics` | Full snapshot into `.scratch/metrics/full/`: lint density, coverage, size, module cycles, unused dependencies, layers, hotspots, and the experimental coupling metrics when their tools are installed. Minutes to tens of minutes. |
 | `just metrics static` | The no-compiler subset into `.scratch/metrics/static/`: size, unused dependencies, layers, hotspots by churn. Seconds. |
+| `just metrics-mutants [BASE]` | The static subset plus cargo-mutants over the lines changed since the merge-base with `BASE` (default `origin/main`), into `.scratch/metrics/mutants/`. Linux only. Minutes for a small change. |
 | `just metrics-layers` | The layer check alone, against `cargo metadata`. Part of `just ci`. |
 
 On macOS the compiling collectors run over the crates that build there, the
@@ -43,12 +44,12 @@ the same tree, baseline and thresholds produce the same bytes. Times live in
 
 | Block | Content |
 |---|---|
-| `run` | `mode` (`full`, `static`, `gate`, `diff`, `darwin`), host OS and arch, and `not_measured`: collector name to the reason it did not run. |
+| `run` | `mode` (`full`, `static`, `gate`, `diff`, `darwin`, `mutants`), host OS and arch, and `not_measured`: collector name to the reason it did not run. |
 | `git` | `sha`, `sha7`, `ref`, `dirty`. |
 | `toolchain`, `tools` | Versions that measured the tree. |
 | `scope` | `crates` the compiling collectors covered; `excluded` crates source-level tools cannot see, with the reason. |
-| `crates.<name>` | `layer`, then one block per collector, each `null` when not measured: `size` (files, code, comments, blanks, test code), `clippy` (workspace lints, every strict lint's count, complexity lint counts, the two totals), `coverage` (lines, functions, regions as covered, total, pct), `modules` (acyclic, orphans), `deps` (internal, unused), `mutants`, `crap`, `experimental` (`rustqual` and `anatomy` sub-blocks, each `null` when that tool did not run; the whole block `null` when neither did). |
-| `workspace` | The same blocks summed, plus `strict_promotable`: the strict lints at zero across the whole tree, present only when clippy covered the whole workspace. `experimental` carries the rustqual score weighted by lines of code with the finding counts summed, and the mean distance from the main sequence with the crates in the zone of pain. |
+| `crates.<name>` | `layer`, then one block per collector, each `null` when not measured: `size` (files, code, comments, blanks, test code), `clippy` (workspace lints, every strict lint's count, complexity lint counts, the two totals), `coverage` (lines, functions, regions as covered, total, pct), `modules` (acyclic, cycles, orphans), `deps` (internal, unused), `mutants` (tested, caught, missed, timeout, unviable, score_pct), `crap` (functions, over_threshold, max), `experimental` (`rustqual` and `anatomy` sub-blocks, each `null` when that tool did not run; the whole block `null` when neither did). |
+| `workspace` | The same blocks summed, plus `strict_promotable`: the strict lints at zero across the whole tree, present only when clippy covered the whole workspace. `mutants` adds `scope`, `shard` and `untracked_outside_scope`; `crap` adds the `threshold` it counted against. `experimental` carries the rustqual score weighted by lines of code with the finding counts summed, and the mean distance from the main sequence with the crates in the zone of pain. |
 | `layers` | Every forbidden edge with whether an exception names it, the counts `unexcepted` and `exceptions`, the `unassigned` crates, and stale exceptions. |
 | `hotspots` | Files ranked by churn over `window_days` multiplied by findings, with each file's components. |
 | `gates` | One entry per threshold, keyed `<kind>:<metric>` (`floor:coverage.lines_pct`, `ratchet:clippy.strict.total`): value, threshold or baseline, result (`pass`, `warn`, `fail`, `not_evaluated`). |
@@ -140,6 +141,42 @@ complete snapshot with the two collectors under `run.not_measured`. The
 collectors' field names were taken from the tools' published docs
 (`scripts/metrics/testdata/SHAPES.md` says which were verified against a
 run), and every lookup tolerates an absent key.
+### Test quality
+
+Coverage says a line ran; it does not say a test would notice the line
+being wrong. Two measures do.
+
+**Mutation score.** cargo-mutants rewrites one function at a time (returns a
+default, flips an operator) and runs the suite with nextest. A mutant the
+suite fails on is *caught*; one the suite passes with is *missed*; one that
+runs past the timeout is *timeout*; one that does not compile is *unviable*.
+The score is `caught / (caught + missed + timeout)`, in percent, and `tested`
+is that denominator. An unviable mutant says nothing about the tests, so it
+is counted but stays out of the score. The scope follows the mode (QM-017):
+
+- `mutants` mode tests the lines the change added or edited, as a `git diff`
+  from the merge-base with the base ref handed to `--in-diff`; `scope` is
+  `in-diff`. A new file that is not yet tracked is not in that diff; it is
+  listed under `untracked_outside_scope` so a reader knows what was not
+  tested. With no Rust change since the base the collector is not measured
+  and the list is still written.
+- `full` mode (the nightly) tests one of seven shards of the workspace,
+  chosen by the weekday, so a week covers the tree; `scope` is `shard` and
+  `shard` records which. `--no-mutants` skips it.
+
+A crate the run generated no mutants for carries `null`, not a perfect
+score. The run needs the baseline suite green, which it is only on Linux; a
+darwin snapshot records the collector as not measured, and `mutants` mode
+refuses to start there. Results and logs are under `<out>/mutants/mutants.out/`.
+
+**CRAP.** Change Risk Anti-Patterns, per function:
+`complexity² × (1 − coverage)³ + complexity`, with coverage as a fraction. A
+complex function that is fully tested scores its complexity; an untested one
+scores roughly its complexity squared. cargo-crap reads the sources and the
+`lcov.info` coverage wrote, so it runs wherever coverage ran. A function over
+`[crap] threshold` in `thresholds.toml` is flagged, and `crap.over_threshold`
+counts them; the gate is a ratchet, because the tree carries such functions
+today and a ceiling of zero would be red from the start.
 
 ### Gates
 

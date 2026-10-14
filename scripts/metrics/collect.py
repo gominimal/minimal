@@ -494,6 +494,74 @@ def anatomy_totals(crates: dict) -> dict:
         "mean_distance": round(sum(distances) / len(distances), 4) if distances else None,
         "crates_in_zone_of_pain": pain,
     }
+MUTANT_SUMMARY = {"CaughtMutant": "caught", "MissedMutant": "missed", "Timeout": "timeout", "Unviable": "unviable"}
+
+
+def collect_mutants(path: Path | None, attr: Attributor):
+    """Per-crate outcome counts from cargo-mutants' outcomes.json.
+
+    One entry per scenario; the baseline is the one whose `scenario` is the
+    string "Baseline", every other carries `scenario.Mutant` with the file
+    the mutant lives in. The mutant is attributed by that path, falling back
+    to the package cargo-mutants names. An unviable mutant never compiled,
+    so it says nothing about the tests: it is counted but kept out of the
+    score (metrics/README.md, "Test quality").
+    """
+    doc = read_json(path)
+    if doc is None:
+        return None
+    per_crate: dict[str, Counter] = defaultdict(Counter)
+    for outcome in doc.get("outcomes", []):
+        scenario = outcome.get("scenario")
+        if not isinstance(scenario, dict) or "Mutant" not in scenario:
+            continue
+        kind = MUTANT_SUMMARY.get(outcome.get("summary"))
+        if kind is None:
+            continue
+        mutant = scenario["Mutant"]
+        crate = attr.crate(mutant.get("file", "")) or mutant.get("package") or "<workspace>"
+        per_crate[crate][kind] += 1
+    return {name: mutants_block(counts) for name, counts in per_crate.items()}
+
+
+def mutants_block(counts: Counter) -> dict:
+    caught, missed, timeout = counts["caught"], counts["missed"], counts["timeout"]
+    tested = caught + missed + timeout
+    return {
+        "tested": tested,
+        "caught": caught,
+        "missed": missed,
+        "timeout": timeout,
+        "unviable": counts["unviable"],
+        "score_pct": pct(caught, tested),
+    }
+
+
+def collect_crap(path: Path | None, attr: Attributor, threshold: float):
+    """Per-crate function counts from cargo-crap's `--format json` report.
+
+    `entries` is one row per function with `file` (absolute), `crap` and
+    `crate`. Attribution goes by path like every other collector, so a
+    function lands where the coverage and clippy numbers for its file land.
+    Over the threshold is strictly greater: the threshold itself is the last
+    acceptable score, as cargo-crap reads it.
+    """
+    doc = read_json(path)
+    if doc is None:
+        return None
+    per_crate: dict[str, dict] = defaultdict(lambda: {"functions": 0, "over_threshold": 0, "max": 0.0})
+    for entry in doc.get("entries", []):
+        rel = attr.relative(entry["file"])
+        crate = attr.crate(rel) or entry.get("crate")
+        if crate is None or is_test_path(rel):
+            continue
+        score = float(entry["crap"])
+        bucket = per_crate[crate]
+        bucket["functions"] += 1
+        if score > threshold:
+            bucket["over_threshold"] += 1
+        bucket["max"] = max(bucket["max"], round(score, 2))
+    return per_crate
 
 
 def churn(window_days: int) -> Counter:
@@ -583,6 +651,8 @@ def metric(snapshot: dict, name: str, crate: str | None = None):
         "modules.orphans": lambda: (ws["modules"] or {}).get("orphans"),
         "deps.unused.total": lambda: (ws["deps"] or {}).get("unused_total"),
         "size.code": lambda: (ws["size"] or {}).get("code"),
+        "mutants.score_pct": lambda: (ws["mutants"] or {}).get("score_pct"),
+        "crap.over_threshold": lambda: (ws["crap"] or {}).get("over_threshold"),
         "layers.unexcepted": lambda: layers["unexcepted"],
         "layers.unassigned": lambda: len(layers["unassigned"]),
         "layers.exceptions": lambda: layers["exceptions"],
@@ -681,6 +751,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shear", type=Path)
     ap.add_argument("--rustqual-dir", type=Path, help="directory of <crate>.json from rustqual --format json")
     ap.add_argument("--anatomy", type=Path, help="cargo anatomy output")
+    ap.add_argument("--mutants", type=Path, help="cargo-mutants outcomes.json")
+    ap.add_argument(
+        "--mutants-scope",
+        choices=("in-diff", "shard", "workspace"),
+        default="workspace",
+        help="what the mutants run covered (QM-017)",
+    )
+    ap.add_argument("--mutants-shard", metavar="K/N", help="the shard a nightly run tested")
+    ap.add_argument(
+        "--mutants-untracked", type=Path, help="one untracked *.rs path per line: outside the mutation scope"
+    )
+    ap.add_argument("--crap", type=Path, help="cargo-crap --format json report")
     ap.add_argument("--tools", type=Path, help="JSON: tool name -> version")
     ap.add_argument("--toolchain", type=Path, help="JSON: channel, rustc, cargo")
     ap.add_argument("--scope", type=Path, help="one crate name per line that compiling collectors covered")
@@ -709,6 +791,9 @@ def main(argv: list[str] | None = None) -> int:
     shear, workspace_unused = collect_shear(args.shear, attr)
     rustqual = collect_rustqual(args.rustqual_dir)
     anatomy = collect_anatomy(args.anatomy)
+    mutants = collect_mutants(args.mutants, attr)
+    crap_threshold = float(thresholds.get("crap", {}).get("threshold", 30))
+    crap = collect_crap(args.crap, attr, crap_threshold)
     layer_result = layers_mod.analyse(meta, rules)
     layer_of = {c: l for l, cs in rules["layers"].items() for c in cs}
     scope = read_lines(args.scope) or sorted(members)
@@ -746,8 +831,14 @@ def main(argv: list[str] | None = None) -> int:
             crate["deps"] = {"internal": internal, "unused": sorted(shear.get(name, []))}
         else:
             crate["deps"] = {"internal": internal, "unused": None}
-        crate["mutants"] = None
-        crate["crap"] = None
+        # A crate the mutants run generated no mutants for (outside the diff,
+        # or the shard) was not measured; it stays null rather than reading
+        # as a perfect score.
+        crate["mutants"] = mutants.get(name) if mutants is not None else None
+        if crap is not None and name in scope:
+            crate["crap"] = crap.get(name) or {"functions": 0, "over_threshold": 0, "max": 0.0}
+        else:
+            crate["crap"] = None
         # Null only when neither tool ran; a crate one tool skipped (rustqual
         # on remote-proto) keeps the other's sub-block.
         if rustqual is None and anatomy is None:
@@ -815,6 +906,32 @@ def main(argv: list[str] | None = None) -> int:
             "rustqual": rustqual_totals(crates) if rustqual is not None else None,
             "anatomy": anatomy_totals(crates) if anatomy is not None else None,
         }
+    # The untracked list is recorded whenever run.sh produced one, even when
+    # cargo-mutants itself did not run: a new file outside the scope is a
+    # fact about the change, not about the tool (QM-017).
+    untracked = read_lines(args.mutants_untracked) if args.mutants_untracked else None
+    if mutants is not None:
+        totals = Counter()
+        for block in mutants.values():
+            totals.update({k: block[k] for k in ("caught", "missed", "timeout", "unviable")})
+        workspace["mutants"] = mutants_block(totals)
+        workspace["mutants"]["scope"] = args.mutants_scope
+        workspace["mutants"]["shard"] = args.mutants_shard
+        workspace["mutants"]["untracked_outside_scope"] = untracked or []
+    elif untracked is not None:
+        workspace["mutants"] = {"untracked_outside_scope": untracked}
+    else:
+        workspace["mutants"] = None
+    if crap is not None:
+        blocks = [c["crap"] for c in measured if c["crap"]]
+        workspace["crap"] = {
+            "functions": sum(b["functions"] for b in blocks),
+            "over_threshold": sum(b["over_threshold"] for b in blocks),
+            "max": max((b["max"] for b in blocks), default=0.0),
+            "threshold": crap_threshold,
+        }
+    else:
+        workspace["crap"] = None
 
     hotspot_cfg = thresholds.get("hotspots", {})
     if args.no_hotspots:
