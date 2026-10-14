@@ -205,7 +205,7 @@ experimental_missing_tool_is_not_measured() {   # QM-005 with QM-001's failure c
     clean_path="$(python3 -c 'import os; print(":".join(d for d in os.environ["PATH"].split(":") if not any(os.path.exists(os.path.join(d, t)) for t in ("rustqual", "cargo-anatomy"))))')"
     local status=0 snap="$tmp/run-exp/snapshot.json"
     (cd "$root" && PATH="$clean_path" bash "$here/metrics/run.sh" full --out "$tmp/run-exp" \
-        --no-coverage --no-modules --no-clippy --no-hotspots --no-mutants >/dev/null 2>&1) || status=$?
+        --no-coverage --no-modules --no-clippy --no-hotspots --no-mutants >/dev/null 2>"$tmp/run-exp.err") || status=$?
     [ -f "$snap" ] || { bad "run.sh full wrote no snapshot (exit $status)"; return; }
     [ "$(py "$snap" "s['run']['not_measured'].get('experimental.rustqual', '').startswith('rustqual not installed')")" = "True" ] \
         && ok "experimental.rustqual is under run.not_measured with its reason" || bad "rustqual reason: $(py "$snap" "s['run']['not_measured']")"
@@ -215,7 +215,8 @@ experimental_missing_tool_is_not_measured() {   # QM-005 with QM-001's failure c
         && ok "the experimental block is null, not zero" || bad "experimental block not null"
     [ "$(py "$snap" "s['tools']['rustqual']")" = "" ] \
         && ok "no version is recorded for an absent tool" || bad "a version for an absent tool"
-    [ "$status" -ne 3 ] && ok "a missing experimental tool does not mark the snapshot incomplete" || bad "exit 3 for a missing experimental tool"
+    [ "$status" -ne 3 ] && ok "a missing experimental tool does not mark the snapshot incomplete" \
+        || bad "exit 3 for a missing experimental tool: $(grep FAILED "$tmp/run-exp.err" | head -n1)"
 }
 
 report_is_byte_stable() {   # QM-006
