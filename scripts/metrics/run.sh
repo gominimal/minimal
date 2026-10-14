@@ -417,7 +417,7 @@ PY
         targets_json=""
         while read -r kind name; do
             [ -n "$kind" ] || continue
-            if [ "$kind" = "lib" ]; then sel=(--lib); label="lib"; else sel=(--bin "$name"); label="bin:$name"; fi
+            if [ "$kind" = "lib" ]; then sel=(--lib); label="lib"; else sel=(--bin "$name"); label="bin-$name"; fi
             dot="$work/modules/$crate.$label.dot"
             err="$work/modules/$crate.$label.err"
             error=null
