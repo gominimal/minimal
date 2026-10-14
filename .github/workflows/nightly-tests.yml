@@ -472,6 +472,10 @@ jobs:
       contents: write
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The mutation run's share of the job: coverage is a cold instrumented
+      # build of the workspace and the module graphs load every crate, so
+      # the rest of the budget is theirs.
+      MINIMAL_METRICS_MUTANTS_BUDGET_SECS: "1500"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
