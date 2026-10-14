@@ -242,6 +242,14 @@ fn run_boot(foreground: bool) -> Result<()> {
         crate::cmd::log_stopping_vm(state_dir.dir());
         if !status.success() {
             let code = status.code().unwrap_or(-1);
+            // `vm.boot` ended at READY and is right as it stands; the
+            // command's failure after it is recorded on its own, so a trace
+            // reader finds the failed `boot` next to the clean boot.
+            tracing::error!(
+                code,
+                vm = %crate::state::vm_name(),
+                "the VMM child exited after READY; a foreground boot fails with it"
+            );
             bail!("VMM child exited with code {code}");
         }
     }
