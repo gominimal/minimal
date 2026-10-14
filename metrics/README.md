@@ -308,6 +308,18 @@ Both take the history directory as their first argument, to read another
 checkout of the branch: `just metrics-dashboard path/to/history`. The fixture
 history for the harness lives under `scripts/metrics/testdata/history/`.
 
+## The nightly run
+
+The `metrics` job in `.github/workflows/nightly-tests.yml` runs `just
+metrics`, renders the dashboard from the fetched history plus the new
+snapshot, uploads both as the `metrics` artifact, and on main hands the
+snapshot to `scripts/metrics/publish-snapshot.sh`. That script fetches the
+`metrics-data` branch (creating it as an orphan the first time), adds
+`history/<date>-<sha7>.json`, prunes, commits and pushes to that branch
+alone: its refspec names the branch on both sides, so it cannot reach main.
+It refuses a snapshot whose mode is not `full` or whose tree was dirty. The
+job is non-blocking until a week of snapshots says it is quiet.
+
 ## Writing about it
 
 Prose here and in the spec is Vale-linted. Name the items or point at the
