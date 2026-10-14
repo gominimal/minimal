@@ -232,6 +232,10 @@ fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32, grace: Duration)
 /// few hundred milliseconds, so a healthy stop pays that, not the bound.
 const GUEST_POWEROFF_GRACE: Duration = Duration::from_secs(3);
 
+/// The least of a stop's budget kept for the SIGTERM path after the power-off
+/// wait ([`settle_vmm`]): a cooperating VMM exits on SIGTERM well within it.
+const SIGTERM_FLOOR: Duration = Duration::from_millis(500);
+
 /// Take the VMM child `pid` down after the quiesce. When the guest
 /// acknowledged the Shutdown RPC (`acked`), first wait up to `poweroff_grace`
 /// (never past `grace`, a stop's whole budget for this child) for the VM to
@@ -247,7 +251,12 @@ fn settle_vmm(pid: u32, acked: bool, poweroff_grace: Duration, grace: Duration) 
         .ok()
         .filter(|p| *p > 0)
         .ok_or_else(|| anyhow::anyhow!("invalid vmm_pid {pid} in state"))?;
-    if wait_for_exit(pid_t, poweroff_grace.min(grace)) {
+    // The power-off wait is carved out of `grace` with a floor left for the
+    // SIGTERM path: a stop near its deadline (`grace` under the power-off
+    // grace) would otherwise spend the whole budget waiting and then SIGKILL
+    // a VMM that was never given its chance to exit on SIGTERM.
+    let poweroff = poweroff_grace.min(grace.saturating_sub(SIGTERM_FLOOR));
+    if wait_for_exit(pid_t, poweroff) {
         tracing::debug!(pid, "the guest powered the VM off after its ack");
         return Ok(());
     }
@@ -762,6 +771,29 @@ mod tests {
         .unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(200));
         assert_eq!(ended.join().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// A stop near its deadline (`grace` under the power-off grace) still
+    /// leaves the SIGTERM path its floor: the VMM is ended by SIGTERM, which
+    /// it handles, not by the SIGKILL that follows an empty window.
+    #[test]
+    fn a_stop_near_its_deadline_keeps_a_sigterm_window() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (pid, ended) = stand_in_vmm("trap 'exit 3' TERM; sleep 30 & wait $!");
+        settle_vmm(
+            pid,
+            true,
+            Duration::from_secs(3),
+            Duration::from_millis(700),
+        )
+        .unwrap();
+        let status = ended.join().unwrap();
+        assert_eq!(
+            status.signal(),
+            None,
+            "SIGKILLed with no SIGTERM window: {status:?}"
+        );
+        assert_eq!(status.code(), Some(3), "ended by its own TERM handler");
     }
 
     /// Without an ack there is no exit path to wait for: SIGTERM at once.
