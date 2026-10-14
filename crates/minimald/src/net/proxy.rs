@@ -4208,15 +4208,15 @@ mod tests {
             "the second VM's publication must take a host port of its own"
         );
 
-        // Each VM's own box, on its own lease, at the one external port both
-        // registries publish — the two leases the attach path would report.
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let box_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Each VM's own box, on its own lease, at a port of its own — the
+        // two leases the attach path would report. The backend binds its
+        // port itself: a number probed free on one address and bound later
+        // on another is a race against every other test's port pick, and
+        // lost it (`AddrInUse` on the second backend, CI and the lab gate).
         let lease_a = Ipv4Addr::new(127, 0, 0, 4);
         let lease_b = Ipv4Addr::new(127, 0, 0, 5);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        let box_port_a = spawn_backend_on(lease_a, "vm-a-web").await;
+        let box_port_b = spawn_backend_on(lease_b, "vm-b-api").await;
         a.sessions_manager()
             .await
             .hostnames()
@@ -4226,7 +4226,7 @@ mod tests {
                 SessionId::nil(),
                 "web",
                 lease_a,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_a)]),
             );
         b.sessions_manager()
             .await
@@ -4237,7 +4237,7 @@ mod tests {
                 SessionId::nil(),
                 "api",
                 lease_b,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_b)]),
             );
 
         // The forwards the publications describe, played by hand: each VM's
@@ -4537,15 +4537,15 @@ mod tests {
             "VM B's proxy must publish at exactly the number it was handed"
         );
 
-        // Each VM's own box, on its own lease, at the one external port both
-        // registries publish — the two leases the attach path would report.
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let box_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Each VM's own box, on its own lease, at a port of its own — the
+        // two leases the attach path would report. The backend binds its
+        // port itself: a number probed free on one address and bound later
+        // on another is a race against every other test's port pick, and
+        // lost it (`AddrInUse` on the second backend, CI and the lab gate).
         let lease_a = Ipv4Addr::new(127, 0, 0, 4);
         let lease_b = Ipv4Addr::new(127, 0, 0, 5);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        let box_port_a = spawn_backend_on(lease_a, "vm-a-web").await;
+        let box_port_b = spawn_backend_on(lease_b, "vm-b-api").await;
         a.sessions_manager()
             .await
             .hostnames()
@@ -4555,7 +4555,7 @@ mod tests {
                 SessionId::nil(),
                 "web",
                 lease_a,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_a)]),
             );
         b.sessions_manager()
             .await
@@ -4566,7 +4566,7 @@ mod tests {
                 SessionId::nil(),
                 "api",
                 lease_b,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_b)]),
             );
 
         // The forwards those publications describe, played by hand: each
@@ -4755,12 +4755,14 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    /// Spawns a one-shot backend on `addr` that answers every connection
-    /// with a `200 OK` carrying `body`, closing when it has — the box each
-    /// VM's name routes to, distinguishable by what it says.
+    /// Spawns a one-shot backend on `lease`, at a port the kernel hands it,
+    /// that answers every connection with a `200 OK` carrying `body`,
+    /// closing when it has — the box each VM's name routes to,
+    /// distinguishable by what it says. Returns the port it listens on.
     #[cfg(target_os = "linux")]
-    async fn spawn_backend_on(addr: SocketAddr, body: &'static str) {
-        let backend = TcpListener::bind(addr).await.unwrap();
+    async fn spawn_backend_on(lease: Ipv4Addr, body: &'static str) -> u16 {
+        let backend = TcpListener::bind((lease, 0)).await.unwrap();
+        let port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 crate::traced::spawn(async move {
@@ -4786,6 +4788,7 @@ mod tests {
                 });
             }
         });
+        port
     }
 
     /// Binds `local` on the host loopback and relays every connection to
