@@ -19,7 +19,76 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
 
     let stream = connect_with_retry(&socket_path).await?;
 
-    proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout()).await
+    let bridge = proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout());
+    match args.owner {
+        None => bridge.await,
+        Some(owner) => tokio::select! {
+            res = bridge => res,
+            () = owner_gone(owner) => {
+                // Dropping the bridge closes the daemon socket: the signal
+                // the daemon acts on for a lost client.
+                tracing::debug!(owner, "the proxy's owner is gone; closing the daemon connection");
+                Ok(())
+            }
+        },
+    }
+}
+
+/// How often the proxy looks for its owner.
+const OWNER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Resolves once the `min` process this proxy serves is gone.
+///
+/// ssh is that process's child and this proxy is ssh's. A `min session exec`
+/// that dies without a chance to take ssh down (SIGKILL, an OOM kill; the
+/// catchable signals are handled in the exec path) leaves both running with
+/// the daemon's socket open, and the daemon, which learns of a lost client
+/// only from its connection closing, keeps the command running — a silent
+/// `sleep` outlived its killed client indefinitely (lab scenario 732).
+/// Polled, since the owner is a grandparent this process cannot wait on;
+/// `kill(pid, 0)` says whether it still exists (`EPERM` is alive). A pid
+/// that does not fit a `pid_t` names no process and reads as gone.
+async fn owner_gone(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    let pid = nix::unistd::Pid::from_raw(pid);
+    loop {
+        if matches!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        ) {
+            return;
+        }
+        tokio::time::sleep(OWNER_POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod owner_watch_tests {
+    use super::owner_gone;
+    use std::time::Duration;
+
+    /// The watch holds while the owner lives and resolves once it is gone.
+    #[tokio::test]
+    async fn the_watch_resolves_when_the_owner_dies() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), owner_gone(pid))
+                .await
+                .is_err(),
+            "the watch resolved while the owner was alive"
+        );
+        child.kill().expect("sleep is killable");
+        child.wait().expect("sleep is reaped");
+        tokio::time::timeout(Duration::from_secs(2), owner_gone(pid))
+            .await
+            .expect("the watch did not resolve after the owner died");
+    }
 }
 
 /// Connect to the daemon UDS, retrying a bounded number of times when the

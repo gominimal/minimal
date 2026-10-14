@@ -106,12 +106,17 @@ pub fn attach_command(
     session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
-    // depend on socat or nc being installed.
+    // depend on socat or nc being installed. `--owner` is this process: a
+    // `min` that dies without taking ssh down (SIGKILL, an OOM kill) leaves
+    // ssh and the proxy holding the daemon's socket open, and the daemon
+    // learns of a lost client only from that socket closing — so the proxy
+    // watches its owner and exits when it is gone.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
     let proxy_cmd = format!(
-        "{} proxy --socket {}",
+        "{} proxy --socket {} --owner {}",
         shell_quote(&exe.display().to_string()),
         shell_quote(&sock.display().to_string()),
+        std::process::id(),
     );
 
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));

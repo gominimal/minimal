@@ -1114,6 +1114,10 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+    /// The `min` process this proxy serves (ssh's parent): the proxy exits,
+    /// closing the daemon connection, once that process is gone.
+    #[arg(long, hide = true)]
+    pub owner: Option<u32>,
 }
 
 /// Arguments for `min login`.
