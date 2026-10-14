@@ -242,7 +242,9 @@ pub(crate) fn guest_env(
     // A signal that is off exports nothing; so does one that is on while
     // the door is unbound, since the forward port is the only way out the
     // guest is allowed (TEL-033): the guest stays inert on every path that
-    // is not the forward, whatever its own environment carries.
+    // is not the forward, whatever its own environment carries. A signal
+    // whose host endpoint was refused stays on: the door spools its lines
+    // for `min bug` and forwards nothing, as the host keeps spooling its own.
     for (signal, s) in [("TRACES", decided.traces), ("LOGS", decided.logs)] {
         if s.off || forward.is_none() {
             out.push(format!("MINIMAL_OTEL_{signal}_EXPORTER=none"));
@@ -252,10 +254,15 @@ pub(crate) fn guest_env(
         out.push(format!("{}=vsock:{port}", mlog::otel::FORWARD_ENV));
     }
     match traceparent.map(|tp| (tp, TraceContext::parse_traceparent(tp))) {
-        // A parsed traceparent is lower-case hex and dashes, always a token.
-        Some((_, Some(ctx))) => {
-            out.extend(crate::vm::boot_token(TRACEPARENT_ENV, &ctx.traceparent()).ok());
-        }
+        // A parsed traceparent is lower-case hex and dashes, always a token;
+        // a refusal is unreachable today and warned like every sibling's.
+        Some((_, Some(ctx))) => match crate::vm::boot_token(TRACEPARENT_ENV, &ctx.traceparent()) {
+            Ok(token) => out.push(token),
+            Err(reason) => tracing::warn!(
+                reason,
+                "not forwarding TRACEPARENT to the guest boot line: not a boot token"
+            ),
+        },
         Some((tp, None)) => tracing::warn!(
             len = tp.len(),
             "not forwarding a malformed TRACEPARENT to the guest boot line"
@@ -437,6 +444,33 @@ mod tests {
             guest_env(&get, true, Some(7353), None),
             vec!["MINIMAL_TELEMETRY=1", "MINIMAL_OTEL_FORWARD=vsock:7353"]
         );
+    }
+
+    /// A signal whose host endpoint was refused (a value `export_url_from`
+    /// will not build a URL from) stays on in the guest: its lines reach the
+    /// per-VM spool through the door, which forwards nothing for it, so a
+    /// mistyped endpoint does not also empty the spool `min bug` collects.
+    #[test]
+    fn a_refused_host_endpoint_keeps_the_signal_on_in_the_guest() {
+        let get = env(&[
+            ("MINIMAL_TELEMETRY", "1"),
+            (
+                "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "::not a url::",
+            ),
+        ]);
+        let decided = mlog::otel::guest_exports(&get);
+        assert!(
+            matches!(decided.traces.url, Some(Err(_))),
+            "the fixture must be a refused endpoint: {:?}",
+            decided.traces.url
+        );
+        let out = guest_env(&get, true, Some(7353), None);
+        assert!(
+            !out.iter().any(|t| t.ends_with("_EXPORTER=none")),
+            "a refused endpoint switches nothing off in the guest: {out:?}"
+        );
+        assert!(out.contains(&"MINIMAL_OTEL_FORWARD=vsock:7353".to_string()));
     }
 
     /// F11: a value that is not one token to both readers of the boot line
