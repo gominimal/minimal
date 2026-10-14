@@ -180,6 +180,12 @@ elif ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     skip coverage "cargo-llvm-cov not installed (scripts/metrics/install-tools.sh)"
 elif ! command -v cargo-nextest >/dev/null 2>&1; then
     skip coverage "cargo-nextest not installed"
+elif ! ls "$(rustc --print target-libdir 2>/dev/null)"/libprofiler_builtins-*.rlib >/dev/null 2>&1; then
+    # A toolchain built without the profiler runtime cannot compile with
+    # -C instrument-coverage (rustc E0463 on every build script). rustup's
+    # toolchains ship it; some distribution builds do not. Say so up front
+    # rather than after a cold instrumented build fails.
+    skip coverage "toolchain has no profiler runtime (libprofiler_builtins); use a rustup toolchain"
 else
     # Without rustup's llvm-tools-preview, a matching system LLVM works when
     # named through the environment cargo-llvm-cov reads.
@@ -208,38 +214,53 @@ else
 fi
 
 # ------------------------------------------------------------------ modules
+# cargo-modules' own `--acyclic` runs before its filters, so every type that
+# owns a method that uses the type reads as a cycle. The module graph is
+# dumped as DOT instead (modules only: no fns, traits or types) and
+# collect.py finds the strongly connected components itself. Orphans are
+# per target: a module a binary declares is not an orphan of the library,
+# so a crate's orphans are the files every one of its targets orphans.
+# --all-features so a feature-gated module is seen; --cfg-test so a test
+# module is.
 if [ "$want_modules" -eq 0 ]; then
     skip modules "$mode mode"
 elif ! command -v cargo-modules >/dev/null 2>&1; then
     skip modules "cargo-modules not installed (scripts/metrics/install-tools.sh)"
 else
     t0="$(now)"
+    mkdir -p "$work/modules"
     : > "$work/modules.jsonl"
     while read -r crate; do
         [ -n "$crate" ] || continue
-        # A crate with no lib target is analysed through its first bin.
-        target=(--lib)
-        if ! python3 - "$work/metadata.json" "$crate" <<'PY'
+        # One line per target: "lib" or "bin <name>".
+        python3 - "$work/metadata.json" "$crate" <<'PY' > "$work/modules/$crate.targets"
 import json, sys
 meta = json.load(open(sys.argv[1]))
 pkg = next(p for p in meta["packages"] if p["name"] == sys.argv[2])
-sys.exit(0 if any("lib" in t["kind"] or "proc-macro" in t["kind"] for t in pkg["targets"]) else 1)
+for t in pkg["targets"]:
+    if "lib" in t["kind"] or "proc-macro" in t["kind"]:
+        print("lib")
+    elif "bin" in t["kind"]:
+        print("bin " + t["name"])
 PY
-        then
-            bin_name="$(python3 -c 'import json,sys; meta=json.load(open(sys.argv[1])); pkg=next(p for p in meta["packages"] if p["name"]==sys.argv[2]); print(next(t["name"] for t in pkg["targets"] if "bin" in t["kind"]))' "$work/metadata.json" "$crate")"
-            target=(--bin "$bin_name")
-        fi
-        acyclic=true; error=""
-        if ! cargo modules dependencies -p "$crate" "${target[@]}" --no-externs --no-sysroot --no-fns \
-                --no-traits --no-types --acyclic > /dev/null 2> "$work/modules-$crate.err"; then
-            if grep -qi "cycl" "$work/modules-$crate.err"; then acyclic=false; else error="$(head -c 300 "$work/modules-$crate.err" | tr '\n"' '  ')"; fi
-        fi
-        orphans=0
-        if ! cargo modules orphans -p "$crate" "${target[@]}" --deny > "$work/orphans-$crate.out" 2>> "$work/modules-$crate.err"; then
-            orphans="$(grep -c '^' "$work/orphans-$crate.out" || true)"
-        fi
-        printf '{"crate": "%s", "acyclic": %s, "orphans": %s, "error": %s}\n' \
-            "$crate" "$acyclic" "$orphans" "$([ -n "$error" ] && printf '"%s"' "$error" || echo null)" >> "$work/modules.jsonl"
+        targets_json=""
+        while read -r kind name; do
+            [ -n "$kind" ] || continue
+            if [ "$kind" = "lib" ]; then sel=(--lib); label="lib"; else sel=(--bin "$name"); label="bin:$name"; fi
+            dot="$work/modules/$crate.$label.dot"
+            err="$work/modules/$crate.$label.err"
+            error=null
+            if ! cargo modules dependencies -p "$crate" "${sel[@]}" --all-features --cfg-test --no-externs \
+                    --no-sysroot --no-fns --no-traits --no-types > "$dot" 2> "$err"; then
+                error="$(head -c 300 "$err" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+            fi
+            orphans_file="$work/modules/$crate.$label.orphans"
+            cargo modules orphans -p "$crate" "${sel[@]}" --all-features --cfg-test --deny 2>&1 \
+                | grep -oE 'at crates/[^[:space:]]+' | sed 's/^at //' | sort -u > "$orphans_file" || true
+            orphans_json="$(python3 -c 'import json,sys; print(json.dumps([l.strip() for l in open(sys.argv[1]) if l.strip()]))' "$orphans_file")"
+            targets_json="$targets_json{\"target\": \"$label\", \"dot\": \"$dot\", \"orphans\": $orphans_json, \"error\": $error}, "
+        done < "$work/modules/$crate.targets"
+        printf '{"crate": "%s", "targets": [%s]}\n' "$crate" "${targets_json%, }" >> "$work/modules.jsonl"
     done < "$work/scope.txt"
     collect_args+=(--modules "$work/modules.jsonl")
     durations+=("modules=$(since "$t0")")

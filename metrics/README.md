@@ -77,6 +77,17 @@ into `[workspace.lints.clippy]` and out of the strict list.
 gated behind `#[ignore]` do not run, so the daemons' coverage is structurally
 low on a host without KVM; `thresholds.toml` carries per-crate floors for them.
 
+### Module cycles and orphans
+
+The module graph of every target of a crate comes from `cargo modules
+dependencies` with functions, traits and types filtered out, and the
+collector finds the strongly connected components itself: the tool's own
+cycle check runs before its filters and reports every type that owns a
+method using the type. Edges touching the crate root (which re-exports its
+children while they `use crate::`) or a test module are structure, not
+findings. A module is an orphan only when every target of its crate orphans
+it, so a binary-only module is not an orphan of the library.
+
 ### Hotspots
 
 For each source file: commits touching it in the window, strict hits,

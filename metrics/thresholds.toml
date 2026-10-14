@@ -23,7 +23,6 @@ schema = 1
 [ceilings]
 "layers.unexcepted" = 0
 "layers.unassigned" = 0
-"modules.cycles" = 0
 "modules.orphans" = 0
 "clippy.workspace_lints" = 0
 

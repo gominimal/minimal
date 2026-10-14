@@ -60,7 +60,7 @@ snapshot_validates() {   # QM-001
     # A document with a wrong verdict is rejected.
     python3 - "$out/snapshot.json" "$tmp/broken.json" <<'PY'
 import json, sys
-s = json.load(open(sys.argv[1])); s["verdict"] = "pass"; s["gates"]["ceiling:modules.cycles"]["result"] = "fail"
+s = json.load(open(sys.argv[1])); s["verdict"] = "pass"; s["gates"]["ceiling:layers.unexcepted"]["result"] = "fail"
 json.dump(s, open(sys.argv[2], "w"))
 PY
     if python3 "$schema" "$tmp/broken.json" >/dev/null 2>&1; then
@@ -295,6 +295,29 @@ hotspots_without_coverage() {   # QM-018 fallback clause: no findings source at 
         && ok "without findings the ranking is churn alone" || bad "churn-only ranking: $(py "$snap" "[(f['path'], f['score']) for f in s['hotspots']['files']]")"
 }
 
+module_cycles_from_dot() {   # cargo-modules' --acyclic is unusable (type<->method edges); SCCs come from the DOT
+    local out="$tmp/modules"
+    run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
+    local snap="$out/snapshot.json"
+    [ "$(py "$snap" "s['crates']['graph']['modules']['cycles']")" = "[['graph::builds', 'graph::plan']]" ] \
+        && ok "a two-module uses cycle is found from the DOT graph" || bad "graph cycles: $(py "$snap" "s['crates']['graph']['modules']")"
+    [ "$(py "$snap" "s['crates']['graph']['modules']['acyclic']")" = "False" ] && ok "acyclic is false for that crate" || bad "acyclic flag"
+    [ "$(py "$snap" "s['crates']['decode']['modules']['cycles']")" = "[]" ] && ok "owns edges and acyclic uses edges make no cycle" || bad "decode cycles"
+    [ "$(py "$snap" "s['crates']['decode']['modules']['orphan_files']")" = "['crates/decode/src/old.rs']" ] \
+        && ok "an orphan is a file every target of the crate orphans" || bad "orphan intersection: $(py "$snap" "s['crates']['decode']['modules']['orphan_files']")"
+    [ "$(py "$snap" "s['workspace']['modules']")" = "{'cycles': 1, 'errors': [], 'orphans': 1}" ] \
+        && ok "workspace modules block sums cycles and orphans" || bad "workspace modules: $(py "$snap" "s['workspace']['modules']")"
+    [ "$(py "$snap" "s['gates']['ceiling:modules.cycles']['result']")" = "fail" ] && ok "the cycles ceiling fails on the seeded cycle" || bad "cycles gate"
+    # Root <-> child and anything through a test module is structure, not a finding.
+    local cycles
+    cycles="$(python3 -c '
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("collect", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.module_cycles([Path(sys.argv[2])]))' "$collect" "$data/structural.dot")"
+    [ "$cycles" = "[]" ] && ok "root and test-module edges are structural, not cycles" || bad "structural filter: $cycles"
+}
+
 darwin_scope_lists_uncovered_crates() {   # QM-013: the snapshot side; the report side lands with the diff grader
     local out="$tmp/darwin"
     printf 'graph\n' > "$tmp/scope-graph.txt"
@@ -343,6 +366,7 @@ all_cases=(
     unassigned_crate_fails
     hotspots_rank_churn_times_findings
     hotspots_without_coverage
+    module_cycles_from_dot
     darwin_scope_lists_uncovered_crates
     clippy_thresholds_agree
 )
