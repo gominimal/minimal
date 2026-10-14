@@ -139,6 +139,13 @@ the same tree, baseline and thresholds produce the same bytes. Times live in
 | `gates` | One entry per threshold, keyed `<kind>:<metric>` (`floor:coverage.lines_pct`, `ratchet:clippy.strict.total`): value, threshold or baseline, result (`pass`, `warn`, `fail`, `not_evaluated`). |
 | `verdict` | The worst gate result. |
 
+`summary.md` beside the snapshot is the same numbers as a page of Markdown:
+the verdict, every gate, the workspace totals, the module cycles, the
+promotable lints and the top hotspots. `full` and `static` runs write it and
+append it to `GITHUB_STEP_SUMMARY` when that is set, so the nightly run shows
+the snapshot on its summary page; the grading modes append their report
+instead.
+
 `clippy-hits.json` beside the snapshot lists every strict and complexity
 diagnostic as path, line and code, for the diff grader to intersect with the
 lines a change touched.

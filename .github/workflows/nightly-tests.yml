@@ -454,7 +454,8 @@ jobs:
   metrics:
     # Architectural-health snapshot (docs/specs/30-spec-quality-metrics): `just
     # metrics` runs every collector, the dashboard renders from the history,
-    # both ship as the `metrics` artifact, and the snapshot is pushed to the
+    # both ship as the `metrics` artifact, the snapshot's summary.md lands on
+    # the run's summary page, and the snapshot is pushed to the
     # orphan `metrics-data` branch, never to main (AGENTS.md: nothing commits
     # to main outside a reviewed PR; the gate reads its baseline from that
     # ref). Non-blocking while it beds in: read it in the run, promote into
