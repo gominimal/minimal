@@ -35,8 +35,9 @@ when the data says its count is zero.
 **Success:** a nightly run on main adds one snapshot to the history, the
 dashboard renders the trend from that history alone, a pull request that
 adds an `unwrap()` on a changed line sees the strict-lint ratchet fail in
-its report, and one Clippy lint moves from the strict gate into the
-workspace set on the strength of a zero count in a snapshot.
+its report, the report names the files where churn meets poor quality, and
+one Clippy lint moves from the strict gate into the workspace set on the
+strength of a zero count in a snapshot.
 
 **First slice:** `just metrics` on Linux writes one snapshot that validates
 against the schema, with lint density, coverage, size, module cycles,
@@ -67,6 +68,8 @@ laptop who wants the same answer the factory gets.
   review contract.
 - AS A developer I WANT one command that runs the same grading the factory
   runs SO THAT the laptop and the factory agree on what the bar is.
+- AS A maintainer I WANT the files where quality is suffering ranked by how
+  often they change SO THAT a refactor goes where it pays back first.
 
 ## Requirements
 
@@ -193,6 +196,21 @@ inputs.
   tier:     T0
   verify:   bash scripts/metrics_test.sh dashboard_renders_offline_with_tables
 
+### Hotspots
+
+- **QM-018** THE SYSTEM SHALL rank source files as hotspots by their change
+  frequency over a declared window multiplied by their quality findings
+  (complexity hits, strict-lint hits and uncovered lines), and SHALL carry
+  the ranked list with each file's components in the snapshot and in the
+  report.
+  tier:     T1
+  verify:   bash scripts/metrics_test.sh hotspots_rank_churn_times_findings
+  property: for all files a, b with churn(a) >= churn(b) and findings(a) >= findings(b), rank(a) <= rank(b); a file with no findings or no changes in the window has score 0
+  - IF coverage was not measured THEN THE SYSTEM SHALL rank on churn and
+    findings alone and say so in the report.
+    tier:   T0
+    verify: bash scripts/metrics_test.sh hotspots_without_coverage
+
 ### Test quality
 
 - **QM-017** WHEN grading a change THE SYSTEM SHALL mutation-test only the
@@ -267,6 +285,12 @@ instability and abstractness come from young tools whose numbers move
 between versions. Recording them builds the history that decides whether
 they are worth gating on; gating on them now would make the verdict depend
 on a tool's release notes.
+
+**Hotspots are churn times findings, not findings alone.** A complex file
+nobody touches costs nothing until someone touches it. A file that changes
+every week and carries strict-lint hits and uncovered lines is where a
+refactor pays back first. The window is declared in the thresholds file so
+the ranking is reproducible from the tree and its history.
 
 **No new workspace crate.** A Rust tool for collection would enter every
 workspace build, every Clippy run and the coverage denominator it measures.
