@@ -16,6 +16,12 @@
 # shellcheck disable=SC2015,SC2016,SC2181
 set -euo pipefail
 
+# Cases that run the real scripts inherit this environment, and in Actions
+# that includes GITHUB_STEP_SUMMARY: run inside the nightly's coverage pass,
+# the gate cases wrote their grading report onto the metrics job's own
+# summary page. The cases that check the append set the variable themselves.
+unset GITHUB_STEP_SUMMARY
+
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 data="$here/metrics/testdata"
