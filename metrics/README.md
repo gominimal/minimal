@@ -133,7 +133,7 @@ the same tree, baseline and thresholds produce the same bytes. Times live in
 | `toolchain`, `tools` | Versions that measured the tree. |
 | `scope` | `crates` the compiling collectors covered; `excluded` crates source-level tools cannot see, with the reason. |
 | `crates.<name>` | `layer`, then one block per collector, each `null` when not measured: `size` (files, code, comments, blanks, test code), `clippy` (workspace lints, every strict lint's count, complexity lint counts, the two totals), `coverage` (lines, functions, regions as covered, total, pct), `modules` (acyclic, cycles, orphans), `deps` (internal, unused), `mutants` (tested, caught, missed, timeout, unviable, score_pct), `crap` (functions, over_threshold, max), `experimental` (`rustqual` and `anatomy` sub-blocks, each `null` when that tool did not run; the whole block `null` when neither did). |
-| `workspace` | The same blocks summed, plus `strict_promotable`: the strict lints at zero across the whole tree, present only when clippy covered the whole workspace. `mutants` adds `scope`, `shard` and `untracked_outside_scope`; `crap` adds the `threshold` it counted against. `experimental` carries the rustqual score weighted by lines of code with the finding counts summed, and the mean distance from the main sequence with the crates in the zone of pain. |
+| `workspace` | The same blocks summed, plus `strict_promotable`: the strict lints at zero across the whole tree, present only when clippy covered the whole workspace. `mutants` adds `scope`, `since`, `partial` and `untracked_outside_scope`; `crap` adds the `threshold` it counted against. `experimental` carries the rustqual score weighted by lines of code with the finding counts summed, and the mean distance from the main sequence with the crates in the zone of pain. |
 | `layers` | Every forbidden edge with whether an exception names it, the counts `unexcepted` and `exceptions`, the `unassigned` crates, and stale exceptions. |
 | `hotspots` | Files ranked by churn over `window_days` multiplied by findings, with each file's components. |
 | `gates` | One entry per threshold, keyed `<kind>:<metric>` (`floor:coverage.lines_pct`, `ratchet:clippy.strict.total`): value, threshold or baseline, result (`pass`, `warn`, `fail`, `not_evaluated`). |
@@ -251,9 +251,14 @@ is counted but stays out of the score. The scope follows the mode (QM-017):
   listed under `untracked_outside_scope` so a reader knows what was not
   tested. With no Rust change since the base the collector is not measured
   and the list is still written.
-- `full` mode (the nightly) tests one of seven shards of the workspace,
-  chosen by the weekday, so a week covers the tree; `scope` is `shard` and
-  `shard` records which. `--no-mutants` skips it.
+- `full` mode (the nightly) tests the lines changed since a reference
+  commit: `--since REF`, or by default the newest snapshot in the history
+  directory, then the merge-base with `origin/main` on a branch. A workspace
+  shard is thousands of mutants and no night is long enough for one;
+  yesterday's changes are bounded and are what the history should speak to.
+  `scope` is `since`, `since` records the reference, and
+  `MINIMAL_METRICS_MUTANTS_BUDGET_SECS` caps the run; a run that hits the cap
+  reports what it tested with `partial` set. `--no-mutants` skips it.
 
 A crate the run generated no mutants for carries `null`, not a perfect
 score. The run needs the baseline suite green, which it is only on Linux; a

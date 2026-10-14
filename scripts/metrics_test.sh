@@ -606,10 +606,20 @@ mutants_scope_follows_mode() {   # QM-017
     (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh full --no-coverage --no-modules --no-clippy --out "$repo/.scratch/full" >/dev/null 2>&1) || true
     snap="$repo/.scratch/full/snapshot.json"
     [ -f "$snap" ] || { bad "full mode wrote no snapshot"; return; }
-    grep -qx -- '--shard' "$tmp/mut-argv" && ok "full mode passes --shard" || bad "no --shard in argv: $(tr '\n' ' ' < "$tmp/mut-argv")"
-    grep -qE '^[0-6]/7$' "$tmp/mut-argv" && ok "the shard is the weekday over seven" || bad "shard argument"
-    grep -qx -- '--in-diff' "$tmp/mut-argv" && bad "full mode passed --in-diff" || ok "full mode passes no diff"
-    [ "$(py "$snap" "s['workspace']['mutants']['scope']")" = "shard" ] && ok "the nightly snapshot records the shard scope" || bad "full scope"
+    # No history dir in the fixture, so `auto` falls back to the merge-base with main.
+    grep -qx -- '--in-diff' "$tmp/mut-argv" && ok "full mode passes --in-diff for the lines since the reference" || bad "no --in-diff in argv: $(tr '\n' ' ' < "$tmp/mut-argv")"
+    grep -qx -- '--shard' "$tmp/mut-argv" && bad "full mode passed --shard" || ok "full mode passes no shard"
+    [ "$(py "$snap" "(s['workspace']['mutants']['scope'], s['workspace']['mutants']['since'] == __import__('subprocess').run(['git','-C','$repo','rev-parse','--short=7','main'],capture_output=True,text=True).stdout.strip(), s['workspace']['mutants']['partial'])")" = "('since', True, False)" ] \
+        && ok "the nightly snapshot records the since scope, the reference and no partial flag" || bad "full scope: $(py "$snap" "s['workspace']['mutants']")"
+    rm -f "$tmp/mut-argv"
+    # The newest history snapshot names the reference when it is a commit.
+    mkdir -p "$repo/.scratch/metrics/history"
+    echo '{}' > "$repo/.scratch/metrics/history/2026-10-01-$(git -C "$repo" rev-parse --short=7 main).json"
+    (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh full --no-coverage --no-modules --no-clippy --out "$repo/.scratch/full2" >/dev/null 2>&1) || true
+    grep -qx -- '--in-diff' "$tmp/mut-argv" && ok "a history snapshot's sha7 is the reference" || bad "history reference not used"
+    (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh full --no-coverage --no-modules --no-clippy --since HEAD --out "$repo/.scratch/full3" >/dev/null 2>&1) || true
+    [ "$(py "$repo/.scratch/full3/snapshot.json" "s['run']['not_measured'].get('mutants','').startswith('no Rust changes since')")" = "True" ] \
+        && ok "--since HEAD finds nothing to test and says so" || bad "since HEAD: $(py "$repo/.scratch/full3/snapshot.json" "s['run']['not_measured']")"
     rm -f "$tmp/mut-argv"
     (cd "$repo" && PATH="$repo/fakebin:$PATH" bash scripts/metrics/run.sh full --no-coverage --no-modules --no-clippy --no-mutants --out "$repo/.scratch/nomut" >/dev/null 2>&1) || true
     [ ! -f "$tmp/mut-argv" ] && [ "$(py "$repo/.scratch/nomut/snapshot.json" "s['workspace']['mutants']")" = "None" ] \

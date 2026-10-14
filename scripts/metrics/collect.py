@@ -855,11 +855,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mutants", type=Path, help="cargo-mutants outcomes.json")
     ap.add_argument(
         "--mutants-scope",
-        choices=("in-diff", "shard", "workspace"),
+        choices=("in-diff", "since", "shard", "workspace"),
         default="workspace",
         help="what the mutants run covered (QM-017)",
     )
     ap.add_argument("--mutants-shard", metavar="K/N", help="the shard a nightly run tested")
+    ap.add_argument("--mutants-since", metavar="SHA7", help="the reference commit of a `since` run")
+    ap.add_argument(
+        "--mutants-budget-exhausted", action="store_true", help="the run stopped at its time budget"
+    )
     ap.add_argument(
         "--mutants-untracked", type=Path, help="one untracked *.rs path per line: outside the mutation scope"
     )
@@ -1023,6 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
         workspace["mutants"] = mutants_block(totals)
         workspace["mutants"]["scope"] = args.mutants_scope
         workspace["mutants"]["shard"] = args.mutants_shard
+        workspace["mutants"]["since"] = args.mutants_since
+        workspace["mutants"]["partial"] = bool(args.mutants_budget_exhausted)
         workspace["mutants"]["untracked_outside_scope"] = untracked or []
     elif untracked is not None:
         workspace["mutants"] = {"untracked_outside_scope": untracked}
