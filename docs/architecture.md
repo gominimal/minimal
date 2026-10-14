@@ -207,11 +207,16 @@ execution:
 and inside the microVM:
 
 `async-dialog`, `minimal`, `minimal-client`, `minimal-tui`, `minimald`,
-`minimald-rpc`, `minvmd`, `sessions`, `switch`
+`minimald-rpc`, `minvmd`, `minzoned`, `sessions`, `switch`
 
 **shared** covers the utilities the other planes draw on:
 
 `common`, `diagnostics`, `mctx`, `mlog`, `ot`, `paths`, `version`
+
+The planes are descriptive. The dependency directions that are enforced, with
+finer layers and the edges the tree still carries as dated exceptions, live in
+[metrics/layers.toml](../metrics/layers.toml); `just metrics-layers` checks
+them against `cargo metadata`.
 
 ## 4. Cache & hashing
 

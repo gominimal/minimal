@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+#
+# metrics_test.sh — harness for scripts/metrics/ (spec 30).
+#
+# Every case runs over fixtures under scripts/metrics/testdata; no tool is
+# invoked, no crate is compiled, no network. Cases are named after the
+# requirement they check (the spec's `verify:` lines name them). Run them all
+# with `bash scripts/metrics_test.sh`, one with `bash scripts/metrics_test.sh
+# <case>`, or the lot through `just test-shell` and the workspace suite
+# (crates/common/tests/shell_harnesses.rs).
+
+# `<check> && ok ... || bad ...` is the harness idiom: ok/bad never fail, so
+# the else-branch warning (SC2015) and the `$?` style note (SC2181) do not apply.
+# shellcheck disable=SC2015,SC2181
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+data="$here/metrics/testdata"
+collect="$here/metrics/collect.py"
+layers="$here/metrics/layers.py"
+schema="$here/metrics/schema.py"
+command -v python3 >/dev/null 2>&1 || { echo "python3 required" >&2; exit 1; }
+
+tmp="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-metrics)"
+trap 'rm -rf "$tmp"' EXIT
+
+pass=0 fail=0
+ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
+bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
+
+# jq-less field access: py <file> <python expression over `s`>
+py() { python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }
+
+# The collector over the standard fixture set, with the given extra flags.
+# Runs from the repo root (collect.py reads git for the sha); hotspots are off
+# unless a case turns them on, so no case walks the real history.
+run_collect() {
+    local out="$1"; shift
+    (cd "$root" && python3 "$collect" --out "$out" --mode full --root "$root" \
+        --metadata "$data/small-metadata.json" --rules "$data/small-layers.toml" \
+        --thresholds "$data/thresholds-basic.toml" --strict-lints "$data/strict-lints.txt" \
+        --no-hotspots "$@")
+}
+standard=(--clippy "$data/clippy.json" --clippy-complete --coverage "$data/llvm-cov.json"
+          --tokei "$data/tokei.json" --modules "$data/modules.jsonl" --shear "$data/shear.json")
+
+# ------------------------------------------------------------------- cases
+
+snapshot_validates() {   # QM-001
+    local out="$tmp/validates"
+    run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
+    if [ -f "$out/snapshot.json" ] && python3 "$schema" "$out/snapshot.json" >/dev/null; then
+        ok "snapshot validates against schema v1"
+    else
+        bad "snapshot missing or invalid"; return
+    fi
+    [ -f "$out/meta.json" ] && ok "meta.json written beside the snapshot" || bad "no meta.json"
+    [ -f "$out/clippy-hits.json" ] && ok "clippy-hits.json written" || bad "no clippy-hits.json"
+    # A document with a wrong verdict is rejected.
+    python3 - "$out/snapshot.json" "$tmp/broken.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1])); s["verdict"] = "pass"; s["gates"]["ceiling:modules.cycles"]["result"] = "fail"
+json.dump(s, open(sys.argv[2], "w"))
+PY
+    if python3 "$schema" "$tmp/broken.json" >/dev/null 2>&1; then
+        bad "schema accepted a verdict that disagrees with its gates"
+    else
+        ok "schema rejects a verdict that disagrees with its gates"
+    fi
+}
+
+missing_tool_is_not_measured() {   # QM-001 failure clause
+    local out="$tmp/missing"
+    run_collect "$out" --tokei "$data/tokei.json" --not-measured "coverage=cargo-llvm-cov not installed" \
+        --not-measured "clippy=static mode" >/dev/null 2>&1 || true
+    [ "$(py "$out/snapshot.json" "s['run']['not_measured']['coverage']")" = "cargo-llvm-cov not installed" ] \
+        && ok "the reason is recorded under run.not_measured" || bad "reason not recorded"
+    [ "$(py "$out/snapshot.json" "s['crates']['graph']['coverage']")" = "None" ] \
+        && ok "an unmeasured block is null, not zero" || bad "unmeasured block not null"
+    [ "$(py "$out/snapshot.json" "s['gates']['floor:coverage.lines_pct']['result']")" = "not_evaluated" ] \
+        && ok "a gate over an unmeasured block is not_evaluated" || bad "gate over unmeasured block evaluated"
+    # run.sh exits 3 when a collector that should have run could not; the
+    # snapshot is still written. Exercised with a fake cargo on PATH.
+    local fake="$tmp/fakebin"; mkdir -p "$fake"
+    printf '#!/bin/sh\necho "no cargo here" >&2\nexit 7\n' > "$fake/cargo"; chmod +x "$fake/cargo"
+    local status=0
+    (cd "$root" && PATH="$fake:$PATH" bash "$here/metrics/run.sh" static --out "$tmp/run-missing" >/dev/null 2>&1) || status=$?
+    [ "$status" -eq 1 ] && ok "run.sh exits non-zero, never clean, when cargo metadata cannot run" \
+        || bad "run.sh exit $status with a broken cargo"
+}
+
+verdict_is_worst_gate() {   # QM-002, property over every gate combination
+    python3 - "$collect" <<'PY'
+import importlib.util, itertools, sys
+spec = importlib.util.spec_from_file_location("collect", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+results = ("pass", "warn", "fail", "not_evaluated")
+rank = {"pass": 0, "not_evaluated": 0, "warn": 1, "fail": 2}
+assert m.verdict({}) == "pass"
+for n in (1, 2, 3):
+    for combo in itertools.product(results, repeat=n):
+        gates = {f"g{i}": {"result": r} for i, r in enumerate(combo)}
+        want = ("pass", "warn", "fail")[max(rank[r] for r in combo)]
+        assert m.verdict(gates) == want, (combo, m.verdict(gates))
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "verdict is the worst gate over every combination of up to three gates" || bad "verdict property"
+}
+
+strict_counts_and_promotable() {   # QM-003
+    local out="$tmp/strict"
+    run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
+    local snap="$out/snapshot.json"
+    [ "$(py "$snap" "s['crates']['graph']['clippy']['strict']['clippy::unwrap_used']")" = "2" ] \
+        && ok "duplicate diagnostics (one per compilation unit) count once" || bad "dedup"
+    [ "$(py "$snap" "s['workspace']['clippy']['strict_total']")" = "4" ] \
+        && ok "workspace strict total sums the crates" || bad "strict total"
+    [ "$(py "$snap" "s['workspace']['clippy']['complexity']")" = "{'cognitive_complexity': 1, 'too_many_arguments': 0, 'too_many_lines': 1}" ] \
+        && ok "complexity lints are counted apart from the strict set" || bad "complexity counts"
+    [ "$(py "$snap" "s['workspace']['clippy']['workspace_lints']")" = "1" ] \
+        && ok "a non-strict diagnostic counts under workspace_lints" || bad "workspace_lints"
+    [ "$(py "$snap" "s['workspace']['strict_promotable']")" = "['clippy::mem_forget']" ] \
+        && ok "a strict lint at zero is listed as promotable" || bad "promotable"
+    # A pinned scope: run.sh then omits --clippy-complete.
+    printf 'graph\n' > "$tmp/scope-graph.txt"
+    run_collect "$tmp/partial" --clippy "$data/clippy.json" --coverage "$data/llvm-cov.json" --tokei "$data/tokei.json" \
+        --modules "$data/modules.jsonl" --shear "$data/shear.json" --scope "$tmp/scope-graph.txt" >/dev/null 2>&1 || true
+    [ "$(py "$tmp/partial/snapshot.json" "s['workspace']['strict_promotable']")" = "None" ] \
+        && ok "no promotable list when clippy did not cover the whole workspace" || bad "partial promotable"
+    [ "$(py "$tmp/partial/snapshot.json" "s['crates']['decode']['clippy']")" = "None" ] \
+        && ok "a crate outside the scope carries no clippy block" || bad "out-of-scope clippy block"
+}
+
+coverage_excludes_tests_and_generated() {   # QM-004
+    local out="$tmp/cov"
+    run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
+    local snap="$out/snapshot.json"
+    # graph: lib.rs 80/100 + plan.rs 10/50; tests/it.rs excluded.
+    [ "$(py "$snap" "s['crates']['graph']['coverage']['lines']")" = "{'covered': 90, 'pct': 60.0, 'total': 150}" ] \
+        && ok "test sources stay out of a crate's denominator" || bad "graph coverage $(py "$snap" "s['crates']['graph']['coverage']['lines']")"
+    [ "$(py "$snap" "s['crates']['decode']['coverage']['lines']['total']")" = "200" ] \
+        && ok "build.rs stays out of the denominator" || bad "decode coverage"
+    [ "$(py "$snap" "s['gates']['floor:coverage.lines_pct']['result']")" = "pass" ] \
+        && ok "the workspace floor reads the llvm-cov totals" || bad "coverage gate"
+}
+
+experimental_never_changes_verdict() {   # QM-005
+    local out="$tmp/exp"
+    run_collect "$out" "${standard[@]}" >/dev/null 2>&1 || true
+    python3 - "$out/snapshot.json" "$collect" "$data/thresholds-basic.toml" <<'PY'
+import json, random, sys, tomllib, importlib.util
+spec = importlib.util.spec_from_file_location("collect", sys.argv[2]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+s = json.load(open(sys.argv[1])); th = tomllib.load(open(sys.argv[3], "rb"))
+base = m.verdict(m.evaluate_gates(s, th, None))
+random.seed(30)
+for _ in range(50):
+    for c in s["crates"].values():
+        c["experimental"] = {"rustqual": {"score": random.random() * 100, "cycles": random.randint(0, 9)},
+                             "anatomy": {"instability": random.random(), "distance": random.random()}}
+    assert m.verdict(m.evaluate_gates(s, th, None)) == base
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "fifty random experimental sections leave the verdict unchanged" || bad "experimental changed the verdict"
+}
+
+report_is_byte_stable() {   # QM-006
+    run_collect "$tmp/stable1" "${standard[@]}" >/dev/null 2>&1 || true
+    sleep 1
+    run_collect "$tmp/stable2" "${standard[@]}" >/dev/null 2>&1 || true
+    if cmp -s "$tmp/stable1/snapshot.json" "$tmp/stable2/snapshot.json"; then
+        ok "two runs over the same inputs give byte-identical snapshots"
+    else
+        bad "snapshots differ between runs"
+    fi
+    grep -q '"started"' "$tmp/stable1/meta.json" && ok "the start time lives in meta.json" || bad "no start time in meta"
+    grep -q '"started"' "$tmp/stable1/snapshot.json" && bad "a timestamp leaked into the snapshot" || ok "no timestamp in the snapshot"
+}
+
+forbidden_edge_is_reported() {   # QM-007
+    # The fixture tree is clean; seed a session->build style edge: common (leaf) -> graph.
+    python3 - "$data/small-metadata.json" "$tmp/bad-meta.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+next(p for p in m["packages"] if p["name"] == "common")["dependencies"].append({"name": "graph", "kind": None})
+next(p for p in m["packages"] if p["name"] == "decode")["dependencies"].append({"name": "mip", "kind": "dev"})
+json.dump(m, open(sys.argv[2], "w"))
+PY
+    local status=0 out
+    out="$(python3 "$layers" --rules "$data/small-layers.toml" --metadata "$tmp/bad-meta.json" --json)" || status=$?
+    [ "$status" -eq 2 ] && ok "a forbidden edge exits 2" || bad "exit $status for a forbidden edge"
+    echo "$out" | grep -q '"from": "common"' && ok "the edge is named with its crates" || bad "edge not reported"
+    echo "$out" | grep -q '"to": "mip"' && bad "a dev-dependency counted as an edge" || ok "dev-dependencies are not edges"
+    status=0
+    python3 "$layers" --rules "$data/small-layers.toml" --metadata "$data/small-metadata.json" >/dev/null || status=$?
+    [ "$status" -eq 0 ] && ok "the clean fixture exits 0" || bad "clean fixture exit $status"
+    # The real tree and the real table: every carried edge is excepted.
+    status=0
+    (cd "$root" && python3 "$layers" --metadata "$data/cargo-metadata.json" >/dev/null) || status=$?
+    [ "$status" -eq 0 ] && ok "the repo's own layers.toml holds against the committed metadata fixture" || bad "repo layers exit $status"
+}
+
+excepted_edge_is_counted_not_failed() {   # QM-007 exception clause
+    cat > "$tmp/exc-layers.toml" <<'EOF'
+schema = 1
+[layers]
+leaf = ["common"]
+build = ["decode", "graph"]
+product = ["mip"]
+[allowed]
+leaf = []
+build = ["leaf", "build"]
+product = ["leaf", "build"]
+[[exception]]
+from = "common"
+to = "graph"
+reason = "fixture"
+since = "2026-10-14"
+issue = "fixture#1"
+EOF
+    local status=0 out
+    out="$(python3 "$layers" --rules "$tmp/exc-layers.toml" --metadata "$tmp/bad-meta.json" --json)" || status=$?
+    [ "$status" -eq 0 ] && ok "an excepted edge does not fail the gate" || bad "excepted edge exit $status"
+    [ "$(echo "$out" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["exceptions"], s["unexcepted"])')" = "1 0" ] \
+        && ok "it counts toward exceptions, not unexcepted" || bad "exception counts"
+    echo "$out" | grep -q '"issue": "fixture#1"' && ok "the exception's issue is carried" || bad "issue not carried"
+    out="$(python3 "$layers" --rules "$tmp/exc-layers.toml" --metadata "$data/small-metadata.json" --json)" || true
+    echo "$out" | grep -q '"common -> graph"' && ok "a stale exception is reported" || bad "stale exception not reported"
+}
+
+unassigned_crate_fails() {   # QM-008
+    cat > "$tmp/un-layers.toml" <<'EOF'
+schema = 1
+[layers]
+leaf = ["common"]
+build = ["decode", "graph"]
+[allowed]
+leaf = []
+build = ["leaf", "build"]
+EOF
+    local status=0 out
+    out="$(python3 "$layers" --rules "$tmp/un-layers.toml" --metadata "$data/small-metadata.json" --json)" || status=$?
+    [ "$status" -eq 2 ] && ok "a member in no layer exits 2" || bad "unassigned exit $status"
+    echo "$out" | grep -q '"mip"' && ok "the unassigned crate is named" || bad "unassigned not named"
+    run_collect "$tmp/un" "${standard[@]}" --rules "$tmp/un-layers.toml" >/dev/null 2>&1 || status=$?
+    [ "$(py "$tmp/un/snapshot.json" "s['gates']['ceiling:layers.unassigned']['result']")" = "fail" ] \
+        && ok "the layers.unassigned gate fails in the snapshot" || bad "unassigned gate"
+}
+
+hotspots_rank_churn_times_findings() {   # QM-018
+    # A throwaway repo whose history gives a.rs 3 commits and b.rs 1; clippy
+    # findings favour b.rs. churn x findings must still rank a.rs first when
+    # a.rs has findings, and a file with no findings scores 0.
+    local repo="$tmp/hot"; mkdir -p "$repo/crates/graph/src"
+    git -c init.templateDir= init -q "$repo" 2>/dev/null
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
+    for i in 1 2 3; do echo "fn a$i(){}" >> "$repo/crates/graph/src/a.rs"; git -C "$repo" add -A; git -C "$repo" commit -q -m "a$i"; done
+    echo "fn b(){}" > "$repo/crates/graph/src/b.rs"; echo "fn c(){}" > "$repo/crates/graph/src/c.rs"
+    git -C "$repo" add -A; git -C "$repo" commit -q -m "b c"
+    python3 - "$tmp/hot-meta.json" "$repo" <<'PY'
+import json, sys
+json.dump({"packages": [{"name": "graph", "id": "g", "manifest_path": sys.argv[2] + "/crates/graph/Cargo.toml",
+           "description": "g", "dependencies": [], "targets": [{"kind": ["lib"], "name": "graph"}]}], "workspace_members": []}, open(sys.argv[1], "w"))
+PY
+    python3 - "$tmp/hot-clippy.json" <<'PY'
+import json, sys
+def msg(code, path, line):
+    return {"reason": "compiler-message", "message": {"level": "warning", "code": {"code": code}, "message": "m",
+            "spans": [{"file_name": path, "line_start": line, "is_primary": True}]}}
+rows = [msg("clippy::unwrap_used", "crates/graph/src/a.rs", 1), msg("clippy::unwrap_used", "crates/graph/src/b.rs", 1),
+        msg("clippy::cognitive_complexity", "crates/graph/src/b.rs", 1), msg("clippy::unwrap_used", "crates/graph/src/b.rs", 2)]
+open(sys.argv[1], "w").write("\n".join(json.dumps(r) for r in rows) + "\n")
+PY
+    (cd "$repo" && python3 "$collect" --out "$tmp/hot-out" --mode full --root "$repo" --metadata "$tmp/hot-meta.json" \
+        --rules "$tmp/hot-layers.toml" --thresholds "$data/thresholds-basic.toml" --strict-lints "$data/strict-lints.txt" \
+        --clippy "$tmp/hot-clippy.json" --clippy-complete --not-measured "coverage=fixture" >/dev/null 2>&1) || true
+    local snap="$tmp/hot-out/snapshot.json"
+    [ -f "$snap" ] || { bad "hotspot snapshot not written"; return; }
+    # a.rs: 3 commits x 1 finding = 3; b.rs: 1 commit x 3 findings = 3; c.rs: no findings.
+    [ "$(py "$snap" "[(f['path'], f['churn'], f['score']) for f in s['hotspots']['files']]")" = "[('crates/graph/src/a.rs', 3, 3.0), ('crates/graph/src/b.rs', 1, 3.0)]" ] \
+        && ok "score is churn times findings; ties break on path; a file with no findings is absent" \
+        || bad "ranking: $(py "$snap" "[(f['path'], f['churn'], f['score']) for f in s['hotspots']['files']]")"
+    [ "$(py "$snap" "s['hotspots']['coverage_included']")" = "False" ] && ok "coverage_included is false without coverage" || bad "coverage flag"
+    [ "$(py "$snap" "s['hotspots']['findings_included']")" = "True" ] && ok "findings_included is true with clippy" || bad "findings flag"
+}
+
+hotspots_without_coverage() {   # QM-018 fallback clause: no findings source at all ranks on churn
+    local repo="$tmp/hot"
+    [ -d "$repo" ] || hotspots_rank_churn_times_findings >/dev/null
+    (cd "$repo" && python3 "$collect" --out "$tmp/hot-static" --mode static --root "$repo" --metadata "$tmp/hot-meta.json" \
+        --rules "$tmp/hot-layers.toml" --thresholds "$data/thresholds-basic.toml" --strict-lints "$data/strict-lints.txt" \
+        --not-measured "coverage=static mode" --not-measured "clippy=static mode" >/dev/null 2>&1) || true
+    local snap="$tmp/hot-static/snapshot.json"
+    [ "$(py "$snap" "s['hotspots']['findings_included']")" = "False" ] && ok "findings_included is false in static mode" || bad "findings flag"
+    [ "$(py "$snap" "[(f['path'], f['score']) for f in s['hotspots']['files']]")" = "[('crates/graph/src/a.rs', 3.0), ('crates/graph/src/b.rs', 1.0), ('crates/graph/src/c.rs', 1.0)]" ] \
+        && ok "without findings the ranking is churn alone" || bad "churn-only ranking: $(py "$snap" "[(f['path'], f['score']) for f in s['hotspots']['files']]")"
+}
+
+darwin_scope_lists_uncovered_crates() {   # QM-013: the snapshot side; the report side lands with the diff grader
+    local out="$tmp/darwin"
+    printf 'graph\n' > "$tmp/scope-graph.txt"
+    run_collect "$out" "${standard[@]}" --mode darwin --scope "$tmp/scope-graph.txt" >/dev/null 2>&1 || true
+    [ "$(py "$out/snapshot.json" "s['run']['mode']")" = "darwin" ] && ok "mode is recorded as darwin" || bad "mode"
+    [ "$(py "$out/snapshot.json" "s['scope']['crates']")" = "['graph']" ] && ok "the pinned scope is recorded" || bad "scope"
+    [ "$(py "$out/snapshot.json" "s['crates']['decode']['coverage']")" = "None" ] \
+        && ok "a crate outside the scope has no coverage block" || bad "out-of-scope coverage"
+    [ "$(py "$out/snapshot.json" "s['crates']['decode']['size'] is not None")" = "True" ] \
+        && ok "static collectors still cover every crate" || bad "size missing outside scope"
+}
+
+clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors clippy.toml
+    python3 - "$root" <<'PY'
+import sys, tomllib
+root = sys.argv[1]
+th = tomllib.load(open(f"{root}/metrics/thresholds.toml", "rb"))["clippy"]
+cl = tomllib.load(open(f"{root}/clippy.toml", "rb"))
+for k, v in th.items():
+    assert cl.get(k) == v, (k, cl.get(k), v)
+PY
+    [ $? -eq 0 ] && ok "clippy.toml and metrics/thresholds.toml agree on the complexity thresholds" || bad "complexity thresholds disagree"
+}
+
+# -------------------------------------------------------------------- run
+
+# The hotspot cases share a tiny layers file.
+cat > "$tmp/hot-layers.toml" <<'EOF'
+schema = 1
+[layers]
+build = ["graph"]
+[allowed]
+build = ["build"]
+EOF
+
+all_cases=(
+    snapshot_validates
+    missing_tool_is_not_measured
+    verdict_is_worst_gate
+    strict_counts_and_promotable
+    coverage_excludes_tests_and_generated
+    experimental_never_changes_verdict
+    report_is_byte_stable
+    forbidden_edge_is_reported
+    excepted_edge_is_counted_not_failed
+    unassigned_crate_fails
+    hotspots_rank_churn_times_findings
+    hotspots_without_coverage
+    darwin_scope_lists_uncovered_crates
+    clippy_thresholds_agree
+)
+cases=("${all_cases[@]}")
+[ "$#" -gt 0 ] && cases=("$@")
+
+for case in "${cases[@]}"; do
+    if ! declare -F "$case" >/dev/null; then
+        bad "no such case: $case"
+        continue
+    fi
+    echo "== $case =="
+    "$case"
+done
+
+echo
+echo "metrics_test: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

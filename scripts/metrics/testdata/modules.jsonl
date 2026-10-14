@@ -1,0 +1,2 @@
+{"crate": "graph", "acyclic": true, "orphans": 0, "error": null}
+{"crate": "decode", "acyclic": false, "orphans": 2, "error": null}

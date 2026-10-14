@@ -340,6 +340,28 @@ clippy:
 clippy-strict BASE="":
     scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
+# Architectural-health measurement (spec 30, metrics/README.md). The snapshot
+# lands in .scratch/metrics/<mode>/; `full` compiles (clippy, coverage, module
+# graphs), `static` does not. On macOS the compiling collectors take the darwin
+# crate pair and the snapshot is marked darwin. Exit 2 is a failed gate, 3 an
+# incomplete snapshot; neither reads as clean.
+# CI: nightly-tests.yml `metrics` (proposed; see docs/ci-strategy.md §6).
+#
+# Install the metrics tools at their pinned versions (scripts/metrics/install-tools.sh).
+metrics-tools:
+    scripts/metrics/install-tools.sh
+
+# Write a quality snapshot (`just metrics` full, `just metrics static` without compiling).
+metrics MODE="full" *args:
+    scripts/metrics/run.sh {{MODE}} {{strict-scope}} {{args}}
+
+# Seconds, no compile: the table in metrics/layers.toml against cargo metadata.
+# Part of `just ci`. Exit 2 names the forbidden edge or the unassigned crate.
+#
+# Check crate dependency directions against metrics/layers.toml.
+metrics-layers:
+    python3 scripts/metrics/layers.py --rules metrics/layers.toml
+
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
 #
@@ -476,12 +498,12 @@ hooks:
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest test-ignored zoned-link-check
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy clippy-strict deny test doctest zoned-link-check
+ci: fmt-check check-version clippy clippy-strict deny metrics-layers test doctest zoned-link-check
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
