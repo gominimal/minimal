@@ -695,7 +695,9 @@ fn newest_cmd_trace_id_in(text: &str) -> Option<String> {
                 continue;
             };
             let t = end(span);
-            if best.as_ref().is_none_or(|(b, _)| t >= *b) {
+            // Files are visited newest first, so an equal end time keeps
+            // the span already recorded: strictly greater, not `>=`.
+            if best.as_ref().is_none_or(|(b, _)| t > *b) {
                 best = Some((t, id.to_owned()));
             }
         }
