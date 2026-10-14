@@ -722,6 +722,107 @@ def verdict(gates: dict) -> str:
     return ("pass", "warn", "fail")[worst]
 
 
+# ----------------------------------------------------------------- summary
+
+
+def _fmt(value) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def summary_markdown(snapshot: dict) -> str:
+    """The snapshot as a page of Markdown for a run's step summary.
+
+    What a person opens the run for: the verdict, every gate, the workspace
+    totals, the module cycles and the top hotspots. The same numbers are in
+    snapshot.json; this is the glance, not the record.
+    """
+    ws = snapshot["workspace"]
+    run = snapshot["run"]
+    lines = [
+        f"## Quality snapshot `{snapshot['git']['sha7']}` ({run['mode']}, {run['host']['os']}/{run['host']['arch']})",
+        "",
+        f"Verdict: **{snapshot['verdict']}**",
+        "",
+        "### Gates",
+        "",
+        "| Gate | Value | Baseline | Threshold | Result |",
+        "|---|---|---|---|---|",
+    ]
+    for name, gate in sorted(snapshot["gates"].items()):
+        if gate["kind"] == "ratchet":
+            threshold = f"{gate['direction']}, tolerance {_fmt(gate['tolerance'])}"
+            baseline = _fmt(gate.get("baseline"))
+        else:
+            threshold = ("≥ " if gate["kind"] == "floor" else "≤ ") + _fmt(gate["threshold"])
+            baseline = "n/a"
+        lines.append(f"| `{name}` | {_fmt(gate['value'])} | {baseline} | {threshold} | {gate['result']} |")
+
+    lines += ["", "### Workspace", "", "| Metric | Value |", "|---|---|"]
+    rows = []
+    if ws.get("size"):
+        rows.append(("Code lines", ws["size"]["code"]))
+        rows.append(("Test code lines", ws["size"]["test_code"]))
+    if ws.get("clippy"):
+        rows.append(("Strict lint hits", ws["clippy"]["strict_total"]))
+        rows.append(("Complexity lint hits", ws["clippy"]["complexity_total"]))
+        rows.append(("Workspace lint hits", ws["clippy"]["workspace_lints"]))
+    if ws.get("coverage"):
+        rows.append(("Line coverage %", ws["coverage"].get("lines", {}).get("pct")))
+    if ws.get("modules"):
+        rows.append(("Module cycles", ws["modules"]["cycles"]))
+        rows.append(("Orphan modules", ws["modules"]["orphans"]))
+    if ws.get("deps"):
+        rows.append(("Unused dependencies", ws["deps"]["unused_total"]))
+    if ws.get("mutants") and "score_pct" in ws["mutants"]:
+        rows.append((f"Mutation score % ({ws['mutants'].get('scope')})", ws["mutants"]["score_pct"]))
+    if ws.get("crap"):
+        rows.append((f"Functions with CRAP > {_fmt(ws['crap']['threshold'])}", ws["crap"]["over_threshold"]))
+    layers = snapshot["layers"]
+    rows.append(("Layer edges excepted / forbidden", f"{layers['exceptions']} / {layers['unexcepted']}"))
+    for label, value in rows:
+        lines.append(f"| {label} | {_fmt(value)} |")
+
+    promotable = ws.get("strict_promotable")
+    if promotable:
+        lines += ["", "### Promotable strict lints", ""] + [f"- `{l}`" for l in promotable]
+
+    cycles = [
+        (name, cycle)
+        for name, crate in sorted(snapshot["crates"].items())
+        if crate.get("modules")
+        for cycle in crate["modules"].get("cycles") or []
+    ]
+    if cycles:
+        lines += ["", "### Module cycles", ""]
+        for name, cycle in cycles:
+            lines.append(f"- `{name}`: " + ", ".join(f"`{m}`" for m in cycle))
+
+    hot = snapshot.get("hotspots")
+    if hot and hot.get("files"):
+        lines += [
+            "",
+            f"### Hotspots (top {len(hot['files'])} of {hot['candidates']}, {hot['window_days']}-day window"
+            + ("" if hot.get("findings_included") else "; churn only")
+            + ("" if hot.get("coverage_included") else "; no coverage term")
+            + ")",
+            "",
+            "| File | Churn | Complexity | Strict | Uncovered | Score |",
+            "|---|---|---|---|---|---|",
+        ]
+        for f in hot["files"]:
+            lines.append(
+                f"| `{f['path']}` | {f['churn']} | {f['complexity']} | {f['strict']} | {_fmt(f['uncovered_lines'])} | {_fmt(f['score'])} |"
+            )
+
+    if run["not_measured"]:
+        lines += ["", "### Not measured", ""] + [f"- {k}: {v}" for k, v in sorted(run["not_measured"].items())]
+    return "\n".join(lines) + "\n"
+
+
 # -------------------------------------------------------------------- main
 
 
@@ -771,6 +872,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--duration", action="append", default=[], metavar="STEP=SECONDS")
     ap.add_argument("--started", help="ISO-8601 start time, written to meta.json only")
     ap.add_argument("--no-hotspots", action="store_true", help="skip the git history walk")
+    ap.add_argument(
+        "--summary",
+        action="store_true",
+        help="write summary.md beside the snapshot and append it to $GITHUB_STEP_SUMMARY when set",
+    )
     args = ap.parse_args(argv)
 
     root = args.root.resolve()
@@ -993,6 +1099,17 @@ def main(argv: list[str] | None = None) -> int:
         + "\n",
         encoding="utf-8",
     )
+
+    if args.summary:
+        md = summary_markdown(snapshot)
+        (args.out / "summary.md").write_text(md, encoding="utf-8")
+        target = os.environ.get("GITHUB_STEP_SUMMARY")
+        if target:
+            try:
+                with open(target, "a", encoding="utf-8") as fh:
+                    fh.write(md)
+            except OSError as e:
+                print(f"collect: GITHUB_STEP_SUMMARY not writable ({e}); summary not appended", file=sys.stderr)
 
     failing = [k for k, g in snapshot["gates"].items() if g["result"] == "fail"]
     warning = [k for k, g in snapshot["gates"].items() if g["result"] == "warn"]

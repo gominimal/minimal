@@ -713,6 +713,23 @@ nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the s
     awk '/^  notify:$/{p=1} p' "$wf" | grep -q 'needs:.*metrics' && bad "notify depends on metrics (it must not while non-blocking)" || ok "notify does not depend on metrics"
 }
 
+summary_is_appended_for_a_snapshot() {   # the nightly's glance: summary.md beside the snapshot, appended to the step summary
+    local out="$tmp/summary" step="$tmp/step-summary.md"
+    : > "$step"
+    GITHUB_STEP_SUMMARY="$step" run_collect "$out" "${standard[@]}" --summary >/dev/null 2>&1 || true
+    [ -f "$out/summary.md" ] && ok "summary.md is written beside the snapshot" || { bad "no summary.md"; return; }
+    cmp -s "$out/summary.md" "$step" && ok "the same text is appended to GITHUB_STEP_SUMMARY" || bad "step summary differs from summary.md"
+    grep -q '^Verdict: \*\*' "$out/summary.md" && ok "it carries the verdict" || bad "no verdict line"
+    grep -q '`ceiling:modules.cycles`' "$out/summary.md" && ok "it carries every gate" || bad "gates table incomplete"
+    grep -q '^| Strict lint hits | 4 |' "$out/summary.md" && ok "it carries the workspace totals" || bad "workspace totals missing"
+    grep -q 'graph::builds' "$out/summary.md" && ok "it lists the module cycles" || bad "module cycles missing"
+    grep -q '^- `clippy::mem_forget`' "$out/summary.md" && ok "it lists the promotable lints" || bad "promotable lints missing"
+    run_collect "$tmp/summary2" "${standard[@]}" --summary >/dev/null 2>&1 || true
+    cmp -s "$out/summary.md" "$tmp/summary2/summary.md" && ok "summary.md is byte-stable" || bad "summary.md differs between runs"
+    run_collect "$tmp/nosummary" "${standard[@]}" >/dev/null 2>&1 || true
+    [ ! -f "$tmp/nosummary/summary.md" ] && ok "without --summary nothing is written" || bad "summary.md written without the flag"
+}
+
 clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors clippy.toml
     python3 - "$root" <<'PY'
 import sys, tomllib

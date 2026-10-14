@@ -555,7 +555,12 @@ run_mode="$mode"
 
 rm -f "$out/snapshot.json"
 status=0
-python3 "$here/collect.py" --out "$out" --mode "$run_mode" --metadata "$work/metadata.json" \
+# The grading modes append their report to the step summary; the others
+# append the snapshot's own page (QM-011 covers the report; this is the
+# nightly's glance at the run).
+summary_args=()
+[ "$grading" -eq 1 ] || summary_args=(--summary)
+python3 "$here/collect.py" --out "$out" --mode "$run_mode" --metadata "$work/metadata.json" "${summary_args[@]}" \
     --tools "$work/tools.json" --toolchain "$work/toolchain.json" --started "$started" \
     --excluded "remote-proto=generated OUT_DIR code is invisible to source-level tools" \
     "${collect_args[@]}" || status=$?
