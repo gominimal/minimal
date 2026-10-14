@@ -4508,7 +4508,7 @@ proof_vm_host_row_read_tracks_create_and_destroy() {
 #     for want of one: a lane that cannot ship a switch cannot prove what
 #     this case exists for, so the fetch failing is a failure.
 #   * The system-package half (the daemon serving the same mapping from
-#     /usr/bin/gvproxy-min, the nfpm/AUR dest) runs only on a lane that can
+#     /usr/bin/gvproxy-min, the package dest) runs only on a lane that can
 #     stage that path — writable /usr/bin, never over an existing binary;
 #     the probe ORDER that finds it is pinned by the switch crate's resolver
 #     tests either way.
@@ -4871,8 +4871,8 @@ if (
   done
 
   # The system-package half: the daemon must serve the same mapping when the
-  # only switch binary it can find is /usr/bin/gvproxy-min (the nfpm/AUR
-  # dest), not the one the installer placed in ~/.local/bin. Gated on what
+  # only switch binary it can find is /usr/bin/gvproxy-min (the distro
+  # package dest), not the one the installer placed in ~/.local/bin. Gated on what
   # this lane permits — never over an existing binary — and the subshell's
   # EXIT trap (set above) removes the staged one on every path out of the proof.
   if [ -w /usr/bin ] && [ ! -e /usr/bin/gvproxy-min ]; then

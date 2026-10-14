@@ -1,10 +1,8 @@
 //! Convention-discovered gate that runs every `scripts/*_test.sh` harness.
 //!
-//! The release/publishing scripts this repo grew (semver resolution, the
-//! version assertion, the staged-version lookup, the packaging renderer, the
-//! AUR and Homebrew publishers) are shell, and no frozen workflow schedules
-//! their harnesses. This test is the extension point the repo documents for
-//! exactly that shape (docs/ci-strategy.md §10; the reviewed precedent is
+//! The release and installer scripts this repo grew are shell, and no frozen
+//! workflow schedules their harnesses. This test is the extension point the
+//! repo documents for exactly that shape (docs/ci-strategy.md §10; the reviewed precedent is
 //! `crates/common/tests/shell_lint.rs` driving `scripts/lint-shell.sh`): the
 //! workspace suite runs on any `crates/**` or `scripts/**` change in the
 //! always-on Linux lanes, so a new `*_test.sh` under `scripts/` is picked up

@@ -140,9 +140,8 @@ pub const SWITCH_SLICE_PREFIX: u8 = 27;
 pub const GVPROXY_FILE: &str = "gvproxy-min";
 
 /// System package install path for the switch binary: where the distro
-/// packages place it (`packaging/nfpm.yaml` for deb/rpm/apk,
-/// `packaging/arch/PKGBUILD-bin.tmpl` for the AUR), so a host that installed
-/// minimal through its package manager finds the binary without a user-local
+/// packages of earlier releases placed it, so a host that installed minimal
+/// through its package manager finds the binary without a user-local
 /// install.
 pub const PACKAGE_GVPROXY_BIN: &str = "/usr/bin/gvproxy-min";
 
@@ -960,10 +959,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn package_install_wins_over_the_operator_paths() {
-        // /usr/bin/gvproxy-min is where the system packages put the binary
-        // (packaging/nfpm.yaml, packaging/arch/PKGBUILD-bin.tmpl): a managed
-        // package install outranks an operator-provisioned /usr/lib path, and
-        // is itself outranked by a user-local install.
+        // /usr/bin/gvproxy-min is where the system packages of earlier
+        // releases put the binary: a managed package install outranks an
+        // operator-provisioned /usr/lib path, and is itself outranked by a
+        // user-local install.
         let tmp = tempfile::tempdir().unwrap();
         let package = tmp.path().join("package-gvproxy-min");
         std::fs::write(&package, b"from the package").unwrap();
