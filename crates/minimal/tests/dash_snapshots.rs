@@ -3,9 +3,9 @@
 
 use boxes::{NetworkMode, SessionId};
 use chrono::DateTime;
-use minimal_tui::app::{self, Detail, Model, Msg, SessionKey};
-use minimal_tui::render;
-use minimal_tui::rpc::ProviderData;
+use minimal::dash::app::{self, Detail, Model, Msg, SessionKey};
+use minimal::dash::render;
+use minimal::dash::rpc::ProviderData;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -593,7 +593,7 @@ fn sidebar_shows_bell_indicator() {
     // on both. After focusing the session, its bell is acknowledged and only
     // the header dot remains — check the session row specifically.
     model.cursor = 1;
-    minimal_tui::app::update(
+    minimal::dash::app::update(
         &mut model,
         Msg::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,

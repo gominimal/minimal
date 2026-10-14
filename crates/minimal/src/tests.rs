@@ -281,6 +281,13 @@ fn every_daemon_connection_is_classified() {
             // `host_ip` name hold, and which live session holds a name a
             // re-hold took over; it builds nothing a skew could half-make.
             "cmd/session.rs::session_record_by = ungated",
+            // The dashboard's activation is the same multi-step mutation as
+            // `cmd_session`'s, so it carries the same gate on its own create.
+            // Its two discovery probes stay open on purpose: they list a skewed
+            // VM precisely so an operator still sees its boxes (see `dash::rpc`).
+            "dash/rpc.rs::activate = gated",
+            "dash/rpc.rs::connect_missing = ungated",
+            "dash/rpc.rs::discover = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -297,15 +304,17 @@ fn every_daemon_connection_is_classified() {
 /// whether it asserts the daemon's build.
 ///
 /// The struct field makes omitting the decision a compile error; this
-/// makes answering it "no" a visible one. Both session-creating paths
-/// assert — they are the ones #1251 is about — and the inventory is what
-/// stops a third from quietly passing `None`.
+/// makes answering it "no" a visible one. Every session-creating path
+/// asserts — they are the ones #1251 is about — and the inventory is what
+/// stops another from quietly passing `None`.
 #[test]
 fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
             "cmd/session.rs::activate_session = asserts",
+            // The dashboard's activation: the same create, the same assertion.
+            "dash/rpc.rs::activate = asserts",
             "task.rs::cmd_task_run = asserts",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".

@@ -30,8 +30,8 @@ available providers on the host.
 
 ## Introduction/Overview
 
-`min dash` is a new subcommand on `minimal` backed by a new `minimal-tui`
-sub-crate. It renders a master-detail split: a filterable session list on the
+`min dash` is a new subcommand on `minimal` backed by the new `dash` module.
+It renders a master-detail split: a filterable session list on the
 left (grouped by provider), and a detail pane on the right that stacks the
 Info, Policy, and Preview sections vertically. The Preview section shows a
 read-only snapshot of the session's live terminal output via a new
@@ -73,8 +73,8 @@ on detach.)
 - G4: The user can create, destroy, and rename sessions from within the TUI.
 - G5: The TUI remembers the last-focused session across invocations via a
   small state file, so re-opening `min dash` restores the cursor.
-- G6: The TUI is isolated in a sub-crate so `ratatui`/`crossterm` do not enter
-  the compile path of the lean `minimal` CLI binary.
+- G6: The TUI is a self-contained `dash` module, with `ratatui`/`crossterm`
+  scoped to a dash-only dependency group in `crates/minimal/Cargo.toml`.
 
 ## Non-Goals
 
@@ -99,29 +99,31 @@ on detach.)
 
 ### Crate structure
 
-A new sub-crate `crates/minimal-tui` (library + the TUI logic) is called from
-a new `Dash` subcommand in `minimal`. The `minimal/src/client.rs` SSH client
-(~167 lines) is extracted into a shared `minimal-client` lib so both the CLI
-and the TUI use the same transport without duplicating it.
+The `dash` module at `crates/minimal/src/dash/` holds the TUI, and a new `Dash`
+subcommand calls it. The design extracts the `minimal/src/client.rs` SSH client
+(~167 lines) into a shared `minimal-client` lib so both the CLI and the `dash`
+module use one transport.
 
 ```
 crates/
-  minimal-tui/      ← new: ratatui, crossterm, Elm-style loop
+  minimal/
     src/
-      lib.rs         re-exports
-      app.rs         model, update, view entry points
-      event.rs       crossterm event → Msg
-      rpc.rs         wraps minimal-client for TUI-specific calls
-      render.rs      ratatui widgets
-      filter.rs      fuzzy filter over session list
-      state.rs       dash-state.json load/save
-    Cargo.toml
-  minimal-client/   ← new: extracted from minimal/src/client.rs
+      dash/            ratatui, crossterm, Elm-style loop
+        mod.rs         re-exports
+        app.rs         model, update, view entry points
+        event.rs       crossterm event → Msg
+        rpc.rs         wraps minimal-client for TUI-specific calls
+        render.rs      ratatui widgets
+        filter.rs      fuzzy filter over session list
+        state.rs       dash-state.json load/save
+  minimal-client/      ← new: extracted from minimal/src/client.rs
     src/lib.rs
     Cargo.toml
 ```
 
-Both are added to the workspace `members` list and `workspace.dependencies`.
+The build adds `minimal-client` to the workspace `members` list and
+`workspace.dependencies`. The `dash` module is part of `minimal`, so it needs no
+member entry of its own.
 
 ### Dependencies
 
@@ -130,9 +132,11 @@ check [blessed.rs](https://blessed.rs) first):
 
 - `ratatui` — immediate-mode TUI rendering.
 - `crossterm` — terminal raw mode, event polling, alternate screen.
+- `unicode-width` measures display width for styled-cell truncation.
+- `futures` provides `StreamExt` to drive crossterm's `EventStream`.
 
 `tokio`, `serde`, `serde_json`, `tracing`, `chrono`, `dirs`, `camino`,
-`sessions`, `minimald-rpc`, `paths` are already workspace deps.
+`sessions`, `minimald-rpc`, `paths`, `common` are already workspace deps.
 
 ### Elm-style loop
 
@@ -300,19 +304,17 @@ else uses existing RPCs.
 
 ## Demoable Units of Work
 
-### Unit 1 — Scaffolding: sub-crate and subcommand
+### Unit 1 — Scaffolding: dash module and subcommand
 
-**R1.1** Create `crates/minimal-tui` with `Cargo.toml` (deps: `ratatui`,
-`crossterm`, `tokio`, `tracing`, `sessions`, `minimald-rpc`, `paths`,
-`common`, `chrono`, `serde`, `serde_json`, `dirs`, `camino`). Add to
-workspace `members` and `workspace.dependencies`.
+**R1.1** Create the `dash` module at `crates/minimal/src/dash/` (deps:
+`ratatui`, `crossterm`, `tokio`, `tracing`, `sessions`, `minimald-rpc`, `paths`,
+`common`, `chrono`, `serde`, `serde_json`, `dirs`, `camino`).
 
 **R1.2** Extract `minimal/src/client.rs` into `crates/minimal-client`
-(shared lib). Update `minimal` to depend on `minimal-client`. Both
-`minimal` and `minimal-tui` depend on `minimal-client`.
+(shared lib). Update `minimal` to depend on `minimal-client`.
 
 **R1.3** Add `Dash` subcommand to `minimal`'s `Command` enum. The handler
-calls `minimal_tui::run(global_args)` which enters the TUI event loop and
+calls `minimal::dash::run(global_args)` which enters the TUI event loop and
 returns when the user quits.
 
 **R1.4** Elm-style skeleton: `Model`, `Msg`, `update`, `view`. Crossterm
@@ -528,9 +530,9 @@ particularly important if the attach/detach leader chord (F1, default
 ## Verification
 
 **Proof artifact 1 (Test):**
-`cargo test -p minimal-tui` passes, covering `update` unit tests and `view`
-snapshot tests (insta). The `GetSessionScreen` integration test in
-`minimald` passes: `cargo test -p minimald -- get_session_screen`.
+`just test` passes, covering `update` unit tests and `view` snapshot tests
+(insta). The `GetSessionScreen` integration test in `minimald` passes:
+`just test-one get_session_screen -p minimald`.
 
 **Proof artifact 2 (File):**
 `grep -q 'Command::Dash' crates/minimal/src/lib.rs` — the subcommand exists.
