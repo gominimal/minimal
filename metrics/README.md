@@ -27,6 +27,8 @@ edits: the thresholds and the layer table. The code is under
 | `just metrics static` | The no-compiler subset into `.scratch/metrics/static/`: size, unused dependencies, layers, hotspots by churn. Seconds. |
 | `just metrics-mutants [BASE]` | The static subset plus cargo-mutants over the lines changed since the merge-base with `BASE` (default `origin/main`), into `.scratch/metrics/mutants/`. Linux only. Minutes for a small change. |
 | `just metrics-layers` | The layer check alone, against `cargo metadata`. Part of `just ci`. |
+| `just metrics-diff [BASE]` | Grade this branch against its base: clippy over the crates the branch touched, the static collectors, then the report in `.scratch/metrics/diff/`. Minutes. |
+| `scripts/metrics/run.sh gate` | The same grade without a compiler, in seconds: what the `quality-gate` task runs. |
 
 On macOS the compiling collectors run over the crates that build there, the
 snapshot is marked `darwin`, and the crates left out are listed in `scope`.
@@ -35,6 +37,88 @@ A darwin snapshot is never published.
 Exit codes of `scripts/metrics/run.sh`: `0` the verdict is pass or warn, `2`
 the verdict is fail, `3` a collector could not run and the snapshot is
 incomplete, `1` nothing was written. None of the non-zero ones reads as clean.
+In the grading modes the verdict is the report's, not the snapshot's.
+
+## Grading a change
+
+`scripts/metrics/diff.py` grades a head snapshot against two things the change
+cannot write: `metrics/thresholds.toml` at the merge-base with the base ref,
+and the newest snapshot under `history/` on the history ref
+(`origin/metrics-data`). Each gate is evaluated against the stricter of the
+base's threshold and the head's (floors take the higher value, ceilings and
+ratchet tolerances the lower, and a gate only one side declares is kept), with
+collect.py's own gate evaluation, so a snapshot and a report never disagree on
+what a gate means. With no baseline every ratchet is `not_evaluated` and the
+report says so. When the thresholds file does not exist at the merge-base yet,
+the head's copy is the only one and the report says that too.
+
+### Modes
+
+- `gate`: the no-compiler grade. Layers, size and hotspots run; clippy,
+  coverage and module analysis are recorded as not measured, and so is
+  cargo-shear, because it resolves the full dependency graph through a `cargo
+  metadata` that probes `rustc`. The one cargo call is `cargo metadata
+  --no-deps --offline`. Seconds on a warm checkout with no build directory.
+- `diff`: gate plus clippy over the crates the change touched, scoped the way
+  `scripts/clippy-strict.sh` scopes itself (an explicit `-p` list wins; Rust
+  changes outside `crates/` widen it to the workspace; no Rust changes skip it).
+  `--coverage` adds llvm-cov over the same crates. When the scope is a subset
+  of the workspace, the ratchets over clippy and coverage re-sum the baseline
+  over the same crates, so a partial run is never compared against a
+  whole-workspace total.
+
+Both modes take an optional base ref after the mode (`run.sh diff main`);
+empty or absent means the merge-base with `origin/main`, falling back to the
+local `main`, the rule `scripts/lib/changed-lines.sh` holds for both gates.
+Both end stdout with one line:
+
+```text
+quality-gate: <pass|warn|fail> report=<path to report.json> sha256=<hex>
+```
+
+### The report
+
+`report.md` is for a person or an agent, `report.json` the same content as
+data (`kind: "report"`, `schema_version: 1`), `meta.json` the wall-clock data.
+The two report documents carry no times, so identical inputs give identical
+bytes and the sha256 on the final line identifies what was measured.
+
+| Section | Content |
+|---|---|
+| Header | Head and base commits, the merge-base, the repository, where the thresholds came from, and the baseline's file name, commit and age in commits (or that there is none). |
+| `Verdict` | The worst gate result, in bold. |
+| `Gates` | One row per gate: value, baseline, effective threshold (marked `(base)` when the base's stricter copy set it), result. |
+| `Changed crates` | Every workspace crate with changed Rust lines: strict hits new on changed lines, strict and complexity totals with their delta against the baseline, unused dependencies, layer. |
+| `New strict hits on changed lines` | `path:line [code]` for every strict diagnostic on a line the change added or edited. |
+| `Promotable strict lints` | The strict lints at zero across the workspace, or that a partial scope could not tell. |
+| `Not measured in this mode` | Each collector that did not run, with its reason. |
+| `Scope` | The snapshot's mode and scope, and every changed crate a pinned scope left out (macOS, or an explicit `-p`). |
+
+When `GITHUB_STEP_SUMMARY` names a writable file, `report.md` is appended to
+it; an unwritable path is reported on stderr and does not stop the run.
+
+`report.json` keys: `repo`, `head_sha`, `base_ref`, `base_sha`, `merge_base`,
+`baseline` (`name`, `sha7`, `age_commits`, or null), `pr` (null: the probe
+carries no pull request number), `verdict`, `gates`, `changed_crates`,
+`new_strict_hits`, `promotable`, `not_measured`, `scope`, `scope_uncovered`.
+
+### The quality-gate task
+
+`.minimal/minimal.toml` declares `quality-gate`, which runs `run.sh gate` into
+`.scratch/metrics/quality-gate/`. The review runtime runs it as a probe under a
+300-second budget with no arguments, and cites the sha256 of its output as
+attested evidence; so the task takes no parameters, derives its own base ref,
+compiles nothing and ends with the line above. `agent-verify`, the gate the
+coding runtime runs after a task's tests, ends with the same run, so a
+regression against the base ref fails the coder's own gate in the session that
+caused it.
+
+### Shared with clippy-strict
+
+`scripts/lib/changed-lines.sh` resolves the base ref and writes the changed
+ranges and the untracked Rust files; `scripts/metrics/changed_lines.py` parses
+them. `scripts/clippy-strict.sh` and the grading modes both use them, so the
+two gates agree on which lines are the change's own.
 
 ## The snapshot (schema version 1)
 

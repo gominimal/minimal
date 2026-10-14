@@ -11,13 +11,16 @@
 
 # `<check> && ok ... || bad ...` is the harness idiom: ok/bad never fail, so
 # the else-branch warning (SC2015) and the `$?` style note (SC2181) do not apply.
-# shellcheck disable=SC2015,SC2181
+# The grading cases grep report.md for Markdown, whose backticks are literal
+# text inside single quotes on purpose (SC2016).
+# shellcheck disable=SC2015,SC2016,SC2181
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 data="$here/metrics/testdata"
 collect="$here/metrics/collect.py"
+diff="$here/metrics/diff.py"
 layers="$here/metrics/layers.py"
 schema="$here/metrics/schema.py"
 prune="$here/metrics/prune.py"
@@ -226,6 +229,16 @@ report_is_byte_stable() {   # QM-006
     fi
     grep -q '"started"' "$tmp/stable1/meta.json" && ok "the start time lives in meta.json" || bad "no start time in meta"
     grep -q '"started"' "$tmp/stable1/snapshot.json" && bad "a timestamp leaked into the snapshot" || ok "no timestamp in the snapshot"
+    # The report too: two gradings of the same head give the same bytes.
+    grade "$tmp/report-stable1" >/dev/null 2>&1 || true
+    sleep 1
+    grade "$tmp/report-stable2" >/dev/null 2>&1 || true
+    if cmp -s "$tmp/report-stable1/report.json" "$tmp/report-stable2/report.json" && cmp -s "$tmp/report-stable1/report.md" "$tmp/report-stable2/report.md"; then
+        ok "two gradings of the same head give byte-identical report.json and report.md"
+    else
+        bad "reports differ between runs"
+    fi
+    grep -q '"generated"' "$tmp/report-stable1/meta.json" && ok "the report's time lives in its meta.json" || bad "no time in report meta"
 }
 
 forbidden_edge_is_reported() {   # QM-007
@@ -658,6 +671,349 @@ PY
     [ $? -eq 0 ] && ok "clippy.toml and metrics/thresholds.toml agree on the complexity thresholds" || bad "complexity thresholds disagree"
 }
 
+# ------------------------------------------------------- grading fixtures
+
+# A throwaway repo for the grading cases. `main` holds the base thresholds;
+# the checked-out `feature` branch loosens one gate, tightens another, edits
+# two crates and leaves one file untracked; `metrics-data` carries one baseline
+# snapshot, built with plumbing so the working tree is never touched. The head
+# snapshot comes from collect.py over the standard fixtures, run inside the
+# repo so its git block is the fixture's.
+#
+# Against the fixtures' numbers (coverage 54.29 %, strict total 4, graph
+# coverage 60 %), the base's floor of 60 fails where the head's 50 would pass,
+# and the head's tolerance of 0 fails the strict ratchet where the base's 1
+# would warn: each side is stricter somewhere, so the report proves both
+# directions of QM-009.
+grade_repo="$tmp/grade"
+grade_head="$tmp/grade-head"
+make_grade_repo() {
+    local repo="$grade_repo"
+    mkdir -p "$repo/crates/graph/src" "$repo/crates/decode/src" "$repo/metrics"
+    git -c init.templateDir= init -q -b main "$repo" 2>/dev/null
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
+    seq 1 30 | sed 's/^/fn graph_/; s/$/() {}/' > "$repo/crates/graph/src/lib.rs"
+    seq 1 80 | sed 's/^/fn decode_/; s/$/() {}/' > "$repo/crates/decode/src/lib.rs"
+    cat > "$repo/metrics/thresholds.toml" <<'EOF'
+schema = 1
+[floors]
+"coverage.lines_pct" = 60.0
+[ceilings]
+"clippy.workspace_lints" = 5
+"layers.unexcepted" = 0
+[ratchet]
+"clippy.strict.total" = { direction = "down", tolerance = 1 }
+[crates.graph.floors]
+"coverage.lines_pct" = 70.0
+EOF
+    git -C "$repo" add -A && git -C "$repo" commit -q -m base
+    git -C "$repo" checkout -q -b feature
+    cat > "$repo/metrics/thresholds.toml" <<'EOF'
+schema = 1
+[floors]
+"coverage.lines_pct" = 50.0
+[ceilings]
+"clippy.workspace_lints" = 0
+"layers.unexcepted" = 0
+[ratchet]
+"clippy.strict.total" = { direction = "down", tolerance = 0 }
+"coverage.lines_pct" = { direction = "up", tolerance = 0.25 }
+EOF
+    # graph line 10 carries a fixture unwrap_used hit; decode's hit is on line
+    # 70, which stays untouched, so only graph gains a hit on a changed line.
+    sed -i.bak '10s/.*/fn graph_10_edited() {}/' "$repo/crates/graph/src/lib.rs"
+    sed -i.bak '1s/.*/fn decode_1_edited() {}/' "$repo/crates/decode/src/lib.rs"
+    rm -f "$repo"/crates/*/src/*.bak
+    git -C "$repo" add -A && git -C "$repo" commit -q -m feature
+    echo "fn brand_new() {}" > "$repo/crates/decode/src/new.rs"
+
+    (cd "$repo" && python3 "$collect" --out "$grade_head" --mode full --root "$repo" \
+        --metadata "$data/small-metadata.json" --rules "$data/small-layers.toml" \
+        --thresholds "$repo/metrics/thresholds.toml" --strict-lints "$data/strict-lints.txt" \
+        --no-hotspots "${standard[@]}" >/dev/null 2>&1) || true
+
+    # The baseline: the head snapshot as the base commit saw it, one strict
+    # hit fewer in graph.
+    local base_sha; base_sha="$(git -C "$repo" rev-parse main)"
+    python3 - "$grade_head/snapshot.json" "$tmp/baseline.json" "$base_sha" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+s["git"] = {"sha": sys.argv[3], "sha7": sys.argv[3][:7], "ref": "main", "dirty": False}
+s["workspace"]["clippy"]["strict_total"] = 3
+s["crates"]["graph"]["clippy"]["strict_total"] = 2
+json.dump(s, open(sys.argv[2], "w"), indent=2, sort_keys=True)
+PY
+    local blob sub top commit
+    blob="$(git -C "$repo" hash-object -w "$tmp/baseline.json")"
+    sub="$(printf '100644 blob %s\t2026-10-01-%s.json\n' "$blob" "${base_sha:0:7}" | git -C "$repo" mktree)"
+    top="$(printf '040000 tree %s\thistory\n' "$sub" | git -C "$repo" mktree)"
+    commit="$(git -C "$repo" commit-tree "$top" -m baseline)"
+    git -C "$repo" update-ref refs/heads/metrics-data "$commit"
+
+    # What run.sh hands diff.py: the changed ranges from the shared library,
+    # resolved the way clippy-strict.sh resolves them (no origin here, so the
+    # local main is the fallback).
+    # shellcheck disable=SC1091
+    (cd "$repo" && . "$root/scripts/lib/changed-lines.sh" \
+        && mb="$(changed_lines_base)" && changed_lines_diff "$mb" "$tmp/grade-changed.diff" \
+        && changed_lines_untracked "$tmp/grade-untracked.txt")
+}
+
+# grade <out> [diff.py args...]: diff.py over the grading fixture.
+grade() {
+    local out="$1"; shift
+    [ -d "$grade_repo" ] || make_grade_repo
+    (cd "$grade_repo" && python3 "$diff" --head "$grade_head" --out "$out" --history-ref metrics-data \
+        --changed "$tmp/grade-changed.diff" --untracked "$tmp/grade-untracked.txt" --repo fixture/repo "$@")
+}
+
+# ---------------------------------------------------------- grading cases
+
+base_thresholds_win_when_stricter() {   # QM-009
+    local out="$tmp/stricter" status=0
+    grade "$out" >/dev/null 2>&1 || status=$?
+    [ "$status" -eq 2 ] && ok "a change graded by the base's stricter floor exits 2" || bad "exit $status"
+    local rep="$out/report.json"
+    [ -f "$rep" ] || { bad "no report.json"; return; }
+    [ "$(py "$rep" "s['gates']['floor:coverage.lines_pct']['threshold'], s['gates']['floor:coverage.lines_pct']['threshold_from']")" = "(60.0, 'base')" ] \
+        && ok "the base's stricter floor is the effective threshold" || bad "floor: $(py "$rep" "s['gates']['floor:coverage.lines_pct']")"
+    [ "$(py "$rep" "s['gates']['floor:coverage.lines_pct']['result']")" = "fail" ] \
+        && ok "the head cannot loosen the floor it is graded by" || bad "loosened floor passed"
+    [ "$(py "$rep" "s['gates']['ceiling:clippy.workspace_lints']['threshold'], s['gates']['ceiling:clippy.workspace_lints']['threshold_from']")" = "(0, 'head')" ] \
+        && ok "the head's stricter ceiling wins the other way" || bad "ceiling: $(py "$rep" "s['gates']['ceiling:clippy.workspace_lints']")"
+    [ "$(py "$rep" "s['gates']['ratchet:clippy.strict.total']['tolerance'], s['gates']['ratchet:clippy.strict.total']['result']")" = "(0, 'fail')" ] \
+        && ok "the head's tighter ratchet tolerance wins and fails on one new hit" || bad "ratchet: $(py "$rep" "s['gates']['ratchet:clippy.strict.total']")"
+    [ "$(py "$rep" "s['gates']['floor:crates.graph.coverage.lines_pct']['threshold_from'], s['gates']['floor:crates.graph.coverage.lines_pct']['result']")" = "('base', 'fail')" ] \
+        && ok "a per-crate floor only the base declares is still graded" || bad "base-only crate floor"
+    [ "$(py "$rep" "'ratchet:coverage.lines_pct' in s['gates']")" = "True" ] \
+        && ok "a ratchet only the head declares is graded too" || bad "head-only ratchet missing"
+    grep -q "(base)" "$out/report.md" && ok "the report marks a threshold the base set" || bad "no (base) marker in report.md"
+    # The property: for all B, H, effective(B, H) is at least as strict as each and symmetric in its values.
+    python3 - "$diff" <<'PY'
+import importlib.util, random, sys
+spec = importlib.util.spec_from_file_location("diff", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+random.seed(9)
+names = ["a", "b", "c", "d"]
+def table():
+    return {
+        "floors": {n: random.choice([0.0, 25.0, 50.0, 75.0]) for n in random.sample(names, random.randint(0, 4))},
+        "ceilings": {n: random.randint(0, 5) for n in random.sample(names, random.randint(0, 4))},
+        "ratchet": {n: {"direction": "down", "tolerance": random.choice([0, 0.25, 1, 2])} for n in random.sample(names, random.randint(0, 4))},
+        "crates": {c: {"floors": {n: random.choice([0.0, 40.0, 80.0]) for n in random.sample(names, random.randint(0, 2))}} for c in random.sample(["x", "y"], random.randint(0, 2))},
+    }
+for _ in range(200):
+    b, h = table(), table()
+    e, _src = m.stricter(b, h)
+    e2, _ = m.stricter(h, b)
+    assert e["floors"] == e2["floors"] and e["ceilings"] == e2["ceilings"]
+    assert {k: v["tolerance"] for k, v in e["ratchet"].items()} == {k: v["tolerance"] for k, v in e2["ratchet"].items()}
+    for side in (b, h):
+        for n, v in side["floors"].items():
+            assert e["floors"][n] >= v
+        for n, v in side["ceilings"].items():
+            assert e["ceilings"][n] <= v
+        for n, v in side["ratchet"].items():
+            assert e["ratchet"][n]["tolerance"] <= v["tolerance"]
+        for c, t in side["crates"].items():
+            for n, v in t["floors"].items():
+                assert e["crates"][c]["floors"][n] >= v
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "effective(B, H) is at least as strict as B and as H over two hundred random pairs" || bad "stricter property"
+}
+
+no_baseline_means_not_evaluated() {   # QM-009 failure clause
+    local out="$tmp/nobase" status=0
+    grade "$out" --history-ref no-such-ref >/dev/null 2>&1 || status=$?
+    local rep="$out/report.json"
+    [ -f "$rep" ] || { bad "no report.json without a baseline (exit $status)"; return; }
+    [ "$(py "$rep" "s['baseline']")" = "None" ] && ok "baseline is null" || bad "baseline not null"
+    [ "$(py "$rep" "sorted(set(g['result'] for g in s['gates'].values() if g['kind'] == 'ratchet'))")" = "['not_evaluated']" ] \
+        && ok "every ratchet is not_evaluated" || bad "a ratchet was evaluated without a baseline"
+    grep -q "Every ratchet gate is not evaluated" "$out/report.md" && ok "the report says so" || bad "report.md silent about the missing baseline"
+    grep -q "no-such-ref" "$out/report.md" && ok "the report names the history ref it looked at" || bad "history ref not named"
+}
+
+report_carries_every_section() {   # QM-010
+    local out="$tmp/sections"
+    grade "$out" >/dev/null 2>&1 || true
+    local md="$out/report.md" rep="$out/report.json"
+    [ -f "$md" ] && [ -f "$rep" ] || { bad "report files missing"; return; }
+    local heading missing=""
+    for heading in "### Gates" "### Changed crates" "### New strict hits on changed lines" "### Promotable strict lints" "### Not measured in this mode" "### Scope"; do
+        grep -qF "$heading" "$md" || missing="$missing '$heading'"
+    done
+    [ -z "$missing" ] && ok "every section heading is present" || bad "missing headings:$missing"
+    grep -q '^Verdict: \*\*fail\*\*$' "$md" && ok "the verdict line is bold and matches the gates" || bad "verdict line"
+    local head7 base7
+    head7="$(git -C "$grade_repo" rev-parse --short=7 HEAD)"; base7="$(git -C "$grade_repo" rev-parse --short=7 main)"
+    grep -q "Head \`$head7\` graded against base \`main\` (\`$base7\`" "$md" && ok "head and base commits are named" || bad "head/base commits"
+    grep -q "Baseline: \`2026-10-01-$base7.json\` (\`$base7\`, 1 commit(s) behind head)" "$md" \
+        && ok "the baseline's name and age are named" || bad "baseline name/age: $(grep Baseline "$md")"
+    python3 - "$rep" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+need = ["schema_version", "kind", "repo", "head_sha", "base_sha", "merge_base", "baseline", "pr", "verdict", "gates",
+        "changed_crates", "new_strict_hits", "promotable", "not_measured", "scope_uncovered"]
+missing = [k for k in need if k not in s]
+assert not missing, missing
+assert s["schema_version"] == 1 and s["kind"] == "report" and s["pr"] is None and s["repo"] == "fixture/repo"
+assert s["baseline"]["age_commits"] == 1 and s["baseline"]["name"].endswith(".json")
+for g in s["gates"].values():
+    assert "value" in g and "result" in g and "threshold" in g
+    if g["kind"] == "ratchet":
+        assert "baseline" in g
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "report.json carries every key and every gate row has value, baseline, threshold and result" || bad "report.json keys"
+    [ "$(py "$rep" "[(r['crate'], r['new_strict_hits'], r['strict_total'], r['strict_total_base']) for r in s['changed_crates']]")" = "[('decode', 0, 1, 1), ('graph', 1, 3, 2)]" ] \
+        && ok "changed crates carry new hits and deltas against the baseline" || bad "changed crates: $(py "$rep" "s['changed_crates']")"
+    [ "$(py "$rep" "[(h['path'], h['line'], h['code']) for h in s['new_strict_hits']]")" = "[('crates/graph/src/lib.rs', 10, 'clippy::unwrap_used')]" ] \
+        && ok "only the strict hit on a changed line is new; the untouched one on line 22 is not" || bad "new hits: $(py "$rep" "s['new_strict_hits']")"
+    grep -q '^- `crates/graph/src/lib.rs:10` \[clippy::unwrap_used\]$' "$md" && ok "the hit is listed as path:line [code]" || bad "hit list format"
+    [ "$(py "$rep" "s['promotable']")" = "['clippy::mem_forget']" ] && ok "promotable lints are carried" || bad "promotable"
+    [ "$(py "$rep" "s['not_measured']")" = "{'hotspots': 'disabled'}" ] && ok "collectors that did not run are listed" || bad "not_measured: $(py "$rep" "s['not_measured']")"
+}
+
+step_summary_is_appended() {   # QM-011
+    local summary="$tmp/step-summary.md"
+    printf 'prior content\n' > "$summary"
+    (cd "$grade_repo" && GITHUB_STEP_SUMMARY="$summary" python3 "$diff" --head "$grade_head" --out "$tmp/summary-out" \
+        --history-ref metrics-data --changed "$tmp/grade-changed.diff" --untracked "$tmp/grade-untracked.txt" >/dev/null 2>&1) || true
+    [ "$(head -n1 "$summary")" = "prior content" ] && ok "existing content is kept" || bad "summary overwritten"
+    grep -q '^# Quality report' "$summary" && ok "the Markdown report is appended" || bad "report not appended"
+    cmp -s <(tail -n +2 "$summary") "$tmp/summary-out/report.md" && ok "appended bytes are report.md" || bad "appended content differs from report.md"
+    local status=0
+    (cd "$grade_repo" && GITHUB_STEP_SUMMARY="$tmp/no-such-dir/summary.md" python3 "$diff" --head "$grade_head" --out "$tmp/summary-out2" \
+        --history-ref metrics-data --changed "$tmp/grade-changed.diff" --untracked "$tmp/grade-untracked.txt" >/dev/null 2>&1) || status=$?
+    [ "$status" -eq 2 ] && [ -f "$tmp/summary-out2/report.md" ] && ok "an unwritable summary path does not stop the report" || bad "unwritable summary: exit $status"
+    (cd "$grade_repo" && env -u GITHUB_STEP_SUMMARY python3 "$diff" --head "$grade_head" --out "$tmp/summary-out3" \
+        --history-ref metrics-data --changed "$tmp/grade-changed.diff" --untracked "$tmp/grade-untracked.txt" >/dev/null 2>&1) || true
+    cmp -s "$tmp/summary-out/report.md" "$tmp/summary-out3/report.md" && ok "the summary variable does not change the report" || bad "report differs with the variable set"
+}
+
+# The real tree, not a fixture: `run.sh gate` needs `cargo metadata` over a
+# workspace. A checkout without origin/main or main (a shallow CI clone) gets
+# HEAD as the base, so the case still proves what it is about.
+gate_base_arg() {
+    if git -C "$root" rev-parse -q --verify origin/main >/dev/null 2>&1 || git -C "$root" rev-parse -q --verify main >/dev/null 2>&1; then
+        printf ''
+    else
+        printf 'HEAD'
+    fi
+}
+
+gate_runs_without_rustc() {   # QM-012
+    command -v cargo >/dev/null 2>&1 || { echo "skip - cargo not on PATH; the gate needs cargo metadata"; return; }
+    # rustc and cargo-clippy exit 99 and log every call; cargo itself is real,
+    # so `cargo metadata --no-deps` still reads the manifests.
+    local fake="$tmp/norustc"; mkdir -p "$fake"
+    printf '#!/bin/sh\necho "$0 $*" >> "%s/invoked.log"\nexit 99\n' "$fake" > "$fake/rustc"
+    cp "$fake/rustc" "$fake/cargo-clippy"; chmod +x "$fake/rustc" "$fake/cargo-clippy"
+    local status=0 out
+    out="$(cd "$root" && PATH="$fake:$PATH" bash "$here/metrics/run.sh" gate "$(gate_base_arg)" --out "$tmp/gate-norustc" 2>"$tmp/gate-norustc.err")" || status=$?
+    [ "$status" -eq 0 ] && ok "the gate exits 0 with rustc and cargo-clippy unusable" || bad "gate exit $status: $(tail -n3 "$tmp/gate-norustc.err")"
+    [ ! -s "$fake/invoked.log" ] && ok "neither rustc nor cargo-clippy was invoked" || bad "compiler invoked: $(cat "$fake/invoked.log")"
+    local last; last="$(printf '%s\n' "$out" | tail -n1)"
+    if printf '%s' "$last" | grep -qE '^quality-gate: (pass|warn|fail) report=.+ sha256=[0-9a-f]{64}$'; then
+        ok "stdout ends with the verdict, the report path and its sha256"
+    else
+        bad "last line: $last"; return
+    fi
+    local path digest
+    path="$(printf '%s' "$last" | sed 's/.* report=\(.*\) sha256=.*/\1/')"
+    digest="$(printf '%s' "$last" | sed 's/.* sha256=//')"
+    case "$path" in /*) ;; *) path="$root/$path" ;; esac
+    [ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$path")" = "$digest" ] \
+        && ok "the sha256 is report.json's" || bad "sha256 mismatch"
+    [ "$(py "$tmp/gate-norustc/snapshot.json" "s['run']['mode']")" = "gate" ] && ok "the snapshot records gate mode" || bad "mode"
+    [ "$(py "$tmp/gate-norustc/snapshot.json" "sorted(k for k in s['run']['not_measured'] if k in ('clippy','coverage','deps','modules'))")" = "['clippy', 'coverage', 'deps', 'modules']" ] \
+        && ok "the compiling collectors and cargo-shear are recorded as not measured" || bad "not_measured: $(py "$tmp/gate-norustc/snapshot.json" "s['run']['not_measured']")"
+}
+
+darwin_scope_lists_uncovered_crates_in_report() {   # QM-013: the report side
+    [ -d "$grade_repo" ] || make_grade_repo
+    printf 'graph\n' > "$tmp/scope-graph-only.txt"
+    local head="$tmp/darwin-head"
+    (cd "$grade_repo" && python3 "$collect" --out "$head" --mode darwin --root "$grade_repo" \
+        --metadata "$data/small-metadata.json" --rules "$data/small-layers.toml" \
+        --thresholds "$grade_repo/metrics/thresholds.toml" --strict-lints "$data/strict-lints.txt" \
+        --no-hotspots --scope "$tmp/scope-graph-only.txt" --clippy "$data/clippy.json" --coverage "$data/llvm-cov.json" \
+        --tokei "$data/tokei.json" --modules "$data/modules.jsonl" --shear "$data/shear.json" >/dev/null 2>&1) || true
+    local out="$tmp/darwin-report"
+    (cd "$grade_repo" && python3 "$diff" --head "$head" --out "$out" --history-ref metrics-data \
+        --changed "$tmp/grade-changed.diff" --untracked "$tmp/grade-untracked.txt" >/dev/null 2>&1) || true
+    [ -f "$out/report.json" ] || { bad "no darwin report"; return; }
+    [ "$(py "$out/report.json" "s['scope_uncovered']")" = "['decode']" ] \
+        && ok "the changed crate the pinned scope left out is listed" || bad "scope_uncovered: $(py "$out/report.json" "s['scope_uncovered']")"
+    grep -A3 '^### Scope' "$out/report.md" | grep -q 'scoped to `graph`' && ok "the report names the pinned scope" || bad "scope not named"
+    grep -q '^- `decode`$' "$out/report.md" && ok "the report lists decode under Scope" || bad "decode not listed"
+    [ "$(py "$out/report.json" "[r['new_strict_hits'] for r in s['changed_crates'] if r['crate']=='decode']")" = "[None]" ] \
+        && ok "an uncovered crate's strict hits read as not measured, not zero" || bad "uncovered crate hits"
+    [ "$(py "$out/report.json" "s['promotable']")" = "None" ] && ok "no promotable list from a partial scope" || bad "promotable from partial scope"
+    # The ratchets compare the scope's crates on both sides rather than the
+    # scope's sum against the whole baseline.
+    [ "$(py "$out/report.json" "s['gates']['ratchet:clippy.strict.total']['scoped'], s['gates']['ratchet:clippy.strict.total']['baseline']")" = "(True, 2)" ] \
+        && ok "a scoped ratchet re-sums the baseline over the same crates" || bad "scoped ratchet: $(py "$out/report.json" "s['gates']['ratchet:clippy.strict.total']")"
+}
+
+gate_fits_probe_budget() {   # QM-N01
+    command -v cargo >/dev/null 2>&1 || { echo "skip - cargo not on PATH; the gate needs cargo metadata"; return; }
+    local status=0 start elapsed
+    start="$(date +%s)"
+    (cd "$root" && bash "$here/metrics/run.sh" gate "$(gate_base_arg)" --out "$tmp/gate-budget" > "$tmp/gate-budget.out" 2>&1) || status=$?
+    elapsed=$(( $(date +%s) - start ))
+    [ "$elapsed" -lt 300 ] && ok "the gate over the real tree took ${elapsed}s, inside the 300 s probe budget" || bad "gate took ${elapsed}s"
+    [ "$status" -ne 1 ] && ok "the gate wrote its report (exit $status)" || bad "gate crashed: $(tail -n3 "$tmp/gate-budget.out")"
+    tail -n1 "$tmp/gate-budget.out" | grep -q '^quality-gate: ' && ok "the evidence line is last on stdout" || bad "no evidence line"
+}
+
+clippy_strict_unchanged() {   # the refactor onto changed-lines.sh keeps the gate's contract
+    local repo="$tmp/strict"; mkdir -p "$repo/crates/graph/src"
+    git -c init.templateDir= init -q -b main "$repo" 2>/dev/null
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
+    seq 1 30 | sed 's/^/fn graph_/; s/$/() {}/' > "$repo/crates/graph/src/lib.rs"
+    git -C "$repo" add -A && git -C "$repo" commit -q -m base
+    git -C "$repo" checkout -q -b feature
+    sed -i.bak '10s/.*/fn graph_10_edited() {}/' "$repo/crates/graph/src/lib.rs"; rm -f "$repo/crates/graph/src/lib.rs.bak"
+    git -C "$repo" add -A && git -C "$repo" commit -q -m feature
+    # A cargo that answers `cargo clippy` with a canned diagnostic stream.
+    local fake="$tmp/strict-bin"; mkdir -p "$fake"
+    cat > "$fake/cargo" <<'EOF'
+#!/bin/sh
+case "$1" in clippy) cat "$CANNED"; exit 0 ;; esac
+echo "fake cargo: unexpected $*" >&2; exit 9
+EOF
+    chmod +x "$fake/cargo"
+    canned() {   # canned <file> <line>
+        python3 - "$1" "$2" <<'PY'
+import json, sys
+msg = {"reason": "compiler-message", "message": {"level": "warning", "code": {"code": "clippy::unwrap_used"}, "message": "used `unwrap()` on a `Result`",
+       "spans": [{"file_name": "crates/graph/src/lib.rs", "line_start": int(sys.argv[2]), "is_primary": True}]}}
+open(sys.argv[1], "w").write(json.dumps(msg) + "\n" + json.dumps({"reason": "build-finished", "success": True}) + "\n")
+PY
+    }
+    local status=0 out
+    canned "$tmp/canned-hit.json" 10
+    out="$(cd "$repo" && CANNED="$tmp/canned-hit.json" PATH="$fake:$PATH" bash "$root/scripts/clippy-strict.sh" 2>"$tmp/strict-hit.err")" || status=$?
+    [ "$status" -eq 2 ] && ok "a strict hit on a changed line exits 2" || bad "hit exit $status: $(cat "$tmp/strict-hit.err")"
+    printf '%s\n' "$out" | grep -q '^crates/graph/src/lib.rs:10: used `unwrap()` on a `Result` \[clippy::unwrap_used\]$' \
+        && ok "the hit is printed as path:line: message [code]" || bad "hit output: $out"
+    grep -q 'diagnostic(s) on the lines your branch changed' "$tmp/strict-hit.err" && ok "the guidance follows on stderr" || bad "no guidance"
+    grep -q '^clippy-strict: scope -p graph$' "$tmp/strict-hit.err" && ok "the scope is derived from the changed crate" || bad "scope: $(grep scope "$tmp/strict-hit.err")"
+    status=0
+    canned "$tmp/canned-clean.json" 22
+    out="$(cd "$repo" && CANNED="$tmp/canned-clean.json" PATH="$fake:$PATH" bash "$root/scripts/clippy-strict.sh" 2>/dev/null)" || status=$?
+    [ "$status" -eq 0 ] && [ "$out" = "clippy-strict: clean" ] && ok "a hit on an unchanged line is clean, exit 0" || bad "clean: exit $status, '$out'"
+    status=0
+    out="$(cd "$repo" && CANNED="$tmp/canned-hit.json" PATH="$fake:$PATH" bash "$root/scripts/clippy-strict.sh" HEAD 2>/dev/null)" || status=$?
+    [ "$status" -eq 0 ] && printf '%s' "$out" | grep -q '^clippy-strict: no Rust changes since ' && ok "no changes since BASE exits 0 before cargo runs" || bad "no-change: exit $status, '$out'"
+    # The pinned-scope message names what the scope leaves out, as before.
+    status=0
+    (cd "$repo" && CANNED="$tmp/canned-clean.json" PATH="$fake:$PATH" bash "$root/scripts/clippy-strict.sh" "" -p other >/dev/null 2>"$tmp/strict-pinned.err") || status=$?
+    grep -q 'changed crates not covered here: graph' "$tmp/strict-pinned.err" && ok "a pinned scope says which changed crate it leaves out" || bad "pinned: $(cat "$tmp/strict-pinned.err")"
+}
+
 # -------------------------------------------------------------------- run
 
 # The hotspot cases share a tiny layers file.
@@ -691,6 +1047,14 @@ all_cases=(
     untracked_file_is_listed
     crap_counts_over_threshold
     clippy_thresholds_agree
+    base_thresholds_win_when_stricter
+    no_baseline_means_not_evaluated
+    report_carries_every_section
+    step_summary_is_appended
+    gate_runs_without_rustc
+    darwin_scope_lists_uncovered_crates_in_report
+    gate_fits_probe_budget
+    clippy_strict_unchanged
 )
 cases=("${all_cases[@]}")
 [ "$#" -gt 0 ] && cases=("$@")
