@@ -4604,12 +4604,17 @@ pub fn install_clause(unfinished: bool) -> &'static str {
 }
 
 /// The one host line a session start prints (NET-018), naming the box:
-/// `names: <box>.min.internal resolves in any browser on this machine`
-/// where native DNS is deployed, `names: <box>.min.internal via
-/// 127.0.0.1:<port>` where it is not, and — independently — the clause
-/// `; finish setup: min finalize-install` while any finalize-install item
-/// is not done. One line, never a block, so the activation's own output
-/// stays what the operator reads. Pure, so tests assert the words without
+/// `names: <box>.min.internal resolves on this machine; open it through
+/// the HTTP proxy at 127.0.0.1:<port>` where native DNS is deployed, and
+/// `names: <box>.min.internal opens through the HTTP proxy at
+/// 127.0.0.1:<port>` where it is not. The native form promises resolution
+/// only: the name answers with a reserved local address, which is not a
+/// connection a browser is promised, so the line names the proxy — which
+/// keeps serving beside native DNS (NET-019) — as the path that opens the
+/// box. Independently, the line carries the clause `; finish setup: min
+/// finalize-install` while any finalize-install item is not done. One
+/// line, never a block, so the activation's own output stays what the
+/// operator reads. Pure, so tests assert the words without
 /// capturing stderr. [`host_line_beside`] is the same line with a
 /// proxy-down cause (NET-020) in place of the resolution half.
 #[must_use]
@@ -4646,9 +4651,13 @@ pub fn host_line_beside(
     // who most needs to know which name the cause is about.
     let names = match (proxy_cause, surface) {
         (Some(cause), _) => format!("{name}: the hostname proxy is not serving: {cause}"),
-        (None, LiveSurface::Native) => {
-            format!("{name} resolves in any browser on this machine")
-        }
+        (None, LiveSurface::Native) => match proxy_port {
+            Some(port) => format!(
+                "{name} resolves on this machine; open it through the HTTP proxy at \
+                 127.0.0.1:{port}"
+            ),
+            None => format!("{name} resolves on this machine"),
+        },
         (None, LiveSurface::Proxy) => match proxy_port {
             Some(port) => format!("{name} opens through the HTTP proxy at 127.0.0.1:{port}"),
             None => format!("{name}: the hostname proxy is not serving"),
@@ -5484,8 +5493,8 @@ mod tests {
 
     /// NET-018: the start prints one host line naming the box. Its name
     /// half is keyed on the host-DNS state — native DNS deployed, the name
-    /// resolves in any browser; not deployed, it routes via the proxy's
-    /// port — and, independently, the line carries `; finish setup: min
+    /// resolves on this machine and opens through the proxy; not deployed,
+    /// it routes via the proxy's port — and, independently, the line carries `; finish setup: min
     /// finalize-install` while any finalize-install item is not done. A
     /// proxy-down cause (NET-020) replaces the resolution half in both
     /// forms, with the clause as it was.
@@ -5516,8 +5525,8 @@ mod tests {
         let names_done = host_line("web", &LiveSurface::Native, Some(7654), others_open);
         assert_eq!(
             names_done,
-            "names: web.min.internal resolves in any browser on this machine; finish setup: \
-             min finalize-install"
+            "names: web.min.internal resolves on this machine; open it through the HTTP proxy \
+             at 127.0.0.1:7654; finish setup: min finalize-install"
         );
         let finished = host_line(
             "web",
@@ -5527,7 +5536,8 @@ mod tests {
         );
         assert_eq!(
             finished,
-            "names: web.min.internal resolves in any browser on this machine"
+            "names: web.min.internal resolves on this machine; open it through the HTTP proxy \
+             at 127.0.0.1:7654"
         );
         // NET-020: a proxy-down cause replaces the resolution half, and the
         // rest of the line is unchanged.
@@ -5635,9 +5645,10 @@ mod tests {
     }
 
     /// NET-142: the resolution clause is keyed on the host-DNS state alone.
-    /// Native DNS deployed, the box name resolves in any browser on this
-    /// machine, whatever else is open; not deployed, the name routes via the
-    /// proxy's port, and the native words never print.
+    /// Native DNS deployed, the box name resolves on this machine and opens
+    /// through the proxy, whatever else is open — never a promise that any
+    /// browser connects to the name itself; not deployed, the name routes
+    /// via the proxy's port, and the native words never print.
     #[test]
     fn activate_host_line_names_native_dns_when_deployed() {
         for host in [
@@ -5648,13 +5659,20 @@ mod tests {
         ] {
             let native = host_line("api", &LiveSurface::Native, Some(7654), host);
             assert!(
-                native
-                    .starts_with("names: api.min.internal resolves in any browser on this machine"),
+                native.starts_with(
+                    "names: api.min.internal resolves on this machine; open it through the \
+                     HTTP proxy at 127.0.0.1:7654"
+                ),
                 "{native}"
             );
-            assert!(
-                !native.contains("opens through the HTTP proxy at"),
-                "{native}"
+            assert!(!native.contains("any browser"), "{native}");
+            assert_eq!(
+                host_line("api", &LiveSurface::Native, None, host),
+                format!(
+                    "names: api.min.internal resolves on this machine{}",
+                    install_clause(host.other_items_unfinished)
+                ),
+                "with no proxy port the native line claims resolution only"
             );
             let proxy = host_line("api", &LiveSurface::Proxy, Some(7654), host);
             assert!(
@@ -5663,7 +5681,7 @@ mod tests {
                 ),
                 "{proxy}"
             );
-            assert!(!proxy.contains("resolves in any browser"), "{proxy}");
+            assert!(!proxy.contains("resolves on this machine"), "{proxy}");
         }
     }
 

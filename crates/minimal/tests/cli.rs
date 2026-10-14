@@ -3705,7 +3705,7 @@ async fn activate_and_ls_report_native_surface() {
         "a default start prints exactly one host line, got: {activate_stderr}"
     );
     assert!(
-        !activate_stderr.contains("resolves in any browser"),
+        !activate_stderr.contains("resolves on this machine"),
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
@@ -3766,7 +3766,11 @@ async fn activate_and_ls_report_native_surface() {
         resolver::HostInstall::default(),
     );
     assert_eq!(
-        finished, "names: native-surface.min.internal resolves in any browser on this machine",
+        finished,
+        format!(
+            "names: native-surface.min.internal resolves on this machine; open it through the \
+             HTTP proxy at 127.0.0.1:{port}"
+        ),
         "a finished host's start line carries no clause"
     );
 }
