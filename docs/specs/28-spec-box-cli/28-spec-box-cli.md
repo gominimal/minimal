@@ -3,8 +3,8 @@ id: BCLI
 title: The box grammar — `min box`, the type nouns, and the migration from the session verbs
 owner: mitodrummer
 epic: gominimal/inbox#731
-arch: https://github.com/gominimal/arch/blob/823f45faf5a48349611f35d8e93e2d4695a61d4e/architecture.md
-arch_sha: "823f45faf5a48349611f35d8e93e2d4695a61d4e"
+arch: https://github.com/gominimal/arch/blob/4d554e41e6e13ec55d3dc64d9282b883601f5818/architecture.md
+arch_sha: "4d554e41e6e13ec55d3dc64d9282b883601f5818"
 updated: 2026-10-07
 ---
 
@@ -84,10 +84,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal resume_non_pty_box_exit2_names_run
 
-- **BCLI-010** WHEN `min task run <task> [-- <args>…]` runs without `--detach` THE SYSTEM SHALL create a box of type `task` from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
-  <!-- was BOX-032 -->
+- **BCLI-010** WHEN `min task run <task> [-- <args>…]` or `min box run <entry> [-- <args>…]` runs without `--detach` THE SYSTEM SHALL create a box from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
+  <!-- was BOX-032; widened to `min box run`, type-neutral; the `pty_enabled` case waits on gominimal/arch#127 (Open questions) -->
   tier:     T0
-  verify:   cargo nextest run -p minimal task_run_wires_stdio_and_propagates_exit
+  verify:   cargo nextest run -p minimal run_entry_wires_stdio_and_exit_code
   - WHERE `--detach` is given to `min task run` THE SYSTEM SHALL print only the `box_id` to stdout, close the task's stdin at creation, leave its output to be captured as BOX-155 defines, and return.
     tier:   T0
     verify: cargo nextest run -p minimal task_run_detach_prints_id_closes_stdin
@@ -184,6 +184,11 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- was BOX-082 -->
   tier:     T0
   verify:   cargo nextest run -p minimal network_flags_override_stored_spec_and_projection
+
+- **BCLI-073** WHEN `min session start` or `min box start` runs with one or more `--loadout <l>` THE SYSTEM SHALL pass the loadouts it names to BOX-064's selected-loadouts layer for the box it creates, within what the box's spec's `loadout_mode` permits.
+  <!-- event-driven; the architecture's `session start` and `box start` carry `--loadout <l>…` (gominimal/arch#124), a per-invocation Loadout Entry -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal start_loadout_flag_selects_loadouts_layer
 
 - **BCLI-025** WHEN `min box show <box> --network` runs THE SYSTEM SHALL render the effective `[network]` section from the stored spec.
   <!-- was BOX-083 -->
@@ -323,6 +328,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - **BCLI-068** WHEN `min box attach <box>` runs without `--exec` against a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach the caller's terminal to the box's PTY.
   tier:     T0
   verify:   cargo nextest run -p minimal box_attach_reattaches_pty_box
+  - IF `min box attach` runs without a client TTY THEN THE SYSTEM SHALL fail with exit 2.
+    <!-- unwanted; the architecture's `min box attach` paragraph and design principle 3 -->
+    tier:   T0
+    verify: cargo nextest run -p minimal box_attach_without_tty_exit2
   - IF `min box attach <box>` runs without `--exec` against a running box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box>`; against a stopped or exited box without `pty_enabled`, BCLI-009's restart refusal naming `min task run` applies instead, and `min session attach` (BCLI-032) inherits the same split.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_running_non_pty_box_exit2_names_logs
@@ -374,7 +383,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_cp_reads_stopped_box_as_box_017
 
-- **BCLI-042** THE SYSTEM SHALL accept, as hidden aliases for one release that print one stderr hint naming the replacement and leave `-o json` output unchanged, `session activate` as `session start` (bare `session activate` as bare `session start`, BCLI-071; a path mapping to the entry, `--name` to the box name, and `--network` and `--ingress` to BCLI-024's overrides), `session destroy` as `box rm --force`, `session exec` as `box exec`, `session rename` as `box rename`, bare `session attach` as `session attach <box>` for the box BCLI-032 resolves, `session policy` as `box show --network`, `session hooks` as `box show`, `task run --keep` as `task run` with `--keep` ignored, and bare `stop` as `host stop` on the local host.
+- **BCLI-042** THE SYSTEM SHALL accept, as hidden aliases for one release that print one stderr hint naming the replacement and leave `-o json` output unchanged, `session activate` as `session start` (bare `session activate` as bare `session start`, BCLI-071; a path mapping to the entry, `--name` to the box name, `--network` and `--ingress` to BCLI-024's overrides, and `--loadout` to BCLI-073's layer), `session destroy` as `box rm --force`, `session exec` as `box exec` (one command argument runs as the box's shell `-c '<argument>'`, as today, with the hint naming `min box exec <box> -- sh -c '…'`), `session rename` as `box rename`, bare `session attach` as `session attach <box>` for the box BCLI-032 resolves, `session policy` as `box show --network`, `session hooks` as `box show`, `task run --keep` as `task run` with `--keep` ignored, and bare `stop` as `host stop` on the local host.
   <!-- was BOX-107; the mapping follows epic S12. `session destroy` maps to the forced reap (BOX-019) so a live box is still stopped and removed and BEP-043's revoke-on-destroy fires; a bare `session rm` of a running box is refused (BCLI-004). -->
   tier:     T0
   verify:   cargo nextest run -p minimal legacy_session_verbs_alias_with_hint
