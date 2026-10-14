@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# check-answerer-links_test.sh — test harness for
-# scripts/check-answerer-links.sh.
+# check-zoned-links_test.sh — test harness for
+# scripts/check-zoned-links.sh.
 #
 # Two halves:
 #
@@ -37,8 +37,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-script="$here/check-answerer-links.sh"
-[ -f "$script" ] || { echo "cannot find check-answerer-links.sh next to test" >&2; exit 1; }
+script="$here/check-zoned-links.sh"
+[ -f "$script" ] || { echo "cannot find check-zoned-links.sh next to test" >&2; exit 1; }
 
 pass=0 fail=0 skip=0
 # ok / bad / skip <description> — count and print one case.
@@ -68,7 +68,7 @@ expect() {
 build() {
     local out="$1"; shift
     if ! "$@" -o "$out"; then
-        printf 'check-answerer-links_test: cannot build fixture %s with: %s\n' "$out" "$*" >&2
+        printf 'check-zoned-links_test: cannot build fixture %s with: %s\n' "$out" "$*" >&2
         exit 1
     fi
 }

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::anyhow;
 use graph::{BuildSpecRef, Transitives};
 use lcache::{CacheErr, EntryMeta, MetaInner, PendingDir};
+use rcache::RemoteCache;
 
 use crate::{Error, Options, Runnable, SpecBuild};
 
@@ -29,6 +30,10 @@ pub struct PatchedBuild<'a, SF: crate::SourceFetcher> {
     pub stdout_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
     /// Optional async writer that receives a copy of the sandbox's stderr stream.
     pub stderr_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
+
+    /// The remote cache to consult before reporting a dependency missing.
+    /// When `None`, dependency resolution stays purely local.
+    pub remote_cache: Option<&'a RemoteCache<common::fetchers::AnyBackend>>,
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
@@ -47,6 +52,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             .collect();
 
         let mut missing = Vec::new();
+        let mut unfetched = Vec::new();
         for bsr in build_deps.iter() {
             let dep_build = opts.graph.get(bsr).unwrap();
             let cache_dir = match opts.cache.unsafe_get_build_by_name(&dep_build.name) {
@@ -57,8 +63,54 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
                         Ok(entry) => entry,
                         Err(by_hash) => {
                             warn_unless_not_found(&dep_build.name, "by spec hash", &by_hash);
-                            missing.push(dep_build.name.clone());
-                            continue;
+                            // A patched build exists to pick up locally-modified
+                            // dependencies, so a local build (by name, then by
+                            // spec hash) always wins. Only a dependency absent
+                            // in both local caches falls through to the remote
+                            // cache; a dependency absent everywhere is reported.
+                            match self.remote_cache {
+                                Some(remote_cache) => {
+                                    let spec_hash = opts.graph.spec_hash(bsr);
+                                    let (fetch_time, pending_dir) = match remote_cache
+                                        .materialize(&spec_hash, &opts.cache, &dep_build.name)
+                                        .await
+                                    {
+                                        Ok(fetched) => fetched,
+                                        Err(rcache::Error::NotFound) => {
+                                            // A plain miss: the dependency is
+                                            // reported in the final error.
+                                            missing.push(dep_build.name.clone());
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            // A real failure (fetch, hash mismatch,
+                                            // IO) is not an absence; report it as a
+                                            // fetch failure, not as "could not find".
+                                            tracing::warn!(
+                                                dep = %dep_build.name,
+                                                error = %e,
+                                                "patched-build remote-cache lookup failed"
+                                            );
+                                            unfetched.push(format!("{} ({e})", dep_build.name));
+                                            continue;
+                                        }
+                                    };
+                                    pending_dir
+                                        .finalize(EntryMeta {
+                                            inner: MetaInner::Spec(dep_build.name.clone()),
+                                            fetched: true,
+                                            fetch_ms: Some(fetch_time.as_millis() as usize),
+                                            origin: Some(dep_build.from.as_ref().clone()),
+                                            ..Default::default()
+                                        })
+                                        .map_err(Error::Cache)?;
+                                    opts.cache.read_dir(&spec_hash).map_err(Error::Cache)?
+                                }
+                                None => {
+                                    missing.push(dep_build.name.clone());
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -66,10 +118,23 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             dependencies.insert(cache_dir.path().to_path_buf());
         }
 
+        let mut problems = Vec::new();
         if !missing.is_empty() {
-            return Err(Error::Other(anyhow!(
-                "patched-build needs local builds of: {}; build them first",
+            problems.push(format!(
+                "could not find builds of: {}, locally or in the remote cache",
                 missing.join(", ")
+            ));
+        }
+        if !unfetched.is_empty() {
+            problems.push(format!(
+                "could not fetch from the remote cache: {}",
+                unfetched.join(", ")
+            ));
+        }
+        if !problems.is_empty() {
+            return Err(Error::Other(anyhow!(
+                "patched-build {}",
+                problems.join("; ")
             )));
         }
 
@@ -111,10 +176,12 @@ fn warn_unless_not_found(name: &str, lookup: &str, err: &CacheErr) {
 mod tests {
     use super::*;
     use crate::SourceFetcher;
+    use common::{SpecHash, archive};
     use decode::Layer;
     use graph::Graph;
     use indoc::indoc;
     use lcache::{Cache, LocalDir};
+    use rcache::{INDEX_FILENAME, IndexFile, IndexSource, RemoteCache};
     use tempfile::TempDir;
 
     /// A [`SourceFetcher`] that must never be called: the paths exercised here
@@ -158,6 +225,7 @@ mod tests {
             remote_fetcher: fetcher,
             stdout_writer: None,
             stderr_writer: None,
+            remote_cache: None,
         }
     }
 
@@ -174,6 +242,276 @@ mod tests {
                 ..Default::default()
             })
             .expect("finalize cache entry");
+    }
+
+    /// Serializes a one-file payload as a compressed artifact and returns the
+    /// index wire bytes mapping every one of `spec_hashes ->` it, plus the
+    /// artifact's sha256 and bytes.
+    fn remote_artifact(spec_hashes: &[SpecHash]) -> (Vec<u8>, [u8; 32], Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("remote.txt"), b"from remote cache").unwrap();
+        let (mut f, sha256) = archive::compress_dir(dir.path(), None, &None).unwrap();
+        let mut artifact = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut artifact).unwrap();
+
+        let mut index = IndexFile::default();
+        index.extend(spec_hashes.iter().map(|h| (h.clone(), sha256)));
+        let mut index_bytes = Vec::new();
+        index.write_to(&mut index_bytes).unwrap();
+
+        (index_bytes, sha256, artifact)
+    }
+
+    /// A throwaway HTTP/1.1 server resolving `GET /<path>` against `objects`;
+    /// every other path 404s. Returns a base URL ending in `/`, so
+    /// [`RemoteCache::new_any_https`] joins object names against it correctly.
+    fn serve_objects(objects: Vec<(String, Vec<u8>)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let hit = objects
+                    .iter()
+                    .find(|(path, _)| req.starts_with(&format!("GET /{path} ")));
+                let (status, body): (&str, &[u8]) = match hit {
+                    Some((_, bytes)) => ("200 OK", bytes),
+                    None => ("404 Not Found", b""),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Builds a [`RemoteCache`] over a local server that serves an artifact
+    /// for each of `spec_hashes` and nothing else.
+    async fn remote_cache_for(
+        spec_hashes: &[SpecHash],
+    ) -> RemoteCache<common::fetchers::AnyBackend> {
+        let (index_bytes, sha256, artifact) = remote_artifact(spec_hashes);
+        let objects = vec![
+            (INDEX_FILENAME.to_string(), index_bytes),
+            (format!("{}.zst", hex::encode(sha256)), artifact),
+        ];
+        let base = serve_objects(objects);
+        RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .expect("build remote cache over local server")
+            .with_fetch_retries(0)
+    }
+
+    /// A dependency with no local build but a remote-cache entry is resolved
+    /// from the remote cache and not reported missing.
+    #[tokio::test]
+    async fn resolves_dependency_from_remote_cache_on_local_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        // dep-a resolves by name; dep-b is absent locally but lives in the
+        // remote cache; dep-c is absent everywhere.
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+
+        let bsr = *dg.by_name("top").unwrap();
+        let dep_b_bsr = dg.by_name("dep-b").unwrap();
+        let dep_b_hash = dg.spec_hash(dep_b_bsr);
+        let remote_cache = remote_cache_for(std::slice::from_ref(&dep_b_hash)).await;
+
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = pb.run(&opts).await.err().expect("dep-c is missing");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dep-c") && !msg.contains("dep-b"),
+            "only dep-c should be reported missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("locally or in the remote cache"),
+            "the error must say how to recover, got: {msg}"
+        );
+
+        // dep-b was materialized from the remote cache and finalized into the
+        // local cache as a fetched entry.
+        let entry = cache
+            .read_dir(&dep_b_hash)
+            .expect("dep-b is in the local cache");
+        assert!(entry.path().join("remote.txt").exists());
+        let meta = cache.read_meta(&dep_b_hash).expect("dep-b meta");
+        assert!(meta.fetched, "dep-b must be recorded as fetched");
+    }
+
+    /// A local build, by name or by spec hash, wins over a remote-cache entry
+    /// for the same dependency: the remote cache is never consulted.
+    #[tokio::test]
+    async fn local_build_wins_over_remote_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        // dep-a and dep-c resolve by name; dep-b only by spec hash.
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-b", "some-other-name");
+        fake_build(&cache, &dg, "dep-c", "dep-c");
+
+        let hashes: Vec<SpecHash> = ["dep-a", "dep-b", "dep-c"]
+            .iter()
+            .map(|n| dg.spec_hash(dg.by_name(n).unwrap()))
+            .collect();
+        // The remote cache serves all three dependencies too.
+        let remote_cache = remote_cache_for(&hashes).await;
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        pb.run(&opts).await.expect("all dependencies are local");
+
+        for hash in &hashes {
+            let meta = cache.read_meta(hash).expect("local meta");
+            assert!(
+                !meta.fetched,
+                "a local build must not be replaced by a fetch"
+            );
+            let entry = cache.read_dir(hash).expect("local entry");
+            assert!(entry.path().join("marker").exists());
+            assert!(!entry.path().join("remote.txt").exists());
+        }
+    }
+
+    /// A dependency the remote index lists but whose artifact cannot be
+    /// fetched is reported as a fetch failure, not as absent.
+    #[tokio::test]
+    async fn reports_remote_fetch_failure_distinctly_from_a_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-c", "dep-c");
+
+        // The index lists dep-b, but its artifact 404s.
+        let dep_b_hash = dg.spec_hash(dg.by_name("dep-b").unwrap());
+        let (index_bytes, _, _) = remote_artifact(std::slice::from_ref(&dep_b_hash));
+        let base = serve_objects(vec![(INDEX_FILENAME.to_string(), index_bytes)]);
+        let remote_cache = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .expect("build remote cache over local server")
+            .with_fetch_retries(0);
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = pb.run(&opts).await.err().expect("dep-b cannot be fetched");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not fetch from the remote cache: dep-b"),
+            "dep-b must be reported as a fetch failure, got: {msg}"
+        );
+        assert!(
+            !msg.contains("could not find"),
+            "a fetch failure must not be reported as an absence, got: {msg}"
+        );
+    }
+
+    /// A remote cache with no entry for a locally-missing dependency still
+    /// reports it missing.
+    #[tokio::test]
+    async fn reports_missing_when_remote_cache_lacks_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+
+        let bsr = *dg.by_name("top").unwrap();
+        // Serve an index for an unrelated hash, so the remote cache has no
+        // entry for dep-b or dep-c.
+        let remote_cache = remote_cache_for(&[SpecHash::from_bytes([0xEE; 32])]).await;
+
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = pb
+            .run(&opts)
+            .await
+            .err()
+            .expect("dep-b and dep-c are missing");
+        let msg = format!("{err}");
+        for missing in ["dep-b", "dep-c"] {
+            assert!(
+                msg.contains(missing),
+                "the error must name every missing dependency ({missing}), got: {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("dep-a"),
+            "dep-a is cached by name and must not be reported missing, got: {msg}"
+        );
     }
 
     /// A top-level pure collection with three runtime dependencies, so
@@ -272,7 +610,7 @@ mod tests {
             "dep-a is cached by name and must not be reported missing, got: {msg}"
         );
         assert!(
-            msg.contains("build them first"),
+            msg.contains("locally or in the remote cache"),
             "the error must say how to recover, got: {msg}"
         );
     }

@@ -7,3 +7,7 @@ self-hosted-runner:
     # GitHub-hosted arm64 image used by the release lane; newer than
     # actionlint 1.7.12's bundled label set.
     - ubuntu-26.04-arm
+    # Custom label on the self-hosted Mac that holds the Developer ID signing
+    # keychain; release.yml routes its signing jobs there
+    # (docs/internal/macos-runner-setup.md).
+    - minimal-signing

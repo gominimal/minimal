@@ -100,7 +100,9 @@ const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["MINIMAL_", "MINIMALD_", "MINVMD
 
 /// Returns true when the named env var's value may be captured verbatim.
 /// A sensitive-shaped name always loses to the allowlist — `MINIMALD_TOKEN`
-/// matches the project prefix but must never leave the machine.
+/// matches the project prefix but must never leave the machine — and so does
+/// a telemetry exporter setting, through the deny list the CLI shares
+/// ([`diagnostics::redact::is_env_value_denylisted`]).
 fn is_env_value_allowlisted(name: &str) -> bool {
     diagnostics::redact::is_env_value_allowlisted(
         name,
@@ -154,7 +156,7 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     let (tx, mut rx) = tokio::io::duplex(PIPE_BUF);
     let build = {
         let s = s.clone();
-        tokio::task::spawn(async move { build_bundle(&s, &req, tx).await })
+        crate::traced::spawn(async move { Box::pin(build_bundle(&s, &req, tx)).await })
     };
 
     let mut writer = c.make_writer();
@@ -276,6 +278,18 @@ async fn build_bundle(
 
     collect_step!(w, "meta", meta(&mut w, s));
     collect_step!(w, "logs", logs(&mut w, &state_dir, log_tail_cap(req)));
+    // The local telemetry spool beside the logs (`min bug` carries the
+    // spool), tail-capped like them and scrubbed for TEL-044.
+    collect_step!(
+        w,
+        "telemetry-spool",
+        spool(
+            &mut w,
+            &spool_dir(&state_dir),
+            log_tail_cap(req),
+            &diagnostics::redact::exporter_header_values(|n| std::env::var(n).ok())
+        )
+    );
     // The kernel's own log, beside the daemon's and under the same caller cap.
     // A guest bundle has no other kernel evidence: `console=hvc0` lands in the
     // *host's* `boot.log`, which is recreated per boot and tail-capped, so on a
@@ -527,6 +541,46 @@ async fn logs<W: BundleSink>(
     Ok(())
 }
 
+/// The directory this daemon's spool files are in ([`spool`]): the one its
+/// open spool writes to, else a pinned `MINIMAL_OTEL_SPOOL_DIR`, else
+/// `<state>/telemetry/spool` (mlog's rule, [`mlog::otel::spool_dir_or`]). The
+/// host collector resolves the variable from its own environment, so the two
+/// bundles agree when `min bug` runs with the daemon's setting; a spool a
+/// daemon pinned elsewhere through an environment `min bug` does not share is
+/// not collected (`SPOOL_DIR_NOTE` in the host collector says so).
+fn spool_dir(state_dir: &Path) -> std::path::PathBuf {
+    mlog::otel::spool_dir_or(state_dir.join("telemetry").join("spool"))
+}
+
+/// The local telemetry spool, [`spool_dir`]`/*.jsonl` (spec 25 TEL-044):
+/// the newest [`LOG_FILES_MAX`] files,
+/// each tail-capped like a log. The same symlink guards as `logs`: the
+/// directory and its files sit on a volume guest tasks can write.
+///
+/// On a VM host this daemon is the guest's `/init`, so this is the guest's
+/// spool, and `min bug` nests this bundle. Each file goes through
+/// `add_spool_tail` (spec 25 TEL-044) with `header_values` plus the header
+/// values of the process that wrote it, when it still runs
+/// ([`diagnostics::redact::spool_file_header_values`]): neither an exporter
+/// header value nor a secret-shaped or header-like attribute's value
+/// travels.
+async fn spool<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    dir: &Path,
+    cap: u64,
+    header_values: &[String],
+) -> Result<(), anyhow::Error> {
+    diagnostics::spool::collect(
+        w,
+        dir,
+        cap,
+        diagnostics::spool::SpoolKeep::Newest(LOG_FILES_MAX),
+        header_values,
+        "no spool directory — telemetry never ran here",
+    )
+    .await
+}
+
 /// A content-addressed store entry: `cache/built/<hh>/<hash>` under the state
 /// dir. A populated store holds far more than the entry cap in these subtrees
 /// alone, and `cache` sorts ahead of `logs`/`sessions`/`tasks`, so without
@@ -561,7 +615,7 @@ async fn state_listing<W: BundleSink>(
     // so a wedged filesystem strands a blocking thread and not the worker whose
     // collect_step! timeout is the failsafe.
     let dir = state_dir.to_path_buf();
-    let listing = tokio::task::spawn_blocking(move || {
+    let listing = crate::traced::spawn_blocking(move || {
         diagnostics::listing_pruned(&dir, LISTING_MAX_ENTRIES, is_content_store_entry)
     })
     .await
@@ -690,29 +744,39 @@ async fn sessions<W: BundleSink>(
 /// `O_NOFOLLOW`, so on the guest-writable state volume a `decisions.log`
 /// swapped for a link is refused at open exactly the way a swapped log file
 /// is.
+///
+/// The log rotates to one kept generation past its bound, so that generation
+/// travels too, under the same cap: right after a rotation the live file
+/// holds only the newest record, and the rotated one holds the history
+/// before it.
 async fn audit<W: BundleSink>(
     w: &mut BundleWriter<W>,
     state_dir: &Path,
     cap: u64,
 ) -> Result<(), anyhow::Error> {
-    let path = crate::audit::log_path(state_dir);
-    match w
-        .add_file_tail(crate::audit::LOG_RELATIVE, &path, cap)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {
-            w.skip(
-                crate::audit::LOG_RELATIVE,
-                "not present — this daemon has recorded no decisions yet",
-            );
-            Ok(())
-        }
-        Err(e) => {
-            w.skip(crate::audit::LOG_RELATIVE, format!("unreadable: {e:#}"));
-            Ok(())
+    for (relative, path, absent) in [
+        (
+            crate::audit::LOG_RELATIVE,
+            crate::audit::log_path(state_dir),
+            "not present — this daemon has recorded no decisions yet",
+        ),
+        (
+            crate::audit::ROTATED_RELATIVE,
+            crate::audit::rotated_path(state_dir),
+            "not present — the decision log has not rotated yet",
+        ),
+    ] {
+        match w.add_file_tail(relative, &path, cap).await {
+            Ok(()) => {}
+            Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {
+                w.skip(relative, absent);
+            }
+            Err(e) => {
+                w.skip(relative, format!("unreadable: {e:#}"));
+            }
         }
     }
+    Ok(())
 }
 
 /// Reads one session JSON file whole, bounded by [`MAX_SESSION_FILE_BYTES`]
@@ -993,6 +1057,146 @@ mod tests {
         assert!(!files.contains_key("net/gvproxy.json"));
     }
 
+    /// The bundle carries the local telemetry spool (TEL-044) as the newest
+    /// `*.jsonl` files under `telemetry/spool/`, and nothing else from that
+    /// directory; each file goes through the same line-wise scrub as a log
+    /// (spec 25 TEL-042).
+    #[tokio::test]
+    async fn diag_bundle_carries_the_telemetry_spool() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let spool = state_dir
+            .as_utf8_path()
+            .as_std_path()
+            .join("telemetry")
+            .join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::write(
+            spool.join("minimald-1-1.jsonl"),
+            b"{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"name\":\"rpc\"}]}]}]}\n",
+        )
+        .unwrap();
+        std::fs::write(spool.join("notes.txt"), b"not a spool file").unwrap();
+
+        let files = fetch_bundle(&server).await;
+        let entry = "telemetry/spool/minimald-1-1.jsonl";
+        let body = files
+            .get(entry)
+            .unwrap_or_else(|| panic!("missing {entry}: {:?}", files.keys()));
+        assert!(
+            std::str::from_utf8(body).unwrap().contains("resourceSpans"),
+            "the spool record travels"
+        );
+        assert!(
+            !files.contains_key("telemetry/spool/notes.txt"),
+            "only *.jsonl spool files travel"
+        );
+        let manifest = manifest(&files);
+        assert!(
+            manifest["errors"].as_array().unwrap().is_empty(),
+            "{}",
+            manifest["errors"]
+        );
+    }
+
+    /// A daemon whose spool is pinned outside its state directory
+    /// (`MINIMAL_OTEL_SPOOL_DIR`, which mlog never relocates) bundles the
+    /// pinned directory's files, and a record holding a header that only
+    /// the producer's environment had is scrubbed by its header-like name.
+    #[tokio::test]
+    async fn a_pinned_spool_dir_is_bundled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pinned = tmp.path().join("pinned-spool");
+        std::fs::create_dir_all(&pinned).unwrap();
+        std::fs::write(
+            pinned.join("minimald-1-1.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"rpc","attributes":["#,
+                r#"{"key":"http.request.header.x-honeycomb-team","value":{"stringValue":"daemonONLYkey1"}},"#,
+                r#"{"key":"rpc.method","value":{"stringValue":"exec"}}]}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool(&mut w, &pinned, 1 << 20, &[]).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&bytes[..]);
+        let unpacked = tmp.path().join("unpacked");
+        async_tar::Archive::new(decoder)
+            .unpack(unpacked.clone())
+            .await
+            .unwrap();
+        let mut files = BTreeMap::new();
+        collect_files(&unpacked, &unpacked, &mut files);
+        let body = files
+            .iter()
+            .find(|(k, _)| k.ends_with("telemetry/spool/minimald-1-1.jsonl"))
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_else(|| panic!("the pinned spool is not bundled: {:?}", files.keys()));
+        assert!(body.contains("\"exec\""), "the record travels: {body}");
+        assert!(
+            !body.contains("daemonONLYkey1"),
+            "header-like value: {body}"
+        );
+    }
+
+    /// TEL-044's two security claims over the daemon's spool collector (on
+    /// a VM host, the guest's spool): a spool line holding the configured
+    /// exporter header value and a secret-shaped attribute reaches the
+    /// bundle without either value.
+    #[tokio::test]
+    async fn a_daemon_bundle_never_carries_a_header_value_or_a_secret_attribute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("telemetry").join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimald-1-1.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"rpc","attributes":["#,
+                r#"{"key":"note","value":{"stringValue":"Bearer%20s3cr3tTOKEN99"}},"#,
+                r#"{"key":"upstream.password","value":{"stringValue":"opensesame"}},"#,
+                r#"{"key":"rpc.method","value":{"stringValue":"exec"}}]}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let headers = diagnostics::redact::exporter_header_values(|n| {
+            (n == "OTEL_EXPORTER_OTLP_HEADERS")
+                .then(|| "authorization=Bearer%20s3cr3tTOKEN99".to_owned())
+        });
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool(&mut w, &spool_dir, 1 << 20, &headers).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&bytes[..]);
+        let unpacked = tmp.path().join("unpacked");
+        async_tar::Archive::new(decoder)
+            .unpack(unpacked.clone())
+            .await
+            .unwrap();
+        let mut files = BTreeMap::new();
+        collect_files(&unpacked, &unpacked, &mut files);
+        let body = files
+            .iter()
+            .find(|(k, _)| k.ends_with("telemetry/spool/minimald-1-1.jsonl"))
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_else(|| panic!("no spool file: {:?}", files.keys()));
+        assert!(body.contains("\"exec\""), "the record travels: {body}");
+        for (path, bytes) in &files {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains("s3cr3tTOKEN99"), "header value in {path}");
+            assert!(!text.contains("opensesame"), "secret attribute in {path}");
+        }
+    }
+
     /// The bundle carries the box zone's table (NET-006's "which names does
     /// this daemon hold"): every live name with the address it answers at on
     /// the host and the session that owns it, read from the same shared
@@ -1188,6 +1392,33 @@ mod tests {
             "LANG",
         ] {
             assert!(!is_env_value_allowlisted(name), "{name} must not be");
+        }
+    }
+
+    /// The telemetry exporter settings match the project prefix, but their
+    /// values (an endpoint URL, a headers list) can carry a collector's
+    /// credentials, so a bundle reports them by name only.
+    #[test]
+    fn telemetry_exporter_settings_are_reported_by_name_only() {
+        for name in [
+            "MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+            "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "MINIMALD_SOMETHING_HEADERS",
+        ] {
+            assert!(!is_env_value_allowlisted(name), "{name} must not be");
+        }
+        // The on/off switches say which mode ran and stay verbatim.
+        for name in [
+            "MINIMAL_TELEMETRY",
+            "MINIMAL_OTEL_SPOOL",
+            "MINIMAL_OTEL_FILTER",
+        ] {
+            assert!(is_env_value_allowlisted(name), "{name} should be allowed");
         }
     }
 
@@ -1513,6 +1744,45 @@ mod tests {
         assert!(
             contents.contains("curl -H 'Authorization: Bearer"),
             "non-credential parts must survive, got: {contents}"
+        );
+    }
+
+    /// NET-046's log keeps reading across a rotation: once the decision log
+    /// has rotated, the bundle carries the live file — whose last line is the
+    /// newest decision — and the rotated generation that holds the records
+    /// before it, each at the path it holds under the state directory.
+    #[tokio::test]
+    async fn diag_bundle_reads_the_decision_log_across_a_rotation() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let state_dir = state_dir.as_utf8_path().as_std_path();
+        let record = |port: u16| crate::audit::DecisionRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            box_name: "web".to_string(),
+            port,
+            decision: sessions::DynamicIngress::Allow,
+            decided_by: crate::audit::DecidedBy::BoxPolicy,
+            outcome: crate::audit::DecisionOutcome::Published,
+            reason: None,
+        };
+        // A cap of one line per file: every append past the first rotates.
+        let cap = serde_json_lenient::to_string(&record(3000)).unwrap().len() as u64 + 1;
+        for port in [3000, 3001, 3002] {
+            crate::audit::try_append_capped(state_dir, &record(port), cap)
+                .await
+                .unwrap();
+        }
+
+        let files = fetch_bundle(&server).await;
+        let live = String::from_utf8_lossy(&files[crate::audit::LOG_RELATIVE]);
+        assert!(
+            live.contains("\"port\":3002"),
+            "the live log's tail carries the newest decision: {live}"
+        );
+        let rotated = String::from_utf8_lossy(&files[crate::audit::ROTATED_RELATIVE]);
+        assert!(
+            rotated.contains("\"port\":3001"),
+            "the rotated generation carries the decision before it: {rotated}"
         );
     }
 }

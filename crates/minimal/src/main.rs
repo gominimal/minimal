@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser};
 use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
+use tracing_subscriber::fmt::format::{FormatEvent, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatFields};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::MakeWriter, prelude::*, registry::LookupSpan,
 };
@@ -54,7 +56,8 @@ async fn run() -> ExitCode {
 
     // Parse before installing the subscriber, so the shell completion handler can
     // be configured to log to stderr instead of stdout.
-    let cli = minimal::Cli::parse();
+    let cli = minimal::Cli::try_parse()
+        .unwrap_or_else(|err| minimal::with_retired_command_hint(err).exit());
     minimal::theme::install();
 
     // Publish `--vm` before any path resolution, so the socket, the state dir,
@@ -64,7 +67,18 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let registry = tracing_subscriber::registry().with(filter);
+    // OTel export (opt-in: MINIMAL_TELEMETRY=1 plus an OTLP endpoint; see
+    // mlog::otel): the layers are None when off and carry their own
+    // info-level filter when on; the console keeps its own filter, with the
+    // OTel SDK's errors silenced.
+    mlog::otel::init("minimal-cli");
+    // A CLI lives for one command: its exit flush is short, so a collector
+    // that is down or silent never shows in a command's wall time.
+    mlog::otel::set_exit_flush(mlog::otel::CLI_EXIT_FLUSH);
+    let filter = mlog::otel::quiet(filter);
+    let registry = tracing_subscriber::registry()
+        .with(mlog::otel::span_layer())
+        .with(mlog::otel::log_layer());
     // `min dash` owns the terminal (alternate screen); a log line landing on
     // stdout/stderr would corrupt the frame. Log to <state>/dash.log
     // instead, discarding if the state dir can't be written.
@@ -94,25 +108,37 @@ async fn run() -> ExitCode {
             }
         };
         registry
-            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .with(
+                fmt::layer()
+                    .with_writer(log)
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
             .init();
     } else if stdout_is_data_contract(&cli.command) {
         registry
-            .with(console_layer(
-                std::io::stderr,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    std::io::stderr,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     } else {
         registry
-            .with(console_layer(
-                ot::StdoutWriter::new,
-                std::io::stdout().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    ot::StderrWriter::new,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     }
+    mlog::otel::report_init();
 
     // The output mode the run is under, read before the CLI is consumed:
     // the error path keys on it (below), so a machine-output run answers a
@@ -123,7 +149,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
-    if let Err(e) = minimal::run(cli).await {
+    let result = minimal::run(cli).await;
+    // Flush exported telemetry (bounded; a no-op when export is off). What
+    // the bound cuts off is in the spool already.
+    mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+    if let Err(e) = result {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
         // (the git-remote helper's ExitCode precedent).
@@ -144,7 +174,7 @@ async fn run() -> ExitCode {
                 MachineModeAnswer::Quiet => return ExitCode::from(141),
                 MachineModeAnswer::Object(failure) => {
                     emit_machine_mode_error(&failure);
-                    return ExitCode::FAILURE;
+                    return ExitCode::from(failure_exit_code(&e));
                 }
             }
         }
@@ -154,9 +184,30 @@ async fn run() -> ExitCode {
             return ExitCode::from(141);
         }
         eprintln!("error: {e:#}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(failure_exit_code(&e));
     }
     ExitCode::SUCCESS
+}
+
+/// The exit code a failed run ends with, from the architecture's reserved
+/// codes ("Exit codes"): 7 when the VM host could not be reached to
+/// register or resume an own-address box's row (provider/host
+/// unreachable, #1790), 8 when the host refused the registration for want
+/// of addresses (insufficient resources), and 1, the unspecified error,
+/// for everything else — a refusal the host answered included. Both
+/// output modes end with the same code.
+fn failure_exit_code(e: &anyhow::Error) -> u8 {
+    if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
+        .is_some()
+    {
+        return 7;
+    }
+    if e.downcast_ref::<minimal_client::box_registration::HostAddressesExhausted>()
+        .is_some()
+    {
+        return 8;
+    }
+    1
 }
 
 /// Whether the error's root cause is a broken pipe: the writer's reader
@@ -186,15 +237,38 @@ enum MachineModeAnswer {
 /// payload it already failed into. A broken pipe means the consumer hung
 /// up, so the run exits quietly. A failure the command tagged as its own
 /// document write ([`minimal::OutputWriteError`]) is `output_failed`, so a
-/// script can tell it from a crash. Anything else is `unspecified`, the
-/// exit table's unspecified error, with the chain as its message and no
-/// hint, because nothing about it is known to name a remedy.
+/// script can tell it from a crash. A VM host that could not be reached is
+/// `host_unreachable`, and one out of addresses `insufficient_resources`,
+/// beside the exit codes [`failure_exit_code`] gives them. Anything else is
+/// `unspecified`, the exit table's unspecified error, with the chain as its
+/// message and no hint, because nothing about it is known to name a remedy.
 fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
     if let Some(failure) = e.downcast_ref::<minimal::MachineModeFailure>() {
         return MachineModeAnswer::Object(failure.clone());
     }
     if is_broken_pipe(e) {
         return MachineModeAnswer::Quiet;
+    }
+    if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
+        .is_some()
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "host_unreachable",
+            format!("{e:#}"),
+            "the VM host daemon is not answering; check that it is running (`minvmd status`)"
+                .to_string(),
+        ));
+    }
+    if e.downcast_ref::<minimal_client::box_registration::HostAddressesExhausted>()
+        .is_some()
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "insufficient_resources",
+            format!("{e:#}"),
+            "the VM host has no address left for another box; destroy a session you no \
+             longer need and try again"
+                .to_string(),
+        ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
@@ -255,9 +329,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     )
 }
 
-/// The console log layer. `plain` (no `RUST_LOG` in effect) drops the
-/// timestamp and target, so a warning reads as one message line; otherwise the
-/// full tracing format is kept for debugging.
+/// The console log layer. `plain` (no `RUST_LOG` in effect) renders through
+/// [`PlainFormat`]: `warning:`/`error:` lines matching the rest of the CLI;
+/// otherwise the full tracing format is kept for debugging.
 fn console_layer<S, W>(writer: W, ansi: bool, plain: bool) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -265,13 +339,63 @@ where
 {
     let layer = fmt::layer().with_writer(writer).with_ansi(ansi);
     if plain {
-        layer
-            .without_time()
-            .with_target(false)
-            .with_level(true)
-            .boxed()
+        layer.event_format(PlainFormat).boxed()
     } else {
         layer.boxed()
+    }
+}
+
+/// The plain console format: `warning: <message>` for WARN, `error: <message>`
+/// for ERROR, and the bare message for INFO and below. A message that already
+/// starts with `help:` is written as a help line with no level prefix. Span
+/// context is omitted on purpose: these lines are for a person, not debugging.
+struct PlainFormat;
+
+impl<S, N> FormatEvent<S, N> for PlainFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut message = MessageVisitor::default();
+        event.record(&mut message);
+
+        match *event.metadata().level() {
+            tracing::Level::WARN => {
+                if !message.0.as_deref().is_some_and(|m| m.starts_with("help:")) {
+                    write!(writer, "warning: ")?;
+                }
+            }
+            tracing::Level::ERROR => write!(writer, "error: ")?,
+            _ => {}
+        }
+
+        ctx.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+/// Captures the event's `message` field, so the formatter can decide whether
+/// to prefix a level.
+#[derive(Default)]
+struct MessageVisitor(Option<String>);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
     }
 }
 
@@ -405,8 +529,8 @@ mod tests {
         }
     }
 
-    /// Without `RUST_LOG`, a warning renders as one plain line: level and
-    /// message only, no timestamp and no target.
+    /// Without `RUST_LOG`, a warning renders as `warning: <message>` — no
+    /// timestamp and no target.
     #[test]
     fn console_layer_renders_plain_warning() {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -420,7 +544,45 @@ mod tests {
             tracing::warn!(key = "value", "lifecycle_hooks is unknown");
         });
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert_eq!(out, " WARN lifecycle_hooks is unknown key=\"value\"\n");
+        assert_eq!(out, "warning: lifecycle_hooks is unknown key=\"value\"\n");
+    }
+
+    /// A WARN event whose message already starts with `help:` renders as a
+    /// bare help line, with no level prefix.
+    #[test]
+    fn console_layer_renders_help_line_without_level() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || BufferWriter(buf.clone())
+        };
+        let layer = console_layer(writer, false, true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("help: do you need to update to a newer version of minimal?");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            out,
+            "help: do you need to update to a newer version of minimal?\n"
+        );
+    }
+
+    /// An ERROR event renders as `error: <message>`.
+    #[test]
+    fn console_layer_renders_plain_error() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || BufferWriter(buf.clone())
+        };
+        let layer = console_layer(writer, false, true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(key = "value", "something failed");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(out, "error: something failed key=\"value\"\n");
     }
 
     /// With `RUST_LOG` set, the full tracing format (timestamp and target) is
@@ -609,6 +771,40 @@ mod tests {
             1,
             "one object, one line, nothing else: {line}"
         );
+    }
+
+    /// #1790: a VM host that could not be reached ends the run with 7 —
+    /// provider/host unreachable — found through every context the
+    /// activation adds over it, and a machine-mode run answers it with the
+    /// `host_unreachable` object and the same code. Any other failure stays
+    /// the unspecified error, 1, in both modes.
+    #[test]
+    fn host_unreachable_exits_7_in_both_output_modes() {
+        let unreachable = minimal_client::box_registration::HostUnreachable::over(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            "connecting to the VM host daemon's box control socket at /x/control.sock",
+        )
+        .context("registering the box with the VM host daemon failed")
+        .context("activating the session");
+        assert_eq!(failure_exit_code(&unreachable), 7);
+        match machine_mode_answer(&unreachable) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "host_unreachable");
+                assert!(
+                    failure.message().contains("/x/control.sock"),
+                    "the message is the chain the text mode prints: {}",
+                    failure.message()
+                );
+            }
+            MachineModeAnswer::Quiet => panic!("an unreachable host is an error object"),
+        }
+
+        let refused = anyhow::anyhow!("the VM host daemon refused the box registration: no");
+        assert_eq!(failure_exit_code(&refused), 1);
+        match machine_mode_answer(&refused) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
+            MachineModeAnswer::Quiet => panic!("a refusal is an error object"),
+        }
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

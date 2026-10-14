@@ -275,6 +275,12 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/session.rs::session_record_by = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -649,6 +655,14 @@ fn cli_reference_has_no_retired_commands() {
         rendered.contains("Usage:"),
         "the refusal must carry the usage, got: {rendered}"
     );
+
+    // The refusal `min` prints names the verb that replaced the retired one.
+    let rendered = with_retired_command_hint(err).to_string();
+    assert!(
+        rendered.contains("unrecognized subcommand 'ssh-forward'")
+            && rendered.contains("min net forward <SESSION> <LOCAL>:<PORT>"),
+        "the refusal must name the replacement, got: {rendered}"
+    );
 }
 
 /// Entry constructor for the bare-`min` state-report tests.
@@ -665,6 +679,7 @@ fn twin_entry(
         status,
         git: None,
         host_ip_enforcement: None,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     }
 }
@@ -686,7 +701,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
              \x20 sessions: 1 (web, active)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
-             \x20 min session attach --command 'min task run <task>' web\n\
+             \x20 min session run web <task>\n\
              \x20 min ls --json\n"
     );
 }
@@ -848,14 +863,15 @@ fn bare_status_counts_elsewhere_sessions() {
         "no cwd session must suggest activate: {out}"
     );
     assert!(
-        !out.contains("session attach --command"),
-        "must not suggest attaching elsewhere: {out}"
+        !out.contains("min session run"),
+        "must not suggest running in a session elsewhere: {out}"
     );
 }
 
 /// More than two cwd matches: the count is the full total, the listing
-/// stops at two, and an unnamed session shows its short id — which is
-/// also what the attach suggestion substitutes for the first match.
+/// stops at two and counts the rest, sessions elsewhere are counted too,
+/// and an unnamed session shows its short id — which is also what the run
+/// suggestion substitutes for the first match.
 #[test]
 fn bare_status_lists_at_most_two_cwd_sessions() {
     let entries = vec![
@@ -877,20 +893,29 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             Some("/w"),
             sessions::SessionStatus::Active,
         ),
+        twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0088",
+            Some("api"),
+            Some("/other"),
+            sessions::SessionStatus::Active,
+        ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     let out = render_bare_status("/w", &entries, &cwd, true);
     assert!(
-        out.contains("  sessions: 3 (019f5d0f, pending), (web, materializing)\n"),
-        "count-then-two listing: {out}"
+        out.contains(
+            "  sessions: 3 (019f5d0f, pending), (web, materializing) and 1 more \
+             (1 elsewhere)\n"
+        ),
+        "count-then-two listing, the rest counted: {out}"
     );
     assert!(
         !out.contains("spare"),
         "third session must not be listed: {out}"
     );
     assert!(
-        out.contains("  min session attach --command 'min task run <task>' 019f5d0f\n"),
-        "attach suggestion uses the first match's handle: {out}"
+        out.contains("  min session run 019f5d0f <task>\n"),
+        "run suggestion uses the first match's handle: {out}"
     );
 }
 
@@ -1012,6 +1037,64 @@ fn provider_local_minimald_is_the_host_backend() {
     use clap::Parser as _;
     let cli = Cli::try_parse_from(["min", "--provider", "local-minimald", "ls"]).unwrap();
     assert!(!cli.global_args.use_minvmd());
+}
+
+#[test]
+fn finalize_install_parses_its_flags() {
+    use clap::Parser as _;
+    let cli = Cli::try_parse_from(["min", "finalize-install"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: false,
+            script: false,
+            json: false,
+            undo: false
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: false
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: false,
+            json: true,
+            undo: false
+        }))
+    ));
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--undo", "--show", "--script"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: true
+        }))
+    ));
+    // `--script` and `--json` need `--show`; `--json` describes an install,
+    // not a removal; the two outputs exclude each other.
+    for args in [
+        &["min", "finalize-install", "--script"][..],
+        &["min", "finalize-install", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--undo"],
+        &["min", "finalize-install", "--undo", "--show", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--script"],
+        &["min", "net", "setup"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
 }
 
 #[test]
@@ -1301,6 +1384,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
         task: "check".to_string(),
         owns_box: false,
         args: vec![],
+        cwd: String::new(),
     };
     let wire = request.encode();
     assert_eq!(
@@ -1309,6 +1393,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
             task: "check".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         })
     );
 }
@@ -1622,6 +1707,33 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
     );
 }
 
+/// A transient git failure — the concurrent `min session activate`
+/// `index.lock` race — is not the user's configuration, so the message must
+/// not instruct them to fix "the configuration there". The remedy is to
+/// re-run, and the directory still leads.
+#[test]
+fn composition_failure_does_not_blame_config_for_git_lock() {
+    let daemon_error = "init of minimal context: other: git command 'checkout' failed \
+                            (exit status: 128): fatal: Unable to create \
+                            '.../.git/index.lock': File exists.";
+    let msg =
+        composition_failure_message(camino::Utf8Path::new("/home/dev/myproject"), daemon_error);
+
+    let headline = msg.lines().next().expect("a first line");
+    assert!(
+        headline.contains("/home/dev/myproject"),
+        "the headline must name the directory: {msg}"
+    );
+    assert!(
+        !msg.contains("Fix the configuration there"),
+        "a git lock is transient, not a config fault: {msg}"
+    );
+    assert!(
+        msg.contains(daemon_error),
+        "the daemon's error must survive: {msg}"
+    );
+}
+
 /// Every site that reports an uncomposable session goes through the one
 /// helper: the refused `ConfigureLoadout` and the headless gating bail in
 /// each creator, plus the interactive gating bail they share via
@@ -1649,6 +1761,88 @@ fn both_creators_share_the_composition_failure_message() {
             assert!(
                 !body.contains(bare),
                 "{func} still names the internal step instead of the directory ({bare})"
+            );
+        }
+    }
+}
+
+/// A daemon refusal is printed in the daemon's own words. The RPC's name
+/// is the wire's vocabulary, not the person's, so no creator, verdict
+/// submitter, finalizer or renamer may prefix the daemon's error with
+/// it. Asserted over the function bodies, the way the composition
+/// message is, because the prefix had crept into five sites across three
+/// files before anyone noticed it on a terminal.
+#[test]
+fn daemon_refusals_print_without_rpc_names() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func) in [
+        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/session.rs", "cmd_rename"),
+        ("src/task.rs", "cmd_task_run"),
+        ("src/cmd/mod.rs", "submit_verdict_and_wait"),
+        ("src/cmd/mod.rs", "upload_and_finalize"),
+    ] {
+        let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body =
+            function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        for bare in [
+            "CreateSession failed",
+            "RenameSession failed",
+            "SubmitVerdict failed",
+            "SubmitVerdict faulted",
+            "FinalizeSession failed",
+        ] {
+            assert!(
+                !body.contains(bare),
+                "{func} still prefixes the daemon's refusal with an RPC name ({bare})"
+            );
+        }
+    }
+
+    // The daemon's side of the same surface: its refusals are printed
+    // verbatim, at finalize through `upload_and_finalize` and at attach,
+    // so none of them may name the RPC a person would have to retry. The
+    // scan is over the string literals of the daemon's session module,
+    // which covers the refusals and the log lines alike; the module has
+    // no log-only RPC name left to exempt. The RPC names stay legitimate
+    // in type paths and comments, which the scan does not read. A literal
+    // is tracked across lines — the refusals are wrapped with `\` — so a
+    // continuation line with no quote of its own is still read.
+    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
+        .expect("readable daemon source");
+    let mut in_literal = false;
+    for (number, line) in daemon.lines().enumerate() {
+        if !in_literal && line.trim_start().starts_with("//") {
+            continue;
+        }
+        let in_string = in_literal || line.contains('"');
+        // Toggle on every unescaped quote, so the state at the line's end
+        // says whether the next line continues a literal.
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_literal = !in_literal,
+                _ => {}
+            }
+        }
+        if !in_string {
+            continue;
+        }
+        for rpc in [
+            "CreateSession",
+            "ConfigureLoadout",
+            "SubmitVerdict",
+            "FinalizeSession",
+            "RenameSession",
+            "WorkspacePatchesTarZst",
+        ] {
+            assert!(
+                !line.contains(rpc),
+                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
+                number + 1
             );
         }
     }
@@ -1815,6 +2009,235 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
     cmd_stop(&global, StopArgs { force: false })
         .await
         .expect("an already-stopped daemon is the goal state, not an error");
+}
+
+/// The wedged-VM recovery: with a VM backend whose state says Running under a
+/// live alive-lock but no bridge socket to answer, `min stop --force` must
+/// stop the VM from the host — signal the VMM the state names, write
+/// `Stopped` — and exit 0, rather than failing on the refused connect and
+/// leaving the only recovery a hand-killed VMM.
+#[tokio::test]
+async fn stop_force_stops_a_wedged_vm_from_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    // The alive lock is held the way a real VM holds it: by the VMM process,
+    // through the inherited fd, so it is released when that process dies and
+    // not before.
+    let lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+    let mut vmm_cmd = std::process::Command::new("sleep");
+    vmm_cmd.arg("30");
+    lock.inherit_into(&mut vmm_cmd);
+    let mut vmm = vmm_cmd.spawn().expect("spawn sleep");
+    drop(lock);
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(vmm.id()),
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    assert!(
+        state_dir.daemon_alive().unwrap(),
+        "the stand-in VMM must hold the alive lock"
+    );
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    cmd_stop(&global, StopArgs { force: true })
+        .await
+        .expect("a wedged VM stopped from the host is the goal state");
+
+    assert_eq!(
+        state_dir.read_state().unwrap().lifecycle,
+        minvmd::lifecycle::Lifecycle::Stopped
+    );
+    assert!(
+        !state_dir.daemon_alive().unwrap(),
+        "the stop must not return while the alive lock is held: a `min start` would refuse"
+    );
+    // SIGTERM'd by the host-side stop; reaped here so the test leaves no stray.
+    let status = vmm.wait().unwrap();
+    assert!(
+        status.code().is_none(),
+        "expected a signalled VMM child, got {status:?}"
+    );
+}
+
+/// A VM that is still booting has no VMM pid to signal, so `min stop --force`
+/// must not report a host-side stop it did not make: it refuses with the
+/// retry, and leaves the boot's `Starting` state for the supervisor to finish.
+#[tokio::test]
+async fn stop_force_refuses_a_booting_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
+            vmm_pid: None,
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: true })
+        .await
+        .expect_err("a booting VM was not stopped from the host");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("still booting") && chain.contains("`min stop`"),
+        "expected the retry hint, got: {chain}"
+    );
+    assert_eq!(
+        state_dir.read_state().unwrap().lifecycle,
+        minvmd::lifecycle::Lifecycle::Starting
+    );
+}
+
+/// Without `--force`, a VM that is still booting is not told to use `--force`,
+/// which refuses a booting VM: the hint names the retry, and the failure stays
+/// the typed host-unreachable one.
+#[tokio::test]
+async fn stop_without_force_on_a_booting_vm_names_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
+            vmm_pid: None,
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: false })
+        .await
+        .expect_err("a booting VM that does not answer keeps failing");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("still booting") && !chain.contains("--force"),
+        "expected the retry hint and no --force, got: {chain}"
+    );
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
+    );
+}
+
+/// The wait a host-side stop ends on is the alive lock, not the lifecycle
+/// file: it fails while a minvmd still holds the lock, even over a `Stopped`
+/// state, and passes once the lock is released.
+#[test]
+fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = minvmd::state::StateDir::new(dir.path().to_path_buf()).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State::stopped())
+        .unwrap();
+    let lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
+        .expect_err("a held alive lock is not a finished stop");
+    assert!(
+        format!("{err:#}").contains("still holds the VM's alive lock"),
+        "got: {err:#}"
+    );
+
+    drop(lock);
+    wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
+        .expect("a released alive lock is a finished stop");
+}
+
+/// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
+/// VM that may still be draining is not the default behaviour — but the error
+/// names the recovery instead of a bare connect failure, and is the typed
+/// host-unreachable failure the binary exits 7 on.
+#[tokio::test]
+async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(std::process::id()),
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: false })
+        .await
+        .expect_err("a wedged VM without --force must keep failing");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("the VM is not answering") && chain.contains("--force"),
+        "expected the recovery hint, got: {chain}"
+    );
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
+    );
 }
 
 /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
@@ -1992,6 +2415,21 @@ fn legacy_network_spellings_parse_with_hint() {
         err.contains("none, host_ip, own_ip"),
         "the error must name the accepted spellings: {err}"
     );
+}
+
+/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// maps it back to the same mode, so the word the daemon logs and the
+/// refusals print is always one a person can type.
+#[test]
+fn network_parser_round_trips_every_mode_word() {
+    for mode in [
+        sessions::NetworkMode::NoNet,
+        sessions::NetworkMode::HostNet,
+        sessions::NetworkMode::OwnIp,
+    ] {
+        let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
+        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+    }
 }
 
 /// `--deny-all-egress` conflicts with every egress rule flag at parse
@@ -2212,6 +2650,8 @@ async fn create_box_on(
                     .expect("the test cwd as a host path"),
                 network: sessions::NetworkMode::NoNet,
                 policy: sessions::SessionPolicy::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),
@@ -2236,7 +2676,10 @@ async fn create_box_on(
         Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
     }
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Ok(_) => id,
@@ -2304,8 +2747,14 @@ async fn ls_shows_vm_per_box() {
         Some(crate::resolver::LiveSurface::Native),
     ];
     let answerers = vec![
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
-        Some(minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+            proxy_down: None,
+        }),
     ];
     let mut out = Vec::new();
     format_ls_across_vms(
@@ -3002,9 +3451,15 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("default")
     );
 
-    // Session start: one line naming the VM the session landed on and the
-    // same port, so the two surfaces agree on the address to point at.
-    let start = hostname_proxy_start_line(Some("alpha"), NEXT_RUNG);
+    // Session start: the one host line names the same port as the routing
+    // line's `via 127.0.0.1:<port>`, so the two surfaces agree on the
+    // address to point at (NET-026 on the activate surface).
+    let start = crate::resolver::host_line(
+        "web",
+        &crate::resolver::LiveSurface::Proxy,
+        Some(NEXT_RUNG),
+        crate::resolver::HostInstall::default(),
+    );
     let address = format!("127.0.0.1:{NEXT_RUNG}");
     assert!(
         routing("alpha").contains(&address) && start.contains(&address),
@@ -3013,71 +3468,198 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("alpha")
     );
     assert!(
-        start.contains("VM alpha"),
-        "on a two-VM host the start line must say whose port it is: {start}"
+        !start.contains(&RECIPES_PORT.to_string()),
+        "the start line must not name the port the recipes assume: {start}"
     );
+}
 
-    // And the wiring: the start line names a VM exactly when the backend hosts
-    // them — the selected VM on the VM backend, nothing on the native one,
-    // whose single daemon has no VM to name. This test process never publishes
-    // a `--vm` name, so the selected VM is the default one.
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    assert_eq!(
-        hostname_proxy_start_vm(&vm_globals(state.path(), None)),
-        Some(paths::DEFAULT_VM_NAME),
-        "the VM backend names the selected VM"
-    );
-    let native = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinimald),
-        no_input: true,
-        vm: None,
-    };
-    // Which backend `--provider local-minimald` selects is the platform's
-    // call: on Linux it is the native one, while macOS has no native backend
-    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
-    // there — the same rule every VM-backed gate keys on, flag or no flag.
-    // The expectation is therefore the kind's, not a constant.
-    let native_names_a_vm = cfg!(target_os = "macos");
-    assert_eq!(
-        hostname_proxy_start_vm(&native),
-        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
-        "the backend the flag selects names a VM exactly where that backend \
-         is the VM one"
-    );
+/// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
+/// `a1b2c3d4…` named `web`.
+fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
+    use sessions::SessionStatus::Active;
+    vec![
+        twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+    ]
+}
 
-    // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one. A fact
-    // about the native backend, so it is asserted only where that backend
-    // exists: a host whose every backend is minvmd renders its routing lines
-    // through the VM listing, which names the VM the start line names above.
-    if !native_names_a_vm {
-        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-        let mut single = Vec::new();
-        let mut native_resp = reply.clone();
-        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-        format_ls(
-            &mut single,
-            &LsArgs {
-                raw: false,
-                json: false,
-            },
-            &native_resp,
-            None,
-            None,
-        )
-        .expect("rendering the single-VM listing");
-        let single = String::from_utf8(single).expect("the listing is UTF-8");
+/// The short id `min ls` prints resolves as a unique id prefix, with or
+/// without dashes and in either case; a prefix nothing matches resolves to
+/// nothing, leaving the caller's "no session found".
+#[test]
+fn a_unique_id_prefix_resolves_to_its_session() {
+    let entries = prefix_entries();
+    for prefix in ["01a0fe9d", "01A0", "01a0fe9d-0a", "01a0fe9d0a99"] {
         assert_eq!(
-            single
-                .lines()
-                .find(|l| l.starts_with("HOSTNAME PROXY:"))
-                .expect("the single-VM listing prints a routing line"),
-            native_start.as_str(),
-            "the native start line and `min ls`'s routing line must be the same \
-             line"
+            match_id_prefix(&entries, prefix).unwrap(),
+            Some(entries[0].id),
+            "`{prefix}` resolves"
         );
     }
+    assert_eq!(match_id_prefix(&entries, "ffff").unwrap(), None);
+}
+
+/// A prefix several sessions share is refused, naming each candidate by its
+/// short id and its session name; one more character that tells them apart
+/// resolves.
+#[test]
+fn an_ambiguous_id_prefix_names_the_candidates() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "a1b29e8f-0a99-78b1-9165-0809440f0052",
+            Some("db"),
+            None,
+            Active,
+        ),
+    ];
+    let err = match_id_prefix(&entries, "a1b2").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2' matches sessions a1b2c3d4… (web), a1b29e8f… (db); use more characters"
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b29").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Candidates that share more than eight hex digits are cut only as far as
+/// needed to be told apart: each rendered id is distinct and exactly as long
+/// as the first differing digit.
+#[test]
+fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
+    ];
+    // The two ids share their first ten hex digits; the eleventh diverges.
+    let err = match_id_prefix(&entries, "a1b2c3d4e5").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2c3d4e5' matches sessions a1b2c3d4e50…, a1b2c3d4e51…; use more characters"
+    );
+    // Each rendered candidate resolves back to exactly its own session.
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e50").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e51").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Only 4 to 32 hex digits (dashes allowed) are tried as a prefix: anything
+/// else stays a plain name, so a miss is the usual "no session found".
+#[test]
+fn a_non_hex_or_short_input_is_not_an_id_prefix() {
+    let (max, over) = ("0".repeat(32), "0".repeat(33));
+    for not_prefix in ["01a", "01a0fe9z", "web-01a0", "", "----", over.as_str()] {
+        assert!(!is_id_prefix(not_prefix), "`{not_prefix}` is not a prefix");
+    }
+    for prefix in ["01a0", "01A0FE9D", "01a0fe9d-0a99", max.as_str()] {
+        assert!(is_id_prefix(prefix), "`{prefix}` is a prefix");
+    }
+    // `01a0fe9z` would match the first session's id were it read as hex.
+    assert_eq!(
+        match_id_prefix(&prefix_entries(), "01a0fe9z").unwrap(),
+        None
+    );
+}
+
+/// A session named with a string that is also another session's id prefix
+/// resolves by its name: an exact name wins over a prefix.
+#[test]
+fn an_exact_name_wins_over_an_id_prefix() {
+    use sessions::SessionStatus::Active;
+    let mut entries = prefix_entries();
+    entries.push(twin_entry(
+        "ffffffff-0a99-78b1-9165-0809440f0052",
+        Some("01a0fe9d"),
+        None,
+        Active,
+    ));
+    assert_eq!(
+        match_id_prefix(&entries, "01a0fe9d").unwrap(),
+        Some(entries[2].id)
+    );
+}
+
+/// A name resolves in any casing, matching how names are made unique: a
+/// session named `Beef-Cafe` is found by `beef-cafe` (and vice versa). The
+/// names are hex-shaped, because only those reach this match on a name miss,
+/// and a folded name wins over a session whose id starts with the same hex.
+#[test]
+fn a_name_resolves_case_insensitively() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "BEEF-CAFE").unwrap(),
+        Some(entries[0].id)
+    );
+}
+
+/// An exact name wins over a case-folded one, and a casing that folds to two
+/// sessions (case-only duplicates written before names were made unique
+/// under case folding) resolves to neither rather than picking one, nor
+/// falls through to a session whose id starts with that prefix.
+#[test]
+fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "eeeeeeee-0a99-78b1-9165-0809440f0053",
+            Some("beef-cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[1].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "Beef-Cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(match_id_prefix(&entries, "BEEF-CAFE").unwrap(), None);
+    // The id prefix alone, with no name folding to it, still resolves.
+    assert_eq!(
+        match_id_prefix(&entries, "beefcafe").unwrap(),
+        Some(entries[2].id)
+    );
 }

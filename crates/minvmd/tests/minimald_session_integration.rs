@@ -186,6 +186,7 @@ async fn minimald_exec_over_bridge() {
             task: "echo_ok".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         }
         .encode();
         result = run_session_exec(&guest.sock_path, Some(&mfile), &task).await;
@@ -282,6 +283,8 @@ async fn run_session_exec(
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 // The serde default, and what every non-`--no-hooks`
                 // activation sends. This session only runs an exec, so
@@ -419,7 +422,10 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
-        let req = FinalizeSessionRequest { session_id };
+        let req = FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        };
         let body =
             serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 

@@ -1028,73 +1028,77 @@ impl GraphBasedChecker for StandaloneTestCheck {
             let cancel = ctx.cancel.clone();
             let daemon_id = ctx.daemon_id.clone();
             drop(graph);
-            result = tokio::task::spawn(async move {
-                let mut result = result;
-                for (name, test) in tests {
-                    if test.build_test {
-                        continue; // We only do standalone tests here
-                    }
-                    // This task is detached, so it outlives a dropped check
-                    // stream: without this it would keep running tests (and
-                    // their sandboxes) after the caller has given up.
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
+            let span = tracing::Span::current();
+            result = tokio::task::spawn(tracing::Instrument::instrument(
+                async move {
+                    let mut result = result;
+                    for (name, test) in tests {
+                        if test.build_test {
+                            continue; // We only do standalone tests here
+                        }
+                        // This task is detached, so it outlives a dropped check
+                        // stream: without this it would keep running tests (and
+                        // their sandboxes) after the caller has given up.
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
-                    let stdout_buf = SharedBuf::new();
-                    let stderr_buf = SharedBuf::new();
-                    let mut t = StandaloneTest {
-                        spec: &bsr,
-                        test_name: name.as_str(),
-                        stdout_writer: Some(Box::new(stdout_buf.clone())),
-                        stderr_writer: Some(Box::new(stderr_buf.clone())),
-                        cancel: cancel.clone(),
-                    };
-                    let opts = Options {
-                        cache: cache.clone(),
-                        exec_base: temp_dir.path().to_path_buf(),
-                        graph: &graph2,
-                        ot: ot.clone(),
-                        daemon_id: daemon_id.clone(),
-                    };
+                        let stdout_buf = SharedBuf::new();
+                        let stderr_buf = SharedBuf::new();
+                        let mut t = StandaloneTest {
+                            spec: &bsr,
+                            test_name: name.as_str(),
+                            stdout_writer: Some(Box::new(stdout_buf.clone())),
+                            stderr_writer: Some(Box::new(stderr_buf.clone())),
+                            cancel: cancel.clone(),
+                        };
+                        let opts = Options {
+                            cache: cache.clone(),
+                            exec_base: temp_dir.path().to_path_buf(),
+                            graph: &graph2,
+                            ot: ot.clone(),
+                            daemon_id: daemon_id.clone(),
+                        };
 
-                    match t.run(&opts).await {
-                        Ok(errors) => {
-                            if !errors.is_empty() {
-                                result.verdict = CheckVerdict::Fail;
-                                errors.iter().for_each(|e| {
-                                    result.err.push(format!(
-                                        "{}: {} {} had exit code {}",
-                                        name,
-                                        e.program,
-                                        e.args.join(" "),
-                                        e.exit_code
-                                    ))
-                                });
-                                let stdout = stdout_buf.into_string();
-                                let stderr = stderr_buf.into_string();
-                                if !stdout.is_empty() {
-                                    result.err.push(format!("stdout:\n{}", stdout));
-                                }
-                                if !stderr.is_empty() {
-                                    result.err.push(format!("stderr:\n{}", stderr));
+                        match t.run(&opts).await {
+                            Ok(errors) => {
+                                if !errors.is_empty() {
+                                    result.verdict = CheckVerdict::Fail;
+                                    errors.iter().for_each(|e| {
+                                        result.err.push(format!(
+                                            "{}: {} {} had exit code {}",
+                                            name,
+                                            e.program,
+                                            e.args.join(" "),
+                                            e.exit_code
+                                        ))
+                                    });
+                                    let stdout = stdout_buf.into_string();
+                                    let stderr = stderr_buf.into_string();
+                                    if !stdout.is_empty() {
+                                        result.err.push(format!("stdout:\n{}", stdout));
+                                    }
+                                    if !stderr.is_empty() {
+                                        result.err.push(format!("stderr:\n{}", stderr));
+                                    }
                                 }
                             }
-                        }
-                        Err(op::Error::Cache(CacheErr::NotFound)) => {
-                            result.verdict = CheckVerdict::Skip;
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::from(e)
-                                .context(format!("running tests for spec {}", build.name))
-                                .context(format!("failed setup for test {}", name)));
+                            Err(op::Error::Cache(CacheErr::NotFound)) => {
+                                result.verdict = CheckVerdict::Skip;
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::Error::from(e)
+                                    .context(format!("running tests for spec {}", build.name))
+                                    .context(format!("failed setup for test {}", name)));
+                            }
                         }
                     }
-                }
-                Ok::<_, anyhow::Error>(result)
-            })
+                    Ok::<_, anyhow::Error>(result)
+                },
+                span,
+            ))
             .await
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?
             .map_err(Error::Other)?;

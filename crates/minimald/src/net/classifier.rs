@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::fetchers::AnyUrl;
-use sandbox2::config::Verdict;
+use sandbox::config::Verdict;
 
 /// The loopback address the box zone's answerer serves at — the one
 /// destination a deny-all host-address box's connections are admitted to
@@ -90,20 +90,10 @@ pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// default's to decide, never a deny-all here — the deny-all default is an
 /// own-address box's (NET-074).
 pub(crate) fn verdict_of(declaration: Option<&sessions::EgressPolicy>) -> Verdict {
-    if declaration.is_some_and(admits_nothing) {
+    if declaration.is_some_and(sessions::EgressPolicy::admits_nothing) {
         return Verdict::Deny;
     }
     Verdict::Allow
-}
-
-/// Whether `section` is the declaration that admits no destination: every
-/// `allow_*` dimension present and empty. `deny_subnets` is not read — it
-/// subtracts from what the `allow_*` fields admit, and there is nothing
-/// there to subtract from.
-fn admits_nothing(section: &sessions::EgressPolicy) -> bool {
-    section.allow_subnets.as_ref().is_some_and(Vec::is_empty)
-        && section.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-        && section.allow_protocols.as_ref().is_some_and(Vec::is_empty)
 }
 
 /// One rule of a host-address box's egress declaration that this host's
@@ -169,7 +159,7 @@ pub(crate) fn unenforceable_rules(
     let Some(section) = declaration else {
         return Vec::new();
     };
-    if admits_nothing(section) {
+    if section.admits_nothing() {
         return Vec::new();
     }
     let mut rules = Vec::new();
@@ -236,18 +226,11 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "this host decides a host-address box's egress verdict per box, and \
-         its classifier cannot enforce the rules this box's declaration \
-         names: {named} — the host-address classifier enforces only \
-         deny-all until declared address rules are supported, and the \
-         per-box verdict the loaded table decides is deny-all alone \
-         (every allow_* list present and empty) or nothing, so the box \
-         was refused rather than run with these rules unenforced; remove \
-         these rules, or declare deny-all egress instead — `min session \
-         activate --deny-all-egress`, or the box's `egress` section, all \
-         three allow lists present and empty, and no deny entries — or \
-         run the box with `--network own_ip` \
-         (own-address boxes enforce them)"
+        "host_ip boxes on this host enforce only deny-all egress, so these \
+         rules would go unenforced: {named}. Remove them, use \
+         --deny-all-egress (or an egress section with all three allow \
+         lists present and empty and no deny entries), or use --network \
+         own_ip, which enforces them."
     )
 }
 
@@ -401,18 +384,82 @@ impl Cause {
     /// the step over that tree would leave the cause standing, or for a
     /// guest whose table its own image never loaded, because the person to
     /// tell is the image's builder and no installer exists there. A table
-    /// the marker vouches for but the probe does not ends with the same
-    /// command — the install is the one thing that reloads it — while a
-    /// probe that could not read the table names nothing: no command is
-    /// known to make a probe run.
+    /// the marker vouches for but the probe does not names nothing either:
+    /// the marker is what the install's item reads, so with it present the
+    /// install is a no-op, not a reload. A probe that could not read the
+    /// table names nothing: no command is known to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled | Self::TableNotEffective => {
-                Some(sandbox2::classifier::install_hint())
-            }
-            Self::CannotConfine | Self::GuestTableNotLoaded | Self::ProbeUnreadable => None,
+            Self::StepNotInstalled => Some(sandbox::classifier::install_hint()),
+            Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::TableNotEffective
+            | Self::ProbeUnreadable => None,
         }
     }
+}
+
+/// The advisory a native host that cannot decide per box owes a session
+/// start whose box declares egress (NET-079): what the person asked the box
+/// for, that this machine cannot enforce it yet, what the box does instead,
+/// and the two ways to enforce it — `min finalize-install`, which finishes
+/// this host's install, or an own-address start, which enforces now. Two
+/// lines, the second indented, spelled once here so the create reply `min
+/// session activate` prints verbatim, the daemon's log line for that create
+/// and the banner the launch writes into the box's pty agree by
+/// construction. A declaration that admits nothing asked for "no network
+/// access"; one with a rule the classifier has no subtree for
+/// ([`unenforceable_rules`]) asked for "limited" access; a section that
+/// lists nothing asked for nothing restrictive, so the line says only that
+/// the box declares egress. The two probe causes refuse a deny-all box at
+/// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
+/// so over those the line says the box is refused instead of claiming it
+/// runs. The install is named only where running it enforces the
+/// declaration: a cause no install ends names the own-address start alone
+/// and says why the install cannot help, and a declaration the classifier
+/// cannot enforce on a host address names the own-address start alone too,
+/// because a host that finished its install refuses such a box
+/// ([`refuses_unenforceable_declaration`]) rather than enforce it. So the
+/// advisory never hands a person a command that leaves the cause standing
+/// or gets the box refused. It is never a prompt: it names what a person
+/// may run, and running it is the person's act, never the session start's.
+pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> String {
+    let verdict = verdict_of(Some(declaration));
+    let unenforceable = !unenforceable_rules(Some(declaration)).is_empty();
+    let asked = if verdict == sandbox::config::Verdict::Deny {
+        "you asked this box for no network access"
+    } else if unenforceable {
+        "you asked this box for limited network access"
+    } else {
+        "this box declares egress"
+    };
+    let refuses = verdict == sandbox::config::Verdict::Deny
+        && matches!(cause, Cause::TableNotEffective | Cause::ProbeUnreadable);
+    let outcome = if refuses {
+        "so it refuses to start the box"
+    } else {
+        "so the box can still reach the network"
+    };
+    let enforce = if unenforceable {
+        "Enforce it: start the box with --network own_ip, which enforces it now   (on a \
+         host address the classifier enforces only a deny-all declaration, so a host \
+         that finished its install refuses this box rather than enforce its rules)"
+            .to_string()
+    } else {
+        match cause.install_command() {
+            Some(command) => format!(
+                "Enforce it: {command}   (or start the box with --network own_ip, which \
+                 enforces it now)"
+            ),
+            None => format!(
+                "Enforce it: start the box with --network own_ip, which enforces it now   \
+                 ({} can't fix this: {})",
+                sandbox::classifier::install_hint(),
+                cause.detail()
+            ),
+        }
+    };
+    format!("note: {asked}, but this machine can't enforce it yet, {outcome}.\n  {enforce}")
 }
 
 /// Whether this host can decide a host-address box's egress verdict per box
@@ -771,7 +818,7 @@ static PROBE_LEAF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// behind by a probe that died before its own cleanup is remade, not
 /// wedged into, by the next.
 fn probe_leaf(root: &Path) -> PathBuf {
-    sandbox2::classifier::box_leaf(
+    sandbox::classifier::box_leaf(
         root,
         &format!("filter-probe-{}", std::process::id()),
         Verdict::Deny,
@@ -1120,14 +1167,20 @@ pub const GUEST_CT_MARK_MASK: u32 = 0x3000_0000;
 const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
 
 /// What the guest's own boot hands the installer's render: the tree this
-/// daemon mounted and NET-078's two source identities — which on a guest are
-/// both the guest's own address, but the render is told so, never left to
-/// assume. No answerer: a VM-backed guest renders no resolver carve-out
-/// ([`GUEST_NO_CARVE_OUT_LINE`]).
+/// daemon mounted, the resolver its boxes resolve through, and NET-078's two
+/// source identities — which on a guest are both the guest's own address,
+/// but the render is told so, never left to assume. No answerer: a VM-backed
+/// guest's resolver carve-out is the node's DNS layer at the switch gateway
+/// ([`GUEST_RESOLVER_CARVE_OUT_LINE`]).
 pub struct GuestRender<'a> {
-    /// The tree root this daemon itself laid out: `sandbox2`'s
+    /// The tree root this daemon itself laid out: `sandbox`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
     pub tree_root: &'a Path,
+    /// The resolver Minimal owns for a host-address box on this guest: the
+    /// node's DNS layer at the switch gateway (NET-003), which the daemon's
+    /// own relay carries every lookup to. The deny subtree's carve-out is
+    /// this address on port 53, over UDP and TCP (NET-079).
+    pub gateway_resolver: Ipv4Addr,
     /// What the boxes cohort leaves as, and what everything else in the
     /// slice leaves as.
     pub cohort_address: IpAddr,
@@ -1153,13 +1206,13 @@ const GUEST_CHILD_DEADLINE: Duration = Duration::from_secs(30);
 /// before the table reads as gone.
 const TABLE_LIST_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The one line the guest's render logs: a VM-backed host's node DNS layer
-/// applies no per-box name rule to host-address boxes, so the guest's table
-/// admits no resolver for a deny-all box and retargets nothing — its DNS to
-/// the gateway is refused like any other destination until the follow-up
-/// gives it a resolver of its own.
-pub const GUEST_NO_CARVE_OUT_LINE: &str =
-    "deny-all host-address box on VM host: no resolver carve-out (follow-up gominimal/inbox#897)";
+/// The one line the guest's render logs, with the resolver's address beside
+/// it: on a VM-backed host a deny-all host-address box resolves through the
+/// node's DNS layer at the switch gateway, like every other host-address box
+/// there (NET-003), so the guest's table admits that one destination, port
+/// 53 over UDP and TCP, and retargets nothing.
+pub const GUEST_RESOLVER_CARVE_OUT_LINE: &str = "deny-all host-address box on VM host: resolver \
+     carve-out is the node's DNS layer at the gateway, port 53 over udp and tcp";
 
 /// Feeds one of the guest's own runs the bytes it reads on stdin, then
 /// waits for it, both inside the bound it is given. The feed is part of
@@ -1289,7 +1342,8 @@ pub fn render_guest_ruleset_over(
         .arg("--print-ruleset")
         .arg("--root")
         .arg(params.tree_root)
-        .arg("--no-resolver-carve-out")
+        .arg("--gateway-resolver")
+        .arg(params.gateway_resolver.to_string())
         .arg("--cohort-address")
         .arg(params.cohort_address.to_string())
         .arg("--node-plane-address")
@@ -1303,7 +1357,7 @@ pub fn render_guest_ruleset_over(
     if let Some(mountinfo) = params.mountinfo_override {
         installer.env(REHEARSAL_MOUNTINFO_ENV, mountinfo);
     }
-    tracing::info!("{GUEST_NO_CARVE_OUT_LINE}");
+    tracing::info!(resolver = %params.gateway_resolver, "{GUEST_RESOLVER_CARVE_OUT_LINE}");
     let child = installer
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", bash.display()))?;
@@ -1440,7 +1494,7 @@ pub fn load_guest_table_over(
     }
     tracing::info!(
         sha256 = %digest,
-        marker = %sandbox2::classifier::TABLE_MARKER,
+        marker = %sandbox::classifier::TABLE_MARKER,
         "loaded the guest's classifier table and wrote its presence marker"
     );
     Ok(GuestLoad { digest })
@@ -1451,7 +1505,7 @@ pub fn load_guest_table_over(
 /// this daemon made, so only a daemon still holding one keeps the removal
 /// from succeeding.
 fn clear_marker_records(root: &Path) -> Result<(), String> {
-    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    let marker = root.join(sandbox::classifier::TABLE_MARKER);
     if marker.exists() {
         std::fs::remove_dir(&marker).map_err(|cause| {
             format!("removing the stale marker at {}: {cause}", marker.display())
@@ -1495,7 +1549,7 @@ fn write_guest_marker(mask: u32, root: &Path) -> Result<(), String> {
             ))
         }
     })?;
-    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    let marker = root.join(sandbox::classifier::TABLE_MARKER);
     std::fs::create_dir(&marker).or_else(|cause| {
         if cause.kind() == std::io::ErrorKind::AlreadyExists {
             Ok(())
@@ -1851,7 +1905,7 @@ pub(crate) fn decide_over(
     // kind of host. A mount table that cannot be read is the same absence
     // of evidence, and the check may not report a host as confining on no
     // evidence.
-    let confining = sandbox2::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
+    let confining = sandbox::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
         .is_some_and(|(_, nsdelegate)| nsdelegate);
     if !confining {
         return Decision::undecidable(Cause::CannotConfine);
@@ -1945,14 +1999,14 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 /// way. A leaf that is not there, or one this daemon is not in, reads as
 /// what it is: no leaf of the daemon's own.
 ///
-/// [`enter_daemon_leaf`]: sandbox2::classifier::enter_daemon_leaf
+/// [`enter_daemon_leaf`]: sandbox::classifier::enter_daemon_leaf
 pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
     let members =
-        std::fs::read_to_string(sandbox2::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
+        std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
     members
         .lines()
         .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
-        .then_some(sandbox2::classifier::DAEMON_LEAF)
+        .then_some(sandbox::classifier::DAEMON_LEAF)
 }
 
 /// NET-080: the node-plane record for the daemon's own fetches — one line
@@ -2116,7 +2170,7 @@ pub(crate) fn url_object(url: &str) -> String {
 fn subtrees_delegated(root: &Path) -> bool {
     [Verdict::Deny, Verdict::Allow].iter().all(|verdict| {
         let subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(verdict.dir_name());
         DELEGATION_FILES
             .iter()
@@ -2133,7 +2187,7 @@ fn subtrees_delegated(root: &Path) -> bool {
 /// is a step that did not finish — the state a failed re-install leaves —
 /// and reads the same as no step at all.
 fn table_marker_present(root: &Path) -> bool {
-    root.join(sandbox2::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
+    root.join(sandbox::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
 }
 
 /// The ct-mark mask the loaded table classifies cohort and node plane
@@ -2227,8 +2281,12 @@ pub(crate) fn live_answerer() -> Option<SocketAddr> {
 /// be refused because the table's carve-out is stale, and the words that say
 /// so: the recorded target is not the live answerer bind, no answerer is
 /// bound, or the table recorded no carve-out at all. The words name the
-/// cause, both values, and the install that re-renders the carve-out onto
-/// the live bind. `None` when the carve-out names the live answerer.
+/// cause, both values, and the remedy as it stands: `min finalize-install
+/// --undo`, then `min finalize-install`, re-renders the carve-out for the
+/// answerer's default port — the step reads no live bind, so a daemon whose
+/// answerer is bound elsewhere has no self-service remedy yet, and the words
+/// say so rather than name flags the verb does not take. `None` when the
+/// carve-out names the live answerer.
 pub(crate) fn stale_carve_out_refusal(
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
@@ -2245,17 +2303,17 @@ pub(crate) fn stale_carve_out_refusal(
         |target| target.to_string(),
     );
     let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
+    let install = sandbox::classifier::install_hint();
+    let re_render = format!(
+        "{install} --undo, then {install} re-renders the carve-out for the answerer's \
+         default port; a daemon whose answerer is bound elsewhere has no self-service \
+         remedy yet"
+    );
     let remedy = match live_v4 {
-        Some(bound) => format!(
-            "{} --answerer-address {} --answerer-port {}",
-            sandbox2::classifier::install_hint(),
-            bound.ip(),
-            bound.port()
+        Some(bound) => format!("re-render the carve-out onto the live bind {bound}: {re_render}"),
+        None => format!(
+            "start the daemon's zone answerer on an IPv4 loopback address, then {re_render}"
         ),
-        None => "start the daemon's zone answerer on an IPv4 loopback address, then re-run \
-                 the classifier install with --answerer-address and --answerer-port set to \
-                 its bind"
-            .to_string(),
     };
     Some(format!(
         "{}: stale carve-out: the table admits {recorded_words} and the zone answerer is \
@@ -2304,7 +2362,7 @@ fn standin_mount() -> StandinMount {
     // name on a real host.
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
@@ -2359,6 +2417,23 @@ fn step_command_over(
     cohort: &str,
     node_plane: &str,
 ) -> std::process::Command {
+    let mut step = step_command_unenrolled(mount, mode, nft_dir);
+    step.arg("--cohort-address")
+        .arg(cohort)
+        .arg("--node-plane-address")
+        .arg(node_plane);
+    step
+}
+
+/// [`step_command`] with no source identity at all: the un-enrolled
+/// host's install (NET-078), which classifies the two identities and
+/// translates nothing.
+#[cfg(test)]
+fn step_command_unenrolled(
+    mount: &StandinMount,
+    mode: &[&str],
+    nft_dir: Option<&Path>,
+) -> std::process::Command {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/install-host-classifier.sh");
     let mut step = std::process::Command::new("bash");
@@ -2373,14 +2448,7 @@ fn step_command_over(
             std::env::join_paths(path).expect("the stub's directory joins the PATH"),
         );
     }
-    step.arg(script)
-        .arg("--root")
-        .arg(&mount.root)
-        .args(mode)
-        .arg("--cohort-address")
-        .arg(cohort)
-        .arg("--node-plane-address")
-        .arg(node_plane);
+    step.arg(script).arg("--root").arg(&mount.root).args(mode);
     step
 }
 
@@ -2528,9 +2596,16 @@ fn guest_bash() -> PathBuf {
     on_path.unwrap_or_else(|| PathBuf::from(GUEST_BASH))
 }
 
+/// The flags the guest's render passes for its resolver carve-out, spelled
+/// as the installer reads them: the default switch's gateway,
+/// `SwitchSubnet::default().dns_server()`, so the print and install lanes
+/// render the guest's own parameters.
+#[cfg(test)]
+const GUEST_RESOLVER_FLAGS: [&str; 2] = ["--gateway-resolver", "100.64.0.1"];
+
 /// The parameters a guest's own boot renders its table with, over a
-/// stand-in mount: the answerer at the address and port this daemon serves
-/// it (NET-079's one carve-out), the ct-mark bits the boot classifies with,
+/// stand-in mount: the switch gateway's resolver (NET-079's one carve-out on
+/// a VM-backed host), the ct-mark bits the boot classifies with,
 /// and the two source identities named by the caller — which a guest hands
 /// as two inputs even where they are the one address an un-enrolled guest
 /// has (NET-078).
@@ -2543,6 +2618,7 @@ fn guest_params<'a>(
 ) -> GuestRender<'a> {
     GuestRender {
         tree_root: &mount.root,
+        gateway_resolver: crate::net::SwitchSubnet::default().dns_server(),
         cohort_address: cohort,
         node_plane_address: node_plane,
         ct_mark_mask: GUEST_CT_MARK_MASK,
@@ -2555,7 +2631,7 @@ fn guest_params<'a>(
 /// it needs as argv (see `render_guest_ruleset`), over the stand-in mount the
 /// step's own tests render and load over.
 #[cfg(test)]
-fn guest_ruleset(cohort: IpAddr, node_plane: IpAddr) -> Vec<u8> {
+pub(crate) fn guest_ruleset(cohort: IpAddr, node_plane: IpAddr) -> Vec<u8> {
     let mount = standin_mount();
     // The stand-in mount table, as the guest's own render would read none: the
     // environment is cleared, so this is the one fact the render is told
@@ -2711,7 +2787,7 @@ mod tests {
     /// The tree root's own name — the component the installer renders a
     /// ruleset's cgroup paths below their covering mount from.
     fn tree_root_name() -> &'static str {
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .expect("the tree root is a slice below the cgroup2 mount root")
@@ -2731,12 +2807,12 @@ mod tests {
     fn installed_cohort(root: &Path) {
         for verdict in [Verdict::Deny, Verdict::Allow] {
             let subtree = root
-                .join(sandbox2::classifier::BOXES_DIR)
+                .join(sandbox::classifier::BOXES_DIR)
                 .join(verdict.dir_name());
             std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
             model_delegation_files(&subtree);
         }
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         std::fs::create_dir_all(root.join(TEST_CT_MARK_RECORD))
             .expect("the step records the ct-mark mask beside the marker");
@@ -2747,6 +2823,157 @@ mod tests {
             std::fs::write(dir.join(file), "")
                 .unwrap_or_else(|e| panic!("modeling {file} in {}: {e}", dir.display()));
         }
+    }
+
+    /// NET-078: an un-enrolled native host's install knows no source
+    /// address and needs none: the two identities are still two distinct
+    /// classifier matches — the boxes subtree for the host-address cohort,
+    /// the slice outside it for the node plane — and nothing is
+    /// translated: the postrouting chain is present and empty, so an
+    /// association can add the reserved addresses to it later without
+    /// touching the matches.
+    #[test]
+    fn unenrolled_native_identities_are_cgroup_matches_without_snat() {
+        let mount = standin_mount();
+        let printed = step_command_unenrolled(&mount, &["--print-ruleset"], None)
+            .output()
+            .expect("running the privileged step over the stand-in mount");
+        assert!(
+            printed.status.success(),
+            "the step renders with no identity given: {}",
+            String::from_utf8_lossy(&printed.stderr),
+        );
+        let ruleset = String::from_utf8(printed.stdout).expect("the rendered ruleset is text");
+        let rel = tree_root_name();
+        let cohort_path = format!("{}/{}", rel, sandbox::classifier::BOXES_DIR);
+        let classify = chain_rules(&ruleset, "classify");
+        assert_eq!(
+            classify.len(),
+            2,
+            "two identities, two matches: {classify:?}"
+        );
+        assert!(
+            classify[0].contains(&format!(
+                "socket cgroupv2 level {} \"{cohort_path}\"",
+                cohort_path.split('/').count()
+            )),
+            "the cohort is the boxes subtree: {classify:?}"
+        );
+        assert!(
+            classify[1].contains(&format!(
+                "socket cgroupv2 level {} \"{rel}\"",
+                rel.split('/').count()
+            )) && classify[1].contains("== 0"),
+            "the node plane is the slice outside the cohort, guarded by the mask: {classify:?}"
+        );
+        assert!(
+            ruleset.contains("chain postrouting"),
+            "the postrouting chain is present for a later association: {ruleset}"
+        );
+        assert!(
+            chain_rules(&ruleset, "postrouting").is_empty(),
+            "an un-enrolled host translates nothing: {ruleset}"
+        );
+        assert!(!ruleset.contains("snat"), "no SNAT anywhere: {ruleset}");
+    }
+
+    /// NET-078: an association adds the reserved SNAT addresses to the
+    /// un-enrolled install without a reinstall of the classifier: the
+    /// render with the pair differs from the render without it only in the
+    /// postrouting chain's rules — the tree, the classify matches, the
+    /// deny chain and every other byte are the same — so what the
+    /// association loads is the translation and nothing else.
+    ///
+    /// This pins the *shape* of the two rulesets, not the act of loading
+    /// the second over the first: no association code exists yet, so the
+    /// test proves that the step's render with a pair is the un-enrolled
+    /// render plus two postrouting rules, which is what lets a later
+    /// association load the translation without touching the matches.
+    #[test]
+    fn association_applies_reserved_snat_without_classifier_reinstall() {
+        let mount = standin_mount();
+        let unenrolled = step_command_unenrolled(&mount, &["--print-ruleset"], None)
+            .output()
+            .expect("running the privileged step over the stand-in mount");
+        let associated = step_command(&mount, &["--print-ruleset"], None)
+            .output()
+            .expect("running the privileged step over the stand-in mount");
+        assert!(unenrolled.status.success() && associated.status.success());
+        let unenrolled = String::from_utf8(unenrolled.stdout).unwrap();
+        let associated = String::from_utf8(associated.stdout).unwrap();
+        assert_eq!(
+            chain_rules(&unenrolled, "classify"),
+            chain_rules(&associated, "classify"),
+            "the association leaves the classifier's matches as they were"
+        );
+        let postrouting = chain_rules(&associated, "postrouting");
+        assert_eq!(postrouting.len(), 2, "{postrouting:?}");
+        assert!(
+            postrouting[0].contains(&format!("snat ip to {TEST_COHORT_ADDRESS}"))
+                && postrouting[1].contains(&format!("snat ip to {TEST_NODE_PLANE_ADDRESS}")),
+            "the association's two reserved addresses are the translation: {postrouting:?}"
+        );
+        // Every line but the postrouting rules is byte-identical.
+        let strip = |ruleset: &str| -> Vec<String> {
+            ruleset
+                .lines()
+                .filter(|line| !line.trim_start().contains("snat ip to"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            strip(&unenrolled),
+            strip(&associated),
+            "nothing but the translation changes between the two renders"
+        );
+    }
+
+    /// The launch-before-placement window: a native daemon starts in its
+    /// starter's cgroup, outside the slice, and the placement unit moves it
+    /// in only once its socket is up. A host-address launch made in that
+    /// window must not record `per_box`: the probe's child cannot be placed
+    /// in the tree from outside it (the migration's common ancestor is the
+    /// hierarchy root this account cannot write), so the leg reads as
+    /// unplaced, the reading is inconclusive, and the decision the record
+    /// is written from is undecidable with the probe as its cause — never
+    /// `decided`. Modeled over a stand-in tree whose deny subtree refuses
+    /// the probe its leaf, the same refusal the kernel makes at the
+    /// ancestor; and NET-080's record reads the daemon's leaf live, so a
+    /// fetch in the window names no node-plane leaf either.
+    #[test]
+    fn launch_before_placement_reads_not_per_box() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root is not refused the probe's leaf by mode bits");
+            return;
+        }
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let root = tree.path();
+        installed_cohort(root);
+        let deny = root
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(Verdict::Deny.dir_name());
+        std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o555))
+            .expect("the deny subtree refuses the probe its leaf");
+        let decision = decide(root, Some(&mountinfo(root, true)), false, || {
+            read_filter(root)
+        });
+        std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o755))
+            .expect("the subtree is writable again for the temp dir's removal");
+        assert!(
+            !decision.can_decide_per_box(),
+            "a launch before the placement never reads per_box: {decision:?}"
+        );
+        assert_eq!(
+            decision.cause(),
+            Some(Cause::ProbeUnreadable),
+            "the unplaced probe is the cause the record carries: {decision:?}"
+        );
+        assert_eq!(
+            daemon_fetch_leaf(root),
+            None,
+            "a fetch in the window records no node-plane leaf for a daemon outside the tree"
+        );
     }
 
     /// NET-078: the node plane and the host-address cohort are classified
@@ -2760,8 +2987,8 @@ mod tests {
     fn node_plane_and_cohort_distinct_sources() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
-        let cohort = root.join(sandbox2::classifier::BOXES_DIR);
-        let daemon = sandbox2::classifier::daemon_leaf(root);
+        let cohort = root.join(sandbox::classifier::BOXES_DIR);
+        let daemon = sandbox::classifier::daemon_leaf(root);
 
         // The node plane's identity is keyed on the daemon's leaf, a sibling
         // of the cohort and never inside it: a daemon leaf under `boxes/`
@@ -2783,7 +3010,7 @@ mod tests {
         // every box leaf is one deeper, in one subtree or the other, never
         // the cohort itself.
         for (verdict, id) in [(Verdict::Deny, "a deny-all box"), (Verdict::Allow, "a box")] {
-            let leaf = sandbox2::classifier::box_leaf(root, id, verdict);
+            let leaf = sandbox::classifier::box_leaf(root, id, verdict);
             assert_eq!(
                 leaf.parent().and_then(Path::parent),
                 Some(cohort.as_path()),
@@ -2815,7 +3042,7 @@ mod tests {
         children.sort();
         assert_eq!(
             children,
-            [sandbox2::config::ALLOW_DIR, sandbox2::config::DENY_DIR],
+            [sandbox::config::ALLOW_DIR, sandbox::config::DENY_DIR],
             "the cohort holds the two subtrees and nothing else"
         );
 
@@ -2841,7 +3068,7 @@ mod tests {
         // refuses to render half a pair, and refuses a mask that is not
         // two contiguous bits.
         let rel = tree_root_name();
-        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let cohort_path = format!("{}/{}", rel, sandbox::classifier::BOXES_DIR);
         let ruleset = rendered_ruleset();
         assert!(
             ruleset.contains("type filter hook output priority mangle"),
@@ -2962,9 +3189,9 @@ mod tests {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
         let deny_subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
-            .join(sandbox2::config::DENY_DIR);
-        let leaf = sandbox2::config::ClassifierLeaf::under(root, "a session", Verdict::Deny);
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(sandbox::config::DENY_DIR);
+        let leaf = sandbox::config::ClassifierLeaf::under(root, "a session", Verdict::Deny);
         assert_eq!(
             leaf.dir().parent(),
             Some(deny_subtree.as_path()),
@@ -2977,8 +3204,8 @@ mod tests {
         assert_ne!(
             leaf.dir().parent(),
             Some(
-                root.join(sandbox2::classifier::BOXES_DIR)
-                    .join(sandbox2::config::ALLOW_DIR)
+                root.join(sandbox::classifier::BOXES_DIR)
+                    .join(sandbox::config::ALLOW_DIR)
                     .as_path()
             ),
             "the deny-all box's leaf is in the deny subtree alone"
@@ -2995,8 +3222,8 @@ mod tests {
         let deny_subtree = format!(
             "{}/{}/{}",
             rel,
-            sandbox2::classifier::BOXES_DIR,
-            sandbox2::config::DENY_DIR
+            sandbox::classifier::BOXES_DIR,
+            sandbox::config::DENY_DIR
         );
         let ruleset = rendered_ruleset();
         let output = chain_rules(&ruleset, "output");
@@ -3119,7 +3346,7 @@ mod tests {
             "the refusal names every rule: {words}"
         );
         assert!(
-            words.contains("--network own_ip") && words.contains("own-address boxes enforce them"),
+            words.contains("--network own_ip") && words.contains("which enforces them"),
             "the refusal says own-address boxes enforce these rules: {words}"
         );
         // The words end with what to do: a refusal that names the rules it
@@ -3131,19 +3358,17 @@ mod tests {
         // the why ahead of it is the classifier's own limit, the thing a
         // person cannot fix from the declaration.
         assert!(
-            words.contains("remove these rules")
-                && words.contains("declare deny-all egress")
-                && words.contains("`egress` section")
+            words.contains("Remove them")
+                && words.contains("--deny-all-egress")
+                && words.contains("egress section")
                 && words.contains("all three allow lists present and empty")
                 && words.contains("no deny entries")
-                && words.contains(
-                    "the host-address classifier enforces only deny-all \
-                     until declared address rules are supported"
-                ),
+                && words.contains("host_ip boxes on this host enforce only deny-all egress")
+                && words.contains("these rules would go unenforced"),
             "the refusal says what to do about the rules it named: {words}"
         );
         assert!(
-            words.ends_with("(own-address boxes enforce them)"),
+            words.ends_with("which enforces them."),
             "the words end with the remedy, so what a person reads last is \
              what they can do: {words}"
         );
@@ -3240,20 +3465,24 @@ mod tests {
         let rules = unenforceable_rules(Some(&declaration));
         let words = unenforceable_declaration_words(&rules);
         let (_, remedy) = words
-            .split_once("remove these rules")
+            .split_once("Remove them")
             .expect("the refusal ends with its remedy");
         assert!(
             remedy.contains("--deny-all-egress"),
             "the remedy names the flag that declares deny-all: {words}"
         );
         assert!(
-            remedy.contains("`egress` section"),
+            remedy.contains("egress section"),
             "the flag names the section form beside it, never in place of \
              it: {words}"
         );
         assert!(
             remedy.contains("--network own_ip"),
             "the mode remedy stays beside the declaration's: {words}"
+        );
+        assert!(
+            words.chars().count() < 300,
+            "a one-rule refusal stays a sentence, not a wall: {words}"
         );
     }
 
@@ -3456,7 +3685,7 @@ mod tests {
             "the output chain does one thing, route a cgroup to its chain: {output:?}"
         );
         assert!(
-            output[0].contains(sandbox2::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
+            output[0].contains(sandbox::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
             "the one jump is the deny subtree's, so nothing else is decided \
              against a deny-all box: {output:?}"
         );
@@ -3501,7 +3730,7 @@ mod tests {
             .await
             .expect("the proxy binds a loopback port");
         let proxy_addr = proxy.local_addr().expect("the proxy's address");
-        tokio::spawn(crate::net::proxy::serve(proxy, router));
+        crate::traced::spawn(crate::net::proxy::serve(proxy, router));
         let answered = crate::net::proxy::proxy_get(
             proxy_addr,
             &format!("denybox.min.internal:{backend_port}"),
@@ -3640,7 +3869,7 @@ mod tests {
             "the resident box is declared deny-all, so its leaf sits in the \
              subtree the refusing rule matches"
         );
-        let resident = sandbox2::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
+        let resident = sandbox::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
             .expect("the launch makes the deny-all box's leaf");
 
         // The daemon's own leaf, entered the way the daemon enters it at
@@ -3648,10 +3877,10 @@ mod tests {
         // performs — its own pid into its leaf's `cgroup.procs` — and the
         // leaf needs the delegation-contract files modelled into it, because
         // nothing behind the stand-in makes them at mkdir.
-        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        let daemon = sandbox::classifier::daemon_leaf(&root);
         std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
         model_delegation_files(&daemon);
-        sandbox2::classifier::enter_daemon_leaf(&root)
+        sandbox::classifier::enter_daemon_leaf(&root)
             .expect("the daemon enters its own leaf, in the tree the box is resident in");
 
         // The fetch's leg: a connection the daemon opens from its own leaf,
@@ -3785,7 +4014,7 @@ mod tests {
         let leaf = daemon_fetch_leaf(&root);
         assert_eq!(
             leaf,
-            Some(sandbox2::classifier::DAEMON_LEAF),
+            Some(sandbox::classifier::DAEMON_LEAF),
             "the daemon that entered its own leaf above reads back as in it, \
              which is the premise the record's leaf field is about to claim"
         );
@@ -3823,7 +4052,7 @@ mod tests {
                 "the record names the host fetched: {line}"
             );
             assert!(
-                line.contains(sandbox2::classifier::DAEMON_LEAF),
+                line.contains(sandbox::classifier::DAEMON_LEAF),
                 "the record names the leaf the fetch left from: {line}"
             );
             assert!(
@@ -3858,7 +4087,7 @@ mod tests {
         let mount = standin_mount();
         let root = mount.root.clone();
         installed_cohort(&root);
-        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        let daemon = sandbox::classifier::daemon_leaf(&root);
         std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
         model_delegation_files(&daemon);
 
@@ -3910,11 +4139,11 @@ mod tests {
         // The entry the daemon performs at start, over the same tree: the
         // leaf read turns, and the line with it — the fetch is now recorded
         // as leaving from the leaf the tree holds for it, beside the cohort.
-        sandbox2::classifier::enter_daemon_leaf(&root)
+        sandbox::classifier::enter_daemon_leaf(&root)
             .expect("the daemon enters its own leaf over the stand-in tree");
         assert_eq!(
             daemon_fetch_leaf(&root),
-            Some(sandbox2::classifier::DAEMON_LEAF),
+            Some(sandbox::classifier::DAEMON_LEAF),
             "the daemon that entered its leaf reads back as in it"
         );
         let (log, guard) = capture_node_plane_log();
@@ -3941,7 +4170,7 @@ mod tests {
         // none to name — the same line as the unplaced daemon's, read the
         // same way by a bundle's tail on a host that never ran the install.
         let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
-        let slice = std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        let slice = std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a path with a name");
         assert_eq!(
@@ -4256,11 +4485,16 @@ mod tests {
         );
 
         // The print lane: the same transaction as text, over the guest's
-        // own parameters — a VM-backed guest renders no resolver carve-out.
+        // own parameters — a VM-backed guest's carve-out is the gateway's
+        // resolver.
         let print_mount = standin_mount();
         let printed = run_step(
             &print_mount,
-            &["--print-ruleset", "--no-resolver-carve-out"],
+            &[
+                "--print-ruleset",
+                GUEST_RESOLVER_FLAGS[0],
+                GUEST_RESOLVER_FLAGS[1],
+            ],
             None,
         );
         assert!(
@@ -4290,7 +4524,7 @@ mod tests {
         // posture lifts is the only privilege it does — so this lane
         // asserts the one text on root lanes too, not only where a
         // person's account happens to be the one that ran sudo.
-        let installed = run_install_with(&mount, &["--no-resolver-carve-out"], stub.path());
+        let installed = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, stub.path());
         assert!(
             installed.status.success(),
             "the install lays out its tree and hands its one transaction to nft: {}{}",
@@ -4388,12 +4622,8 @@ mod tests {
         let command = cause
             .install_command()
             .expect("the step's cause is the one a command ends");
-        assert!(
-            command.contains("install-host-classifier.sh"),
-            "the command is the privileged step's install: {command}"
-        );
-        assert!(
-            command.contains("sudo bash ./install-host-classifier.sh"),
+        assert_eq!(
+            command, "min finalize-install",
             "the command is the one a person runs, spelled exactly: {command}"
         );
 
@@ -4438,7 +4668,7 @@ mod tests {
         // — for a guest, that is the state a launch refuses rather than
         // places (design §7.1).
         installed_cohort(root);
-        std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("removing the marker");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
@@ -4460,7 +4690,7 @@ mod tests {
         // whose table's bits it cannot name.
         std::fs::remove_dir_all(root.join(TEST_CT_MARK_RECORD))
             .expect("removing the recorded mask");
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
@@ -4510,7 +4740,7 @@ mod tests {
         // the listing is handed to the decision here as the fact a guest
         // whose boot loaded its table reads (the recheck itself is pinned
         // in `guest_decide_rechecks_table_not_only_marker`).
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         let decided = decide(root, Some(&mountinfo(root, true)), false, refused_reading);
         assert!(
@@ -4566,12 +4796,10 @@ mod tests {
             detail.contains("marked loaded") && detail.contains("was not refused"),
             "the cause names what the marker said and what the probe read: {detail}"
         );
-        let command = cause
-            .install_command()
-            .expect("reloading the table is the command that ends it");
         assert!(
-            command.contains("install-host-classifier.sh"),
-            "the command is the one thing that reloads the table: {command}"
+            cause.install_command().is_none(),
+            "the marker the install's item reads is present, so the install is a \
+             no-op here, not a reload: no command is named"
         );
 
         // And a probe that could not read the table at all claims nothing:
@@ -4946,7 +5174,7 @@ mod tests {
         let read = || {
             decide_now(
                 root,
-                sandbox2::classifier::own_mountinfo().as_deref(),
+                sandbox::classifier::own_mountinfo().as_deref(),
                 crate::guest::is_microvm_daemon(),
             )
         };
@@ -5004,7 +5232,11 @@ mod tests {
         ] {
             let step = step_command_over(
                 &mount,
-                &["--print-ruleset", "--no-resolver-carve-out"],
+                &[
+                    "--print-ruleset",
+                    GUEST_RESOLVER_FLAGS[0],
+                    GUEST_RESOLVER_FLAGS[1],
+                ],
                 None,
                 &cohort.to_string(),
                 &node_plane.to_string(),
@@ -5068,7 +5300,8 @@ mod tests {
                 "--print-ruleset".to_string(),
                 "--root".to_string(),
                 mount.root.display().to_string(),
-                "--no-resolver-carve-out".to_string(),
+                "--gateway-resolver".to_string(),
+                crate::net::SwitchSubnet::default().dns_server().to_string(),
                 "--cohort-address".to_string(),
                 guest_ip.to_string(),
                 "--node-plane-address".to_string(),
@@ -5222,16 +5455,26 @@ mod tests {
         );
     }
 
-    /// On a VM-backed host the guest renders no resolver carve-out: its node
-    /// DNS layer applies no per-box name rule to host-address boxes, so the
-    /// table admits no resolver for a deny-all box and retargets nothing.
-    /// The deny chain is the reply admission, the log, and the reject — a
-    /// deny-all box's DNS to the gateway meets the reject like any other
-    /// destination — and no chain moves or matches DNS's port. Read off the
-    /// guest's own render, over the collapsed pair an un-enrolled guest has.
+    /// NET-079's one carve-out on a VM-backed host, as the guest's own render
+    /// spells it: the resolver Minimal owns for a host-address box there is
+    /// the node's DNS layer at the switch gateway (NET-003), so the deny
+    /// chain admits the gateway on DNS's port, over UDP and over TCP (a
+    /// truncated answer retries over TCP), and nothing else beside the reply
+    /// direction. Nothing is retargeted: the box already asks the gateway,
+    /// so the table carries no dstnat chain, and the gateway on any other
+    /// port (its control surface) meets the reject like any destination.
+    /// Read off the guest's own render, over the collapsed pair an
+    /// un-enrolled guest has.
     #[test]
-    fn guest_deny_all_renders_no_resolver_carve_out() {
-        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+    fn guest_deny_all_renders_gateway_resolver_carve_out() {
+        let subnet = crate::net::SwitchSubnet::default();
+        let guest_ip = IpAddr::V4(subnet.daemon_ip());
+        let gateway = subnet.dns_server();
+        assert_eq!(
+            GUEST_RESOLVER_FLAGS,
+            ["--gateway-resolver", gateway.to_string().as_str()],
+            "the tests' spelling of the guest's carve-out is the switch gateway"
+        );
         let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
             .expect("the guest's render is text");
         assert!(
@@ -5244,10 +5487,17 @@ mod tests {
             .copied()
             .filter(|rule| rule.ends_with("accept"))
             .collect();
+        let udp = format!("ip daddr {gateway} udp dport 53 accept");
+        let tcp = format!("ip daddr {gateway} tcp dport 53 accept");
         assert_eq!(
             accepts,
-            ["ct state established,related ct direction reply accept"],
-            "the deny chain admits the reply direction and nothing else: {deny_out:?}"
+            [
+                "ct state established,related ct direction reply accept",
+                udp.as_str(),
+                tcp.as_str(),
+            ],
+            "the deny chain admits the reply direction and the gateway's resolver \
+             on port 53 over udp and tcp, and nothing else: {deny_out:?}"
         );
         assert_eq!(
             deny_out.last().copied(),
@@ -5255,21 +5505,84 @@ mod tests {
             "everything else a deny-all box opens is rejected: {deny_out:?}"
         );
         assert!(
-            !ruleset.contains("dport 53") && !ruleset.contains("dnat "),
-            "no rule matches or moves DNS's port:\n{ruleset}"
+            !ruleset.contains("dnat "),
+            "no rule moves a lookup anywhere:\n{ruleset}"
+        );
+        for chain in ["output", "classify", "postrouting"] {
+            let rules = chain_rules(&ruleset, chain);
+            assert!(
+                rules.iter().all(|rule| !rule.contains("dport 53")),
+                "DNS's port is matched in deny_out alone, not {chain}: {rules:?}"
+            );
+        }
+        assert!(
+            GUEST_RESOLVER_CARVE_OUT_LINE.contains("node's DNS layer at the gateway")
+                && GUEST_RESOLVER_CARVE_OUT_LINE.contains("port 53 over udp and tcp"),
+            "the render's one line names the carve-out it renders"
+        );
+    }
+
+    /// NET-079's interim on a VM-backed host: a guest whose table loaded
+    /// decides per box, and a host that decides per box refuses an allow-list
+    /// host-address declaration (`egress.allow_dns_hosts` with its address
+    /// rules) at create and at launch, naming each rule, because the guest's
+    /// table enforces deny-all or nothing. While this refusal stands, NET-066
+    /// (admitting an allowed name's answers for such a box) is moot on a VM
+    /// host: no such box runs. The same declaration is not refused on a guest
+    /// that decides nothing, where it runs unenforced, nor for an own-address
+    /// box, whose relay enforces it.
+    #[test]
+    fn allow_list_host_address_declaration_refused_on_vm_host() {
+        let allow_list = sessions::EgressPolicy {
+            allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec!["github.com".to_string()]),
+            deny_subnets: None,
+        };
+        let guest_decided = Decision::decided();
+        assert!(
+            guest_decided.can_decide_per_box(),
+            "a guest whose table loaded and whose probe read a refusal decides per box"
         );
         assert_eq!(
-            GUEST_NO_CARVE_OUT_LINE,
-            "deny-all host-address box on VM host: no resolver carve-out \
-             (follow-up gominimal/inbox#897)",
-            "the render's one line names the follow-up"
+            refuses_unenforceable_declaration(
+                sessions::NetworkMode::HostNet,
+                guest_decided.can_decide_per_box(),
+                Some(&allow_list),
+            ),
+            Some(vec![
+                UnenforceableRule::AllowSubnets,
+                UnenforceableRule::AllowDnsHosts,
+                UnenforceableRule::AllowProtocols,
+            ]),
+            "a deciding guest refuses the allow-list host-address box over its rules"
+        );
+        let guest_undecided = Decision::undecidable(Cause::GuestTableNotLoaded);
+        assert_eq!(
+            refuses_unenforceable_declaration(
+                sessions::NetworkMode::HostNet,
+                guest_undecided.can_decide_per_box(),
+                Some(&allow_list),
+            ),
+            None,
+            "a guest that decides nothing runs the box unenforced instead"
+        );
+        assert_eq!(
+            refuses_unenforceable_declaration(
+                sessions::NetworkMode::OwnIp,
+                guest_decided.can_decide_per_box(),
+                Some(&allow_list),
+            ),
+            None,
+            "an own-address box's allow list is enforced on its relay, never refused"
         );
     }
 
     /// The native install records the carve-out it loaded beside the marker,
     /// the decision reads that record with the verdict, and a deny-all
     /// launch over it runs only while the record names the answerer's live
-    /// bind (NET-079). An install that renders no carve-out records none.
+    /// bind (NET-079). An install whose carve-out is the gateway's resolver
+    /// records none.
     #[test]
     fn carve_out_targets_live_answerer_bind() {
         let mount = standin_mount();
@@ -5308,9 +5621,9 @@ mod tests {
             "a carve-out naming the live bind runs the box"
         );
 
-        // A re-install that renders no carve-out clears the record it
-        // replaces and writes none.
-        let bare = run_install_with(&mount, &["--no-resolver-carve-out"], nft_dir.path());
+        // A re-install whose carve-out is the gateway's resolver clears the
+        // answerer record it replaces and writes none.
+        let bare = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, nft_dir.path());
         assert!(
             bare.status.success(),
             "the re-install runs: {}",
@@ -5325,8 +5638,11 @@ mod tests {
 
     /// A native deny-all launch is refused when the table's carve-out is not
     /// the live answerer bind, or when the table recorded none: the words are
-    /// the table-not-effective cause, both values, and the install that
-    /// re-renders onto the live bind.
+    /// the table-not-effective cause, both values, and the remedy as it
+    /// stands — the undo-then-install that re-renders for the default port,
+    /// and that a bind elsewhere has no self-service remedy yet — never the
+    /// verb with flags it does not take, and never a claim the step reads
+    /// the live bind.
     #[test]
     fn native_deny_all_refused_when_carve_out_target_is_stale() {
         let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
@@ -5338,7 +5654,10 @@ mod tests {
             "stale carve-out",
             "127.0.0.1:7656",
             "127.0.0.1:7700",
-            "--answerer-address 127.0.0.1 --answerer-port 7700",
+            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install \
+             --undo, then min finalize-install re-renders the carve-out for the answerer's \
+             default port",
+            "no self-service remedy yet",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5351,6 +5670,61 @@ mod tests {
             unrecorded.contains("no recorded carve-out") && unrecorded.contains("127.0.0.1:7700"),
             "the refusal names the missing record and the live bind: {unrecorded}"
         );
+    }
+
+    /// Every remedy the daemon renders for a person names a command that
+    /// exists: `min finalize-install` bare — the CLI reads the answerer bind
+    /// and the source identities itself — never with flags of the installer
+    /// script appended, and never the script or a fetch of it. Over every
+    /// cause and verdict the advisory takes, both arms of the stale
+    /// carve-out refusal, and the cause's own command.
+    #[test]
+    fn rendered_remedies_never_append_flags_to_the_install_verb() {
+        let live = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7700);
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
+        let mut rendered = vec![
+            stale_carve_out_refusal(Some(recorded), Some(live)).expect("stale"),
+            stale_carve_out_refusal(Some(recorded), None).expect("no live answerer"),
+            stale_carve_out_refusal(None, Some(live)).expect("no record"),
+        ];
+        for cause in [
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+            Cause::GuestTableNotLoaded,
+            Cause::TableNotEffective,
+            Cause::ProbeUnreadable,
+        ] {
+            for declaration in [
+                sessions::EgressPolicy::deny_all(),
+                sessions::EgressPolicy::default(),
+                sessions::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..sessions::EgressPolicy::default()
+                },
+            ] {
+                rendered.push(advisory_text(cause, &declaration));
+            }
+            rendered.extend(cause.install_command());
+        }
+        for text in rendered {
+            let without_undo = text.replace("min finalize-install --undo", "");
+            assert!(
+                !without_undo.contains("min finalize-install --"),
+                "the verb takes none of the installer's flags (only its own --undo): {text}"
+            );
+            assert!(
+                !text.contains("reads the answerer"),
+                "no claim that the step reads the live bind: {text}"
+            );
+            assert!(
+                !text.contains("install-host-classifier.sh") && !text.contains("curl"),
+                "the remedy is the verb, never the script or a fetch: {text}"
+            );
+            assert!(
+                !text.contains("--answerer-address") && !text.contains("--cohort-address"),
+                "no installer flag is asked of a person: {text}"
+            );
+        }
     }
 
     /// No live answerer — never bound, or stopped — refuses a native
@@ -5454,7 +5828,7 @@ mod tests {
             "the digest the boot logs covers exactly the bytes piped to the load"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the marker is written after the load"
         );
         assert!(
@@ -5481,7 +5855,7 @@ mod tests {
             "the check that refused is the only call: no load ran behind it"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a refused check writes no marker, and the one a previous load \
              wrote does not survive a load that did not run"
         );
@@ -5498,7 +5872,7 @@ mod tests {
             other => panic!("a refused load is the load's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a refused load writes no marker"
         );
         assert!(
@@ -5536,7 +5910,7 @@ mod tests {
             load_guest_table(&guest_bash(), &nft, &params)
                 .expect("the load runs over an nft stub that accepts it");
             assert!(
-                root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+                root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
                 "the load that succeeded wrote the marker"
             );
         };
@@ -5569,7 +5943,7 @@ mod tests {
             }
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a render that never returned writes no marker, and takes the \
              standing one away first"
         );
@@ -5587,7 +5961,7 @@ mod tests {
             other => panic!("a check that never returns is the check's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "no load ran behind a check that never answered, so no marker stands"
         );
 
@@ -5611,7 +5985,7 @@ mod tests {
             other => panic!("a load that never returns is the load's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a table nobody loaded is not marked present"
         );
     }
@@ -5678,7 +6052,7 @@ mod tests {
              the guest's boot reaches its load: {held:?}"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the load the ordered boot ran wrote its marker"
         );
 
@@ -5687,7 +6061,7 @@ mod tests {
         // and a host that allows it keeps the verdict the order is for — and
         // still loads, because the marker's table is not the listeners'.
         let cause = std::io::Error::other("the loopback would not come up");
-        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let _ = std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER));
         let (ran, held_at_load) = (
             std::cell::RefCell::new(Vec::new()),
             std::cell::Cell::new(None),
@@ -5728,14 +6102,14 @@ mod tests {
              bind keeps the verdict the order is for"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the load is not gated on the loopback or the listeners: the \
              marker's table is still the decision's own fact"
         );
 
         // And a hold that cannot bind is the same: logged, and the load
         // still runs, so the tree it leaves is the fact a launch reads.
-        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let _ = std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER));
         let ran = std::cell::RefCell::new(Vec::new());
         boot_guest_classifier(
             || {
@@ -5755,7 +6129,7 @@ mod tests {
         );
         assert_eq!(*ran.borrow(), ["loopback", "listeners", "load"]);
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a hold that cannot bind does not stop the load"
         );
         clear_probe_listeners();
@@ -5787,7 +6161,7 @@ mod tests {
         load_guest_table(&guest_bash(), &nft, &params)
             .expect("the load runs over an nft stub that accepts it");
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the previous load wrote its marker"
         );
 
@@ -5813,7 +6187,7 @@ mod tests {
             "no check ran behind a render that failed"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a failed render leaves no marker, and the one a previous load \
              wrote does not survive a load that did not run"
         );
@@ -5864,12 +6238,12 @@ mod tests {
             "the load the stub refuses fails"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a failed load leaves no marker to vouch for a table"
         );
         assert!(
-            root.join(sandbox2::classifier::BOXES_DIR)
-                .join(sandbox2::config::DENY_DIR)
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::DENY_DIR)
                 .is_dir(),
             "the subtrees stay: only the table's marker is the boot's half"
         );
@@ -5909,7 +6283,7 @@ mod tests {
         // a memo another launch could overwrite — so the undecidable
         // reading above is exactly what keeps the plan on the node's DNS
         // layer. Proven in provider.rs's
-        // `guest_deny_all_renders_no_resolver_carve_out_in_the_box_plan`.
+        // `guest_deny_all_box_resolves_through_answerer_once_decided`.
     }
 
     /// The per-launch recheck is bounded like every other guest child: an
@@ -5977,7 +6351,7 @@ mod tests {
         // its subtrees but no marker is still the interim, and no listing is
         // consulted for it either.
         installed_cohort(root);
-        std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("removing the marker");
         let listed = std::cell::Cell::new(0);
         let still_unmarked = decide_over(root, Some(&table), true, refused_reading, || {
@@ -5990,7 +6364,7 @@ mod tests {
             "the marker gates the recheck too: subtrees alone are no table"
         );
         assert_eq!(listed.get(), 0, "no listing is read without the marker");
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("restoring the marker");
 
         // A table the kernel no longer holds behind its marker — a flush, a

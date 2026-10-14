@@ -2,7 +2,8 @@ name: CI (Kani proofs)
 
 # Kani bounded-verification harnesses over the pure security-load-bearing
 # cores (#1109): the rcache index_file untrusted-bytes parse path and the
-# sessions PathDecision combination lattice. ADVISORY lane: not in branch
+# PathDecision combination lattice in the session-types crate (`sessions`,
+# renamed `boxes`). ADVISORY lane: not in branch
 # protection's required contexts until the harnesses have soaked — flip by
 # adding `ci-kani-success` to the ruleset, no workflow change needed.
 #
@@ -60,6 +61,9 @@ jobs:
                       kani:
                         - "crates/rcache/**"
                         - "crates/sessions/**"
+                        # The same crate after its rename to `boxes`; both
+                        # paths match until the old one is dropped.
+                        - "crates/boxes/**"
                         # The Box Egress Proxy's redemption decision and
                         # audit chain (docs/specs/24, BEP-019 to BEP-025,
                         # BEP-031, BEP-049, BEP-058, BEP-064) are proved

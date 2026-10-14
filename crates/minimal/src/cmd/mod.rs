@@ -18,6 +18,7 @@ use minimal_client::{ensure_version_match, ensure_version_reported, version_asse
 use crate::*;
 
 mod admin;
+mod finalize_install;
 mod list;
 mod net;
 mod project;
@@ -26,25 +27,163 @@ mod session;
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the provider-kind rule its gate keys on.
-use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
+pub(crate) use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
+pub use finalize_install::*;
 pub use list::*;
 pub use net::*;
 pub use project::*;
 pub use session::*;
 
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
-    use tracing::Instrument as _;
-    let ctx = minimal_client::trace_context();
     let root = tracing::info_span!(
         "cmd",
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
     );
+    // A caller may run `min` inside its own trace (a CI job, a test
+    // harness, or a script in a session, whose daemon put the exec's
+    // `TRACEPARENT` there on opt-in): adopt it as the parent. Adopting is
+    // not exporting. When this process exports, the context goes on to
+    // this command's daemon RPCs; when it does not, the daemon is told
+    // the command opted out and gets no `TRACEPARENT` (below), and the ids
+    // only join this process's own log lines to the caller's trace. A
+    // `min` inside a box is the in-box helper, not this binary: it hands
+    // the box's `TRACEPARENT` to the daemon itself (TEL-025, minimald's
+    // `channel_request_span`).
+    let inbound = inbound_parent(std::env::var(minimald_rpc::trace::TRACEPARENT_ENV).ok());
+    let ctx = root_context(&root, inbound.as_ref());
+    minimal_client::init_trace_context(ctx);
+    // With telemetry off (not opted in, `DO_NOT_TRACK`, `OTEL_SDK_DISABLED`,
+    // or traces off: whatever left no tracer installed) the daemon is told
+    // so on every channel and given no `TRACEPARENT`, so it records nothing
+    // of this command's requests either. The ids above still join this
+    // process's own log lines.
+    minimal_client::set_telemetry_opted_out(!mlog::otel::exporting());
+    let ctx = minimal_client::trace_context();
+    root.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    root.record("span_id", tracing::field::display(ctx.span_id_hex()));
+    if let Some(p) = &inbound {
+        root.record("parent_span_id", tracing::field::display(p.span_id_hex()));
+    }
     // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
     // query depth (128) when computing the future's layout.
-    Box::pin(run_command(cli)).instrument(root).await
+    match run_in_root(root, Box::pin(run_command(cli))).await? {
+        None => Ok(()),
+        Some(handoff) => Err(handoff.finish()),
+    }
+}
+
+/// What a command leaves for the process to do after its `cmd` span has
+/// ended: exit with ssh's status, or die of the signal that stopped it.
+///
+/// Neither returns, so neither can run inside the span: the span would never
+/// end, and every span under it (the client's and the daemon's) would parent
+/// to one the collector never sees. A command returns this as its error
+/// ([`session_via_ssh`]); [`run`] takes it back out once the span has ended
+/// and finishes it there. It is the [`crate::task::TaskExit`] pattern: a
+/// status carried on the error path, never printed.
+#[derive(Debug)]
+pub(crate) enum Handoff {
+    /// Exit with this status (`min session exec` / `run` once ssh has exited
+    /// or been taken down, an interactive attach after ssh has exited and the
+    /// terminal has been put back).
+    Exit(i32),
+    /// Die of this signal, as if nothing had caught it (`min net forward`,
+    /// stopped by SIGTERM or SIGHUP once its relays are down).
+    Raise(nix::sys::signal::Signal),
+}
+
+impl std::fmt::Display for Handoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only seen if a hand-off escapes [`run`], which takes every one back.
+        match self {
+            Self::Exit(code) => write!(f, "unfinished hand-off: exit {code}"),
+            Self::Raise(signal) => write!(f, "unfinished hand-off: raise {signal}"),
+        }
+    }
+}
+
+impl std::error::Error for Handoff {}
+
+impl Handoff {
+    /// Flush exported telemetry, then exit or raise. Never returns.
+    ///
+    /// The flush has the bound of the normal exit path
+    /// ([`mlog::otel::CLI_EXIT_FLUSH`]); with telemetry off it returns at
+    /// once, so the hand-off is what it was before. On the exit path the
+    /// `atexit` hook finds the flush done and returns.
+    fn finish(self) -> anyhow::Error {
+        mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+        match self {
+            Self::Exit(code) => std::process::exit(code),
+            Self::Raise(signal) => die_of(signal),
+        }
+    }
+}
+
+/// End the process by `signal` as an uncaught one would: restore its default
+/// action, then raise it, so a parent sees the same wait status (killed by
+/// that signal, no core) as when no handler was installed.
+///
+/// Exits with the shell's `128 + signal` only if the signal does not end the
+/// process: its default action could not be restored, or it does not
+/// terminate.
+fn die_of(signal: nix::sys::signal::Signal) -> ! {
+    use nix::sys::signal::{SigHandler, raise};
+    // SAFETY: SIG_DFL installs no handler, so no code of ours can run in
+    // signal context; the handler it replaces (tokio's) is never needed again
+    // because the process ends here.
+    let restored = unsafe { nix::sys::signal::signal(signal, SigHandler::SigDfl) };
+    // raise() delivers to this thread before it returns, so with the default
+    // action restored a terminating signal never comes back here.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "a failure to restore or raise falls through to the exit below"
+    )]
+    let _ = restored.and_then(|_| raise(signal));
+    std::process::exit(128_i32.saturating_add(signal as i32))
+}
+
+/// Run `command` inside `root`, end `root`, and return the command's
+/// [`Handoff`], if it made one. Any other error is returned as is.
+///
+/// `root` ends when the instrumented future is dropped, at the end of the
+/// `await`, so it has closed (and its exporter has it) by the time a caller
+/// finishes the hand-off.
+async fn run_in_root<F>(root: tracing::Span, command: F) -> Result<Option<Handoff>, anyhow::Error>
+where
+    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+{
+    use tracing::Instrument as _;
+    match command.instrument(root).await {
+        Ok(()) => Ok(None),
+        Err(e) => match e.downcast::<Handoff>() {
+            Ok(handoff) => Ok(Some(handoff)),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// The caller's trace context from a `TRACEPARENT` value, read whether or not
+/// this process exports (TEL-021: forwarding is not exporting).
+fn inbound_parent(raw: Option<String>) -> Option<minimald_rpc::trace::TraceContext> {
+    raw.and_then(|v| minimald_rpc::trace::TraceContext::parse_traceparent(&v))
+}
+
+/// The command's root context: the exported span's ids when exporting,
+/// otherwise a child of `inbound` (or a fresh trace when there is none).
+fn root_context(
+    root: &tracing::Span,
+    inbound: Option<&minimald_rpc::trace::TraceContext>,
+) -> minimald_rpc::trace::TraceContext {
+    use minimald_rpc::trace::TraceContext;
+    match mlog::otel::align(root, inbound.map(TraceContext::parts)) {
+        Some((t, s, f)) => TraceContext::from_parts(t, s, f),
+        None => inbound.map_or_else(TraceContext::mint, TraceContext::child),
+    }
 }
 
 pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
@@ -82,11 +221,13 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
+        Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
             diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
+            diag::DiagCommand::Delete(args) => diag::cmd_diag_delete(args).await,
         },
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {
@@ -103,6 +244,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
+        #[cfg(debug_assertions)]
+        Some(Command::DebugAnswererCommand) => {
+            println!(
+                "{}",
+                crate::resolver::answerer_command_for_this_host().await?
+            );
+            Ok(())
+        }
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -123,75 +272,13 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     }
 }
 
-/// Bounded retries when a freshly minted autogen name collides with an
-/// existing session built from the same directory.
-pub(crate) const AUTOGEN_NAME_RETRIES: u32 = 8;
-
-/// Longest component [`sanitize_name_component`] returns, so a minted
-/// `task-<component>-<hex>` (the longest wrapper) stays inside the 63-octet
-/// DNS label `validate_session_name` requires.
-const NAME_COMPONENT_MAX: usize = 48;
-
-/// Reduce a directory basename to the characters a session name may carry —
-/// ASCII alphanumerics, lowercased, with `-`, `_` and `.` each mapped to `-` —
-/// dropping everything else (spaces, unicode) and capping the length, so the
-/// minted handle is typable and is a single DNS label that clears
-/// `validate_session_name`. Falls back to `session` when nothing survives.
-pub(crate) fn sanitize_name_component(basename: &str) -> String {
-    let filtered: String = basename
-        .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() {
-                Some(c.to_ascii_lowercase())
-            } else if matches!(c, '-' | '_' | '.') {
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .take(NAME_COMPONENT_MAX)
-        .collect();
-    let trimmed = filtered.trim_matches('-');
-    if trimmed.is_empty() {
-        "session".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Mint a typable session name `<dir-basename>-<hex>` from the project
-/// directory. The caller supplies the hex so the format is unit-testable and
-/// so a collision retry can re-mint with fresh entropy.
-pub(crate) fn autogen_session_name(project_dir: &camino::Utf8Path, hex: &str) -> String {
-    let base = sanitize_name_component(project_dir.file_name().unwrap_or("session"));
-    format!("{base}-{hex}")
-}
-
-/// Four lowercase hex digits of per-call entropy, drawn from the stdlib
-/// hasher's randomized seed — enough to disambiguate sessions from one
-/// directory without pulling in an RNG dependency. Each call reseeds, so a
-/// retry gets a fresh suffix.
-pub(crate) fn random_hex4() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-    let seed = RandomState::new().hash_one("minimal-session-name");
-    format!("{:04x}", seed & 0xffff)
-}
-
-/// The daemon collapses the session-store `AlreadyExists` into a plain message
-/// (see `serve_create_session` in `crates/minimald/src/rpc.rs`); match it so an
-/// autogen name clash can be told apart from any other `CreateSession` failure.
-pub(crate) fn is_name_collision(error: &str) -> bool {
-    error.contains("already exists")
-}
-
-/// Whether a failed `CreateSession` should retry under a freshly minted name:
-/// only autogen names (`autogen`), only on a name collision, and only within
-/// the bounded budget. A user-supplied name never retries, so its collision
-/// surfaces verbatim.
-pub(crate) fn should_retry_autogen(autogen: bool, attempts: u32, error: &str) -> bool {
-    autogen && attempts < AUTOGEN_NAME_RETRIES && is_name_collision(error)
-}
+// The autogen session name and its collision retry are the client
+// library's, shared with `min dash`.
+#[cfg(test)]
+pub(crate) use minimal_client::session_name::AUTOGEN_NAME_RETRIES;
+pub(crate) use minimal_client::session_name::{
+    autogen_session_name, random_hex4, sanitize_name_component, should_retry_autogen,
+};
 
 /// Connect to the daemon, resolving the socket path from global args, and
 /// refuse to proceed against a daemon of a different build
@@ -228,7 +315,8 @@ pub(crate) async fn connect_daemon_unchecked(
 }
 
 /// A session reference parsed from a CLI string: either a UUID or a name.
-/// Used to build the typed request enums both `GetSessionRecord` and
+/// A name lookup that misses falls back to a unique id prefix in
+/// [`get_session_record`]. Used to build the typed request enums both `GetSessionRecord` and
 /// `GetSessionPolicy` expect.
 pub(crate) enum SessionLookup {
     Id(sessions::SessionId),
@@ -273,11 +361,13 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
     }
 }
 
-/// Resolve a session by UUID or name, returning its record.
+/// Resolve a session by UUID, unique id prefix, or session name, returning
+/// its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
 /// rename). If the string parses as a UUID, the session
-/// is looked up by ID; otherwise by name. Bails if no session matches.
+/// is looked up by ID; otherwise by name, then by unique id prefix (see
+/// [`get_session_record`]). Bails if no session matches.
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
     session: &str,
@@ -306,17 +396,130 @@ pub(crate) async fn resolve_session_version_gated(
 }
 
 /// The `GetSessionRecord` round trip both resolvers share.
+///
+/// A name lookup that finds no record falls back to matching `session` as an
+/// id prefix (see [`match_id_prefix`]), so the short id `min ls` prints
+/// resolves. An exact name always wins, because the name is asked first. A
+/// prefix that matches several sessions is an error naming them; one that
+/// matches none returns the empty reply, for the caller's "no session found".
 pub(crate) async fn get_session_record(
     client: &mut client::Client,
     session: &str,
 ) -> Result<minimald_rpc::GetSessionRecordResponse, anyhow::Error> {
-    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
-    let lookup: GetSessionRecordRequest = SessionLookup::parse(session).into();
-    client
-        .oneshot_rpc::<GetSessionRecord>(lookup)
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest, ListSessions};
+    let lookup = SessionLookup::parse(session);
+    let by_name = matches!(lookup, SessionLookup::Name(_));
+    let resp = client
+        .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::from(lookup))
         .await
-        .context("GetSessionRecord RPC failed")
+        .context("GetSessionRecord RPC failed")?;
+    if resp.record.is_some() || !by_name || !is_id_prefix(session) {
+        return Ok(resp);
+    }
+    let listing = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    match match_id_prefix(&listing.sessions, session)? {
+        Some(id) => client
+            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+            .await
+            .context("GetSessionRecord RPC failed"),
+        None => Ok(resp),
+    }
 }
+
+/// Whether `s` is shaped like a session id prefix: 4 to 32 hex digits, with
+/// dashes allowed between them.
+pub(crate) fn is_id_prefix(s: &str) -> bool {
+    let digits = s.chars().filter(|c| *c != '-').count();
+    (4..=32).contains(&digits) && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+/// Match `session` against the listed sessions: an exact name first, then a
+/// name that matches ignoring ASCII case (the fold names are made unique
+/// under), then a unique id prefix (compared without dashes, ignoring case).
+/// A case-folded name that matches several sessions (written before names
+/// were made unique that way) resolves to none of them, not to an id prefix
+/// either. `None` when nothing matches or `session` is not prefix-shaped; an
+/// error naming the candidates when the prefix matches more than one session.
+pub(crate) fn match_id_prefix(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    session: &str,
+) -> Result<Option<sessions::SessionId>, anyhow::Error> {
+    if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
+        return Ok(Some(entry.id));
+    }
+    let mut folded = entries.iter().filter(|e| {
+        e.name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(session))
+    });
+    match (folded.next(), folded.next()) {
+        (Some(entry), None) => return Ok(Some(entry.id)),
+        (Some(_), Some(_)) => return Ok(None),
+        _ => {}
+    }
+    if !is_id_prefix(session) {
+        return Ok(None);
+    }
+    let prefix = session.replace('-', "").to_ascii_lowercase();
+    let matches: Vec<&minimald_rpc::ListSessionsEntry> = entries
+        .iter()
+        .filter(|e| e.id.as_ref().simple().to_string().starts_with(&prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some(entry.id)),
+        several => {
+            // `min ls` shows sessions cut to eight digits, but sessions made
+            // close together share a long UUIDv7 prefix, so the refusal names
+            // each candidate at the shortest length that keeps them distinct.
+            let simples: Vec<String> = several
+                .iter()
+                .map(|e| e.id.as_ref().simple().to_string())
+                .collect();
+            let cut = (8..=32)
+                .find(|&n| {
+                    let prefixes: Vec<&str> = simples.iter().map(|s| &s[..n]).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    prefixes.iter().all(|p| seen.insert(*p))
+                })
+                .unwrap_or(32);
+            // Only a shortened id gets an ellipsis; a full id is not cut.
+            let ellipsis = if cut < 32 { "…" } else { "" };
+            let candidates: Vec<String> = several
+                .iter()
+                .zip(&simples)
+                .map(|(entry, simple)| {
+                    let mut candidate = format!("{}{ellipsis}", &simple[..cut]);
+                    if let Some(name) = entry.name.as_deref() {
+                        candidate.push_str(&format!(" ({name})"));
+                    }
+                    candidate
+                })
+                .collect();
+            Err(AmbiguousIdPrefix(format!(
+                "'{session}' matches sessions {}; use more characters",
+                candidates.join(", ")
+            ))
+            .into())
+        }
+    }
+}
+
+/// An id prefix that matches more than one session; the message names them.
+/// Typed so a caller can tell it from a failed RPC.
+#[derive(Debug)]
+pub(crate) struct AmbiguousIdPrefix(String);
+
+impl std::fmt::Display for AmbiguousIdPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousIdPrefix {}
 
 /// Unwrap a looked-up record, naming what was asked for when nothing matched.
 pub(crate) fn named_record(
@@ -440,14 +643,14 @@ pub(crate) async fn submit_verdict_and_wait(
         minimald_rpc::Errorable::Ok(s) => s,
         minimald_rpc::Errorable::Err { error } => {
             send_abort(client, session_id).await;
-            bail!("SubmitVerdict failed: {error}");
+            bail!("{error}");
         }
     };
     match step {
         SessionStep::Materialized { id } => Ok(id),
         SessionStep::Fault { error } => {
             send_abort(client, session_id).await;
-            bail!("SubmitVerdict faulted: {error}");
+            bail!("{error}");
         }
     }
 }
@@ -577,6 +780,17 @@ pub(crate) async fn best_effort_destroy(
     }
 }
 
+/// The stderr line activation prints for a declared port the box yields
+/// because another box at the same shared loopback address holds it.
+fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
+    format!(
+        "warning: port {} is already held by {}; this session will not \
+         forward it (first-come on the shared address); recreate one of them \
+         with a different external port, e.g. --ingress <other>:<internal>",
+        collision.port, collision.held_by
+    )
+}
+
 /// Upload the composition's patches and external hook scripts (if
 /// any) and finalize the session. The session is `Materializing` at
 /// entry; `Active` on success. On upload/finalize failure the session
@@ -612,7 +826,10 @@ pub(crate) async fn upload_and_finalize(
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
         .oneshot_rpc_with_hook_budget::<FinalizeSession>(
-            FinalizeSessionRequest { session_id },
+            FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: true,
+            },
             hook_budget,
         )
         .await
@@ -637,10 +854,29 @@ pub(crate) async fn upload_and_finalize(
                     }
                 }
             }
+            if ok.package_check_skipped {
+                eprintln!(
+                    "warning: the session package check was skipped (the package graph \
+                     did not resolve in time or could not be evaluated; see the daemon \
+                     log); unknown package names will surface at first exec"
+                );
+            }
+            // First-come on a shared loopback address: another box at the
+            // same address holds this port, so this box's attach yields the
+            // forward. The box activates and serves its other ports, but
+            // without this line the only trace of the yield is the daemon
+            // log — a user reading a green activate would never know.
+            for collision in &ok.shared_port_collisions {
+                eprintln!("{}", shared_port_collision_warning(collision));
+            }
             Ok(())
         }
+        // The stage in the client's words, the cause in the daemon's: a
+        // refusal here can be a bare OS string from the record write or
+        // the composition check, which says nothing about where the
+        // activation stopped.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("FinalizeSession failed: {error}");
+            bail!("could not finish activating the session: {error}");
         }
     }
 }
@@ -715,7 +951,13 @@ pub(crate) fn arm_activation_interrupt(
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
             if let Some(record) = row {
-                withdraw_box_row(control_sock, record.name.as_deref(), record.box_addresses).await;
+                withdraw_box_row(
+                    control_sock,
+                    record.name.as_deref(),
+                    record.box_addresses,
+                    None,
+                )
+                .await;
             }
         }
         std::process::exit(130);
@@ -725,14 +967,225 @@ pub(crate) fn arm_activation_interrupt(
 
 /// The user-facing text for a session that could not be composed, by
 /// either route: a refused `ConfigureLoadout` or failed gating of what it
-/// sent back. The underlying error names an internal step the caller never
-/// asked for, so the directory leads and that text follows as the only
-/// diagnostic there is. Shared with `min task run` (`crate::task`), which
-/// creates a session through the same two steps.
+/// sent back. The underlying error often names an internal step the caller
+/// never asked for (a package server, a git lock), so the directory leads
+/// and that text follows as the only diagnostic there is. The cause may or
+/// may not implicate the project configuration, so the remedy is phrased
+/// conditionally rather than assuming the config is at fault. Shared with
+/// `min task run` (`crate::task`), which creates a session through the same
+/// two steps.
 pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error: &str) -> String {
     format!(
         "Cannot start a session for {project_dir}: composing a session environment from \
-         that directory's project configuration failed, so no session was activated. Fix \
-         the configuration there, then re-run.\n\ncause: {error}"
+         that directory's project configuration failed, so no session was activated. If \
+         the cause below names the project configuration, fix it there; otherwise re-run.\
+         \n\ncause: {error}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// NET-129: the activate warning for a yielded shared-address port is a
+    /// `warning:` line naming the port, the box that holds it, and the way
+    /// out of the collision: a different external port, since the check keys
+    /// on the `--ingress` external port and both boxes are already `own_ip`.
+    #[test]
+    fn shared_port_collision_warning_names_the_port_its_holder_and_the_way_out() {
+        let line = super::shared_port_collision_warning(&minimald_rpc::SharedPortCollision {
+            port: 18080,
+            held_by: "first.min.internal".to_string(),
+        });
+        assert_eq!(
+            line,
+            "warning: port 18080 is already held by first.min.internal; this session \
+             will not forward it (first-come on the shared address); recreate one \
+             of them with a different external port, e.g. --ingress \
+             <other>:<internal>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trace_forward_tests {
+    use super::{inbound_parent, root_context};
+
+    /// With telemetry off (no exporter installed), an inbound `TRACEPARENT`
+    /// still parents the command, so this process's own log lines carry
+    /// the caller's trace id, and nothing is installed to export. The
+    /// daemon is not told the context then: an opted-out command sends the
+    /// opt-out marker instead (`minimal_client::set_telemetry_opted_out`).
+    /// A `min` inside a box joins the outer trace by the in-box helper's
+    /// route instead (TEL-025, minimald's
+    /// `a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix`).
+    #[test]
+    fn adopts_an_inbound_traceparent_without_exporting() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let parent = inbound_parent(Some(tp.to_string())).expect("valid traceparent");
+        let root = tracing::info_span!("cmd");
+        let ctx = root_context(&root, Some(&parent));
+        assert!(
+            !mlog::otel::exporting(),
+            "the test must not install an exporter"
+        );
+        assert_eq!(ctx.trace_id_hex(), parent.trace_id_hex());
+        assert_ne!(ctx.span_id_hex(), parent.span_id_hex());
+        assert!(
+            ctx.traceparent()
+                .contains("0af7651916cd43dd8448eb211c80319c")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_malformed_traceparent_starts_a_fresh_trace() {
+        assert!(inbound_parent(None).is_none());
+        assert!(inbound_parent(Some("junk".into())).is_none());
+        let root = tracing::info_span!("cmd");
+        let a = root_context(&root, None);
+        assert_ne!(a.trace_id_hex(), "0af7651916cd43dd8448eb211c80319c");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::{Handoff, die_of, run_in_root};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+
+    /// Records the name of every span that closes, in the order they close.
+    #[derive(Clone, Default)]
+    struct Closed(Arc<Mutex<Vec<&'static str>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for Closed
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+            if let Some(span) = ctx.span(&id) {
+                self.0.lock().unwrap().push(span.name());
+            }
+        }
+    }
+
+    fn closed_names(closed: &Closed) -> Vec<&'static str> {
+        closed.0.lock().unwrap().clone()
+    }
+
+    /// The TEL-031 contract: by the time `run` holds a hand-off (and so before
+    /// it flushes and exits or raises), the `cmd` span and the spans under it
+    /// have closed, which is what puts them in the exporter and the spool.
+    #[tokio::test]
+    async fn the_cmd_span_ends_before_a_handoff_is_finished() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let root = tracing::info_span!("cmd");
+        let handoff = run_in_root(root, async {
+            tracing::info_span!("client.rpc").in_scope(|| ());
+            Err(Handoff::Exit(0).into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(0))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["client.rpc", "cmd"]);
+    }
+
+    /// The attach's exit status comes back unchanged, after the span ends.
+    #[tokio::test]
+    async fn an_exit_handoff_keeps_its_status() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let handoff = run_in_root(tracing::info_span!("cmd"), async {
+            Err(Handoff::Exit(130).into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(130))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["cmd"]);
+    }
+
+    /// A SIGTERM'd `min net forward` hands back the signal after `cmd` ends.
+    #[tokio::test]
+    async fn a_raise_handoff_comes_back_after_the_span_ends() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let handoff = run_in_root(tracing::info_span!("cmd"), async {
+            tracing::info_span!("client.rpc").in_scope(|| ());
+            Err(Handoff::Raise(nix::sys::signal::Signal::SIGTERM).into())
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                handoff,
+                Some(Handoff::Raise(nix::sys::signal::Signal::SIGTERM))
+            ),
+            "{handoff:?}"
+        );
+        assert_eq!(closed_names(&closed), ["client.rpc", "cmd"]);
+    }
+
+    /// Set in the child [`die_of_ends_the_process_by_the_signal`] spawns, to
+    /// the number of the signal the child dies of.
+    const DIE_OF_CHILD: &str = "MINIMAL_TEST_DIE_OF_CHILD";
+
+    /// `die_of` kills the process by the signal even though a handler for it
+    /// is installed (tokio's, as in the forward), so a parent sees the wait
+    /// status an uncaught SIGTERM or SIGHUP gave it before the handler
+    /// existed. Runs itself in a child process, since passing means the
+    /// process dies.
+    #[test]
+    fn die_of_ends_the_process_by_the_signal() {
+        use nix::sys::signal::Signal;
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(raw) = std::env::var_os(DIE_OF_CHILD) {
+            let signal = Signal::try_from(raw.to_str().unwrap().parse::<i32>().unwrap()).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _handler = rt
+                .block_on(async {
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(
+                        signal as i32,
+                    ))
+                })
+                .unwrap();
+            die_of(signal);
+        }
+        for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cmd::handoff_tests::die_of_ends_the_process_by_the_signal",
+                    "--test-threads=1",
+                ])
+                .env(DIE_OF_CHILD, (signal as i32).to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.signal(), Some(signal as i32), "{signal}: {status:?}");
+            assert!(!status.core_dumped(), "{signal}: {status:?}");
+        }
+    }
+
+    /// A command that returns, or fails, hands nothing off: its error comes
+    /// back as it was, and the span still ends.
+    #[tokio::test]
+    async fn ordinary_outcomes_pass_through() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let ok = run_in_root(tracing::info_span!("cmd"), async { Ok(()) }).await;
+        assert!(matches!(ok, Ok(None)));
+        let err = run_in_root(tracing::info_span!("cmd"), async {
+            Err(anyhow::anyhow!("no session found"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(format!("{err:#}"), "no session found");
+        assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
+    }
 }

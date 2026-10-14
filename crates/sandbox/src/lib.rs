@@ -162,6 +162,76 @@ impl<C: Channel> Sandbox<C> {
         self.base_dir.join("run").join(name)
     }
 
+    /// Holds the program of every command `container` spawns at a start gate:
+    /// the command's pre-exec closure builds the whole box — namespaces,
+    /// classifier placement, credentials, seal — and then waits, before it
+    /// execs the program, until the returned [`StartGate`] is released or
+    /// dropped.
+    ///
+    /// For a launch whose box must exist before its program may run: minimald
+    /// runs a session's activate hooks in the namespaces of a box it launched
+    /// for them, and the box's program is the session's interactive shell,
+    /// whose startup files are the user's own and must not run before those
+    /// hooks have.
+    ///
+    /// The gate is a FIFO in the box's `/run`, which the daemon creates and
+    /// holds open for writing; the box opens it for reading and waits for
+    /// end-of-file, which the kernel delivers when the last writer closes.
+    /// Each call makes a FIFO of its own, so two gates on one sandbox never
+    /// share one: a container's commands wait at the gate its own call
+    /// returned, and releasing one gate starts no other container's program.
+    #[cfg(target_os = "linux")]
+    pub fn hold_start(&self, container: &mut Container) -> Result<StartGate, Error> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "{START_GATE_NAME}-{}",
+            NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = self.base_dir.join("run").join(&name);
+        // A FIFO left at this name by an earlier daemon process has no
+        // writer; replace it rather than share it.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::IO("removing a stale start gate", path, e)),
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+            Error::IO(
+                "naming the start gate",
+                path.clone(),
+                std::io::Error::other(e),
+            )
+        })?;
+        // SAFETY: `mkfifo(3)` with a NUL-terminated path and a mode.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(Error::IO(
+                "creating the start gate",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // `O_RDWR` on a FIFO opens without waiting for a reader (Linux
+        // `fifo(7)`), and makes this the writer whose close releases the box.
+        // SAFETY: `open(2)` with a NUL-terminated path.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(Error::IO(
+                "opening the start gate",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        container.start_gate = Some(Path::new("/run").join(&name));
+        Ok(StartGate {
+            // SAFETY: `fd` is a fresh descriptor nothing else owns.
+            _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            path,
+        })
+    }
+
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
@@ -396,6 +466,40 @@ pub struct Container {
     /// its pre-exec closure brings that namespace's `lo` up.  A box sharing
     /// the host's (or VM's) namespace leaves its `lo` alone.
     fresh_netns: bool,
+    /// The start gate a command from this container waits at before it execs
+    /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
+    /// [`Sandbox::hold_start`]; `None` runs the program at once.
+    start_gate: Option<PathBuf>,
+}
+
+/// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
+/// its own number. See [`Sandbox::hold_start`].
+pub const START_GATE_NAME: &str = "minimal-start-gate";
+
+/// The daemon's half of a box's start gate: the one writer of the FIFO the
+/// box's first process waits on, just before it execs its program. The
+/// program runs once every writer has closed, so dropping this — or calling
+/// [`Self::release`], which says so at the call site — lets it start. A
+/// daemon that loses the gate any other way (its host dropped, the daemon
+/// gone) releases it too: the gate can delay the program, never wedge it.
+#[derive(Debug)]
+pub struct StartGate {
+    _writer: std::os::fd::OwnedFd,
+    /// The FIFO, host-side, removed when the gate goes. A box that has not
+    /// opened it by then finds no gate and runs at once, which is what a
+    /// released gate means anyway.
+    path: PathBuf,
+}
+
+impl StartGate {
+    /// Lets the gated program exec.
+    pub fn release(self) {}
+}
+
+impl Drop for StartGate {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -457,6 +561,7 @@ impl Container {
             self.fresh_netns,
             sandbox.config.classifier_leaf.clone(),
             sandbox.config.force_cover_fallback,
+            self.start_gate.clone(),
         )?;
 
         Ok(command)
@@ -792,21 +897,24 @@ pub mod classifier {
     #[cfg(target_os = "linux")]
     pub fn probe_child_placement(root: &Path, verdict: config::Verdict) -> std::io::Result<()> {
         // A throwaway leaf under the cohort, in the verdict's subtree, named
-        // by this daemon's pid so two daemons probing one tree never share
-        // one, and removed first so a probe that died before its own cleanup
-        // cannot wedge the next.
+        // by this daemon's pid and a per-process counter so two concurrent
+        // probes in one daemon never share one. The counter is a static
+        // atomic: the probe is called from a single daemon process, and the
+        // counter's only job is to make each probe's leaf unique within that
+        // process.
+        static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let leaf = box_leaf(
             root,
-            &format!("placement-probe-{}", std::process::id()),
+            &format!("placement-probe-{}-{}", std::process::id(), n),
             verdict,
         );
-        let _ = std::fs::remove_dir(&leaf);
         std::fs::create_dir(&leaf)?;
         let placed = place_child_in(&leaf.join("cgroup.procs"));
         // The throwaway leaf is owed its removal. The child is gone by now,
         // so over a real tree the kernel allows it; a refusal here is left
-        // alone — the probe has its answer, and a stuck probe leaf says so
-        // at the next probe, which removes it first.
+        // alone — the probe has its answer, and the empty leaf is swept at
+        // the next daemon start by `sweep_box_leaves`.
         let _ = std::fs::remove_dir(&leaf);
         placed
     }
@@ -920,43 +1028,18 @@ pub mod classifier {
             .map(str::to_string)
     }
 
-    /// The account this daemon runs as: the daemon knows its own uid, and
-    /// the *name* is what a person types after the installer's `--user`, so
-    /// it is looked up rather than guessed. A uid with no account — a
-    /// container running a bare uid — is the `None` the hint below names
-    /// its fallback for.
-    #[cfg(target_os = "linux")]
-    #[must_use]
-    pub fn own_account() -> Option<String> {
-        nix::unistd::User::from_uid(nix::unistd::getuid())
-            .ok()
-            .flatten()
-            .map(|user| user.name)
-    }
-
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree. A stock install does not ship the installer (the
-    /// release stages only the apparmor one), so the hint names where the
-    /// script lives in the source repository rather than a `scripts/` path
-    /// the host does not have. The installer takes the account the daemon
-    /// runs as and the two source identities the classification rests on
-    /// (NET-078 — what the boxes cohort leaves as, and what the rest of the
-    /// slice leaves as; the step refuses to render one without the other, so
-    /// a hint that named neither is a command the step itself refuses). The
-    /// hint spells the whole command, so the advisory that carries it never
-    /// has to name a placeholder for the one thing the daemon knows — only
-    /// for the two things this host does.
+    /// classifier tree: the installed CLI's own verb, `min finalize-install`
+    /// (NET-122), which carries the privileged step itself and installs it
+    /// for the account this daemon runs as. The hint spells the whole
+    /// command: no placeholder — an un-enrolled host has no source identity
+    /// to be told (NET-078: its two identities are the classifier's own
+    /// cgroup matches, translated to nothing) — and no remote fetch, because
+    /// the step the CLI carries is the step of the release it came from.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        let account =
-            own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
-        format!(
-            "run: curl -fsSLO \
-             https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
-             && sudo bash ./install-host-classifier.sh --user {account} \
-             --cohort-address <cohort address> --node-plane-address <node-plane address>"
-        )
+        "min finalize-install".to_string()
     }
 
     /// Makes one level of the classifier layout, taking `AlreadyExists` as
@@ -1161,6 +1244,7 @@ fn install_box_credentials(
     fresh_netns: bool,
     classifier_leaf: Option<config::ClassifierLeaf>,
     force_cover_fallback: bool,
+    start_gate: Option<PathBuf>,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1209,6 +1293,7 @@ fn install_box_credentials(
                 classifier_join.as_deref(),
                 force_cover_fallback,
                 closure_report.as_deref(),
+                start_gate.as_deref(),
             )
         })
     };
@@ -1378,6 +1463,10 @@ fn bring_lo_up() -> std::io::Result<()> {
 /// Split out of the closure so each unsafe operation sits in its own block
 /// rather than inheriting the one around `command_from_closure`.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, the closure, which hands over each fact it captured"
+)]
 fn exec_box_program(
     program: &str,
     args: &[String],
@@ -1386,6 +1475,7 @@ fn exec_box_program(
     classifier_join: Option<&Path>,
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
+    start_gate: Option<&Path>,
 ) -> ! {
     // Cap the box's PTY count before the credentials drop: PTYs are a
     // machine-wide pool, and the box's devpts instance was mounted without a
@@ -1538,6 +1628,11 @@ fn exec_box_program(
             &format!("lo-down errno {}", e.raw_os_error().unwrap_or(0)),
         );
     }
+    // Opened before the credentials drop, while the box still holds its
+    // user namespace's root: the FIFO sits in the daemon-owned `/run`, which
+    // the box uid cannot open. Waited on only after the seal is in, the last
+    // step before the exec.
+    let start_gate = start_gate.and_then(open_start_gate);
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
@@ -1550,6 +1645,14 @@ fn exec_box_program(
         if let Err(e) = unsafe { install_socket_family_filter(socket_family_filter) } {
             exit_child("installing the socket-family filter", &e, closure_report);
         }
+    }
+    // Held here until the daemon releases the gate (see
+    // [`Sandbox::hold_start`]): the box is complete — placed, credentialed,
+    // sealed — so processes injected into its namespaces run in the box they
+    // would find once the program is up, while the program itself has not
+    // started.
+    if let Some(gate) = start_gate {
+        wait_at_start_gate(gate);
     }
     // `command_from_closure` replaces the program with this closure; exec
     // into the real program so the spawn runs what the caller asked for, now
@@ -1693,6 +1796,65 @@ fn execv_in_child(program: &str, args: &[String]) -> std::io::Error {
     unsafe { libc::execv(argv_c[0].as_ptr(), argv_ptrs.as_ptr()) };
     // execv returns only on failure.
     std::io::Error::last_os_error()
+}
+
+/// Opens the box's end of its start gate, read-only. Non-blocking for the
+/// open, so a gate the daemon already released (no writer left) cannot park
+/// the child in `open(2)`; blocking again for the read, so
+/// [`wait_at_start_gate`] waits for the release. A gate that cannot be
+/// opened is not waited on: the gate may delay the program, never stop it
+/// from running.
+#[cfg(target_os = "linux")]
+fn open_start_gate(path: &Path) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `open(2)` with a NUL-terminated path; it reads no other memory.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh descriptor this child owns.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `fcntl(2)` on a descriptor this child owns.
+    let cleared = unsafe {
+        let flags = libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_GETFL);
+        flags >= 0
+            && libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::F_SETFL,
+                flags & !libc::O_NONBLOCK,
+            ) == 0
+    };
+    cleared.then_some(fd)
+}
+
+/// Waits until the daemon releases the start gate: a read on the FIFO
+/// returns end-of-file once its last writer, the daemon's [`StartGate`],
+/// closes. Any other outcome — a byte, an error — ends the wait too.
+#[cfg(target_os = "linux")]
+fn wait_at_start_gate(gate: std::os::fd::OwnedFd) {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: `read(2)` into a one-byte buffer that outlives the call.
+        let n = unsafe {
+            libc::read(
+                std::os::fd::AsRawFd::as_raw_fd(&gate),
+                (&raw mut byte).cast(),
+                1,
+            )
+        };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
 }
 
 /// Reports a failure of the forked child on its stderr and exits it with 127,
@@ -1942,7 +2104,7 @@ impl<C: Channel> Sandbox<C> {
         // IP/UNIX flows, but AF_VSOCK is not subject to the network namespace,
         // so a process in any box could still reach the host over vsock.  The
         // seal is an allowlist: the `none` plan's seal admits the families its
-        // own network namespace confines (unix, inet, inet6, netlink), so the
+        // own network namespace confines (unix, inet, inet6, netlink route), so the
         // box can use its own loopback — but only when `isolate` says this
         // launch unshares that namespace (hakoniwa fails the spawn if the
         // unshare fails), and AF_UNIX alone otherwise, so a none box never
@@ -2178,6 +2340,7 @@ impl<C: Channel> Sandbox<C> {
             container,
             socket_family_filter,
             fresh_netns: isolate,
+            start_gate: None,
         })
     }
 
@@ -2673,18 +2836,107 @@ impl std::fmt::Display for UsernsRestriction {
     }
 }
 
-/// Best-effort probe for whether this host will refuse the unprivileged user
-/// namespace every sandbox starts by unsharing — the counterpart of the
-/// network probe above, for the namespace that has no fallback.
+/// The binary a [`UsernsRestriction::remedy`] is written for. The AppArmor
+/// profile attaches by binary path, so the step that lifts that restriction
+/// differs per binary; the sysctl remedy does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemedyTarget<'a> {
+    /// `minimald`. `min finalize-install` loads the profile for the daemon
+    /// at the path the installer wrote; a daemon built from source runs
+    /// elsewhere, so the remedy also names the loader with `--path` for
+    /// `bin`, this daemon's own path. No cheap check tells the two apart
+    /// here, so both forms are always printed. A profile attaches at exec,
+    /// so the daemon that is running stays unconfined until it is
+    /// restarted.
+    Daemon { bin: &'a str },
+    /// A `mip` binary, which the installer's profile does not cover: the
+    /// loader script is run with `--path` for it. `bin` is the binary's
+    /// path; `data_dir` is the installer's data prefix, where the loader
+    /// lands (`<data_dir>/apparmor/install-apparmor-profile.sh`).
+    Mip { bin: &'a str, data_dir: &'a str },
+}
+
+impl UsernsRestriction {
+    /// The cause in the words a person reads inside a refusal — never the
+    /// sysctl key alone, which names the mechanism rather than the fact.
+    #[must_use]
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::Disabled => {
+                "user namespaces are switched off (user.max_user_namespaces=0 or no kernel support)"
+            }
+            Self::ApparmorUnconfined => "Ubuntu restricts unprivileged user namespaces",
+        }
+    }
+
+    /// The remedy this restriction takes for `target`, one sentence a person
+    /// can act on. The AppArmor restriction is lifted by the profile — the
+    /// install step for the daemon, the loader with `--path` for `mip` —
+    /// never by `sudo sysctl`, which switches the protection off for every
+    /// program, is lost at boot, and leaves the install's record unchanged.
+    /// Switched-off namespaces no profile can lift: the sysctl set now (the
+    /// gate re-reads it on the next create) and made persistent, or a kernel
+    /// built with them.
+    #[must_use]
+    pub fn remedy(self, target: RemedyTarget<'_>) -> String {
+        match (self, target) {
+            (Self::Disabled, _) => "Set user.max_user_namespaces above 0: sudo sysctl -w \
+                                    user.max_user_namespaces=15000 takes effect now, a \
+                                    /etc/sysctl.d drop-in keeps it across reboots; or use a \
+                                    kernel with CONFIG_USER_NS."
+                .to_string(),
+            (Self::ApparmorUnconfined, RemedyTarget::Daemon { bin }) => {
+                let bin = shell_word(bin);
+                format!(
+                    "Finish the install to allow it for Minimal only: min finalize-install   (see \
+                     what it changes first: min finalize-install --show). The profile takes effect \
+                     when the daemon next starts: run min stop, then your command again.\n\
+                     A daemon built from source is not covered: attach the profile to this \
+                     binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
+                     --path {bin}, then the same restart."
+                )
+            }
+            (Self::ApparmorUnconfined, RemedyTarget::Mip { bin, data_dir }) => {
+                let loader =
+                    shell_word(&format!("{data_dir}/apparmor/install-apparmor-profile.sh"));
+                let bin = shell_word(bin);
+                format!(
+                    "Attach the AppArmor profile to mip (one-time, needs root): sudo bash \
+                     {loader} --path {bin} (from a checkout: \
+                     sudo scripts/install-apparmor-profile.sh --path {bin})."
+                )
+            }
+        }
+    }
+}
+
+/// A path as one shell word for a remedy the operator pastes, so a space in
+/// it does not split the command. A path with a NUL cannot be quoted for a
+/// shell at all; it is shown bare.
+fn shell_word(path: &str) -> String {
+    shlex::try_quote(path).map_or_else(|_| path.to_string(), |q| q.into_owned())
+}
+
+/// Probe for whether this host will refuse the unprivileged user namespace
+/// every sandbox starts by unsharing — the counterpart of the network probe
+/// above, for the namespace that has no fallback.
 ///
 /// Returns the obstruction it finds, or `None` when none is visible. The
 /// sandbox child is forked from the calling process with no exec in between,
 /// so the caller's own privileges and AppArmor label are exactly what the
 /// kernel will check at `unshare`/`uid_map` time — probe from the daemon,
 /// not from a helper. Like the network probe this is a necessary-not-
-/// sufficient signal (seccomp or LSM policy can still deny at spawn time),
-/// but it is advisory: a false `None` surfaces later as the spawn error it
-/// always was, never as a loss of isolation.
+/// sufficient signal (seccomp or LSM policy can still deny at spawn time):
+/// a false `None` surfaces later as the spawn error it always was, never as
+/// a loss of isolation.
+///
+/// A `Some` is not advisory: `minimald` gates every session create on it
+/// (NET-141), refusing the create with this cause and its remedy, so a false
+/// `Some` — a host whose kernel would in fact allow the unshare — refuses
+/// every session on that host. Three facts are read, each live from `/proc`
+/// on every call, so a remedy applied to a running host takes effect at the
+/// next create without a restart; a daemon that must run anyway sets
+/// `MINIMALD_USERNS_GATE=off` to skip the gate.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn user_namespaces_restriction() -> Option<UsernsRestriction> {
@@ -2900,6 +3152,17 @@ const COMPAT_SYS_SOCKETPAIR: u32 = 360; // __NR_socketpair, i386
 const COMPAT_SYS_SOCKET: u32 = 281; // __NR_socket, arm EABI
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const COMPAT_SYS_SOCKETPAIR: u32 = 288; // __NR_socketpair, arm EABI
+/// `io_uring_setup(2)`: since Linux 5.19 an `IORING_OP_SOCKET` on a ring
+/// creates a socket without passing through `socket(2)`, so seccomp never
+/// sees its family.  The filter refuses the ring itself with `ENOSYS` (the
+/// answer of a kernel built without io_uring, which libuv, tokio, and glibc
+/// users already fall back on), so no box can open a socket the seal would
+/// refuse through it (NET-137).  425 on every architecture's table,
+/// the compat ones included (the unified numbering new syscalls share).
+#[cfg(target_os = "linux")]
+const SYS_IO_URING_SETUP: i64 = libc::SYS_io_uring_setup;
+#[cfg(target_os = "linux")]
+const COMPAT_SYS_IO_URING_SETUP: u32 = 425; // __NR_io_uring_setup, i386 and arm EABI
 /// The 32-bit multiplexed socket entry point.  The filter returns `ENOSYS`
 /// for its socket-creating sub-calls on the compat ABI because seccomp cannot
 /// read their address-family argument (it sits behind a pointer), so a compat
@@ -2924,16 +3187,53 @@ const SOCKETCALL_SOCKETPAIR: u32 = 8;
 /// namespace confines — `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` —
 /// so the box can use its own loopback; the confined-families seal adds
 /// `AF_PACKET` (refused by the missing `CAP_NET_RAW` no box holds, per
-/// NET-083, not by this filter).  No family that reaches past the namespace
-/// survives either seal.
+/// NET-083, not by this filter).  Within the netlink family only the
+/// `NETLINK_ROUTE` protocol is admitted — the protocols a box needs to
+/// configure its own namespace's interfaces — and every other netlink
+/// protocol is refused with `EPROTONOSUPPORT`, the kernel's own answer for
+/// a netlink protocol it does not provide, so a caller never reads the
+/// refusal as netlink itself missing.  `io_uring_setup(2)`, the one path
+/// that creates sockets without `socket(2)`, is refused with `ENOSYS` on
+/// both ABIs.  No family that reaches past the namespace survives either
+/// seal.
 ///
 /// This program is the first instalment of the seccomp profile applied
 /// inside boxes (architecture.md AT9, open gap 2): the family list is
 /// published here, reviewable where the design promised it.
+/// The address families `seal` admits, in the order the verdict tail
+/// compares them. No seal lists `AF_VSOCK`: the family reaches the host
+/// whatever network namespace the caller sits in, so the VM host's vsock
+/// doors (the guest daemon's telemetry port among them, spec 25 TEL-034)
+/// are the guest daemon's alone.
+#[cfg(target_os = "linux")]
+const fn admitted_families(seal: network::SocketSeal) -> &'static [u32] {
+    match seal {
+        network::SocketSeal::Full => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+        ],
+        network::SocketSeal::UnixOnly => &[libc::AF_UNIX as u32],
+        network::SocketSeal::ConfinedFamilies => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+            libc::AF_PACKET as u32,
+        ],
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return EAFNOSUPPORT for a socket() or socketpair() the seal refuses.
     let refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+    // Return EPROTONOSUPPORT for an admitted family's refused protocol: the
+    // netlink protocols other than NETLINK_ROUTE.  The kernel answers the
+    // same for a netlink protocol it does not provide, whereas EAFNOSUPPORT
+    // would tell the caller netlink as a whole is missing.
+    let proto_refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EPROTONOSUPPORT as u32);
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
     let allow_action = libc::SECCOMP_RET_ALLOW;
@@ -2953,25 +3253,11 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
 
     // The families the seal admits, in the order the verdict tail compares
     // them.  The `none` seal admits the families its own network namespace
-    // confines — unix, inet, inet6, netlink — so the box can use its own
-    // loopback; the confined-families seal adds `AF_PACKET` (refused by the
-    // missing `CAP_NET_RAW` no box holds, per NET-083, not by this filter).
-    let admitted: &[u32] = match seal {
-        network::SocketSeal::Full => &[
-            libc::AF_UNIX as u32,
-            libc::AF_INET as u32,
-            libc::AF_INET6 as u32,
-            libc::AF_NETLINK as u32,
-        ],
-        network::SocketSeal::UnixOnly => &[libc::AF_UNIX as u32],
-        network::SocketSeal::ConfinedFamilies => &[
-            libc::AF_UNIX as u32,
-            libc::AF_INET as u32,
-            libc::AF_INET6 as u32,
-            libc::AF_NETLINK as u32,
-            libc::AF_PACKET as u32,
-        ],
-    };
+    // confines — unix, inet, inet6, netlink (route protocol only) — so the
+    // box can use its own loopback; the confined-families seal adds
+    // `AF_PACKET` (refused by the missing `CAP_NET_RAW` no box holds, per
+    // NET-083, not by this filter).
+    let admitted = admitted_families(seal);
 
     // Offsets into struct seccomp_data in bytes:
     //   int nr;                  // 0
@@ -2981,6 +3267,9 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     const OFFSET_NR: u32 = 0;
     const OFFSET_ARCH: u32 = 4;
     const OFFSET_ARG0: u32 = 16;
+    // arg2's low word: socket(2)'s protocol argument, truncated to int by the
+    // kernel, holds the netlink protocol the verdict tail judges.
+    const OFFSET_ARG2: u32 = 32;
 
     let load = |offset: u32| libc::sock_filter {
         code: (libc::BPF_LD | libc::BPF_ABS | libc::BPF_W) as u16,
@@ -3005,16 +3294,28 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // `socket` and `socketpair` numbers, with the syscall number already
     // loaded.  Relative jumps keep it correct wherever it is placed.
     let socket_verdict = |socket_nr: u32, socketpair_nr: u32| {
+        // Plain families cost one comparison and one allow return; the
+        // netlink entry costs four — family match, protocol load, protocol
+        // comparison, allow return.  The family refuse return follows the
+        // entries and the protocol refuse return follows it, so its index
+        // tells every refusal jump where to land.
+        let netlink_entry_extra = if admitted.contains(&(libc::AF_NETLINK as u32)) {
+            2
+        } else {
+            0
+        };
+        let refuse_index = 3 + 2 * admitted.len() + netlink_entry_extra;
+        let total = refuse_index + 3;
         let mut tail = vec![
             // socket() -> load arg0; else -> check socketpair.
             jeq(socket_nr, 1, 0),
             // socketpair() -> load arg0; anything else jumps past the whole
-            // verdict tail to the default allow — one skip per admitted-family
-            // verdict pair plus the refuse and allow returns that end it.
+            // verdict tail to the default allow — one skip per verdict pair,
+            // four for the netlink entry, plus the two refuse returns.
             jeq(
                 socketpair_nr,
                 0,
-                u8::try_from(2 * admitted.len() + 2).expect("seccomp jump offset fits u8"),
+                u8::try_from(total - 3).expect("seccomp jump offset fits u8"),
             ),
             // Load arg0 (the address family).
             load(OFFSET_ARG0),
@@ -3022,15 +3323,40 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         // The verdict tail: both seals are allowlists, so each admitted family
         // gets an allow return and whatever is left over is refused.
         for family in admitted {
-            // family matches -> the allow return; anything else falls through
-            // to the next comparison, or to the refuse return past the last.
-            tail.push(jeq(*family, 0, 1));
+            if *family == libc::AF_NETLINK as u32 {
+                // Netlink is admitted for NETLINK_ROUTE only: the family
+                // comparison admits the load of arg2 (the netlink protocol),
+                // and only the route protocol reaches the allow return.
+                let pos = tail.len();
+                // No match -> skip the entry's remaining three instructions;
+                // a one-instruction skip would compare the stale family
+                // against the route protocol.
+                tail.push(jeq(*family, 0, 3));
+                // Load arg2 (the netlink protocol).
+                tail.push(load(OFFSET_ARG2));
+                // route -> the allow return; other protocols -> the protocol
+                // refuse return, one past the family refuse return.
+                let jf =
+                    u8::try_from(refuse_index + 1 - pos - 3).expect("seccomp jump offset fits u8");
+                tail.push(jeq(libc::NETLINK_ROUTE as u32, 0, jf));
+            } else {
+                // family matches -> the allow return; anything else falls
+                // through to the next comparison, or to the refuse return.
+                tail.push(jeq(*family, 0, 1));
+            }
             tail.push(ret(allow_action));
         }
         // The seal's verdict for every family it does not admit, EAFNOSUPPORT.
         tail.push(ret(refuse_action));
+        // The verdict for a netlink protocol other than the route protocol,
+        // EPROTONOSUPPORT.
+        tail.push(ret(proto_refuse_action));
         // The default allow for every syscall that creates no socket.
         tail.push(ret(allow_action));
+        // The jump offsets above assume AF_NETLINK appears at most once in
+        // `admitted` and is the only protocol-gated family; a miscounted tail
+        // fails here instead of misjudging sockets at runtime.
+        debug_assert_eq!(tail.len(), total, "seccomp verdict tail length");
         tail
     };
 
@@ -3042,8 +3368,10 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     //   1: native ABI -> native block
     //   2: compat ABI -> compat block
     //   3: kill (a truly foreign ABI: its numbers would mean other syscalls)
-    //   native block: load nr, x32 guard (x86_64), native socket verdict
-    //   compat block: load nr, socketcall(SOCKET|SOCKETPAIR) -> ENOSYS,
+    //   native block: load nr, x32 guard (x86_64), io_uring_setup -> ENOSYS,
+    //                 native socket verdict
+    //   compat block: load nr, io_uring_setup -> ENOSYS,
+    //                 socketcall(SOCKET|SOCKETPAIR) -> ENOSYS,
     //                 compat socket verdict
     //
     // Each ABI is judged against its own syscall table: the compat ABI's
@@ -3061,10 +3389,16 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         });
         native.push(ret(kill_action));
     }
+    // io_uring_setup() -> ENOSYS; else -> the socket verdict.
+    native.push(jeq(SYS_IO_URING_SETUP as u32, 0, 1));
+    native.push(ret(enosys_action));
     native.extend(socket_verdict(SYS_SOCKET as u32, SYS_SOCKETPAIR as u32));
 
     let mut compat: Vec<libc::sock_filter> = vec![
         load(OFFSET_NR),
+        // io_uring_setup() -> ENOSYS; else -> the socketcall dispatch.
+        jeq(COMPAT_SYS_IO_URING_SETUP, 0, 1),
+        ret(enosys_action),
         // socketcall(2) -> load its call number; else -> the compat socket
         // verdict past the sub-call dispatch.
         jeq(COMPAT_SYS_SOCKETCALL, 0, 5),
@@ -3101,10 +3435,10 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         program: filter,
         seal,
         refused_families: match seal {
-            network::SocketSeal::Full => "every family but unix, inet, inet6, netlink",
+            network::SocketSeal::Full => "every family but unix, inet, inet6, netlink route",
             network::SocketSeal::UnixOnly => "every family but unix",
             network::SocketSeal::ConfinedFamilies => {
-                "every family but unix, inet, inet6, netlink, packet"
+                "every family but unix, inet, inet6, netlink route, packet"
             }
         },
     }
@@ -3162,11 +3496,12 @@ pub fn socket_family_filter_for_none_box() -> &'static SocketFamilyFilter {
 
 /// Returns a pointer to the built-in confined-families socket-family filter:
 /// it admits the families the box's own network namespace confines — unix,
-/// inet, inet6, netlink, packet — and refuses everything else with
-/// `EAFNOSUPPORT`, `AF_VSOCK` (the family that reaches the host whatever
-/// network namespace the caller sits in) included, so an own-address or
-/// host-address box keeps its inet sockets and cannot reach past its
-/// namespace.
+/// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only), packet — and
+/// refuses the other netlink protocols with `EPROTONOSUPPORT` and every
+/// other family with `EAFNOSUPPORT`, `AF_VSOCK` (the family that reaches the
+/// host whatever network namespace the caller sits in) included, so an
+/// own-address or host-address box keeps its inet sockets and cannot reach
+/// past its namespace.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn socket_family_filter_for_confined_families() -> &'static SocketFamilyFilter {
@@ -3401,6 +3736,75 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 mod tests {
     use super::*;
     use config::{Config, SandboxMapped};
+
+    /// The daemon's AppArmor remedy names the install step for the
+    /// installed daemon and, on its own line, the loader with `--path` for
+    /// this daemon's own path, so a source-built daemon is covered too
+    /// (NET-141).
+    #[test]
+    fn daemon_apparmor_remedy_names_finalize_install_and_this_binary() {
+        let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
+            bin: "/home/me/src/minimal/target/debug/minimald",
+        });
+        assert_eq!(
+            remedy,
+            "Finish the install to allow it for Minimal only: min finalize-install   (see what \
+             it changes first: min finalize-install --show). The profile takes effect when the \
+             daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path \
+             /home/me/src/minimal/target/debug/minimald, then the same restart."
+        );
+        let spaced = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
+            bin: "/opt/my tools/minimald",
+        });
+        assert!(
+            spaced.contains("--path '/opt/my tools/minimald', then"),
+            "a path with a space is one shell word: {spaced}"
+        );
+    }
+
+    /// The mip AppArmor remedy is a command the operator pastes, so a data
+    /// dir or binary path with a space stays one shell word, while a plain
+    /// path is shown bare (NET-141).
+    #[test]
+    fn mip_apparmor_remedy_quotes_paths_with_spaces() {
+        let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/opt/my tools/mip",
+            data_dir: "/home/me/.local/share/minimal",
+        });
+        assert!(
+            remedy.contains(
+                "sudo bash /home/me/.local/share/minimal/apparmor/install-apparmor-profile.sh \
+                 --path '/opt/my tools/mip' (from a checkout: \
+                 sudo scripts/install-apparmor-profile.sh --path '/opt/my tools/mip')."
+            ),
+            "paths with spaces are single-quoted, plain ones bare: {remedy}"
+        );
+
+        let plain = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/usr/local/bin/mip",
+            data_dir: "/usr/local/share/minimal",
+        });
+        assert!(
+            plain.contains("--path /usr/local/bin/mip (from a checkout"),
+            "a plain path is not quoted: {plain}"
+        );
+
+        // The loader's path is built from the data dir, so a space there
+        // (a custom XDG_DATA_HOME) is quoted the same way.
+        let spaced_dir = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/usr/local/bin/mip",
+            data_dir: "/home/me/My Data/minimal",
+        });
+        assert!(
+            spaced_dir.contains(
+                "sudo bash '/home/me/My Data/minimal/apparmor/install-apparmor-profile.sh' \
+                 --path /usr/local/bin/mip (from a checkout"
+            ),
+            "a data dir with a space is one shell word: {spaced_dir}"
+        );
+    }
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
     // if either stops showing up we've broken the FsFlags → MountOptions
@@ -4009,18 +4413,26 @@ ff02::2\tip6-allrouters
     /// opcodes [`build_socket_family_filter`] emits: `LD|W|ABS`, `JMP|JEQ|K`,
     /// `JMP|JGE|K`, and `RET|K`.
     #[cfg(target_os = "linux")]
-    fn run_seccomp_program(program: &[libc::sock_filter], nr: u32, arch: u32, arg0: u32) -> u32 {
+    fn run_seccomp_program(
+        program: &[libc::sock_filter],
+        nr: u32,
+        arch: u32,
+        arg0: u32,
+        arg2: u32,
+    ) -> u32 {
         let (mut pc, mut acc) = (0usize, 0u32);
         loop {
             let insn = &program[pc];
             pc += 1;
             let code = u32::from(insn.code);
             if code == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS {
-                // Offsets into `struct seccomp_data`: nr, arch, args[0] low word.
+                // Offsets into `struct seccomp_data`: nr, arch, and the low
+                // words of args[0] and args[2].
                 acc = match insn.k {
                     0 => nr,
                     4 => arch,
                     16 => arg0,
+                    32 => arg2,
                     other => panic!("unexpected seccomp_data offset {other}"),
                 };
             } else if code == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K {
@@ -4035,20 +4447,76 @@ ff02::2\tip6-allrouters
         }
     }
 
-    /// The socket families the filter's live-kernel behaviour is probed for,
-    /// in the order the probe child reports them.
+    /// The sockets the filter's live-kernel behaviour is probed for, in the
+    /// order the probe child reports them: one `socket()` per entry, with the
+    /// family, type, and protocol the probe passes, and whether the seals
+    /// under test admit it.  The netlink probes cover the seal's protocol
+    /// split — `NETLINK_ROUTE` is admitted, the host-global audit, connector,
+    /// and uevent protocols are not.
     #[cfg(target_os = "linux")]
-    const PROBED_FAMILIES: [(&str, i32); 4] = [
-        ("AF_UNIX", libc::AF_UNIX),
-        ("AF_INET", libc::AF_INET),
-        ("AF_INET6", libc::AF_INET6),
-        ("AF_VSOCK", libc::AF_VSOCK),
+    const PROBED_SOCKETS: [(&str, i32, i32, i32, bool); 8] = [
+        ("AF_UNIX", libc::AF_UNIX, libc::SOCK_STREAM, 0, true),
+        ("AF_INET", libc::AF_INET, libc::SOCK_STREAM, 0, true),
+        ("AF_INET6", libc::AF_INET6, libc::SOCK_STREAM, 0, true),
+        ("AF_VSOCK", libc::AF_VSOCK, libc::SOCK_STREAM, 0, false),
+        (
+            "NETLINK_ROUTE",
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_ROUTE,
+            true,
+        ),
+        (
+            "NETLINK_AUDIT",
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_AUDIT,
+            false,
+        ),
+        (
+            "NETLINK_CONNECTOR",
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_CONNECTOR,
+            false,
+        ),
+        (
+            "NETLINK_KOBJECT_UEVENT",
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_KOBJECT_UEVENT,
+            false,
+        ),
     ];
 
-    /// Probes [`PROBED_FAMILIES`] in a forked child, installing the given
+    /// Probes [`PROBED_SOCKETS`] in a forked child, installing the given
     /// production filter first when one is supplied, and returns one errno
-    /// byte per family: `0` when the child created a socket of that family,
-    /// the raw errno otherwise.
+    /// byte per probe: `0` when the child created that socket, the raw errno
+    /// otherwise.
+    #[cfg(target_os = "linux")]
+    fn probe_socket_families_in_child(
+        filter: Option<&'static SocketFamilyFilter>,
+    ) -> std::io::Result<[u8; 8]> {
+        probe_in_child(filter, || {
+            let mut report = [0u8; 8];
+            for (i, &(_, family, ty, protocol, _)) in PROBED_SOCKETS.iter().enumerate() {
+                // SAFETY: `socket(2)` reads only its arguments.
+                let fd = unsafe { libc::socket(family, ty, protocol) };
+                report[i] = if fd >= 0 {
+                    // SAFETY: `close(2)` consumes the descriptor just created.
+                    unsafe { libc::close(fd) };
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8
+                };
+            }
+            report
+        })
+    }
+
+    /// Runs `probe` in a forked child, installing the given production
+    /// filter first when one is supplied, and returns the report the child
+    /// wrote back.
     ///
     /// The child runs only async-signal-safe calls between the fork and its
     /// `_exit` (`prctl`, the raw `seccomp` syscall, `socket`, `close`, `write`,
@@ -4056,10 +4524,11 @@ ff02::2\tip6-allrouters
     /// installed in; the parent owns every assertion, so a failure is reported
     /// with the test's own messages rather than a bare child exit code.
     #[cfg(target_os = "linux")]
-    fn probe_socket_families_in_child(
+    fn probe_in_child<const N: usize>(
         filter: Option<&'static SocketFamilyFilter>,
-    ) -> std::io::Result<[u8; 4]> {
-        let mut report = [0u8; 4];
+        probe: fn() -> [u8; N],
+    ) -> std::io::Result<[u8; N]> {
+        let mut report = [0u8; N];
         let mut fds = [0; 2];
         // SAFETY: `pipe(2)` writes two descriptors into `fds` and reads no
         // memory of ours beyond it; the result is checked.
@@ -4074,7 +4543,7 @@ ff02::2\tip6-allrouters
             return Err(std::io::Error::last_os_error());
         }
         if pid == 0 {
-            // Child: the production filter, then one errno byte per family.
+            // Child: the production filter, then the probe's report.
             // SAFETY: the descriptors are the pipe's own ends.
             unsafe { libc::close(fds[0]) };
             if let Some(filter) = filter {
@@ -4086,17 +4555,7 @@ ff02::2\tip6-allrouters
                     unsafe { libc::_exit(127) };
                 }
             }
-            for (i, &(_, family)) in PROBED_FAMILIES.iter().enumerate() {
-                // SAFETY: `socket(2)` reads only its arguments.
-                let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
-                report[i] = if fd >= 0 {
-                    // SAFETY: `close(2)` consumes the descriptor just created.
-                    unsafe { libc::close(fd) };
-                    0
-                } else {
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8
-                };
-            }
+            report = probe();
             // SAFETY: `write(2)` reads `report`, which outlives the call, and
             // `_exit(2)` never returns, so the child ends here.
             unsafe {
@@ -4130,14 +4589,14 @@ ff02::2\tip6-allrouters
         }
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
             return Err(std::io::Error::other(format!(
-                "the socket-family probe child exited with status {status} \
+                "the seccomp probe child exited with status {status} \
                  (127 means installing the filter failed, so this host cannot \
                  install the seal at all)"
             )));
         }
         if filled != report.len() {
             return Err(std::io::Error::other(format!(
-                "the socket-family probe child reported {filled} of {} bytes",
+                "the seccomp probe child reported {filled} of {} bytes",
                 report.len()
             )));
         }
@@ -4253,6 +4712,7 @@ ff02::2\tip6-allrouters
                 libc::SYS_socket as u32,
                 AUDIT_ARCH,
                 family as u32,
+                0,
             )
         };
         assert_eq!(run(libc::AF_UNIX), libc::SECCOMP_RET_ALLOW);
@@ -4277,6 +4737,7 @@ ff02::2\tip6-allrouters
                 libc::SYS_socket as u32,
                 AUDIT_ARCH,
                 family as u32,
+                0,
             )
         };
         for family in [
@@ -4292,6 +4753,56 @@ ff02::2\tip6-allrouters
             );
         }
         assert_eq!(run(libc::AF_VSOCK), refuse);
+    }
+
+    /// No seal admits `AF_VSOCK`: a box, in any network mode, cannot open
+    /// a vsock socket, so the VM host's guest-to-host doors (the guest
+    /// daemon's telemetry port, spec 25 TEL-034) hear from the guest daemon
+    /// alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_seal_admits_af_vsock() {
+        for seal in [
+            network::SocketSeal::Full,
+            network::SocketSeal::UnixOnly,
+            network::SocketSeal::ConfinedFamilies,
+        ] {
+            let admitted = admitted_families(seal);
+            assert!(
+                !admitted.contains(&(libc::AF_VSOCK as u32)),
+                "{seal:?} admits AF_VSOCK: {admitted:?}"
+            );
+            assert!(admitted.contains(&(libc::AF_UNIX as u32)), "{seal:?}");
+        }
+    }
+
+    /// The refusal itself, not only the family list: every seal's filter
+    /// answers `socket(AF_VSOCK, ..)` with `EAFNOSUPPORT`, the
+    /// `ConfinedFamilies` seal the isolated and host plans run under as well
+    /// as the `none` plan's. The guest telemetry door in `minvmd` trusts a
+    /// vsock connection as the guest daemon's on this (spec 25 TEL-034).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_seal_refuses_a_vsock_socket() {
+        let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        for seal in [
+            network::SocketSeal::Full,
+            network::SocketSeal::UnixOnly,
+            network::SocketSeal::ConfinedFamilies,
+        ] {
+            let filter = build_socket_family_filter(seal);
+            assert_eq!(
+                run_seccomp_program(
+                    &filter.program,
+                    libc::SYS_socket as u32,
+                    AUDIT_ARCH,
+                    libc::AF_VSOCK as u32,
+                    0
+                ),
+                refuse,
+                "{seal:?}: socket(AF_VSOCK) must fail with EAFNOSUPPORT"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -4321,14 +4832,26 @@ ff02::2\tip6-allrouters
         let filter = build_socket_family_filter(network::SocketSeal::Full);
         assert_eq!(filter.seal, network::SocketSeal::Full);
         assert_eq!(
-            filter.refused_families, "every family but unix, inet, inet6, netlink",
+            filter.refused_families, "every family but unix, inet, inet6, netlink route",
             "the launch log must name what the seal refuses"
         );
 
         let run = |nr: i64, arch: u32, arg0: u32| {
-            run_seccomp_program(&filter.program, nr as u32, arch, arg0)
+            run_seccomp_program(&filter.program, nr as u32, arch, arg0, 0)
+        };
+        // The same program judged with the netlink protocol as arg2: the
+        // socket(2) protocol argument the live kernel passes.
+        let run_proto = |nr: i64, arch: u32, family: i32, protocol: i32| {
+            run_seccomp_program(
+                &filter.program,
+                nr as u32,
+                arch,
+                family as u32,
+                protocol as u32,
+            )
         };
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        let proto_refuse = libc::SECCOMP_RET_ERRNO | (libc::EPROTONOSUPPORT as u32);
         let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
         // AUDIT_ARCH_S390: a truly foreign arch the filter must still kill.
         const FOREIGN_ARCH: u32 = 0x8000_0016;
@@ -4348,6 +4871,86 @@ ff02::2\tip6-allrouters
             libc::SECCOMP_RET_ALLOW,
             "socket(AF_UNIX) must stay allowed"
         );
+        // Netlink is admitted for the route protocol alone; the host-global
+        // audit, connector, and uevent protocols get the kernel's answer for
+        // a protocol it does not provide, not the refused-family errno.
+        for protocol in [
+            libc::NETLINK_AUDIT,
+            libc::NETLINK_CONNECTOR,
+            libc::NETLINK_KOBJECT_UEVENT,
+        ] {
+            assert_eq!(
+                run_proto(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK, protocol),
+                proto_refuse,
+                "socket(AF_NETLINK, {protocol}) must fail with EPROTONOSUPPORT"
+            );
+        }
+        assert_eq!(
+            run_proto(
+                libc::SYS_socket,
+                AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_ROUTE
+            ),
+            libc::SECCOMP_RET_ALLOW,
+            "socket(AF_NETLINK, NETLINK_ROUTE) must stay allowed"
+        );
+        // The compat ABI judges the netlink protocol under the same rule.
+        let compat_socket = i64::from(COMPAT_SYS_SOCKET);
+        assert_eq!(
+            run_proto(
+                compat_socket,
+                COMPAT_AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_AUDIT
+            ),
+            proto_refuse,
+            "the compat ABI must refuse NETLINK_AUDIT with EPROTONOSUPPORT"
+        );
+        assert_eq!(
+            run_proto(
+                compat_socket,
+                COMPAT_AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_ROUTE
+            ),
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must keep NETLINK_ROUTE allowed"
+        );
+        // socketpair(2) carries its protocol in the same argument, so it is
+        // judged by the same netlink rule as socket(2).
+        assert_eq!(
+            run_proto(
+                libc::SYS_socketpair,
+                AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_AUDIT
+            ),
+            proto_refuse,
+            "socketpair(AF_NETLINK, NETLINK_AUDIT) must fail with EPROTONOSUPPORT"
+        );
+        assert_eq!(
+            run_proto(
+                libc::SYS_socketpair,
+                AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_ROUTE
+            ),
+            libc::SECCOMP_RET_ALLOW,
+            "socketpair(AF_NETLINK, NETLINK_ROUTE) must reach the kernel"
+        );
+        // Only the netlink entry reads the protocol: an inet socket with an
+        // explicit protocol stays allowed.
+        assert_eq!(
+            run_proto(
+                libc::SYS_socket,
+                AUDIT_ARCH,
+                libc::AF_INET,
+                libc::IPPROTO_TCP
+            ),
+            libc::SECCOMP_RET_ALLOW,
+            "socket(AF_INET, IPPROTO_TCP) must stay allowed"
+        );
         assert_eq!(
             run(libc::SYS_read, AUDIT_ARCH, 0),
             libc::SECCOMP_RET_ALLOW,
@@ -4355,7 +4958,6 @@ ff02::2\tip6-allrouters
         );
         // The compat ABI is admitted under the same family rules as native,
         // judged against its own syscall numbers.
-        let compat_socket = i64::from(COMPAT_SYS_SOCKET);
         let compat_socketpair = i64::from(COMPAT_SYS_SOCKETPAIR);
         assert_eq!(
             run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_VSOCK as u32),
@@ -4431,7 +5033,7 @@ ff02::2\tip6-allrouters
             .expect("running the unfiltered socket-family probe");
         let filtered = probe_socket_families_in_child(Some(socket_family_filter_for_none_box()))
             .expect("running the none-filtered socket-family probe");
-        let [unix, inet, inet6, vsock] = filtered;
+        let [unix, inet, inet6, vsock, route, audit, connector, uevent] = filtered;
         assert_eq!(
             unix, 0,
             "the filter must keep AF_UNIX sockets working (errno {unix})"
@@ -4450,12 +5052,27 @@ ff02::2\tip6-allrouters
             "the filter must refuse AF_VSOCK with EAFNOSUPPORT — the family \
              that bypasses the network namespace is the point of the seal"
         );
-        // Where the control child could create the family at all, the filter
+        assert_eq!(
+            route, 0,
+            "the filter must keep NETLINK_ROUTE sockets working (errno {route})"
+        );
+        for (name, errno) in [
+            ("NETLINK_AUDIT", audit),
+            ("NETLINK_CONNECTOR", connector),
+            ("NETLINK_KOBJECT_UEVENT", uevent),
+        ] {
+            assert_eq!(
+                errno,
+                libc::EPROTONOSUPPORT as u8,
+                "the filter must refuse {name} with EPROTONOSUPPORT"
+            );
+        }
+        // Where the control child could create the socket at all, the filter
         // is what refused it; where the kernel never could, the refusal above
         // matches what the kernel already answers and says so, so a missing
         // driver on the host is never mistaken for the seal working.
-        for (i, (name, _)) in PROBED_FAMILIES.iter().enumerate().skip(1) {
-            if unfiltered[i] != 0 {
+        for (i, &(name, .., admitted)) in PROBED_SOCKETS.iter().enumerate() {
+            if !admitted && unfiltered[i] != 0 {
                 eprintln!(
                     "note: this kernel creates no {name} sockets (errno {}), \
                      so the filtered refusal matches what it already answers",
@@ -4470,7 +5087,8 @@ ff02::2\tip6-allrouters
     /// full `none` seal for [`NetPlan::none`], the confined-families seal for
     /// every other plan — and the seal picks the filter.  Both are
     /// allowlists: the none seal admits the families its own network
-    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`);
+    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`
+    /// with `NETLINK_ROUTE` only);
     /// the confined-families seal adds `AF_PACKET` (refused by the missing
     /// `CAP_NET_RAW` no box holds, per NET-083, not by this filter).  Both
     /// refuse `AF_VSOCK` — the family that reaches the host whatever
@@ -4512,6 +5130,7 @@ ff02::2\tip6-allrouters
             ("none", network::NetPlan::none(), network::SocketSeal::Full),
         ];
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        let proto_refuse = libc::SECCOMP_RET_ERRNO | (libc::EPROTONOSUPPORT as u32);
         for (name, plan, seal) in plans {
             assert_eq!(plan.to_string(), name, "the plan under test");
             assert_eq!(plan.seal(), seal, "plan {name} must run under its seal");
@@ -4521,7 +5140,16 @@ ff02::2\tip6-allrouters
                 "plan {name}: the seal selects the filter"
             );
             let run = |nr: i64, arch: u32, arg0: u32| {
-                run_seccomp_program(&filter.program, nr as u32, arch, arg0)
+                run_seccomp_program(&filter.program, nr as u32, arch, arg0, 0)
+            };
+            let run_proto = |nr: i64, arch: u32, family: i32, protocol: i32| {
+                run_seccomp_program(
+                    &filter.program,
+                    nr as u32,
+                    arch,
+                    family as u32,
+                    protocol as u32,
+                )
             };
             assert_eq!(
                 run(libc::SYS_socket, AUDIT_ARCH, libc::AF_VSOCK as u32),
@@ -4597,10 +5225,49 @@ ff02::2\tip6-allrouters
                 "{name}: a box must keep its unix sockets"
             );
             assert_eq!(
-                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK as u32),
+                run_proto(
+                    libc::SYS_socket,
+                    AUDIT_ARCH,
+                    libc::AF_NETLINK,
+                    libc::NETLINK_ROUTE
+                ),
                 libc::SECCOMP_RET_ALLOW,
-                "{name}: a box must keep its netlink sockets — \
+                "{name}: a box must keep its netlink route sockets — \
                  the namespace confines them"
+            );
+            for protocol in [
+                libc::NETLINK_AUDIT,
+                libc::NETLINK_CONNECTOR,
+                libc::NETLINK_KOBJECT_UEVENT,
+            ] {
+                assert_eq!(
+                    run_proto(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK, protocol),
+                    proto_refuse,
+                    "{name}: socket(AF_NETLINK, {protocol}) must fail with \
+                     EPROTONOSUPPORT — the host-global protocols reach past \
+                     the namespace"
+                );
+            }
+            // The compat ABI judges the netlink protocol under the same rule.
+            assert_eq!(
+                run_proto(
+                    compat_socket,
+                    COMPAT_AUDIT_ARCH,
+                    libc::AF_NETLINK,
+                    libc::NETLINK_ROUTE
+                ),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: the compat ABI must keep NETLINK_ROUTE allowed"
+            );
+            assert_eq!(
+                run_proto(
+                    compat_socket,
+                    COMPAT_AUDIT_ARCH,
+                    libc::AF_NETLINK,
+                    libc::NETLINK_AUDIT
+                ),
+                proto_refuse,
+                "{name}: the compat ABI must refuse NETLINK_AUDIT with EPROTONOSUPPORT"
             );
             if seal == network::SocketSeal::ConfinedFamilies {
                 assert_eq!(
@@ -4628,7 +5295,7 @@ ff02::2\tip6-allrouters
         let confined =
             probe_socket_families_in_child(Some(socket_family_filter_for_confined_families()))
                 .expect("running the confined-families socket-family probe");
-        let [unix, inet, inet6, vsock] = confined;
+        let [unix, inet, inet6, vsock, route, audit, connector, uevent] = confined;
         assert_eq!(
             unix, 0,
             "a confined-families-sealed box keeps AF_UNIX sockets (errno {unix})"
@@ -4648,14 +5315,109 @@ ff02::2\tip6-allrouters
              — the family that bypasses the network namespace is the point of \
              the seal"
         );
-        for (i, (name, _)) in PROBED_FAMILIES.iter().enumerate().skip(1) {
-            if unfiltered[i] != 0 {
+        assert_eq!(
+            route, 0,
+            "a confined-families-sealed box keeps NETLINK_ROUTE sockets \
+             (errno {route})"
+        );
+        for (name, errno) in [
+            ("NETLINK_AUDIT", audit),
+            ("NETLINK_CONNECTOR", connector),
+            ("NETLINK_KOBJECT_UEVENT", uevent),
+        ] {
+            assert_eq!(
+                errno,
+                libc::EPROTONOSUPPORT as u8,
+                "the confined-families seal must refuse {name} with EPROTONOSUPPORT"
+            );
+        }
+        for (i, &(name, .., admitted)) in PROBED_SOCKETS.iter().enumerate() {
+            if !admitted && unfiltered[i] != 0 {
                 eprintln!(
                     "note: this kernel creates no {name} sockets (errno {}), \
                      so the filtered refusal matches what it already answers",
                     unfiltered[i]
                 );
             }
+        }
+    }
+
+    /// NET-137's io_uring clause.  Since Linux 5.19 an `IORING_OP_SOCKET`
+    /// creates a socket without passing through `socket(2)`, so the family
+    /// rule above never sees it; every seal therefore refuses the ring
+    /// itself — `io_uring_setup(2)` answers `ENOSYS`, as a kernel without
+    /// io_uring would — on the native and the compat ABI alike, while the
+    /// syscalls around it stay untouched.  The shipped filters are then
+    /// installed against the live kernel, with an unfiltered control child
+    /// as the witness for what the kernel answers on its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn box_io_uring_socket_refused() {
+        let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+        for seal in [
+            network::SocketSeal::Full,
+            network::SocketSeal::UnixOnly,
+            network::SocketSeal::ConfinedFamilies,
+        ] {
+            let filter = socket_family_filter_for_seal(seal);
+            let run =
+                |nr: i64, arch: u32| run_seccomp_program(&filter.program, nr as u32, arch, 0, 0);
+            assert_eq!(
+                run(SYS_IO_URING_SETUP, AUDIT_ARCH),
+                enosys,
+                "{seal}: io_uring_setup must fail with ENOSYS — a ring creates \
+                 sockets the family rule never judges"
+            );
+            assert_eq!(
+                run(i64::from(COMPAT_SYS_IO_URING_SETUP), COMPAT_AUDIT_ARCH),
+                enosys,
+                "{seal}: compat io_uring_setup must fail with ENOSYS"
+            );
+            assert_eq!(
+                run(libc::SYS_read, AUDIT_ARCH),
+                libc::SECCOMP_RET_ALLOW,
+                "{seal}: a syscall that creates no socket must stay allowed"
+            );
+        }
+
+        // One io_uring_setup(2) per child, a single-entry ring with zeroed
+        // parameters: `0` when the kernel built the ring, the errno
+        // otherwise.  The parameter block is `struct io_uring_params`, 120
+        // bytes, which the kernel reads and writes back.
+        fn probe_io_uring() -> [u8; 1] {
+            let mut params = [0u64; 15];
+            // SAFETY: `io_uring_setup(2)` reads and writes the 120-byte
+            // parameter block `params` owns, which outlives the call.
+            let fd = unsafe { libc::syscall(SYS_IO_URING_SETUP, 1u32, params.as_mut_ptr()) };
+            if fd >= 0 {
+                // SAFETY: `close(2)` consumes the ring descriptor just created.
+                unsafe { libc::close(fd as i32) };
+                [0]
+            } else {
+                [std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8]
+            }
+        }
+        let [unfiltered] =
+            probe_in_child(None, probe_io_uring).expect("running the unfiltered io_uring probe");
+        if unfiltered != 0 {
+            eprintln!(
+                "note: this kernel builds no io_uring ring unfiltered (errno {unfiltered}), \
+                 so the filtered refusal below is checked against a kernel that \
+                 already refuses it"
+            );
+        }
+        for filter in [
+            socket_family_filter_for_none_box(),
+            socket_family_filter_for_confined_families(),
+        ] {
+            let [filtered] = probe_in_child(Some(filter), probe_io_uring)
+                .expect("running the filtered io_uring probe");
+            assert_eq!(
+                filtered,
+                libc::ENOSYS as u8,
+                "{}: the filter must refuse io_uring_setup with ENOSYS",
+                filter.seal
+            );
         }
     }
 
@@ -4713,32 +5475,18 @@ ff02::2\tip6-allrouters
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
 
-    /// A stock install does not ship the classifier installer, so the hint
-    /// says where to fetch it — the raw file, not GitHub's HTML viewer page,
-    /// which a `curl` of the URL would save and `sudo` would then run — rather
-    /// than name a checkout-relative `scripts/` path, and still spells the
-    /// `--user` the daemon knows.
+    /// NET-122: the hint is the installed CLI's own verb, spelled whole —
+    /// no placeholder a person cannot fill, and no fetch from the
+    /// repository's `main`, which is not the release they installed.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_install_hint_names_where_the_installer_lives() {
+    fn the_install_hint_names_the_installed_verb() {
         let hint = classifier::install_hint();
-        assert!(
-            hint.contains(
-                "https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh"
-            ),
-            "{hint}"
-        );
-        assert!(!hint.contains("/blob/"), "{hint}");
-        assert!(!hint.contains("sudo scripts/"), "{hint}");
-        // The fetch saves the file under its own name, so the run that
-        // follows finds it; a downloaded file has no executable bit, so the
-        // hint runs it via bash.
-        assert!(hint.contains("curl -fsSLO https://"), "{hint}");
-        assert!(
-            hint.contains("sudo bash ./install-host-classifier.sh"),
-            "{hint}"
-        );
-        assert!(hint.contains("--user "), "{hint}");
+        assert_eq!(hint, "min finalize-install");
+        assert!(!hint.contains("install-host-classifier.sh"), "{hint}");
+        for absent in ["<", ">", "curl", "raw.githubusercontent.com", "sudo"] {
+            assert!(!hint.contains(absent), "{absent:?} in {hint}");
+        }
     }
 
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
@@ -4832,28 +5580,6 @@ ff02::2\tip6-allrouters
             !classifier::tree_is_real(tree, None, false),
             "a host whose mount table cannot be read has no tree to check"
         );
-    }
-
-    /// The install hint names every argument the installer requires of a
-    /// person (NET-078): the account the daemon runs as — the one thing the
-    /// daemon knows and would otherwise make the reader look up — and the
-    /// two source identities, which the step refuses to render one of
-    /// without the other, so a hint without them is a command the installer
-    /// itself refuses. Pinned as data: the daemon's start-up warn line, the
-    /// native unenforced notice and `Cause::StepNotInstalled`'s command all
-    /// carry this string, and the installer's own `--check` hint names the
-    /// same two flags, so the two spellings cannot drift apart unseen.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn install_hint_names_the_installers_required_identities() {
-        let hint = classifier::install_hint();
-        assert!(
-            hint.contains("install-host-classifier.sh"),
-            "the hint names the privileged step's install: {hint}"
-        );
-        for flag in ["--cohort-address", "--node-plane-address"] {
-            assert!(hint.contains(flag), "the hint names {flag}: {hint}");
-        }
     }
 
     /// The files the kernel makes when a cgroup is created, modelled over a
@@ -5446,6 +6172,128 @@ int main(int argc, char **argv) {
         held.report().await
     }
 
+    /// The start gate (#2118): a command whose container holds its start
+    /// builds its box and then waits, before it execs its program, until the
+    /// gate is released. While the gate is held the box's process is alive
+    /// and the program has done nothing; released, the program runs to
+    /// completion. Two gates on one sandbox are independent: releasing the
+    /// second starts only its own box, and the first waits for its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_start_runs_the_program_only_once_released() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping a_held_start_runs_the_program_only_once_released: \
+                 this host denies the unprivileged user namespace every \
+                 sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let name = "start-gate";
+        let base_dir = box_base_dir(name);
+        let build = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let probe = compile_cgroup_probe(build.path());
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &probe);
+        let sandbox_home = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let mut sandbox = Config::new(name)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .build(sandbox_home.path().join("sandbox"), ())
+            .await
+            .expect("building the box");
+
+        let plan = sandbox.built_in_plan();
+        let run = sandbox.base_dir.join("run");
+        // Both gates are armed before either box spawns: the order in which a
+        // shared FIFO would hand the first box the second gate.
+        let mut armed = Vec::new();
+        for mark in ["first", "second"] {
+            let mut container = sandbox
+                .new_container(&plan)
+                .expect("building the box's container");
+            let gate = sandbox
+                .hold_start(&mut container)
+                .expect("holding the box's start");
+            armed.push((mark, gate, container));
+        }
+        let mut held = Vec::new();
+        for (mark, gate, container) in armed {
+            let mut command = sandbox
+                .command(
+                    &container,
+                    "/usr/bin/probe",
+                    [format!("MARK:/run/{mark}")],
+                    std::iter::empty::<(&str, &str)>(),
+                )
+                .expect("building the probe command");
+            let child = command.spawn().expect("spawning the probe in the box");
+            held.push((run.join(mark), gate, child, container));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        for (mark, _, child, _) in &mut held {
+            assert!(
+                !mark.exists(),
+                "a program ran while its start was held: {}",
+                mark.display()
+            );
+            assert!(
+                child.try_wait().expect("polling the held box").is_none(),
+                "a held box exited before its start was released"
+            );
+        }
+
+        // Released in reverse: the second gate starts only the second box.
+        let (first_mark, first_gate, mut first_child, _first_container) = held.remove(0);
+        let (second_mark, second_gate, mut second_child, _second_container) = held.remove(0);
+        second_gate.release();
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || second_child.wait()),
+        )
+        .await
+        .expect("the released box ran to completion in time")
+        .expect("spawn_blocking join")
+        .expect("waiting for the released box");
+        assert!(status.success(), "the released probe failed: {status:?}");
+        assert!(
+            second_mark.exists(),
+            "the released program never ran: no mark at {}",
+            second_mark.display()
+        );
+        assert!(
+            !first_mark.exists(),
+            "releasing the second gate started the first box's program"
+        );
+        assert!(
+            first_child
+                .try_wait()
+                .expect("polling the still-held box")
+                .is_none(),
+            "the first box exited while its own gate was still held"
+        );
+
+        first_gate.release();
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || first_child.wait()),
+        )
+        .await
+        .expect("the released box ran to completion in time")
+        .expect("spawn_blocking join")
+        .expect("waiting for the released box");
+        assert!(status.success(), "the released probe failed: {status:?}");
+        assert!(
+            first_mark.exists(),
+            "the released program never ran: no mark at {}",
+            first_mark.display()
+        );
+    }
+
     /// The devpts remount, in a real box launched from the production path:
     /// the box's `/dev/pts` carries the per-instance `max=` cap, keeps the
     /// `nosuid,noexec` it was mounted with, and keeps `ptmxmode=0666`, so the
@@ -5693,13 +6541,16 @@ int main(int argc, char **argv) {
 
         // The leaf the probe made is not left behind by the failure either:
         // the probe owes the throwaway its removal whatever the answer was.
+        // The leaf is named by pid and a per-process counter, so the exact
+        // name is not knowable here; what is knowable is that no
+        // `placement-probe-` leaf survives the probe.
+        let leftover = std::fs::read_dir(&deny)
+            .expect("reading the deny subtree")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("placement-probe-"));
         assert!(
-            !classifier::box_leaf(
-                tree.path(),
-                &format!("placement-probe-{}", std::process::id()),
-                config::Verdict::Deny,
-            )
-            .exists(),
+            !leftover,
             "the throwaway leaf the probe made is gone, failure or not"
         );
 
@@ -5714,6 +6565,68 @@ int main(int argc, char **argv) {
             bare.kind(),
             std::io::ErrorKind::NotFound,
             "a missing cohort is a missing tree, not a probe that passes"
+        );
+    }
+
+    /// Concurrent placement probes each get their own throwaway leaf, so
+    /// they never race on a shared name. N probes over a stand-in tree all
+    /// report the same answer (the tree has no cgroup.procs, so every probe
+    /// fails with `NotFound`), and no probe leaf is left behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_probes_each_get_their_own_leaf() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
+            .expect("creating the cohort directory");
+        let deny = tree
+            .path()
+            .join(classifier::BOXES_DIR)
+            .join(config::DENY_DIR);
+        std::fs::create_dir(&deny).expect("creating the deny subtree");
+
+        // Four probes are enough to exercise the race and eight is the cap:
+        // every probe forks a child, so an unbounded count on a high-core CI
+        // host can exhaust a restrictive process limit and fail the test for
+        // a resource reason rather than a placement one.
+        let n: usize = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(4, 8);
+        let results: Vec<_> = (0..n)
+            .map(|_| {
+                let root = tree.path().to_path_buf();
+                std::thread::spawn(move || {
+                    classifier::probe_child_placement(&root, config::Verdict::Deny)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("probe thread panicked"))
+            .collect();
+
+        // Every probe reports the same answer: the stand-in tree has no
+        // cgroup.procs, so every child's write fails with NotFound.
+        for result in &results {
+            let e = result
+                .as_ref()
+                .expect_err("over a stand-in tree every probe should fail");
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "every probe's child opens the leaf's cgroup.procs without \
+                 creating it: a missing one is a missing leaf"
+            );
+        }
+
+        // No probe leaf is left behind.
+        let leftover = std::fs::read_dir(&deny)
+            .expect("reading the deny subtree")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("placement-probe-"));
+        assert!(
+            !leftover,
+            "no throwaway probe leaf is left behind after {n} concurrent probes"
         );
     }
 

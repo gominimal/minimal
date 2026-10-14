@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# check-answerer-links.sh — the min-answerer binary must resolve only system
+# check-zoned-links.sh — the minzoned binary must resolve only system
 # libraries.
 #
-# WHY: min-answerer is the always-on box-zone answerer the host's service
+# WHY: minzoned is the always-on box-zone answerer the host's service
 # manager holds as a root service (NET-122 to NET-128 in
 # docs/specs/18-spec-box-networking): every process on the machine resolves
 # `*.min.internal` through it, so it starts as root and runs unattended. A
@@ -49,7 +49,7 @@
 # who ran the gate or on what their environment would have injected into
 # the loader's search path.
 #
-# Usage: scripts/check-answerer-links.sh <binary>
+# Usage: scripts/check-zoned-links.sh <binary>
 #
 # Exit codes: 0 = resolves only system libraries, no embedded search path;
 # 1 = at least one offender named, or the binary could not be verified
@@ -60,7 +60,7 @@ set -euo pipefail
 
 # die <message> — print it with the script prefix on stderr and exit 1.
 die() {
-    printf 'check-answerer-links: %s\n' "$1" >&2
+    printf 'check-zoned-links: %s\n' "$1" >&2
     exit 1
 }
 
@@ -88,7 +88,7 @@ offender_names=""
 offender() {
     offenders=$((offenders + 1))
     offender_names="${offender_names:+$offender_names; }$1"
-    printf 'check-answerer-links: %s — verdict: offender (%s)\n' "$1" "$2"
+    printf 'check-zoned-links: %s — verdict: offender (%s)\n' "$1" "$2"
 }
 
 # system_dir <path> — the system directory a path lives under, or nothing.
@@ -152,7 +152,7 @@ classify_dep() {
             offender "$item" "carries a '..' path component; the loader walks it to wherever it lands, which is not provably a system directory"
             ;;
         *)
-            printf 'check-answerer-links: %s — verdict: ok (%s)\n' "$item" "$state"
+            printf 'check-zoned-links: %s — verdict: ok (%s)\n' "$item" "$state"
             ;;
     esac
 }
@@ -163,7 +163,7 @@ linux_check() {
     command -v ldd >/dev/null 2>&1 || die "ldd is not on PATH — cannot inspect $bin"
     command -v readelf >/dev/null 2>&1 || die "readelf is not on PATH — cannot inspect $bin"
 
-    printf 'check-answerer-links: checking %s (Linux: readelf -l, ldd, readelf -d)\n' "$bin"
+    printf 'check-zoned-links: checking %s (Linux: readelf -l, ldd, readelf -d)\n' "$bin"
 
     # The program interpreter first: root runs it before any library, and
     # the string is baked into the binary, so a loader path that is not
@@ -186,7 +186,7 @@ linux_check() {
                 offender "interpreter $interp" "the program interpreter carries a '..' path component; the loader walks it to wherever it lands, which is not provably a system loader"
                 ;;
             *)
-                printf 'check-answerer-links: interpreter %s — verdict: ok (%s)\n' "$interp" "$interp_state"
+                printf 'check-zoned-links: interpreter %s — verdict: ok (%s)\n' "$interp" "$interp_state"
                 ;;
         esac
     done < <(
@@ -200,7 +200,7 @@ linux_check() {
         ' <<<"$interp_out"
     )
     if [ "$interp_seen" -eq 0 ]; then
-        printf 'check-answerer-links: no program interpreter (statically linked) — verdict: ok\n'
+        printf 'check-zoned-links: no program interpreter (statically linked) — verdict: ok\n'
     fi
 
     # ldd, under a scrubbed loader environment: the answerer is started by
@@ -213,7 +213,7 @@ linux_check() {
     # ldd exits 1 for a binary with no dynamic section as well — that is
     # the static case this gate passes, not an error.
     if grep -qE 'not a dynamic executable|statically linked' <<<"$ldd_out"; then
-        printf 'check-answerer-links: not dynamically linked — no dynamic dependencies to check\n'
+        printf 'check-zoned-links: not dynamically linked — no dynamic dependencies to check\n'
     else
         if [ "$ldd_rc" -ne 0 ]; then
             die "ldd could not inspect $bin: $ldd_out"
@@ -221,7 +221,7 @@ linux_check() {
         while IFS=$'\t' read -r state item path; do
             case "$state" in
                 vdso)
-                    printf 'check-answerer-links: %s — verdict: ok (the kernel vDSO)\n' "$item"
+                    printf 'check-zoned-links: %s — verdict: ok (the kernel vDSO)\n' "$item"
                     ;;
                 missing)
                     offender "$item" "a dependency that resolves from nowhere is not provably a system library"
@@ -271,7 +271,7 @@ linux_check() {
         ' <<<"$rpath_out"
     )
     if [ "$saw_rpath" -eq 0 ]; then
-        printf 'check-answerer-links: no RPATH or RUNPATH entries — verdict: ok\n'
+        printf 'check-zoned-links: no RPATH or RUNPATH entries — verdict: ok\n'
     fi
 }
 
@@ -279,7 +279,7 @@ linux_check() {
 macos_check() {
     command -v otool >/dev/null 2>&1 || die "otool is not on PATH (install the Xcode Command Line Tools) — cannot inspect $bin"
 
-    printf 'check-answerer-links: checking %s (macOS: otool -L + otool -l)\n' "$bin"
+    printf 'check-zoned-links: checking %s (macOS: otool -L + otool -l)\n' "$bin"
 
     local deps_out deps_rc=0 path
     deps_out="$(otool -L "$bin" 2>&1)" || deps_rc=$?
@@ -325,7 +325,7 @@ macos_check() {
         ' <<<"$lc_out"
     )
     if [ "$saw_lcrpath" -eq 0 ]; then
-        printf 'check-answerer-links: no LC_RPATH load commands — verdict: ok\n'
+        printf 'check-zoned-links: no LC_RPATH load commands — verdict: ok\n'
     fi
 }
 
@@ -351,4 +351,4 @@ if [ "$offenders" -gt 0 ]; then
     die "$offenders offender(s) in $bin: $offender_names — a root answerer that resolves any of these runs user-chosen code as root; link the system libraries only and strip every rpath entry, or do not ship this build"
 fi
 
-printf 'check-answerer-links: %s resolves only system libraries with no embedded search path — verdict: ok\n' "$bin"
+printf 'check-zoned-links: %s resolves only system libraries with no embedded search path — verdict: ok\n' "$bin"

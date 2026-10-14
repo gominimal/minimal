@@ -32,7 +32,15 @@ pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 /// - `timeout_secs`: only meaningful under `--detach`; `None` when the flag was
 ///   omitted. Rejected without `--detach` rather than silently ignored;
 ///   defaults to [`DEFAULT_DETACH_TIMEOUT_SECS`] when detaching.
-pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
+/// - `root`: this process's root span ([`crate::telemetry::root_span`]),
+///   entered. A `--detach` caller holds it until it returns; the supervisor
+///   ends it once the VM is ready, so it exports while the VM runs
+///   (`telemetry::SupervisorStart`).
+pub fn run(
+    detach: bool,
+    timeout_secs: Option<u64>,
+    root: tracing::span::EnteredSpan,
+) -> Result<()> {
     // `--timeout` only bounds the detach poll loop; foreground runs supervise
     // the VMM child for its whole life and never consult it. Accepting it in
     // foreground mode would silently ignore it, so reject the combination.
@@ -79,17 +87,18 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
 
     #[cfg(minvmd_libkrun)]
-    return run_supervisor(detach, timeout_secs);
+    return run_supervisor(detach, timeout_secs, root);
 
     #[cfg(not(minvmd_libkrun))]
     {
         let _ = (detach, timeout_secs);
+        drop(root);
         bail!("`minvmd run` requires libkrun (macOS, or Linux with libkrun installed)");
     }
 }
 
 #[cfg(minvmd_libkrun)]
-fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
+fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredSpan) -> Result<()> {
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own `local-minvmd0` dir, so an upgraded host reuses
     // its existing VM state (data volume, boot log) instead of orphaning it.
@@ -108,9 +117,18 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
-        return run_detach(timeout_secs);
+        // The caller's root covers its whole wait: the hand-off ends when this
+        // returns, with the VM serving or the wait failed.
+        let result = run_detach(timeout_secs);
+        drop(root);
+        return result;
     }
-    run_foreground()
+    // A supervisor stopped by SIGTERM/SIGINT returns here once its teardown
+    // (the `Stopped` write, the guards' drops) has run; `main` then ends the
+    // process by that signal after flushing its telemetry and its log
+    // ([`crate::control::die_by_received_stop_signal`]), so its exit status
+    // still says what stopped it.
+    run_foreground(root)
 }
 
 /// Outcome of one poll of the `--detach` readiness loop, decided from the
@@ -254,6 +272,8 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     // Forward the state-dir override and VM name so the re-exec'd supervisor
     // resolves the same per-VM state dir this process did.
     crate::state::forward_identity(&mut cmd);
+    // And the trace: the supervisor's spans are children of this `run`.
+    crate::telemetry::forward_trace(&mut cmd);
     // Mark the child as detached so it routes tracing to the daily-rotated
     // log file (`<state>/logs/minvmd.log`) instead of stdout.
     cmd.env(crate::DETACHED_ENV, "1");
@@ -342,8 +362,12 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
+///
+/// `root` (the process's root span, entered) and the `supervisor.start` span
+/// under it end once the VM is ready; the rest of the VM's life runs under a
+/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
 #[cfg(minvmd_libkrun)]
-fn run_foreground() -> Result<()> {
+fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     use std::io::Read as _;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -357,12 +381,14 @@ fn run_foreground() -> Result<()> {
     use crate::net::answerer::DEFAULT_ANSWERER_PORT;
     use crate::state::{StartingGuard, State, StateDir};
 
-    // One span per supervised VM, like minimald's per-connection `conn` span:
-    // every record the supervisor emits carries `vm`, so a detached
+    // One span per supervisor phase, like minimald's per-connection `conn`
+    // span: every record the supervisor emits carries `vm`, so a detached
     // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
     // to every VM on the host) stay attributable once a second VM runs —
-    // grep instead of manual fields on each line.
-    let _vm_scope = tracing::info_span!("supervisor", vm = %crate::state::vm_name()).entered();
+    // grep instead of manual fields on each line. This one, `supervisor.start`,
+    // is the parent of the switch start and of `vm.boot` (and so of the guest's
+    // `guest.ready`), and ends with the process root at READY below.
+    let start_phase = crate::telemetry::SupervisorStart::enter(root);
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
@@ -472,25 +498,16 @@ fn run_foreground() -> Result<()> {
     // address plan cannot drift apart. The daemon therefore keeps the egress
     // it had before the gate existed, its own package fetches above all.
     //
-    // An own-address box's lease is not a row this process can name: the guest
-    // daemon's own allocator mints it inside the VM, so no host-side process
-    // knows it — not this supervisor, and not the CLI that asked for the box.
-    // Until the creator-side registration (T66, #1711) supplies those rows,
-    // such a source is what the gate's announced interim is for: an address
-    // inside the plan's lease block but held by no row is admitted — with a
-    // warn naming T66 on every admit — so an own-address box keeps the egress
-    // it had before the gate existed, while everything outside the block, and
-    // every row that *is* published, stays exactly as decided.
-    //
-    // What that admits, said plainly: under the interim the host-side gate
-    // cannot attribute a frame to the box it came from unless a row holds the
-    // address, so a box with restrictive rules can be escaped by sourcing
-    // frames from any unregistered in-block address — NET-081's host-side
-    // guarantee is deferred to T66 until its rows land and its flip of
-    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) puts the per-box default in
-    // force. Every admit under the interim is rate-limited-warned, so a
-    // diagnostic bundle's daemon log tail shows a host running it.
-    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
+    // An own-address box's row is not one this process names on its own:
+    // the activating client registers the box over the control socket below
+    // (T66, #1711), and the registry hands out its switch address, so the
+    // row stands before the box's first frame. A frame from an address no
+    // row holds is dropped, unconditionally (NET-085), and the egress
+    // default is in force (`UNREGISTERED_SOURCE_PHASE`, egress_gate): a row
+    // with no egress section reaches nothing outside itself, unless the
+    // operator set `MINVMD_EGRESS_DENY_ALL_OPT_OUT` when this process
+    // started (NET-077), and a publish at an address no row holds is
+    // refused.
     //
     // The proxy's attachment table (NET-133): one attachment per box, held
     // by this process for the VM's life. The registry is its one writer —
@@ -503,8 +520,23 @@ fn run_foreground() -> Result<()> {
     // table and its one line per attachment are the host's own state, ready
     // for the acceptor that reads them.
     let proxy_attachments = crate::bep_attach::Attachments::new();
+    // The operator's deny-all opt-out (NET-077), read once here as the VMM
+    // child reads it for the boot line: the registry compiles a client box
+    // with no `egress` section by it, so the host gate keeps the default the
+    // guest daemon was handed.
+    let egress_deny_all_opt_out = crate::vm::egress_deny_all_opt_out_from_env();
+    tracing::info!(
+        egress_deny_all_opt_out,
+        "host-side egress default opt-out for undeclared boxes"
+    );
+    // The client boxes' registrations persist in this VM's state dir
+    // (NET-138): a supervisor restarted under a session's live box reloads
+    // its row detached, for the box to attach again or its creator to
+    // resume inside the grace — never from anything the guest reports.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments.clone());
+        .feeding_proxy_attachments(proxy_attachments.clone())
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
+        .persisting_to(state_dir.dir().join(crate::box_registry::REGISTRY_FILE));
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -520,11 +552,61 @@ fn run_foreground() -> Result<()> {
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
     let mut node_port =
         assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
-    boxes.register_node_namespace(node_port.port);
-    // A box's row goes with its shuttle connection: the gate reports which
-    // addresses each relay carried at the relay's end, and this drainer thread
-    // applies the reports for the life of the process (NET-133).
-    boxes.spawn_withdrawal_drainer();
+    boxes
+        .try_register_node_namespace(node_port.port)
+        .context("publishing the node namespace's row")?;
+    // SIGTERM or SIGINT sent to the supervisor (a service manager's stop,
+    // or kill(1)) cancels and audits every pending ask (NET-045), then
+    // stops the VM the same way `minvmd stop` does: the guest gets the
+    // Shutdown RPC so the data volume's ext4 journal stays clean (informed
+    // by #705), the VMM child is signalled and reaped, and the main
+    // thread's own teardown writes the `Stopped` state, then `main` ends
+    // the process by the signal. The whole stop is bounded at
+    // `SIGNAL_STOP_BOUND` from the signal's arrival; when it cannot run,
+    // fails, or the teardown overruns that deadline, the watcher dies by
+    // the signal itself. A second signal meanwhile ends the process at
+    // once. A signal during the boot, before `Running`, aborts the boot:
+    // the VMM child is signalled without a guest ask (no guest daemon is
+    // up to take one), the watcher writes `Stopped`, and it ends the
+    // process by the signal, since the main thread is still in its READY
+    // wait. It keeps the lifecycle write lock from that write on, and the
+    // boot forks only under that lock, so no VMM is forked behind it.
+    //
+    // Not covered: a terminal Ctrl-C on a foreground run. The VMM child
+    // shares the terminal's foreground process group, so the tty delivers
+    // SIGINT to it directly, at the same moment as to the supervisor, and
+    // the VMM dies before the Shutdown RPC can run; the journal replay
+    // backstop bounds that case, as before. Nor is a SIGKILL of the
+    // supervisor: the orphaned VMM keeps the alive lock it inherited, so
+    // the VM still reads as live, and `min stop --force` is the recovery.
+    let signal_state_dir = state_dir.dir().to_path_buf();
+    if let Err(error) = crate::control::watch_stop_signals(boxes.clone(), move |signum| {
+        let deadline = crate::control::stop_signal_received()
+            .map_or_else(std::time::Instant::now, |(_, at)| at)
+            + crate::cmd::stop::SIGNAL_STOP_BOUND;
+        match crate::cmd::stop::graceful_stop_from_signal(signal_state_dir, deadline) {
+            Ok(crate::cmd::stop::SignalStop::TeardownFinished) => {
+                // The main thread normally ends the process by the signal
+                // once its teardown returns; this is the backstop.
+                tracing::info!(signum, "graceful stop after signal complete");
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                crate::control::die_by_signal(signum);
+            }
+            Ok(crate::cmd::stop::SignalStop::BootAborted) => {
+                // The main thread is still waiting for READY and would not
+                // return before the deadline, so the watcher ends the
+                // process.
+                tracing::info!(signum, "boot aborted after signal; dying by signal");
+                crate::control::die_by_signal(signum);
+            }
+            Err(e) => {
+                tracing::warn!(signum, error = %e, "graceful stop after signal failed; dying by signal");
+                crate::control::die_by_signal(signum);
+            }
+        }
+    }) {
+        tracing::warn!(%error, "could not install the stop-signal handler");
+    }
 
     // The answerer's state — the host fact the CLI surfaces at session
     // start and on `min ls` — created here so both halves that move it can
@@ -534,6 +616,18 @@ fn run_foreground() -> Result<()> {
     // is its pre-acquisition value, and the CLI treats it as "nothing to
     // say yet" rather than a verdict.
     let answerer_status = crate::net::answerer::AnswererStatus::starting();
+    // A box's row goes with its shuttle connection: the gate reports which
+    // addresses each relay carried at the relay's end, and this drainer thread
+    // detaches those rows and withdraws them once their grace passes with no
+    // relay carrying them again, for the life of the process (NET-133,
+    // NET-138). Each
+    // withdrawal hands the box's published address back to the machine's
+    // answerer, as the creator's withdrawal does, unless a live row or a
+    // registration in flight under the name owns it — so a session ended
+    // daemon-side frees its address rather than holding it until this
+    // process exits.
+    let drainer_answerer = answerer_status.clone();
+    boxes.spawn_withdrawal_drainer(move |name| drainer_answerer.release_address(name));
     // The hostname proxy's publish state (T93): the cell the supervisor
     // writes a failed start's cause into and the control socket below
     // serves, so the CLI's surfaces read *why* the proxy is not serving
@@ -546,47 +640,41 @@ fn run_foreground() -> Result<()> {
     // allocated switch and loopback addresses from, and asks for the
     // answerer's state — the read that never goes through the in-VM
     // daemon, because a guest relaying a host fact is forgeable from
-    // inside the escape boundary. Bound before the guest boots, so a
+    // inside the escape boundary — and the guest report door's bridge pair
+    // beside it (T94, NET-138). Both are bound before the guest boots, so a
     // session activated against this VM can only ever be handed an address
-    // this table holds. Best-effort at startup, like the switch above: a
-    // bind failure is warned and the VM still boots — a registration then
-    // degrades to the gate's announced interim, exactly as against a
-    // supervisor predating the socket — rather than failing a boot the
-    // client could still activate against.
-    let _control = crate::control::resolve_control_sock()
-        .and_then(|sock_path| {
-            crate::control::spawn(
-                sock_path,
-                boxes.clone(),
-                answerer_status.clone(),
-                proxy_publish.clone(),
-            )
-        })
-        .inspect_err(|error| {
-            tracing::warn!(
-                %error,
-                "failed to bind the box-registration control socket; own-address \
-                 activations will not be handed addresses (the egress gate's \
-                 announced interim applies)"
-            );
-        })
-        .ok();
+    // this table holds. A bind failure of either is fatal (#1790): with no
+    // control socket no own-address box can register, and the gate admits
+    // no unregistered source, so a VM booted without it would run boxes
+    // that reach nothing — the supervisor exits naming the socket instead.
+    let (_control, guest_report_door) = bind_box_doors(
+        &crate::control::resolve_control_sock()
+            .context("resolving the box-registration control socket's path")?,
+        &boxes,
+        &answerer_status,
+        &proxy_publish,
+    )?;
 
-    // The guest report door's bridge pair (T94, NET-138): the door is bound
-    // and handed to the VMM child as one step — the env the child registers
-    // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] against is produced only
-    // when the door bound, so the door stands exactly once the bridge is
-    // up: no boot bridges a door it did not bind, and no bound door waits
-    // behind a bridge that never comes up. Best-effort at startup, like
-    // the control socket above: a bind failure is warned and the VM still
-    // boots — its runtime publishes then fail the in-VM report instead of
-    // being recorded, which the box's own log says — rather than failing a
-    // boot a registration could still activate against.
-    let guest_report_door = crate::control::resolve_control_sock()
-        .and_then(|sock_path| {
-            guest_report_door_env(&sock_path, &boxes, &answerer_status, &proxy_publish)
-        })
-        .ok();
+    // The guest telemetry door (TEL-034): bound only with telemetry on,
+    // and handed to the VMM child the same way, so the guest daemon's
+    // records reach this process's exporter and spool over the vsock
+    // bridge and the guest needs no endpoint. Best-effort like the doors
+    // above: a bind failure is warned and the VM boots without it, and the
+    // guest then spools alone (TEL-046).
+    let guest_telemetry_door = if mlog::otel::telemetry_enabled() {
+        crate::control::resolve_control_sock()
+            .and_then(|sock_path| crate::guest_telemetry::spawn_guest_telemetry_door(&sock_path))
+            .inspect_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "failed to bind the guest telemetry door; the guest daemon's telemetry \
+                     stays in the guest's own spool"
+                );
+            })
+            .ok()
+    } else {
+        None
+    };
 
     // The host answerer (NET-138): the box zone's answerer on the host
     // loopback, answering from this host-authored table — the same
@@ -603,7 +691,7 @@ fn run_foreground() -> Result<()> {
     // one, is the one answerer the machine runs. Started beside the switch,
     // before the guest boots, so the node row the registration above
     // published answers from the moment the VM does — best-effort at
-    // startup, like the control socket: a thread that could not spawn is
+    // startup, unlike the control socket: a thread that could not spawn is
     // warned and the VM still boots, its names then answering from whatever
     // answerer holds the port.
     if let Err(error) =
@@ -651,6 +739,19 @@ fn run_foreground() -> Result<()> {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
+            // A crashed supervisor (SIGKILL, abort) leaves its gvproxy alive:
+            // the pidfd stop paths are clean-stop-only and gvproxy holds no
+            // alive lock, so nothing reaps it. Unlinking the stale socket
+            // below would let the fresh gvproxy bind while the leftover still
+            // holds the host-side forwards. Kill it first — matched on exact
+            // argv tokens: argv[0] is the gvproxy binary and `-listen` names
+            // this VM's switch socket. This supervisor's alive lock rules out
+            // a live same-instance supervisor, so a match owned by a live
+            // minvmd fails the start rather than spawning a duplicate switch.
+            // This thread is the synchronous supervisor thread, not a tokio
+            // worker, so the reap's bounded wait may block it.
+            crate::net::reap_stale_gvproxy(&binary, &switch_sock)
+                .context("reaping a stale gvproxy")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             // The gate binds the socket beside the switch socket, so a stale
@@ -842,23 +943,41 @@ fn run_foreground() -> Result<()> {
             generation = publish_generation,
             "drew the boot's publish generation"
         );
+        // `vm.boot`: from spawning the VMM child to the guest's READY beacon,
+        // one span per boot (a T93 redraw boots again under a fresh one). The
+        // child and, through the boot line, the guest daemon inherit it as
+        // their parent (`telemetry::forward_trace`), so the guest's boot
+        // spans land under it in the same trace.
+        let boot_span = tracing::info_span!(
+            "vm.boot",
+            vm = %crate::state::vm_name(),
+            otel.status_code = tracing::field::Empty,
+        )
+        .entered();
+        // Every return from here to READY (the spawn's `?`, the lifecycle
+        // lock, read and write `?`s, the `bail!` on a lifecycle changed
+        // during spawn, a failed wait) exports `vm.boot` with an error
+        // status (TEL-035), as `minvmd boot` does; reaching READY clears it.
+        let boot_failed = crate::telemetry::ErrorUnlessOk::new(&boot_span);
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("__krun-vmm");
         // Forward the state-dir override and VM name so the VMM child resolves the
         // same per-VM state dir this supervisor does.
         crate::state::forward_identity(&mut cmd);
+        crate::telemetry::forward_trace(&mut cmd);
         alive_lock.inherit_into(&mut cmd);
         // The guest report door's path travels the same way the marker
         // socket's does: the child is the process that owns the libkrun
         // context, so it is the one that registers the door's vsock port at
-        // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — and it registers it
-        // only when the supervisor bound a door, which is what the env
+        // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the door the
+        // supervisor bound before the first boot, which is what the env
         // names. A redraw hands the same door to the fresh boot.
-        if let Some((name, path)) = guest_report_door.as_ref() {
-            cmd.env(name, path);
+        let (name, path) = &guest_report_door;
+        cmd.env(name, path);
+        if let Some(path) = guest_telemetry_door.as_ref() {
+            cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
         }
-        child = cmd
-            .env(MARKER_SOCK_ENV, &marker_sock_path)
+        cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
             // The node's proxy port travels to the guest through the VMM child's
             // env: the child is a separate process (like the marker socket path),
             // and its backend appends it to the kernel command line, where the
@@ -874,30 +993,35 @@ fn run_foreground() -> Result<()> {
             .env(
                 crate::vm::PUBLISH_GENERATION_ENV,
                 publish_generation.to_string(),
-            )
-            .spawn()
-            .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+            );
 
-        child_pid = child.id();
-        tracing::info!(pid = child_pid, "VMM child spawned");
-
-        // Update state with the known pid so that concurrent `stop` invocations
-        // during Starting can signal the correct process.
+        // Fork the VMM child and record its pid under one hold of the
+        // lifecycle write lock, so a stopper never sees a lifecycle whose
+        // child exists but is not recorded. A concurrent `stop` during
+        // Starting signals the pid it reads here. A stop signal's boot abort
+        // (`stop::graceful_stop_from_signal`) takes the same lock, writes
+        // `Stopped`, and keeps the lock until it has ended the process: it
+        // either reads this child's pid and signals it, or holds the lock
+        // first, and then this boot never forks.
         {
             let mut lock = state_dir
                 .lifecycle_lock()
                 .context("opening lifecycle lock")?;
             let _guard = lock.write().context("acquiring lifecycle write lock")?;
             let state = state_dir.read_state().context("reading state")?;
-            // A concurrent stop might have already reset us to Stopped; bail early.
+            // A concurrent stop might have already reset us to Stopped; bail
+            // before a child exists.
             if !matches!(state.lifecycle, Lifecycle::Starting) {
-                let _ = child.kill();
-                let _ = child.wait();
                 bail!(
-                    "lifecycle changed to {:?} during spawn; aborting",
+                    "lifecycle changed to {:?} before spawn; aborting",
                     state.lifecycle
                 );
             }
+            child = cmd
+                .spawn()
+                .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+            child_pid = child.id();
+            tracing::info!(pid = child_pid, "VMM child spawned");
             state_dir
                 .write_state(&State {
                     lifecycle: Lifecycle::Starting,
@@ -931,6 +1055,8 @@ fn run_foreground() -> Result<()> {
                 // guard drops here → StartingGuard resets state to Stopped (R4.6)
             }
         };
+        boot_failed.ok();
+        drop(boot_span);
 
         // T93: watch what became of the port this start reserved. The guest
         // reports the publish's outcome over the marker channel — served, or
@@ -999,7 +1125,13 @@ fn run_foreground() -> Result<()> {
                 drop(node_port);
                 node_port = assign_node_proxy_port(&ports_dir)
                     .context("redrawing the node's proxy port after a refused publish")?;
-                boxes.register_node_namespace(node_port.port);
+                // A row the redraw cannot publish fails the start, which
+                // discards a fresh volume image like every other failed boot.
+                if let Err(error) = boxes.try_register_node_namespace(node_port.port) {
+                    crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                    return Err(error)
+                        .context("publishing the node namespace's row after a redraw");
+                }
                 continue;
             }
             crate::control::PublishDecision::FailStart {
@@ -1050,8 +1182,10 @@ fn run_foreground() -> Result<()> {
     // from a guest too old to echo one — none.
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
-        // The watcher keeps the supervisor's span, so its lines carry `vm`.
-        let vm_scope = tracing::Span::current();
+        // The watcher's lines carry `vm` through a span of its own: it may
+        // outlive READY, and keeping the start phase's span would keep that
+        // phase from exporting (`telemetry::vm_task`).
+        let vm_scope = crate::telemetry::vm_task("proxy.publish.watch");
         std::thread::spawn(move || {
             let _vm_scope = vm_scope.entered();
             for event in marker_events {
@@ -1150,8 +1284,24 @@ fn run_foreground() -> Result<()> {
         }
     }
 
+    // The VM is ready: the start phase and the process root end and are
+    // flushed now, not when the supervisor exits — which is the VM's whole
+    // life later, if ever: a supervisor killed with its VM never exports what
+    // is still open. Supervision runs under its own root.
+    let _serve_phase = start_phase.ready();
+
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
+    // The VM is gone, so the guest telemetry door's connection ends: let
+    // the door hand the guest's last records (its shutdown) to the host's
+    // endpoint before this process exits, bounded (TEL-034). The spool
+    // already holds them either way.
+    if guest_telemetry_door.is_some() {
+        crate::guest_telemetry::drain_at_exit(crate::guest_telemetry::DRAIN_AT_EXIT);
+    }
+    // The VM is gone, so no answer to a pending ask can still matter: each
+    // is cancelled and audited before the supervisor exits (NET-045).
+    crate::control::stop_pending_asks(&boxes);
     // The one-per-stop line (NET-055): the supervisor observes every stop of
     // its VM — `min stop`, `minvmd stop`, a guest poweroff, a crash — as the
     // VMM child exiting, and it is the line's only witness: the `minvmd stop`
@@ -2135,13 +2285,67 @@ fn draw_publish_generation() -> u64 {
     hasher.finish()
 }
 
+/// Bind the host's two box doors beside each other before the guest boots
+/// (T66, T94, NET-138): the box-registration control socket at
+/// `control_sock_path`, whose accept loop's handle the caller holds for the
+/// daemon's life, and the guest report door beside it, answered as the env
+/// pair the VMM child registers the door's vsock port from. Either bind
+/// failing is the supervisor's startup error, naming the socket and the
+/// cause (#1790): under the in-force gate a box with no host row reaches
+/// nothing, so there is no interim a boot without its doors could degrade
+/// to.
+#[cfg_attr(
+    not(minvmd_libkrun),
+    allow(
+        dead_code,
+        reason = "only the libkrun boot loop binds the doors, so every other \
+                  target compiles them unreached"
+    )
+)]
+fn bind_box_doors(
+    control_sock_path: &std::path::Path,
+    boxes: &crate::box_registry::BoxRegistry,
+    answerer: &crate::net::answerer::AnswererStatus,
+    proxy_publish: &crate::control::ProxyPublishStatus,
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    (&'static str, std::path::PathBuf),
+)> {
+    use anyhow::Context as _;
+    let control = crate::control::spawn(
+        control_sock_path.to_path_buf(),
+        boxes.clone(),
+        answerer.clone(),
+        proxy_publish.clone(),
+    )
+    .with_context(|| {
+        format!(
+            "binding the box-registration control socket at {}; own-address boxes cannot \
+             register without it",
+            control_sock_path.display()
+        )
+    })?;
+    let guest_report_door =
+        guest_report_door_env(control_sock_path, boxes, answerer, proxy_publish).with_context(
+            || {
+                format!(
+                    "binding the guest report door at {}",
+                    control_sock_path
+                        .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
+                        .display()
+                )
+            },
+        )?;
+    Ok((control, guest_report_door))
+}
+
 /// Bind the guest report door (T94) beside `control_sock_path` and answer
 /// the env pair the VMM child registers the door's vsock port at
 /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] from — the bridge's two halves
 /// as one step, so the door is bound only once the bridge is up. A bind
-/// failure is warned and answered as the caller's `None`: the boot loop
-/// then hands the child no env at all, so no boot bridges a door it did
-/// not bind, and no bound door stands behind a bridge that never comes up.
+/// failure answers no env at all, and [`bind_box_doors`] fails the boot on
+/// it: no boot bridges a door it did not bind, and no bound door stands
+/// behind a bridge that never comes up.
 #[cfg_attr(
     not(minvmd_libkrun),
     allow(
@@ -2161,14 +2365,7 @@ fn guest_report_door_env(
         boxes.clone(),
         answerer.clone(),
         proxy_publish.clone(),
-    )
-    .inspect_err(|error| {
-        tracing::warn!(
-            %error,
-            "failed to bind the guest report door; the in-VM daemon's runtime \
-             publishes will not be recorded in the host-held grant"
-        );
-    })?;
+    )?;
     Ok((crate::control::GUEST_REPORT_SOCK_ENV, door))
 }
 
@@ -2554,7 +2751,7 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_bails_without_libkrun() {
-        let err = run(false, None).unwrap_err();
+        let err = run(false, None, tracing::Span::none().entered()).unwrap_err();
         assert!(
             err.to_string().contains("requires libkrun"),
             "expected libkrun-required message, got: {err}"
@@ -2564,7 +2761,7 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_rejects_timeout_without_detach() {
-        let err = run(false, Some(5)).unwrap_err();
+        let err = run(false, Some(5), tracing::Span::none().entered()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("`--timeout` only applies with `--detach`"),
@@ -3539,8 +3736,8 @@ mod tests {
     /// from happen together, so the door is bound only once the bridge is
     /// up: the pair names a live socket at the door's own file name beside
     /// the control socket, and a bind that cannot happen answers no env at
-    /// all — no boot bridges a door it did not bind, and no bound door
-    /// stands behind a bridge that never comes up.
+    /// all — no boot bridges a door it did not bind (the boot fails on it,
+    /// [`super::bind_box_doors`]).
     #[test]
     fn guest_report_door_bound_only_behind_its_bridge() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3584,6 +3781,59 @@ mod tests {
             super::guest_report_door_env(&blocked_sock, &boxes, &answerer, &proxy_publish).is_err(),
             "a guest-door path held by a non-socket file refuses the bind, and \
              the env the child would register it from"
+        );
+    }
+
+    /// #1790: a door that cannot bind is the supervisor's startup error,
+    /// never a warning the VM boots past. A non-socket file at the control
+    /// socket's path refuses the control bind, and one at the guest door's
+    /// path refuses the door's; each error names the path it could not
+    /// bind and the cause.
+    #[test]
+    fn box_door_bind_failure_is_a_startup_error() {
+        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let answerer = crate::net::answerer::AnswererStatus::starting();
+        let proxy_publish = crate::control::ProxyPublishStatus::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
+        std::fs::write(&control_sock, "not a socket").expect("seeding the blocking file");
+        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
+            .expect_err("a control socket path held by a non-socket file fails the startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "binding the box-registration control socket at {}",
+                control_sock.display()
+            )) && message.contains("is not a socket"),
+            "the error names the control socket and the cause: {message}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
+        let door = control_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE);
+        std::fs::write(&door, "not a socket").expect("seeding the blocking file");
+        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
+            .expect_err("a guest door path held by a non-socket file fails the startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "binding the guest report door at {}",
+                door.display()
+            )),
+            "the error names the guest report door: {message}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
+        let (_control, (name, door)) =
+            super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
+                .expect("both doors bind on a clear path");
+        assert_eq!(name, crate::control::GUEST_REPORT_SOCK_ENV);
+        assert!(
+            std::os::unix::net::UnixStream::connect(&control_sock).is_ok()
+                && std::os::unix::net::UnixStream::connect(&door).is_ok(),
+            "both doors are live sockets once the startup binds them"
         );
     }
 }

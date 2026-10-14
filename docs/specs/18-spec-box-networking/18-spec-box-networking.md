@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-09-25
+updated: 2026-10-09
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -55,7 +55,7 @@ sign-in (no Gatehouse-brokered grants; Gatehouse §6.10's un-enrolled bullet,
 ruled 2026-09-17), is the next thing built and is a separate document,
 [BEP](https://github.com/gominimal/minimal/pull/1426), that cites this one. It
 depends on these behaviours bound here: box-zone resolution (NET-072, NET-073)
-and the resolver advisory that makes its default `dns` steering buildable
+and the opt-in host setup that makes its default `dns` steering buildable
 (NET-122), `egress.allow_dns_hosts` with DNS-pinned admission (NET-066,
 NET-067), the hostname-proxy parity rule (NET-069 to NET-071), the relay's
 source-address check (NET-084), which on a VM-backed host makes a box's switch
@@ -133,7 +133,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the address that reaches the host's loopback: `127.0.0.1` on the host, the switch's host-gateway address inside boxes.
   tier:     T0
   verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_reach_address_per_mode
-  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
+  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: box→host reach over the name is default-deny except configured host exposures (design §7.1), and an exposure is local reach under the box's egress rules (NET-079; design §7.1 local names), so an allow-all box reaches only the exposures and a deny-all box resolves the name and reaches nothing -->
   - WHERE the host is VM-backed, WHILE a box is a host-address box THE SYSTEM SHALL resolve its lookups through the node's DNS layer and never through the host's own resolver.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_box_resolves_through_node_dns_layer
@@ -142,7 +142,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
   verify:   cargo nextest run -p minimald legacy_host_literal_routes_with_deprecation
-  <!-- S1a/AC2; prose 3; event-driven; "for one release" is a plan fact -->
+  <!-- S1a/AC2; prose 3; event-driven; "for one release" is a plan fact; routing as `host.min.internal` means the literal reaches what that name reaches: box→host default-deny except configured host exposures (design §7.1), so the deprecated spelling grants nothing the name does not -->
 
 - **NET-006** THE SYSTEM SHALL answer `*.min.internal` names only to lookups that originate on the machine.
   tier:     T0
@@ -165,6 +165,10 @@ included, with every refusal logged (NET-001 to NET-004).
   property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
   harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across allocators; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any allocator's own state
   <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is host-global through the answerer's authenticated channel for every allocator, the helper for each VM (NET-138) and each native daemon, and no in-VM daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
+  - WHEN the allocator frees a box's host loopback address THE SYSTEM SHALL hold it back from allocation for the positive answer TTL.
+    tier:   T0
+    verify: cargo nextest run -p minvmd released_address_is_not_reused_within_the_answer_ttl
+    <!-- design §7.1; event-driven; allocation runs through the answerer's authenticated channel from `.2` upward within the reserved range, and co-resident nodes never self-assign; a client that resolved the released name can still connect for the answer's 15 s positive TTL, so an early reuse would hand that connection to a different box; this hold is one of two on the address: NET-138's withdrawal path holds it too, from the row's withdrawal until the host has unbound every forward the withdrawn box published there, and refuses a registration at it meanwhile, so the allocator hands out an address only after both holds have cleared, whichever clears later -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
@@ -208,6 +212,20 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald run_box_ends_when_its_run_ends
   <!-- S1b-2c; event-driven within the WHILE; `min task run` creates a session for the run, execs the task into it, and today destroys it from the client; the destroy moves to the daemon side of the exec's exit so a lost client strands no session; the abandoned-launch reap covers only un-finalized sessions and does not reach this case -->
 
+- **NET-141** WHEN an activation targets a host whose user-namespace verdict refuses the sandbox THE SYSTEM SHALL fail the activation before the session is created, name the cause, exit non-zero, and leave no session behind.
+  tier:     T0
+  verify:   cargo nextest run -p minimal activate_refuses_unconfinable_sandbox_before_session_creation
+  verify:   cargo nextest run -p minimald create_reply_carries_user_namespace_verdict
+  <!-- event-driven; the verdict is the host's; the daemon decides it and carries it in the create reply, so the client fails the activation on that reply and a refused create persists nothing; the remedy depends on the cause, below, because `min finalize-install`'s user-namespace item installs the AppArmor profile and nothing else -->
+  - WHERE the cause is an AppArmor restriction on unprivileged user namespaces THE SYSTEM SHALL name `min finalize-install` as the remedy, with `--show` for the step it runs.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_refusal_names_finalize_install_for_apparmor_restriction
+    <!-- optional-feature; the profile is the step's user-namespace item, so this is the one cause the step fixes -->
+  - WHERE the cause is `user.max_user_namespaces=0` or a kernel without user-namespace support THE SYSTEM SHALL name the sysctl key and the persistent change, a `sysctl.d` drop-in setting `user.max_user_namespaces` or a kernel built with `CONFIG_USER_NS`, and not name `min finalize-install`.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_refusal_names_sysctl_for_max_user_namespaces_zero
+    <!-- optional-feature; the step has no item for this cause, so pointing at it would send the operator to a run that changes nothing; a `sudo sysctl` typed by hand is lost at boot, so the refusal names the change that survives one -->
+
 - **NET-016** WHILE a box is running, WHEN a process in it starts listening on a port its ingress rules permit and no declaration names THE SYSTEM SHALL publish that port on the box's address.
   tier:     T0
   verify:   cargo nextest run -p minimald listen_publishes_permitted_port
@@ -227,17 +245,34 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-018** WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL report native DNS as the live name surface in `min session activate` and `min ls`.
   tier:     T0
   verify:   cargo nextest run -p minimal activate_and_ls_report_native_surface
-  <!-- S1b-3; prose 12; optional-feature; WHERE per design §7.1 v0.5 supersession condition -->
+  <!-- S1b-3; prose 12; optional-feature; WHERE per design §7.1 v0.5 supersession condition; the line and row that report it are NET-142's -->
+
+- **NET-142** WHEN a box is activated THE SYSTEM SHALL print one host line naming the box, whose resolution clause is `names: <box>.min.internal via 127.0.0.1:<port>`, where `<port>` is the hostname-proxy port.
+  tier:     T0
+  verify:   cargo nextest run -p minimal activate_prints_one_host_line_per_install_state
+  <!-- event-driven; one line, never a block, so the activation's own output stays what the operator reads; the resolution clause is keyed on the host-DNS state (below) and the install clause on the rest of the install, independently, since a host can have native DNS and still lack the classifier, or the reverse; `<port>` is the port NET-026 discovers -->
+  - WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL print the resolution clause as `names: <box>.min.internal resolves in any browser on this machine`, with no port.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_host_line_names_native_dns_when_deployed
+    <!-- optional-feature; the WHERE is NET-018's; the port is `min ls`'s to print on that host -->
+  - WHILE any `min finalize-install` item is missing THE SYSTEM SHALL end the host line with the install clause `; finish setup: min finalize-install`, whatever its resolution clause.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_host_line_carries_finish_setup_clause_while_items_missing
+    <!-- state-driven; the clause is the pointer NET-122 owes an unfinished host, so a session start and `min finalize-install --show` agree on whether anything is left; a finished host has no clause -->
+  - WHEN `min ls` runs THE SYSTEM SHALL keep its `HOSTNAME PROXY:` and `ZONE ANSWERER:` detail rows, keep the resolution wording of its `NAME SURFACE:` row, and end that row with the same install clause as the activate host line while any item is missing.
+    tier:   T0
+    verify: cargo nextest run -p minimal ls_keeps_detail_rows_and_name_surface_clause
+    <!-- event-driven; the listing is per daemon and names no box, so its row keeps its own words, `the hostname proxy is the live name surface · <name>.min.internal routes through it on 127.0.0.1:<port>` or `native DNS is the live name surface · …`, and only the install clause `; finish setup: min finalize-install` is shared with the host line; a listener failure (NET-020) stays on the `HOSTNAME PROXY:` row here; the port, the answerer and the surface each get a row, while an activation gets one line -->
 
 - **NET-019** WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL keep the hostname proxy serving.
   tier:     T0
   verify:   cargo nextest run -p minimald proxy_keeps_serving_after_supersession
   <!-- S1b-3; prose 12; optional-feature; interview decision; WHERE per design §7.1 v0.5 -->
 
-- **NET-020** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL print the reason and the remedy in `min session activate` and `min ls`.
+- **NET-020** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL print the reason and the remedy in `min session activate` and `min ls`, as `names: <cause>` in place of the host line's resolution clause, in both its forms, with the install clause after it when one applies.
   tier:     T0
   verify:   cargo nextest run -p minimal listener_failure_reported_with_remedy
-  <!-- S2a/AC1; prose 13; unwanted -->
+  <!-- S2a/AC1; prose 13; unwanted; the activate surface stays one line (NET-142): the cause stands in for the resolution clause whether that clause named the proxy or native DNS, since native DNS answers through the same listener, and the install clause is decided on its own; `min ls` carries the cause on its `HOSTNAME PROXY:` row -->
 
 - **NET-021** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL retry with backoff until it succeeds.
   tier:     T0
@@ -267,7 +302,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-026** WHEN `min` connects to a daemon THE SYSTEM SHALL discover the hostname-proxy port in use and print it.
   tier:     T0
   verify:   cargo nextest run -p minimal min_prints_discovered_proxy_port
-  <!-- S2b/AC1; prose 16; event-driven -->
+  <!-- S2b/AC1; prose 16; event-driven; `min ls` prints the port on its `HOSTNAME PROXY:` row on every host, and that row is where the test reads it; the activate host line (NET-142) carries it only in its proxy form, since on a host with native DNS deployed the line names no port -->
 
 - **NET-027** WHILE two daemons run on one machine THE SYSTEM SHALL route both daemons' box hostnames at the same time.
   tier:     T0
@@ -317,7 +352,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-044** WHEN a dynamic ingress request is decided `allow` THE SYSTEM SHALL publish the port and show the mapping in `min session policy`.
   tier:     T0
   verify:   cargo nextest run -p minimald expose_allow_publishes_and_lists
-  <!-- S5/AC2; prose 29; event-driven -->
+  <!-- S5/AC2; prose 29; event-driven; "publish" means reachable, as in NET-040 and NET-016: the box's relay gate admits the port in the same step the forward is bound, for an `allow` and for a yes-answered `ask` (NET-045) alike, and no pending window exists; with nothing listening on the port yet, the box's own kernel answers with a reset; the admission is kept apart from NET-016/NET-017's listen-published set, so a listener closing never withdraws it, and the expose's revocation (the box's stop) does -->
   - IF a dynamic ingress request is decided `deny` THEN THE SYSTEM SHALL refuse it with a typed error.
     tier:   T0
     verify: cargo nextest run -p minimald expose_deny_typed_error
@@ -422,7 +457,7 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald egress_drop_logged_rate_limited
     <!-- S8a/AC2; prose 40; unwanted -->
-  - WHILE a box runs with an own address, IF it opens a flow to one of the switch's own addresses THEN THE SYSTEM SHALL drop it whatever the box's `egress.allow_subnets` says, except at three port-scoped openings: the resolver's port on the gateway address; the proxy's address for a box on a credentialed lane (NET-134); and configured host exposures over the host alias, reached as local reach under the box's rules.
+  - WHILE a box runs with an own address, IF it opens a flow to one of the switch's own addresses THEN THE SYSTEM SHALL drop it whatever the box's `egress.allow_subnets` says, except at four port-scoped openings: the resolver's port on the gateway address, the proxy's address for a box on a credentialed lane (NET-134), configured host exposures over the host alias (reached as local reach under the box's rules), and the hostname proxy's port on the node address while the node serves the interim proxy (design §7.1, NET-070).
     tier:   T0
     verify: cargo nextest run -p minvmd box_cannot_reach_switch_api
     <!-- S8a/AC2; prose 40; state+unwanted; a frame-level decision on every plane: design §5.3 (direct-to-IP flows admitted by CIDR rules are always intersected with the infrastructure deny set) and §4.3 rule 2 applied to every box-plane packet, not only DNS answers (NET-067 carries the DNS-answer intersection); the switch's gateway serves its own forwarder and zone configuration from inside the VM, so a CIDR rule covering the switch subnet must not reach it; on a VM-backed host the host-side gate enforces it outside the boundary and the in-VM relay carries the same verdict; on a native host the daemon's relay is the only leg and its switch gateway is the same control surface -->
@@ -515,10 +550,15 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald box_zone_connection_enforced_at_connect
   <!-- S8c/AC3; prose 46; event-driven -->
 
-- **NET-074** WHERE the deny-all default is in force and the opt-out flag is not set, WHEN an own-address box is created with no `egress` section THE SYSTEM SHALL give it no reach to any external address.
+- **NET-074** WHERE the deny-all default is in force and the opt-out flag is not set, WHEN a box is created with an `egress` section, or an own-address box with none, THE SYSTEM SHALL give each destination allow list the expanded section leaves absent, `allow_subnets` and `allow_dns_hosts`, no reach in that dimension, so that an own-address box with no `egress` section reaches no external address.
   tier:     T0
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
-  <!-- S9a/AC1; prose 47; feature+event; supersedes the shipped 03-spec R2.1 default of allow-all for absent `egress` fields; NET-076 binds the announcement window and NET-077 the opt-out -->
+  verify:   cargo nextest run -p sessions absent_destination_lists_grant_nothing_once_merged
+  <!-- S9a/AC1; prose 47; feature+event; stated per list, not per section: an absent list in the expanded spec grants nothing (the architecture replaces a table wholesale between layers, so an absent list is simply absent), so a section that names only `allow_dns_hosts` reaches its names and no address directly, and allow-all is written out (`0.0.0.0/0` and `::/0` in `allow_subnets`), never left to an absent list; the per-list rule is not mode-qualified, as the architecture's default-deny rule is not: a declared section on a host-address box resolves the same, a host that decides per box reads the resolved shape (NET-079) and refuses a narrowing list it cannot enforce, and only the absent-section default is an own-address box's; `allow_protocols` is a filter over the reach the two destination lists grant and grants none itself, so its absence narrows nothing and `allow_subnets = ["0.0.0.0/0"]` alone is allow-all; `::/0` grants nothing until an IPv6 path exists (NET-082) and is written as the forward-compatible spelling; supersedes the shipped 03-spec R2.1 meaning of an absent `allow_subnets` or `allow_dns_hosts` list, allow-all, in a declared section, and with it R2.1's allow-all for an own-address box with no `egress` section; NET-076 binds the announcement window and NET-077 the opt-out -->
+  - WHERE the opt-out flag is not set, WHEN the user activates an own-address box with no `egress` section THE SYSTEM SHALL print one line that names the deny-all default and the flags that declare reach.
+    tier:   T0
+    verify: cargo nextest run -p minimal deny_all_in_force_note_printed
+    <!-- S9a/AC2; prose 48; optional-feature+event; the in-force note that replaces NET-076's announcement; the verify test is Linux-only (`#[cfg(target_os = "linux")]`), as it drives the compiled binary against a local daemon -->
 
 - **NET-075** WHERE the deny-all default is in force and the opt-out flag is not set, WHILE an own-address box has no `egress` section THE SYSTEM SHALL show `deny-all` in `min session policy`.
   tier:     T0
@@ -527,18 +567,26 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-076** WHILE the deny-all default is announced but not yet in force THE SYSTEM SHALL print the coming change at activate.
   tier:     T0
-  verify:   cargo nextest run -p minimal deny_all_announcement_printed
-  <!-- S9a/AC2; prose 48; state-driven; interview decision -->
+  verify:   cargo nextest run -p minimald own_ip_default_deny_all
+  <!-- S9a/AC2; prose 48; state-driven; interview decision; window ended: the default is in force as of the change that flips both phase constants, so this requirement's condition no longer holds; the verify test proves that, asserting the shipped phase is `InForce`; the note printed in force is NET-074's child requirement -->
 
-- **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all default for a box with no `egress` section.
+- **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all meaning of an absent `egress` section and of an absent allow list in a declared one.
   tier:     T0
   verify:   cargo nextest run -p minimald deny_all_opt_out_keeps_prior_default
-  <!-- S9a/AC2; prose 48; optional-feature; the shipped default is 03-spec R2.1's -->
+  <!-- S9a/AC2; prose 48; optional-feature; the shipped meaning is 03-spec R2.1's; the opt-out is one flag for the section and its lists, since NET-074 is the one rule it defers -->
 
 - **NET-078** THE SYSTEM SHALL classify node-plane traffic and the host-address cohort separately with distinct source identities.
   tier:     T0
   verify:   cargo nextest run -p minimald node_plane_and_cohort_distinct_sources
   <!-- S9b/AC1; prose 49; ubiquitous -->
+  - WHERE the host is not VM-backed, WHILE no association exists THE SYSTEM SHALL decide the two identities as distinct classifier matches with no source translation: a process in the boxes cgroup subtree is the host-address cohort, and a process outside it is the node-plane set.
+    tier:   T0
+    verify: cargo nextest run -p minimald unenrolled_native_identities_are_cgroup_matches_without_snat
+    <!-- design §7.4 (v0.8) and §4.1; state-driven within the WHERE; the ruling on an un-enrolled host: no gateway reads a source address until an association exists, so the identities are the classifier's own matches and nothing is translated; they stay in this document rather than moving to the enrolled-host egress document, because the matches are what the deny-all verdict (NET-079) and the node-plane record (NET-080) are decided on, with or without a gateway -->
+  - WHERE the host is not VM-backed, WHEN an association is established THE SYSTEM SHALL apply the reserved SNAT addresses, the node-plane address and the host-ip cohort address, the two reserved addresses of the egress-plane block (design §4.2), to the same two matches without reinstalling the classifier.
+    tier:   T0
+    verify: cargo nextest run -p minimald association_applies_reserved_snat_without_classifier_reinstall
+    <!-- design §7.4 (v0.8) and §4.2; event-driven within the WHERE; the privileged step installs the matches once and the association adds the translation to them, so the operator takes no second step; on a VM-backed host the SNAT rules stay in force while un-enrolled, since the host-side helpers are the egress gateway there (design §7.1) -->
 
 - **NET-079** WHILE a host-address box is declared deny-all THE SYSTEM SHALL refuse every outbound connection it opens, deciding inside the box host on the box's own declaration.
   tier:     T0
@@ -556,14 +604,19 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_box_cannot_leave_its_cgroup
     <!-- design §4.1; state-driven, and not inherited from the deny-all WHILE above: the classifier decides every host-address box's verdict on its cgroup, so an allow-list box that could leave its leaf would take a sibling's verdict; the box host's obligation, not a property of the kernel: the box is confined by a cgroup namespace rooted at its own placement on a mount that treats namespaces as delegation boundaries, with the host's cgroup mount kept out of the box's mount namespace; a box as the daemon's user with write access to a common ancestor can otherwise migrate itself -->
-  - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, WHEN a session starts THE SYSTEM SHALL print an advisory naming the cause, with the exact command that installs the classifier's privileged step when that step is what is missing, with no privilege prompt, and record that host-address boxes have no per-box enforcement on that host.
+  - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, WHEN a session starts THE SYSTEM SHALL record that host-address boxes have no per-box enforcement on that host, and, WHILE the box declares egress (deny-all, any allow or deny flag, or an `egress` section), print an advisory naming the cause, with `min finalize-install` as the command that installs the classifier's privileged step when that step is what is missing, with no privilege prompt, at session start and in the in-box banner alike.
     tier:   T0
     verify: cargo nextest run -p minimald native_host_advises_classifier_install_without_prompt
-    <!-- design §7.4; state+event; the causes are the privileged step not installed, or the host unable to confine a box as above (cgroup2 mounted without delegation-boundary namespaces, or the host's cgroup mount not keepable out of the box's mount namespace); installing the step clears only the first, so the command is named only for it; the ruleset needs a capability the native daemon lacks, so a native host takes one privileged install step in NET-122's advisory pattern; until then the host has no per-box host-address enforcement and says so at session start, visible to policy; refusing host-address egress declarations until then, and scoping the classifier to VM-backed hosts, are the shapes the architecture's ruling on the native install step rejected (design §7.4 and its v0.8 change history); the enforcement the host records covers addresses, never names, while the open question on native forwarding is open -->
+    verify: cargo nextest run -p minimald classifier_advisory_prints_only_while_box_declares_egress
+    <!-- design §7.4; state+event; the deny-all copy is `note: you asked this box for no network access, but this machine can't enforce it yet, so the box can still reach the network.` followed by `  Enforce it: min finalize-install   (or start the box with --network own_ip, which enforces it now)`; a box that declares nothing is told nothing, since it has no declaration to go unenforced, and the in-box banner follows the same rule; the command is the installed CLI's own verb, never a placeholder and never a remote fetch; the causes are the privileged step not installed, or the host unable to confine a box as above (cgroup2 mounted without delegation-boundary namespaces, or the host's cgroup mount not keepable out of the box's mount namespace); installing the step clears only the first, so the command is named only for it; the ruleset needs a capability the native daemon lacks, so a native host takes one privileged install step in NET-122's advisory pattern; until then the host has no per-box host-address enforcement and says so at session start, visible to policy; refusing host-address egress declarations until then, and scoping the classifier to VM-backed hosts, are the shapes the architecture's ruling on the native install step rejected (design §7.4 and its v0.8 change history); the enforcement the host records covers addresses, never names, while the open question on native forwarding is open -->
   - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, WHILE a host-address box is declared deny-all or carries an `egress` section, THE SYSTEM SHALL run the box with no per-box verdict and its declaration unenforced, recorded as such, and never refuse the box or its connections on that ground.
     tier:   T0
     verify: cargo nextest run -p minimald unenforcing_native_host_runs_host_ip_box_unenforced
     <!-- design §7.4; state-driven; the explicit exception to this requirement's deny and to NET-080's node-plane record: on that host there is no classifier, so there is no verdict to fail closed on, and the architecture's ruling on the native install step rejected turning the missing step into a hard failure for a mode whose chooser accepted the reduced tier; whether such a box may run there is policy's call on the recorded attribute, not the box host's; the box's declaration is enforced the moment the host can decide per box -->
+  - WHILE the box host decides per box, WHEN a host-address box is created or launched with an `egress` declaration the box host's classifier cannot enforce THE SYSTEM SHALL refuse the creation or launch with an error naming each unenforced rule.
+    tier:   T0
+    verify: cargo nextest run -p minimald per_box_host_refuses_unenforceable_host_ip_declaration
+    <!-- design §4.1 and §7.4; state+event; interim, retired when the classifier enforces a host-address box's declared address rules on its cgroup; the classifier decides addresses, never names, and enforces only the deny-all verdict, so any `deny_subnets` entry and any allow list short of every allow list present and empty is a rule it cannot enforce; reporting per-box enforcement over an unenforced declaration is a false claim, and the refusal replaces it with an honest one while own-address boxes stay the restricted mode; distinct from the sub-requirement above, which governs a host that cannot decide per box, where the box runs unenforced and is never refused on that ground: this one governs a host that decides per box but not for this declaration's shape; launch is covered as well as creation because the host's fact is read again at each launch, so a box created on a host that could not decide, or persisted before this rule, can reach a host that now decides per box; the launch record never claims per-box enforcement for such a declaration -->
 
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own package fetch on the same host and record it as node-plane traffic.
   tier:     T0
@@ -602,23 +655,40 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-138** WHERE the host is VM-backed THE SYSTEM SHALL hold, outside the VM, one table of every published namespace on the node — each live box, the node itself and the host-address cohort — with its switch address, its host loopback address, its name, its admitted port set and its egress rules, filled from the host-side creator's expanded spec and the host-side helper's own allocation.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_table_holds_every_published_namespace
-  <!-- S10a/AC1; prose 51; optional-feature; design §7.1 (un-enrolled: the client-side helpers self-allocate locally; rules derive from the expanded specs the creator made), §7.6 (the helper accepts no rule change from a guest) and Gatehouse §6.10 (address-to-box facts from the host-side creator); the table is what the gate NET-081 decides by and what NET-133's attachments are read from; a box's admitted port set is its declared ports, the ports it listens on under `dynamic_ingress = allow` (NET-016/NET-017's listen-published set), and the ports the attached human answered yes to under `ask` (NET-045), which the client records in the table; the node's admitted set is the hostname proxy at the port the helper assigned, and any port while a host-address box is published; on a VM-backed host the helper publishes this table's rows into the host's answerer, bound on the host loopback (design §7.1: a host service, never a session-daemon child), so the answerer needs no forwarder and no row; the cohort row admits a flow when any live member's rules admit it, and one member's denies never narrow a sibling's allows, so the row keeps each member's rules and is never a computed aggregate (design §4.3 rule 2) -->
+  <!-- S10a/AC1; prose 51; optional-feature; design §7.1 (un-enrolled: the client-side helpers self-allocate locally; rules derive from the expanded specs the creator made), §7.6 (the helper accepts no rule change from a guest) and Gatehouse §6.10 (address-to-box facts from the host-side creator); the table is what the gate NET-081 decides by and what NET-133's attachments are read from; a box's admitted port set is its declared ports plus its runtime ports: under `dynamic_ingress = allow`, the ports it listens on (NET-016/NET-017's listen-published set) and the ports `min net expose` publishes (NET-044); under `ask`, the ports the attached human answered yes to (NET-045); every runtime port lies inside the row's range; only the in-VM daemon observes a listener or an expose, so it reports each `allow` port and the helper records it only inside the box's `dynamic_ingress` grant, the stance and range the host-side creator registered with the row; under `ask` the in-VM daemon's report only raises the question: the helper holds the pending ask, offers it to the attached host clients with facts read from the host row, records the first answer itself and audits it, so an `ask` port enters the row only on a yes the host recorded, and a guest report under `ask` is refused; the report is §7.6's fixed, size-bounded status message (row key, port, protocol, admit or withdraw) and carries no address, name or rule, so it selects a member of a set the host already holds and never changes a rule, the same shape as Gatehouse §6.11's one node-asserted input, where a lying node can only select within the union it already holds; one residual follows and is accepted: the in-VM daemon reports for every box in the VM, so the row key is guest-chosen and an escapee can select within a sibling's `allow` grant, or raise an ask on a sibling's row that the offer names by the sibling's host-row facts, the resident-union bound the threat assumption already concedes (Gatehouse §6.11), never a host-attributed claim; the node's admitted set is the hostname proxy at the port the helper assigned, and any port while a host-address box is published; on a VM-backed host the helper publishes this table's rows into the host's answerer, bound on the host loopback (design §7.1: a host service, never a session-daemon child), so the answerer needs no forwarder and no row; the cohort row admits a flow when any live member's rules admit it, and one member's denies never narrow a sibling's allows, so the row keeps each member's rules and is never a computed aggregate (design §4.3 rule 2) -->
   - WHEN a box is created on a VM-backed host THE SYSTEM SHALL allocate its switch address and its host loopback address in the host-side helper and hand them to the in-VM daemon before the box's first connection.
     tier:   T0
     verify: cargo nextest run -p minvmd box_addresses_allocated_on_host_and_handed_to_daemon
-    <!-- S10a/AC1; prose 51; event-driven; the helper hands the lease and the gate admits only that address (design §4.2, un-enrolled self-allocation); the in-VM daemon configures the tap with the address it was handed and selects none; a native host has no helper and its daemon is the creator (NET-010's allocator, unchanged) -->
+    <!-- S10a/AC1; prose 51; event-driven; the helper hands the lease and the gate admits only that address (design §4.2, un-enrolled self-allocation); the in-VM daemon configures the tap with the address it was handed and selects none; a box's task addresses are registered with it: the helper allocates up to one per task slot (`TASK_SLOTS_PER_BOX`, 4) after the box's own, best-effort: it stops while its hand-out run is at `TASK_SLOT_FLOOR` (16) so task addresses never starve a new box's own, and never refuses a box for want of them (`a_box_registers_with_fewer_task_slots_when_the_book_is_short`, `task_slots_never_starve_a_new_box`); it files each as a task row carrying the box's id and egress and no ingress, names or credentialed lane, so a task run attaches at a free one and the in-VM daemon draws nothing once a control socket exists (`task_addresses_registered_with_box_and_handed`); a native host has no helper and its daemon is the creator (NET-010's allocator, unchanged) -->
   - WHEN the VM boots THE SYSTEM SHALL assign the hostname-proxy port in the host-side helper, hand it to the in-VM daemon before it listens, and bind the daemon's hostname proxy to that port and no other.
     tier:   T0
     verify: cargo nextest run -p minvmd node_port_assigned_on_host_and_handed_to_daemon
-    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored, and the helper publishes its node's rows into the host's one answerer over its authenticated channel (design §7.1: one always-on answerer per host, its listener socket held by the service manager, never a session-daemon child; co-resident nodes write into one answerer, never two); NET-124 to NET-128 hold in that answerer wherever it is hosted; until the host answerer service exists (NET-122's privileged step installs it), the helper that binds the hook port hosts the answerer as a recorded single-operator interim (the port held by a session process, not the manager), a second helper writes into it over the same channel instead of binding, and the interim is surfaced at session start; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
-  - IF the in-VM daemon reports an address, a name, a port or a rule for any row THEN THE SYSTEM SHALL keep it out of the table.
+    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored, and the helper publishes its node's rows into the host's one answerer over its authenticated channel (design §7.1: one always-on answerer per host, its listener socket held by the service manager, never a session-daemon child; co-resident nodes write into one answerer, never two); NET-124 to NET-128 hold in that answerer wherever it is hosted; until the host answerer service exists (NET-122's privileged step installs it), the helper that binds the hook port hosts the answerer as a recorded single-operator interim (the port held by a session process, not the manager), a second helper writes into it over the same channel instead of binding, and the interim is surfaced at session start; the interim's channel is per user, so a helper under another state dir of the same operator publishes into it instead of binding, and the channel admits peers of the same user, and root for the release verbs only; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
+  - IF the in-VM daemon reports an address, a name, a declared port or a rule for any row THEN THE SYSTEM SHALL keep it out of the table.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_never_sourced_from_guest
-    <!-- S10a/AC1; prose 51; unwanted; NET-133's discipline for the proxy's attachments, applied to the table the gate decides by; the daemon is what an escapee controls; a row's liveness is the host's own observation of the attachment, not a report -->
+    <!-- S10a/AC1; prose 51; unwanted; NET-133's discipline for the proxy's attachments, applied to the table the gate decides by; the daemon is what an escapee controls; a row's liveness is the host's own observation of the attachment, not a report; runtime ports are the one report the table takes, and only inside the host-held grant (the next two requirements) -->
+  - WHEN the in-VM daemon reports a runtime port for a live box whose row's `dynamic_ingress` grant admits it THE SYSTEM SHALL add the port to the row's admitted port set, and remove it when the daemon reports its withdrawal or the row is withdrawn.
+    tier:   T0
+    verify: cargo nextest run -p minvmd admit_report_recorded_within_host_grant
+    <!-- S10a/AC1; prose 51; event-driven; the grant is the `dynamic_ingress` stance and `dynamic_allowed_range` the host-side creator registered with the row, never a value the report carries; `allow` admits a reported port inside the range; `ask` admits a port inside the range only after the attached human's yes recorded by the host (NET-045), never on the in-VM daemon's report; the helper appends a host-side line to the `audit/box-admissions.log` in its state dir for each port it records under `allow` (minvmd `control.rs`, `admit_report_and_reply` through `append_audit_copy`) and for each ask event, the ask's outcome included (`serve_guest_ask` through `audit_ask`), so the record survives an escapee erasing the in-VM log (NET-046); a refused `allow` report is a warn line in the helper's log, not an audit line -->
+  - IF the in-VM daemon reports a runtime port that its row's `dynamic_ingress` grant does not admit, or for a row the table does not hold, THEN THE SYSTEM SHALL refuse the report and keep the port out of the table.
+    tier:   T0
+    verify: cargo nextest run -p minvmd admit_report_refused_outside_range_or_under_deny
+    <!-- S10a/AC1; prose 51; unwanted; an absent or `deny` stance, an `ask` stance (an `ask` port enters only on the host-recorded yes), an absent range, or a port outside the range refuses; the in-VM daemon unwinds the publish it reported, so the refusal leaves no partial mapping (NET-047) -->
+  - WHILE a row's `dynamic_ingress` stance is `ask`, THE SYSTEM SHALL add a runtime port to the row's admitted port set only when the attached human's yes is recorded by the host, and IF the in-VM daemon reports the port THEN THE SYSTEM SHALL refuse the report.
+    tier:   T0
+    verify: cargo nextest run -p minvmd ask_admit_from_guest_refused_without_host_record
+    <!-- NET-045; state-driven with an unwanted-behaviour clause; the security property of the runtime path: an escapee inside the VM cannot turn an `ask` stance into an admission by reporting the port, because only the host's own record of the human's yes admits it; the admit half is also proven by `ask_yes_recorded_by_client_admits` -->
+
+  - IF the in-VM daemon reports a runtime port for admission to a row that already holds the per-row cap of runtime ports, or reports admissions for a row faster than the per-row report rate THEN THE SYSTEM SHALL refuse the report and keep the port out of the table.
+    tier:   T0
+    verify: cargo nextest run -p minvmd admit_report_refused_past_row_cap_or_rate
+    <!-- S10a/AC1; prose 51; unwanted; design §7.6 bounds the guest-to-host channel to fixed, size-bounded status messages; a range can span tens of thousands of ports, so the cap bounds what one row's reports can grow the table to; working values: 256 runtime ports per row (`RUNTIME_PORT_CAP`) and 10 recorded admit reports per trailing second per row (`ROW_ADMIT_RATE_PER_SECOND`); a re-admit of a port the row already holds is answered as recorded and counts toward neither; a withdrawal report is never refused by the cap or rate, because it can only narrow; a yes the host records under `ask` is bounded by the ask queue and the human's dialog, not by the cap or rate; the in-VM daemon unwinds the refused publish, so the refusal leaves no partial mapping (NET-047) -->
   - WHEN a box's attachment to the switch ends or its creator destroys it THE SYSTEM SHALL withdraw its row within 60 seconds.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_row_withdrawn_within_60s_of_box_end
-    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row -->
+    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row; the attachment's end detaches the row and the row is withdrawn after a grace (`DETACH_GRACE`, 45 s, swept every second) unless the box's shuttle carries a frame from its address again first — while detached the row decides frames as before and keeps its addresses; the creator's registrations persist host-side in the VM host daemon's state dir (`box-registry.json`, mode 0600, written by rename, versioned) and reload detached at start — a minvmd restart is a VM restart and a reloaded row rarely outlives a cold boot, so survival across it rides the creator's resume, and the reload's job is to keep the creator's records so a resume can be checked; a creator resumes a row withdrawn after its grace from that host-side record, never from a guest report, found by its box id so a renamed session still resumes it (`a_resume_by_box_id_survives_a_rename`); a resume never extends a row that stands: a detached row's grace keeps running from its attachment's end, so a resume never holds it past 60 s from that end (`NET_138_WITHDRAWAL_BOUND`, asserted at compile time against the grace and the sweep; `a_standing_resume_leaves_the_detached_rows_grace`), and a resume racing the grace's end reinstates the row rather than answering with one about to go; only a reinstated row, which has no attachment left to end, takes `RESUME_ATTACH_BOUND` (5 min, a cold boot plus a box host's launch) and is withdrawn as at the grace's end when no relay carries its unit (its box row or a task row) within it, its record kept; a relay already carrying the source re-attributes a reinstated row on its next frame; a creation keeps its addresses reserved while dormant, its switch and task addresses across a reload too and its published loopback address with the answerer, and holds its name, so no other box is handed them, until its creator's destroy releases them; an exhausted hand-out run stays an explicit refusal; the row-standing read and a task run's attach check the box id, so a row of another box at the address never stands for this one, and a record naming no box id is answered as not standing; a registry file this build cannot read, parse or version is set aside under an `.unusable-<seconds>` suffix and said as an error line, never written over; a box and its task rows are one liveness unit: the box row detaches only once no relay carries its own address nor any task address, a relay carrying either re-attaches it, and the grace's end withdraws the unit (`a_running_task_keeps_its_box_row_past_the_grace`); a task row is withdrawn with its box's row on every path that removes it, never alone, and is persisted, reloaded and resumed with it (`task_rows_withdrawn_with_their_box`) -->
   - WHILE a host-address box is published THE SYSTEM SHALL admit the node's mirrored binds for it at the node's address at any port.
     tier:   T0
     verify: cargo nextest run -p minvmd host_address_mirrored_binds_admitted_unfiltered
@@ -631,20 +701,20 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-083** THE SYSTEM SHALL run every box without `CAP_NET_RAW`.
   tier:     T0
-  verify:   cargo nextest run -p sandbox2 boxes_lack_cap_net_raw
+  verify:   cargo nextest run -p sandbox boxes_lack_cap_net_raw
   <!-- S10a/AC3; prose 53; ubiquitous -->
 
 - **NET-137** THE SYSTEM SHALL refuse a process in a box every socket whose family the box's network namespace does not confine, `AF_VSOCK` included, whatever the box's network mode.
   tier:     T0
-  verify:   cargo nextest run -p sandbox2 every_box_refuses_namespace_bypass_families
-  <!-- S10a/AC3; prose 53; ubiquitous; design §4.1's precision rule (no reachable switch or tunnel control surface, by socket permissions) as the box-level seal: a vsock socket is not scoped by the box's network namespace and reaches the host-side helper's listeners directly, which is the seal a `none` box already carries (NET-038); own-address and host-address boxes keep their inet families -->
+  verify:   cargo nextest run -p sandbox every_box_refuses_namespace_bypass_families
+  <!-- S10a/AC3; prose 53; ubiquitous; design §4.1's precision rule (no reachable switch or tunnel control surface, by socket permissions) as the box-level seal: a vsock socket is not scoped by the box's network namespace and reaches the host-side helper's listeners directly, which is the seal a `none` box already carries (NET-038); every box whose network namespace confines the inet families keeps them, a `none` box included, because its fresh namespace holds only loopback -->
   - WHEN the daemon starts a process inside a running box by joining its namespaces (exec, attach, a hook) THE SYSTEM SHALL apply the same refusal to that process.
     tier:   T0
     verify: cargo nextest run -p minimald joined_process_refuses_namespace_bypass_families
     <!-- S10a/AC3; prose 53; event-driven; a seal set only at box start does not reach a process the daemon injects from outside -->
   - IF a path other than `socket(2)` or `socketpair(2)` can create such a socket for a process in a box, `io_uring` included, THEN THE SYSTEM SHALL refuse that path to the box.
     tier:   T0
-    verify: cargo nextest run -p sandbox2 box_io_uring_socket_refused
+    verify: cargo nextest run -p sandbox box_io_uring_socket_refused
     <!-- S10a/AC3; prose 53; unwanted; the SHALL above names every socket, not every `socket(2)`: a socket an `io_uring` operation creates reaches the same families, so the seal refuses the creating path (`io_uring_setup`) inside the box; the published profile for box processes (architecture AT9, open gap 2) is a default-deny syscall allowlist, which refuses a new socket-creating path by construction, and on a VM-backed host a `socket_create` LSM hook keyed on the box's cgroup, which decides every creation path at once; guest-local vsock is removed from the guest kernel as well, so no reach survives a seal that fails -->
 
 - **NET-139** WHILE the daemon is VM-hosted THE SYSTEM SHALL accept a vsock connection to its RPC listener only from peer CID 2 (`VMADDR_CID_HOST`), deciding at accept before any request byte is read, and SHALL refuse every other CID with one rate-limited audited line naming the peer CID.
@@ -680,7 +750,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, from the host-side creator outside the VM and before the box's first connection, an attachment naming the box by its box id, with its addressing and the source address it arrives from.
   tier:     T0
   verify:   cargo nextest run -p minvmd proxy_attachment_given_before_first_connection
-  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); on a VM-backed host the attachment is the box's NET-138 row, withdrawn with it -->
+  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); on a VM-backed host the attachment is the box's NET-138 row, withdrawn with it; a task row carries its box's id and gets no attachment of its own, since it declares no credentialed lane -->
   - IF the in-VM daemon reports an address-to-box fact THEN THE SYSTEM SHALL keep it out of the proxy's attachments.
     tier:   T0
     verify: cargo nextest run -p minvmd proxy_attachment_never_sourced_from_guest
@@ -693,7 +763,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-134** WHILE a box declares a credentialed upstream THE SYSTEM SHALL admit its connections to the node-local Box Egress Proxy's listener as part of its infrastructure set, whatever its egress rules, and its connections to any other host destination only as those rules admit them.
   tier:     T0
   verify:   ./scripts/session-e2e.sh deny_all_box_reaches_proxy_and_no_other_host_port
-  <!-- state-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the steered proxy address is infrastructure, the machine-internal analogue of the fabric pin's infrastructure set (design §4.4), never an egress carve-out, never spec-declared, and it grants nothing: the proxy's own checks and the box's egress still govern every upstream; the resolver stays the one carve-out from a deny-all verdict (NET-074, NET-079); `host.min.internal` stays local reach under the box's rules (NET-003) -->
+  <!-- state-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the steered proxy address is infrastructure, the machine-internal analogue of the fabric pin's infrastructure set (design §4.4), never an egress carve-out, never spec-declared, and it grants nothing: the proxy's own checks and the box's egress still govern every upstream; the resolver stays the one carve-out from a deny-all verdict (NET-074, NET-079); `host.min.internal` stays default-deny except configured host exposures, each local reach under the box's rules (NET-003) -->
   - WHILE a box declares no credentialed upstream THE SYSTEM SHALL steer none of its flows to the proxy's listener and refuse its direct connections to it under the box-to-host default-deny.
     tier:   T0
     verify: ./scripts/session-e2e.sh box_without_credentialed_lane_cannot_reach_proxy
@@ -702,7 +772,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-102** WHERE the host is un-enrolled THE SYSTEM SHALL self-allocate box addresses from the default plan.
   tier:     T0
   verify:   cargo nextest run -p switch unenrolled_self_allocates_default_plan
-  <!-- S17/AC1, its un-enrolled clause; prose 64; optional-feature; the enrolled clauses are EHE's (formerly NET-100, NET-101, NET-103) -->
+  <!-- S17/AC1, its un-enrolled clause; prose 64; optional-feature; the enrolled clauses are EHE's (formerly NET-100, NET-101, NET-103); native and un-enrolled hosts only: on a VM-backed host the helper allocates every box and task address and the in-VM daemon self-allocates none (NET-138) -->
 
 - **NET-104** WHEN `min net forward <box> <local>:<port>` is run THE SYSTEM SHALL open a local listener relayed over the session's SSH channel so that a request to `localhost:<local>` returns the in-box server's response.
   tier:     T0
@@ -739,6 +809,19 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p sessions egress_on_host_ip_box_accepted
   <!-- S9b/AC2; ubiquitous; supersedes the shipped 03-spec R2.1 rule that `egress` on a HostNet PTask is a parse-time error, which the daemon's session RPC still enforces; NET-079 and NET-080 presuppose this; NET-065 keeps the `none` rejection -->
 
+- **NET-140** WHEN a box is activated with `--deny-all-egress` THE SYSTEM SHALL declare every allow list in its `egress` section present and empty.
+  tier:     T0
+  verify:   cargo nextest run -p minimal deny_all_egress_flag_declares_every_allow_list_empty
+  <!-- S9b/AC2; event-driven; one argument group defines the flag for every command that takes the egress flags, with one meaning, and it conflicts with every `--allow-*` and `--deny-*` flag; an empty value for any of those flags stays a validation error and never becomes an empty list; in the box spec form deny-all is every allow list present and empty, and an absent list in the expanded spec grants nothing in its dimension (NET-074), so the spec loader keeps the two apart and resolves neither early; the predicate that reads a resolved section as deny-all consults the two destination lists, `allow_protocols` being a filter over what they grant; an unset section on a host-address box admits everything because no requirement narrows it (NET-120), which makes this flag the CLI's one deny-all declaration for that mode; mixed forms such as no addresses but some names are not offered, since the classifier decides addresses, never names -->
+  - WHILE a box's `egress` section is declared deny-all THE SYSTEM SHALL show `deny-all` in `min session policy`.
+    tier:   T0
+    verify: cargo nextest run -p minimal policy_shows_declared_deny_all
+    <!-- state-driven; the display NET-075 requires for the own-address default, here for a declaration; on a host-address box it sits beside the box's per-box enforcement value -->
+  - WHILE a box has no `egress` section THE SYSTEM SHALL show its effective default by name in `min session policy`, marked as a default and not as a declaration.
+    tier:   T0
+    verify: cargo nextest run -p minimal policy_shows_unset_egress_as_named_default
+    <!-- state-driven; the effective default is `deny-all` for an own-address box under the deny-all default (NET-075) and `allow-all` for a host-address box or under the opt-out (NET-077); the policy view never shows an unset section as nothing, since a declared deny-all and an unset section admit opposite things -->
+
 - **NET-121** WHEN a box is published THE SYSTEM SHALL bind a forwarder for each ingress port its declaration names before its name is registered, and hold that forwarder until the box stops.
   tier:     T0
   verify:   cargo nextest run -p minimald declared_ports_bound_before_name_registered
@@ -752,27 +835,95 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald failed_forwarder_bind_is_reported_not_substituted
     <!-- design §7.1: a failed bind is "a surfaced error, never a silent fallback or a standing-capability grant"; unwanted; NET-020 covers the hostname listener -->
 
-- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming the exact command that configures it, with no privilege prompt.
+- **NET-122** WHILE a part of the install is missing on this host, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL name what is missing and run the exact script that installs it, with the script's one privilege elevation as the only prompt.
   tier:     T0
-  verify:   cargo nextest run -p minimal session_start_advises_resolver_command_without_prompt
-  <!-- S1b-1; design §7.1 (host-OS resolution per OS); state+event; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
+  verify:   cargo nextest run -p minimal finalize_install_names_missing_items_and_runs_the_script
+  <!-- S1b-1; design §7.1 (host-OS resolution per OS) and §7.4 (the classifier's privileged step); state+event; `min finalize-install`; the script holds only what this host is missing from: the AppArmor user-namespace profile, names (the resolver link and the box-zone answerer, plus the reserved range on macOS), the classifier tree, and membership of the KVM group only where the configured provider is the Linux VM provider; host DNS is opt-in: the proxy is the name surface until the operator takes the step; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
+  - WHILE any item is missing, WHEN a session starts THE SYSTEM SHALL point at `min finalize-install` by the host line's install clause (NET-142) without printing the privileged script or prompting for privilege.
+    tier:   T0
+    verify: cargo nextest run -p minimal session_start_points_at_finalize_install_without_the_advisory
+    <!-- state+event; the CLI test `activate_and_ls_report_native_surface` checks both verbs' output; the clause is `; finish setup: min finalize-install`, the tail of NET-142's one host line, so `min session activate` and `min ls` print the same words; a finished host has no clause; a scripted or agent start that repeats on every activation carries one clause, never a script block that buries the session's own errors -->
+  - WHEN the operator runs `min finalize-install` THE SYSTEM SHALL write the script for this host's current state to a file with mode `0600` that only the operator can read, run it as root with one privilege elevation, remove the file, exit with the script's status, and end a completed run that installed any item other than the KVM group with the line `Running boxes pick this up on their next start.`.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_runs_the_script_with_one_elevation
+    <!-- event-driven; `min finalize-install` runs `sudo sh <file>`; the operator's request is the consent, so that `sudo` is the only prompt; the summary of what is missing goes to stderr; the closing line tells the operator that no running box changes under them, since each picks the step up when it next starts -->
+  - WHEN a completed run added the operator to the KVM group THE SYSTEM SHALL end with the line `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_kvm_group_closing_line_names_a_new_login
+    <!-- event-driven; group membership reaches only the processes of a new login, so a daemon started from the current one keeps its old groups and no box start picks the change up; the other items' closing line is not true for this one -->
+  - WHILE every part of the install is finished on this host, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL print `Every part of the install is finished on this machine; there is nothing to run.`, run nothing, and exit zero.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_finished_host_runs_nothing_and_exits_zero
+    <!-- state+event; a finished host is the common case after the first run, so it is a success and never an error -->
+  - IF a host fact that no script can change blocks an item THEN THE SYSTEM SHALL list that item with its cause under `can't do on this machine:` and run the remaining items.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_lists_unfixable_facts_and_runs_the_rest
+    <!-- unwanted; cgroup2 mounted without delegation-boundary namespaces is one such fact (NET-079); an item no script can fix is no reason to withhold the ones a script can, so the run is never refused on it while another item can run -->
+  - WHILE a host fact that no script can change blocks every missing item, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL list them under `can't do on this machine:`, run nothing, and exit non-zero.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_all_blocked_runs_nothing_and_exits_non_zero
+    <!-- state+event; that host is not finished, so it is not the zero-exit finished case, and nothing can be run on it, so it is not a run either; the non-zero exit is what a script reads -->
+  - WHILE no daemon is reachable, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL list the names item as `waiting on a daemon` under the summary and run the remaining items.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_without_daemon_runs_the_items_that_need_none
+    <!-- state+event; the names item points the resolver at the port the daemon's answerer binds, so it waits on one; the user-namespace profile, the classifier tree and the KVM group need no daemon and are not held back by one; the names item is retried on the next run, or by an activation, and the host line carries the install clause until then; the command starts no daemon -->
+  - WHILE no TTY is attached, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL run the script through `sudo -n`, and IF `sudo -n` cannot run it without a prompt THEN print the summary and the pointer `f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"`, run nothing, and exit 1.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_without_tty_exits_one_with_script_pointer
+    <!-- state+event; a prompt with no terminal to answer it hangs the caller, so an agent or a script gets the file route instead; a cached `sudo` credential still runs the step -->
+  - WHEN the operator runs `min finalize-install --show` THE SYSTEM SHALL print the summary of what this host is missing, without running anything and with no privilege prompt, and exit zero whatever the items' states.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_show_names_missing_items_without_prompt
+    <!-- event-driven; the summary is the one a run prints before it elevates, so what `--show` names is what a run installs; the exit status says only that the summary printed, since `--show --json` is the form that answers whether anything is left -->
+  - WHEN the operator runs `min finalize-install --show --script` THE SYSTEM SHALL print, without running it and with no privilege prompt, the same script that a run executes on stdout, with the summary on stderr, and exit zero whatever the items' states. The script is POSIX shell that stops at its first failed statement. Its header says what it configures and that it runs as root, and a comment introduces each step.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_show_script_is_an_annotated_posix_script
+    <!-- event-driven; one renderer is the script's only source, so the shown script and the run script never disagree; the script on stdout and the summary on stderr, for an operator who reviews or adapts it and for the session e2e, which runs the shown file; no statement elevates on its own and no outer quoting layer wraps it; the zero exit is what lets the no-TTY pointer chain `&& sudo sh` after it -->
+  - WHEN the operator runs `min finalize-install --show --json` THE SYSTEM SHALL print one JSON document under the schema `min/v1/finalize-install` whose items carry stable ids and each item's state, and exit non-zero while any item is missing, in whichever state: ready to install, waiting on a daemon, or blocked by a host fact.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_show_json_carries_stable_item_ids_and_exit_status
+    <!-- event-driven; the ids are the contract a caller matches on, never the summary's words; the exit status is the one-bit answer for a script that only needs to know whether anything is left -->
+  - IF a box-name service installed for another user is present THEN THE SYSTEM SHALL refuse to run anything, name that user, and exit non-zero.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_refuses_another_users_service
+    <!-- unwanted; the operator is the `UserName` of the installed launchd plist on macOS, the `User=` of the installed systemd service on Linux; replacing it would hand the one machine-wide service to a different user and cut the first user's daemons off; `--show` is not refused, and neither is removal -->
   - WHERE the host is hooked THE SYSTEM SHALL install, by the privileged step, the box-zone answerer as a host service whose listener and channel sockets the service manager holds, running as the operator, from a root-owned non-user-writable program.
     tier:   T0
     verify: cargo nextest run -p minimal advisory_installs_manager_held_answerer
-    <!-- design §7.1 (one always-on answerer per host, its sockets held by the service manager, the answerer running as the operator and never root); state-driven; a launchd plist with socket activation on macOS, a systemd system socket and service pair on Linux, never a user-session unit; the step copies the answerer program to a root-owned path and the unit names that copy, never a user-writable binary; the copy carries the channel protocol version, and the hook probe re-surfaces the advisory when it differs from the daemon's, so an upgrade re-runs the step -->
+    <!-- design §7.1 (one always-on answerer per host, its sockets held by the service manager, the answerer running as the operator and never root); state-driven; a launchd plist with socket activation on macOS, a systemd system socket and service pair on Linux, never a user-session unit; the step copies the answerer program to a root-owned path and the unit names that copy, never a user-writable binary; the copy carries the channel protocol version, and `min finalize-install` reinstalls it when it differs from the daemon's, so an upgrade re-runs the step -->
+  - WHERE the host is not VM-backed, WHEN the classifier step runs THE SYSTEM SHALL install, beside the classifier tree, a root-owned placement unit that watches the daemon's listening socket path and places the socket's holder into the daemon leaf on every daemon start, moving no process that already stands inside the classifier tree, and record a launch made before placement as not decidable per box.
+    tier:   T0
+    verify: cargo nextest run -p minimal classifier_step_places_the_daemon_on_every_start
+    verify: cargo nextest run -p minimald launch_before_placement_reads_not_per_box
+    verify: just test-installer host_classifier_tree_installed
+    <!-- design §7.4 and §4.1; event-driven within the WHERE; the placement unit is an artefact of the one-time privileged install, so a daemon restart needs no root step to land in its leaf again, while box placement stays with the daemon; a process already inside the tree is a box or the daemon's own leaf and is never moved; a launch that outruns placement reads as not decidable per box (NET-079) rather than as enforced; one unit per host today, and a unit per account and socket is a later step -->
+  - WHEN the operator runs `min finalize-install --undo` THE SYSTEM SHALL remove everything the step installed on this host, without a daemon, and exit zero on a host that holds none of it.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_undo_removes_what_the_step_installs
+    verify: cargo nextest run -p minimal finalize_install_undo_succeeds_on_a_clean_host
+    <!-- event-driven; `--undo` runs the removal script as root, `--undo --show --script` prints it; it removes what the step installed: the user-namespace profile, the classifier tree, the group membership the step added, and on macOS the answerer unit, its program copy and channel, the range unit and its program, and the resolver file, on Linux the answerer socket and service units, the program copy and channel, and the routing-domain link; the range aliases on macOS stay on the loopback until the next boot, since no unit re-applies them; the installer's uninstall names this step while any of those paths exist -->
+  - WHEN the installer completes on a TTY and the host lacks a step THE SYSTEM SHALL show the summary and offer the step with `Finish setup now? This runs one sudo command. [Y/n]`, default yes, and IF the operator declines or no TTY is attached THEN print ``run `min finalize-install` when you're ready``.
+    tier:   T0
+    verify: just test-installer installer_offers_finalize_install_on_a_tty
+    verify: just test-installer installer_prints_the_pointer_when_declined_or_without_tty
+    <!-- event-driven; the offer is the installer's one chance to finish the host while the operator is present; the install itself stays unprivileged, so the question names what a yes costs -->
+  - WHILE the host needs nothing THE SYSTEM SHALL complete the installer without the offer.
+    tier:   T0
+    verify: just test-installer installer_does_not_prompt_on_a_finished_host
+    <!-- state-driven; a question whose answer changes nothing is noise on every re-run -->
 
 - **NET-123** WHEN a session starts THE SYSTEM SHALL verify by a bind probe that the reserved local range is present before publishing.
   tier:     T0
   verify:   cargo nextest run -p minimald session_start_probes_reserved_range
   <!-- S1b-2a; design §7.1 (macOS per-box addresses, the privileged step); event-driven; on Linux the range is always present on `lo` and the probe is a macOS concern; the routing-domain link carries the §4.2 hook carve-out address, not the range -->
-  - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, re-surface the advisory of NET-122, and neither prompt nor hang.
+  - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, point at `min finalize-install` by the host line's install clause (NET-142), and neither prompt nor hang.
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
-  - WHERE the host is macOS THE SYSTEM SHALL name, in NET-122's advisory command, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
+  - WHERE the host is macOS THE SYSTEM SHALL carry, in the script `min finalize-install` (NET-122) runs, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
     tier:   T0
     verify: cargo nextest run -p minimal advisory_command_reserves_the_range_on_macos
-    <!-- design §7.1 (the privileged step, one command with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its command keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
+    <!-- design §7.1 (the privileged step, one script with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its script keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
 
 - **NET-124** WHEN a lookup asks for a record type other than A for a name a box or node holds in the box zone THE SYSTEM SHALL answer NODATA.
   tier:     T0
@@ -912,12 +1063,14 @@ loopback answerer held by the host's service manager, published addresses come
 from a reserved local range (`127.0.64.0/24`), Linux uses a systemd-resolved
 routing domain on a dedicated link of routable scope, and macOS uses
 `/etc/resolver/min.internal` with a `port` directive, written once by the
-advisory command NET-122 names at session start. On macOS the same command
+script `min finalize-install` (NET-122) runs, or shows, on the operator's
+request. Host DNS is opt-in, and a session start only points at it. On macOS the same script
 reserves the local range: it installs a root-held boot step that re-applies
 exactly the reserved range at each start, at root-owned paths no user can
 write, so the range is present before any session starts and no daemon
 re-applies it. NET-123's bind probe with its `127.0.0.1` interim is what holds
 on a host until that step is installed, so session start never prompts. The
+same command removes the step again, on both platforms. The
 answerer's negatives are cacheable by the host resolver (NET-124): an
 uncacheable negative stalls every lookup on a macOS host, not only the zone's.
 NET-018 and NET-019 take their WHERE from the same ruling: the proxy
@@ -989,10 +1142,10 @@ other candidate; the naming story is what the epic's summary leads with.
 bind the announcement and the opt-out flag for the deny-all default because
 both are observable; recording the window only in the plan was considered and
 rejected as leaving the opt-out flag unbound. Precedence: before the default is
-in force, and whenever the opt-out flag is set, an absent `egress` section
-keeps the shipped allow-all default of 03-spec R2.1; once in force without the
-opt-out, NET-074 and NET-075 apply. The release that brings it into force is a
-plan fact.
+in force, and whenever the opt-out flag is set, an absent `egress` section, and
+an absent allow list in a declared one, keep the shipped allow-all meaning of
+03-spec R2.1; once in force without the opt-out, NET-074 and NET-075 apply. The
+default is now in force, so the announcement window NET-076 bound is over.
 
 **Bounds that were chosen here.** "Local-only" for `*.min.internal` means the
 zone is answered only to lookups that originate on the machine (NET-006);
@@ -1067,8 +1220,10 @@ error for `egress` on a HostNet PTask (NET-120), because the two-address
 classifier (NET-078, design §4.1) gives the host-address cohort an enforcement
 identity and the deny-all story for those boxes (NET-079, NET-080) needs the
 declaration, while NET-065 keeps the rejection for `none` boxes, where there is
-nothing to enforce; R2.1's allow-all default for absent `egress` fields
-(NET-074, inside the window NET-076 and NET-077 bind); and R2.3's
+nothing to enforce; R2.1's allow-all meaning of an absent `allow_subnets` or
+`allow_dns_hosts` list in a declared section on any box, and so of an absent
+`egress` section on an own-address box (NET-074, inside the window NET-076 and
+NET-077 bind), `allow_protocols` keeping its meaning as a filter; and R2.3's
 `dynamic_allowed_ports` (NET-043). **Command tree.** This document binds the
 shipped verbs `min session activate` and `min session policy`. The
 architecture's command tree spells them `min session start` and `min box show
@@ -1182,6 +1337,16 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
+- [NEEDS CLARIFICATION (MEDIUM): can one machine-wide box-name service serve
+  several users of the same host? The service runs as one operator. Its
+  channel's peer check admits that operator's daemons only (NET-122). A
+  second user's host setup replaces the first user's service. Until this
+  question closes, host setup refuses on a host whose installed service names
+  another user. One option is a service per user on distinct hook ports, but
+  the resolver hook routes a zone to one port. A second is one service that
+  admits a set of users, which needs a name space per user or box-address
+  arbitration across users. The third is one host DNS user per machine, the
+  current behaviour.]
 - [NEEDS CLARIFICATION (MEDIUM): on a native host, which component forwards a
   non-deny-all host-address box's upstream name queries under the box's rules
   (NET-066, NET-079), or are native host-address allow lists CIDR-only until one

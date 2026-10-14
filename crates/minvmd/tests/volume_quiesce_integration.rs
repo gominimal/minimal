@@ -197,6 +197,127 @@ fn stop_quiesces_volume_leaving_clean_ext4_journal() {
     );
 }
 
+/// SIGTERM to the foreground supervisor must quiesce the volume too: the
+/// signal watcher stops the VM the same way `minvmd stop` does — Shutdown
+/// RPC before the VMM is signalled — instead of dying by the signal with
+/// the journal open.
+#[test]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
+fn sigterm_to_supervisor_quiesces_volume() {
+    signal_to_supervisor_quiesces_volume(libc::SIGTERM, "SIGTERM");
+}
+
+/// SIGINT sent to the supervisor alone (`kill -INT`) stops the VM the same
+/// way. This is not a terminal Ctrl-C: the tty delivers that to the whole
+/// foreground process group, the VMM child included, and the graceful stop
+/// does not cover it.
+#[test]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
+fn sigint_to_supervisor_quiesces_volume() {
+    signal_to_supervisor_quiesces_volume(libc::SIGINT, "SIGINT");
+}
+
+/// Boot a foreground supervisor, send `signum` to it alone, and assert the
+/// clean stop: the supervisor ends by that signal inside the stop bound, the
+/// lifecycle record reads `Stopped`, and the volume's ext4 journal is clean.
+fn signal_to_supervisor_quiesces_volume(signum: libc::c_int, name: &str) {
+    if !e2e_enabled("volume_quiesce_integration") {
+        return;
+    }
+    let env = TestEnv::new();
+
+    // Foreground supervisor as a direct child, so this test holds its pid
+    // and can deliver the signal a service manager would. Null stdio: the
+    // supervisor logs to its own sinks. No `--timeout` — it bounds only
+    // the detach poll and is rejected for foreground runs.
+    let mut supervisor = env
+        .command(&["run"])
+        .env("MINVMD_VOLUME_BYTES", "1073741824") // 1 GiB
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning foreground minvmd run");
+    let pid = supervisor.id();
+    let _teardown = StopOnDrop(&env);
+
+    wait_until_running(&env, Duration::from_secs(60));
+    let volume = env.volume_path();
+    assert!(volume.exists(), "volume image must exist after boot");
+
+    // The service manager's stop: one signal to the supervisor process,
+    // never to its process group.
+    // SAFETY: kill(2) on the supervisor child this test spawned.
+    let r = unsafe { libc::kill(pid as libc::pid_t, signum) };
+    assert_eq!(r, 0, "{name} to supervisor pid {pid} must be deliverable");
+
+    // The supervisor's teardown reaps the VMM child and ends the process by
+    // the signal, inside the signal-stop bound (15 s, under launchd's 20 s
+    // ExitTimeOut); the wait is looser so a slow host fails on the
+    // assertion below rather than a hang.
+    let signalled_at = Instant::now();
+    let deadline = signalled_at + Duration::from_secs(60);
+    let status = loop {
+        match supervisor.try_wait().expect("polling supervisor exit") {
+            Some(status) => break status,
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "supervisor did not exit within 60s of {name}"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
+    assert!(
+        signalled_at.elapsed() < Duration::from_secs(20),
+        "the signal stop must finish inside a service manager's stop timeout; took {:?}",
+        signalled_at.elapsed()
+    );
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(signum),
+            "the supervisor must end by the signal that stopped it; got {status:?}"
+        );
+    }
+
+    // The lifecycle record must show the supervisor's own teardown ran:
+    // `Stopped`, not an abandoned `Running`.
+    let out = env
+        .command(&["status", "--json"])
+        .output()
+        .expect("running minvmd status");
+    let status = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        status.contains("stopped"),
+        "state must be Stopped after {name}; status: {status}"
+    );
+
+    // The proof the Shutdown RPC ran before the signal: a cleanly
+    // unmounted ext4 superblock, exactly as `minvmd stop` leaves it.
+    assert_eq!(
+        read_le_u16(&volume, EXT4_MAGIC_OFFSET),
+        0xEF53,
+        "volume image must carry an ext4 superblock"
+    );
+    let s_state = read_le_u16(&volume, EXT4_S_STATE_OFFSET);
+    assert_ne!(
+        s_state & EXT4_VALID_FS,
+        0,
+        "s_state ({s_state:#06x}) must have EXT4_VALID_FS set after {name} stop"
+    );
+    let incompat = read_le_u32(&volume, EXT4_S_FEATURE_INCOMPAT_OFFSET);
+    assert_eq!(
+        incompat & EXT4_INCOMPAT_RECOVER,
+        0,
+        "s_feature_incompat ({incompat:#010x}) must not need journal recovery after {name} stop"
+    );
+}
+
 #[test]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]

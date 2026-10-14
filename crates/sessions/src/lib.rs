@@ -35,6 +35,24 @@ pub enum NetworkMode {
     OwnIp,
 }
 
+impl NetworkMode {
+    /// The word naming this mode in the CLI's `--network` values and the
+    /// spec: `none`, `host_ip`, `own_ip`. It is not the serde form: the
+    /// derive serializes `no_net`, `host_net`, `own_ip`, so the two differ
+    /// for [`NetworkMode::NoNet`] and [`NetworkMode::HostNet`]. Policy
+    /// refusals and the daemon's `network_mode` log field use this word,
+    /// never Rust `Debug`. Deliberately not `Display`, so a format string
+    /// cannot pick one spelling by accident.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            NetworkMode::NoNet => "none",
+            NetworkMode::HostNet => "host_ip",
+            NetworkMode::OwnIp => "own_ip",
+        }
+    }
+}
+
 /// An IP transport protocol, used in egress/ingress policy rules.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -100,23 +118,37 @@ pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "production.cloudfront.docker.com",
 ];
 
-/// Effective egress policy for a session.
+/// Egress policy for a session: the `egress` section as declared, before
+/// [`effective_egress`] resolves it.
 ///
-/// Each `allow_*` field is `None` to mean allow-all for that dimension, and
-/// `deny_subnets` is `None` to mean nothing is denied. Absent `egress` config
-/// on a session is equivalent to all-`None` (allow-all). A `deny_subnets`
-/// entry is subtractive: it carves a range out of what the `allow_*` fields
-/// admit, so a rule set is effective only where it is not also denied.
+/// `None` on a destination list (`allow_subnets`, `allow_dns_hosts`) grants
+/// nothing once the spec is expanded: under the in-force deny-all default
+/// (NET-074) [`effective_egress`] resolves it to present and empty on every
+/// declared section, whatever the box's network mode, and only the daemon's
+/// opt-out (NET-077) keeps the earlier allow-all reading of it. Allow-all is
+/// therefore written out, as `0.0.0.0/0` and `::/0` in `allow_subnets`; no
+/// absent list stands in for it. `::/0` is the forward-compatible spelling:
+/// v1 compiles IPv4 rules only and drops IPv6 as a family (NET-082), so it
+/// grants nothing today. `allow_protocols` filters the reach the two
+/// destination lists grant rather than granting any, so `None` there
+/// narrows nothing: every protocol passes. `deny_subnets: None` denies
+/// nothing. A `deny_subnets` entry is subtractive: it carves a range out of
+/// what the `allow_*` fields admit, so a rule set is effective only where it
+/// is not also denied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct EgressPolicy {
-    /// Allowed destination CIDR prefixes; `None` means allow-all subnets.
+    /// Allowed destination CIDR prefixes. `None` grants no destination once
+    /// the spec is expanded; allow-all is written out as `0.0.0.0/0` (and
+    /// `::/0`, which grants nothing until an IPv6 path exists).
     pub allow_subnets: Option<Vec<String>>,
-    /// Allowed destination DNS hostnames; `None` means allow-all hosts.
+    /// Allowed destination DNS hostnames. `None` grants no name once the
+    /// spec is expanded.
     pub allow_dns_hosts: Option<Vec<String>>,
-    /// Allowed IP protocols; `None` means allow all protocols.
+    /// Allowed IP protocols, a filter over the reach the destination lists
+    /// grant; `None` lets every protocol through.
     pub allow_protocols: Option<Vec<IpProto>>,
     /// Denied destination CIDR prefixes, subtracted from the allowed set;
-    /// `None` means nothing is denied.
+    /// `None` denies nothing.
     pub deny_subnets: Option<Vec<String>>,
 }
 
@@ -161,9 +193,10 @@ impl EgressPolicy {
     }
 
     /// The deny-all section: `Some(vec![])` on every `allow_*` dimension —
-    /// the one [`crate::core::egress::EgressRules::from_policy`] shape that
-    /// admits nothing — with nothing denied, because there is nothing left
-    /// to subtract from. The materialized form of
+    /// the shape `--deny-all-egress` writes and
+    /// [`crate::core::egress::EgressRules::from_policy`] compiles to rules
+    /// admitting nothing — with nothing denied, because there is nothing
+    /// left to subtract from. The materialized form of
     /// [`EffectiveEgress::DenyAll`], built as a real section so the gate
     /// compiles the default through the same path a declared one takes.
     ///
@@ -178,6 +211,25 @@ impl EgressPolicy {
             allow_protocols: Some(Vec::new()),
             deny_subnets: None,
         }
+    }
+
+    /// Whether this section admits nothing: both destination lists,
+    /// `allow_subnets` and `allow_dns_hosts`, present and empty. Those two
+    /// are the grants; `allow_protocols` only filters what they grant, so
+    /// it is not read — a section that grants no destination reaches
+    /// nothing whatever protocols it lists, which is the shape
+    /// [`effective_egress`] resolves a declaration with no destination
+    /// list (protocols only, denies only) to under the in-force default
+    /// without the opt-out, whatever the box's network mode. `deny_subnets`
+    /// is not read
+    /// either — it subtracts from what the `allow_*` fields admit, and
+    /// there is nothing there to subtract from. The one predicate the
+    /// in-VM classifier, the host-side registry and `min session policy`
+    /// share, so the box each treats as deny-all is one shape.
+    #[must_use]
+    pub fn admits_nothing(&self) -> bool {
+        self.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+            && self.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
     }
 }
 
@@ -293,6 +345,40 @@ impl IngressPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CredentialedUpstream {}
 
+impl CredentialedUpstream {
+    /// Whether a declared lane takes effect in a box of this network mode:
+    /// the lane is admitted at the switch's gate, which only own-address
+    /// boxes sit behind. A declaration in any other mode stays on the
+    /// record and is still shown, marked as not in effect.
+    #[must_use]
+    pub fn in_effect(network: NetworkMode) -> bool {
+        network == NetworkMode::OwnIp
+    }
+
+    /// The policy row that states a declared lane, without indentation:
+    /// the one text `min session policy` and the `min dash` detail pane
+    /// both print, so the two surfaces cannot disagree. A box whose mode
+    /// leaves the lane without effect gets a `(not in effect: <mode> box)`
+    /// mark, the mode named by its CLI word.
+    #[must_use]
+    pub fn policy_row(network: NetworkMode) -> String {
+        if Self::in_effect(network) {
+            Self::POLICY_ROW.to_string()
+        } else {
+            format!(
+                "{} (not in effect: {} box)",
+                Self::POLICY_ROW,
+                network.word()
+            )
+        }
+    }
+
+    /// The lane's row text with no mode mark: what [`Self::policy_row`]
+    /// prints for an own-address box, and what a view prints when it does
+    /// not know the box's mode.
+    pub const POLICY_ROW: &'static str = "credentialed upstream  box egress proxy listener";
+}
+
 /// The networking policy for a session: its egress and ingress configuration.
 ///
 /// `None` for a dimension means it was not configured (allow-all egress; the
@@ -342,14 +428,14 @@ impl SessionPolicy {
 //
 // An absent `egress` section used to mean allow-all on every dimension
 // (03-spec R2.1). The deny-all default replaces that for an own-address box:
-// once in force it reaches nothing outside itself, an opt-out keeps the
-// shipped default, and the release before it only announces the change.
+// in force, it reaches nothing outside itself, and an opt-out keeps the
+// earlier allow-all. The release before it only announced the change.
 // ---------------------------------------------------------------------------
 
 /// Which release the deny-all egress default is in (NET-074..NET-077): a
 /// build-time fact, not configuration, because it is decided by which build
 /// is running. Every path that needs it — the session gate, the session-start
-/// log line, `min session policy`, the activate announcement — reads
+/// log line, `min session policy`, the activate note — reads
 /// [`EGRESS_DEFAULT_PHASE`] rather than a flag nobody could set differently
 /// within one build.
 ///
@@ -360,7 +446,9 @@ impl SessionPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EgressDefaultPhase {
     /// The coming default is announced at activate (NET-076); an absent
-    /// `egress` section still allows all.
+    /// `egress` section still allows all. The release before the default
+    /// bound; kept so the cutover's arms stay named and tested, and no
+    /// build ships it now.
     Announced,
     /// The default binds: an own-address box created with no `egress`
     /// section reaches nothing outside itself (NET-074) and shows
@@ -369,13 +457,14 @@ pub enum EgressDefaultPhase {
     InForce,
 }
 
-/// The phase this build ships: the coming default is announced (NET-076),
-/// so an absent `egress` section still allows all and `activate` prints the
-/// change it will bring. The release that turns the default in force is a
-/// plan fact, and no plan has named one yet; when one does, this constant is
-/// the whole cutover — every reader of it (the session gate, the
-/// session-start line, `min session policy`, the activate notice) follows.
-pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::Announced;
+/// The phase this build ships: the deny-all default is in force (NET-074),
+/// so an own-address box with no `egress` section reaches nothing outside
+/// itself unless its daemon opted out (NET-077), and the announcement
+/// (NET-076) is retired. This constant is the whole cutover — every reader
+/// of it (the session gate, the session-start line, `min session policy`,
+/// the activate note) follows — and minvmd's own phase must match it (a
+/// build-time assertion there refuses a split).
+pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce;
 
 /// The egress a box's traffic is actually held to: its declared section when
 /// it has one, otherwise the default [`effective_egress`] resolves for an
@@ -390,14 +479,35 @@ pub enum EffectiveEgress {
     /// nothing outside the box is reachable, the resolver Minimal owns for
     /// it excepted (NET-079).
     DenyAll,
-    /// The shipped default (03-spec R2.1): every dimension allows all. What
-    /// an absent section keeps before the default is in force, behind the
-    /// daemon's opt-out (NET-077), and on any box without an address of its
-    /// own.
+    /// The earlier default (03-spec R2.1): every dimension allows all. What
+    /// an absent section keeps behind the daemon's opt-out (NET-077), on any
+    /// box without an address of its own, and under the announced phase.
     #[default]
     AllowAll,
-    /// The box declared its own egress section; carried verbatim.
+    /// The box declared its own egress section, carried as declared except
+    /// that under the in-force default (NET-074, without the opt-out) a
+    /// destination list the section leaves absent is resolved to present
+    /// and empty, on a box of any network mode: an absent list in the
+    /// expanded spec grants nothing.
     Declared(EgressPolicy),
+}
+
+impl EffectiveEgress {
+    /// The one-line verdict the egress block prints in place of its rows,
+    /// or `None` when the section has rule rows to list. A default is marked
+    /// as one (`deny-all (default)`, `allow-all (default)`); a declared
+    /// deny-all ([`EgressPolicy::admits_nothing`]) prints unmarked, because
+    /// the box chose it. The single source for `min session policy` and the
+    /// TUI's detail pane, so the two never spell a verdict differently.
+    #[must_use]
+    pub fn summary_label(&self) -> Option<&'static str> {
+        match self {
+            Self::DenyAll => Some("deny-all (default)"),
+            Self::AllowAll => Some("allow-all (default)"),
+            Self::Declared(egress) if egress.admits_nothing() => Some("deny-all"),
+            Self::Declared(_) => None,
+        }
+    }
 }
 
 /// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
@@ -418,7 +528,11 @@ pub enum EffectiveEgress {
 // The strictness is also the wire contract with an older `min`: an old client
 // rejects a key it has no field for, so a fact that did not exist when it was
 // built must ride its own reply (`GetSessionRuntimeFacts`, the way live
-// ingress rides `GetLiveIngress`) rather than a new field here.
+// ingress rides `GetLiveIngress`) rather than a new field here. The
+// credentialed-upstream lane (NET-134) breaks that rule deliberately: a
+// policy reply a client cannot read is a visible error, while a lane it
+// cannot see is a security fact this command exists to state, and
+// `min session policy` reads no other reply that carries it.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -426,17 +540,36 @@ pub struct EffectiveSessionPolicy {
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// The box's credentialed-upstream lane (NET-134), carried verbatim
+    /// from the declaration: `Some` marks the Box Egress Proxy's listener
+    /// as the box's infrastructure — the one destination its egress rules
+    /// never decide — and `None` is no lane. Skipped when `None`, so a
+    /// lane-less box serializes exactly as it did before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
-/// Resolves the effective egress of a box (NET-074/NET-077): a declared
-/// section is carried verbatim whatever the phase — a box that says what it
-/// wants gets what it said — and an absent `egress` section is the default's
-/// to decide. Deny-all once [`EgressDefaultPhase::InForce`], on an
-/// own-address box ([`NetworkMode::OwnIp`]) whose daemon has not opted out;
-/// the shipped allow-all of 03-spec R2.1 in every other case: before the
-/// default is in force, behind the opt-out, or for a box that shares its
-/// host's namespace (or has no network at all) and so owns no address of its
-/// own to deny from.
+/// Resolves the effective egress of a box (NET-074/NET-077). An absent
+/// `egress` section is the default's to decide: deny-all once
+/// [`EgressDefaultPhase::InForce`], on an own-address box
+/// ([`NetworkMode::OwnIp`]) whose daemon has not opted out; the shipped
+/// allow-all of 03-spec R2.1 in every other case: before the default is in
+/// force, behind the opt-out, or for a box that shares its host's namespace
+/// (or has no network at all) and so owns no address of its own to deny
+/// from. A declared section is the box's own — a box that says what it
+/// wants gets what it said — and the in-force default decides the
+/// destination lists it leaves absent, on a box of any network mode: once
+/// in force and not opted out, an absent `allow_subnets` or
+/// `allow_dns_hosts` is resolved to present and empty, so it grants nothing
+/// in its dimension (an absent list in the expanded spec grants nothing; the
+/// arch's default-deny rule is not mode-qualified, and a host that decides
+/// per box reads the resolved shape, NET-079); before the default is in
+/// force, or behind the opt-out, the absent list keeps the earlier allow-all
+/// reading. Only the absent-*section* default is own-address scoped.
+/// `allow_protocols` is left as declared in every arm: it filters the reach
+/// the destination lists grant and grants none itself, so `allow_subnets =
+/// ["0.0.0.0/0"]` alone is the written-out IPv4 allow-all.
 ///
 /// `opt_out` is the daemon's deny-all opt-out flag (NET-077); the caller
 /// threads it in from the daemon's configuration, because it is the daemon —
@@ -449,15 +582,34 @@ pub fn effective_egress(
     phase: EgressDefaultPhase,
     opt_out: bool,
 ) -> EffectiveEgress {
+    let in_force = phase == EgressDefaultPhase::InForce && !opt_out;
     match declared {
+        Some(section) if in_force => {
+            let mut section = section.clone();
+            section.allow_subnets.get_or_insert_with(Vec::new);
+            section.allow_dns_hosts.get_or_insert_with(Vec::new);
+            EffectiveEgress::Declared(section)
+        }
         Some(section) => EffectiveEgress::Declared(section.clone()),
-        None => match (phase, network) {
-            (EgressDefaultPhase::InForce, NetworkMode::OwnIp) if !opt_out => {
-                EffectiveEgress::DenyAll
-            }
-            _ => EffectiveEgress::AllowAll,
-        },
+        None if in_force && network == NetworkMode::OwnIp => EffectiveEgress::DenyAll,
+        None => EffectiveEgress::AllowAll,
     }
+}
+
+/// Reads the deny-all opt-out (NET-077) off its raw environment spelling:
+/// the one parse the VM host daemon (`MINVMD_EGRESS_DENY_ALL_OPT_OUT`) and
+/// the guest daemon (the boot token it is handed) share, so the two can
+/// never read the same value differently. Only `1`, `true`, `yes` or `on`
+/// opt out, case-insensitive and trimmed; absent or anything else fails
+/// closed to the build's egress default.
+#[must_use]
+pub fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// The lowest host port a dynamic ingress range may start at: below it a
@@ -466,6 +618,23 @@ pub fn effective_egress(
 /// CLI's `--dynamic-range` flag, so the two can never disagree.
 pub const MIN_DYNAMIC_INGRESS_PORT: u16 = 1024;
 
+/// The refusal for a non-empty `ingress` on a box that is not own-IP: a
+/// dynamic declaration (a range or a non-deny stance) names the dynamic
+/// fields, otherwise the refusal names the port mappings. The dynamic check
+/// comes first, in the same order as the CLI's refusals, so a policy carrying
+/// both gets the same first complaint from either surface.
+fn ingress_requires_own_ip(ingress: &IngressPolicy, mode: NetworkMode) -> PolicyError {
+    let dynamic = ingress.dynamic_allowed_range.is_some()
+        || ingress
+            .dynamic_ingress
+            .is_some_and(|d| d != DynamicIngress::Deny);
+    if dynamic {
+        PolicyError::DynamicIngressRequiresOwnIp { mode }
+    } else {
+        PolicyError::IngressRequiresOwnIp { mode }
+    }
+}
+
 /// Why a session's networking policy is incompatible with its network mode.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -473,12 +642,34 @@ pub enum PolicyError {
     /// An egress policy was set on a [`NetworkMode::NoNet`] `PTask`. An
     /// own-address (`OwnIp`) and a host-address (`HostNet`) box both carry a
     /// network their egress rules can bound; a none box has none, so there is
-    /// nothing to enforce the declaration on and it is rejected.
-    #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
+    /// nothing to enforce the declaration on and it is rejected. Names the
+    /// mode word, not the `Debug` name, as the ingress variants below do.
+    #[error(
+        "egress rules need network mode own_ip or host_ip (this box is {}): a none box \
+         has no network to apply them to",
+        .mode.word()
+    )]
     EgressRequiresNetwork { mode: NetworkMode },
-    /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
-    #[error("ingress policy is only valid for an own-IP PTask, not {mode:?}")]
+    /// A static ingress port mapping was set on a `PTask` that is not
+    /// [`NetworkMode::OwnIp`]. Names the policy fields and the mode word, not
+    /// CLI flags: every client reads this refusal, and the CLI names its own
+    /// flags in a refusal of its own before the request is sent.
+    #[error(
+        "ingress port mappings need network mode own_ip (this box is {}): only an own-IP \
+         box has a published address to apply them to",
+        .mode.word()
+    )]
     IngressRequiresOwnIp { mode: NetworkMode },
+    /// A dynamic ingress declaration (a non-deny `dynamic_ingress` stance or a
+    /// `dynamic_allowed_range`), with or without a static mapping, was set on a `PTask`
+    /// that is not [`NetworkMode::OwnIp`]. Neutral wording, as for
+    /// [`PolicyError::IngressRequiresOwnIp`].
+    #[error(
+        "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
+         box is {}): only an own-IP box has a published address to apply them to",
+        .mode.word()
+    )]
+    DynamicIngressRequiresOwnIp { mode: NetworkMode },
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
     /// expose. gvproxy only forwards TCP and UDP, so any other protocol (e.g.
     /// ICMP) must be rejected at validation time rather than silently mapped.
@@ -795,6 +986,84 @@ where
     Ok(name.filter(|name| !name.is_empty()))
 }
 
+/// A box's identity on its host: 16 bytes — one `UUIDv7`, 32 lowercase hex
+/// digits on the wire — minted once per box by the host-side creator
+/// outside the VM, with its random fields from the host's OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts, never
+/// anything a process inside the VM could predict or arrange. The
+/// registration that publishes the box's row mints it — a client never
+/// presents one — the row and the proxy's attachment hold it, and the
+/// reply hands it back so the client records the id its box was created
+/// as.
+///
+/// Unique per creation by construction: a box recreated with the same
+/// name and the same addresses is a new box, and its id says so. Ids are
+/// never reused — no registration can present one, and the host refuses a
+/// mint that collides with a record it holds — so a revocation scoped to
+/// an id stays scoped forever. The all-zero id is not
+/// a mint's output and never names a box: the delivery header carried it
+/// for "no box named" before ids were the box's own, and the acceptor
+/// that reads a delivered header refuses it like any other id the
+/// source's attachment does not hold.
+///
+/// On the wire it is one hex string, the same 32 lowercase digits a
+/// diagnostic names a box id by — so a log line, a transcript and a
+/// socket capture all read the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoxId([u8; 16]);
+
+impl BoxId {
+    /// Wraps `bytes` as a box id — the shape a registration's reply
+    /// carries and a delivery header fills from the box's attachment.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id's own 16 bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BoxId {
+    /// 32 lowercase hex digits — the one fixed form every diagnostic that
+    /// names a box id uses, so a tail can compare two lines for the same
+    /// box.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BoxId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for BoxId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Owned, not borrowed: a record read from a file or a request read
+        // off a socket is deserialized from a reader, which lends no `&str`.
+        let text = String::deserialize(deserializer)?;
+        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(bytes) => {
+                return Err(serde::de::Error::custom(format!(
+                    "a box id is 32 hex digits (16 bytes); got {} bytes",
+                    bytes.len()
+                )));
+            }
+        };
+        Ok(Self(bytes))
+    }
+}
+
 /// The pair of addresses a VM host daemon allocates for a box and hands
 /// back to its creator (T66): where the box lives on the switch, and where
 /// it is published on the guest's loopback.
@@ -913,10 +1182,34 @@ pub struct Record {
     /// the host table still holds a row for; drawing a fresh one would
     /// silently orphan the row and drop the box to the egress gate's
     /// unregistered-source interim. Defaults to `None` for records that
-    /// predate the field (every pre-T66 session): those boxes self-allocate
-    /// exactly as they always have.
+    /// predate the field (every pre-T66 session): on a VM-backed host such
+    /// a box is refused at launch and must be re-activated, since the
+    /// in-VM daemon draws no address of its own once its switch is the
+    /// host's (NET-138); a native host self-allocates as it always has.
     #[serde(default)]
     pub box_addresses: Option<BoxAddresses>,
+
+    /// The task addresses the same registration handed (NET-138): the
+    /// switch addresses this box's task runs attach at, one run per
+    /// address at a time. Each is a row on the host carrying the box's id
+    /// and egress, withdrawn with the box. Kept off [`BoxAddresses`] so
+    /// that pair stays `Copy`. Empty for every record that handed no box
+    /// addresses, and for one that predates the field — a VM-backed task
+    /// run under such a record is refused and the session must be
+    /// re-activated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
+
+    /// The box id the same registration handed back (BEP-070, NET-138):
+    /// the id the host's row of this box holds. The in-VM daemon names it
+    /// when it asks whether the box's row still stands, and the creator
+    /// when it resumes the row, so a row the host handed another box at
+    /// the same address is never taken for this box's. `None` for a record
+    /// that handed no box addresses, and for one that predates the field:
+    /// a registered box with no id is never answered as standing, so it
+    /// must be re-activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
 
     /// The per-box egress enforcement this session's own launch placed its
     /// host-address box under (NET-079): `per_box` when the launch placed the
@@ -941,6 +1234,17 @@ pub struct Record {
     /// answer over the host's state exactly as they did before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+
+    /// Whether a launch has bound this box's host-side row (NET-138): set,
+    /// and persisted, by the first host launch of a box that carries
+    /// [`Self::box_addresses`]. The row lives exactly as long as that
+    /// launch's switch attachment and is never registered again, so once
+    /// this is set, any host other than that first launch's is rowless —
+    /// including every host after a daemon restart. Daemon-owned, like
+    /// [`Self::host_ip_enforcement`]. Defaults to `false` for records that
+    /// predate the field and for a registered box that has not launched yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_row_bound: bool,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -990,8 +1294,9 @@ impl Record {
     ///
     /// Returns [`PolicyError::EgressRequiresNetwork`] when an egress policy is
     /// set on a none (`NoNet`) `PTask`, or
-    /// [`PolicyError::IngressRequiresOwnIp`] when a non-empty ingress policy is
-    /// set on anything but an `OwnIp` `PTask`. Returns
+    /// [`PolicyError::DynamicIngressRequiresOwnIp`] when a dynamic ingress
+    /// declaration, or [`PolicyError::IngressRequiresOwnIp`] when only a static
+    /// ingress mapping, is set on anything but an `OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose,
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
@@ -1015,13 +1320,8 @@ impl Record {
             if self.policy.egress.is_some() {
                 return Err(PolicyError::EgressRequiresNetwork { mode: self.network });
             }
-            if self
-                .policy
-                .ingress
-                .as_ref()
-                .is_some_and(|ingress| !ingress.is_empty())
-            {
-                return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+            if let Some(ingress) = self.policy.ingress.as_ref().filter(|i| !i.is_empty()) {
+                return Err(ingress_requires_own_ip(ingress, self.network));
             }
             return Ok(());
         }
@@ -1076,13 +1376,8 @@ impl Record {
         // Host-address box: egress is accepted, but ingress still requires an
         // own address — the switch's forwarder is the only per-session ingress
         // surface, and a host-address box shares its host's namespace.
-        if self
-            .policy
-            .ingress
-            .as_ref()
-            .is_some_and(|ingress| !ingress.is_empty())
-        {
-            return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+        if let Some(ingress) = self.policy.ingress.as_ref().filter(|i| !i.is_empty()) {
+            return Err(ingress_requires_own_ip(ingress, self.network));
         }
         Ok(())
     }
@@ -1091,6 +1386,76 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box id reads back from a reader, which lends no borrowed string —
+    /// the path a record on disk and a request off a socket both take.
+    #[test]
+    fn box_id_deserializes_from_a_reader() {
+        let id = BoxId::from_bytes([0x42; 16]);
+        let wire = serde_json_lenient::to_string(&id).expect("an id serializes");
+        let read: BoxId =
+            serde_json_lenient::from_reader(wire.as_bytes()).expect("an id reads from a reader");
+        assert_eq!(read, id);
+    }
+
+    /// The verdict strings `min session policy` and the TUI pane both print.
+    #[test]
+    fn effective_egress_summary_labels_are_pinned() {
+        assert_eq!(
+            EffectiveEgress::DenyAll.summary_label(),
+            Some("deny-all (default)")
+        );
+        assert_eq!(
+            EffectiveEgress::AllowAll.summary_label(),
+            Some("allow-all (default)")
+        );
+        assert_eq!(
+            EffectiveEgress::Declared(EgressPolicy::deny_all()).summary_label(),
+            Some("deny-all")
+        );
+        let rules = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..EgressPolicy::deny_all()
+        };
+        assert_eq!(EffectiveEgress::Declared(rules).summary_label(), None);
+    }
+
+    /// `word()` pins the CLI and spec vocabulary, and stays distinct from
+    /// the serde form where the two spellings differ: a refactor that
+    /// routed either through the other would rename a log field or a wire
+    /// value.
+    #[test]
+    fn network_mode_word_is_the_cli_word_not_the_serde_form() {
+        assert_eq!(NetworkMode::NoNet.word(), "none");
+        assert_eq!(NetworkMode::HostNet.word(), "host_ip");
+        assert_eq!(NetworkMode::OwnIp.word(), "own_ip");
+        for mode in [NetworkMode::NoNet, NetworkMode::HostNet] {
+            let serde = serde_json_lenient::to_string(&mode).unwrap();
+            assert_ne!(mode.word(), serde.trim_matches('"'), "{mode:?}");
+        }
+    }
+
+    /// NET-134: the lane's row is unmarked only where the switch gate
+    /// admits it; every other mode still shows the declaration, marked
+    /// with the mode that leaves it without effect.
+    #[test]
+    fn credentialed_upstream_row_marks_modes_without_effect() {
+        assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp));
+        assert_eq!(
+            CredentialedUpstream::policy_row(NetworkMode::OwnIp),
+            "credentialed upstream  box egress proxy listener"
+        );
+        assert!(!CredentialedUpstream::in_effect(NetworkMode::HostNet));
+        assert_eq!(
+            CredentialedUpstream::policy_row(NetworkMode::HostNet),
+            "credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+        );
+        assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet));
+        assert_eq!(
+            CredentialedUpstream::policy_row(NetworkMode::NoNet),
+            "credentialed upstream  box egress proxy listener (not in effect: none box)"
+        );
+    }
 
     fn record_with(network: NetworkMode, policy: SessionPolicy) -> Record {
         Record {
@@ -1102,8 +1467,11 @@ mod tests {
             policy,
             status: SessionStatus::default(),
             hooks_enabled: true,
+            task_addresses: Vec::new(),
             box_addresses: None,
             host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
             attrs: BTreeMap::new(),
         }
     }
@@ -1216,6 +1584,19 @@ mod tests {
         assert!(record.validate_policy().is_ok());
     }
 
+    /// NET-077: the opt-out's parse fails closed — only the truthy set opts
+    /// out; absent or anything else keeps the build's egress default.
+    #[test]
+    fn the_egress_opt_out_fails_closed() {
+        assert!(!egress_deny_all_opt_out_from_raw(None));
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "no", "off", "false", "garbage", "1x", "enabled"] {
+            assert!(!egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
+    }
+
     /// NET-074/NET-075/NET-076/NET-077: what an absent `egress` section
     /// resolves to, by rollout phase, opt-out, and network mode — and that
     /// the deny-all arm is not a label but the section whose compiled rules
@@ -1236,16 +1617,29 @@ mod tests {
             ..EgressPolicy::default()
         };
 
-        // A declared section is carried verbatim in every phase, opted out
-        // or not, on every mode: the default only fills an absent section.
+        // A declared section is carried verbatim before the default is in
+        // force and behind the opt-out; in force, on a box of any mode, the
+        // default also decides the destination list the section left absent
+        // (`allow_dns_hosts` here), resolving it to present and empty, which
+        // `absent_destination_lists_grant_nothing_once_merged` proves in
+        // full.
         for phase in [EgressDefaultPhase::Announced, EgressDefaultPhase::InForce] {
             for opt_out in [false, true] {
                 for network in [NetworkMode::OwnIp, NetworkMode::HostNet, NetworkMode::NoNet] {
+                    let in_force = phase == EgressDefaultPhase::InForce && !opt_out;
+                    let expected = if in_force {
+                        EgressPolicy {
+                            allow_dns_hosts: Some(Vec::new()),
+                            ..declared.clone()
+                        }
+                    } else {
+                        declared.clone()
+                    };
                     assert_eq!(
                         effective_egress(Some(&declared), network, phase, opt_out),
-                        EffectiveEgress::Declared(declared.clone()),
-                        "a declared egress section must survive phase {phase:?}, \
-                         opt_out {opt_out}, mode {network:?} untouched",
+                        EffectiveEgress::Declared(expected),
+                        "a declared egress section under phase {phase:?}, \
+                         opt_out {opt_out}, mode {network:?}",
                     );
                 }
             }
@@ -1301,6 +1695,207 @@ mod tests {
         );
     }
 
+    /// NET-074 per list, under the NET-077 opt-out: in the expanded spec —
+    /// the policy the daemon receives — a destination list the section
+    /// leaves absent grants nothing in its dimension, on an own-address and
+    /// a host-address box alike, so a box with a name allow list and no
+    /// `allow_subnets` reaches no address directly; the opt-out keeps the
+    /// earlier allow-all reading of the absent list; and allow-all is
+    /// written out as `0.0.0.0/0`, which admits every address.
+    #[test]
+    fn absent_destination_lists_grant_nothing_once_merged() {
+        use crate::core::egress::{DropReason, EgressRules, FrameVerdict, summarize, verdict};
+
+        let resolver = [100, 64, 0, 1];
+        let lease = [100, 64, 0, 9];
+        // A TCP SYN from the lease to a public address, port 443: the direct
+        // connection a name allow list does not grant.
+        let direct_to_ip = {
+            let mut frame = vec![0u8; 14 + 20 + 20];
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[23] = 6;
+            frame[26..30].copy_from_slice(&lease);
+            frame[30..34].copy_from_slice(&[203, 0, 113, 7]);
+            frame[36..38].copy_from_slice(&443u16.to_be_bytes());
+            summarize(&frame)
+        };
+        let reach_on = |section: &EgressPolicy, network: NetworkMode, opt_out: bool| {
+            let EffectiveEgress::Declared(merged) =
+                effective_egress(Some(section), network, EgressDefaultPhase::InForce, opt_out)
+            else {
+                panic!("a declared section stays declared");
+            };
+            let rules = EgressRules::from_policy(Some(&merged), resolver, lease);
+            (merged, verdict(&direct_to_ip, &rules))
+        };
+        let reach =
+            |section: &EgressPolicy, opt_out: bool| reach_on(section, NetworkMode::OwnIp, opt_out);
+
+        // Names only: the absent `allow_subnets` resolves to present and
+        // empty, and the direct connection drops on the subnet dimension —
+        // the one drop a DNS pin lifts, so the name grant still works and
+        // nothing else does. `allow_protocols` is a filter, not a grant, and
+        // stays as declared.
+        let names_only = EgressPolicy {
+            allow_dns_hosts: Some(vec!["github.com".into()]),
+            ..EgressPolicy::default()
+        };
+        let (merged, direct) = reach(&names_only, false);
+        assert_eq!(
+            merged,
+            EgressPolicy {
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["github.com".into()]),
+                allow_protocols: None,
+                deny_subnets: None,
+            },
+            "an absent destination list is present and empty once merged",
+        );
+        assert!(
+            matches!(
+                direct,
+                FrameVerdict::Drop(DropReason::UndeclaredSubnet {
+                    dst: [203, 0, 113, 7],
+                    ..
+                })
+            ),
+            "a name allow list grants no direct-to-address reach: {direct:?}",
+        );
+        assert!(
+            !merged.admits_nothing(),
+            "a section with a name allow list is not the deny-all shape",
+        );
+        // The same on a host-address box: the half-open shape survives on
+        // no mode. (A host that decides per box refuses the narrowing
+        // natively, NET-079; the resolved shape is what a VM host's cohort
+        // and an unenforced box are held to.)
+        let (on_host_address, direct) = reach_on(&names_only, NetworkMode::HostNet, false);
+        assert_eq!(
+            on_host_address, merged,
+            "a host-address declaration resolves the same"
+        );
+        assert!(
+            matches!(
+                direct,
+                FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
+            ),
+            "names-only on a host-address box grants no direct-to-address reach: {direct:?}",
+        );
+
+        // Behind the opt-out (NET-077) the absent list keeps its earlier
+        // allow-all reading, so the same section still reaches the address.
+        let (opted_out, direct) = reach(&names_only, true);
+        assert_eq!(
+            opted_out, names_only,
+            "the opt-out leaves the section as declared"
+        );
+        assert_eq!(direct, FrameVerdict::Admit, "the opt-out keeps allow-all");
+
+        // Allow-all is written out, and the written-out list admits every
+        // address, under the deny-all default and without the opt-out.
+        let written_out = EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".into(), "::/0".into()]),
+            ..EgressPolicy::default()
+        };
+        let (merged, direct) = reach(&written_out, false);
+        assert_eq!(
+            merged.allow_subnets, written_out.allow_subnets,
+            "a written-out list is carried as declared",
+        );
+        assert_eq!(
+            merged.allow_dns_hosts,
+            Some(Vec::new()),
+            "the names the written-out box did not list grant nothing",
+        );
+        assert_eq!(
+            direct,
+            FrameVerdict::Admit,
+            "`0.0.0.0/0` admits every address"
+        );
+    }
+
+    #[test]
+    fn admits_nothing_reads_the_deny_all_shape() {
+        // The deny-all predicate reads the two destination lists, present
+        // and empty. An absent list is not yet resolved (`effective_egress`
+        // decides what it grants), and one non-empty destination list
+        // admits something, so neither is deny-all.
+        assert!(EgressPolicy::deny_all().admits_nothing());
+        assert!(!EgressPolicy::default().admits_nothing());
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_dns_hosts: Some(vec!["example.com".into()]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        // Both destination lists present and empty is deny-all whatever
+        // `allow_protocols` says: protocols filter the granted reach and
+        // there is none to filter. This is the shape a protocols-only or
+        // denies-only declaration resolves to under the deny-all default.
+        assert!(
+            EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        let protocols_only = EgressPolicy {
+            allow_protocols: Some(vec![IpProto::Tcp]),
+            ..EgressPolicy::default()
+        };
+        let EffectiveEgress::Declared(resolved) = effective_egress(
+            Some(&protocols_only),
+            NetworkMode::OwnIp,
+            EgressDefaultPhase::InForce,
+            false,
+        ) else {
+            panic!("a declared section stays declared");
+        };
+        assert!(
+            resolved.admits_nothing(),
+            "a protocols-only declaration grants no destination once resolved",
+        );
+        assert_eq!(
+            EffectiveEgress::Declared(resolved).summary_label(),
+            Some("deny-all")
+        );
+        // `deny_subnets` is not read: the deny-all shape stays deny-all
+        // with a subtraction set.
+        assert!(
+            EgressPolicy {
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::deny_all()
+            }
+            .admits_nothing()
+        );
+    }
+
     #[test]
     fn egress_on_none_box_is_validation_error() {
         // NET-065: a none box has no network, so there is nothing to enforce
@@ -1309,11 +1904,18 @@ mod tests {
             NetworkMode::NoNet,
             SessionPolicy::new(Some(EgressPolicy::default()), None),
         );
+        let err = record.validate_policy().unwrap_err();
         assert_eq!(
-            record.validate_policy(),
-            Err(PolicyError::EgressRequiresNetwork {
+            err,
+            PolicyError::EgressRequiresNetwork {
                 mode: NetworkMode::NoNet
-            })
+            }
+        );
+        // The refusal names the mode word, not the `Debug` name.
+        assert_eq!(
+            err.to_string(),
+            "egress rules need network mode own_ip or host_ip (this box is none): a none box \
+             has no network to apply them to"
         );
     }
 
@@ -1355,6 +1957,75 @@ mod tests {
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::IngressRequiresOwnIp {
+                mode: NetworkMode::HostNet
+            })
+        );
+    }
+
+    #[test]
+    fn own_ip_refusals_name_the_fields_that_caused_them() {
+        // A static mapping names the port mappings; a dynamic-only declaration
+        // names the dynamic fields. Both name the box's mode as a word and no
+        // CLI flag.
+        let static_ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let err = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(None, Some(static_ingress)),
+        )
+        .validate_policy()
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ingress port mappings need network mode own_ip (this box is host_ip): only an \
+             own-IP box has a published address to apply them to"
+        );
+
+        let range_only = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some((8000, 8443)),
+            dynamic_ingress: None,
+        };
+        let err = record_with(
+            NetworkMode::NoNet,
+            SessionPolicy::new(None, Some(range_only)),
+        )
+        .validate_policy()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyError::DynamicIngressRequiresOwnIp {
+                mode: NetworkMode::NoNet
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
+             box is none): only an own-IP box has a published address to apply them to"
+        );
+
+        // A static mapping alongside a dynamic declaration names the dynamic
+        // fields first, matching the CLI's check order.
+        let mixed = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: Some(DynamicIngress::Allow),
+        };
+        assert_eq!(
+            record_with(NetworkMode::HostNet, SessionPolicy::new(None, Some(mixed)))
+                .validate_policy(),
+            Err(PolicyError::DynamicIngressRequiresOwnIp {
                 mode: NetworkMode::HostNet
             })
         );
@@ -1858,7 +2529,7 @@ mod tests {
                 let record = record_with(network, SessionPolicy::new(None, Some(ingest)));
                 assert_eq!(
                     record.validate_policy(),
-                    Err(PolicyError::IngressRequiresOwnIp { mode: network }),
+                    Err(PolicyError::DynamicIngressRequiresOwnIp { mode: network }),
                     "dynamic_ingress = {mode} must be rejected on {network:?}"
                 );
             }

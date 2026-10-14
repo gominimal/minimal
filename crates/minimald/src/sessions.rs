@@ -18,7 +18,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod composables;
 #[cfg(test)]
@@ -105,12 +106,19 @@ fn build_record(
         // included — reuses the address the host table still holds instead
         // of drawing a new one the row would not match.
         box_addresses: config.box_addresses,
+        // Task runs attach at these, one run per address, so the in-VM
+        // daemon draws nothing for a task either (NET-138).
+        task_addresses: config.task_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
         // Daemon-owned from its first line: a create holds no launch's
         // outcome to record, and the key a client might assert in `attrs`
         // is stripped above, so only a launch ever writes this field.
         host_ip_enforcement: None,
+        // The id the host's row of the box holds, beside its addresses.
+        box_id: config.box_id,
+        // Daemon-owned as well: only a launch binds the box's host-side row.
+        host_row_bound: false,
         attrs: config.attrs,
     };
     record
@@ -148,6 +156,9 @@ struct CreateSessionMsg {
     /// Authenticated SSH username, supplied by the RPC handler from
     /// the SSH connection context (never the client).
     username: Option<String>,
+    /// The creating connection's liveness, see
+    /// [`ManagerHandle::create_session_by`].
+    creator: Option<std::sync::Weak<()>>,
     responder: Responder<SessionId>,
 }
 
@@ -178,13 +189,40 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<()>),
+    DeleteSession(SessionId, Responder<Vec<String>>),
     Shutdown(bool, Responder<Result<(), ()>>),
+    /// Bring up the actor of every `Active` record whose box owns a name,
+    /// so a restarted daemon routes the names of the sessions it restored
+    /// (see [`ManagerHandle::resume_active_sessions`]). Answers with how many
+    /// actors it started.
+    #[cfg(target_os = "linux")]
+    ResumeActive(Responder<usize>),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
     /// A no-op for an id already removed; ids are never reused, so a stale
     /// evict can't remove a fresh actor.
     Evict(SessionId),
+}
+
+impl ManagerMessage {
+    /// The variant's name, for the manager loop's span.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::List(..) => "List",
+            Self::GetRecord(..) => "GetRecord",
+            Self::GetSession(..) => "GetSession",
+            Self::GetScreen(..) => "GetScreen",
+            Self::GetComposition(..) => "GetComposition",
+            #[cfg(test)]
+            Self::RunningCount(..) => "RunningCount",
+            Self::CreateSession(..) => "CreateSession",
+            Self::DeleteSession(..) => "DeleteSession",
+            Self::Shutdown(..) => "Shutdown",
+            #[cfg(target_os = "linux")]
+            Self::ResumeActive(..) => "ResumeActive",
+            Self::Evict(..) => "Evict",
+        }
+    }
 }
 
 /// Routes session operations to per-session [`Session`] actors, spawning
@@ -197,8 +235,11 @@ enum ManagerMessage {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Manager {
-    in_shutdown: bool,
-    receiver: mpsc::Receiver<ManagerMessage>,
+    /// Cancelled once a shutdown proceeds, before any session is stopped.
+    /// Shared with every [`ManagerHandle`], so a command the shutdown ends
+    /// can tell (see [`ManagerHandle::is_shutting_down`]).
+    in_shutdown: CancellationToken,
+    receiver: crate::traced::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, SessionHandle>,
     store: StoreHandle,
 
@@ -274,7 +315,7 @@ impl Manager {
         reap_unresumable_records(&store).await?;
 
         let running = BTreeMap::new();
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = crate::traced::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
         // a clone is held by both the actor (which mutates it) and the handle
         // (which hands it to the proxies via `hostnames()`). Whether the
@@ -366,7 +407,7 @@ impl Manager {
                 crate::net::SwitchTransport::HostShuttle { cid, port } => (None, Some((cid, port))),
                 _ => (
                     Some(
-                        tokio::task::spawn_blocking(crate::net::loopback::probe)
+                        crate::traced::spawn_blocking(crate::net::loopback::probe)
                             .await
                             .unwrap_or_else(|join_error| {
                                 tracing::warn!(
@@ -472,7 +513,7 @@ impl Manager {
                 // publish is gone.
                 let book = Arc::clone(&loopback);
                 let registry = Arc::clone(&hostnames);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let probe = crate::net::policy::probe_publish_surface(
                         &crate::net::policy::ControlChannel::Vsock { cid, port },
                     )
@@ -538,8 +579,10 @@ impl Manager {
             }
             (hostnames, loopback)
         };
+        let in_shutdown = CancellationToken::new();
         let handle = ManagerHandle {
             sender,
+            in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -549,7 +592,7 @@ impl Manager {
         // so its binding can request destruction (see `weak_self`).
         let weak_self = handle.downgrade();
         let mngr = Self {
-            in_shutdown: false,
+            in_shutdown,
             receiver,
             running,
             store,
@@ -565,7 +608,13 @@ impl Manager {
             deny_all_opt_out,
         };
 
-        tokio::spawn(mngr.mainloop());
+        // The manager serves every request for the daemon's life: a root of
+        // its own, so it never pins whatever span its creator ran in. Each
+        // message's span names its sender (see `mainloop`).
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "sessions.manager"),
+            mngr.mainloop(),
+        );
         Ok(handle)
     }
 }
@@ -752,7 +801,7 @@ pub(crate) fn draw_interim_upgrades(
 /// The present landing's second half: re-publish one drawn box at the
 /// address it was drawn — under the write lock, and only if the box still
 /// exists. The draw ran outside every registry lock, so between it and this
-/// the box may have been stopped or destroyed, its name taken over by a
+/// the box may have been destroyed, its name taken over by a
 /// rename or a later session, or its publish moved off the interim by its
 /// own next registration; names are first-writer-owned, so any of those
 /// means the move publishes nothing. `true` when the move was made, `false`
@@ -763,8 +812,10 @@ pub(crate) fn draw_interim_upgrades(
 /// then hold spoken for. One whose publish still stands keeps the grant:
 /// the grant is idempotent by namespace, so a box that moved off the
 /// interim through its own re-registration stands at the very address the
-/// draw recorded, and a stopped or renamed one is answered with it at its
-/// next registration; releasing it would free an address a live box holds.
+/// draw recorded, and a renamed one is answered with it at its next
+/// registration; releasing it would free an address a live box holds. A
+/// stopped box keeps its name, so the move applies to it with its stopped
+/// marker intact.
 ///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
@@ -929,8 +980,22 @@ impl Manager {
     /// The async task which handles interactions with the
     /// manager.
     async fn mainloop(mut self) {
-        while let Some(msg) = self.receiver.recv().await {
-            self.handle_message(msg).await;
+        while let Some((msg, caller)) = self.receiver.recv().await {
+            // One span per message, opened now and a child of the sender's
+            // ids (see `traced::Receiver::recv`): a message that holds the
+            // loop (an inline await on a busy actor) shows as a long span
+            // here, and every caller queued behind it waits for its end.
+            let span = tracing::info_span!(
+                parent: None,
+                "sessions.manager.message",
+                kind = msg.kind(),
+                queued_behind = self.receiver.len(),
+                trace_id = tracing::field::Empty,
+                span_id = tracing::field::Empty,
+                parent_span_id = tracing::field::Empty,
+            );
+            crate::exec::adopt_trace(&span, caller);
+            tracing::Instrument::instrument(self.handle_message(msg), span).await;
         }
     }
 
@@ -950,7 +1015,7 @@ impl Manager {
         &mut self,
         pred: SessionKeyPredicate,
     ) -> Result<Option<SessionHandle>, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
@@ -969,6 +1034,97 @@ impl Manager {
         Ok(Some(h))
     }
 
+    /// Starts the actor of every `Active` record whose box owns a name
+    /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
+    /// registered when its actor starts ([`Session::run`]), and a restarted
+    /// daemon otherwise starts an actor only when an RPC first names the
+    /// session, so until then the name of a session `min ls` lists as active
+    /// answers NXDOMAIN and the proxy has no route for it.
+    ///
+    /// Resuming through [`Session::run`] keeps one registration path, with
+    /// its collision rules and its rule never to wait on the range verdict.
+    /// It is idempotent: a session already in `running` is skipped, and a
+    /// later RPC that names a resumed session finds its actor there rather
+    /// than registering it again.
+    ///
+    /// A record whose box name is already routed for another session is not
+    /// resumed: [`crate::net::dns::HostnameRegistry`] lets the later
+    /// registration take the route over, and a restart must not move a name
+    /// from one session to another. The check keys on the session id, not
+    /// the name — two restored sessions can share one registry name
+    /// outright (two unnamed sessions whose project directories share a
+    /// basename), the pair the store's name-uniqueness check never sees, as
+    /// well as fold to one hostname. That record keeps the lazy path.
+    /// A record that cannot be read, or whose actor fails to start, is
+    /// logged and skipped, so one bad record costs only its own name.
+    #[cfg(target_os = "linux")]
+    async fn resume_active_sessions(&mut self) -> Result<usize, SessionsError> {
+        if self.in_shutdown.is_cancelled() {
+            return Ok(0);
+        }
+        let mut resumed = 0;
+        for handle in self.store.handles().await? {
+            let session_id = *handle.id();
+            if self.running.contains_key(&session_id) {
+                continue;
+            }
+            let record = match handle.record().await {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %error,
+                        "resume: could not read the session record; its name stays \
+                         unregistered until an RPC names the session",
+                    );
+                    continue;
+                }
+            };
+            if !matches!(record.status, sessions::SessionStatus::Active)
+                || !matches!(
+                    record.network,
+                    sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp
+                )
+            {
+                continue;
+            }
+            let name = crate::session::registry_name(&record);
+            if let Some(owner) = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned")
+                .hostname_held_by_another(session_id, &name)
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    session_name = &name,
+                    owner,
+                    action = "hostname-collision",
+                    "resume: the box name is already routed for another session; \
+                     not resuming this one, so the restart does not move the name",
+                );
+                continue;
+            }
+            match Session::run(self.session_config(handle)).await {
+                Ok(session) => {
+                    self.running.insert(session_id, session);
+                    resumed += 1;
+                }
+                Err(error) => tracing::warn!(
+                    session_id = %session_id,
+                    session_name = &name,
+                    %error,
+                    "resume: could not start the session's actor; its name stays \
+                     unregistered until an RPC names the session",
+                ),
+            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "resumed active sessions so their names route");
+        }
+        Ok(resumed)
+    }
+
     /// The spawn-time config for a session actor backing `record`. The one
     /// place the daemon-scoped dependencies are gathered, so the create and
     /// bring-up-from-disk paths can't hand their actors different worlds.
@@ -981,6 +1137,7 @@ impl Manager {
             net_switch: Arc::clone(&self.net_switch),
             manager: self.weak_self.clone(),
             deny_all_opt_out: self.deny_all_opt_out,
+            creator: None,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -1005,8 +1162,9 @@ impl Manager {
         &mut self,
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
@@ -1035,7 +1193,7 @@ impl Manager {
             REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 session_name = ?config.name,
-                network_mode = ?config.network,
+                network_mode = %config.network.word(),
                 host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
                 refused_unenforceable_creates = refused_unenforceable_creates(),
                 refusal = %refusal,
@@ -1050,7 +1208,9 @@ impl Manager {
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
 
-        match Session::run(self.session_config(handle.clone())).await {
+        let mut seed = self.session_config(handle.clone());
+        seed.creator = creator;
+        match Session::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
                 Ok(session_id)
@@ -1124,6 +1284,10 @@ impl Manager {
                 })
                 .await;
             }
+            #[cfg(target_os = "linux")]
+            ManagerMessage::ResumeActive(r) => {
+                r.handle(self.resume_active_sessions()).await;
+            }
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {
                 let n = self.running.len();
@@ -1177,7 +1341,7 @@ impl Manager {
                     // the hang off this loop and onto a task nothing reaps,
                     // leaving the client on an unanswered oneshot.
                     Ok(Some(h)) => {
-                        tokio::spawn(async move {
+                        crate::traced::spawn(async move {
                             r.handle(async move {
                                 Ok(tokio::time::timeout(HOST_PROBE_TIMEOUT, h.get_screen())
                                     .await
@@ -1201,16 +1365,17 @@ impl Manager {
                 let CreateSessionMsg {
                     config,
                     username,
+                    creator,
                     responder,
                 } = *msg;
-                let created = self.create_session(config, username).await;
+                let created = self.create_session(config, username, creator).await;
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: tears down its running host and actor (if
             // any), then removes its on-disk record.
             ManagerMessage::DeleteSession(id, r) => {
                 r.handle(async {
-                    if self.in_shutdown {
+                    if self.in_shutdown.is_cancelled() {
                         return Err(SessionsError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "in shutdown",
@@ -1260,7 +1425,7 @@ impl Manager {
                     };
                     match actor {
                         Some(hnd) => {
-                            hnd.destroy().await?;
+                            let hook_failures = hnd.destroy().await?;
                             // Belt-and-braces: a dead actor (self-terminated
                             // but not yet evicted) reads as `Ok` above, and
                             // may have died *without* deleting its record
@@ -1271,10 +1436,13 @@ impl Manager {
                             {
                                 return Err(e);
                             }
+                            Ok(hook_failures)
                         }
-                        None => handle.delete().await?,
+                        None => {
+                            handle.delete().await?;
+                            Ok(Vec::new())
+                        }
                     }
-                    Ok(())
                 })
                 .await
             }
@@ -1294,7 +1462,7 @@ impl Manager {
                         }
                     }
 
-                    self.in_shutdown = true;
+                    self.in_shutdown.cancel();
                     // Stop live sessions. Each actor kills its host and
                     // withdraws its own PTask hostname (R3.5) on the way
                     // down; records — and, with them, the loopback grants
@@ -1334,7 +1502,9 @@ impl Manager {
 /// The handle to the session manager.
 #[derive(Debug, Clone)]
 pub struct ManagerHandle {
-    sender: mpsc::Sender<ManagerMessage>,
+    sender: crate::traced::Sender<ManagerMessage>,
+    /// The actor's [`Manager::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
     /// through the actor mainloop.
@@ -1356,7 +1526,9 @@ pub struct ManagerHandle {
 /// why the path back to the manager must be weak.
 #[derive(Debug, Clone)]
 pub struct WeakManagerHandle {
-    sender: mpsc::WeakSender<ManagerMessage>,
+    sender: crate::traced::WeakSender<ManagerMessage>,
+    /// Mirrors [`ManagerHandle::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an
     /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
     /// keep the actor alive (only live senders do).
@@ -1375,6 +1547,7 @@ impl WeakManagerHandle {
     pub fn upgrade(&self) -> Option<ManagerHandle> {
         Some(ManagerHandle {
             sender: self.sender.upgrade()?,
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1405,7 +1578,7 @@ impl SessionControl {
     /// delete itself fails (e.g. the manager is mid-shutdown).
     pub async fn destroy(&self) -> Result<(), SessionsError> {
         match self.manager.upgrade() {
-            Some(mngr) => mngr.delete_session(self.id).await,
+            Some(mngr) => mngr.delete_session(self.id).await.map(drop),
             None => Err(SessionsError::new(
                 std::io::ErrorKind::NotConnected,
                 "sessions manager is gone",
@@ -1438,11 +1611,19 @@ impl SessionControl {
 }
 
 impl ManagerHandle {
+    /// Whether a shutdown is under way: set before the shutdown stops any
+    /// session, so a command it ends can still see why when it returns.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.in_shutdown.is_cancelled()
+    }
+
     /// Returns a non-owning handle to this manager.
     #[must_use]
     pub fn downgrade(&self) -> WeakManagerHandle {
         WeakManagerHandle {
             sender: self.sender.downgrade(),
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1525,6 +1706,41 @@ impl ManagerHandle {
         self.loopback.verdict_waiters()
     }
 
+    /// Enqueues the resume of every active session restored from the store
+    /// (see [`Manager::resume_active_sessions`]) and returns the future that
+    /// answers with how many actors it started. The message is in the
+    /// manager's mailbox when this returns, so any message sent after it —
+    /// an RPC's lookup of a restored session, say — is served once the
+    /// resume has registered the restored names; the answer can be awaited
+    /// later, or not at all.
+    ///
+    /// [`crate::server::Server::run`] enqueues this once, before its accept
+    /// loop opens, and awaits the answer off that path. It is a message
+    /// rather than part of [`Manager::init`] so the test harness, which
+    /// builds the manager without `Server::run`, can open a window (a
+    /// pending range verdict, say) before the resume.
+    #[cfg(target_os = "linux")]
+    pub async fn enqueue_resume_active_sessions(
+        &self,
+    ) -> impl Future<Output = Result<usize, SessionsError>> + Send + 'static {
+        let (send, recv) = Responder::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a closed manager is the one way the send can fail, and the recv \
+                      reports it — the send's own receipt has nothing to add"
+        )]
+        let _ = self.sender.send(ManagerMessage::ResumeActive(send)).await;
+        async move { recv.await.expect("corresponding sessions manager is dead") }
+    }
+
+    /// [`Self::enqueue_resume_active_sessions`], awaited: starts the actor
+    /// of every active session restored from the store and returns how many
+    /// it started.
+    #[cfg(target_os = "linux")]
+    pub async fn resume_active_sessions(&self) -> Result<usize, SessionsError> {
+        self.enqueue_resume_active_sessions().await.await
+    }
+
     /// Lists the sessions known to this (minimald) instance.
     pub async fn list(&self) -> Result<Vec<SessionInfo>, SessionsError> {
         let (send, recv) = Responder::channel();
@@ -1592,6 +1808,21 @@ impl ManagerHandle {
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
     ) -> Result<SessionId, SessionsError> {
+        self.create_session_by(config, username, None).await
+    }
+
+    /// [`Self::create_session`] for a session created over a connection:
+    /// `creator` is that connection's liveness. While it still upgrades the
+    /// session's activation belongs to its creator, so an attach to the
+    /// still-unconfigured session is refused instead of configuring it (see
+    /// the `Draft` shortcut in `Session::attach`). Passed at creation, not
+    /// afterwards, so there is no window in which the actor exists without it.
+    pub async fn create_session_by(
+        &self,
+        config: minimald_rpc::SessionConfig,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1599,6 +1830,7 @@ impl ManagerHandle {
             .send(ManagerMessage::CreateSession(Box::new(CreateSessionMsg {
                 config,
                 username,
+                creator,
                 responder: send,
             })))
             .await;
@@ -1662,8 +1894,9 @@ impl ManagerHandle {
     /// Deletes the session with the given ID, cascadingly tearing down its
     /// running host and actor (if any) before removing its on-disk record.
     ///
+    /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
-    pub async fn delete_session(&self, id: SessionId) -> Result<(), SessionsError> {
+    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1699,6 +1932,7 @@ impl ManagerHandle {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::session::PACKAGE_CHECK_DEADLINE;
     use paths::HostAbsPath;
     use sessions::daemon::composer::ComposeOutcome;
     use sessions::wire::request::{ContributionVerdict, SessionStep, WireContribution};
@@ -1825,6 +2059,8 @@ pub(crate) mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -2694,6 +2930,151 @@ pub(crate) mod tests {
         let _pending = mngr.create_session(sample_config(), None).await.unwrap();
 
         assert!(mngr.needed_packages().await.unwrap().is_empty());
+    }
+
+    /// Creates a session over a workspace declaring local package `pkg` in
+    /// its `[session]` block plus `extra` as further session packages,
+    /// configures it with `contribution`, and finalizes it with the package
+    /// check on, bounded by `deadline`. Returns the manager, the id, and
+    /// the finalize's outcome.
+    async fn finalize_with_package_check(
+        extra: &[&str],
+        contribution: WireContribution,
+        deadline: std::time::Duration,
+    ) -> (
+        TempDir,
+        TempDir,
+        ManagerHandle,
+        SessionId,
+        Result<minimald_rpc::FinalizeSessionResponse, std::io::Error>,
+    ) {
+        let (state, cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        seed_workspace_package(&mngr, id, "pkg-ok").await;
+        let packages: Vec<String> = std::iter::once("pkg-ok")
+            .chain(extra.iter().copied())
+            .map(|p| format!("\"{p}\""))
+            .collect();
+        seed_workspace_mfile(
+            &mngr,
+            id,
+            &format!("[session]\npackages = [{}]\n", packages.join(", ")),
+        )
+        .await;
+        let handle = session(&mngr, id).await;
+        let response = handle
+            .configure_loadout(contribution)
+            .await
+            .expect("packages gate nothing at compose");
+        assert!(response.is_none(), "nothing in the composition is gated");
+        handle.check_packages_at_finalize(deadline).await;
+        let outcome = handle.finalize().await;
+        (state, cache, mngr, id, outcome)
+    }
+
+    async fn status_of(mngr: &ManagerHandle, id: SessionId) -> sessions::SessionStatus {
+        mngr.get_record(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the record should survive the finalize")
+            .status
+    }
+
+    /// A `[session]` package the graph does not declare is refused at
+    /// finalize, naming the package and the project that declared it, and
+    /// the record is not promoted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_refuses_an_unknown_session_package() {
+        let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
+            &["no-such-pkg-zz"],
+            WireContribution::default(),
+            PACKAGE_CHECK_DEADLINE,
+        )
+        .await;
+        let err = outcome.expect_err("an unknown package must not activate");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-zz") && msg.contains("project"),
+            "the error should name the package and its declarer, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("pkg-ok"),
+            "a package that resolves is not reported, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// The same refusal for a package that arrives through a loadout: the
+    /// project resolves, the loadout's package does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_refuses_an_unknown_loadout_package() {
+        use sessions::wire::primitives::{WirePackageRef, WireSource};
+
+        let mut contribution = WireContribution::default();
+        contribution.requested_packages.push(WirePackageRef {
+            name: "no-such-pkg-qq".into(),
+            source: WireSource::UserLoadout {
+                name: "editor".into(),
+            },
+        });
+        let (_state, _cache, mngr, id, outcome) =
+            finalize_with_package_check(&[], contribution, PACKAGE_CHECK_DEADLINE).await;
+        let err = outcome.expect_err("an unknown loadout package must not activate");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-qq") && msg.contains("loadout `editor`"),
+            "the error should name the package and its loadout, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// A composition whose every package resolves still finalizes to
+    /// `Active` with the check on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_with_resolvable_packages_still_activates() {
+        let (_state, _cache, mngr, id, outcome) =
+            finalize_with_package_check(&[], WireContribution::default(), PACKAGE_CHECK_DEADLINE)
+                .await;
+        let response = outcome.expect("a session whose packages resolve should finalize");
+        assert!(
+            !response.package_check_skipped,
+            "a check that ran to a verdict is not skipped"
+        );
+        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// A check that cannot resolve the graph within its deadline steps
+    /// aside instead of failing the finalize: the session activates with
+    /// its unknown name unresolved, which the launch reports at first
+    /// exec, exactly as before the check existed. This is the daemon-side
+    /// bound on the work the check adds to the `FinalizeSession`
+    /// round-trip — a cold-cache upstream clone can outlast the client's
+    /// own deadline, and a client that expires does not cancel the
+    /// daemon-side finalize, so the check must not hold the record's
+    /// promotion hostage to work the client has stopped waiting for.
+    ///
+    /// A zero deadline pins the expiry path without a slow graph to wait
+    /// out: the check body gets its single poll before the deadline fires
+    /// (tokio polls the future before the delay), and cannot complete
+    /// within it, since its graph evaluation round-trips the blocking
+    /// pool. The composition names an unknown package so a check that
+    /// ignored its deadline would refuse instead of activate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_with_an_expired_package_check_still_activates() {
+        let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
+            &["no-such-pkg-exp"],
+            WireContribution::default(),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let response = outcome.expect("an expired check steps aside; the session still activates");
+        assert!(
+            response.package_check_skipped,
+            "an expired check reports the skip so the client can warn"
+        );
+        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
     }
 
     /// The held [`Composition`] actually carries the project

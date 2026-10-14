@@ -23,8 +23,8 @@ use serde_json_lenient::{Value, json};
 pub const SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 
 /// The session's project root inside the box. Mirrors minimald's
-/// `env::WORKSPACE_ROOT` (itself `/` + `sandbox2::SESSION_DEFAULT_WD`), which
-/// the CLI cannot reference directly: `sandbox2` is Linux-only and `min` builds
+/// `env::WORKSPACE_ROOT` (itself `/` + `sandbox::SESSION_DEFAULT_WD`), which
+/// the CLI cannot reference directly: `sandbox` is Linux-only and `min` builds
 /// on macOS.
 pub const WORKSPACE_ROOT: &str = "/workbench";
 

@@ -18,13 +18,28 @@ impl Repo {
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
         let url = url.into();
-        let base = base.into();
+        // Absolute, because every git call below pairs `current_dir(base)`
+        // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
+        // that new working directory.
+        let base = std::path::absolute(base.into())?;
 
         if base.join("HEAD").exists() {
-            // Double-check its the right remote
+            // Double-check its the right remote. Read the clone's stored value,
+            // not `git remote get-url`: the latter applies `url.<base>.insteadOf`
+            // rewrites from any config level, so a rewritten clone would never
+            // match and every cache open would fail with InvalidPath.
+            // `--local` so a `remote.origin.url` in global or system config
+            // cannot stand in for a cache whose own config lacks one.
             let output = Command::new("git")
-                .args(["remote", "get-url", "origin"])
+                .args(["config", "--local", "--get", "remote.origin.url"])
                 .current_dir(&base)
+                // Explicit GIT_DIR so git recognises the bare repo as
+                // intentional even when `safe.bareRepository = explicit` is
+                // configured (planned as the default in Git 3.0). Under that
+                // setting, missing it makes this command fail and fall
+                // through to a clone into the already-populated directory,
+                // which can surface as `clone ... already exists`.
+                .env("GIT_DIR", &base)
                 .output()?;
 
             if output.status.success() {
@@ -55,7 +70,7 @@ impl Repo {
         if !output.status.success() {
             return Err(Error::GitCommandFailed {
                 command: "clone".to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                stderr: scrub_stderr(&url, &output.stderr),
                 status: output.status.to_string(),
             });
         }
@@ -237,13 +252,14 @@ impl Repo {
             .current_dir(self.bare_repo_path())
             // Explicitly set GIT_DIR so git recognises the bare repo as
             // intentional even when `safe.bareRepository = explicit` is set
-            // in the system or global config (the default since git 2.49).
+            // in the system or global config (planned as the default in
+            // Git 3.0).
             .env("GIT_DIR", self.bare_repo_path())
             .args(&args)
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = scrub_stderr(&self.url, &output.stderr);
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
@@ -267,7 +283,7 @@ impl Repo {
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = scrub_stderr(&self.url, &output.stderr);
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
@@ -285,4 +301,30 @@ impl std::fmt::Debug for Repo {
             .field("bare", &self.bare)
             .finish()
     }
+}
+
+/// Git's stderr, with the secret parts of `url` taken out: the whole URL is
+/// replaced by the scrubbed remote, and then any userinfo or query/fragment
+/// left is removed on its own, because git echoes the URL it was given
+/// ("unable to access '…'"), sometimes with its own userinfo already gone.
+/// A token in the URL must not reach an error message (spec 25 TEL-041).
+fn scrub_stderr(url: &str, stderr: &[u8]) -> String {
+    let mut stderr = String::from_utf8_lossy(stderr).into_owned();
+    let scrubbed = crate::scrubbed_remote(url);
+    if scrubbed == url {
+        return stderr;
+    }
+    stderr = stderr.replace(url, &scrubbed);
+    let (base, tail) = url
+        .find(['?', '#'])
+        .map_or((url, ""), |at| url.split_at(at));
+    if !tail.is_empty() {
+        stderr = stderr.replace(tail, "");
+    }
+    let authority = base.split_once("://").map_or(base, |(_, rest)| rest);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    if let Some((userinfo, _)) = authority.rsplit_once('@') {
+        stderr = stderr.replace(&format!("{userinfo}@"), "");
+    }
+    stderr
 }

@@ -6,6 +6,8 @@
 //! contract test. Console output stays human-format everywhere; this layer is
 //! only for the files `min bug` collects and downstream tools parse.
 
+pub mod otel;
+
 /// Build the JSON-lines file-log layer for a daemon named `service_name`.
 ///
 /// Records are flat — span fields (`trace_id`/`span_id`/`conn`/`channel`) are

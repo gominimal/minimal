@@ -30,6 +30,36 @@ pub struct Cli {
     pub global_args: GlobalArgs,
 }
 
+/// Retired top-level verbs, each with the tip naming what replaced it.
+const RETIRED_COMMANDS: &[(&str, &str)] = &[(
+    "ssh-forward",
+    "`min ssh-forward` was removed: forward a box port with \
+     `min net forward <SESSION> <LOCAL>:<PORT>`",
+)];
+
+/// Adds a tip naming the replacement when `err` refuses a retired verb. The
+/// parser still refuses the verb, with its usage; the tip says where it went.
+pub fn with_retired_command_hint(mut err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let tip = match err.get(ContextKind::InvalidSubcommand) {
+        Some(ContextValue::String(verb)) => RETIRED_COMMANDS
+            .iter()
+            .find(|(retired, _)| *retired == verb.as_str())
+            .map(|(_, tip)| tip),
+        _ => None,
+    };
+    if let Some(tip) = tip {
+        err.insert(
+            ContextKind::Suggested,
+            ContextValue::StyledStrs(vec![(*tip).to_owned().into()]),
+        );
+    }
+    err
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// List sessions
@@ -56,6 +86,8 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
+    FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
     /// naming the canonical `min task run <task>` (host) and
     /// `min session attach --command 'min task run <task>'` (in-box) forms.
@@ -124,6 +156,15 @@ pub enum Command {
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
     Spin(SpinArgs),
+    /// Print the privileged command that installs this host's resolver,
+    /// local range and box-name service (development aid).
+    ///
+    /// The command a session start's advisory prints, rendered without a
+    /// daemon, so the service install can be tested on a host that cannot
+    /// boot a VM. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-answerer-command", hide = true)]
+    DebugAnswererCommand,
     /// Print session-identifier completion candidates (used by the shell).
     ///
     /// The completion path a shell actually takes runs in-process (see
@@ -207,7 +248,7 @@ pub enum SessionCommand {
 
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
@@ -221,7 +262,7 @@ pub struct SetupZedArgs {
 /// Args for `min session hooks`.
 #[derive(Debug, Args)]
 pub struct HooksArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
@@ -231,7 +272,7 @@ pub struct HooksArgs {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Command to execute in the session context
@@ -246,7 +287,7 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
@@ -255,7 +296,7 @@ pub struct SessionRunArgs {
 
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Write one JSON document instead of text (the default)
@@ -664,9 +705,10 @@ pub struct ActivateArgs {
     /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
     /// — a declaration, not the default: on a host-address box the host's
     /// classifier decides it per box (NET-079), while a box that declares no
-    /// egress at all keeps the default the rollout phase resolves
-    /// (NET-074). Valid wherever the egress rule flags are; conflicts with
-    /// every one of them, because deny-all admits no exceptions.
+    /// egress at all gets the default NET-074 sets: deny-all for an own-ip
+    /// box, unless the host opts out. Valid wherever the egress rule flags
+    /// are; conflicts with every one of them, because deny-all admits no
+    /// exceptions.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
     /// Declare a credentialed upstream for this box (NET-134): the Box
@@ -923,9 +965,9 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name). When omitted, `min session attach`
-    /// resolves a session from the current working directory (or the only
-    /// existing session), and opens an interactive picker if the choice is
+    /// Session identifier (UUID, unique id prefix, or session name). When
+    /// omitted, `min session attach` resolves a session from the current
+    /// working directory (or the only existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
@@ -945,7 +987,7 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
@@ -976,7 +1018,7 @@ pub enum NetCommand {
 
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
@@ -987,15 +1029,33 @@ pub struct NetForwardArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct FinalizeInstallArgs {
+    /// Name what is missing on this host and run nothing
+    #[arg(long)]
+    pub show: bool,
+    /// With --show, also print the script a run would execute, on stdout
+    #[arg(long, requires = "show", conflicts_with = "json")]
+    pub script: bool,
+    /// With --show, print the report as JSON (schema `min/v1/finalize-install`); exits non-zero while any part is missing
+    #[arg(long, requires = "show", conflicts_with = "undo")]
+    pub json: bool,
+    /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
+    #[arg(long)]
+    pub undo: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one).
+    /// On a VM backend whose in-guest daemon does not answer, stops the VM from the host;
+    /// data not yet flushed inside the VM can then be lost
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct RenameArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// New name for the session

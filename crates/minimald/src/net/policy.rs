@@ -76,6 +76,20 @@ pub enum ControlChannel {
     Vsock { cid: u32, port: u32 },
 }
 
+impl ControlChannel {
+    /// Whether the host, not this daemon, unbinds a declared port's forward.
+    /// On a VM-backed host (the vsock channel) every control request passes
+    /// the host's egress gate first. The gate refuses any withdrawal of a
+    /// declared port (NET-081's withdrawal rule) and unbinds the declared
+    /// forwards itself when the box's row is withdrawn (design §7.1:
+    /// host-side ingress revocation). On a native host the daemon drives the
+    /// switch directly, and the unbind is its own job.
+    #[must_use]
+    pub fn host_unbinds_declared_forwards(&self) -> bool {
+        matches!(self, Self::Vsock { .. })
+    }
+}
+
 /// gvproxy's wire spelling of an [`IpProto`] in a forwarder request.
 fn protocol_str(proto: IpProto) -> &'static str {
     match proto {
@@ -306,6 +320,11 @@ impl PortForwarder {
 /// box has no relay — the netns proofs — where a forwarder simply has no
 /// gate to revoke through.
 ///
+/// `yielded` is the ports the box yields at a shared address (NET-129,
+/// first-come): another box holds each one, so its forward is known state,
+/// not a failure. It is skipped, with one warn line naming the port and the
+/// box that holds it, and the box's other forwards bind as usual.
+///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
 /// error is returned. The failure says its own line first (NET-121's sub 2):
@@ -321,9 +340,24 @@ pub async fn apply_ingress(
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
     gate: Option<&Arc<super::switch::SessionGate>>,
+    yielded: &[super::dns::SharedPortCollision],
 ) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
+        if let Some(collision) = yielded
+            .iter()
+            .find(|collision| collision.port == mapping.external_port)
+        {
+            tracing::warn!(
+                port = mapping.external_port,
+                address = %published,
+                other = %collision.other,
+                action = "shared-address-port-collision",
+                "declared ingress port not bound: another box at the shared \
+                 address holds it"
+            );
+            continue;
+        }
         let req = expose_request(mapping, published, ptask_ip);
         match post_json(control, "/services/forwarder/expose", &req).await {
             Ok(()) => bound.push(PortForwarder {
@@ -349,7 +383,7 @@ pub async fn apply_ingress(
                 );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                remove_ingress(control, &bound).await;
+                release_declared_ingress(control, &bound).await;
                 return Err(e);
             }
         }
@@ -393,6 +427,48 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
                 );
             }
         }
+    }
+}
+
+/// Unbinds one forward and says whether the switch let it go: the fallible
+/// twin of [`remove_ingress`], for a caller that keeps tracking a forward the
+/// switch still holds so a later teardown can retry it. A forward already
+/// revoked is already down.
+pub async fn unexpose_forwarder(
+    control: &ControlChannel,
+    forwarder: &PortForwarder,
+) -> io::Result<()> {
+    if forwarder.is_revoked() {
+        return Ok(());
+    }
+    unexpose_mapping(control, &forwarder.mapping).await
+}
+
+/// Ends the declared ports' forwards in `bound` when their box stops (NET-121)
+/// or when a partial apply rolls back. Who unbinds them depends on the host
+/// ([`ControlChannel::host_unbinds_declared_forwards`]):
+///
+/// - On a native host the daemon asks the switch itself, through
+///   [`remove_ingress`].
+/// - On a VM-backed host the daemon asks nothing. The host's egress gate
+///   refuses any withdrawal of a declared port, by dropping the request
+///   unanswered. Asking anyway only produced a misleading "malformed status
+///   line" warning per port. The host unbinds the forwards and terminates
+///   their connections when it withdraws the box's row. Each forward still
+///   gets one info line, so the log keeps NET-121's bind/unbind pair.
+pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
+    if !control.host_unbinds_declared_forwards() {
+        remove_ingress(control, bound).await;
+        return;
+    }
+    for forwarder in bound.iter().filter(|forwarder| !forwarder.is_revoked()) {
+        let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
+        tracing::info!(
+            host,
+            port = external_port,
+            reason = "box stopped",
+            "left the declared ingress forwarder for the host to unbind"
+        );
     }
 }
 
@@ -478,6 +554,15 @@ pub enum ExposeRefusal {
     /// with nobody attached — or until that prompt path exists — the request
     /// fails closed rather than publishing unasked.
     AskNeedsAnswer,
+    /// `dynamic_ingress` is `ask` and the attached human answered no — or
+    /// keyed a cancel, which means the same (NET-045): the box's own deny
+    /// answer, now in the human's hand. The log and the audit record say it
+    /// with the deny's words; the caller's line says who declined.
+    DeniedByHuman,
+    /// `dynamic_ingress` is `ask` and the VM host's attached client could
+    /// not show the dialog — no terminal to draw it on — so the ask ended
+    /// in the deny an unanswerable dialog defaults to.
+    AskNoTerminal,
     /// `dynamic_ingress` allows, but the box declares no
     /// `dynamic_allowed_range`: no port was opted in.
     NoDynamicRange,
@@ -502,12 +587,79 @@ pub enum ExposeRefusal {
         port: u16,
         owner: super::listeners::PublicationOwner,
     },
+    /// The box shares the host's network (`host_ip`), so the port already
+    /// answers on the host and there is nothing to publish. The request's
+    /// goal is met, not refused, so the in-box caller hears this as a plain
+    /// message and exits 0. `host_loopback` says whether the host's own
+    /// loopback is one of the places it answers: true on a native host, and
+    /// false on a VM-backed one, where the loopback the box shares is the
+    /// guest's and the name is the only host-reachable answer (NET-129).
+    NeedsNoExposing { port: u16, host_loopback: bool },
+}
+
+impl ExposeRefusal {
+    /// The line the in-box `min net expose` prints for this refusal: the
+    /// verdict and, where a way forward exists, the way forward, named with
+    /// the box's current host-side name and the port the request asked for,
+    /// so a detached agent reading it has its next command. `network` is the
+    /// box's mode: a `--network none` box carries no dynamic ingress at all,
+    /// so re-activating with it is no way forward there, and the host-side
+    /// forward — which dials inside the box's own namespace — is the one
+    /// offered. The verdict alone (`Display`) is what the log line and the
+    /// audit record carry.
+    #[must_use]
+    pub fn for_caller(&self, box_name: &str, network: sessions::NetworkMode, port: u16) -> String {
+        let forward = format!("min net forward {box_name} <local>:{port}");
+        match self {
+            Self::DeniedByPolicy => match network {
+                sessions::NetworkMode::NoNet => format!(
+                    "{self}: a --network none box has no address to publish at. Forward it \
+                     from the host instead: {forward}"
+                ),
+                // `NetworkMode` is non-exhaustive; every other mode gets the
+                // own-address advice.
+                _ => format!(
+                    "{self}. Re-activate with --network own_ip and --dynamic-ingress allow \
+                     --dynamic-range <lo>-<hi> (or --dynamic-ingress ask) to allow it, or \
+                     forward it from the host now: {forward}"
+                ),
+            },
+            Self::DeniedByHuman => format!(
+                "{self}: your operator declined it. Ask again, or forward it from the \
+                 host: {forward}"
+            ),
+            Self::AskNoTerminal => format!(
+                "{self}: no terminal was attached to answer. Attach one and retry, or \
+                 forward it from the host: {forward}"
+            ),
+            Self::AskNeedsAnswer => format!(
+                "{self}: attach a terminal (min session attach {box_name}) and retry, or \
+                 have the host forward it ({forward})"
+            ),
+            Self::NeedsNoExposing {
+                host_loopback: true,
+                ..
+            } => format!(
+                "{self}, so it already answers at {box_name}.min.internal:{port} \
+                 (and localhost:{port})"
+            ),
+            Self::NeedsNoExposing {
+                host_loopback: false,
+                ..
+            } => format!("{self}, so it already answers at {box_name}.min.internal:{port}"),
+            _ => self.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for ExposeRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DeniedByPolicy => {
+            // One verdict for the three denies: the policy's, the human's
+            // and the one an unshowable dialog defaults to. The log and the
+            // audit record pin these words; the caller's line tells them
+            // apart.
+            Self::DeniedByPolicy | Self::DeniedByHuman | Self::AskNoTerminal => {
                 write!(f, "dynamic ingress is denied for this box")
             }
             Self::AskNeedsAnswer => write!(
@@ -538,6 +690,10 @@ impl fmt::Display for ExposeRefusal {
                 f,
                 "port {port} is published already by this box ({})",
                 owner.as_str()
+            ),
+            Self::NeedsNoExposing { port, .. } => write!(
+                f,
+                "port {port} needs no exposing: this box shares the host's network"
             ),
         }
     }
@@ -1344,6 +1500,80 @@ mod tests {
     }
 
     #[test]
+    fn refusals_name_the_way_forward_for_the_caller() {
+        use sessions::NetworkMode;
+
+        // The in-box line carries the verdict and the next command, named
+        // with the host-side box name and the port asked for; the verdict
+        // alone is what the log and the audit record keep.
+        assert_eq!(
+            ExposeRefusal::DeniedByPolicy.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is denied for this box. Re-activate with --network own_ip and \
+             --dynamic-ingress allow --dynamic-range <lo>-<hi> (or --dynamic-ingress ask) \
+             to allow it, or forward it from the host now: min net forward web <local>:3001"
+        );
+        // A `--network none` box cannot carry dynamic ingress, so the only
+        // way forward is the host's forward, which dials inside the box.
+        assert_eq!(
+            ExposeRefusal::DeniedByPolicy.for_caller("web", NetworkMode::NoNet, 3001),
+            "dynamic ingress is denied for this box: a --network none box has no address \
+             to publish at. Forward it from the host instead: min net forward web \
+             <local>:3001"
+        );
+        // The three denies share the verdict and differ in the way forward.
+        assert_eq!(
+            ExposeRefusal::DeniedByHuman.to_string(),
+            ExposeRefusal::DeniedByPolicy.to_string()
+        );
+        assert_eq!(
+            ExposeRefusal::AskNoTerminal.to_string(),
+            ExposeRefusal::DeniedByPolicy.to_string()
+        );
+        assert_eq!(
+            ExposeRefusal::DeniedByHuman.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is denied for this box: your operator declined it. Ask again, \
+             or forward it from the host: min net forward web <local>:3001"
+        );
+        assert_eq!(
+            ExposeRefusal::AskNoTerminal.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is denied for this box: no terminal was attached to answer. \
+             Attach one and retry, or forward it from the host: min net forward web \
+             <local>:3001"
+        );
+        assert_eq!(
+            ExposeRefusal::AskNeedsAnswer.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is set to ask and nobody is attached to answer: attach a \
+             terminal (min session attach web) and retry, or have the host forward it \
+             (min net forward web <local>:3001)"
+        );
+        // Natively the host's loopback answers too; on a VM-backed host the
+        // loopback the box shares is the guest's, so only the name is named.
+        assert_eq!(
+            ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                host_loopback: true
+            }
+            .for_caller("web", NetworkMode::HostNet, 3001),
+            "port 3001 needs no exposing: this box shares the host's network, so it \
+             already answers at web.min.internal:3001 (and localhost:3001)"
+        );
+        assert_eq!(
+            ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                host_loopback: false
+            }
+            .for_caller("web", NetworkMode::HostNet, 3001),
+            "port 3001 needs no exposing: this box shares the host's network, so it \
+             already answers at web.min.internal:3001"
+        );
+        // A refusal with no way forward beyond its own words is its verdict.
+        assert_eq!(
+            ExposeRefusal::NoDynamicRange.for_caller("web", NetworkMode::OwnIp, 3001),
+            ExposeRefusal::NoDynamicRange.to_string()
+        );
+    }
+
+    #[test]
     fn dynamic_ingress_decision_denies_the_absent_and_explicit_deny() {
         // NET-043: the setting decides, and an absent declaration is the
         // deny-all default — the two shapes a request from inside a bare box
@@ -1687,7 +1917,7 @@ mod tests {
         // must return the full reply from a peer that stays open. If it ever
         // reverts to read-to-EOF, this test hangs (the peer never closes).
         let (client, mut server) = tokio::io::duplex(1024);
-        let server = tokio::spawn(async move {
+        let server = crate::traced::spawn(async move {
             let mut buf = [0u8; 256];
             // Drain the request (headers + empty body arrive together here).
             let _ = server.read(&mut buf).await.unwrap();
@@ -1786,7 +2016,7 @@ mod tests {
         /// for the one test that needs a forwarder slower than its budget.
         /// Every round's `local` is handed to the returned receiver; the
         /// returned handle aborts the server when the test is done with it.
-        fn spawn_forwarder_answering(
+        pub(super) fn spawn_forwarder_answering(
             path: PathBuf,
             delay: Duration,
             decide: impl Fn(&str) -> u16 + Send + Sync + 'static,
@@ -1794,7 +2024,7 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let (tx, rx) = mpsc::channel(512);
             let decide = std::sync::Arc::new(decide);
-            let handle = tokio::spawn(async move {
+            let handle = crate::traced::spawn(async move {
                 // Sequential on purpose: the probe is a walk, one request per
                 // address, so one connection served at a time is its shape.
                 loop {
@@ -2096,6 +2326,87 @@ mod tests {
 
             assert_eq!(asked_expose, format!("127.0.64.1:{RANGE_PROBE_PORT}"));
             assert_eq!(asked_unexpose, asked_expose);
+        }
+    }
+
+    // ---- who unbinds a declared forward when its box stops (NET-121) ------
+    mod declared_release {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        use super::super::{
+            ControlChannel, ExposedMapping, PortForwarder, release_declared_ingress,
+        };
+        use super::forwarder_probe::spawn_forwarder_answering;
+
+        /// A declared forwarder bound at `local`, as `apply_ingress` builds
+        /// one, with no session gate behind it.
+        fn declared_at(local: &str) -> PortForwarder {
+            PortForwarder {
+                mapping: ExposedMapping {
+                    local: local.to_string(),
+                    protocol: "tcp".to_string(),
+                },
+                internal_port: 80,
+                gate: None,
+                revoked: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// On a VM-backed host the host's egress gate refuses any withdrawal
+        /// of a declared port and unbinds the forward itself at box end, so
+        /// the daemon asks the switch for nothing. It says one info line per
+        /// forward, and no "removing ingress port mapping" warning.
+        #[tokio::test]
+        async fn declared_forwards_left_to_the_host_on_a_vm_host() {
+            let log = crate::test_harness::captured_log();
+            let control = ControlChannel::Vsock { cid: 2, port: 1 };
+            assert!(control.host_unbinds_declared_forwards());
+            let bound = [declared_at("127.0.64.201:18201")];
+
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                release_declared_ingress(&control, &bound),
+            )
+            .await
+            .expect("releasing on a VM host asks nothing of the switch, so it returns at once");
+
+            let logged = log.contents();
+            assert!(
+                logged.lines().any(|line| line
+                    .contains("left the declared ingress forwarder for the host to unbind")
+                    && line.contains("port=18201")),
+                "each declared forward says it was left to the host, got: {logged}"
+            );
+            assert!(
+                !logged
+                    .lines()
+                    .any(|line| line.contains("127.0.64.201:18201")
+                        && line.contains("removing ingress port mapping")),
+                "no retraction was attempted, so none failed, got: {logged}"
+            );
+        }
+
+        /// On a native host the daemon drives the switch directly, so it
+        /// still unbinds a declared forward itself when the box stops.
+        #[tokio::test]
+        async fn declared_forwards_unbound_by_the_daemon_on_a_native_host() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (forwarder, mut asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
+            let control = ControlChannel::Unix(sock);
+            assert!(!control.host_unbinds_declared_forwards());
+
+            release_declared_ingress(&control, &[declared_at("127.0.64.202:18202")]).await;
+            forwarder.abort();
+
+            assert_eq!(
+                asked.recv().await.as_deref(),
+                Some("127.0.64.202:18202"),
+                "the daemon asked the switch to unbind the declared forward"
+            );
         }
     }
 }

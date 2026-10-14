@@ -13,8 +13,9 @@
 //! was pinned by the gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
 //! and is implemented in [`switch`].
 //!
-//! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation with no
-//! reuse), and R1.8 (structured tracing for every switch lifecycle event).
+//! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation, each
+//! address to one live attach at a time, reused only under an allocation epoch
+//! and a quarantine), and R1.8 (structured tracing for every switch lifecycle event).
 
 pub mod answerer;
 pub mod dns;
@@ -55,14 +56,16 @@ pub mod classifier;
 #[cfg(feature = "networking-wg")]
 pub mod wg;
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 // The gvproxy-switch primitives (subnet arithmetic, MAC derivation, wire
 // constants, `-config` rendering) live in the shared `switch` crate.
@@ -110,10 +113,11 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[non_exhaustive]
 pub enum NetError {
     /// The daemon's self-allocation reserve — the sub-run of the plan's PTask
-    /// run it draws task sandboxes and unregistered boxes from — has no
-    /// address left. Explicit, never wrapped: a spent address stays spent.
+    /// run a native daemon draws its task sandboxes and boxes from — has no
+    /// address free: every one is held by a live attach, still inside its
+    /// reuse quarantine, or still named by a live gate row or flow.
     #[error(
-        "the self-allocation reserve on subnet {0} is exhausted; no daemon-side address remains"
+        "the self-allocation reserve on subnet {0} is exhausted; no daemon-side address is free"
     )]
     SubnetExhausted(SwitchSubnet),
     /// The host handed the box a switch address outside the plan's PTask run
@@ -136,8 +140,8 @@ pub enum NetError {
     #[error("handed switch address {address} is already held by a lease (MAC {holder})")]
     HandedAddressCollision { address: Ipv4Addr, holder: MacAddr },
     /// The host handed the box a switch address inside this daemon's
-    /// self-allocation reserve (T66) — the sub-run task sandboxes and
-    /// unregistered boxes draw from. Host and daemon keep disjoint sub-runs
+    /// self-allocation reserve (T66) — the sub-run a native daemon draws
+    /// from. Host and daemon keep disjoint sub-runs
     /// of the plan's PTask run (the daemon's half is [`self_allocation_run`],
     /// the host's mirror `minvmd`'s `box_registry::hand_out_run`), so a
     /// handed address inside the reserve means the two sides disagree about
@@ -151,6 +155,33 @@ pub enum NetError {
         address: Ipv4Addr,
         subnet: SwitchSubnet,
     },
+    /// An attach on a switch the VM host owns asked this daemon to draw an
+    /// address of its own (NET-138): once a control socket exists the host
+    /// registers every box and task address, and the in-VM daemon draws
+    /// nothing. The session predates host registration — its record carries
+    /// no handed address for this attach — and must be re-activated.
+    #[error(
+        "this session predates host registration of its addresses, and the VM host no longer \
+         lets the daemon draw one; destroy the session and re-activate it"
+    )]
+    SelfAllocationRetired,
+    /// Every task address the host registered with the session's box
+    /// (NET-138) is held by a task run still in progress: one task run
+    /// attaches per address at a time.
+    #[error("{slots} task runs already in progress for this session; wait for one to finish")]
+    TaskSlotsBusy { slots: usize },
+    /// A task run on a switch the VM host owns, for a box the host
+    /// registered no task address with (NET-138): task addresses are
+    /// best-effort, and the host files none while its hand-out run is near
+    /// full — or the session predates them. The in-VM daemon draws nothing,
+    /// so the run cannot attach.
+    #[error(
+        "this box has no task addresses on this host (the VM host registers up to {capacity} \
+         per box, and registered none: its address run was nearly full when the box \
+         registered, or the session predates task addresses); destroy the session and \
+         re-activate it once other boxes have been destroyed"
+    )]
+    NoTaskAddresses { capacity: u8 },
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -176,11 +207,16 @@ pub enum NetError {
     Io(#[from] io::Error),
 }
 
-/// One PTask's place on the switch: a never-reused IP and its derived MAC.
+/// One PTask's place on the switch: an IP, its derived MAC, and the
+/// allocation epoch it was handed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtaskLease {
     pub ip: Ipv4Addr,
     pub mac: MacAddr,
+    /// The allocator's hand count when this lease was made. An address
+    /// handed again carries a new epoch, so equality names one hand of an
+    /// address, never the address alone.
+    pub epoch: u64,
 }
 
 /// Returned by [`SwitchClient::attach`].
@@ -198,18 +234,19 @@ pub struct AttachResult {
 /// more, a PTask run holding an odd number of addresses.
 ///
 /// The plan's PTask run is split into two disjoint sub-runs so the two
-/// allocators that draw on it cannot meet: this daemon self-allocates task
-/// sandboxes and unregistered boxes from the lower half, and the VM host
-/// daemon hands registered boxes only from the upper half — the run above
-/// this reserve. The host's half is the same midpoint rule mirrored in
+/// allocators that draw on it cannot meet: a native daemon self-allocates
+/// from the lower half, and the VM host daemon hands registered boxes and
+/// their task addresses only from the upper half — the run above this
+/// reserve. The host's half is the same midpoint rule mirrored in
 /// `minvmd`'s `box_registry::hand_out_run`; one rule, two statements, so
 /// change both together — each side's tests pin the default plan's split
 /// literally.
 ///
-/// This is the interim allocation shape (NET-138): task sandboxes
-/// self-allocate from the reserve until the task registering every live box
-/// host-side retires daemon-side allocation, after which a daemon with a
-/// control socket draws nothing — every own-address box arrives handed.
+/// A daemon whose switch is the VM host's ([`SwitchTransport::HostShuttle`])
+/// draws nothing from it (NET-138): every own-address box arrives handed,
+/// and every task run attaches at a task address registered with its box
+/// ([`SwitchClient::attach_task_slot`]). [`SwitchClient::attach`] refuses
+/// there with [`NetError::SelfAllocationRetired`].
 #[must_use]
 pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
     let first = subnet.first_ptask();
@@ -218,43 +255,83 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
     (first, first + reserve_len - 1)
 }
 
-/// Hands out unique switch addresses, never reusing a drawn one for the
-/// lifetime of the allocator (R1.6).
+/// How long a released drawn address waits before it may be handed again.
+///
+/// It outlasts every record that can still name the address once its
+/// holder is gone: a peer's replied-UDP flow (the relay's UDP flow TTL) and
+/// the Box Egress Proxy leg's neighbour-cache entry, which would otherwise
+/// answer the new holder, wearing the same derived MAC, from the old
+/// holder's entry. Both are asserted below at compile time. Waiting out the
+/// quarantine is necessary but not sufficient: [`IpAllocator`] also skips an
+/// address any live gate row or flow still names.
+///
+/// The value is the switch crate's one quarantine
+/// ([`::switch::SWITCH_ADDRESS_REUSE_QUARANTINE`]), shared with the VM host
+/// daemon's hand-out run, so the two allocators that hand addresses on one
+/// switch never wait out different spans.
+pub const REUSE_QUARANTINE: Duration = ::switch::SWITCH_ADDRESS_REUSE_QUARANTINE;
+
+const _: () = assert!(
+    REUSE_QUARANTINE.as_millis() > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
+    "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
+);
+const _: () = assert!(
+    REUSE_QUARANTINE.as_millis() >= self::switch::UDP_FLOW_TTL.as_millis(),
+    "the reuse quarantine must outlast a replied-UDP flow"
+);
+
+/// Hands out switch addresses, each to one live attach at a time, and
+/// reuses a released drawn one only under an allocation epoch and a
+/// quarantine (R1.6).
 ///
 /// Two allocation shapes: [`Self::allocate`] draws a self-allocation from
 /// the plan run's lower half — the sub-run [`self_allocation_run`] reserves
-/// for this daemon (task sandboxes, unregistered boxes) — and [`Self::hand`]
-/// records the address the VM host daemon handed a registered box, from the
-/// upper half. The two sub-runs are disjoint, so a self-allocation can never
+/// for a native daemon — and [`Self::hand`] records the address the VM host
+/// daemon handed a registered box or one of its task runs, from the upper
+/// half. The two sub-runs are disjoint, so a self-allocation can never
 /// spend a handed address, nor the reverse. A lease's life is its
 /// attachment's, handed or drawn alike: it joins the static-lease table the
 /// switch is configured from when the tap arrives and leaves with the attach
 /// ([`Self::release`], via [`SwitchClient::detach`]), so the table holds only
-/// live taps. The never-reuse rule is carried by the draw cursor, not by the
-/// table — `next` never regresses, so a withdrawn drawn address is never
-/// re-drawn, and it is never handed either (it sits in the reserve, which
-/// [`Self::hand`] refuses). A handed address, by contrast, is the registered
-/// box's — the host-side row is keyed by it — and the same box re-attaching
-/// re-hands it; that re-hand is not a reuse: it is the same row coming back,
-/// and the collision refusal guards only an address an attach still holds.
+/// live taps.
 ///
-/// The interim this shape ships in: task sandboxes self-allocate from the
-/// reserve until the task registering every live box host-side (NET-138)
-/// retires self-allocation, after which no daemon-side draw happens once a
-/// control socket exists — every own-address box arrives handed.
+/// Every lease carries an allocation epoch, a counter that advances at each
+/// hand, so a lease names one hand of its address rather than the address
+/// alone. A release withdraws only the lease whose address *and* epoch it
+/// names: a stale release from an address's previous holder withdraws
+/// nothing of its next one.
+///
+/// A drawn address is reused, never shared. Release returns it to the
+/// reserve's free queue, and [`Self::allocate`] hands it again only when
+/// [`REUSE_QUARANTINE`] has passed since its release **and** no live gate
+/// row or flow still names it. Addresses are handed longest-free first: the
+/// cursor's never-drawn addresses before any released one, then released
+/// ones in release order, so the quarantine is the normal case rather than
+/// the edge. A handed address, by contrast, is the registered box's — the
+/// host-side row is keyed by it — and the same box re-attaching re-hands
+/// it: that re-hand is the same row coming back, and the collision refusal
+/// guards only an address an attach still holds.
+///
+/// Under a VM host no daemon-side draw happens (NET-138): every own-address
+/// box and every task run arrives handed, and [`SwitchClient::attach`]
+/// refuses to reach [`Self::allocate`] on a switch the host owns.
 #[derive(Debug)]
 pub struct IpAllocator {
     subnet: SwitchSubnet,
     /// This daemon's self-allocation reserve, inclusive — both bounds from
     /// [`self_allocation_run`]. `allocate` draws inside it and nothing else.
     reserve: (u32, u32),
-    /// The next host offset to draw for a self-allocation; only ever
-    /// advances, within the reserve.
+    /// The next never-drawn host offset in the reserve; only ever advances.
     next: u32,
-    /// Every address handed out, in allocation order. Doubles as the
-    /// static-lease table written into gvproxy's config, which therefore
-    /// holds only live taps: a lease leaves with its attach
-    /// ([`Self::release`]), handed or drawn alike.
+    /// Released drawn addresses with the instant each was released, oldest
+    /// release first: the order [`Self::allocate`] reuses them in.
+    released: VecDeque<(Ipv4Addr, Instant)>,
+    /// The last allocation epoch handed; the next hand takes one more.
+    epoch: u64,
+    /// Every live lease, in allocation order. Doubles as the static-lease
+    /// table written into gvproxy's config, which therefore holds only live
+    /// taps: a lease leaves with its attach ([`Self::release`]), handed or
+    /// drawn alike.
     leases: Vec<PtaskLease>,
 }
 
@@ -267,6 +344,8 @@ impl IpAllocator {
             next: subnet.first_ptask(),
             reserve: self_allocation_run(subnet),
             subnet,
+            released: VecDeque::new(),
+            epoch: 0,
             leases: Vec::new(),
         }
     }
@@ -287,32 +366,62 @@ impl IpAllocator {
         self.subnet
     }
 
-    /// Allocates the next free address and its derived MAC, drawing from the
-    /// daemon's self-allocation reserve — the plan run's lower half.
+    /// Allocates a free address and its derived MAC under a new epoch,
+    /// drawing from the daemon's self-allocation reserve — the plan run's
+    /// lower half.
     ///
-    /// Addresses are sequential and never reused, even after the PTask
-    /// detaches, so a stale frame from a torn-down PTask can never be
-    /// misdelivered to a freshly-attached one.
+    /// A never-drawn address is taken first, in order. Once the reserve has
+    /// been drawn through, the released address free longest is reused,
+    /// provided [`REUSE_QUARANTINE`] has passed since its release and no
+    /// live gate row or flow on this daemon's relays still names it, so a
+    /// stale frame or flow from a torn-down PTask can never be delivered to
+    /// or admitted for a freshly-attached one.
     ///
     /// # Errors
     ///
-    /// Returns [`NetError::SubnetExhausted`] once the reserve is used up —
-    /// explicitly, with no wrap and no reuse; a spent address stays spent.
+    /// Returns [`NetError::SubnetExhausted`] when no address in the reserve
+    /// is free: every one is held, still quarantined, or still referenced.
     pub fn allocate(&mut self) -> Result<PtaskLease, NetError> {
-        if self.next > self.reserve.1 {
-            return Err(NetError::SubnetExhausted(self.subnet));
-        }
-        let ip = Ipv4Addr::from(self.next);
-        self.next += 1;
+        self.allocate_at(Instant::now(), self::switch::address_referenced)
+    }
+
+    /// [`Self::allocate`] at `now`, with `referenced` saying whether a live
+    /// gate row or flow still names an address — the clock and the check
+    /// injected so the quarantine can be driven without waiting it out.
+    fn allocate_at(
+        &mut self,
+        now: Instant,
+        referenced: impl Fn(Ipv4Addr) -> bool,
+    ) -> Result<PtaskLease, NetError> {
+        let ip = if self.next <= self.reserve.1 {
+            let ip = Ipv4Addr::from(self.next);
+            self.next += 1;
+            ip
+        } else {
+            let reusable = self.released.iter().position(|&(ip, released_at)| {
+                now.saturating_duration_since(released_at) >= REUSE_QUARANTINE && !referenced(ip)
+            });
+            let Some((ip, _)) = reusable.and_then(|at| self.released.remove(at)) else {
+                return Err(NetError::SubnetExhausted(self.subnet));
+            };
+            ip
+        };
+        Ok(self.record(ip))
+    }
+
+    /// Records a lease for `ip` under the next epoch.
+    fn record(&mut self, ip: Ipv4Addr) -> PtaskLease {
+        self.epoch += 1;
         let lease = PtaskLease {
             ip,
             mac: MacAddr::for_switch_ip(ip),
+            epoch: self.epoch,
         };
         self.leases.push(lease);
-        Ok(lease)
+        lease
     }
 
-    /// Every lease handed out so far, oldest first.
+    /// Every live lease, oldest first.
     #[must_use]
     pub fn leases(&self) -> &[PtaskLease] {
         &self.leases
@@ -321,14 +430,12 @@ impl IpAllocator {
     /// Records `ip` as the switch address a registered box attaches at (T66):
     /// the VM host daemon allocated it into its table and handed it back, so
     /// the daemon mints nothing. The lease joins [`Self::leases`] — the
-    /// static-lease table the switch is configured from — and leaves with
-    /// the box's attach ([`Self::release`]), so the same box re-attaching
-    /// re-hands it: the host's persisted row still holds the address, and
-    /// detach never touches that row. A drawn lease ([`Self::allocate`])
-    /// leaves the same way, and its address is never seen again — the draw
-    /// cursor never regresses, and the reserve [`Self::hand`] refuses — so
-    /// the never-reuse rule (R1.6) is carried by the cursor, not by a lease
-    /// the table keeps for a tap that is gone.
+    /// static-lease table the switch is configured from — under a new epoch,
+    /// and leaves with the box's attach ([`Self::release`]), so the same box
+    /// re-attaching re-hands it: the host's persisted row still holds the
+    /// address, and detach never touches that row. A drawn lease
+    /// ([`Self::allocate`]) leaves the same way, and its address is never
+    /// handed here — it sits in the reserve, which this refuses.
     ///
     /// Three refusals, never a share:
     ///
@@ -374,30 +481,41 @@ impl IpAllocator {
                 holder: lease.mac,
             });
         }
-        let lease = PtaskLease {
-            ip,
-            mac: MacAddr::for_switch_ip(ip),
-        };
-        self.leases.push(lease);
-        Ok(lease)
+        Ok(self.record(ip))
     }
 
-    /// Withdraws the lease for `ip`, when the allocator holds one: the
-    /// attachment ended, so the lease ends with it — every attachment's,
-    /// handed or drawn alike. A handed address is free for the same box to
-    /// re-hand on the re-attach an in-process host rebuild or a restart
-    /// produces (T66): the host's persisted row still holds it, and nothing
-    /// here does. A drawn address is never re-drawn — the draw cursor never
-    /// regresses (R1.6), so a stale frame from a torn-down PTask can never be
-    /// misdelivered to a freshly-attached one — and never handed either: it
-    /// sits in the reserve [`Self::hand`] refuses. An address the allocator
-    /// never recorded withdraws nothing.
+    /// Withdraws `lease` — its address at its epoch — when the allocator
+    /// holds it: the attachment ended, so the lease ends with it, handed or
+    /// drawn alike. A lease from an earlier epoch of the same address
+    /// withdraws nothing, so a stale release cannot end the address's
+    /// current holder. A handed address is free for the same box to re-hand
+    /// on the re-attach an in-process host rebuild or a restart produces
+    /// (T66): the host's persisted row still holds it, and nothing here
+    /// does. A drawn address joins the reserve's free queue, to be handed
+    /// again under a new epoch once [`Self::allocate`]'s quarantine and
+    /// reference check both pass.
+    ///
+    /// The caller ends the lease's relay first (see the own-IP guard's
+    /// teardown), so its gate row, flows and admission windows go with it;
+    /// the reference check covers a relay still winding down.
     ///
     /// Returns whether a lease was withdrawn.
-    pub(crate) fn release(&mut self, ip: Ipv4Addr) -> bool {
-        let held = self.leases.iter().any(|lease| lease.ip == ip);
-        self.leases.retain(|lease| lease.ip != ip);
-        held
+    pub(crate) fn release(&mut self, lease: PtaskLease) -> bool {
+        self.release_at(lease, Instant::now())
+    }
+
+    /// [`Self::release`] at `now`, the clock injected as in
+    /// [`Self::allocate_at`].
+    fn release_at(&mut self, lease: PtaskLease, now: Instant) -> bool {
+        let Some(at) = self.leases.iter().position(|held| *held == lease) else {
+            return false;
+        };
+        self.leases.remove(at);
+        let (reserve_first, reserve_last) = self.reserve;
+        if (reserve_first..=reserve_last).contains(&u32::from(lease.ip)) {
+            self.released.push_back((lease.ip, now));
+        }
+        true
     }
 }
 
@@ -439,11 +557,47 @@ pub struct SwitchClient {
     /// DNS names under so two daemons on one host mint distinct ones
     /// (NET-027). Defaults to the single-daemon id `local`.
     host_id: String,
-    /// The port this daemon's hostname proxy listens on, as configured (or
-    /// the documented default when none is pinned): the node address's one
-    /// interim opening in every box's own-address set (design §7.1).
-    /// `None` when no port is known, which leaves the node with no opening.
+    /// The hostname proxy's port this switch's boxes are compiled with, as
+    /// the node address's one interim opening in every box's own-address set
+    /// (design §7.1): built from the configured port (or the documented
+    /// default when none is pinned), then re-pointed to the port the proxy
+    /// actually bound once its startup retry has it serving. `None` when no
+    /// port is known, which leaves the node with no opening.
     hostname_proxy_port: Option<u16>,
+    /// Whether that port is safe to compile a box's opening from: `false`
+    /// from construction until [`Self::set_hostname_proxy_port`] records
+    /// the port the proxy actually bound — the transition
+    /// [`hostname_proxy_serving_port`] waits for — because a seeded default
+    /// is only the bind's *request*, which the OS may relocate when busy
+    /// (NET-025), and a box compiled against it would point its node
+    /// address's opening at whatever unrelated host process holds the
+    /// reselected port (design §7.1). A pinned seed is no exception: it
+    /// never relocates (NET-024), but a busy one is retried while another
+    /// host process holds it, so it too waits for the recorded bind.
+    hostname_proxy_serving: bool,
+    /// Whether a proxy bind is still to come on this host: set by a seeded
+    /// port, and by [`Self::with_hostname_proxy_pending`] for the OS-picks
+    /// `0`, which seeds no port but still binds one. A switch with nothing
+    /// pending (no proxy on this host) answers [`hostname_proxy_serving_port`]
+    /// at once; one with a bind pending waits for it, whether or not a port
+    /// was seeded.
+    hostname_proxy_pending: bool,
+    /// The leases of the attached boxes [`hostname_proxy_serving_port`]
+    /// compiled with no opening because the proxy was still not serving past
+    /// its settle: told in-session at launch, said again with the remedy when
+    /// the serving transition lands ([`Self::set_hostname_proxy_port`] hands
+    /// the count back), and dropped only at detach — the box keeps its
+    /// openingless rules until then, so the transition never clears it, and
+    /// a launch that reads it after the bind still tells its session. A set
+    /// keyed by lease, so one box is counted once and a box that left is not
+    /// counted.
+    hostname_proxy_stranded: std::collections::HashSet<Ipv4Addr>,
+    /// Whether [`Self::attach`] may draw on a [`SwitchTransport::HostShuttle`]
+    /// switch: never in production (NET-138), and only for a test that
+    /// drives the draw path over a shuttle switch without a host to hand it
+    /// addresses ([`Self::allowing_self_allocation`]).
+    #[cfg(test)]
+    allow_self_allocation: bool,
 }
 
 impl SwitchClient {
@@ -474,6 +628,11 @@ impl SwitchClient {
             transport: SwitchTransport::default(),
             host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
             hostname_proxy_port: None,
+            hostname_proxy_serving: false,
+            hostname_proxy_pending: false,
+            hostname_proxy_stranded: std::collections::HashSet::new(),
+            #[cfg(test)]
+            allow_self_allocation: false,
         }
     }
 
@@ -499,6 +658,17 @@ impl SwitchClient {
     #[must_use]
     pub fn with_hostname_proxy_port(mut self, port: Option<u16>) -> Self {
         self.hostname_proxy_port = port;
+        self.hostname_proxy_pending |= port.is_some();
+        self
+    }
+
+    /// Marks a proxy bind as still to come even when no port was seeded —
+    /// the OS-picks `0`, whose port is known only once bound — so a box
+    /// attaching before it waits for the bind like any other, rather than
+    /// taking "no port known" as "no proxy on this host".
+    #[must_use]
+    pub fn with_hostname_proxy_pending(mut self, pending: bool) -> Self {
+        self.hostname_proxy_pending |= pending;
         self
     }
 
@@ -509,6 +679,50 @@ impl SwitchClient {
         self.hostname_proxy_port
     }
 
+    /// The port a box may compile its opening from right now, without
+    /// waiting: the port once the proxy serves on it, `None`
+    /// before then (fail closed, design §7.1).
+    #[must_use]
+    pub fn serving_hostname_proxy_port(&self) -> Option<u16> {
+        self.hostname_proxy_port
+            .filter(|_| self.hostname_proxy_serving)
+    }
+
+    /// Whether a proxy bind is still to come and has not landed: the window
+    /// in which [`Self::serving_hostname_proxy_port`] withholds the port.
+    #[must_use]
+    pub fn hostname_proxy_unsettled(&self) -> bool {
+        self.hostname_proxy_pending && !self.hostname_proxy_serving
+    }
+
+    /// Whether the box on `lease` attached with no node-address opening
+    /// because the proxy was not serving past the settle (see
+    /// [`hostname_proxy_serving_port`]).
+    #[must_use]
+    pub fn hostname_proxy_stranded(&self, lease: Ipv4Addr) -> bool {
+        self.hostname_proxy_stranded.contains(&lease)
+    }
+
+    /// Re-points the port this switch's boxes are compiled with to the port
+    /// the proxy actually bound, called once its startup has bound it and
+    /// spawned its serve loop (see [`crate::net::switch::compiled_egress`]):
+    /// an OS-selected port replaces the configured/default opening the
+    /// switch was built with. This call is also the serving transition: from
+    /// it on, the port is one a box may compile its node address's opening
+    /// from. Returns how many boxes attached openingless before it (see
+    /// [`hostname_proxy_serving_port`]) — on the transition only, so a
+    /// repeat call answers `0` — leaving each box's own marker in place
+    /// until it detaches.
+    pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) -> usize {
+        self.hostname_proxy_port = port;
+        let was_serving = std::mem::replace(&mut self.hostname_proxy_serving, true);
+        if was_serving {
+            0
+        } else {
+            self.hostname_proxy_stranded.len()
+        }
+    }
+
     /// Sets how PTask taps reach the switch. The DM2 default is
     /// [`SwitchTransport::LocalSpawn`]; in a libkrun VM (DM1/3/4) the caller sets
     /// [`SwitchTransport::HostShuttle`] so this `minimald` attaches taps to the
@@ -517,6 +731,27 @@ impl SwitchClient {
     pub fn with_transport(mut self, transport: SwitchTransport) -> Self {
         self.transport = transport;
         self
+    }
+
+    /// Lets [`Self::attach`] draw on a [`SwitchTransport::HostShuttle`]
+    /// switch, for a test of the draw path that has no host to hand it
+    /// addresses. Production has no such switch (NET-138).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn allowing_self_allocation(mut self) -> Self {
+        self.allow_self_allocation = true;
+        self
+    }
+
+    /// Whether this switch may draw an address of its own: only when it
+    /// spawns its own gvproxy, the native shape (NET-102). A switch the VM
+    /// host owns draws nothing (NET-138).
+    fn self_allocates(&self) -> bool {
+        #[cfg(test)]
+        if self.allow_self_allocation {
+            return true;
+        }
+        matches!(self.transport, SwitchTransport::LocalSpawn)
     }
 
     /// How this switch's PTask taps reach the gvproxy switch.
@@ -570,10 +805,20 @@ impl SwitchClient {
     /// fires `true` when gvproxy exits unexpectedly; the caller should tear down
     /// the PTask's tap relay when the signal fires.
     ///
+    /// Only a native switch draws ([`SwitchTransport::LocalSpawn`],
+    /// NET-102). On a switch the VM host owns, every address is the host's
+    /// to hand (NET-138) — a box's at [`Self::attach_handed`], a task
+    /// run's at [`Self::attach_task_slot`] — and a draw is refused.
+    ///
     /// # Errors
     ///
-    /// Propagates config-write, spawn, and socket-readiness failures.
+    /// [`NetError::SelfAllocationRetired`] on a
+    /// [`SwitchTransport::HostShuttle`] switch; propagates config-write,
+    /// spawn, and socket-readiness failures.
     pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
+        if !self.self_allocates() {
+            return Err(NetError::SelfAllocationRetired);
+        }
         let lease = self.allocator.allocate()?;
         // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
         // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
@@ -586,6 +831,7 @@ impl SwitchClient {
         tracing::info!(
             ip = %lease.ip,
             mac = %lease.mac,
+            epoch = lease.epoch,
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch"
         );
@@ -602,18 +848,21 @@ impl SwitchClient {
     /// ([`IpAllocator::hand`]) — and leaves with the attach: [`Self::detach`]
     /// withdraws it, so the same box's re-attach re-hands it. That re-handed
     /// address comes from the host's persisted row — the registration
-    /// allocated it into the host-side table and nothing on the host
-    /// withdraws it — and detach never touches that row: the daemon-side
-    /// lease ends with the attach, the host-side row does not. What this
-    /// daemon cannot yet check is that the address it is handed is still the
-    /// row's for this box: the host-row check by box id — the same address
-    /// for the same box, a refusal on mismatch — lands with the box id in
-    /// the registration (T44, #1660, NET-133), which names it as the gap;
-    /// until then this daemon attaches with whatever the create request
-    /// carries. A drawn lease, by contrast, is never re-drawn: the draw
-    /// cursor never regresses (the never-reuse rule). Everything else
-    /// matches [`Self::attach`], including the DM2 config/spawn steps
-    /// and the attach count.
+    /// allocated it into the host-side table — and detach never touches that
+    /// row: the daemon-side lease ends with the attach, the host-side row
+    /// does not. The row goes when the box's shuttle connection ends (the
+    /// box's PTask stops) or when its creator withdraws it, so a re-attach
+    /// here after the previous PTask ended finds no row unless the creator
+    /// registers again. What this daemon cannot yet check is that the
+    /// address it is handed is still the row's for this box: the host-row
+    /// check by box id — the same address for the same box, a refusal on
+    /// mismatch — lands with the box id in the registration (T44, #1660,
+    /// NET-133), which names it as the gap; until then this daemon attaches
+    /// with whatever the create request carries. A drawn lease, by
+    /// contrast, is reused only under a new epoch and after the reuse
+    /// quarantine ([`IpAllocator::allocate`]). Everything else matches
+    /// [`Self::attach`], including the DM2 config/spawn steps and the
+    /// attach count.
     ///
     /// # Errors
     ///
@@ -637,11 +886,47 @@ impl SwitchClient {
         tracing::info!(
             ip = %lease.ip,
             mac = %lease.mac,
+            epoch = lease.epoch,
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch at its handed address"
         );
         let exit_signal = self.exit_tx.subscribe();
         Ok(AttachResult { lease, exit_signal })
+    }
+
+    /// Attaches a task run at one of the task addresses the host registered
+    /// with its session's box (NET-138): the first of `slots` no attach
+    /// holds, through [`Self::attach_handed`]. A slot frees when the task
+    /// run that held it detaches, so the session's runs in progress are
+    /// exactly the slots the switch's live leases hold, and no other state
+    /// is kept.
+    ///
+    /// No slots at all is the plain [`Self::attach`] on a native switch,
+    /// which draws; a switch the VM host owns refuses it with
+    /// [`NetError::NoTaskAddresses`] — the session's registration handed
+    /// none (task addresses are best-effort), or it predates them.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::TaskSlotsBusy`] when every slot is held,
+    /// [`NetError::NoTaskAddresses`] as above; otherwise what
+    /// [`Self::attach_handed`] or [`Self::attach`] returns.
+    pub async fn attach_task_slot(&mut self, slots: &[Ipv4Addr]) -> Result<AttachResult, NetError> {
+        if slots.is_empty() {
+            if !self.self_allocates() {
+                return Err(NetError::NoTaskAddresses {
+                    capacity: minimald_rpc::TASK_SLOTS_PER_BOX,
+                });
+            }
+            return self.attach().await;
+        }
+        for &slot in slots {
+            match self.attach_handed(slot).await {
+                Err(NetError::HandedAddressCollision { .. }) => {}
+                attached => return attached,
+            }
+        }
+        Err(NetError::TaskSlotsBusy { slots: slots.len() })
     }
 
     /// Records that a PTask detached, withdrawing its lease with it (T66):
@@ -651,18 +936,27 @@ impl SwitchClient {
     /// address is the registered box's, keyed by the host-side row, so once
     /// the box's attach ends the same box re-attaching re-hands it — the
     /// collision refusal then guards only an address an attach still holds.
-    /// A drawn address is never re-drawn: the allocator's draw cursor never
-    /// regresses (R1.6), so the rule holds without the table keeping a lease
-    /// for a tap that is gone; see [`IpAllocator::release`]. When the last
-    /// one leaves, the switch is stopped.
+    /// A drawn address goes back to the reserve's free queue, handed again
+    /// only under a new epoch, after the reuse quarantine, and once nothing
+    /// still names it (R1.6); see [`IpAllocator::release`]. A lease from an
+    /// earlier epoch than the address's current one releases nothing. When
+    /// the last one leaves, the switch is stopped.
     ///
     /// # Errors
     ///
     /// Propagates teardown failures from [`stop`](Self::stop).
-    pub async fn detach(&mut self, released: Ipv4Addr) -> Result<(), NetError> {
+    pub async fn detach(&mut self, released: PtaskLease) -> Result<(), NetError> {
         self.attached = self.attached.saturating_sub(1);
         if self.allocator.release(released) {
-            tracing::debug!(ip = %released, "released the lease with the attach");
+            // The box on that lease is gone: it no longer needs a restart to
+            // reach the hostname proxy, and a later box may take the address.
+            // A stale lease ends nothing, so it leaves the new holder's mark.
+            self.hostname_proxy_stranded.remove(&released.ip);
+            tracing::debug!(
+                ip = %released.ip,
+                epoch = released.epoch,
+                "released the lease with the attach"
+            );
         }
         tracing::info!(attached = self.attached, "detached OwnIp PTask from switch");
         if self.attached == 0 {
@@ -844,6 +1138,82 @@ impl SwitchClient {
     }
 }
 
+/// How long [`hostname_proxy_serving_port`] waits for the serving
+/// transition before failing closed, and how often it re-checks while it
+/// waits. A settle, not a wait: the transition normally lands within
+/// milliseconds of an attach, and a proxy still unserving past it is one
+/// whose startup retry is backing off over a port some other process holds
+/// (NET-021) — at which point a box compiled against the seeded port would
+/// point its opening at whatever unrelated host process holds the port the
+/// OS reselected, which is exactly what failing closed (design §7.1: no
+/// opening) is the safe answer to.
+const HOSTNAME_PROXY_SERVE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const HOSTNAME_PROXY_SERVE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The hostname proxy's port for a box's own-address set (design §7.1):
+/// the port the proxy actually bound, once its startup has it bound — not
+/// the configured/default port the switch was seeded with, which is only the
+/// bind's request and may have been relocated by the OS when busy
+/// (NET-025). Bounded-waits for that transition, then fails closed: `None`
+/// past [`HOSTNAME_PROXY_SERVE_WAIT`]. A switch with no bind pending (no
+/// proxy on this host) answers at once. Called on the attach path — where a
+/// box may arrive while the proxy's detached startup driver is still
+/// retrying — so no box can compile a node-address opening against a port
+/// that is not yet the proxy's own.
+///
+/// `stranded` is the lease of the box whose relay opening this resolves:
+/// failing closed for it records the box as stranded (and warns), so its
+/// launch can say so in-session and the serving transition can name it
+/// with the remedy. `None` is a lookup that compiles no box's opening — a
+/// caller-check registration — which fails closed without counting a box.
+pub(crate) async fn hostname_proxy_serving_port(
+    switch: &Arc<Mutex<SwitchClient>>,
+    stranded: Option<Ipv4Addr>,
+) -> Option<u16> {
+    let deadline = tokio::time::Instant::now() + HOSTNAME_PROXY_SERVE_WAIT;
+    loop {
+        // Untimed on purpose: the deadline bounds the serving transition, not
+        // contention on the switch mutex. Both callers take this same lock
+        // unbounded immediately before (the `subnet()` read), so timing this
+        // acquisition would not bound the attach, and the fail-closed path
+        // below must hold the lock to record the box stranded. The lock is
+        // dropped before every poll, so a waiter cannot starve the transition
+        // writer (`set_hostname_proxy_port`, from `record_bound`).
+        let mut switch = switch.lock().await;
+        let port = switch.hostname_proxy_port();
+        if !switch.hostname_proxy_unsettled() {
+            return port;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            match stranded {
+                Some(lease) => {
+                    switch.hostname_proxy_stranded.insert(lease);
+                    drop(switch);
+                    tracing::warn!(
+                        ?port,
+                        %lease,
+                        "the hostname proxy is not serving yet; a box attaching now is \
+                         compiled with no node-address opening rather than against \
+                         the port it was seeded with (design §7.1), and cannot reach \
+                         the hostname proxy until it restarts once the proxy serves"
+                    );
+                }
+                None => {
+                    drop(switch);
+                    tracing::debug!(
+                        ?port,
+                        "the hostname proxy is not serving yet; a registration resolved \
+                         now carries no node-address opening (design §7.1)"
+                    );
+                }
+            }
+            return None;
+        }
+        drop(switch);
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,14 +1279,14 @@ mod tests {
     }
 
     #[test]
-    fn allocate_never_reuses_after_logical_release() {
-        // The allocator has no `free`: addresses only ever advance, so even a
-        // long-lived process never hands the same address to two PTasks.
+    fn allocate_never_shares_an_address_between_live_leases() {
+        // Live leases never share an address, and each hand is a new epoch.
         let mut a = IpAllocator::new(SwitchSubnet::default());
-        let one = a.allocate().unwrap().ip;
-        let two = a.allocate().unwrap().ip;
-        let three = a.allocate().unwrap().ip;
-        assert!(one < two && two < three);
+        let one = a.allocate().unwrap();
+        let two = a.allocate().unwrap();
+        let three = a.allocate().unwrap();
+        assert!(one.ip < two.ip && two.ip < three.ip);
+        assert!(one.epoch < two.epoch && two.epoch < three.epoch);
     }
 
     #[test]
@@ -936,7 +1306,7 @@ mod tests {
         // run's ends are the switch crate's, read rather than restated: the
         // run splits at its midpoint, so this daemon's reserve is .2 alone
         // and the host's hand-out run is .3 — exhaustion is explicit on each
-        // side, with no wrap and no reuse.
+        // side while every address is held.
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         let first = Ipv4Addr::from(subnet.first_ptask());
         let last = Ipv4Addr::from(subnet.last_ptask());
@@ -1084,20 +1454,24 @@ mod tests {
         assert_eq!(a.leases().len(), 1);
 
         // A drawn lease leaves the same way — a task sandbox's self-drawn
-        // address ends with its sandbox — and the never-reuse rule (R1.6) is
-        // carried by the cursor, not by the table: the next draw is a higher
-        // address, never the withdrawn one.
+        // address ends with its sandbox — and the next draw takes a
+        // never-drawn address before the withdrawn one (longest free first).
         let task = a.allocate().unwrap();
-        assert!(a.release(task.ip), "the drawn lease is withdrawn");
+        assert!(a.release(task), "the drawn lease is withdrawn");
         assert_eq!(a.leases(), &[lease], "only the handed lease remains");
         let redrawn = a.allocate().unwrap();
         assert_eq!(
             redrawn.ip,
             Ipv4Addr::new(100, 64, 0, 3),
-            "the withdrawn address is never re-drawn"
+            "a never-drawn address goes before the withdrawn one"
         );
-        // An address the allocator never recorded releases nothing.
-        assert!(!a.release(Ipv4Addr::new(100, 64, 200, 1)));
+        // A lease the allocator never recorded releases nothing.
+        let stranger = Ipv4Addr::new(100, 64, 200, 1);
+        assert!(!a.release(PtaskLease {
+            ip: stranger,
+            mac: MacAddr::for_switch_ip(stranger),
+            epoch: 1,
+        }));
         assert_eq!(a.leases().len(), 2);
 
         // A handed address an attach still holds refuses a second hand: the
@@ -1112,7 +1486,7 @@ mod tests {
         // again — the same address, the same derived MAC, the same row the
         // host-side table is keyed by — beside the draw that replaced the
         // withdrawn one.
-        assert!(a.release(handed_ip));
+        assert!(a.release(lease));
         assert_eq!(
             a.leases(),
             &[redrawn],
@@ -1123,6 +1497,7 @@ mod tests {
             .expect("the same box re-attaching re-hands its own address");
         assert_eq!(rehanded.ip, lease.ip);
         assert_eq!(rehanded.mac, lease.mac);
+        assert!(rehanded.epoch > lease.epoch, "the re-hand is a new epoch");
     }
 
     #[test]
@@ -1190,25 +1565,420 @@ mod tests {
         );
     }
 
+    /// A switch the VM host owns, pointed at a gvproxy binary that does not
+    /// exist: `minvmd` owns gvproxy in HostShuttle mode, so nothing here may
+    /// try to spawn it.
+    fn host_shuttle_switch(dir: &std::path::Path) -> SwitchClient {
+        SwitchClient::new("/nonexistent/gvproxy-binary", dir.join("gvproxy")).with_transport(
+            SwitchTransport::HostShuttle {
+                cid: VSOCK_HOST_CID,
+                port: VSOCK_GVPROXY_SHUTTLE_PORT,
+            },
+        )
+    }
+
+    /// The first `n` addresses of the default plan's hand-out run: the
+    /// upper half the VM host hands boxes and task addresses from.
+    fn handed_addresses(n: u32) -> Vec<Ipv4Addr> {
+        let (_, reserve_last) = self_allocation_run(AddressPlan::default().switch_subnet());
+        (1..=n).map(|k| Ipv4Addr::from(reserve_last + k)).collect()
+    }
+
     #[tokio::test]
-    async fn host_shuttle_attach_allocates_without_spawning_gvproxy() {
-        // In HostShuttle mode `minvmd` owns gvproxy, so `attach` must not try to
-        // spawn the (here nonexistent) binary: it allocates a lease and only
-        // tracks the attach count. A LocalSpawn switch pointed at the same
-        // missing binary would instead fail in `ensure_running`.
+    async fn host_shuttle_attach_handed_without_spawning_gvproxy() {
+        // In HostShuttle mode `minvmd` owns gvproxy, so a handed attach must
+        // not try to spawn the (here nonexistent) binary: it records the
+        // lease and only tracks the attach count. A LocalSpawn switch
+        // pointed at the same missing binary would instead fail in
+        // `ensure_running`.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let handed = handed_addresses(1)[0];
+        let result = switch
+            .attach_handed(handed)
+            .await
+            .expect("host-shuttle attach");
+        assert_eq!(result.lease.ip, handed);
+        // No gvproxy child was spawned; detach decrements the count and
+        // withdraws the lease with the attach.
+        switch.detach(result.lease).await.expect("detach");
+    }
+
+    /// NET-138's hard guarantee: on a switch the VM host owns, the daemon
+    /// draws nothing — a draw is refused, telling the user to re-activate,
+    /// and leaves no lease and no attach behind.
+    #[tokio::test]
+    async fn host_shuttle_switch_refuses_self_allocation() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let Err(err) = switch.attach().await else {
+            panic!("a switch the VM host owns draws nothing");
+        };
+        assert!(
+            matches!(err, NetError::SelfAllocationRetired),
+            "refused as retired: {err}"
+        );
+        assert!(
+            err.to_string().contains("re-activate"),
+            "the refusal names the remedy: {err}"
+        );
+        assert!(switch.leases().is_empty(), "nothing was drawn");
+        assert_eq!(switch.attached(), 0);
+        // A task run with no task address on its record draws nothing
+        // either, refused as a box without task addresses on this host.
+        let Err(err) = switch.attach_task_slot(&[]).await else {
+            panic!("a task run with no task address draws nothing either");
+        };
+        assert!(
+            matches!(err, NetError::NoTaskAddresses { capacity: 4 }),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("no task addresses on this host") && message.contains("up to 4"),
+            "the refusal names the box's state and the capacity: {message}"
+        );
+        assert!(switch.leases().is_empty(), "nothing was drawn");
+    }
+
+    /// A native switch keeps self-allocation (NET-102): its draw reaches the
+    /// reserve, and fails only where spawning the (missing) gvproxy does.
+    #[tokio::test]
+    async fn local_spawn_switch_still_self_allocates() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut switch =
-            SwitchClient::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"))
-                .with_transport(SwitchTransport::HostShuttle {
-                    cid: VSOCK_HOST_CID,
-                    port: VSOCK_GVPROXY_SHUTTLE_PORT,
-                });
+            SwitchClient::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"));
+        let err = match switch.attach().await {
+            Ok(_) => panic!("the missing gvproxy binary cannot be spawned"),
+            Err(err) => err,
+        };
+        assert!(
+            !matches!(err, NetError::SelfAllocationRetired),
+            "a native switch is never refused the draw: {err}"
+        );
+        let (reserve_first, _) = self_allocation_run(switch.subnet());
+        assert_eq!(
+            switch.leases().first().map(|lease| lease.ip),
+            Some(Ipv4Addr::from(reserve_first)),
+            "the draw reached the reserve"
+        );
+    }
 
-        let result = switch.attach().await.expect("host-shuttle attach");
-        assert_eq!(result.lease.ip, Ipv4Addr::new(100, 64, 0, 2));
-        // No gvproxy child was spawned; detach decrements the count and
-        // withdraws the lease with the attach — the drawn address stays
-        // spent regardless, the draw cursor never regresses.
-        switch.detach(result.lease.ip).await.expect("detach");
+    /// A task run attaches at a task address registered with its box
+    /// (NET-138): the first one no run holds, and a slot frees when the run
+    /// holding it detaches.
+    #[tokio::test]
+    async fn own_ip_task_attaches_at_a_handed_task_address() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let slots = handed_addresses(2);
+        let first = switch.attach_task_slot(&slots).await.expect("a free slot");
+        assert_eq!(first.lease.ip, slots[0]);
+        let second = switch.attach_task_slot(&slots).await.expect("a free slot");
+        assert_eq!(second.lease.ip, slots[1], "a held slot is skipped");
+        switch.detach(first.lease).await.expect("detach");
+        let again = switch.attach_task_slot(&slots).await.expect("a freed slot");
+        assert_eq!(again.lease.ip, slots[0], "the freed slot is taken again");
+    }
+
+    /// Every task address held: the run is refused with how many are in
+    /// progress, and nothing is drawn in their place.
+    #[tokio::test]
+    async fn own_ip_task_refused_when_no_task_address_free() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let slots = handed_addresses(2);
+        for _ in &slots {
+            switch.attach_task_slot(&slots).await.expect("a free slot");
+        }
+        let Err(err) = switch.attach_task_slot(&slots).await else {
+            panic!("no slot is free");
+        };
+        assert!(matches!(err, NetError::TaskSlotsBusy { slots: 2 }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("2 task runs already in progress for this session"),
+            "{err}"
+        );
+        assert_eq!(switch.leases().len(), 2, "nothing was drawn beside them");
+        assert_eq!(switch.attached(), 2);
+    }
+
+    /// A native daemon's switch: a /24 inside the default /16, whose
+    /// self-allocation reserve is `.2..=.126`.
+    fn native_slash24() -> SwitchSubnet {
+        SwitchSubnet::new(Ipv4Addr::new(100, 64, 37, 0), 24).unwrap()
+    }
+
+    #[test]
+    fn reuse_quarantine_outlasts_the_bep_neighbour_cache() {
+        // A reused address wears the same derived MAC, so the BEP leg's
+        // neighbour cache must have dropped the old holder's entry first.
+        assert!(REUSE_QUARANTINE > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME);
+        assert!(REUSE_QUARANTINE >= Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_thousand_launch_release_cycles_on_a_native_slash24_never_exhaust() {
+        let subnet = native_slash24();
+        let (first, last) = self_allocation_run(subnet);
+        assert_eq!(
+            (Ipv4Addr::from(first), Ipv4Addr::from(last)),
+            (
+                Ipv4Addr::new(100, 64, 37, 2),
+                Ipv4Addr::new(100, 64, 37, 126)
+            ),
+            "125 addresses: the reserve that used to be a lifetime cap"
+        );
+        // One launch every 3 s: the reserve's 125 addresses cover the
+        // 300 s quarantine at any pace slower than one per 2.4 s.
+        let step = Duration::from_secs(3);
+        let mut a = IpAllocator::new(subnet);
+        let mut now = Instant::now();
+        let mut released_at = std::collections::HashMap::new();
+        let mut last_epoch = 0;
+        for cycle in 0..1000 {
+            let lease = a
+                .allocate_at(now, |_| false)
+                .unwrap_or_else(|e| panic!("cycle {cycle} failed: {e}"));
+            assert!(lease.epoch > last_epoch, "every hand is a new epoch");
+            last_epoch = lease.epoch;
+            if let Some(at) = released_at.get(&lease.ip) {
+                assert!(
+                    now.duration_since(*at) >= REUSE_QUARANTINE,
+                    "cycle {cycle} re-handed {} inside the quarantine",
+                    lease.ip
+                );
+            }
+            assert!(a.release_at(lease, now));
+            released_at.insert(lease.ip, now);
+            now += step;
+        }
+        assert!(a.leases().is_empty());
+    }
+
+    #[test]
+    fn a_rehanded_address_carries_a_new_epoch_and_its_old_lease_ends_nothing() {
+        // A /29's reserve is one address, so every draw after the first is
+        // a re-hand of it.
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        let mut a = IpAllocator::new(subnet);
+        let t0 = Instant::now();
+        let old = a.allocate_at(t0, |_| false).unwrap();
+        assert!(a.release_at(old, t0));
+        let new = a.allocate_at(t0 + REUSE_QUARANTINE, |_| false).unwrap();
+        assert_eq!((new.ip, new.mac), (old.ip, old.mac), "the same address");
+        assert!(new.epoch > old.epoch, "under a new epoch");
+        assert_ne!(new, old, "so the two leases are not the same lease");
+        // The old holder's lease admits nothing for the new one: a stale
+        // release ends nothing, and the static-lease table keeps the new
+        // holder's row.
+        assert!(!a.release_at(old, t0 + REUSE_QUARANTINE));
+        assert_eq!(a.leases(), &[new]);
+        assert!(a.release_at(new, t0 + REUSE_QUARANTINE));
+        assert!(a.leases().is_empty());
+    }
+
+    #[test]
+    fn no_rehand_inside_the_quarantine_or_while_referenced() {
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        let mut a = IpAllocator::new(subnet);
+        let t0 = Instant::now();
+        let lease = a.allocate_at(t0, |_| false).unwrap();
+        // Held: nothing to hand.
+        assert!(matches!(
+            a.allocate_at(t0 + REUSE_QUARANTINE, |_| false),
+            Err(NetError::SubnetExhausted(_))
+        ));
+        assert!(a.release_at(lease, t0));
+        // Released, but inside the quarantine.
+        assert!(matches!(
+            a.allocate_at(
+                t0 + REUSE_QUARANTINE.saturating_sub(Duration::from_millis(1)),
+                |_| false
+            ),
+            Err(NetError::SubnetExhausted(_))
+        ));
+        // Past the quarantine, but a live gate row or flow still names it.
+        assert!(matches!(
+            a.allocate_at(t0 + REUSE_QUARANTINE, |ip| ip == lease.ip),
+            Err(NetError::SubnetExhausted(_))
+        ));
+        // Past the quarantine with nothing naming it: handed again.
+        let again = a.allocate_at(t0 + REUSE_QUARANTINE, |_| false).unwrap();
+        assert_eq!(again.ip, lease.ip);
+    }
+
+    #[test]
+    fn released_addresses_are_handed_longest_free_first() {
+        let mut a = IpAllocator::new(native_slash24());
+        let t0 = Instant::now();
+        let drawn: Vec<PtaskLease> =
+            std::iter::from_fn(|| a.allocate_at(t0, |_| false).ok()).collect();
+        assert_eq!(drawn.len(), 125, "the never-drawn addresses go first");
+        // Released out of address order, a second apart.
+        for (offset, index) in [7usize, 3, 5].into_iter().enumerate() {
+            let at = t0 + Duration::from_secs(offset as u64);
+            assert!(a.release_at(drawn[index], at));
+        }
+        let later = t0 + REUSE_QUARANTINE + Duration::from_secs(10);
+        let order: Vec<Ipv4Addr> = (0..3)
+            .map(|_| a.allocate_at(later, |_| false).unwrap().ip)
+            .collect();
+        assert_eq!(order, vec![drawn[7].ip, drawn[3].ip, drawn[5].ip]);
+        // A referenced address is skipped, not waited on: the next free one
+        // in release order goes instead.
+        assert!(a.release_at(drawn[9], later));
+        assert!(a.release_at(drawn[11], later));
+        let skip = drawn[9].ip;
+        let next = a
+            .allocate_at(later + REUSE_QUARANTINE, |ip| ip == skip)
+            .unwrap();
+        assert_eq!(next.ip, drawn[11].ip);
+    }
+
+    /// Design §7.1, the three shapes the attach path can meet: a switch that
+    /// never learned a port answers at once; one whose proxy is not serving
+    /// yet fails closed instead of handing out its seeded request; one whose
+    /// proxy is serving hands over the port actually bound.
+    #[tokio::test(start_paused = true)]
+    async fn serving_port_fails_closed_until_the_proxy_serves() {
+        use std::sync::Arc;
+
+        // No port known: no proxy on this host — answered immediately, not
+        // waited on.
+        let unseeded = Arc::new(tokio::sync::Mutex::new(SwitchClient::new(
+            "/nonexistent/gvproxy-binary",
+            "/run/minimal/gvproxy",
+        )));
+        let lease = Ipv4Addr::new(10, 88, 0, 7);
+        assert_eq!(
+            hostname_proxy_serving_port(&unseeded, Some(lease)).await,
+            None
+        );
+
+        // Seeded but not serving: the seeded port is only the bind's
+        // request, so it must not become a box's opening. Fails closed,
+        // within the wait bound, so an attach cannot hang behind it.
+        let seeded = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            hostname_proxy_serving_port(&seeded, Some(lease)).await,
+            None,
+            "a seeded-but-unserving switch must not hand its seed to a box"
+        );
+        assert!(
+            start.elapsed() >= HOSTNAME_PROXY_SERVE_WAIT,
+            "the fail-closed answer must come from the wait running out, not before"
+        );
+
+        // Serving: the port the proxy actually bound — here a relocation
+        // away from the seed — is the answer, returned at once.
+        let serving = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        serving.lock().await.set_hostname_proxy_port(Some(41913));
+        assert_eq!(
+            hostname_proxy_serving_port(&serving, Some(lease)).await,
+            Some(41913)
+        );
+
+        // The box that failed closed above is counted — once, however many
+        // times its own lookups fail closed, and never for a lookup that
+        // compiles no box's opening (a caller-check registration) — and the
+        // serving transition hands the count back once (for its remedy line),
+        // keeping the box's own marker: it stays openingless until it
+        // detaches, and a launch reading it after the bind still says so.
+        assert!(seeded.lock().await.hostname_proxy_stranded(lease));
+        assert_eq!(
+            hostname_proxy_serving_port(&seeded, Some(lease)).await,
+            None
+        );
+        assert_eq!(hostname_proxy_serving_port(&seeded, None).await, None);
+        assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 1);
+        assert!(seeded.lock().await.hostname_proxy_stranded(lease));
+        assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 0);
+    }
+
+    /// A pinned seed (NET-024) is pending like any other until the bind is
+    /// recorded: it never relocates, but a busy one is retried while another
+    /// host process holds it, so compiling a box's opening from it would let
+    /// the box reach that foreign process (design §7.1). Not yet bound, it
+    /// fails closed past the settle and records the box as stranded; once
+    /// the bind is recorded, it is the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_pinned_seed_waits_for_the_bind_like_any_other() {
+        use std::sync::Arc;
+
+        let lease = Ipv4Addr::new(10, 88, 0, 9);
+        let pinned = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            hostname_proxy_serving_port(&pinned, Some(lease)).await,
+            None,
+            "a pinned seed not yet bound must not become a box's opening"
+        );
+        assert!(start.elapsed() >= HOSTNAME_PROXY_SERVE_WAIT);
+        assert!(pinned.lock().await.hostname_proxy_stranded(lease));
+
+        assert_eq!(pinned.lock().await.set_hostname_proxy_port(Some(7654)), 1);
+        assert_eq!(
+            hostname_proxy_serving_port(&pinned, Some(lease)).await,
+            Some(7654)
+        );
+    }
+
+    /// The race itself: a box that starts attaching while the proxy is
+    /// still unbound waits, and the bind landing mid-wait — relocated off
+    /// the seed — hands it the bound port, never the seed.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_attach_takes_the_port_bound_mid_wait() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let waiter = crate::traced::spawn({
+            let switch = Arc::clone(&switch);
+            async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
+        });
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL * 3).await;
+        assert!(!waiter.is_finished(), "the attach waits for the bind");
+        assert_eq!(switch.lock().await.set_hostname_proxy_port(Some(41913)), 0);
+        assert_eq!(waiter.await.expect("waiter"), Some(41913));
+    }
+
+    /// The same race behind the OS-picks `0`, which seeds no port at all:
+    /// a bind is still pending, so a box attaching before it waits and
+    /// takes the port bound mid-wait, rather than reading "no port known"
+    /// as "no proxy here" and attaching openingless for good.
+    #[tokio::test(start_paused = true)]
+    async fn an_os_picked_port_is_waited_for_not_read_as_no_proxy() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(None)
+                .with_hostname_proxy_pending(true),
+        ));
+        let waiter = crate::traced::spawn({
+            let switch = Arc::clone(&switch);
+            async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
+        });
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL * 3).await;
+        assert!(
+            !waiter.is_finished(),
+            "the attach waits for the OS-picked bind"
+        );
+        assert_eq!(switch.lock().await.set_hostname_proxy_port(Some(41915)), 0);
+        assert_eq!(waiter.await.expect("waiter"), Some(41915));
     }
 }

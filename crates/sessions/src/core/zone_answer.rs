@@ -61,6 +61,27 @@ pub const ANSWER_TTL_SECS: u32 = 15;
 /// past NET-126's bound fails the build rather than a test run.
 const _: () = assert!(ANSWER_TTL_SECS <= 15);
 
+/// The label of the host's node row (NET-003): the row the switch and
+/// the DNS gate resolve for the host itself, whose zone name is
+/// [`HOST_ROW_NAME`]. The store's reserved session names include this
+/// label, so a session cannot take the host row's name.
+pub const HOST_ROW_LABEL: &str = "host";
+
+/// The zone name of the host's node row (NET-003): the label under
+/// [`ZONE_APEX`] that the switch resolves for the host itself. The
+/// switch reads its spelling here rather than keeping a second one.
+pub const HOST_ROW_NAME: &str = "host.min.internal";
+
+/// The label of the managed-node row the box registry keys its node
+/// zones under. The store's reserved session names include this label,
+/// so a session cannot take a node's name.
+pub const NODE_ROW_LABEL: &str = "minimald";
+
+/// Every node-row label the zone defines. A new node row's label goes
+/// here; the store's tests read this list, so a label added without a
+/// matching reserved session name fails them.
+pub const NODE_ROW_LABELS: [&str; 2] = [HOST_ROW_LABEL, NODE_ROW_LABEL];
+
 /// The record type of one lookup, as the decision classifies it: A is the
 /// only type the zone answers with data, and every other type — AAAA,
 /// TXT, SRV, anything a resolver asks besides A — is NODATA on a held
@@ -283,8 +304,8 @@ fn in_zone(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Lookup, Origin, RecordType, Verdict, ZONE_APEX, ZoneRow, ZoneView, decide, in_zone,
-        normalize,
+        HOST_ROW_LABEL, HOST_ROW_NAME, Lookup, NODE_ROW_LABEL, Origin, RecordType, Verdict,
+        ZONE_APEX, ZoneRow, ZoneView, decide, in_zone, normalize,
     };
 
     /// An A lookup for `name` from this machine.
@@ -486,6 +507,25 @@ mod tests {
             decide(&a_lookup("WEB.min.internal"), &view),
             Verdict::Nodata,
             "the held name answers under any case the lookup arrives in"
+        );
+    }
+
+    /// The node-row names are the labels under the apex: the host row's
+    /// zone name is its label suffixed with the apex, and the managed
+    /// node's label under the apex spells the name the box registry
+    /// keys its node zones under. A label that outgrows this shape
+    /// stops matching the registries that consume it.
+    #[test]
+    fn node_row_names_are_labels_under_the_apex() {
+        assert_eq!(
+            HOST_ROW_NAME,
+            format!("{HOST_ROW_LABEL}.{ZONE_APEX}"),
+            "the host row's zone name is its label under the apex"
+        );
+        assert_eq!(
+            format!("{NODE_ROW_LABEL}.{ZONE_APEX}"),
+            "minimald.min.internal",
+            "the managed node's label under the apex spells its zone name"
         );
     }
 }

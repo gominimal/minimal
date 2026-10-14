@@ -55,7 +55,11 @@ pub struct ProviderView {
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
     pub record: Option<sessions::Record>,
-    pub policy: Option<sessions::SessionPolicy>,
+    pub policy: Option<sessions::EffectiveSessionPolicy>,
+    /// Why the policy could not be fetched, when it could not: a daemon that
+    /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
+    /// says so instead of sitting on "loading policy…".
+    pub policy_error: Option<String>,
 }
 
 /// A modal prompt capturing footer input, if one is open.
@@ -128,6 +132,10 @@ pub enum Msg {
     Created {
         provider: String,
         id: SessionId,
+        /// The daemon's package check stepped aside at finalize.
+        package_check_skipped: bool,
+        /// The deny-all egress default binds the new box (NET-074).
+        egress_deny_all_default: bool,
     },
 }
 
@@ -172,6 +180,11 @@ pub struct Model {
     pub scroll: usize,
     pub filter: FilterState,
     pub details: HashMap<SessionKey, Detail>,
+    /// When each cached detail's policy fetch last failed, so the retry is
+    /// throttled to [`REDISCOVERY_INTERVAL`] instead of riding every 2s
+    /// refresh tick: a daemon that predates `GetEffectiveSessionPolicy`
+    /// refuses it every time.
+    pub policy_failed_at: HashMap<SessionKey, DateTime<Utc>>,
     pub screens: HashMap<SessionKey, ScreenFetch>,
     /// The most recent bell timestamp acknowledged for a session; a bell
     /// newer than this lights the `●` indicator.
@@ -210,6 +223,7 @@ impl Model {
             scroll: 0,
             filter: FilterState::default(),
             details: HashMap::new(),
+            policy_failed_at: HashMap::new(),
             screens: HashMap::new(),
             bells_seen: HashMap::new(),
             action: None,
@@ -484,6 +498,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 })
                 .collect();
             model.details.retain(|k, _| live.contains(k));
+            model.policy_failed_at.retain(|k, _| live.contains(k));
             model.screens.retain(|k, _| live.contains(k));
             model.bells_seen.retain(|k, _| live.contains(k));
             // The cursor may have (re)landed on a session — restore from the
@@ -494,6 +509,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             fetch_focused(model)
         }
         Msg::DetailLoaded(key, detail) => {
+            if detail.policy_error.is_some() {
+                model.policy_failed_at.insert(key.clone(), model.now);
+            } else {
+                model.policy_failed_at.remove(&key);
+            }
             model.details.insert(key, *detail);
             Vec::new()
         }
@@ -508,13 +528,44 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             vec![Effect::Refresh]
         }
-        Msg::Created { provider, id } => {
-            model.status = Some("session created".to_string());
+        Msg::Created {
+            provider,
+            id,
+            package_check_skipped,
+            egress_deny_all_default,
+        } => {
+            model.status = Some(created_status(
+                package_check_skipped,
+                egress_deny_all_default,
+            ));
             model.pending_focus = Some((provider, id));
             vec![Effect::Refresh]
         }
         Msg::Key(key) => update_key(model, key),
     }
+}
+
+/// The status line a create ends with: the package check's warning when it
+/// stepped aside, and the note `min session activate` prints when the
+/// deny-all egress default binds the new box (NET-074) — the dashboard has
+/// no egress fields, so a bare own-address box it creates reaches nothing
+/// outside itself until it is re-created with declared reach.
+fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) -> String {
+    let mut status = "session created".to_string();
+    if package_check_skipped {
+        status.push_str(
+            "; warning: the package check was skipped, so unknown package names will \
+             surface at first exec",
+        );
+    }
+    if egress_deny_all_default {
+        status.push_str(
+            "; egress: deny-all (default for an own-ip box with no egress section); \
+             declare reach with `min session activate --allow-subnets`, \
+             --allow-dns-hosts or --allow-protocols",
+        );
+    }
+    status
 }
 
 fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
@@ -811,8 +862,24 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
     let Some(key) = model.focused() else {
         return Vec::new();
     };
-    if model.details.contains_key(&key) {
-        return Vec::new();
+    // A detail whose policy fetch failed is not an answer: retry it rather
+    // than caching the failure for the session's lifetime, but no sooner
+    // than REDISCOVERY_INTERVAL after the failure — an older daemon refuses
+    // the RPC every time, and the 2s tick would otherwise re-ask forever.
+    if let Some(detail) = model.details.get(&key) {
+        if detail.policy_error.is_none() {
+            return Vec::new();
+        }
+        let retry_due = model.policy_failed_at.get(&key).is_none_or(|&t| {
+            model
+                .now
+                .signed_duration_since(t)
+                .to_std()
+                .is_ok_and(|d| d >= REDISCOVERY_INTERVAL)
+        });
+        if !retry_due {
+            return Vec::new();
+        }
     }
     vec![Effect::FetchDetail(key)]
 }
@@ -901,16 +968,45 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
-                Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
+                Effect::Attach(key) => match providers.iter_mut().find(|p| p.label == key.provider)
+                {
                     Some(p) => {
                         let sock = p.sock.clone();
+                        let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
+                        // The box's row is asked back before the attach
+                        // (NET-138), and the pair it was registered with is
+                        // read: a Delete at the shell-exit prompt leaves no
+                        // record to read it from after.
+                        let box_addresses = match box_name {
+                            Some(_) => {
+                                rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
+                            }
+                            None => Ok(None),
+                        };
+                        // A VM host that cannot be reached fails the attach
+                        // closed (#1790), with the CLI's message.
+                        let box_addresses = match box_addresses {
+                            Ok(box_addresses) => box_addresses,
+                            Err(error) => {
+                                model.status = Some(format!("error: {error:#}"));
+                                continue;
+                            }
+                        };
                         attach_and_resume(
                             &mut terminal,
                             &sock,
                             key.id,
+                            box_name.as_deref(),
                             opts.config_dir.as_deref(),
                             &mut model,
                         );
+                        // The attach may have ended in the shell-exit
+                        // prompt's Delete: withdraw the box's row, or
+                        // release a `host_ip` box's hold.
+                        if let Some(name) = box_name.as_deref() {
+                            rpc::release_held_name_after_attach(p, key.id, name, box_addresses)
+                                .await;
+                        }
                         inbox.push_back(Msg::Tick);
                     }
                     None => {
@@ -950,7 +1046,16 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             }
                             .await;
                             let msg = match result {
-                                Ok(id) => Msg::Created { provider, id },
+                                Ok(rpc::Activated {
+                                    id,
+                                    package_check_skipped,
+                                    egress_deny_all_default,
+                                }) => Msg::Created {
+                                    provider,
+                                    id,
+                                    package_check_skipped,
+                                    egress_deny_all_default,
+                                },
                                 Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
                             };
                             let _ = tx.send(msg).await;
@@ -1042,7 +1147,18 @@ async fn exec_effect(
             let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
             match rpc::fetch_detail(provider, key.id).await {
                 Ok((record, policy)) => {
-                    Some(Msg::DetailLoaded(key, Box::new(Detail { record, policy })))
+                    let (policy, policy_error) = match policy {
+                        Ok(policy) => (Some(policy), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    Some(Msg::DetailLoaded(
+                        key,
+                        Box::new(Detail {
+                            record,
+                            policy,
+                            policy_error,
+                        }),
+                    ))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "detail fetch failed");
@@ -1087,10 +1203,16 @@ async fn exec_effect(
 /// detaches), then resume. The session-key config is resolved from
 /// `config_dir` so the daemon adopts the user's detach/forward chord; a bad
 /// config is reported in the status bar rather than aborting the TUI.
+///
+/// On a VM-backed daemon the attach subscribes to `box_name`'s pending asks
+/// on the VM host daemon and answers them the way `min session attach`
+/// does (NET-045); the dash's list view never subscribes, so only an attach
+/// counts as an attached client.
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
     id: SessionId,
+    box_name: Option<&str>,
     config_dir: Option<&std::path::Path>,
     model: &mut Model,
 ) {
@@ -1104,7 +1226,13 @@ fn attach_and_resume(
     let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
         .and_then(|cmd| {
             attach_through_relay(terminal, cmd, |cmd| {
-                minimal_client::attach::run_interactive_attach(cmd, None)
+                let host_asks = box_name.and_then(|name| {
+                    minimal_client::attach::HostAsks::subscribe_beside(sock, name)
+                });
+                minimal_client::attach::run_interactive_attach(
+                    cmd,
+                    host_asks.map(minimal_client::attach::HostAsks::into_hook),
+                )
             })
         });
     match result {
@@ -1227,6 +1355,7 @@ mod tests {
             status: sessions::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }
     }
@@ -1256,6 +1385,38 @@ mod tests {
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// NET-074 from the dashboard: a create the deny-all default binds ends
+    /// with the in-force note on the status line, as `min session activate`
+    /// prints it; one it does not bind says only that the session was made.
+    #[test]
+    fn created_status_notes_the_deny_all_default() {
+        let mut model = model_with(Vec::new());
+        update(
+            &mut model,
+            Msg::Created {
+                provider: "host".to_string(),
+                id: id(1),
+                package_check_skipped: false,
+                egress_deny_all_default: true,
+            },
+        );
+        let status = model.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("egress: deny-all (default for an own-ip box with no egress section)"),
+            "{status}"
+        );
+        update(
+            &mut model,
+            Msg::Created {
+                provider: "host".to_string(),
+                id: id(2),
+                package_check_skipped: false,
+                egress_deny_all_default: false,
+            },
+        );
+        assert_eq!(model.status.as_deref(), Some("session created"));
     }
 
     fn two_providers() -> Model {
@@ -1554,6 +1715,37 @@ mod tests {
         update(&mut model, key(KeyCode::Down));
         let effects = update(&mut model, key(KeyCode::Up));
         assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+    }
+
+    #[test]
+    fn a_failed_policy_fetch_is_retried() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        // The policy fetch failed (an older daemon, a transient error): the
+        // failure is shown but not cached as the session's answer.
+        update(
+            &mut model,
+            Msg::DetailLoaded(
+                skey("host", 1),
+                Box::new(Detail {
+                    policy_error: Some("request subsystem failed".to_string()),
+                    ..Detail::default()
+                }),
+            ),
+        );
+        // Not straight away: an older daemon refuses every time, so the
+        // retry waits out REDISCOVERY_INTERVAL rather than riding each tick.
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+        model.now += chrono::Duration::from_std(REDISCOVERY_INTERVAL).unwrap();
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if k.id == id(1)))
+        );
     }
 
     #[test]

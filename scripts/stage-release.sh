@@ -230,7 +230,7 @@ fi
 # scripts/fetch-gvproxy.sh); only the installed name is ours, and
 # `switch::GVPROXY_FILE` is the resolver's matching definition.
 #
-# min-answerer stages as `bin/min-answerer` beside `min` on every platform
+# minzoned stages as `bin/minzoned` beside `min` on every platform
 # that stages `min` — exactly where the session advisory's `answerer_source`
 # looks for it (beside the running `min` first, then PATH). The staged copy is
 # only the COPY SOURCE for NET-122's one privileged step: the advisory's
@@ -239,16 +239,16 @@ fi
 # plist references the user-prefix path, and neither does this table. It
 # carries no lib/ component on any platform: the Linux builds are static musl
 # and the macOS build links only system libraries (the rule
-# scripts/check-answerer-links.sh gates before the binary can leave the build).
+# scripts/check-zoned-links.sh gates before the binary can leave the build).
 #
-# min-answerer is OPTIONAL, with a warning, where every other binary is
+# minzoned is OPTIONAL, with a warning, where every other binary is
 # required: see OPTIONAL_COMPONENTS below.
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
-    "min-answerer|linux|amd64|file|bin/min-answerer|min-answerer-linux-amd64"
+    "minzoned|linux|amd64|file|bin/minzoned|minzoned-linux-amd64"
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|amd64|file|bin/gvproxy-min|gvproxy-linux-amd64"
     "minvmd|linux|amd64|file|bin/minvmd|minvmd-linux-amd64"
@@ -259,7 +259,7 @@ COMPONENTS=(
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
-    "min-answerer|linux|arm64|file|bin/min-answerer|min-answerer-linux-arm64"
+    "minzoned|linux|arm64|file|bin/minzoned|minzoned-linux-arm64"
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|arm64|file|bin/gvproxy-min|gvproxy-linux-arm64"
     "minvmd|linux|arm64|file|bin/minvmd|minvmd-linux-arm64"
@@ -268,7 +268,7 @@ COMPONENTS=(
     "vmlinuz|linux|arm64|file|data/vmlinuz|vmlinuz-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
-    "min-answerer|darwin|arm64|file|bin/min-answerer|min-answerer-macos-arm64"
+    "minzoned|darwin|arm64|file|bin/minzoned|minzoned-macos-arm64"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
@@ -296,14 +296,13 @@ COMPONENTS=(
 )
 
 # Components whose missing artifact warns and is omitted instead of failing
-# the stage. TEMPORARY (gominimal/inbox#899): .github/workflows/release.yml does
-# not build, sign or upload min-answerer yet, and that workflow is frozen, so
-# the patch that adds it waits on a code owner. Until it lands, a release ships
-# no min-answerer and the session advisory names that state ("this release
-# ships no min-answerer; the answerer service step is unavailable") instead of
-# offering the step. Once release.yml uploads the artifact on every platform,
+# the stage. TEMPORARY (gominimal/inbox#899): .github/workflows/release.yml now
+# builds, signs and uploads minzoned on every platform, but a release cut before
+# that change ships no minzoned, and the session advisory names that state
+# ("this release ships no minzoned; the answerer service step is unavailable")
+# instead of offering the step. Once releases with the artifact are the norm,
 # empty this list so a missing answerer fails the stage like any other binary.
-OPTIONAL_COMPONENTS=(min-answerer)
+OPTIONAL_COMPONENTS=(minzoned)
 
 # is_optional <component> — whether a missing artifact for it only warns.
 is_optional() {

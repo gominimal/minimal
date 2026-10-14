@@ -30,13 +30,61 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
-use tokio::sync::mpsc::WeakSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 mod helpers;
+// The per-message span names: a file of its own, because the daemon's refusal guard scans this
+// file's string literals for RPC names (crates/minimal/src/tests.rs) and span names are not refusals.
+mod kind;
 
 pub(crate) use helpers::*;
+
+/// Why this host refuses the unprivileged user namespace every session
+/// sandbox needs, with the fix to run — `None` when nothing is visible.
+///
+/// Probed at failure time rather than reused from the daemon's startup
+/// probe: the sysctls it reads take effect live (the host-setup doc's
+/// `sysctl -w` fix needs no daemon restart), so a startup verdict could
+/// name a restriction already lifted, or miss one set since. The probe is a
+/// handful of `/proc` reads on a path that has already failed.
+#[cfg(target_os = "linux")]
+fn userns_spawn_hint() -> Option<String> {
+    sandbox::user_namespaces_restriction()
+        .map(|r| format!("{r} — fix: {}", crate::userns_restriction_fix(r)))
+}
+
+/// Off Linux no user namespace is involved, so there is nothing to name.
+#[cfg(not(target_os = "linux"))]
+fn userns_spawn_hint() -> Option<String> {
+    None
+}
+
+/// The error a failed host attach surfaces: the bare symptom, plus the
+/// userns diagnosis and fix when there is one (see [`userns_spawn_hint`]).
+/// A host that dies in the launch-to-attach window on a userns-restricted
+/// host (stock Ubuntu 24.04+) otherwise leaves the client with a symptom
+/// that names neither the restriction nor the fix.
+fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
+    with_userns_hint(
+        std::io::Error::other("session host exited before its channel could attach"),
+        userns_spawn_hint,
+    )
+}
+
+/// `err` with the userns diagnosis and fix appended when there is one,
+/// keeping its kind. A launch that fails outright on a userns-restricted
+/// host (an own-ip session wiring the netns of a child that already died on
+/// its `uid_map` write) otherwise reaches the client with the same
+/// cause-less symptom as a host that dies before its attach. The probe
+/// sees the host, not this error, so the hint is labelled the likely cause
+/// and the error's own message stays first.
+fn with_userns_hint(err: std::io::Error, userns_spawn_hint: Option<&str>) -> std::io::Error {
+    match userns_spawn_hint {
+        Some(hint) => std::io::Error::new(err.kind(), format!("{err} — likely cause: {hint}")),
+        None => err,
+    }
+}
 
 /// An error that occurred when attaching to a running session/its-shell.
 #[derive(Debug)]
@@ -64,9 +112,26 @@ pub enum AttachError {
     /// client still owes a patches upload + `FinalizeSession`
     /// before a shell can be minted.
     SessionPending,
+    /// The session's `WorkspaceFilesTarZst` upload is still streaming, so
+    /// the workspace the attach would configure against is incomplete:
+    /// the Draft shortcut would scaffold a default against a half-empty
+    /// tree and later conflict with the uploaded layout. The client
+    /// should retry once the upload has landed.
+    WorkspaceUploadInFlight,
     /// The session host is alive but busy (its mailbox stayed full past the
     /// attach deadline). The client should retry.
     SessionBusy,
+    /// This box carries host-handed addresses (T66), the launch that bound
+    /// its host-side row no longer holds the slot — its loop ended, a later
+    /// launch replaced it, or the daemon restarted — and the VM host daemon
+    /// holds no row for it (NET-138): the row was withdrawn after its detach
+    /// grace and its creator did not resume it. The host gate drops frames
+    /// from an unregistered source, so any host handed out now would be
+    /// "rowless". Only the box's creator registers or resumes a row, and the
+    /// client resumes it before every attach and exec, so the message names
+    /// a re-run as the way forward, and a new activation once the host no
+    /// longer holds the creator's record to resume from.
+    BoxHostRowEnded,
 }
 
 impl std::error::Error for AttachError {
@@ -97,12 +162,24 @@ impl fmt::Display for AttachError {
             ),
             AttachError::SessionPending => write!(
                 f,
-                "session isn't attachable yet (still awaiting either \
-                 SubmitVerdict or FinalizeSession)"
+                "session isn't attachable yet (still being activated; retry \
+                 after the activation finishes)"
+            ),
+            AttachError::WorkspaceUploadInFlight => write!(
+                f,
+                "session is still receiving its workspace upload; retry the \
+                 attach once the upload completes"
             ),
             AttachError::SessionBusy => {
                 write!(f, "session host is busy; retry the attach once it drains")
             }
+            AttachError::BoxHostRowEnded => write!(
+                f,
+                "this box's host-side network registration has ended; run the attach or \
+                 exec again to resume it, and if that is refused too (the host no longer \
+                 holds the box's record), destroy the session with `min session destroy` \
+                 and activate it again with `min session activate`"
+            ),
         }
     }
 }
@@ -125,6 +202,23 @@ pub struct SessionPaths {
     /// exist yet — a session whose hooks are all inline never uploads
     /// anything here.
     pub hooks: DaemonAbsPath,
+}
+
+/// The control channel `switch`'s switch is reached on: its control
+/// socket for a switch this daemon spawned, the host shuttle's vsock port
+/// for the VM host's.
+pub(crate) async fn switch_control_of(
+    switch: &Mutex<crate::net::SwitchClient>,
+) -> crate::net::policy::ControlChannel {
+    let switch = switch.lock().await;
+    match switch.transport() {
+        crate::net::SwitchTransport::LocalSpawn => {
+            crate::net::policy::ControlChannel::Unix(switch.control_socket())
+        }
+        crate::net::SwitchTransport::HostShuttle { cid, port } => {
+            crate::net::policy::ControlChannel::Vsock { cid, port }
+        }
+    }
 }
 
 /// Everything a [`Session`] actor needs at spawn time. Every session actor
@@ -162,18 +256,22 @@ pub(crate) struct SessionConfig {
     /// it so a diagnostics bundle can name the posture without the daemon's
     /// flags.
     pub deny_all_opt_out: bool,
+    /// The liveness of the connection that created this session over
+    /// `CreateSession`, or `None` for a session brought up any other way
+    /// (from disk, or by an in-process caller). See `Session::creator`.
+    pub creator: Option<std::sync::Weak<()>>,
 }
 
 /// The egress *section* the gate compiles for a session: the materialized
-/// form of [`sessions::effective_egress`]'s answer — `None` for the shipped
-/// allow-all, the deny-all section for an absent declaration under the
-/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// form of [`sessions::effective_egress`]'s answer — `None` for the
+/// allow-all default, the deny-all section for an absent declaration under the
+/// in-force default (NET-074), and a declaration with the destination lists
+/// it left absent resolved as that function documents. `phase` is the
 /// rollout phase to resolve under — the launcher and the task path pass
-/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
-/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the posture the
-/// rollout ends at stays proven while the default is only announced
-/// (NET-076). `opt_out` is the daemon's deny-all opt-out (NET-077), threaded
-/// from the server config.
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`sessions::EgressDefaultPhase::InForce`] so the posture they
+/// prove does not hang on that constant. `opt_out` is the daemon's deny-all
+/// opt-out (NET-077), threaded from the server config.
 ///
 /// Shared by the session launcher (the box's own gate) and the task path
 /// ([`crate::exec::task_network`]), so a task runs under the same egress
@@ -194,12 +292,12 @@ pub(crate) fn effective_egress_section(
 /// The policy the gate enforces for a session: its declared ingress, and its
 /// egress resolved to the section [`effective_egress_section`] names — the
 /// deny-all section for an own-address box with no `egress` section once the
-/// default is in force (NET-074), the shipped allow-all for everything an
+/// default is in force (NET-074), the allow-all default for everything an
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
-/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
-/// documents. The declaration on the record is left untouched: the strict
-/// `SessionPolicy` a client reads back stays exactly what the box was
-/// launched with.
+/// with the destination lists it left absent resolved. `phase` resolves
+/// under, exactly as [`effective_egress_section`] documents. The
+/// declaration on the record is left untouched: the strict `SessionPolicy`
+/// a client reads back stays exactly what the box was launched with.
 pub(crate) fn effective_session_policy(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
@@ -313,6 +411,32 @@ const TEARDOWN_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// against a wedge, not a performance budget.
 const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long [`Session::check_composed_packages`] waits for the session
+/// graph to resolve before stepping aside.
+///
+/// Evaluating the graph can clone the upstream repo when the daemon's
+/// cache is cold — network I/O with no bound of its own — and the check
+/// runs inside the `FinalizeSession` round-trip. The deadline on that
+/// round-trip is otherwise the *client's* (`minimal-client`'s 60 s base
+/// plus the activate-hook budget; the dashboard grants only the base),
+/// and a client that expires does not cancel the daemon-side finalize:
+/// the session actor runs on, and may promote the record — running the
+/// activate hooks on the way — while the client, which has already
+/// reported a failed activation and best-effort-destroyed the session,
+/// believes nothing was activated. So the daemon bounds the work it
+/// adds itself: past this deadline the check logs a warning, steps
+/// aside, and reports the skip back to the client. Expiry cancels the
+/// wait, not the evaluation — the detached `spawn_blocking` runs to
+/// completion and warms the cache the launch reads — and finalize
+/// proceeds exactly as it did before the check existed, the launch
+/// resolving names at first exec as it always has.
+///
+/// Half the client's 60 s base: a warm cache evaluates in seconds, well
+/// inside it, and what follows the check in finalize — patch
+/// materialization, and the host mint an activate hook needs — keeps
+/// the other half of the base for itself.
+pub(crate) const PACKAGE_CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// This session's workspace baseline for the shell-exit prompt's change
 /// detection, established once before the first host launches and reused
 /// across every host teardown and rebuild. Re-arming the baseline at each
@@ -385,6 +509,26 @@ const UNATTACHED_WIN_SIZE: WinSize = WinSize {
     ypixel: 0,
 };
 
+/// The rows `min session policy` lists as a box's live ingress (NET-044), by
+/// the runtime surface that published them. Kept apart because the two are
+/// read differently: a runtime expose binds before the box's relay gate
+/// admits its port, so whether its row is reachable is read off the gate's
+/// compile set when served, while a listen publication is admitted at the
+/// gate as its own publish's last step, so its row is reachable as it
+/// stands.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LiveIngressRows {
+    /// The box's own `min net expose` publications, in publish order.
+    pub(crate) exposed: Vec<minimald_rpc::LiveMapping>,
+    /// The listen watcher's publications of in-range listens under `allow`,
+    /// in port order: one per listener still holding its port.
+    pub(crate) listened: Vec<minimald_rpc::LiveMapping>,
+    /// The permitted listening ports the listen watcher left unpublished
+    /// because their audit record could not be written (NET-046), in port
+    /// order — the warnings `min session policy` prints.
+    pub(crate) unaudited_listen_ports: Vec<u16>,
+}
+
 enum SessionMessage {
     GetPaths(oneshot::Sender<SessionPaths>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
@@ -394,6 +538,8 @@ enum SessionMessage {
         String,
         Channel<Msg>,
         ChannelConfig,
+        /// The attaching connection's liveness, see [`Session::creator`].
+        Option<std::sync::Weak<()>>,
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     /// Hand back this session's host, minting one — with no channel bound to
@@ -436,7 +582,7 @@ enum SessionMessage {
     /// patches-ready marker under `<workspace>/patches/`. Idempotent
     /// on an already-`Active` session; refused with `InvalidInput`
     /// on `Pending` (configure the loadout first).
-    Finalize(oneshot::Sender<Result<Vec<minimald_rpc::RanHook>, std::io::Error>>),
+    Finalize(oneshot::Sender<Result<minimald_rpc::FinalizeSessionResponse, std::io::Error>>),
     /// Run this session's `on_detach` hooks, sent by a binding that has
     /// left a session which outlives it. Answered when they have run (or
     /// been skipped), so a departing binding can await them.
@@ -457,7 +603,7 @@ enum SessionMessage {
     Stop(oneshot::Sender<()>),
     /// Full teardown: like [`Stop`](Self::Stop), but also deletes the on-disk
     /// record.
-    Destroy(oneshot::Sender<Result<(), std::io::Error>>),
+    Destroy(oneshot::Sender<Result<Vec<String>, std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
@@ -476,6 +622,18 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Mark one `WorkspaceFilesTarZst` upload into this session as
+    /// started (true) or finished (false), see
+    /// [`Session::workspace_uploads_in_flight`]. The ack fires once the
+    /// actor has applied the change, so a Begin is visible to an attach
+    /// before the upload pulls its first byte. It carries whether the
+    /// change was applied: a Begin is refused unless the session is still
+    /// unconfigured (`Draft { pending: None }`), since an upload comes
+    /// before the configure in the create flow. One already composed and
+    /// awaiting its verdict is refused too: the upload would change the
+    /// tree under a composition already computed. `configure_loadout`
+    /// holds the other side, refusing while any upload is in flight.
+    SetWorkspaceUploadInFlight(bool, oneshot::Sender<bool>),
     /// Register a live direct-tcpip forward relay as belonging to this
     /// session, so teardown takes it down too: a session that goes away
     /// aborts its forwards rather than leaving relays pointing into a box
@@ -511,14 +669,14 @@ enum SessionMessage {
             oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     },
     /// The live dynamic-ingress mappings this box published at runtime
-    /// (NET-044) — what the `GetLiveIngress` RPC serves. Empty for a box that
-    /// published none.
-    LiveIngress(oneshot::Sender<Vec<minimald_rpc::LiveMapping>>),
+    /// (NET-044), by the surface that published them — what the
+    /// `GetLiveIngress` RPC serves. Empty for a box that published none.
+    LiveIngress(oneshot::Sender<LiveIngressRows>),
     /// The attached human's answer to a runtime port-publish ask routed to
     /// them (NET-045), sent by the task [`Session::route_ask`] spawned —
-    /// never by the actor itself, which must not park on a human. `None`
-    /// means nobody was attached to answer, which is the ask's own
-    /// fail-closed case rather than an error to report.
+    /// never by the actor itself, which must not park on a human.
+    /// [`AskEnd::Unanswered`] means nobody was attached to answer, which is
+    /// the ask's own fail-closed case rather than an error to report.
     ///
     /// Carries the ask's [`AskId`], not just its port: two asks can share a
     /// port, and an answer that arrived keyed only by that would pop whichever
@@ -527,7 +685,7 @@ enum SessionMessage {
     AskAnswered {
         id: AskId,
         port: u16,
-        answer: Option<session_host::AskAnswer>,
+        answer: AskEnd,
     },
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
@@ -541,6 +699,24 @@ enum SessionMessage {
     /// deterministically here — without disturbing the lifecycle.
     #[cfg(test)]
     PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
+    /// Test-only inspection: clones of the box's shared runtime ingress cell
+    /// and publication set, the two a spawn's end reaches without going
+    /// through this actor — so a test can end the spawn while the actor is
+    /// mid-turn, the way the spawn's guard does in production.
+    #[cfg(test)]
+    PeekIngressCells(
+        oneshot::Sender<(
+            crate::net::provider::RuntimeIngress,
+            crate::net::listeners::BoxPublications,
+        )>,
+    ),
+    /// Test-only: turn on the finalize package check that test builds leave
+    /// off (see [`Session::check_packages_at_finalize`]), bounded by the
+    /// carried deadline — [`PACKAGE_CHECK_DEADLINE`] for the production
+    /// bound, shorter to exercise the expiry path. Acknowledged once set,
+    /// so a finalize sent after the ack sees it.
+    #[cfg(test)]
+    CheckPackagesAtFinalize(std::time::Duration, oneshot::Sender<()>),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -551,6 +727,95 @@ enum SessionMessage {
 /// that already ended does not pop its neighbour instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AskId(u64);
+
+/// How a routed ask ended (NET-045): the continuation's input, the same
+/// for an ask this daemon's binding rendered and one the VM host daemon
+/// asked the human attached on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AskEnd {
+    /// The attached human answered.
+    Answered(session_host::AskAnswer),
+    /// Nobody answered: on a native host no binding, or a dialog that ended
+    /// without a pick; on a VM-backed host no client attached when the ask
+    /// arrived. The typed nobody-is-attached refusal.
+    Unanswered,
+    /// The host's attached client could not show the prompt: treated as
+    /// the human's no.
+    HostNoTty,
+    /// The VM host daemon cancelled the ask before an answer, by `cause`.
+    HostCancelled(minimald_rpc::AskCancelCause),
+    /// The VM host daemon refused the ask for a reason that is not about
+    /// who is attached: its row's ask queue was full, or the row's grant
+    /// did not admit the ask.
+    HostRefused(minimald_rpc::AskRefused),
+    /// The VM host daemon could not be asked or did not answer the ask.
+    HostUnreachable(String),
+}
+
+/// The binding's answer, or its absence: the native dialog's own ends.
+impl From<Option<session_host::AskAnswer>> for AskEnd {
+    fn from(answer: Option<session_host::AskAnswer>) -> Self {
+        answer.map_or(Self::Unanswered, Self::Answered)
+    }
+}
+
+impl AskEnd {
+    /// The end the VM host daemon's reply names: the human's yes or no as
+    /// the human's answer, the ends nobody answered as unanswered, and the
+    /// host's own refusals as such.
+    fn from_host(outcome: minimald_rpc::AskAdmitOutcome) -> Self {
+        use minimald_rpc::AskRefused;
+        match outcome {
+            minimald_rpc::AskAdmitOutcome::Admitted { .. } => {
+                Self::Answered(session_host::AskAnswer::Allowed)
+            }
+            minimald_rpc::AskAdmitOutcome::Refused { reason, cause, .. } => match reason {
+                AskRefused::Denied => Self::Answered(session_host::AskAnswer::Refused),
+                AskRefused::NoClient => Self::Unanswered,
+                AskRefused::NoTty => Self::HostNoTty,
+                // A cancellation always names its cause; one that does not
+                // is a daemon that predates causes, said as its own stop.
+                AskRefused::Cancelled => Self::HostCancelled(
+                    cause.unwrap_or(minimald_rpc::AskCancelCause::MinvmdStopping),
+                ),
+                AskRefused::QueueFull
+                | AskRefused::NoRow
+                | AskRefused::StanceNotAsk
+                | AskRefused::OutsideGrant => Self::HostRefused(reason),
+            },
+        }
+    }
+}
+
+/// What the expose's failure says when the attached client could not show
+/// the prompt (NET-045): the human's no, by default.
+const HOST_NO_TTY_REASON: &str = "the attached client could not show the prompt; treated as no";
+
+/// A host cancellation as the expose's failure names it.
+fn host_ask_cancel_text(cause: minimald_rpc::AskCancelCause) -> String {
+    match cause {
+        minimald_rpc::AskCancelCause::LastDetach => {
+            format!("the ask was cancelled: {cause}; nobody is attached any more")
+        }
+        _ => format!("the ask was cancelled: {cause}"),
+    }
+}
+
+/// A host refusal as the expose's failure names it.
+fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'static str {
+    match reason {
+        minimald_rpc::AskRefused::QueueFull => "the box's pending-ask queue is full",
+        minimald_rpc::AskRefused::NoRow => "the VM host daemon holds no row for this box",
+        minimald_rpc::AskRefused::StanceNotAsk => "the box's host-held stance is not ask",
+        minimald_rpc::AskRefused::OutsideGrant => {
+            "the port is outside the box's host-held dynamic range"
+        }
+        minimald_rpc::AskRefused::NoClient => "nobody is attached on the host to answer",
+        minimald_rpc::AskRefused::Denied => "the attached human answered no",
+        minimald_rpc::AskRefused::NoTty => "the host client had no terminal for the dialog",
+        minimald_rpc::AskRefused::Cancelled => "the ask was cancelled before an answer",
+    }
+}
 
 /// One runtime port-publish request this box decided `ask`, parked until the
 /// attached human answers the dialog it was routed to (NET-045).
@@ -576,6 +841,11 @@ struct PendingAsk {
     box_name: String,
     /// The caller's reply, answered by whichever way the ask ended.
     reply: oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
+    /// The task holding a VM host daemon ask open, aborted when the session
+    /// answers the ask fail-closed on its way down: the abort closes the
+    /// ask's connection, which the host takes as its withdrawal. `None` for
+    /// an ask this daemon's binding renders.
+    host_ask: Option<tokio::task::AbortHandle>,
 }
 
 /// Manages one session, from the moment its record is allocated: the create
@@ -586,7 +856,7 @@ struct PendingAsk {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Session {
-    receiver: mpsc::Receiver<SessionMessage>,
+    receiver: crate::traced::Receiver<SessionMessage>,
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
     daemon_ctx: Arc<mctx::DaemonContext>,
@@ -680,6 +950,36 @@ pub struct Session {
     /// reason.
     hook_scripts_upload_lock: Arc<Mutex<()>>,
 
+    /// How many `WorkspaceFilesTarZst` uploads are currently streaming into
+    /// the workspace. A count rather than a flag so one upload finishing
+    /// cannot re-admit attaches while another into the same session is
+    /// still unpacking. While non-zero, an attach would run its Draft shortcut
+    /// (`configure_loadout` with an empty contribution) against a
+    /// half-populated tree, scaffolding a default `minimal.toml` that
+    /// conflicts with the layout the upload is about to land — so the
+    /// attach is refused instead, and the client retries once the upload
+    /// completes.
+    workspace_uploads_in_flight: usize,
+
+    /// The liveness of the connection that created this session, while it
+    /// is still open. That connection owns the activation — upload,
+    /// `ConfigureLoadout`, `FinalizeSession` — from `CreateSession` until
+    /// the session leaves `Draft`, so an attach from any other connection
+    /// that finds the session unconfigured while its creator is live is
+    /// refused rather than configured: the Draft shortcut would compose
+    /// against a workspace the creator has not finished uploading (or has
+    /// uploaded but not yet configured), and the creator's own
+    /// `ConfigureLoadout` would then be refused. The creator's own attach
+    /// is let through: it knows where its activation stands. This
+    /// keeps upgrading after the creator's connection closes, until that
+    /// connection's teardown has reaped the sessions it left unfinalized:
+    /// the gate holds over a dying creator's `Draft` until the `Draft` is
+    /// gone, and only then stops upgrading. So the shortcut is
+    /// open to the creator's own connection, and otherwise only for a
+    /// session with no live creator: one restored from disk or created
+    /// in-process (`None`).
+    creator: Option<std::sync::Weak<()>>,
+
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
@@ -697,6 +997,20 @@ pub struct Session {
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
 
+    /// Whether the host in the slot is the launch that bound this box's
+    /// host-side row (NET-138): set by that launch, cleared by every later
+    /// one. In memory only, so a restarted actor starts without it — the
+    /// restart ended the PTask the row was tied to. See
+    /// [`Self::host_row_lost`].
+    slot_holds_row: bool,
+
+    /// Whether the last [`Self::host_row_lost`] read found the binding
+    /// launch's host gone and the VM host daemon's row still standing, so
+    /// the launch that follows rejoins that row. The next attach or exec
+    /// launch takes it and marks its host as holding the row; a hook launch,
+    /// which reads nothing first, drops it.
+    relaunch_row_confirmed: bool,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -708,6 +1022,20 @@ pub struct Session {
     /// finish; every live one is aborted by [`Session::stop_running`], so a
     /// session that goes away takes its forwards down with it (NET-105).
     forwards: Vec<tokio::task::AbortHandle>,
+
+    /// Whether [`Self::finalize`] resolves the composition's package names
+    /// before promoting the record (see [`Self::check_composed_packages`]).
+    /// On in every production build. Off by default under
+    /// `test`/`test-support`, whose sessions run offline and compose names
+    /// (the scaffolded `base`/`vim`, for one) that only an upstream declares;
+    /// a test that wants the check turns it on through
+    /// [`SessionHandle::check_packages_at_finalize`].
+    check_packages_at_finalize: bool,
+
+    /// The bound on [`Self::check_composed_packages`] —
+    /// [`PACKAGE_CHECK_DEADLINE`] in every build; the test-only switch
+    /// above carries a shorter one to drive the expiry path.
+    package_check_deadline: std::time::Duration,
 }
 
 /// Why a session host was launched.
@@ -724,8 +1052,12 @@ enum HostOrigin {
     /// describes a terminal.
     Interactive,
     /// Minted by [`Session::launch_host_for_hooks`] to run lifecycle hooks.
-    /// Nothing of the user's runs in it: activation hooks have completed by
-    /// the time an attach can arrive, so the shell is safe to replace.
+    /// Nothing of the user's runs in it: its shell waits at the launch's
+    /// start gate, before it execs, until an attach releases it (see
+    /// `session_host::Launched::start_gate`), so neither the shell nor its
+    /// startup files have run when an attach arrives, and it is safe to
+    /// replace. A host kept instead ([`replaces_host_for_terminal`]) starts
+    /// its shell at that attach, after the activate hooks.
     Hooks,
     /// Minted by [`Session::ensure_host`] to serve an exec. The command is
     /// live inside that sandbox, so replacing the shell would kill it — this
@@ -734,12 +1066,30 @@ enum HostOrigin {
     Exec,
 }
 
+/// Whether replacing a live host for an attaching terminal is safe for the
+/// box it serves. A [`HostOrigin::Hooks`] host is replaceable — nothing of
+/// the user's runs in it — unless the record holds a registered host-side
+/// row: on a VM-backed host, ending that host's PTask ends the shuttle
+/// connection the row is tied to, and the in-VM daemon cannot re-register
+/// it, so a respawn would strand the box with no row. The guard is the
+/// record's handed `box_addresses`, not a VM check, so any registered box is
+/// kept, native ones included: keeping costs nothing, because the terminal
+/// rides the per-attach environment the host republishes, exactly as it does
+/// for an [`HostOrigin::Exec`] host.
+fn replaces_host_for_terminal(
+    origin: HostOrigin,
+    declares_terminal: bool,
+    holds_host_row: bool,
+) -> bool {
+    origin == HostOrigin::Hooks && declares_terminal && !holds_host_row
+}
+
 impl Session {
     /// Assembles the actor from its seed, mailbox, and initial state. The
     /// caller decides when to enter [`Self::mainloop`].
     fn assemble(
         seed: SessionConfig,
-        receiver: mpsc::Receiver<SessionMessage>,
+        receiver: crate::traced::Receiver<SessionMessage>,
         inner: SessionInner,
         weak_self: WeakSessionHandle,
     ) -> Self {
@@ -751,6 +1101,7 @@ impl Session {
             net_switch,
             manager,
             deny_all_opt_out,
+            creator,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -769,15 +1120,22 @@ impl Session {
             workspace_baseline: WorkspaceBaseline::Unarmed,
             patches_upload_lock: Arc::new(Mutex::new(())),
             hook_scripts_upload_lock: Arc::new(Mutex::new(())),
+            workspace_uploads_in_flight: 0,
+            creator,
             manager,
             weak_self,
             // No host yet; the first launch sets this. `Interactive` is the
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // No host yet, so none holds a row.
+            slot_holds_row: false,
+            relaunch_row_confirmed: false,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
+            check_packages_at_finalize: !cfg!(any(test, feature = "test-support")),
+            package_check_deadline: PACKAGE_CHECK_DEADLINE,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -864,7 +1222,7 @@ impl Session {
             }
         };
 
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = crate::traced::channel(8);
         // One line per session start (NET-074/NET-076/NET-077): the rollout
         // phase this build ships, the daemon's opt-out state, and the
         // effective egress they leave this box with. The declaration
@@ -882,7 +1240,7 @@ impl Session {
             tracing::info!(
                 session = %record.id,
                 name = ?record.name,
-                network = ?record.network,
+                network = %record.network.word(),
                 egress_default_phase = ?sessions::EGRESS_DEFAULT_PHASE,
                 deny_all_opt_out = conf.deny_all_opt_out,
                 effective_egress = ?sessions::effective_egress(
@@ -925,7 +1283,15 @@ impl Session {
         #[cfg(target_os = "linux")]
         actor.register_hostname(obj.record(), false).await;
 
-        tokio::spawn(actor.mainloop());
+        // The actor outlives the message that brought it up (a create, the
+        // resume an RPC naming the box makes): its own root, linked to that
+        // request, so the request's span ends with the request.
+        let root = tracing::info_span!(
+            parent: None,
+            "session.actor",
+            session_id = %actor.record.id(),
+        );
+        crate::traced::spawn_detached(root, actor.mainloop());
         Ok(SessionHandle(sender))
     }
 
@@ -961,17 +1327,60 @@ impl Session {
     /// manager's message handling, a rename — publishes such a hand at the
     /// `127.0.0.1` interim at once, and the present landing moves it.
     #[cfg(target_os = "linux")]
-    async fn register_hostname(&self, record: &Record, wait_for_verdict: bool) {
+    async fn register_hostname(
+        &self,
+        record: &Record,
+        wait_for_verdict: bool,
+    ) -> Vec<crate::net::dns::SharedPortCollision> {
         if !self.owns_hostname_route(record) {
-            return;
+            return Vec::new();
         }
         let name = registry_name(record);
+        // The hostname proxy's port for the box's own-address set (design
+        // §7.1): resolved through the serving transition (see
+        // [`crate::net::hostname_proxy_serving_port`]) so a registration
+        // racing the proxy's detached startup cannot compile the seeded —
+        // possibly relocated (NET-025) — port into the node's opening. Only a
+        // registration that may wait (`wait_for_verdict`) waits for it: the
+        // others run inside the manager's own message handling, where a
+        // wait would park every other session's operation, so they read the
+        // port only if it is already settled and fail closed otherwise. What
+        // that withholds is the caller check's reach to the node address at
+        // the proxy's own port — a proxied request back at the proxy — never
+        // the box's relay opening, which the attach path resolves itself.
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
-        let (subnet, hostname_proxy_port) = {
+        let (subnet, settled_port, unsettled) = {
             let switch = self.net_switch.lock().await;
-            (switch.subnet(), switch.hostname_proxy_port())
+            (
+                switch.subnet(),
+                switch.serving_hostname_proxy_port(),
+                switch.hostname_proxy_unsettled(),
+            )
         };
+        // Only an `OwnIp` box carries the opening: a `HostNet` one never
+        // waits for it. The wait does not count the box as stranded: this
+        // is the caller check's copy, not the box's relay opening, which
+        // the attach path resolves (and counts) itself.
+        let hostname_proxy_port = match record.network {
+            sessions::NetworkMode::OwnIp if wait_for_verdict => {
+                crate::net::hostname_proxy_serving_port(&self.net_switch, None).await
+            }
+            sessions::NetworkMode::OwnIp if unsettled => {
+                // Said, not silent: this registration keeps no opening at
+                // the node address for the caller check until the session
+                // re-registers (a rename, a re-finalize, a restart).
+                tracing::info!(
+                    session = %record.id,
+                    "the hostname proxy is not serving yet; this session's \
+                     caller check is registered with no node-address opening \
+                     (design §7.1)"
+                );
+                settled_port
+            }
+            _ => settled_port,
+        };
+        let mut shared_port_collisions = Vec::new();
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
@@ -1173,10 +1582,19 @@ impl Session {
                 }
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
-                    // also publishes (NET-129): intrinsic to the shared-address
-                    // mode, reported — the session-start report — and never
-                    // translated.
-                    reg.publish_own_address(record.id, &name, address, declared.clone());
+                    // already holds (NET-129): intrinsic to the shared-address
+                    // mode, reported — here at finalize and at every later
+                    // session start, since each re-registers — and never
+                    // translated. First-come: the registry records the
+                    // collisions on this box, the one that yields, so its
+                    // attach skips those forwards instead of failing on a bind
+                    // the forwarder refuses. The box activates and stays
+                    // usable; its other forwards bind as usual. The list rides
+                    // the finalize reply so the activating client can warn —
+                    // the daemon log line is the only other trace, and a user
+                    // reading exit 0 never sees it.
+                    shared_port_collisions =
+                        reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
                 // A box whose grant was withheld registers no name: the
                 // registry's own route is built only from a published
@@ -1206,6 +1624,7 @@ impl Session {
         if matches!(record.network, sessions::NetworkMode::OwnIp) {
             self.report_unrecorded_publishes();
         }
+        shared_port_collisions
     }
 
     /// Resolves a hand to the address the box publishes at (NET-123 §7.1):
@@ -1421,18 +1840,20 @@ impl Session {
     /// the address returns to the host's pool (NET-010) and every later
     /// lookup of the name answers NXDOMAIN (NET-012).
     ///
-    /// A stop is not that: a stopped box still exists — its session record
-    /// survives, and a resume brings the same box back — so `for_good` is
-    /// the destroy paths' alone. A stop withdraws the name's route and
-    /// keeps both halves of the publish, the registry's row and the
-    /// answerer's grant (NET-013: the box's address is its own from
-    /// finalize to destroy, and a stopped box that resumes must find the
-    /// same address waiting, whether the same daemon or a restarted one
-    /// answers — a stop that released the grant would hand the address to
-    /// the next box to finalize and leave the resumed one published
-    /// somewhere else). Shutdown stops every session the same way, which is
-    /// how the grant a restarted daemon re-derives from the answerer's
-    /// record is the very one the box held before the restart.
+    /// `for_good` is the destroy paths' alone; `for_good = false` is the
+    /// rename path, which withdraws the route and re-registers it against
+    /// the same lease. A stop does not come here: a stopped box still
+    /// exists — its session record survives, and a resume brings the same
+    /// box back — so the Stop arm keeps the name's route and both halves of
+    /// the publish, the registry's row and the answerer's grant, and marks
+    /// the box stopped (NET-013: the box's address is its own from finalize
+    /// to destroy, and a stopped box that resumes must find the same
+    /// address waiting, whether the same daemon or a restarted one answers;
+    /// NET-128: the name stays held, answering NODATA while a
+    /// shared-address box is stopped). Shutdown stops every session the
+    /// same way, which is how the grant a restarted daemon re-derives from
+    /// the answerer's record is the very one the box held before the
+    /// restart.
     ///
     /// Gated on [`Self::owns_hostname_route`] rather than relying on the
     /// registry's no-op behavior: the registry is keyed by name alone, so an
@@ -1490,8 +1911,22 @@ impl Session {
     /// instead of deadlocking against a full manager mailbox.
     async fn mainloop(mut self) {
         let mut teardown = Teardown::ManagerInitiated;
-        while let Some(msg) = self.receiver.recv().await {
-            if let ControlFlow::Break(t) = self.handle_message(msg).await {
+        while let Some((msg, caller)) = self.receiver.recv().await {
+            // Opened now, a child of the sender's ids (see
+            // `traced::Receiver::recv`), so compose, graph resolution and
+            // checkouts nest under the RPC that asked for them.
+            let span = tracing::info_span!(
+                parent: None,
+                "session.message",
+                kind = msg.kind(),
+                trace_id = tracing::field::Empty,
+                span_id = tracing::field::Empty,
+                parent_span_id = tracing::field::Empty,
+            );
+            crate::exec::adopt_trace(&span, caller);
+            if let ControlFlow::Break(t) =
+                tracing::Instrument::instrument(self.handle_message(msg), span).await
+            {
                 teardown = t;
                 break;
             }
@@ -1519,9 +1954,9 @@ impl Session {
             SessionMessage::MakeContext(r) => {
                 let _ = r.send(self.context(false).await);
             }
-            SessionMessage::Attach(r, session_hnd, conn_username, channel, config) => {
+            SessionMessage::Attach(r, session_hnd, conn_username, channel, config, attacher) => {
                 let _ = r.send(
-                    self.attach(session_hnd, conn_username, channel, config)
+                    self.attach(session_hnd, conn_username, channel, config, attacher)
                         .await,
                 );
             }
@@ -1543,7 +1978,7 @@ impl Session {
                     // unbounded probe would strand one task per poll against
                     // a host that never answers.
                     let h = h.clone();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = r.send(probe_host(h.get_attrs()).await);
                     });
                 }
@@ -1559,7 +1994,7 @@ impl Session {
                     // commands / a workspace re-walk that can take seconds,
                     // and this actor must stay responsive while they run.
                     let h = h.clone();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = r.send(h.at_risk().await);
                     });
                 }
@@ -1574,7 +2009,7 @@ impl Session {
                     // Off-actor and bounded for the same reasons as
                     // `GetHostAttrs`.
                     let h = h.clone();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = r.send(probe_host(h.get_screen()).await);
                     });
                 }
@@ -1649,15 +2084,42 @@ impl Session {
             }
             SessionMessage::Stop(r) => {
                 self.stop_running(true).await;
-                // NET-013: a stop withdraws the name's route — the stopped
-                // box is not answering for clients — but keeps the grant and
-                // the registry's publish row: the session still exists, a
-                // resume brings the same box back, and its address is its
-                // own until destroy. Releasing here would let the next box
-                // to finalize take the address and leave a resumed box
-                // published somewhere else than before it stopped.
+                // NET-013: a stop keeps the grant and the registry's publish
+                // row — the session still exists, a resume brings the same
+                // box back, and its address is its own until destroy.
+                // NET-128: the name stays held but a shared-address box
+                // answers NODATA while stopped, so the node's own listener
+                // at that port is not spoken for by a dead box. The marker
+                // is cleared on resume when the host starts.
                 #[cfg(target_os = "linux")]
-                self.deregister_hostname(false).await;
+                {
+                    // An unreadable record must not panic the Stop arm, and it
+                    // must not fail open either: the box is stopped whether or
+                    // not its record reads, and a shared-address name left
+                    // answering would let a dead box speak for the node's own
+                    // listener. The marker is keyed by the session id, which
+                    // the actor holds without the record, so when the network
+                    // mode cannot be read the name is marked stopped on the
+                    // `Active` half of the route gate alone.
+                    let owns_route = match self.record.record().await {
+                        Ok(record) => self.owns_hostname_route(&record),
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %self.record.id(),
+                                error = %e,
+                                "reading the session record failed while stopping; \
+                                 marking the box's name stopped by its id",
+                            );
+                            matches!(self.inner, SessionInner::Active { .. })
+                        }
+                    };
+                    if owns_route {
+                        self.hostnames
+                            .write()
+                            .expect("hostname registry lock poisoned")
+                            .mark_stopped(*self.record.id());
+                    }
+                }
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
@@ -1670,11 +2132,23 @@ impl Session {
                 // Before `stop_running`: a destroy hook runs *inside* the
                 // session, so the sandbox it joins has to still exist — or
                 // be minted, which is what this does when the session's
-                // shell has already gone. Failures are logged, never
-                // propagated: a session must stay destroyable whatever its
-                // hooks do.
-                self.run_hooks_headless(crate::hooks::HookEvent::Destroy)
-                    .await;
+                // shell has already gone. Failures are reported back to the
+                // destroying client, never obeyed: a session must stay
+                // destroyable whatever its hooks do.
+                let hook_failures: Vec<String> = self
+                    .run_hooks_headless(crate::hooks::HookEvent::Destroy)
+                    .await
+                    .iter()
+                    .filter(|o| o.failed())
+                    .map(|o| {
+                        let mut line = format!("{}: {}", o.declared_by, o.status);
+                        if !o.output.is_empty() {
+                            line.push('\n');
+                            line.push_str(&o.output);
+                        }
+                        line
+                    })
+                    .collect();
                 self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
@@ -1683,7 +2157,8 @@ impl Session {
                 // its lease fact goes with it.
                 #[cfg(target_os = "linux")]
                 self.deregister_hostname(true).await;
-                let _ = r.send(self.record.clone().delete().await);
+                let deleted = self.record.clone().delete().await;
+                let _ = r.send(deleted.map(|()| hook_failures));
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
             SessionMessage::GetPatchesUploadLock(r) => {
@@ -1691,6 +2166,19 @@ impl Session {
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
+            SessionMessage::SetWorkspaceUploadInFlight(in_flight, r) => {
+                let applied = if !in_flight {
+                    self.workspace_uploads_in_flight =
+                        self.workspace_uploads_in_flight.saturating_sub(1);
+                    true
+                } else if matches!(self.inner, SessionInner::Draft { pending: None }) {
+                    self.workspace_uploads_in_flight += 1;
+                    true
+                } else {
+                    false
+                };
+                let _ = r.send(applied);
             }
             SessionMessage::TrackForward(forward) => {
                 // Prune the ones that have finished on their own, so the
@@ -1763,6 +2251,24 @@ impl Session {
                         .collect(),
                 );
             }
+            #[cfg(test)]
+            SessionMessage::PeekIngressCells(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send((self.live_ingress.clone(), self.publications.clone()));
+            }
+            #[cfg(test)]
+            SessionMessage::CheckPackagesAtFinalize(deadline, r) => {
+                self.check_packages_at_finalize = true;
+                self.package_check_deadline = deadline;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -1802,11 +2308,21 @@ impl Session {
             SessionInner::Draft { pending: Some(_) } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    "session already has a pending contribution awaiting SubmitVerdict; \
+                    "session already has a pending contribution awaiting its verdict; \
                      abort it and create a new session to retry",
                 ));
             }
             SessionInner::Draft { pending: None } => {}
+        }
+        // Composing mid-upload would scaffold and resolve against a
+        // half-populated tree, and the session could then go `Active` with
+        // the upload still streaming into it.
+        if self.workspace_uploads_in_flight > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "session is still receiving its workspace upload; retry once \
+                 the upload completes",
+            ));
         }
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
@@ -1820,31 +2336,38 @@ impl Session {
         //
         // Fenced: the scaffold resolves the default package repo over the
         // network and runs inline on the session actor, so an unfenced call
-        // would pin a worker for the whole fetch. Flavor-guarded because
-        // `block_in_place` panics on a current-thread runtime.
-        let scaffold = || self.scaffold_mfile_if_missing(&workspace_path);
-        match tokio::runtime::Handle::current().runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
-            _ => scaffold(),
-        }
-        .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
-
-        // Phase 1+2: resolve the project and drive the composer. Kept fully
-        // synchronous — its non-`Send` intermediaries must not cross an
-        // `.await`.
-        // A session activated with `--no-hooks` drops the project's
-        // hooks here, the same way the client already dropped its
-        // loadouts' before sending. Both ends honour the flag, so the
-        // composition — and the snapshot persisted from it — records
-        // that the session has no hooks at all, rather than carrying
-        // hooks that every later transition has to remember to skip.
-        let outcome = composables::run_compose(
-            &self.daemon_ctx,
-            &workspace_path,
-            &self.record.record().await?.project_path,
-            contribution,
-            hooks_enabled,
-        )?;
+        // would pin a worker for the whole fetch. The compose shares the
+        // fence: it resolves the graph through the checkouts cache, whose
+        // lock may block for up to the lock timeout, and that wait must not
+        // park a tokio worker. Flavor-guarded because `block_in_place`
+        // panics on a current-thread runtime.
+        let declared_path = self.record.record().await?.project_path;
+        let scaffold_and_compose = || {
+            self.scaffold_mfile_if_missing(&workspace_path)
+                .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
+            // Phase 1+2: resolve the project and drive the composer. Kept
+            // fully synchronous — its non-`Send` intermediaries must not
+            // cross an `.await`; `block_in_place` keeps them on this thread.
+            // A session activated with `--no-hooks` drops the project's
+            // hooks here, the same way the client already dropped its
+            // loadouts' before sending. Both ends honour the flag, so the
+            // composition — and the snapshot persisted from it — records
+            // that the session has no hooks at all, rather than carrying
+            // hooks that every later transition has to remember to skip.
+            composables::run_compose(
+                &self.daemon_ctx,
+                &workspace_path,
+                &declared_path,
+                contribution,
+                hooks_enabled,
+            )
+        };
+        let outcome = match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(scaffold_and_compose)
+            }
+            _ => scaffold_and_compose(),
+        }?;
 
         match outcome {
             // The composition is complete: promote the record
@@ -1965,13 +2488,15 @@ impl Session {
     /// with `WrongState`; refuses `Materializing` sessions without
     /// a patches-ready marker with a "patches upload never
     /// finished" fault.
-    async fn finalize(&mut self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+    async fn finalize(&mut self) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
         let record = self.record.record().await?;
         match record.status {
             SessionStatus::Active => {
                 // Already finalized — retry is a no-op, and its hooks ran
-                // on the finalize that did the work.
-                Ok(Vec::new())
+                // on the finalize that did the work. Like the hooks, a
+                // skipped package check is reported only by that first
+                // finalize; a retry does not re-report it.
+                Ok(minimald_rpc::FinalizeSessionResponse::default())
             }
             SessionStatus::Materializing => {
                 // Guard against a `Materializing` record whose
@@ -2047,7 +2572,7 @@ impl Session {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "patches upload never completed; cannot finalize \
-                             (upload patches, then retry FinalizeSession)",
+                             (upload patches, then retry the activation)",
                         ));
                     }
                 }
@@ -2082,9 +2607,24 @@ impl Session {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "hook-script upload never completed; cannot finalize \
-                             (upload hook scripts, then retry FinalizeSession)",
+                             (upload hook scripts, then retry the activation)",
                         ));
                     }
+                }
+
+                // Every composed package name has to resolve before the
+                // record is promoted: otherwise activate hands back an id
+                // for a session whose first spawn fails with `no such
+                // package`. Refusing here leaves the record unpromoted,
+                // and the client's activate cleanup removes it.
+                let mut package_check_skipped = false;
+                if self.check_packages_at_finalize
+                    && let SessionInner::Active {
+                        composition: Some(comp),
+                        ..
+                    } = &self.inner
+                {
+                    package_check_skipped = self.check_composed_packages(comp).await?;
                 }
 
                 // Materialize the composition's patches into the
@@ -2119,6 +2659,40 @@ impl Session {
                 // with a throwaway sandbox. Gated on there actually
                 // being activate hooks, so a session without them pays
                 // nothing and comes up exactly as before.
+                //
+                // The box's name and publish come first (NET-010/NET-011):
+                // the box's first finalize, the one registration that may
+                // wait for the range verdict (NET-123 §7.1), runs before
+                // the hook launch below, because that launch is the box's
+                // first attach. An own-address box that declared ingress
+                // binds its forwards at the address this registration
+                // publishes, and an attach that finds none fails with "no
+                // published address handed" by design (NET-121) — so a box
+                // with an activate hook and a static ingress could never
+                // activate if the hooks launched first (#2070). The
+                // registration reads only the record's identity, network
+                // mode and policy, which the `Active` write below does not
+                // change. A finalize that fails after this point — an
+                // activate hook that fails, a launch that cannot start, the
+                // record write — leaves the publish standing on a
+                // `Materializing` record, and the client's activate cleanup
+                // destroys the session, whose destroy withdraws the publish,
+                // the name and any grant for good
+                // ([`Self::deregister_hostname`]). A retried finalize
+                // registers again, which is idempotent for one session id.
+                #[cfg(target_os = "linux")]
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = self
+                    .register_hostname(&record, true)
+                    .await
+                    .into_iter()
+                    .map(|c| minimald_rpc::SharedPortCollision {
+                        port: c.port,
+                        held_by: c.other,
+                    })
+                    .collect();
+                #[cfg(not(target_os = "linux"))]
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = Vec::new();
+
                 let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
                 if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
                     self.launch_host_for_hooks(LaunchPhase::Activating).await?;
@@ -2160,14 +2734,18 @@ impl Session {
                     }));
                 }
 
-                let mut record = record;
+                // Re-read rather than reuse the record read above: the
+                // activate-hook launch wrote its own facts to it (the
+                // placement outcome, the host-row binding), and promoting a
+                // stale copy would erase them.
+                let mut record = self.record.record().await?;
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
-                // The box's first finalize: the one registration that may
-                // wait for the range verdict (NET-123 §7.1).
-                #[cfg(target_os = "linux")]
-                self.register_hostname(&record, true).await;
-                Ok(ran)
+                Ok(minimald_rpc::FinalizeSessionResponse {
+                    activate_hooks: ran,
+                    package_check_skipped,
+                    shared_port_collisions,
+                })
             }
             SessionStatus::Pending => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -2338,6 +2916,38 @@ impl Session {
             }
         };
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        // A host-address box is answered before its stance is read: it
+        // shares the host's network, so the port already answers there, and
+        // its record can carry no `dynamic_ingress` (the policy validation
+        // refuses one), so the stance check could only ever deny it — true
+        // of the setting, and wrong about the port. No decision is made, so
+        // nothing is audited (NET-046); the request's one info line says
+        // what became of it.
+        if record.network == sessions::NetworkMode::HostNet {
+            // Where the port answers: the name always; the host's loopback
+            // only natively, since on a VM-backed host the loopback the box
+            // shares is the guest's (NET-129).
+            let host_loopback =
+                !crate::net::listeners::reports_to_vm_host(&self.switch_control().await);
+            let refusal = crate::net::policy::ExposeRefusal::NeedsNoExposing {
+                port,
+                host_loopback,
+            };
+            tracing::info!(
+                name = %box_name,
+                port,
+                network_mode = record.network.word(),
+                outcome = "needs no exposing",
+                reason = %refusal,
+                "dynamic ingress expose"
+            );
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the asker may already be gone; there is nothing to answer then"
+            )]
+            let _ = reply.send(Err(ExposeFailure::Refused(refusal)));
+            return;
+        }
         // The setting the request is evaluated against (NET-043), spelled the
         // way the record carries it: the deny-all default for a box that
         // declared nothing.
@@ -2396,6 +3006,13 @@ impl Session {
     /// fail-closed answer, decided by the daemon, and it goes through the
     /// same continuation ([`Self::resume_ask`]) so every ask ends on the one
     /// path that writes the log line and the audit record (NET-046).
+    ///
+    /// On a VM-backed host the binding renders nothing: the human who
+    /// answers is the one attached on the host, so the ask goes to the VM
+    /// host daemon over the report door ([`crate::net::listeners::report_ask`])
+    /// and its reply is the answer, with no deadline. A yes there was
+    /// recorded in the box's host row, so the publish that follows reports
+    /// nothing again. The native path is unchanged.
     async fn route_ask(
         &mut self,
         record: Record,
@@ -2430,27 +3047,84 @@ impl Session {
                 return;
             }
         };
+        // On a VM-backed host the human who answers is the one attached on
+        // the host, and the VM host daemon asks them (NET-045): this
+        // daemon's binding renders nothing, and the ask crosses the report
+        // door as the row key, the port and the protocol. The row key is
+        // the switch address the host handed the box; a box the host never
+        // handed one holds no row there to ask about.
+        let control = self.switch_control().await;
+        let host_switch_address = if crate::net::listeners::reports_to_vm_host(&control) {
+            let Some(addresses) = record.box_addresses else {
+                self.answer_expose(
+                    &box_name,
+                    port,
+                    sessions::DynamicIngress::Ask,
+                    crate::audit::DecidedBy::Daemon,
+                    Err(crate::net::policy::ExposeFailure::Refused(
+                        crate::net::policy::ExposeRefusal::NotAttached,
+                    )),
+                    reply,
+                )
+                .await;
+                return;
+            };
+            Some(addresses.switch_address)
+        } else {
+            None
+        };
         // Minted before the park, not derived from the port: two asks can
         // share a port, and the continuation below keys on this so each
         // answer reaches the ask it answers however their answers arrive.
         let id = AskId(self.next_ask_id);
         self.next_ask_id += 1;
+        let weak = self.weak_self.clone();
+        let host_ask = match host_switch_address {
+            Some(switch_address) => {
+                let task = crate::traced::spawn(async move {
+                    let end =
+                        match crate::net::listeners::report_ask(&control, switch_address, port)
+                            .await
+                        {
+                            Ok(outcome) => AskEnd::from_host(outcome),
+                            Err(error) => {
+                                tracing::warn!(
+                                    port,
+                                    reason = %error,
+                                    "the VM host daemon did not answer the ask; it fails closed"
+                                );
+                                AskEnd::HostUnreachable(error.to_string())
+                            }
+                        };
+                    if let Some(handle) = weak.upgrade() {
+                        handle.ask_answered(id, port, end).await;
+                    }
+                });
+                Some(task.abort_handle())
+            }
+            None => {
+                crate::traced::spawn(async move {
+                    let answer = host.ask_expose(port).await;
+                    // A session that already went away has already answered
+                    // its pending asks fail-closed (`stop_running`), so a
+                    // handle that will not promote is the normal end of a
+                    // late answer.
+                    if let Some(handle) = weak.upgrade() {
+                        handle.ask_answered(id, port, answer).await;
+                    }
+                });
+                None
+            }
+        };
+        // Parked after the spawn: the continuation arrives through this
+        // actor's own mailbox, which this turn is still holding.
         self.pending_asks.push(PendingAsk {
             id,
             port,
             record,
             box_name,
             reply,
-        });
-        let weak = self.weak_self.clone();
-        tokio::spawn(async move {
-            let answer = host.ask_expose(port).await;
-            // A session that already went away has already answered its
-            // pending asks fail-closed (`stop_running`), so a handle that
-            // will not promote is the normal end of a late answer.
-            if let Some(handle) = weak.upgrade() {
-                handle.ask_answered(id, port, answer).await;
-            }
+            host_ask,
         });
     }
 
@@ -2463,7 +3137,7 @@ impl Session {
     /// publish half against the record the ask was routed with, a deny is the
     /// box's own deny answer in the human's hand, and nobody attached is the
     /// typed nobody-is-attached refusal the request ends with.
-    async fn resume_ask(&mut self, id: AskId, port: u16, answer: Option<session_host::AskAnswer>) {
+    async fn resume_ask(&mut self, id: AskId, port: u16, answer: AskEnd) {
         let Some(position) = self.pending_asks.iter().position(|ask| ask.id == id) else {
             // The ask already ended another way — the session answered it
             // fail-closed on its way down — or the asker went away. Nothing
@@ -2479,27 +3153,51 @@ impl Session {
             return;
         };
         let ask = self.pending_asks.remove(position);
-        let outcome = match answer {
+        let outcome = match &answer {
             // The human said allow: run the publish half. Everything that can
             // still refuse it runs there — a duplicate publish, a missing
             // address pair, a switch that would not bind — so even an
             // allowed ask can end refused, with the switch asked only now
             // (NET-047).
-            Some(session_host::AskAnswer::Allowed) => {
-                self.publish_exposed_port(
-                    &ask.record,
-                    ask.port,
-                    minimald_rpc::PortReportSource::Ask,
-                )
-                .await
+            AskEnd::Answered(session_host::AskAnswer::Allowed) => {
+                let published = self
+                    .publish_exposed_port(
+                        &ask.record,
+                        ask.port,
+                        minimald_rpc::PortReportSource::Ask,
+                    )
+                    .await;
+                // A VM host recorded the yes in the row before the publish
+                // ran, so a publish refused before its bind gives the port
+                // back there, leaving no partial mapping — unless the port
+                // stands published already, whose admission the row's entry
+                // is.
+                if ask.host_ask.is_some()
+                    && let Err(crate::net::policy::ExposeFailure::Refused(refusal)) = &published
+                    && !matches!(
+                        refusal,
+                        crate::net::policy::ExposeRefusal::AlreadyPublished { .. }
+                    )
+                    && let Some(addresses) = ask.record.box_addresses
+                {
+                    let control = self.switch_control().await;
+                    crate::net::listeners::unreport_port(
+                        &control,
+                        addresses.switch_address,
+                        ask.port,
+                        minimald_rpc::PortReportSource::Ask,
+                    )
+                    .await;
+                }
+                published
             }
             // The human said deny — or keyed a cancel (Ctrl-C, `q`, Escape),
             // which means the same thing: the box's own deny answer, now in
             // the human's hand. An input EOF is not this — a client that
             // went away did not answer — so it lands on the `None` below.
-            Some(session_host::AskAnswer::Refused) => {
+            AskEnd::Answered(session_host::AskAnswer::Refused) => {
                 Err(crate::net::policy::ExposeFailure::Refused(
-                    crate::net::policy::ExposeRefusal::DeniedByPolicy,
+                    crate::net::policy::ExposeRefusal::DeniedByHuman,
                 ))
             }
             // Nobody was attached to answer (NET-045's unwanted branch) — no
@@ -2509,20 +3207,57 @@ impl Session {
             // client's channel going away with the dialog standing). The
             // typed refusal, decided by the daemon, because there was no
             // human deciding.
-            None => Err(crate::net::policy::ExposeFailure::Refused(
+            AskEnd::Unanswered => Err(crate::net::policy::ExposeFailure::Refused(
                 crate::net::policy::ExposeRefusal::AskNeedsAnswer,
             )),
+            // The host's attached client could not show the prompt: the
+            // deny an unanswerable dialog defaults to, said as such.
+            AskEnd::HostNoTty => {
+                tracing::info!(
+                    port = ask.port,
+                    reason = HOST_NO_TTY_REASON,
+                    "the VM host daemon's ask ended without a prompt"
+                );
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::AskNoTerminal,
+                ))
+            }
+            // Cancelled at the host before an answer: nothing was recorded
+            // and nothing is published; the cause says why.
+            AskEnd::HostCancelled(cause) => Err(crate::net::policy::ExposeFailure::Publish {
+                port: ask.port,
+                source: std::io::Error::other(host_ask_cancel_text(*cause)),
+            }),
+            // The VM host daemon refused the ask before any human saw it:
+            // nothing was recorded at the host and nothing is published.
+            AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
+                port: ask.port,
+                source: std::io::Error::other(format!(
+                    "the VM host daemon refused the ask: {}",
+                    host_ask_refusal_text(*reason)
+                )),
+            }),
+            AskEnd::HostUnreachable(error) => Err(crate::net::policy::ExposeFailure::Publish {
+                port: ask.port,
+                source: std::io::Error::other(error.clone()),
+            }),
         };
-        let decided_by = match answer {
-            Some(_) => crate::audit::DecidedBy::AttachedHuman,
-            None => crate::audit::DecidedBy::Daemon,
+        let decided_by = match &answer {
+            AskEnd::Answered(_) => crate::audit::DecidedBy::AttachedHuman,
+            AskEnd::Unanswered
+            | AskEnd::HostNoTty
+            | AskEnd::HostCancelled(_)
+            | AskEnd::HostRefused(_)
+            | AskEnd::HostUnreachable(_) => crate::audit::DecidedBy::Daemon,
         };
-        self.answer_expose(
+        let because = matches!(answer, AskEnd::HostNoTty).then_some(HOST_NO_TTY_REASON);
+        self.answer_expose_because(
             &ask.box_name,
             ask.port,
             sessions::DynamicIngress::Ask,
             decided_by,
             outcome,
+            because,
             ask.reply,
         )
         .await;
@@ -2546,6 +3281,82 @@ impl Session {
             Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
         >,
     ) {
+        self.answer_expose_because(box_name, port, decision, decided_by, outcome, None, reply)
+            .await;
+    }
+
+    /// [`Self::answer_expose`], with the audit record's reason said in
+    /// `because`'s words when the refusal's own text would hide why: a
+    /// VM host's no-tty end refuses with the plain deny, and its record
+    /// says the client could not show the prompt.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "answer_expose's arguments plus the one reason override"
+    )]
+    async fn answer_expose_because(
+        &mut self,
+        box_name: &str,
+        port: u16,
+        decision: sessions::DynamicIngress,
+        decided_by: crate::audit::DecidedBy,
+        outcome: Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        because: Option<&'static str>,
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
+        let state_dir = self
+            .minimal_state_dir
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf();
+        // An allow that stands is recorded before anything else is said
+        // about it, and only a recorded one is answered as published
+        // (NET-046): an allow whose record cannot be written is withdrawn and
+        // answered as a failed publish, which the arms below then log and —
+        // best-effort, like every refusal — audit like any other.
+        let (outcome, recorded) = match outcome {
+            Ok(mapping) => {
+                let record = crate::audit::DecisionRecord {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    box_name: box_name.to_string(),
+                    port,
+                    decision,
+                    decided_by,
+                    outcome: crate::audit::DecisionOutcome::Published,
+                    reason: None,
+                };
+                match crate::audit::try_append(&state_dir, &record).await {
+                    Ok(()) => {
+                        // The record is written, so the box's relay gate
+                        // admits the port now, before the caller hears the
+                        // publish (NET-044): an answered publish is
+                        // reachable, never a bound forward the gate
+                        // refuses. Nothing listening yet is answered by the
+                        // box's own kernel with a reset, so no gate state
+                        // waits on a listener, and a listener closing later
+                        // never withdraws this admission — the box's stop
+                        // does. A box with no relay gate (no switch
+                        // attached) has nothing in front of it to admit
+                        // through.
+                        if let Some(gate) = self
+                            .reported_switch_address
+                            .and_then(crate::net::switch::live_gate)
+                        {
+                            gate.admit_exposed(port);
+                        }
+                        (Ok(mapping), true)
+                    }
+                    Err(error) => (
+                        Err(self
+                            .withdraw_unaudited(box_name, port, decision, error)
+                            .await),
+                        false,
+                    ),
+                }
+            }
+            refused => (refused, false),
+        };
         let (audited, reason) = match &outcome {
             Ok(mapping) => {
                 tracing::info!(
@@ -2646,24 +3457,153 @@ impl Session {
                 )
             }
         };
-        crate::audit::append(
-            self.minimal_state_dir.as_utf8_path().as_std_path(),
-            &crate::audit::DecisionRecord {
-                ts: chrono::Utc::now().to_rfc3339(),
-                box_name: box_name.to_string(),
-                port,
-                decision,
-                decided_by,
-                outcome: audited,
-                reason,
-            },
-        )
-        .await;
+        // A refusal is recorded best-effort: it already refused, and a record
+        // that cannot be written must not undo it — that would open the port.
+        if !recorded {
+            let reason = because.map(str::to_string).or(reason);
+            crate::audit::append(
+                &state_dir,
+                &crate::audit::DecisionRecord {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    box_name: box_name.to_string(),
+                    port,
+                    decision,
+                    decided_by,
+                    outcome: audited,
+                    reason,
+                },
+            )
+            .await;
+        }
         #[expect(
             clippy::let_underscore_must_use,
             reason = "the asker may already be gone; there is nothing to answer then"
         )]
         let _ = reply.send(outcome);
+    }
+
+    /// Fails an allow closed whose audit record could not be written
+    /// (NET-046): the publish that stood is withdrawn — the gate's admission
+    /// taken first, then the forward unbound, then the port given back in
+    /// the box's publication set, then the VM host daemon's row withdrawn,
+    /// because the host's gate retracts
+    /// a runtime port only while the row still holds it — and the caller
+    /// hears a failed publish that says why. The warn line is the refusal's
+    /// record of last resort: the audit log that refused the allow may
+    /// refuse the refusal too.
+    ///
+    /// The withdrawal is fallible, and the forward is *retained* until it
+    /// takes: an unexpose the switch refuses leaves a forward standing that
+    /// nothing else names, so taking it out of the set here would leave the
+    /// switch exposing a port whose allow was never recorded and nothing
+    /// able to unexpose it again — the box's stop sweep
+    /// ([`Self::stop_running`]) and the spawn's teardown both draw their
+    /// retries from [`Self::live_ingress`]. The box's publication-set entry
+    /// and the VM host daemon's row entry are held back with it: a row
+    /// withdrawn while its forward still stands leaves the host holding a
+    /// port its retraction rule can no longer reach, so the withdrawal
+    /// follows the unexpose the way it does everywhere else. The one forward
+    /// that cannot be kept is one whose spawn ended mid-unbind: the cell
+    /// refuses it back, so it is unbound once more, best-effort, and the
+    /// port is given back like every detached publish's.
+    async fn withdraw_unaudited(
+        &mut self,
+        box_name: &str,
+        port: u16,
+        decision: sessions::DynamicIngress,
+        error: std::io::Error,
+    ) -> crate::net::policy::ExposeFailure {
+        tracing::warn!(
+            name = %box_name,
+            port,
+            decision = %decision,
+            error = %error,
+            "the dynamic ingress allow could not be audited; the publish is \
+             withdrawn and the request refused"
+        );
+        // The surface the publish reported under: an answered ask was
+        // recorded at the host as one (NET-045), every other allow is the
+        // box's own expose.
+        let source = if decision == sessions::DynamicIngress::Ask {
+            minimald_rpc::PortReportSource::Ask
+        } else {
+            minimald_rpc::PortReportSource::Expose
+        };
+        let control = self.switch_control().await;
+        let live = self.live_ingress.take(port);
+        // The gate refuses the port before the forward comes down (NET-044),
+        // the same order the box's stop takes every publication in. The
+        // publish admits only after its record is written, so an unaudited
+        // allow was never admitted and this is a no-op kept as the
+        // fail-closed backstop: an allow refused cannot be crossed while
+        // its forward unbinds. A relay already gone took its gate with it.
+        if let Some(gate) = self
+            .reported_switch_address
+            .and_then(crate::net::switch::live_gate)
+        {
+            gate.withdraw_exposed(port);
+        }
+        let mut unbound = true;
+        if let Some(mut live) = live {
+            match crate::net::policy::unexpose_forwarder(&control, &live.forwarder).await {
+                // Unbound: the switch holds no forward at its `local` any
+                // more, so the row entry and the publication-set entry go
+                // with it below.
+                Ok(()) => {}
+                Err(unexpose) => {
+                    tracing::warn!(
+                        name = %box_name,
+                        port,
+                        error = %unexpose,
+                        "the unaudited publish's forward could not be unbound; \
+                         it stays recorded for the box's stop to unbind again"
+                    );
+                    unbound = false;
+                    // The forward stays recorded, and the row entry with
+                    // it: the host's gate retracts a runtime port only while
+                    // the row still holds it, so a withdrawal that ran
+                    // first would strand the forward — bound, and
+                    // retractable by nothing. Recorded back, mapping and
+                    // all, rather than never taken, because the sweep that
+                    // would retry the unexpose — [`Self::stop_running`] —
+                    // draws from the same cell. The gate refuses the port,
+                    // so the row it lists reads pending, never reachable:
+                    // `min session policy` must not show a refused port as
+                    // admitted (NET-044).
+                    live.mapping.pending = Some(true);
+                    if let Err(unrecorded) = self.live_ingress.record(live) {
+                        // The spawn ended while this withdrawal was in
+                        // flight, so the cell refuses the record and the
+                        // guard that emptied it cannot unbind this one —
+                        // we still hold it. Best-effort, like every other
+                        // unwind's unexpose; then the port is given back
+                        // below, as every detached publish's is: no sweep
+                        // is left to retry it, so holding the publication
+                        // and the row back would only strand them.
+                        crate::net::policy::remove_ingress(
+                            &control,
+                            std::slice::from_ref(&unrecorded.forwarder),
+                        )
+                        .await;
+                        unbound = true;
+                    }
+                }
+            }
+        }
+        if unbound {
+            self.publications
+                .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
+            if let Some(switch_address) = self.reported_switch_address {
+                crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
+            }
+        }
+        crate::net::policy::ExposeFailure::Publish {
+            port,
+            source: std::io::Error::new(
+                error.kind(),
+                format!("the decision could not be recorded in the audit log: {error}"),
+            ),
+        }
     }
 
     /// The actor's own answer to "is a box running behind this session": an
@@ -2812,9 +3752,17 @@ impl Session {
         // as it always did. Every end below that leaves the port unpublished
         // withdraws the report again once the forward is down — the gate
         // applies a runtime port's retraction only while the row holds it.
-        if let Err(report) =
-            crate::net::listeners::report_admitted_port(&control, switch_address, port, source)
-                .await
+        //
+        // An answered ask is the exception: on a VM-backed host the human's
+        // yes was recorded in the row by the VM host daemon, and the ask's
+        // own reply was the one admit it is consumed by (NET-045), so it is
+        // not reported again — a guest's own admit report under `ask` is
+        // refused by the grant. Its unwinds below still withdraw the port.
+        let host_recorded = source == minimald_rpc::PortReportSource::Ask;
+        if !host_recorded
+            && let Err(report) =
+                crate::net::listeners::report_admitted_port(&control, switch_address, port, source)
+                    .await
         {
             tracing::warn!(
                 session_id = %record.id,
@@ -2870,11 +3818,10 @@ impl Session {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
             proto: sessions::IpProto::Tcp,
-            // A fact about the box's relay gate, not about the bind: the
-            // serving handler fills it on every read, from the gate's
-            // compile set. Stored as `Some(false)` here — never rendered
-            // from the stored cell, and never the unknown `None` that a
-            // reply from a daemon older than the field decodes as.
+            // Never pending: the box's relay gate admits the port in the
+            // same turn the mapping is recorded (NET-044, below). `Some`,
+            // never the unknown `None` that a reply from a daemon older
+            // than the field decodes as.
             pending: Some(false),
         };
         if !self.has_live_host() {
@@ -2928,6 +3875,24 @@ impl Session {
             crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
+        // The publish stands, but the box's relay gate does not admit the
+        // port here: an allow is admitted only once its `Published` record
+        // is written (NET-046), so the admission is
+        // [`Self::answer_expose_because`]'s, made right after the record —
+        // every caller that gets this mapping ends there. Until then the
+        // forward is bound and the gate refuses it, so nothing crosses an
+        // allow the audit log has not taken.
+        //
+        // The gate's sets are keyed by the box's internal port. The answer
+        // admits `port`, and the stop withdraws `forwarder.internal_port()`;
+        // the two agree only because an expose binds the same number on
+        // both sides. A host-port remap would split them and leave the
+        // admission behind, so the assert pins them to the one
+        // internal-port space.
+        debug_assert_eq!(
+            mapping.internal_port, port,
+            "the admitted port must be the forward's internal port, the one the stop withdraws"
+        );
         Ok(mapping)
     }
 
@@ -2935,21 +3900,21 @@ impl Session {
     /// a lock held only for the two sync reads — never across the publish it
     /// feeds.
     async fn switch_control(&self) -> crate::net::policy::ControlChannel {
-        let switch = self.net_switch.lock().await;
-        match switch.transport() {
-            crate::net::SwitchTransport::LocalSpawn => {
-                crate::net::policy::ControlChannel::Unix(switch.control_socket())
-            }
-            crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                crate::net::policy::ControlChannel::Vsock { cid, port }
-            }
-        }
+        switch_control_of(&self.net_switch).await
     }
 
-    /// The live dynamic-ingress mappings, in publish order — the rows
-    /// `min session policy` lists beside the declaration (NET-044).
-    fn live_ingress_snapshot(&self) -> Vec<minimald_rpc::LiveMapping> {
-        self.live_ingress.snapshot()
+    /// The live dynamic-ingress mappings — the rows `min session policy`
+    /// lists beside the declaration (NET-044): the runtime exposes in
+    /// publish order, from the runtime-ingress table that holds their
+    /// forwarders, and the listen watcher's in-range publications in port
+    /// order, from the publication set its watcher commits them to and
+    /// withdraws them from.
+    fn live_ingress_snapshot(&self) -> LiveIngressRows {
+        LiveIngressRows {
+            exposed: self.live_ingress.snapshot(),
+            listened: self.publications.listen_rows(),
+            unaudited_listen_ports: self.publications.audit_refused(),
+        }
     }
 
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
@@ -2984,6 +3949,18 @@ impl Session {
         let forwarders = self.live_ingress.take_all();
         self.publications.revoke_all();
         if !forwarders.is_empty() {
+            // The expose's revocation withdraws its admission at the box's
+            // gate first (NET-044), so no new connection crosses the gap
+            // between a port the gate still admits and a forward that is
+            // coming down. A relay already gone took its gate with it.
+            if let Some(gate) = self
+                .reported_switch_address
+                .and_then(crate::net::switch::live_gate)
+            {
+                for forwarder in &forwarders {
+                    gate.withdraw_exposed(forwarder.internal_port());
+                }
+            }
             let control = self.switch_control().await;
             crate::net::policy::remove_ingress(&control, &forwarders).await;
             // The VM host daemon's row entries go with the forwards (T94,
@@ -3070,6 +4047,9 @@ impl Session {
         // audited like every other (NET-046) — and a late answer from the
         // task the ask routed through finds no ask left to answer.
         for ask in std::mem::take(&mut self.pending_asks) {
+            if let Some(host_ask) = &ask.host_ask {
+                host_ask.abort();
+            }
             self.answer_expose(
                 &ask.box_name,
                 ask.port,
@@ -3167,6 +4147,7 @@ impl Session {
         conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
+        attacher: Option<std::sync::Weak<()>>,
     ) -> Result<(), AttachError> {
         let sz = WinSize::from(match config.pty.as_ref() {
             Some(pty) => pty,
@@ -3256,6 +4237,29 @@ impl Session {
         // reachable for `DestroySession`) and refuse the attach with
         // an actionable error naming the required explicit flow.
         if let SessionInner::Draft { pending: None } = &self.inner {
+            // Refuse the shortcut while the workspace upload is still
+            // streaming: it configures against whatever the tree holds
+            // right now, and mid-upload that is a half-populated workspace
+            // whose scaffolded default would conflict with the layout the
+            // upload is about to land. The client retries once the upload
+            // completes.
+            if self.workspace_uploads_in_flight > 0 {
+                return Err(AttachError::WorkspaceUploadInFlight);
+            }
+            // Refuse it too while the creating connection is live, unless
+            // that connection is the one attaching: it is mid-activation —
+            // before its upload, or after it and before its
+            // `ConfigureLoadout` — and configuring the session from elsewhere
+            // would compose an empty contribution against a workspace it has
+            // not finished with, then refuse the creator's own configure.
+            if self.creator.as_ref().is_some_and(|creator| {
+                creator.strong_count() > 0
+                    && !attacher
+                        .as_ref()
+                        .is_some_and(|attacher| std::sync::Weak::ptr_eq(attacher, creator))
+            }) {
+                return Err(AttachError::SessionPending);
+            }
             // Hooks are forced off on this path regardless of the
             // record. The shortcut composes with no client in the loop,
             // and a project hook needs a client-side policy decision it
@@ -3285,8 +4289,7 @@ impl Session {
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "composition has patches that can only be uploaded via `min session activate` \
-                     (ConfigureLoadout → WorkspacePatchesTarZst → FinalizeSession); \
+                    "composition has patches that only `min session activate` can upload; \
                      the attach shortcut can't drive that sequence — destroy this session \
                      and re-activate through the CLI",
                 )));
@@ -3306,28 +4309,43 @@ impl Session {
         // and materializing without them would produce a broken
         // sandbox rootfs. See [`Session::finalize`] for the
         // transition.
-        {
-            let record = self
-                .record
-                .record()
-                .await
-                .map_err(AttachError::LoadoutFailed)?;
-            if record.status != SessionStatus::Active {
-                return Err(AttachError::SessionPending);
-            }
+        let record = self
+            .record
+            .record()
+            .await
+            .map_err(AttachError::LoadoutFailed)?;
+        if record.status != SessionStatus::Active {
+            return Err(AttachError::SessionPending);
         }
+        // Before any respawn or re-mint below: a registered box whose row is
+        // gone must not be handed a rowless host, whichever way the slot came
+        // to be without its binding launch — the shell exited, a hook run
+        // relaunched over a dead host, or the daemon restarted.
+        if self.host_row_lost(&record).await {
+            return Err(AttachError::BoxHostRowEnded);
+        }
+        let holds_host_row = record.box_addresses.is_some();
 
         // A host minted to run hooks has an environment that describes no
         // terminal, because there was none — and the shell's `environ` cannot
-        // be revised in place. Nothing of the user's is running in it (the
-        // activation hooks it was launched for have completed by the time an
-        // attach can arrive), so replace it with one minted for the terminal
-        // that is actually here. An `Exec`-minted host is deliberately not
+        // be revised in place. Nothing of the user's is running in it (its
+        // shell is still held at the launch's start gate, and the activation
+        // hooks it was launched for have completed by the time an attach can
+        // arrive), so replace it with one minted for the terminal that is
+        // actually here. An `Exec`-minted host is deliberately not
         // replaced: a command is live inside that sandbox, and killing it to
-        // improve `TERM` is a bad trade. That case rides on the per-attach
-        // environment the host republishes instead.
+        // improve `TERM` is a bad trade. A box the host registered is not
+        // replaced either, because ending its PTask ends the shuttle
+        // connection the host-side row is tied to. Both cases ride on the
+        // per-attach environment the host republishes instead; a kept hook
+        // host's shell starts only now, when this attach releases its start
+        // gate, so its startup still runs after the activate hooks (#2118).
+        let declares_terminal = attach_env.declares_terminal();
         let respawn_for_terminal =
-            self.host_origin == HostOrigin::Hooks && attach_env.declares_terminal();
+            replaces_host_for_terminal(self.host_origin, declares_terminal, holds_host_row);
+        // Kept only for its row: the same host would be replaced without one.
+        let kept_for_host_row = !respawn_for_terminal
+            && replaces_host_for_terminal(self.host_origin, declares_terminal, false);
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -3342,6 +4360,11 @@ impl Session {
             // loop rather than parking the attach behind it. Same bounded
             // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
+        } else if kept_for_host_row {
+            tracing::info!(
+                "kept the hook-launched session shell: replacing it would end the box's \
+                 host-side row; the terminal's environment rides the per-attach republish"
+            );
         }
 
         let host = match &mut self.inner {
@@ -3372,6 +4395,14 @@ impl Session {
                 {
                     Ok(()) => Ok(()),
                     Err(session_host::HostAttachError::Closed(channel, sz)) => {
+                        // A registered box's row ended with this loop
+                        // (NET-138); re-minting would re-attach it rowless.
+                        // The check at the top of this attach normally
+                        // refuses first, but the loop can end between that
+                        // check and this send, so ask again.
+                        if self.host_row_lost(&record).await {
+                            return Err(AttachError::BoxHostRowEnded);
+                        }
                         // The host's loop has ended; mint a fresh one from the
                         // channel it handed back.
                         self.mint_session_host(
@@ -3432,6 +4463,9 @@ impl Session {
         phase: LaunchPhase,
         for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
+        // Taken first, so a confirmation never outlives the launch it was
+        // read for, whichever way that launch ends.
+        let rejoins_row = std::mem::take(&mut self.relaunch_row_confirmed) && !for_hooks;
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
         // Kept before the launcher consumes `attach_env`: the launch folds
@@ -3475,6 +4509,10 @@ impl Session {
                 control: Some(SessionControl::new(self.manager.clone(), record.id)),
                 delta,
                 archives_dir,
+                // A registered box: its shell-exit prompt says a kept session's
+                // network registration is restored on its next attach or exec
+                // (NET-138).
+                holds_host_row: record.box_addresses.is_some(),
                 session_id: record.id,
                 // The host runs attach and detach itself: it owns the terminal
                 // they write to and the process whose namespaces they join.
@@ -3499,7 +4537,39 @@ impl Session {
             }
             None => (None, spawn.await),
         };
-        let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        let (host, task, host_ip_enforcement) = spawned.map_err(|e| {
+            AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
+        })?;
+        // The confirmation was a read, not a reservation: the VM host daemon
+        // may have withdrawn the row at its grace's end between that read
+        // and this launch (NET-138). Read it again now the new host is up,
+        // before the slot is marked as holding it; a row gone in between
+        // ends the launch as the read before it would have.
+        if rejoins_row && !self.host_row_stands(&record).await {
+            let _ = host.kill(false).await;
+            return Err(AttachError::BoxHostRowEnded);
+        }
+        // Whatever this launch replaces, the slot it goes into no longer
+        // holds the launch that bound the box's host-side row; only the
+        // binding launch itself, below, sets this again — or a relaunch the
+        // VM host daemon just confirmed its standing row for, which rejoins
+        // the switch under that row.
+        self.slot_holds_row =
+            record.box_addresses.is_some() && record.host_row_bound && rejoins_row;
+        // The first launch of a registered box binds its host-side row
+        // (NET-138). Recorded on the record, so a restarted daemon knows the
+        // row is gone, before anything else can fail the launch: the kill
+        // below ends the switch attachment, and with it the row, so a
+        // binding not yet recorded by then would let a later launch run
+        // rowless. A binding that cannot be recorded fails the launch the
+        // same way.
+        if record.box_addresses.is_some()
+            && !record.host_row_bound
+            && let Err(e) = self.record_host_row_bound().await
+        {
+            let _ = host.kill(false).await;
+            return Err(AttachError::LaunchRecordUnwritable(e));
+        }
         // NET-079: the launch that just ran records its own outcome for
         // this session's box on the box's record here — the one path every
         // launch takes, so an attach, an exec, an activation and a hook run
@@ -3514,6 +4584,69 @@ impl Session {
             return Err(AttachError::LaunchRecordUnwritable(e));
         }
         Ok((channel, (host, task)))
+    }
+
+    /// Records on this session's record that a launch bound the box's
+    /// host-side row, and marks the slot's coming host as that launch. See
+    /// [`Self::host_row_lost`].
+    async fn record_host_row_bound(&mut self) -> Result<(), std::io::Error> {
+        let mut record = self.record.record().await?;
+        record.host_row_bound = true;
+        self.record.write(record).await?;
+        self.slot_holds_row = true;
+        Ok(())
+    }
+
+    /// Whether this registered box's host-side row is gone (NET-138): the
+    /// record says a launch bound it, and the slot does not hold that
+    /// launch's host alive. The row lives exactly as long as the binding
+    /// launch's switch attachment and the daemon never registers it again,
+    /// so a box in this state must not be handed a host — every one would
+    /// be rowless, and the host gate silently drops a rowless box's frames.
+    /// False for a box that carries no host-handed addresses, and for a
+    /// registered box no launch has bound yet: its first launch binds it.
+    ///
+    /// When the binding launch's host is gone, the VM host daemon is asked
+    /// whether its row still stands ([`crate::net::listeners::host_row_standing`]):
+    /// the host detaches a row at the end of its box's attachment and
+    /// withdraws it only after a grace, and the box's creator may resume a
+    /// withdrawn one, so a row that stands is the host's own word that a
+    /// relaunch rejoins the switch under it. The answer is the host's
+    /// table, never a fact this daemon asserts; a host that cannot be asked
+    /// — a native host, or a door that does not answer — reads as no row.
+    ///
+    /// A row the host confirms while the slot holds no live host is left
+    /// for the relaunch that follows ([`Self::relaunch_row_confirmed`]), so
+    /// later attaches and execs reuse that host without asking again.
+    async fn host_row_lost(&mut self, record: &Record) -> bool {
+        self.relaunch_row_confirmed = false;
+        let slot_alive = matches!(
+            &self.inner,
+            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        );
+        if record.box_addresses.is_none()
+            || !record.host_row_bound
+            || (self.slot_holds_row && slot_alive)
+        {
+            return false;
+        }
+        let standing = self.host_row_stands(record).await;
+        self.relaunch_row_confirmed = standing && !slot_alive;
+        !standing
+    }
+
+    /// Whether the VM host daemon says this registered box's row stands
+    /// ([`crate::net::listeners::host_row_standing`]), read for the box id
+    /// the record names. A record naming no box id cannot be told from
+    /// another box handed its address, so it reads as no row without
+    /// asking: fail-closed. A host that cannot be asked reads as no row.
+    async fn host_row_stands(&mut self, record: &Record) -> bool {
+        let (Some(addresses), Some(box_id)) = (record.box_addresses, record.box_id) else {
+            return false;
+        };
+        let control = self.switch_control().await;
+        crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id).await
+            == Some(true)
     }
 
     /// Records the launch's own placement outcome on this session's record
@@ -3647,6 +4780,12 @@ impl Session {
             if record.status != SessionStatus::Active {
                 return Err(AttachError::SessionPending);
             }
+            // Attach's refusal, for the same reason: neither the host a
+            // later launch left in the slot nor a fresh one would hold the
+            // registered box's host-side row.
+            if self.host_row_lost(&record).await {
+                return Err(AttachError::BoxHostRowEnded);
+            }
         }
 
         let running = match &self.inner {
@@ -3713,15 +4852,25 @@ impl Session {
             .await?;
         let channel = channel.expect("progress hands back the channel it was given");
 
-        // Wire the channel to the freshly launched host. A failure here means
-        // the host died in the window between launch and attach; surface it as
-        // a spawn failure rather than leaving a dead, channel-less host — which
-        // is why the host is stored only once it is bound.
+        #[cfg(test)]
+        let launched = mint_attach_seam::apply(*self.record.id(), launched).await;
+
+        // Wire the channel to the freshly launched host. A failure here is
+        // one of two things: the host died in the window between launch and
+        // attach, or it is alive but wedged and its mailbox stayed full past
+        // the attach deadline. The first is surfaced as a spawn failure rather
+        // than leaving a dead, channel-less host — which is why a host whose
+        // loop already ended is never stored. The second must not read as
+        // death: it is the same wedged case the re-attach path refuses with
+        // `SessionBusy`, and the host is stored before refusing, so a retry
+        // reaches it through that path instead of minting a second host over
+        // it, and teardown stops it instead of a dropped `JoinHandle`
+        // detaching a live loop.
         //
         // The launch already folded this attach's connection facts into the
         // shell's environment, so nothing new is passed here: the host holds
         // them, and an empty map means "no revision", not "no terminal".
-        launched
+        let outcome = match launched
             .0
             .attach(
                 channel,
@@ -3730,11 +4879,20 @@ impl Session {
                 session_keys,
             )
             .await
-            .map_err(|_| {
-                AttachError::SpawnFailed(std::io::Error::other(
-                    "session host exited before its channel could attach",
-                ))
-            })?;
+        {
+            Ok(()) => Ok(()),
+            // The host's loop ended before the attach could be delivered.
+            Err(session_host::HostAttachError::Closed(..)) => {
+                return Err(AttachError::SpawnFailed(spawn_failed_error(
+                    userns_spawn_hint().as_deref(),
+                )));
+            }
+            // The host is alive but its mailbox stayed full past the attach
+            // deadline: the same wedged case the re-attach path refuses with
+            // `SessionBusy`, and for the same reason — re-minting would abort
+            // a busy-but-healthy shell. The host is still stored below.
+            Err(session_host::HostAttachError::Timeout) => Err(AttachError::SessionBusy),
+        };
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
@@ -3751,7 +4909,7 @@ impl Session {
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
-        Ok(())
+        outcome
     }
 
     /// True when this session's composition declares at least one script for
@@ -3790,9 +4948,15 @@ impl Session {
     /// Activation is the exception and keeps its own path in
     /// [`Self::finalize`] — a failed activate hook aborts the activation
     /// rather than being logged past.
-    async fn run_hooks_headless(&mut self, event: crate::hooks::HookEvent) {
+    ///
+    /// Returns the outcomes of the hooks that ran, for a caller that
+    /// reports them (destroy does); empty when none could.
+    async fn run_hooks_headless(
+        &mut self,
+        event: crate::hooks::HookEvent,
+    ) -> Vec<crate::hooks::HookOutcome> {
         if !self.has_hooks_for(event) {
-            return;
+            return Vec::new();
         }
         // `Attached`, not `Activating`: both transitions only happen once the
         // session is `Active`, so neither has reason to skip the status gate.
@@ -3818,7 +4982,7 @@ impl Session {
                     error = %e,
                     "launching the session to run its hooks failed; skipping them",
                 );
-                return;
+                return Vec::new();
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -3826,10 +4990,10 @@ impl Session {
                     timeout_secs = HOOK_LAUNCH_TIMEOUT.as_secs(),
                     "launching the session to run its hooks timed out; skipping them",
                 );
-                return;
+                return Vec::new();
             }
         }
-        run_session_hooks(&self.inner, &self.record, event).await;
+        run_session_hooks(&self.inner, &self.record, event).await
     }
 
     /// Launch the session host so lifecycle hooks have namespaces to
@@ -3997,7 +5161,7 @@ impl Session {
             for_hooks,
             // The classifier tree the privileged step installs natively and
             // the guest's own boot mounts; see the field's doc.
-            classifier_root: std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+            classifier_root: std::path::PathBuf::from(sandbox::classifier::TREE_ROOT),
             // The mount table the launch's classifier facts answer over is
             // the daemon's own, read live on every launch; see the field's
             // doc.
@@ -4005,6 +5169,13 @@ impl Session {
             // The spawn's publication set, shared with the listen plan the
             // launch gathers; see the assignment above.
             publications: self.publications.clone(),
+            // Where the listen plan's watcher audits the listens it
+            // publishes: the log this actor audits its exposes in (NET-046).
+            state_dir: self
+                .minimal_state_dir
+                .as_utf8_path()
+                .as_std_path()
+                .to_path_buf(),
         })
     }
 
@@ -4074,12 +5245,32 @@ impl Session {
                 seeded.control,
                 seeded.gate,
                 self.publications.clone(),
+                self.minimal_state_dir
+                    .as_utf8_path()
+                    .as_std_path()
+                    .to_path_buf(),
             ));
             // The set this launch is running on, handed back so a test can
             // contend with its two real surfaces over the real port — a
             // reservation held in it is the reservation the actor's own
             // publish would hold.
             listen_plan_seam::hand_back(record.id, self.publications.clone());
+        }
+        // What the launch's own-address attach would read as the box's
+        // published address (NET-010), read through the reporter the
+        // production launcher hands its attach, at the moment of the launch:
+        // the mock attaches nothing, so this is how a test sees whether a
+        // launch found the box's publish already standing (#2070).
+        #[cfg(target_os = "linux")]
+        if record.network == sessions::NetworkMode::OwnIp {
+            launch_publish_seam::observe(
+                record.id,
+                crate::net::provider::OwnAddressReporter::new(
+                    Arc::clone(&self.hostnames),
+                    record.id,
+                )
+                .published_address(),
+            );
         }
         // A session whose launch-record write a test fails also carries
         // the guard that test watches, so the box's teardown is
@@ -4123,7 +5314,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-             finish the upload + FinalizeSession sequence first)",
+             finish the activation first)",
                 record.status,
             ));
         }
@@ -4220,9 +5411,115 @@ impl Session {
     async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         let wsp = self.record.object().await.unwrap().workspace_path();
         if scaffold_if_missing {
-            self.scaffold_mfile_if_missing(&wsp)?;
+            // Fenced: the scaffold updates the default package checkout,
+            // whose checkouts cache lock may block for up to the lock
+            // timeout, and that wait must not park a tokio worker.
+            // Flavor-guarded because `block_in_place` panics on a
+            // current-thread runtime.
+            let scaffold = || self.scaffold_mfile_if_missing(&wsp);
+            match tokio::runtime::Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
+                _ => scaffold(),
+            }?;
         }
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
+    }
+
+    /// Refuse a composition that names a package the session's graph does
+    /// not declare, naming each such package and who declared it (the
+    /// project or a loadout).
+    ///
+    /// Resolves names only, through the lookup the launch uses
+    /// ([`crate::env::session_package`]): nothing is built, and the graph is
+    /// dropped here, since the launch evaluates its own. A context or graph
+    /// that cannot be evaluated at all (an upstream that does not resolve)
+    /// is not judged here; the launch reports it, as it did before this
+    /// check existed — and so is one that does not resolve within
+    /// [`PACKAGE_CHECK_DEADLINE`]: the daemon bounds the work the check
+    /// adds to the `FinalizeSession` round-trip itself, because the
+    /// round-trip's other deadline is the client's, and its expiry does not
+    /// cancel the daemon-side finalize. An expired check steps aside,
+    /// warned, and the launch resolves the names at first exec, as it
+    /// always has.
+    ///
+    /// Returns `Ok(true)` when the check stepped aside (expired deadline,
+    /// no session context, or no package graph) so the client can warn the
+    /// operator; `Ok(false)` when it ran to a verdict (nothing unknown, or
+    /// an unknown package refused via `Err`).
+    async fn check_composed_packages(&self, comp: &Composition) -> Result<bool, std::io::Error> {
+        if comp.packages().is_empty() {
+            return Ok(false);
+        }
+        let checked: Result<Result<bool, std::io::Error>, _> =
+            tokio::time::timeout(self.package_check_deadline, async {
+                let ctx = match self.build_context(true).await {
+                    Ok(ctx) => ctx,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "package check skipped at finalize: no session context"
+                        );
+                        return Ok(true);
+                    }
+                };
+                // CPU-heavy (nickel evaluation), so on the blocking pool, as the
+                // launch runs it.
+                let graph = crate::traced::spawn_blocking(move || {
+                    let mut ctx = ctx;
+                    ctx.graph_from_all_packages().map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(std::io::Error::other)?;
+                let graph = match graph {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "package check skipped at finalize: no package graph"
+                        );
+                        return Ok(true);
+                    }
+                };
+                let unknown: Vec<String> = comp
+                    .packages()
+                    .iter()
+                    .filter_map(|p| {
+                        crate::env::session_package(&graph, p.package())
+                            .err()
+                            .map(|e| {
+                                format!(
+                                    "{e} (declared by {})",
+                                    sessions::core::source::Provenanced::source(p)
+                                )
+                            })
+                    })
+                    .collect();
+                if unknown.is_empty() {
+                    return Ok(false);
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}; the session was not activated", unknown.join("; ")),
+                ))
+            })
+            .await;
+        match checked {
+            Ok(result) => result,
+            Err(_expired) => {
+                // Stepping aside, not failing: a graph this slow is one the
+                // launch tolerates — it evaluates its own, unbounded, at
+                // first exec — so the check tolerates it too. The evaluation
+                // the timeout detached keeps running on the blocking pool and
+                // warms the cache that launch reads.
+                tracing::warn!(
+                    deadline = ?self.package_check_deadline,
+                    "package check skipped at finalize: the session graph did not \
+                     resolve within its deadline; unknown package names will surface \
+                     at first exec, as before this check existed",
+                );
+                Ok(true)
+            }
+        }
     }
 
     async fn paths(&self) -> SessionPaths {
@@ -4240,7 +5537,7 @@ impl Session {
 
 /// The handle to the session.
 #[derive(Debug, Clone)]
-pub struct SessionHandle(mpsc::Sender<SessionMessage>);
+pub struct SessionHandle(crate::traced::Sender<SessionMessage>);
 
 impl SessionHandle {
     /// Returns a non-owning handle to this session.
@@ -4290,6 +5587,55 @@ impl SessionHandle {
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
+    }
+
+    /// Marks one `WorkspaceFilesTarZst` upload into the session as started
+    /// (true) or finished (false); every accepted `true` must be paired with
+    /// exactly one `false`. The reply is awaited — the actor's ack fires
+    /// once the change is applied, so a `true` returns only once an attach
+    /// racing the upload will see it. A dead actor maps to `NotConnected`;
+    /// a `true` into a session that is no longer unconfigured maps to
+    /// `PermissionDenied` and marks nothing.
+    pub async fn set_workspace_upload_in_flight(
+        &self,
+        in_flight: bool,
+    ) -> Result<(), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::SetWorkspaceUploadInFlight(in_flight, send))
+            .await;
+        match recv.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session is already configured; a workspace upload is accepted \
+                 only while the session is being created",
+            )),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is gone",
+            )),
+        }
+    }
+
+    /// The `false` half of [`Self::set_workspace_upload_in_flight`] for a
+    /// caller that cannot await, such as a `Drop`. The message is enqueued
+    /// synchronously when the mailbox has room, so it is ordered ahead of
+    /// anything sent after this returns; a full mailbox hands it to a
+    /// detached task instead. A dead actor needs no clear and is ignored.
+    pub fn end_workspace_upload_detached(&self) {
+        let (send, _) = oneshot::channel();
+        let msg = SessionMessage::SetWorkspaceUploadInFlight(false, send);
+        if let Err(mpsc::error::TrySendError::Full(msg)) = self.0.try_send(msg)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let sender = self.0.clone();
+            runtime.spawn(async move {
+                let _ = sender.send(msg).await;
+            });
+        }
     }
 
     /// Kicks off a background package build as a session side-op, returning the
@@ -4432,7 +5778,7 @@ impl SessionHandle {
         let mut ctx = self.context().await?;
         // `mctx::Error` isn't `Send` (it carries nickel-language types), so it
         // is rendered to a string inside the task.
-        tokio::task::spawn_blocking(move || ctx.needed_packages().map_err(|e| e.to_string()))
+        crate::traced::spawn_blocking(move || ctx.needed_packages().map_err(|e| e.to_string()))
             .await
             .map_err(|e| format!("resolving needed packages: {e}"))?
     }
@@ -4497,12 +5843,8 @@ impl SessionHandle {
     /// by shape: a session that has already stopped has answered its asks
     /// fail-closed, so a message that does not land is the normal end of a
     /// late answer, not a loss.
-    pub(crate) async fn ask_answered(
-        &self,
-        id: AskId,
-        port: u16,
-        answer: Option<session_host::AskAnswer>,
-    ) {
+    pub(crate) async fn ask_answered(&self, id: AskId, port: u16, answer: impl Into<AskEnd>) {
+        let answer = answer.into();
         #[expect(
             clippy::let_underscore_must_use,
             reason = "the session may already be gone; its asks were answered fail-closed then"
@@ -4532,12 +5874,29 @@ impl SessionHandle {
         recv.await.unwrap_or_default()
     }
 
+    /// Test-only: clones of the box's shared runtime ingress cell and
+    /// publication set (see [`SessionMessage::PeekIngressCells`]). `None` once
+    /// the actor is gone.
+    #[cfg(test)]
+    pub(crate) async fn ingress_cells(
+        &self,
+    ) -> Option<(
+        crate::net::provider::RuntimeIngress,
+        crate::net::listeners::BoxPublications,
+    )> {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self.0.send(SessionMessage::PeekIngressCells(send)).await;
+        recv.await.ok()
+    }
+
     /// The live dynamic-ingress mappings this box published at runtime
     /// (NET-044) — the rows `min session policy` lists. Empty for a box that
     /// published none. A dead actor maps to `NotConnected`.
-    pub(crate) async fn live_ingress(
-        &self,
-    ) -> Result<Vec<minimald_rpc::LiveMapping>, std::io::Error> {
+    pub(crate) async fn live_ingress(&self) -> Result<LiveIngressRows, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         #[expect(
@@ -4628,7 +5987,9 @@ impl SessionHandle {
     /// `WorkspacePatchesTarZst` upload. Idempotent on already-Active
     /// sessions. See [`Session::finalize`] for the state-machine
     /// contract.
-    pub(crate) async fn finalize(&self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+    pub(crate) async fn finalize(
+        &self,
+    ) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::Finalize(send)).await;
@@ -4663,6 +6024,23 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::IsBusy(send)).await;
         recv.await.unwrap_or(false)
+    }
+
+    /// Test-only: turn on the finalize package check for this session,
+    /// bounded by `deadline` (see [`SessionMessage::CheckPackagesAtFinalize`]
+    /// and [`PACKAGE_CHECK_DEADLINE`]).
+    #[cfg(test)]
+    pub(crate) async fn check_packages_at_finalize(&self, deadline: std::time::Duration) {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::CheckPackagesAtFinalize(deadline, send))
+            .await;
+        recv.await.expect("the session actor should ack the switch");
     }
 
     /// Test-only peek at the actor's held [`Composition`]. Bumps the
@@ -4705,11 +6083,13 @@ impl SessionHandle {
     /// deletes the on-disk record, and stops the actor. The handle is dead
     /// once this returns. A dead actor reads as `Ok` — whatever terminated it
     /// already ran its teardown.
-    pub(crate) async fn destroy(&self) -> Result<(), std::io::Error> {
+    ///
+    /// On success, returns one line per `on_destroy` hook that failed.
+    pub(crate) async fn destroy(&self) -> Result<Vec<String>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::Destroy(send)).await;
-        recv.await.unwrap_or(Ok(()))
+        recv.await.unwrap_or(Ok(Vec::new()))
     }
 
     /// This session's host, launching one with nothing bound to it if the
@@ -4759,11 +6139,14 @@ impl SessionHandle {
         let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
+    /// `attacher` is the attaching connection's liveness: while the session
+    /// is still unconfigured, only its creating connection may attach.
     pub async fn attach(
         &self,
         conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
+        attacher: Option<std::sync::Weak<()>>,
     ) -> Result<(), AttachError> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -4775,6 +6158,7 @@ impl SessionHandle {
                 conn_username,
                 channel,
                 config,
+                attacher,
             ))
             .await;
         // A dead session actor (it panicked or was dropped mid-attach) drops the
@@ -4791,7 +6175,7 @@ impl SessionHandle {
 
 /// A non-owning handle to the [`Session`] actor.
 #[derive(Debug, Clone)]
-pub struct WeakSessionHandle(WeakSender<SessionMessage>);
+pub struct WeakSessionHandle(crate::traced::WeakSender<SessionMessage>);
 
 impl WeakSessionHandle {
     /// Promotes to a strong [`SessionHandle`], or `None` if the session actor
@@ -4807,7 +6191,7 @@ impl WeakSessionHandle {
     /// handle, without standing up a live actor.
     #[cfg(test)]
     pub(crate) fn dangling() -> Self {
-        let (tx, _rx) = mpsc::channel::<SessionMessage>(1);
+        let (tx, _rx) = crate::traced::channel::<SessionMessage>(1);
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
@@ -4826,15 +6210,15 @@ impl WeakSessionHandle {
     pub(crate) fn answering(
         answers: Vec<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SessionMessage>(1);
+        let (tx, mut rx) = crate::traced::channel::<SessionMessage>(1);
         let weak = tx.downgrade();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             // Hold the strong sender for the runtime the test lives in:
             // without a live sender the channel closes and the asker's
             // `upgrade()` fails before any answer is reached.
             let _hold = tx;
             let mut answers = answers.into_iter();
-            while let Some(message) = rx.recv().await {
+            while let Some((message, _span)) = rx.recv().await {
                 // Past the script, no answer is sent: `reply` drops
                 // unanswered, which the asker types as the actor being gone.
                 if let SessionMessage::ExposeDynamic { reply, .. } = message
@@ -4877,6 +6261,50 @@ fn promote_interim_to_hand(
     }
 }
 
+/// The test seam for what an own-address box's launch found published: the
+/// test launcher records, per launch, the address the production attach
+/// would bind the box's declared forwards at
+/// ([`crate::net::provider::OwnAddressReporter::published_address`]), so a
+/// test can prove the publish precedes the launch — the order finalize's
+/// activate-hook launch depends on (#2070). Keyed by session id, like the
+/// seams below, so tests running beside each other in one process never
+/// read each other's launches.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod launch_publish_seam {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::Mutex;
+
+    use sessions::SessionId;
+
+    /// What each launch of one session found published, in launch order.
+    type Launches = Vec<Option<Ipv4Addr>>;
+
+    static OBSERVED: Mutex<Option<HashMap<SessionId, Launches>>> = Mutex::new(None);
+
+    /// The launcher's half: one launch of `id` found `published`.
+    pub(super) fn observe(id: SessionId, published: Option<Ipv4Addr>) {
+        OBSERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .entry(id)
+            .or_default()
+            .push(published);
+    }
+
+    /// What each launch of `id` found published, in launch order; empty
+    /// when nothing launched it.
+    pub(crate) fn observed(id: SessionId) -> Launches {
+        OBSERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|observed| observed.get(&id).cloned())
+            .unwrap_or_default()
+    }
+}
+
 /// The test seam for a launch whose outcome cannot be recorded (NET-079):
 /// a test names a session whose launch-record write fails, and gets back
 /// the flag the session's box's network teardown sets — the observable
@@ -4913,7 +6341,7 @@ pub(crate) mod launch_record_seam {
             .is_some_and(|failing| failing.contains_key(id))
     }
 
-    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox2::NetGuard>> {
+    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox::NetGuard>> {
         let failing = FAILING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4923,13 +6351,112 @@ pub(crate) mod launch_record_seam {
 
     struct TeardownFlag(Arc<AtomicBool>);
 
-    impl sandbox2::NetGuard for TeardownFlag {
+    impl sandbox::NetGuard for TeardownFlag {
         fn teardown(
             self: Box<Self>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
             self.0.store(true, Ordering::SeqCst);
             Box::pin(async {})
         }
+    }
+}
+
+/// The test seam for the window between a mint's launch and its attach: a
+/// test seeds the failure that lands there for one session id, and the mint
+/// applies it to the host it just launched before wiring the channel. The
+/// take is once: a failure belongs to the mint that reads it, and a session a
+/// test seeded nothing for mints an ordinary host. Keyed by session id, like
+/// the launch-record seam, so tests running beside each other in one process
+/// never answer each other's mints.
+///
+/// The seam never fabricates the error itself — it only puts the freshly
+/// launched host into the state that produces it, so what the mint's own
+/// `attach` call returns, and how that maps onto the refusal the client sees,
+/// is exactly what production runs.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test seam: plain tokio tasks are fine here; the traced-spawn rule is for request handling"
+)]
+pub(crate) mod mint_attach_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use sessions::SessionId;
+
+    use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle, WedgedMailbox};
+
+    /// The failure a seeded mint must hit: the host's loop ending before the
+    /// attach could be delivered, or a wedged loop whose mailbox stays full.
+    pub(crate) enum Failure {
+        HostDiedBeforeAttach,
+        HostWedged,
+    }
+
+    static SEEDED: Mutex<Option<HashMap<SessionId, Failure>>> = Mutex::new(None);
+    // Held for the daemon's lifetime so a wedged handle's mailbox never
+    // drains: an undrained mailbox is what keeps it wedged. Keyed by session
+    // id, like SEEDED, so tests running beside each other in one process keep
+    // their own stand-in's mailbox.
+    static WEDGED_MAILBOXES: Mutex<Option<HashMap<SessionId, WedgedMailbox>>> = Mutex::new(None);
+
+    /// Makes the next mint of `id` hit `failure` between its launch and its
+    /// attach.
+    pub(crate) fn seed(id: SessionId, failure: Failure) {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, failure);
+    }
+
+    /// Applies the failure seeded for `id`, if any, to the host this mint
+    /// just launched. Once: the seeded failure is taken, not borrowed, so a
+    /// later mint of the same session mints an ordinary host. Takes the
+    /// launched pair and hands it back so the mint's binding needs no
+    /// mutation the non-test build would flag as unused.
+    pub(crate) async fn apply(
+        id: SessionId,
+        mut launched: super::LaunchedHost,
+    ) -> super::LaunchedHost {
+        let seeded = SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|seeded| seeded.remove(&id));
+        match seeded {
+            None => {}
+            Some(Failure::HostDiedBeforeAttach) => {
+                // End the host's loop now, and wait for the end so the host
+                // (and its mailbox) is gone before the mint's attach sends:
+                // the send finds the channel closed rather than racing a
+                // loop that might still drain it.
+                launched.1.abort();
+                let _ = (&mut launched.1).await;
+            }
+            Some(Failure::HostWedged) => {
+                // End the real host's loop, as above, so nothing of it
+                // outlives the swap. Then swap in a wedged stand-in, paired
+                // with a task that stays pending like a live wedged loop, so
+                // the stored (handle, task) pair describes one host. Fill the
+                // stand-in's mailbox to capacity through the production
+                // sender, so the mint's own attach send cannot queue and runs
+                // out its deadline.
+                launched.1.abort();
+                let _ = (&mut launched.1).await;
+                let (wedged, mailbox) = HostHandle::wedged();
+                launched = (wedged, tokio::spawn(std::future::pending()));
+                WEDGED_MAILBOXES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(HashMap::new)
+                    .insert(id, mailbox);
+                for i in 0..HOST_MAILBOX_CAPACITY {
+                    launched.0.rename(format!("mint-attach-seam-{i}")).await;
+                }
+            }
+        }
+        launched
     }
 }
 

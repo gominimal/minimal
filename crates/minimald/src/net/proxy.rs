@@ -33,6 +33,7 @@
 //! spike #485's systemd-resolved finding (spec Open Question 1).
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -350,7 +351,7 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
     loop {
         let (client, peer) = listener.accept().await?;
         let router = router.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             if let Err(error) = handle_connection_io(client, Some(peer), &router).await {
                 tracing::debug!(
                     component = "dns-proxy",
@@ -439,6 +440,15 @@ where
             "absolute-form https:// target; use CONNECT to tunnel TLS",
             "400 Bad Request",
         );
+        return write_status(&mut client, "400 Bad Request").await;
+    }
+
+    // A head the proxy and the box could read two ways is refused before any
+    // route lookup or upstream dial: two `Host` fields could route by one and
+    // be served by the other (RFC 9112 §3.2), and `Content-Length` beside
+    // `Transfer-Encoding` could end the body in two places (RFC 9112 §6.1).
+    if let Some(reason) = ambiguous_head(&head) {
+        log_refusal(None, reason, "400 Bad Request");
         return write_status(&mut client, "400 Bad Request").await;
     }
 
@@ -653,6 +663,45 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
         kind: RequestKind::Forward,
         authority,
     })
+}
+
+/// Why a buffered request head is ambiguous, or `None` when it is not: more
+/// than one `Host` field (RFC 9112 §3.2 requires a `400`), both
+/// `Content-Length` and `Transfer-Encoding` (RFC 9112 §6.1 bars an
+/// intermediary from forwarding it as it is), or `Content-Length` values that
+/// differ (RFC 9112 §6.3; repeated identical values are one length). Header
+/// names match case-insensitively; the request line is not a header and is not
+/// consulted, and bytes past the end-of-head marker are never scanned. A
+/// `Content-Length` that is not a decimal number is left to [`request_body`],
+/// which refuses it.
+fn ambiguous_head(head: &[u8]) -> Option<&'static str> {
+    let lines = head_lines(head.get(..head_end(head)).unwrap_or_default());
+    let headers: Vec<(&[u8], &[u8])> = lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| header_parts(line))
+        .collect();
+    let values = |want: &'static [u8]| {
+        headers
+            .iter()
+            .filter(move |(name, _)| is_header(name, want))
+            .map(|(_, value)| *value)
+    };
+    let lengths: BTreeSet<u64> = values(b"content-length")
+        .flat_map(value_tokens)
+        .filter_map(|token| std::str::from_utf8(token).ok()?.parse().ok())
+        .collect();
+    if values(b"host").count() > 1 {
+        Some("the request head has more than one Host header")
+    } else if values(b"content-length").next().is_some()
+        && values(b"transfer-encoding").next().is_some()
+    {
+        Some("the request head has both Content-Length and Transfer-Encoding")
+    } else if lengths.len() > 1 {
+        Some("the request head has Content-Length values that differ")
+    } else {
+        None
+    }
 }
 
 /// Whether the buffered head opens with the HTTP/2 prior-knowledge preface's
@@ -1392,9 +1441,9 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
 pub(crate) async fn spawn_backend() -> u16 {
     let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = backend.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    crate::traced::spawn(async move {
         while let Ok((mut sock, _)) = backend.accept().await {
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 let mut scratch = [0u8; 1024];
                 let _ = sock.read(&mut scratch).await;
                 let _ = sock
@@ -1460,7 +1509,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let authority = format!("myservice.min.internal:{backend_port}");
         let routed = proxy_get(proxy_addr, &authority).await;
@@ -1551,7 +1600,7 @@ mod tests {
         let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let routed = proxy_get(proxy_addr, &format!("web.min.internal:{backend_port}")).await;
         assert!(
@@ -1599,7 +1648,7 @@ mod tests {
         // box's internal listener.
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let routed = proxy_get(proxy_addr, "web.min.internal:18080").await;
         assert!(
@@ -1645,7 +1694,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let refused = proxy_get(proxy_addr, "web.min.internal:9000").await;
         assert!(
@@ -1747,7 +1796,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // Nothing owns the name: a no-route refusal.
         let no_route = proxy_get(proxy_addr, "ghost.min.internal").await;
@@ -2305,7 +2354,7 @@ mod tests {
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap();
@@ -2321,7 +2370,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let request_line = format!("GET http://web.min.internal:{backend_port}/path HTTP/1.1");
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2358,7 +2407,7 @@ mod tests {
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap();
@@ -2376,7 +2425,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // URI authority is `real.min.internal`, `Host:` header is a different
         // host that is not registered — the request must route by the URI.
@@ -2435,7 +2484,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // HTTP: a plain request routes to the registered PTask and returns
         // its response.
@@ -2492,7 +2541,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -2543,7 +2592,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // The h2c offer in RFC 7540 §3.2's wire shape, with an unrelated
         // header riding along.
@@ -2676,7 +2725,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // First request: box-a.
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2748,7 +2797,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!(
@@ -2779,7 +2828,7 @@ mod tests {
     async fn bare_lf_response_is_passed_through_when_the_upstream_closes() {
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut scratch = [0u8; 1024];
             let _ = sock.read(&mut scratch).await;
@@ -2792,7 +2841,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
@@ -2810,9 +2859,9 @@ mod tests {
         // A backend that answers without a `Connection` header.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     let _ = sock.read(&mut scratch).await;
                     let _ = sock
@@ -2828,7 +2877,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
@@ -2856,9 +2905,9 @@ mod tests {
         // echoes back whatever the client sends after the upgrade.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 2048];
                     let n = sock.read(&mut scratch).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&scratch[..n]);
@@ -2888,7 +2937,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!(
@@ -2948,10 +2997,10 @@ mod tests {
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 let sink = Arc::clone(&sink);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let mut continued = !interim;
                     let mut answered = false;
@@ -3007,7 +3056,7 @@ mod tests {
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
         proxy_addr
     }
 
@@ -3184,6 +3233,175 @@ mod tests {
         assert!(box_a_received.lock().unwrap().is_empty());
     }
 
+    /// Drives one request head through the proxy toward a `web` box whose
+    /// port is a listener nothing answers on, returning the response, the
+    /// log lines, and whether the proxy dialed the box at all.
+    async fn drive_toward_unanswered_box(head: impl Fn(u16) -> String) -> (String, String, bool) {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        let (buf, guard) = capture_logs();
+        let (mut client, proxy_side) = tokio::io::duplex(1024);
+        client.write_all(head(port).as_bytes()).await.unwrap();
+        handle_connection_io(proxy_side, None, &router)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let dialed = tokio::time::timeout(Duration::from_millis(200), upstream.accept())
+            .await
+            .is_ok();
+        (
+            String::from_utf8_lossy(&response).into_owned(),
+            buf.contents(),
+            dialed,
+        )
+    }
+
+    /// A head with two `Host` fields is refused with `400` before any route
+    /// lookup or dial (RFC 9112 §3.2), and the refusal names its reason.
+    #[tokio::test]
+    async fn request_with_two_host_headers_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 host: other.min.internal:{port}\r\n\r\n"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has more than one Host header"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// A head carrying both `Content-Length` and `Transfer-Encoding` is
+    /// refused with `400` before any dial, never forwarded as it is
+    /// (RFC 9112 §6.1).
+    #[tokio::test]
+    async fn request_with_length_and_transfer_encoding_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "POST / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has both Content-Length and Transfer-Encoding"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// A head with one `Host` and one framing header is not ambiguous, and
+    /// still routes to its box.
+    #[tokio::test]
+    async fn request_with_one_host_and_one_framing_header_still_routes() {
+        let proxy_addr = spawn_two_box_proxy().await;
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
+             Content-Length: 4\r\n\r\nping"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(
+            String::from_utf8_lossy(&box_a_received.lock().unwrap()).contains("Host: box-a"),
+            "the box must receive the request"
+        );
+    }
+
+    /// A head whose `Content-Length` fields differ is refused with `400`
+    /// before any dial (RFC 9112 §6.3), and the refusal names its reason.
+    #[tokio::test]
+    async fn request_with_differing_content_lengths_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "POST / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 Content-Length: 4\r\nContent-Length: 5\r\n\r\nping"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has Content-Length values that differ"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// Repeated identical `Content-Length` values are one length, not an
+    /// ambiguity (RFC 9112 §6.3): the request still routes to its box.
+    #[tokio::test]
+    async fn request_with_identical_content_lengths_still_routes() {
+        let proxy_addr = spawn_two_box_proxy().await;
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
+             Content-Length: 4\r\nContent-Length: 4\r\n\r\nping"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(
+            String::from_utf8_lossy(&box_a_received.lock().unwrap()).contains("Host: box-a"),
+            "the box must receive the request"
+        );
+    }
+
+    /// Which heads `ambiguous_head` flags: header names match
+    /// case-insensitively, and the request line and body are not headers.
+    #[test]
+    fn ambiguous_head_flags_duplicate_host_and_dual_framing() {
+        assert!(ambiguous_head(b"GET / HTTP/1.1\r\nHost: a\r\nHOST: b\r\n\r\n").is_some());
+        assert!(
+            ambiguous_head(
+                b"POST / HTTP/1.1\r\nHost: a\r\ncontent-length: 1\r\n\
+                  transfer-encoding: chunked\r\n\r\n"
+            )
+            .is_some()
+        );
+        assert!(ambiguous_head(b"GET http://a:80/ HTTP/1.1\r\nHost: a\r\n\r\n").is_none());
+        assert!(
+            ambiguous_head(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 9\r\n\r\nHost: b\r\n")
+                .is_none()
+        );
+    }
+
     /// The framings `request_body` reads, and the ones it refuses.
     #[test]
     fn request_body_framing() {
@@ -3289,7 +3507,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // The direct half: the relay's own gate for the same declaration —
         // the shared `declared_ingress_ports` derivation — admits the port
@@ -3398,7 +3616,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -4500,10 +4718,10 @@ mod tests {
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 let sink = Arc::clone(&sink);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     sink.lock().unwrap().extend_from_slice(&buf[..n]);
@@ -4543,9 +4761,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_backend_on(addr: SocketAddr, body: &'static str) {
         let backend = TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     // Neither the read's count nor the answer's fate is what
                     // this backend exists for; the drop that follows closes
@@ -4579,9 +4797,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_forward(local: SocketAddr, remote: SocketAddr) {
         let listener = TcpListener::bind(local).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let Ok(mut upstream) = TcpStream::connect(remote).await else {
                         return;
                     };
@@ -4664,7 +4882,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_udp_forward(local: SocketAddr, remote: SocketAddr) {
         let listener = tokio::net::UdpSocket::bind(local).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
                 let Ok((len, reply_to)) = listener.recv_from(&mut buf).await else {

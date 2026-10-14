@@ -189,6 +189,32 @@ impl<W: BundleSink> BundleWriter<W> {
         src: &Path,
         cap: u64,
     ) -> Result<(), anyhow::Error> {
+        self.add_tail_scrubbed(path, src, cap, scrub_lines).await
+    }
+
+    /// [`add_file_tail`](Self::add_file_tail) for a telemetry spool file:
+    /// each line goes through [`crate::redact::scrub_spool_line`] with
+    /// `header_values` before the log scrub, so neither an exporter header
+    /// value nor a secret-shaped attribute's value reaches the bundle
+    /// (spec 25 TEL-044).
+    pub async fn add_spool_tail(
+        &mut self,
+        path: &str,
+        src: &Path,
+        cap: u64,
+        header_values: &[String],
+    ) -> Result<(), anyhow::Error> {
+        self.add_tail_scrubbed(path, src, cap, |b| scrub_spool_lines(b, header_values))
+            .await
+    }
+
+    async fn add_tail_scrubbed(
+        &mut self,
+        path: &str,
+        src: &Path,
+        cap: u64,
+        scrub: impl Fn(&[u8]) -> Vec<u8>,
+    ) -> Result<(), anyhow::Error> {
         let (mut file, meta) = open_regular_nofollow(src).await?;
         let len = meta.len();
         let capped = len > cap;
@@ -209,7 +235,7 @@ impl<W: BundleSink> BundleWriter<W> {
 
         // Scrub line-wise so a credential in a log tail is cleaned even when
         // it was logged before this fix.
-        let scrubbed = scrub_lines(&contents);
+        let scrubbed = scrub(&contents);
         let was_scrubbed = scrubbed != contents;
         let redaction = match (capped, was_scrubbed) {
             (true, true) => Redaction::TailCappedScrubbed,
@@ -361,6 +387,21 @@ fn scrub_lines(input: &[u8]) -> Vec<u8> {
             std::borrow::Cow::Borrowed(_) => out.extend_from_slice(body),
             std::borrow::Cow::Owned(scrubbed) => out.extend_from_slice(scrubbed.as_bytes()),
         }
+        out.extend_from_slice(ending);
+    }
+    out
+}
+
+/// [`scrub_lines`] for a spool file: each line is first made safe by
+/// [`crate::redact::scrub_spool_line`], then scrubbed like a log line.
+fn scrub_spool_lines(input: &[u8], header_values: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let body_len = line.strip_suffix(b"\n").map_or(line.len(), <[u8]>::len);
+        let (body, ending) = line.split_at(body_len);
+        let text = String::from_utf8_lossy(body);
+        let safe = crate::redact::scrub_spool_line(&text, header_values);
+        out.extend_from_slice(crate::redact::scrub_secrets(&safe).as_bytes());
         out.extend_from_slice(ending);
     }
     out

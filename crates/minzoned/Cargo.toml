@@ -1,6 +1,6 @@
 [package]
-name = "min-answerer"
-description = "The host's box-zone answerer service program, linked without libkrun, that the privileged step installs."
+name = "minzoned"
+description = "The host's box-name service (DNS and addresses for boxes), linked without libkrun, that the privileged step installs."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ publish.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "min-answerer"
+name = "minzoned"
 path = "src/main.rs"
 
 [dependencies]

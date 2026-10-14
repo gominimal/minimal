@@ -215,7 +215,9 @@ removes one session entirely and leaves the provider running to host the rest.
 Because `min` auto-spawns a provider on demand, the next `min` command after a
 stop simply brings one back up.
 
-You can inspect a session's effective networking policy as JSON:
+You can inspect a session's effective networking rules, rendered as text.
+Pass `-o json` for the machine-readable document; see the CLI reference's
+[`session policy`](../reference/cli-min.md#session-policy) section:
 
 ```console
 $ min session policy my-session

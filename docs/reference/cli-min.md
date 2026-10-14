@@ -53,6 +53,13 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
+Another box at the same shared loopback address can hold a port this box
+declares, and this box does not forward it. The list prints one stderr line
+per such port after the table:
+`warning: <session>: port <p> is held by <box>; not forwarded`.
+With `--json` the entry lists those ports under `shared_port_collisions`,
+each with `port` and `held_by`, and the key is absent when there are none.
+
 `min ls` is the same command kept bare at the top level — a deliberate
 exception to the `min <noun> <verb>` convention, since it is the
 highest-traffic command in the CLI; `min session ls` is the noun-level alias.
@@ -93,7 +100,7 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
-| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
+| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
 | `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them, `ask` asks the attached person, and `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. A VM-backed host refuses `allow` and `ask` before it creates the box, until the host side can admit a publish the box requests ([gominimal/minimal#1897](https://github.com/gominimal/minimal/issues/1897)). Every macOS host is VM-backed |
 | `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
@@ -102,16 +109,50 @@ the current directory).
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
-| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable; unset means allow all. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
-| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable; unset means allow all |
-| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable; unset means allow all |
-| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied |
-| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An undeclared box keeps the default the rollout phase resolves. Conflicts with every `--allow-*`/`--deny-*` rule flag |
+| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
+| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
+| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant |
+| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box without egress flags already gets deny-all by default (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
 declaration. Naming one of them stores it on the session, and `min session
 policy` shows what the session ended up with. `--deny-all-egress` declares
 the whole section in one flag and cannot combine with them.
+
+An unset `--allow-subnets` or `--allow-dns-hosts` inside a declaration
+grants nothing, whatever the box's network mode. This changes
+what a declaration with no allow list does. `--allow-dns-hosts github.com`
+alone reaches `github.com` and no address directly. `--deny-subnets` alone
+reaches nothing. Both used to reach every address the deny left, and the
+operator opt-out named below restores that earlier meaning. An
+own-address box (`--network own_ip`) without these flags, and without an
+`egress` section in its `minimal.toml`, gets the deny-all default: it
+reaches no external address. It can still resolve names in the box zone,
+`host.min.internal` included. Activate prints one line saying so:
+
+```
+egress: deny-all (default for an own-ip box with no egress section); declare reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags
+```
+
+To give such a box reach, declare it with the allow flags, such as
+`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`, or with an
+`egress` section in `minimal.toml`. To keep the earlier allow-all default for
+every undeclared box on a host, the operator opts out. A native Linux host
+opts out with `minimald run --egress-deny-all-opt-out`, or with
+`MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
+`minimald`. `min` starts the daemon without the flag when it is not running,
+so export the variable to keep the opt-out after such a restart (see
+[minimald](./cli-minimald.md)). A VM-backed host opts out with
+`MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts `minvmd`
+(see [minvmd](./cli-minvmd.md)). A host-address box with no section
+keeps allow-all either way.
+
+The opt-out also keeps the earlier meaning of an unset allow flag inside a
+declaration. On an opted-out host, `--allow-dns-hosts github.com` alone keeps
+allow-all addresses: the box reaches every address directly, and the names
+bound nothing. Activation does not warn about it. Add `--allow-subnets` to
+bound the addresses there.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
@@ -136,10 +177,18 @@ of this, so an unknown loadout name errors even in a directory with no config.
 min session attach [SESSION]
 ```
 
-Attaches to an existing session, identified by UUID or session name. When
-`SESSION` is omitted, `min session attach` resolves a session from the current
-working directory (or the only existing session) and opens an interactive
-picker if the choice is ambiguous (`--no-input` errors instead).
+Attaches to an existing session, identified by UUID, unique id prefix, or
+session name. An exact session name wins over an id prefix. A prefix that
+matches more than one session fails with an error that names the candidates.
+When `SESSION` is omitted, `min session attach` resolves a session from the
+current working directory (or the only existing session) and opens an
+interactive picker if the choice is ambiguous (`--no-input` errors instead).
+
+`min session attach` exits 0 when you detach or the session's shell exits.
+It prints a one-line notice and exits 254 when the daemon ends the attach.
+That happens when someone destroys the session, another connection attaches
+to it, or the daemon shuts down. It exits 255 when the connection fails, or
+when the daemon disconnects a terminal that stopped keeping up with output.
 
 ### `session exec`
 
@@ -149,6 +198,9 @@ min session exec <SESSION> <COMMAND>...
 
 Runs a command in an existing session, non-interactively, relaying its
 stdout, stderr and exit code.
+When a daemon shutdown stops the command, `min` prints
+`minimald is shutting down; the command was stopped` on stderr and exits with
+the command's own status.
 
 How `COMMAND` is read depends on how many arguments you give it:
 
@@ -201,6 +253,17 @@ its own stdout and stderr and drops the ones it inherited, so nothing about it
 depends on the exec channel at all. The same applies to `session run` and
 `task run`, which relay over the same channel.
 
+If the client goes away while the command is still running, the exec ends its
+whole process group: SIGTERM, a grace period, then SIGKILL. A `nohup`'d job
+stays in that group, so it ends too. Start a job that must outlive the client
+with `setsid`, which puts it in a session and group of its own:
+
+```
+min session exec web 'setsid nohup ./server >/dev/null 2>&1 &'
+```
+
+A command that exits by itself ends nothing: its background jobs keep running.
+
 ### `session run`
 
 ```
@@ -225,8 +288,15 @@ session's `PATH`.
 min session destroy [--all] [-f|--force] [SESSION]
 ```
 
-Destroys (terminates) a session. `--all` destroys all sessions;
-`-f/--force` skips the confirmation when destroying all sessions.
+Destroys a session and ends its processes. `--all` destroys all sessions.
+`-f/--force` skips the confirmation.
+
+Before it destroys one session, the command asks for confirmation if the
+session holds uncommitted changes or commits that no remote has. It also asks
+if the daemon cannot report that state. The command destroys a clean session without
+a prompt. Without a terminal, or under `--no-input`, nobody can answer, so the
+command refuses unless you pass `-f`. `--all` without a terminal also refuses
+unless you pass `-f`.
 
 ### `session rename`
 
@@ -242,8 +312,8 @@ Renames an existing session.
 min session policy <SESSION> [-o json]
 ```
 
-Prints the effective networking rules for `SESSION` (a UUID or session
-name). Resolved from the daemon, which answers from the policy stored at
+Prints the effective networking rules for `SESSION` (a UUID, unique id
+prefix, or session name). Resolved from the daemon, which answers from the policy stored at
 activation; each rule line shows what the session ended up with, not just
 what was typed.
 
@@ -264,13 +334,41 @@ declaration denies nothing. A deny-all declaration, the `egress` section
 with every allow list present and empty, prints as the one row `deny-all`.
 A box without an `egress` section prints the default the daemon resolved
 the absence to, by name and marked as what it is. `deny-all (default)`
-marks an own-address box once the deny-all default is in force.
-`allow-all (default)` marks a box behind the opt-out or one that shares
-its host's network namespace. The `(default)` mark distinguishes a verdict
-the box declared from the same verdict the default gave it. The ingress
-block lists the published port mappings the session's `--ingress` flags
-declared (or `deny-all` when the box leaves ingress undeclared). The
-`dynamic ports` row joins them when the box declared a `--dynamic-range`.
+marks an own-address box, which gets the deny-all default.
+`allow-all (default)` marks a box on a host that opted out of that default,
+or one that shares its host's network namespace. The `(default)` mark distinguishes a verdict
+the box declared from the same verdict the default gave it.
+
+A box activated with `--credentialed-upstream` prints one more row in
+the egress block:
+
+```
+egress
+  deny-all (default)
+  credentialed upstream  box egress proxy listener
+```
+
+The row names the lane the declaration opened. The gate admits the box's
+frames to the box egress proxy's listener, and the proxy checks their
+credential. The rows above never decide that destination. The listener is
+the lane's whole reach. The gate still refuses everything else the box
+sends to the proxy's address. A box without the lane omits the row, so
+the missing row means the box runs without a lane.
+
+The gate that admits the lane sits only in front of own-address boxes. A
+box in any other mode still prints the row it declared, marked as not in
+effect, with the box's mode named:
+
+```
+egress
+  allow-all (default)
+  credentialed upstream  box egress proxy listener (not in effect: host_ip box)
+```
+
+The ingress block lists the published port mappings the session's
+`--ingress` flags declared (or `deny-all` when the box leaves ingress
+undeclared). The `dynamic ports` row joins them when the box declared a
+`--dynamic-range`.
 The `dynamic ingress` row always prints, with the stance that decides the
 box's own publish requests. A box that set no `--dynamic-ingress`
 reads `deny (default)`, the deny the absence evaluates to, marked the way
@@ -297,12 +395,26 @@ live ingress (published at runtime)
   tcp  127.0.64.21:3000 → :3000
 ```
 
-The host binds a runtime publish at once. A frame reaches the box only
-through the relay gate its attach installed, and that gate admits only the
-ports the declaration named. So a port the box published at runtime reads
-`(pending; not yet reachable)` until the gate admits it. A row from a daemon
-older than the `pending` field reads `(unknown; daemon predates this field)`.
-The CLI never shows such a row as reachable.
+A listed runtime publish is reachable. The daemon admits the port at the
+box's relay gate when it binds the forward. If nothing in the box listens on
+the port yet, the box itself refuses a connection to it.
+A row from an older daemon whose gate did not admit runtime publishes reads
+`(pending; not yet reachable)`. A row from a daemon older than the `pending`
+field reads `(unknown; daemon predates this field)`. The CLI never shows
+either row as reachable.
+
+The daemon publishes a port the box listens on only after it writes the
+decision to its audit log. When the daemon cannot write the log, the port
+stays unpublished, and the command prints one line per port after the live
+rows:
+
+```
+warning: port 3000 is permitted but not published: the audit log /path/to/audit/decisions.log cannot be written
+```
+
+The line clears once the log takes records again and the port publishes.
+In `-o json` output the same ports appear as `unaudited_listen_ports`, a
+list the document leaves out when it is empty.
 
 `-o json` (`--output json`) prints one `min/v1/session-policy` document on
 stdout instead of text. Each block the text output prints becomes a key:
@@ -318,14 +430,27 @@ Each `live_ingress` row is the daemon's mapping object, with its `pending`
 state (`true`, `false`, or `null` for a daemon older than the field). The
 document leaves out the blocks the text output leaves out. A host-address
 session has no `ingress` key, and a `--network none` box has only `schema`
-and `network`. The `ingress` block has a `kind` tag, `deny_all` or
+and `network`, plus `credentialed_upstream` when it declared a lane. The `ingress` block has a `kind` tag, `deny_all` or
 `declared`, so a client reads one field to branch. Both kinds carry
 `dynamic_ingress`, the resolved stance: `allow`, `ask`, or `deny`, never
 `null`. Both also carry `dynamic_ingress_source`. It reads `declared` when
 the box set `--dynamic-ingress`, and `default` when the stance is the deny
 an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
-client that reads them finds a value in every `ingress` object.
+client that reads them finds a value in every `ingress` object. The
+document also carries `credentialed_upstream`, an object, when the box
+declared a lane, in any network mode. Its `effective` field is `true`
+for an own-address box and `false` for any other, the text row's
+`(not in effect: …)` mark. The document leaves the key out when the box
+did not declare a lane, so a missing key means the box runs without one.
+
+Boxes handed one shared loopback address can declare the same port. The
+box that published it first holds it, and a later box does not forward it.
+Activation prints a `warning:` line on stderr for each such port, naming
+the box that holds it. The text output marks the declared row
+`(held by <box>)`, and the document lists the rows under
+`shared_port_collisions`, each with `port` and the holding box as `held_by`.
+The key is absent when another box holds none of the box's ports.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the
@@ -345,7 +470,7 @@ min session hooks <SESSION> [--json]
 ```
 
 Lists the [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points)
-composed into `SESSION` (a UUID or session name), one row per script, with
+composed into `SESSION` (a UUID, unique id prefix, or session name), one row per script, with
 the transition it runs on, whether it is inline or external, its timeout, and
 the loadout or project that declared it.
 
@@ -407,6 +532,95 @@ the box's namespaces — is exercised by the daemon's harness test with a
 host-side stand-in relay rather than a real box; a root-integration proof of
 that leg (`just test-root-integration`) is still owed to the root lane.
 
+### `finalize-install`
+
+```
+min finalize-install [--show [--script | --json]] [--undo]
+```
+
+The installer runs without privilege. Anything on this host that needs root
+is left for this command, which runs it in one `sudo` call. Until it runs,
+the hostname proxy serves box names. The host line that
+`min session activate` prints says where the box name resolves:
+`names: <box>.min.internal via 127.0.0.1:<port>` while the proxy serves the
+names, or `names: <box>.min.internal resolves in any browser on this machine`
+once this host resolves the zone natively. While any item is not done, the
+line ends with `; finish setup: min finalize-install`. When the proxy failed
+to bind, the cause replaces the resolution and the box stays named:
+`names: <box>.min.internal: the hostname proxy is not serving — <cause>`, with
+the same clause after it when it applies. A session
+start never prints or runs the privileged step.
+
+The script holds only what this host is missing from:
+
+- the AppArmor profile that allows user namespaces for the sandbox
+- names: the resolver link and the box-name service, plus the reserved local
+  range on macOS
+- the classifier tree that enforces a host-address box's egress declaration.
+  The step keeps a root-owned copy of itself under `/usr/local/lib/minimal`.
+  A systemd boot unit re-installs the tree after a reboot. A path unit places
+  the daemon's listener in its leaf on every daemon start. An un-enrolled
+  host does not need a source identity for it. The classifier translates
+  nothing until an association adds the reserved addresses
+- membership of the `kvm` group, only when the configured provider is the
+  Linux VM provider
+
+`min finalize-install` prints the summary of what is missing. It writes the
+script to a temporary file that only you can read (mode `0600`) and runs it
+with `sudo sh`, so `sudo` asks for your password once. It then removes the
+file and exits with the script's status. A completed run that installed
+anything other than the `kvm` group membership ends with
+`Running boxes pick this up on their next start.`. A run that added you to
+the `kvm` group ends with
+`KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
+When both apply, both lines print, the login line last. On a host that needs nothing it prints
+`Every part of the install is finished on this machine; there is nothing to run.`
+and exits 0. It lists a fact that no script can change, such as cgroup2
+mounted without `nsdelegate`, under `can't do on this machine:`. The other
+items still run. When a host fact blocks every missing item, it runs
+nothing and exits non-zero.
+
+Without a terminal, it tries `sudo -n`. If `sudo -n` cannot run the script
+without a prompt, it prints the summary and
+`f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"`,
+runs nothing, and exits 1.
+
+The script is plain POSIX `sh` and stops at the first statement that fails.
+Its header says what it configures and that it must run as root. A comment
+introduces each step.
+
+| Flag | Description |
+|---|---|
+| `--show` | Print the summary of what this host is missing, with no privilege prompt, and run nothing. Exits 0 whatever the items' states. |
+| `--show --script` | Print the script to stdout and the summary to stderr, with no privilege prompt. Run it later with `sudo sh <file>`. Exits 0 whatever the items' states. |
+| `--show --json` | Print the summary as one JSON document under the schema `min/v1/finalize-install`. Each item has a stable id and a state: `done`, `missing`, `waiting`, or `cannot`. Exits non-zero while any item is not `done`. |
+| `--undo` | Remove everything the step installed on this host. It accepts only `--show --script`, which prints the removal script instead. |
+
+The names step points at the port the daemon's zone answerer listens on, so
+it needs a running daemon that has bound its answerer. It does not start one.
+With no daemon reachable, it lists the names item as `waiting on a daemon`
+under the summary and runs the remaining items.
+
+The box-name service runs as one user for the whole machine. If another user
+already installed it, the command refuses before running anything, names
+that user, and exits 1. `--show` still prints.
+
+`--undo` works without a daemon, and it succeeds on a host that holds none of
+the install. It removes the user-namespace profile, the classifier tree with
+its units and step copy, and the group membership the step added. A profile
+or a classifier tree installed another way stays, with a note. It also removes the box-name
+service and its program copy, the resolver hook, and on macOS the local range
+unit.
+The local range addresses on macOS stay on the loopback until the next boot.
+`install.sh --uninstall` points at `min finalize-install --undo` while any of
+these host files remain.
+
+When the installer finishes on a terminal and the host lacks a step, it shows
+the summary and asks `Finish setup now? This runs one sudo command. [Y/n]`.
+The default is yes. It does not ask on a host that needs nothing. If you
+decline, or there is no terminal, it prints
+``run `min finalize-install` when you're ready``.
+
 ### `stop`
 
 ```
@@ -414,7 +628,11 @@ min stop [-f|--force]
 ```
 
 Shuts down the `minimald` daemon. `--force` shuts down even if active
-sessions exist. This stops the daemon backend that hosts sessions, and the
+sessions exist. On a VM backend, `--force` also stops the VM from the host
+when the in-guest daemon does not answer. A guest that does not acknowledge the
+shutdown is killed: its running sessions get no clean stop, and data not yet
+flushed inside the VM can be lost. Without `--force`, an unanswering VM fails
+with exit code 7. This stops the daemon backend that hosts sessions, and the
 sessions themselves survive it (contrast
 [`session destroy`](#session-destroy), which removes one session and leaves the
 daemon running).
@@ -449,7 +667,7 @@ Prints important directories and file paths for debugging.
 ### `bug`
 
 ```
-min bug [-o <OUTPUT>]
+min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--endpoint <URL>]]
 ```
 
 Collects a diagnostic bundle (logs, state, config) to send to the minimal
@@ -494,6 +712,52 @@ prefixes) have values captured verbatim (a sensitive-shaped
 name always loses to the allowlist), and every other env var is reported
 by name only. Session and project file contents are never included, only
 name/size listings. Review the archive before sharing.
+
+`--upload` sends the bundle to the diag portal after `bug` writes it to
+disk. A failed upload leaves the archive in place. The upload sends
+nothing to identify you: it sends the bundle and the `--context` text.
+`--context` is a sentence on what went wrong. The portal shows it beside
+the report and gives it to the agent that reads the bundle. `--endpoint`
+names another portal. It must be HTTPS, or plain HTTP to a loopback
+host. The portal takes bundles up to 64 MiB.
+
+After an upload, `bug` prints:
+
+```
+Report:  https://agents.minimal.farm/diag/<id>
+The bundle is stored for the minimal team for 7 days. It is not diagnosed until someone signs in at the report URL and starts the diagnosis.
+Expires: <date>
+Delete:  min diag delete <id> <token>
+```
+
+The portal keeps the bundle for 7 days and then deletes it. The portal
+starts a diagnosis only when someone signs in on the report page and
+starts it there. The report URL does not contain the delete token, so
+you can share the URL. To remove the bundle sooner, run the `Delete:`
+line. See [`diag`](#diag).
+
+### `diag`
+
+```
+min diag collect [<bug options>]
+min diag upload <PATH> [--context <TEXT>] [--endpoint <URL>]
+min diag delete <ID> <TOKEN> [--endpoint <URL>]
+```
+
+`diag collect` is [`bug`](#bug) under another name and takes the same
+options.
+
+`diag upload` sends a bundle that you collected earlier. Use it for a
+bundle someone gave you, or for one you collected while the portal was
+unreachable. It prints the same lines as `bug --upload`.
+
+`diag delete` deletes an uploaded bundle before it expires. Give it the
+id and the delete token that the upload printed. The portal deletes the
+bundle and any diagnosis made from it, and the command prints
+`Deleted <id>`. It fails with a plain error when the portal has no such
+bundle, or when the token does not match the bundle. A bundle is missing
+when nobody uploaded it, it expired, or someone already deleted it.
+`--endpoint` follows the same HTTPS rule as the upload.
 
 ### `init`, `add`, `update`
 
@@ -574,7 +838,7 @@ the shell to ask `min` itself what to offer. That indirection is what makes
 session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
-as "UUID or session name" completes this way: `session attach`,
+as "UUID, unique id prefix, or session name" completes this way: `session attach`,
 `session exec`, `session run`, `session destroy`, `session rename`, and
 `session policy`.
 

@@ -22,7 +22,6 @@ use tokio::sync::mpsc::error::{SendError, SendTimeoutError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::RequestedPty;
 use crate::session::SessionPaths;
@@ -57,6 +56,17 @@ const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(5
 /// changed since activation. Exposed for the same test-await purpose as
 /// [`SHELL_EXIT_PROMPT`].
 pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
+
+/// The shell-exit prompt's Keep item.
+pub(crate) const SHELL_EXIT_KEEP: &str =
+    "Exit, leaving the session filesystem in place and recoverable";
+
+/// The Keep item for a registered box, whose host-side row ends with its
+/// shell (NET-138): the client resumes the row before its next attach or
+/// exec, so the kept session comes back under the same addresses.
+pub(crate) const SHELL_EXIT_KEEP_REGISTERED: &str = "Exit, keeping the session's files. Its \
+     network registration ends with the shell and is restored when you attach or exec into \
+     the session again.";
 
 /// Header of the dialog a runtime port-publish request decided `ask` renders
 /// over the channel (NET-045), asking the attached human whether the box may
@@ -275,6 +285,20 @@ enum MainloopExitReason {
     /// The host shed this binding: its mailbox stopped taking session output
     /// within [`OUTPUT_STALL_TIMEOUT`].
     Shed,
+}
+
+impl MainloopExitReason {
+    /// The exit status the binding reports to its client, which `min session
+    /// attach` exits with. An end the user chose — a detach, or the session
+    /// process exiting — is 0. An end the daemon imposed is not, so a script
+    /// can tell the two apart.
+    fn exit_status(&self) -> u32 {
+        match self {
+            Self::Detach | Self::ProcessExited => 0,
+            Self::HostGone | Self::Superceded | Self::Shutdown => DAEMON_ENDED_EXIT_STATUS,
+            Self::Shed => SHED_EXIT_STATUS,
+        }
+    }
 }
 
 /// What a binding told to end itself renders, and the mainloop exit it ends
@@ -505,6 +529,10 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// Whether the box is registered (see [`HostParams::holds_host_row`]):
+    /// the shell-exit prompt's Keep item says the session cannot be
+    /// attached to again.
+    holds_host_row: bool,
     /// Cancelled by the host when it sheds this binding (see
     /// [`Host::shed_binding`]). A separate signal rather than a
     /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
@@ -530,6 +558,18 @@ const SHED_NOTICE: &[u8] =
 /// unwind codes followed it.
 const SHED_EXIT_STATUS: u32 = 255;
 
+/// The exit status of an attach the daemon ended: the session was destroyed
+/// (or otherwise went away), another connection took it over, or the daemon
+/// is shutting down. Non-zero so a script does not read it as a detach, and
+/// not ssh's 255, because the daemon still spoke for itself: these ends send
+/// their own unwind codes or none are owed, so the client's blind unwind (see
+/// [`SHED_EXIT_STATUS`]) stays off.
+const DAEMON_ENDED_EXIT_STATUS: u32 = 254;
+
+/// The line a binding whose host went away leaves on the terminal: the
+/// session is gone, so there is no farewell from the host to render.
+const HOST_GONE_NOTICE: &[u8] = b"\r\nDisconnecting - the session is gone\r\n";
+
 /// Hands a departing binding its teardown message and waits for it to
 /// finish, so its farewell lands before whatever comes next.
 ///
@@ -554,6 +594,10 @@ async fn retire_binding((tx, mut task, shed): BindingSlot, msg: BindingMsg) {
 impl Binding {
     /// Spawns a new binding task for a given channel, returning objects
     /// which the owning [`Host`] should own to communicate with it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site, which hands over the host's per-binding facts by name"
+    )]
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
@@ -562,6 +606,7 @@ impl Binding {
         delta: Option<Arc<DeltaSource>>,
         name: String,
         archives_dir: std::path::PathBuf,
+        holds_host_row: bool,
     ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
         let shed = CancellationToken::new();
@@ -575,6 +620,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            holds_host_row,
             shed: shed.clone(),
         };
 
@@ -584,12 +630,17 @@ impl Binding {
         // The session name rides the span too: the channel id correlates these
         // lines with the connection's `accepted connection`/`closed` pair, but
         // only the name says *which* session an operator's report is about.
+        //
+        // A root of its own, linked to whatever spawned it (the host loop, or
+        // the request that launched the host): a binding lives as long as
+        // its channel, past the attach that asked for it.
         let span = tracing::info_span!(
+            parent: None,
             "binding",
             channel = %binding.channel.id(),
             session = %binding.name,
         );
-        (tx, tokio::spawn(binding.run().instrument(span)), shed)
+        (tx, crate::traced::spawn_detached(span, binding.run()), shed)
     }
 
     /// Hands `kind` to the host, giving up if the binding is shed first.
@@ -921,6 +972,7 @@ impl Binding {
                     self.control.as_ref(),
                     &self.archives_dir,
                     &self.name,
+                    self.holds_host_row,
                     rs.make_reader(),
                     &mut w,
                 )
@@ -964,24 +1016,26 @@ impl Binding {
             control.detached().await;
         }
 
-        let shed = exit_reason == MainloopExitReason::Shed;
-        if shed {
-            // Bounded: the client stopped draining, so this write can park
-            // exactly as the one that got the binding shed. The notice is
-            // lost then, but the close below still goes out. The writer is a
-            // fresh one whenever a write was cut short mid-send — the mainloop
-            // replaces it at every race it drops, because russh's channel
-            // writer otherwise answers this short buffer with the interrupted
-            // write's byte count and tokio's `write_all` panics past its end.
+        let notice = match exit_reason {
+            MainloopExitReason::Shed => Some(SHED_NOTICE),
+            MainloopExitReason::HostGone => Some(HOST_GONE_NOTICE),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            // Bounded: after a shed the client stopped draining, so this
+            // write can park exactly as the one that got the binding shed.
+            // The notice is lost then, but the close below still goes out.
+            // The writer is a fresh one whenever a write was cut short
+            // mid-send — the mainloop replaces it at every race it drops,
+            // because russh's channel writer otherwise answers this short
+            // buffer with the interrupted write's byte count and tokio's
+            // `write_all` panics past its end.
             let _ =
-                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(SHED_NOTICE))
-                    .await;
+                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(notice)).await;
         }
 
         let _ = ws.eof().await;
-        let _ = ws
-            .exit_status(if shed { SHED_EXIT_STATUS } else { 0 })
-            .await;
+        let _ = ws.exit_status(exit_reason.exit_status()).await;
         let _ = ws.close().await; // needed to release the remote
     }
 
@@ -1115,11 +1169,14 @@ impl Binding {
             reason = "a client that cannot take the lead-in line cannot take the dialog either; \
                       the dialog's own result is the answer to relay"
         )]
+        // The same frame the VM-backed host's dialog draws
+        // (`minimal_client::ask_dialog`): the protocol on the lead-in — a
+        // runtime publish is TCP — and the `? ` the question leads with.
         let _ = w
-            .write_all(format!("\r\n{name} asks to publish port {port}.\r\n").as_bytes())
+            .write_all(format!("\r\n{name} asks to publish port {port}/tcp.\r\n").as_bytes())
             .await;
         let select = async_dialog::Select::new()
-            .with_prompt(ASK_PROMPT)
+            .with_prompt(format!("? {ASK_PROMPT}"))
             .items(["Deny", "Allow"])
             // Deny stands highlighted: the answer the box's own posture
             // would have given, so nothing publishes because someone held
@@ -1162,6 +1219,7 @@ impl Binding {
         control: Option<&SessionControl>,
         archives_dir: &std::path::Path,
         name: &str,
+        holds_host_row: bool,
         mut r: R,
         mut w: W,
     ) -> ExitDisposition
@@ -1218,8 +1276,15 @@ impl Binding {
             Delete,
         }
 
-        let mut items =
-            vec!["Exit, leaving the session filesystem in place and recoverable".to_string()];
+        // A registered box's host-side row ends with its shell (NET-138); the
+        // client resumes it before the next attach or exec, so the Keep item
+        // says the registration comes back rather than that nothing does.
+        let keep_item = if holds_host_row {
+            SHELL_EXIT_KEEP_REGISTERED
+        } else {
+            SHELL_EXIT_KEEP
+        };
+        let mut items = vec![keep_item.to_string()];
         let mut choices = vec![ExitChoice::Keep];
         // Destination for the save-then-delete lane, fixed while the prompt
         // is up so the rendered path is the path written — including across
@@ -1545,9 +1610,9 @@ pub(crate) struct Launched<P, G> {
     /// Kept alive for the session; see [`SessionLauncher::Guard`].
     guard: G,
     /// The per-sandbox network attachment (own-IP switch wiring), if any. Torn
-    /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
+    /// down explicitly via [`sandbox::NetGuard::teardown`] at session end.
     /// `None` for `HostNet`/`NoNet` and for the plain mock.
-    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    net_guard: Option<Box<dyn sandbox::NetGuard>>,
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     tty_path: std::path::PathBuf,
@@ -1563,7 +1628,7 @@ pub(crate) struct Launched<P, G> {
     /// is absent, and while a native session then runs unenforced rather than
     /// refused on that ground, a guest's host-address launch is refused
     /// instead (design §7.1).
-    leaf: Option<sandbox2::config::ClassifierLeaf>,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
     /// What the launch decided about this box's egress verdict: enforced on
     /// a leaf of its own, or unenforced on a host that could not decide per
     /// box. Carried to the host's attributes so a session can say which it
@@ -1578,6 +1643,12 @@ pub(crate) struct Launched<P, G> {
     /// is this launch's own from the moment it is built: it never survives
     /// to a spawn that did not gather it.
     listen_plan: Option<crate::net::listeners::ListenPlan>,
+    /// The gate holding the launched shell before it execs, on a launch
+    /// minted only for lifecycle hooks (see [`SandboxLauncher::for_hooks`]):
+    /// the box exists for the hooks to run in, while the shell — whose
+    /// startup files are the user's — waits for the first attach. `None` on
+    /// every other launch, whose shell starts at once.
+    start_gate: Option<sandbox::StartGate>,
 }
 
 /// Actor messages to a [`Host`].
@@ -2126,7 +2197,7 @@ pub struct HostAttrs {
 /// Pure over its inputs, so the mapping is pinned where it is written.
 fn host_ip_enforcement(
     network_mode: NetworkMode,
-    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    leaf: Option<&sandbox::config::ClassifierLeaf>,
     declaration: Option<&sessions::EgressPolicy>,
 ) -> Option<HostIpEnforcement> {
     match network_mode {
@@ -2205,7 +2276,7 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // down explicitly in `mainloop` when the session ends, before `_guard` (and
     // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and
     // net-guard-less tests.
-    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    net_guard: Option<Box<dyn sandbox::NetGuard>>,
 
     /// The box's listen-publication watcher (NET-016, NET-017): publishes
     /// the ports its processes listen on when the box's ingress rules
@@ -2268,7 +2339,11 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// the box's namespaces, from the daemon's own cgroup namespace where the
     /// leaf is reachable. `None` on a host that places no box.
     #[cfg_attr(test, allow(dead_code))]
-    leaf: Option<sandbox2::config::ClassifierLeaf>,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
+
+    /// The launch's start gate, held until the first attach; see
+    /// [`Launched::start_gate`] and [`Self::attach`].
+    start_gate: Option<sandbox::StartGate>,
 
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
@@ -2288,6 +2363,10 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // Daemon-side directory the save-then-delete lane archives into, handed
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
+
+    // Whether the box is registered (see [`HostParams::holds_host_row`]),
+    // handed to each binding for its shell-exit prompt.
+    holds_host_row: bool,
 
     // The per-channel session-key chord matcher: the negotiated leader chord
     // that enters command mode, the detach/forward subcommand keys, the bell
@@ -2456,7 +2535,7 @@ pub(crate) struct SandboxBackend {
     /// The box's classifier leaf (NET-079), removed when this backend — and
     /// so the session's last process — is dropped: a leaf does not outlive the
     /// box it decided.
-    leaf: Option<sandbox2::config::ClassifierLeaf>,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
 impl SandboxBackend {
@@ -2599,14 +2678,14 @@ fn remove_box_leaf_patiently(
 ) -> io::Result<()> {
     let attempts = attempts.max(1);
     for attempt in 1..attempts {
-        if sandbox2::classifier::remove_box_leaf(leaf).is_ok() {
+        if sandbox::classifier::remove_box_leaf(leaf).is_ok() {
             return Ok(());
         }
         pause(attempt);
     }
     // The last attempt is the return, not another pause: its refusal is
     // what the caller warns with.
-    sandbox2::classifier::remove_box_leaf(leaf)
+    sandbox::classifier::remove_box_leaf(leaf)
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -2682,10 +2761,10 @@ pub(crate) type ConnectionEnv = std::collections::BTreeMap<String, String>;
 
 /// Where the session home lives inside the sandbox.
 ///
-/// Derived from the same `sandbox2` constant the sandbox mounts it from
+/// Derived from the same `sandbox` constant the sandbox mounts it from
 /// (`crate::env::HOME_ROOT` is the same value; this module cannot use that one
 /// because `env` is `cfg(not(test))` and these paths are asserted under test).
-const SESSION_HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+const SESSION_HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
 /// Session-home-relative directory holding the per-attach environment files.
 const ATTACH_ENV_DIR_REL: &str = ".local/state/minimal";
@@ -2744,11 +2823,11 @@ pub(crate) const ATTACH_ENV_JSON: &str =
 const BASELINE_PROMPT_COMMAND: &str = r#"eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD"#;
 
 /// Absolute workspace root inside a session sandbox, `/workbench` by
-/// convention. Derived from the same [`sandbox2::SESSION_DEFAULT_WD`] the
+/// convention. Derived from the same [`sandbox::SESSION_DEFAULT_WD`] the
 /// sandbox uses as the shell's initial cwd (sessions never set a
 /// `working_name_override`), so [`BASELINE_MOTD`]'s blueprint test cannot
 /// drift from where the workspace actually lives.
-const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_DEFAULT_WD);
 
 /// Payload half of the launcher-baseline orientation banner: a STATIC
 /// template. The dynamic parts resolve in-shell at print time: the
@@ -2874,7 +2953,8 @@ pub(crate) struct SandboxLauncher {
     /// attaches with instead of drawing one, and the published loopback
     /// address the host side names the box by. Ignored by every other
     /// network mode; `None` for a session the activating client did not
-    /// register, which self-allocates as it always has.
+    /// register, which self-allocates on a native host and is refused on a
+    /// VM host, where the in-VM daemon draws nothing (NET-138).
     pub(crate) box_addresses: Option<sessions::BoxAddresses>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
@@ -2922,6 +3002,10 @@ pub(crate) struct SandboxLauncher {
     /// half, and the answer `min net expose` gets when the listener
     /// watcher published its port first).
     pub(crate) publications: crate::net::listeners::BoxPublications,
+    /// The daemon's state directory, handed to this launch's listen plan:
+    /// its watcher appends each listen it publishes to the audit log under
+    /// it, the one the session's runtime expose path audits in (NET-046).
+    pub(crate) state_dir: std::path::PathBuf,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -2938,7 +3022,7 @@ pub(crate) struct SandboxLauncher {
 /// sandbox the destroy then tries to delete out from under.
 ///
 /// Reaping is synchronous (`kill` + `wait` are not async), so unlike
-/// [`sandbox2::PlannedLaunch`] — which has to give a lease back, and spawns
+/// [`sandbox::PlannedLaunch`] — which has to give a lease back, and spawns
 /// that release — this needs no runtime to do its work in `Drop`.
 struct SpawnedProcessGuard {
     /// `None` once the process has been handed off — see
@@ -3004,22 +3088,22 @@ impl Drop for SpawnedProcessGuard {
 /// first and the leaf removed after, because a cgroup that still holds a
 /// process refuses its removal.
 struct BoxLeafGuard {
-    leaf: Option<sandbox2::config::ClassifierLeaf>,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
 impl BoxLeafGuard {
-    fn new(leaf: sandbox2::config::ClassifierLeaf) -> Self {
+    fn new(leaf: sandbox::config::ClassifierLeaf) -> Self {
         Self { leaf: Some(leaf) }
     }
 
     /// The leaf this guard owns, for the placement between the spawn and the
     /// handoff.
-    fn get(&self) -> Option<&sandbox2::config::ClassifierLeaf> {
+    fn get(&self) -> Option<&sandbox::config::ClassifierLeaf> {
         self.leaf.as_ref()
     }
 
     /// Hand the leaf off, disarming the guard.
-    fn release(mut self) -> sandbox2::config::ClassifierLeaf {
+    fn release(mut self) -> sandbox::config::ClassifierLeaf {
         self.leaf
             .take()
             .expect("the leaf is taken only here, and this consumes the guard")
@@ -3058,14 +3142,14 @@ impl Drop for BoxLeafGuard {
 /// is every production path ([`SandboxLauncher::classifier_mountinfo`]).
 ///
 /// The distinction is not cosmetic. `None` handed through as "no table at
-/// all" makes [`sandbox2::classifier::tree_is_real`] say a real tree is not
+/// all" makes [`sandbox::classifier::tree_is_real`] say a real tree is not
 /// real — it answers from the table — so a guest, whose own boot mounted the
 /// `nsdelegate` cgroup2 the tree sits on, would refuse every host-address
 /// box it launched as a broken image, while a native host without a tree
 /// kept running boxes unenforced: the one table read here is what both
 /// halves of the launch — the decision and the placement — answer over.
 fn launch_mountinfo(knob: Option<String>) -> Option<String> {
-    knob.or_else(sandbox2::classifier::own_mountinfo)
+    knob.or_else(sandbox::classifier::own_mountinfo)
 }
 
 /// The daemon's one node fact about per-box egress enforcement (NET-079):
@@ -3220,7 +3304,7 @@ pub(crate) fn clear_host_ip_enforcement_fact() {
 pub(crate) fn displayed_host_ip_enforcement(
     guest: bool,
     network_mode: NetworkMode,
-    verdict: sandbox2::config::Verdict,
+    verdict: sandbox::config::Verdict,
     fact: &HostIpEnforcementFact,
     launch_record: Option<HostIpEnforcement>,
 ) -> Option<minimald_rpc::HostIpEnforcement> {
@@ -3386,7 +3470,7 @@ pub(crate) async fn re_read_classifier_fact(
     mountinfo_knob: Option<String>,
     guest: bool,
 ) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
-    tokio::task::spawn_blocking(move || {
+    crate::traced::spawn_blocking(move || {
         let mountinfo = launch_mountinfo(mountinfo_knob);
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
             classifier_reading(&root, guest)
@@ -3415,7 +3499,7 @@ pub(crate) async fn re_read_classifier_fact(
 /// dies making, because the kernel gates a `cgroup.procs` write on write
 /// permission to the common ancestor of source and destination — the
 /// root-owned mount root above the tree for a daemon still in `user.slice`.
-/// [`sandbox2::classifier::probe_child_placement`] performs the migration
+/// [`sandbox::classifier::probe_child_placement`] performs the migration
 /// with a throwaway child first, so the box's own join never runs where it
 /// cannot succeed: an unplaceable session is decided here, at the launch,
 /// not by a box that dies with `127` in a closure whose stderr reaches no
@@ -3435,14 +3519,14 @@ async fn create_session_leaf(
     guest: bool,
     session_id: &sessions::SessionId,
     session_name: &str,
-    verdict: sandbox2::config::Verdict,
+    verdict: sandbox::config::Verdict,
     can_decide_per_box: bool,
-) -> io::Result<Option<sandbox2::config::ClassifierLeaf>> {
-    if !sandbox2::classifier::tree_is_real(root, mountinfo, guest) {
+) -> io::Result<Option<sandbox::config::ClassifierLeaf>> {
+    if !sandbox::classifier::tree_is_real(root, mountinfo, guest) {
         tracing::info!(
             session = session_name,
-            tree = sandbox2::classifier::TREE_ROOT,
-            install = %sandbox2::classifier::install_hint(),
+            tree = sandbox::classifier::TREE_ROOT,
+            install = %sandbox::classifier::install_hint(),
             "this host has no classifier tree to place a box in; the session's \
              box runs unenforced",
         );
@@ -3454,9 +3538,9 @@ async fn create_session_leaf(
     // do not belong on an executor thread. The probe makes its leaf in the
     // subtree this box's verdict picked, the same one its own leaf will
     // live in.
-    let placement = match tokio::task::spawn_blocking({
+    let placement = match crate::traced::spawn_blocking({
         let root = root.to_path_buf();
-        move || sandbox2::classifier::probe_child_placement(&root, verdict)
+        move || sandbox::classifier::probe_child_placement(&root, verdict)
     })
     .await
     {
@@ -3489,8 +3573,8 @@ async fn create_session_leaf(
         tracing::info!(
             session = session_name,
             error = %e,
-            daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
-            install = %sandbox2::classifier::install_hint(),
+            daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),
+            install = %sandbox::classifier::install_hint(),
             hint,
             "{what}; {hint} — the session's box runs unenforced",
         );
@@ -3536,7 +3620,7 @@ async fn create_session_leaf(
                     verdict.dir_name()
                 );
             }
-            Ok(Some(sandbox2::config::ClassifierLeaf::new(leaf)))
+            Ok(Some(sandbox::config::ClassifierLeaf::new(leaf)))
         }
         // `NotFound` is the ordinary shape of "no tree on this host": the
         // privileged step has not run. Info, not warn — it is a deployment
@@ -3545,7 +3629,7 @@ async fn create_session_leaf(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(
                 session = session_name,
-                install = %sandbox2::classifier::install_hint(),
+                install = %sandbox::classifier::install_hint(),
                 "the classifier tree is not installed on this host; \
                  the session's box runs unenforced",
             );
@@ -3574,7 +3658,7 @@ async fn create_session_leaf(
 /// fresh launch of the same session id then finds. Whether that leaf is a
 /// leftover or another session's is not for this code to guess — the
 /// kernel's own emptiness test tells them apart, and it is the same
-/// primitive [`sandbox2::classifier::remove_box_leaf`] runs: an `rmdir`,
+/// primitive [`sandbox::classifier::remove_box_leaf`] runs: an `rmdir`,
 /// which the kernel refuses while the cgroup holds a process. A leftover
 /// goes and the leaf is created again for this launch; a leaf that stays
 /// belongs to a live session, and the refusal names the `rmdir` that
@@ -3589,15 +3673,15 @@ async fn create_session_leaf(
 fn create_or_reclaim_box_leaf(
     root: &std::path::Path,
     session_id: &sessions::SessionId,
-    verdict: sandbox2::config::Verdict,
+    verdict: sandbox::config::Verdict,
 ) -> io::Result<(std::path::PathBuf, bool)> {
     let id = session_id.to_string();
-    match sandbox2::classifier::create_box_leaf(root, &id, verdict) {
+    match sandbox::classifier::create_box_leaf(root, &id, verdict) {
         Ok(leaf) => Ok((leaf, false)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let leftover = sandbox2::classifier::box_leaf(root, &id, verdict);
-            sandbox2::classifier::remove_box_leaf(&leftover)
-                .and_then(|()| sandbox2::classifier::create_box_leaf(root, &id, verdict))
+            let leftover = sandbox::classifier::box_leaf(root, &id, verdict);
+            sandbox::classifier::remove_box_leaf(&leftover)
+                .and_then(|()| sandbox::classifier::create_box_leaf(root, &id, verdict))
                 .map(|leaf| (leaf, true))
                 .map_err(|refused| {
                     io::Error::new(
@@ -3828,7 +3912,7 @@ fn say_closure_line(line: &str, session: &str) -> bool {
 fn refused_unenforced_host_address_box(
     guest: bool,
     network_mode: NetworkMode,
-    verdict: sandbox2::config::Verdict,
+    verdict: sandbox::config::Verdict,
     placed: bool,
     decision: Option<&crate::net::classifier::Decision>,
 ) -> Option<String> {
@@ -3852,7 +3936,7 @@ fn refused_unenforced_host_address_box(
     }
     let decision = decision?;
     if guest {
-        if verdict == sandbox2::config::Verdict::Deny && !decision.can_decide_per_box() {
+        if verdict == sandbox::config::Verdict::Deny && !decision.can_decide_per_box() {
             return Some(
                 "this guest has not loaded the classifier table, so a \
                  deny-all box's connections would not be refused: the box's \
@@ -3864,15 +3948,17 @@ fn refused_unenforced_host_address_box(
         }
         return None;
     }
-    if placed && verdict == sandbox2::config::Verdict::Deny {
+    if placed && verdict == sandbox::config::Verdict::Deny {
         return match decision.cause() {
             Some(crate::net::classifier::Cause::TableNotEffective) => Some(format!(
                 "this host's classifier table is marked loaded but its refusal \
                  is not in force, so a deny-all box's connections would not be \
                  refused: the box's declaration promises a verdict nothing here \
                  enforces, and the box was refused rather than run unenforced \
-                 (the table's refusal is not in force — {} reloads it)",
-                sandbox2::classifier::install_hint()
+                 (the table's refusal is not in force — the marker says loaded, so \
+                 {install} alone is a no-op; {install} --undo, then {install}, \
+                 reloads it)",
+                install = sandbox::classifier::install_hint()
             )),
             Some(crate::net::classifier::Cause::ProbeUnreadable) => Some(
                 "this host's classifier table's effect could not be read, so \
@@ -3924,7 +4010,7 @@ fn refused_unenforced_host_address_box(
 /// pinned where it is written.
 fn advises_unenforced_placement(
     network_mode: NetworkMode,
-    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    leaf: Option<&sandbox::config::ClassifierLeaf>,
     decision: Option<&crate::net::classifier::Decision>,
 ) -> bool {
     matches!(network_mode, NetworkMode::HostNet)
@@ -3939,7 +4025,7 @@ fn advises_unenforced_placement(
 /// image's builder, and the interim's words are all the guest has to say.
 fn unenforced_placement_notice(
     guest: bool,
-    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    leaf: Option<&sandbox::config::ClassifierLeaf>,
 ) -> String {
     if guest {
         return "guest-side classifier enforcement is not available yet; \
@@ -3951,13 +4037,13 @@ fn unenforced_placement_notice(
             "this host places no classifier leaf for this session: its box \
              runs with the host's address and no egress verdict of its own \
              — {}",
-            sandbox2::classifier::install_hint()
+            sandbox::classifier::install_hint()
         ),
         Some(_) => format!(
             "this host's classifier table is not loaded, so the leaf this \
              session's box was placed in decides nothing: the box runs with \
              the host's address and no egress verdict of its own — {}",
-            sandbox2::classifier::install_hint()
+            sandbox::classifier::install_hint()
         ),
     }
 }
@@ -3974,10 +4060,10 @@ fn unenforced_placement_notice(
 /// leaf from its parent, so the box is in its leaf from its first process to
 /// its last.
 fn place_box_processes(
-    leaf: &sandbox2::config::ClassifierLeaf,
+    leaf: &sandbox::config::ClassifierLeaf,
     supervisor: u32,
 ) -> std::io::Result<()> {
-    sandbox2::classifier::place_pid(&leaf.procs(), supervisor)
+    sandbox::classifier::place_pid(&leaf.procs(), supervisor)
 }
 
 impl SessionLauncher for SandboxLauncher {
@@ -4041,7 +4127,7 @@ impl SessionLauncher for SandboxLauncher {
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
-        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
             (ctx, r)
@@ -4130,7 +4216,7 @@ impl SessionLauncher for SandboxLauncher {
                 let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
                 tracing::info!(
                     session = %session_name,
-                    network_mode = ?network_mode,
+                    network_mode = %network_mode.word(),
                     host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     refusal = %refusal,
                     "refusing a host-address box whose declaration names rules \
@@ -4195,7 +4281,7 @@ impl SessionLauncher for SandboxLauncher {
         ) {
             tracing::error!(
                 session = %session_name,
-                network_mode = ?network_mode,
+                network_mode = %network_mode.word(),
                 tree = %classifier_root.display(),
                 placed = leaf.is_some(),
                 refusal = %refusal,
@@ -4246,6 +4332,31 @@ impl SessionLauncher for SandboxLauncher {
                 "the session's host-address box runs unenforced on this host",
             );
         }
+        // The banner is the advisory's in-box surface, and follows the
+        // advisory's rule (NET-079): a native daemon only — per-box
+        // enforcement is a native-host fact, and the guest's state is the
+        // interim's, said in the record above — only while the box declares
+        // egress, because a box that declared nothing asked for no
+        // enforcement, and only over a decision that names a cause: a box
+        // nothing placed on a host that decides per box runs unenforced for
+        // a reason the record above names (the placement's own failure),
+        // not one an install or an own-address start ends, so the advisory
+        // would hand out a command that changes nothing. Its text is the
+        // create reply's own, which carries none without a cause either, so
+        // the terminal the start printed into and the shell it opens say the
+        // same thing.
+        let banner = match (
+            advise && !guest,
+            policy.egress.as_ref(),
+            decision
+                .as_ref()
+                .and_then(crate::net::classifier::Decision::cause),
+        ) {
+            (true, Some(egress), Some(cause)) => {
+                Some(crate::net::classifier::advisory_text(cause, egress))
+            }
+            _ => None,
+        };
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
@@ -4254,7 +4365,7 @@ impl SessionLauncher for SandboxLauncher {
         // this launch's verdict fact and never a concurrent launch's.
         // `PlannedLaunch` owns the release from here: an early `Err` return
         // or a cancelled launch gives the lease back.
-        let planned = sandbox2::PlannedLaunch::begin(crate::net::provider::network_for(
+        let planned = sandbox::PlannedLaunch::begin(crate::net::provider::network_for(
             network_mode,
             &net_switch,
             &session_name,
@@ -4271,7 +4382,7 @@ impl SessionLauncher for SandboxLauncher {
         // confined-families seal is the shim's default. Derived from the plan
         // itself — the same data `new_container` seals the box from — so
         // launch and injection agree by construction.
-        let seal_injection = planned.plan().seal() == sandbox2::SocketSeal::Full;
+        let seal_injection = planned.plan().seal() == sandbox::SocketSeal::Full;
 
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
@@ -4281,7 +4392,7 @@ impl SessionLauncher for SandboxLauncher {
         // composition's over a small launcher baseline — the session's
         // identity (`MINIMAL_SESSION_NAME`) and the once-only
         // orientation banner pair (see [`session_baseline_env`]) —
-        // while sandbox2 sets the session defaults (`PS1`, `PATH`,
+        // while `sandbox` sets the session defaults (`PS1`, `PATH`,
         // `HOME`, `LANG`, …) which these vars then override on a
         // shared key.
         //
@@ -4351,7 +4462,7 @@ impl SessionLauncher for SandboxLauncher {
         // moves into the env build; the rootfs it has to be checked
         // against doesn't exist until that build has run.
         let requested_shell = env_vars.get("SHELL").cloned();
-        // Whether anything composed a prompt. `sandbox2` sets a
+        // Whether anything composed a prompt. `sandbox` sets a
         // bash-syntax `PS1` as the session default, which a shell that
         // doesn't speak those escapes prints literally — so a non-bash
         // shell gets its own (see `ShellChoice::prompt`), but only when
@@ -4378,6 +4489,7 @@ impl SessionLauncher for SandboxLauncher {
             // the launch future's layout overruns rustc's query depth (128).
             let mut env_args =
                 crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache, session)
+                    .with_session_id(session_id)
                     .with_packages(packages)
                     .with_resolved_env_vars(env_vars)
                     // Session envs source package attrs (env_state_wiring,
@@ -4402,6 +4514,19 @@ impl SessionLauncher for SandboxLauncher {
                 .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
             container.set_session_leader();
+            // A launch minted only for hooks holds its shell at the gate: the
+            // hooks need the box, not the shell, and the shell's startup —
+            // the user's rc files and prompt commands — must not run ahead of
+            // the activate hooks it may depend on. The first attach releases
+            // it (see [`Host::attach`]).
+            let start_gate = if for_hooks {
+                Some(
+                    env.hold_start(&mut container)
+                        .map_err(|e| io::Error::other(format!("start gate: {e}")))?,
+                )
+            } else {
+                None
+            };
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
@@ -4420,14 +4545,17 @@ impl SessionLauncher for SandboxLauncher {
             // per box yet is told so at its own start, like any host's.
             // And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
-            if advise {
-                let notice = unenforced_placement_notice(guest, leaf.as_ref());
+            if let Some(notice) = &banner {
                 // The same write the shell fallback notice uses, for the
-                // same reasons: onto the pty's slave, best-effort, CRLF —
-                // see the comment there.
+                // same reasons: onto the pty's slave, best-effort, CRLF on
+                // each of the advisory's two lines — see the comment there.
+                let text = notice
+                    .lines()
+                    .map(|line| format!("minimal: {line}\r\n"))
+                    .collect::<String>();
                 let written = pty.dup_slave_fd().and_then(|fd| {
                     use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                    std::fs::File::from(fd).write_all(text.as_bytes())
                 });
                 if let Err(e) = written {
                     tracing::debug!(
@@ -4485,21 +4613,29 @@ impl SessionLauncher for SandboxLauncher {
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             let tty_path = pty.slave_path().to_path_buf();
+            // Kept for one notice written after the switch attach below (an
+            // own-address box the hostname proxy stranded), so it is said in
+            // the terminal, not only in the daemon's log. Never for a hook
+            // launch: its pty is read by nobody. Dropped before the launch
+            // returns, so it never outlives the shell's own slave fds.
+            let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
+                .then(|| pty.dup_slave_fd().ok())
+                .flatten();
             let (master, slave) = pty.into_fds();
             command.stderr(hakoniwa::Stdio::from(slave));
 
             // On the fork thread, never this one: the container dies with
-            // the thread that forked it (see `sandbox2::forker`).
-            let process = sandbox2::forker::on_fork_thread(move || command.spawn())
+            // the thread that forked it (see `sandbox::forker`).
+            let process = sandbox::forker::on_fork_thread(move || command.spawn())
                 .map_err(|e| io::Error::other(format!("exec failed: {e}")))?;
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process, tty_path))
+            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd, start_gate))
         }
         .await;
 
-        let (env, master, process, tty_path) = match build_and_spawn {
+        let (env, master, process, tty_path, late_notice_fd, start_gate) = match build_and_spawn {
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
@@ -4520,9 +4656,9 @@ impl SessionLauncher for SandboxLauncher {
         if let Some(leaf) = leaf.as_ref() {
             let report = env.closure_report_path(leaf);
             let session = session_label.clone();
-            tokio::spawn(
-                async move { report_box_closure(report, session, CLOSURE_REPORT_WATCH).await },
-            );
+            crate::traced::spawn(async move {
+                report_box_closure(report, session, CLOSURE_REPORT_WATCH).await
+            });
         }
 
         // NET-079: the box's supervisor is moved into its leaf right after the
@@ -4560,8 +4696,8 @@ impl SessionLauncher for SandboxLauncher {
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
-        let net_guard: Option<Box<dyn sandbox2::NetGuard>> = {
-            let spawned = sandbox2::Spawned::from_child(process.get_mut());
+        let net_guard: Option<Box<dyn sandbox::NetGuard>> = {
+            let spawned = sandbox::Spawned::from_child(process.get_mut());
             match planned.attach(spawned).await {
                 // The guard owns the release now; it detaches at session end.
                 Ok(guard) => Some(guard),
@@ -4594,6 +4730,30 @@ impl SessionLauncher for SandboxLauncher {
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::switch::live_gate);
+        // Design §7.1: a box that attached while the hostname proxy was not
+        // serving past the settle was compiled with no node-address opening
+        // (fail closed rather than at a port the proxy may not hold), so it
+        // cannot reach the hostname proxy until it restarts. Said in the
+        // session's own terminal — the person whose `HTTP(S)_PROXY` requests
+        // will not route is told why and what clears it — beside the
+        // daemon's warning. Best-effort, like the banner notices above.
+        if let (Some(fd), Some(lease)) = (late_notice_fd, lease)
+            && net_switch.lock().await.hostname_proxy_stranded(lease)
+        {
+            use std::io::Write as _;
+            let written = std::fs::File::from(fd).write_all(
+                b"minimal: the hostname proxy was not serving yet when this session's \
+                  box attached, so the box cannot reach it (*.min.internal requests \
+                  through HTTP(S)_PROXY will not route); restart the session once the \
+                  daemon's hostname proxy serves\r\n",
+            );
+            if let Err(e) = written {
+                tracing::debug!(
+                    error = %e,
+                    "could not print the hostname-proxy notice to the terminal"
+                );
+            }
+        }
         if matches!(network_mode, NetworkMode::OwnIp)
             && (lease.is_none() || published.is_none() || gate.is_none())
         {
@@ -4644,6 +4804,7 @@ impl SessionLauncher for SandboxLauncher {
                     control,
                     gate,
                     self.publications,
+                    self.state_dir,
                 ))
             }
             _ => None,
@@ -4673,6 +4834,7 @@ impl SessionLauncher for SandboxLauncher {
             // host that runs the box: taken when the host builds, so a
             // cancelled launch's plan never reaches any host at all.
             listen_plan,
+            start_gate,
         })
     }
 }
@@ -4756,7 +4918,7 @@ pub(crate) struct MockLauncher {
     /// Attached to the launched process as `Launched::net_guard`, so a test can
     /// observe network teardown; `None` for the plain mock (mirroring
     /// `HostNet`/`NoNet`).
-    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    net_guard: Option<Box<dyn sandbox::NetGuard>>,
     /// The placement outcome this mock launch reports (NET-079): seeded by
     /// the session's test launcher from the daemon's one node fact —
     /// `per_box` when the fact's cause says the tree is there to place a
@@ -4777,7 +4939,7 @@ pub(crate) struct MockLauncher {
 #[cfg(test)]
 impl MockLauncher {
     /// A mock that attaches `net_guard`, for the network-teardown tests.
-    pub(crate) fn with_net_guard(net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+    pub(crate) fn with_net_guard(net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             net_guard: Some(net_guard),
             host_ip_enforcement: None,
@@ -4798,7 +4960,7 @@ impl MockLauncher {
 
     /// This mock with `net_guard` attached as well, so a test can observe
     /// the teardown of a host-address box's launch.
-    pub(crate) fn and_net_guard(self, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+    pub(crate) fn and_net_guard(self, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             net_guard: Some(net_guard),
             ..self
@@ -4874,6 +5036,9 @@ impl SessionLauncher for MockLauncher {
             // The plan the launch gathered, riding to the host the way a
             // real launch's plan rides: taken when the host builds.
             listen_plan: self.listen_plan,
+            // The mock's process is a plain host child with no pre-exec
+            // closure to hold it.
+            start_gate: None,
         })
     }
 }
@@ -4892,6 +5057,10 @@ pub(crate) struct HostParams {
     pub control: Option<SessionControl>,
     pub delta: Option<Arc<DeltaSource>>,
     pub archives_dir: std::path::PathBuf,
+    /// Whether the session's record carries host-handed addresses (T66): the
+    /// box is registered, so its host-side row ends with this host's shell
+    /// (NET-138). The shell-exit prompt words its Keep item for that.
+    pub holds_host_row: bool,
     pub session_id: sessions::SessionId,
     pub composition: Option<Arc<sessions::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
@@ -5143,7 +5312,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // launch's own, set once by `build` and never updated, and the
         // host's attrs stay what `get_attrs` serves for the session's life.
         let host_ip_enforcement = host.attrs.host_ip_enforcement;
-        let task = tokio::spawn(host.mainloop());
+        // The host loop outlives the exec or attach that launched it: its own
+        // root, linked to that request. Without it, `session host killed on
+        // request` minutes later still named the first exec's command.
+        let root = tracing::info_span!(
+            parent: None,
+            "session.host",
+            session_id = %host.session_id,
+            session = %host.session_name,
+        );
+        let task = crate::traced::spawn_detached(root, host.mainloop());
         Ok((handle, task, host_ip_enforcement))
     }
 
@@ -5163,6 +5341,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             control,
             delta,
             archives_dir,
+            holds_host_row,
             session_id,
             composition,
             connection_env,
@@ -5195,6 +5374,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             leaf,
             host_ip_enforcement,
             listen_plan,
+            start_gate,
         } = launcher
             .launch(
                 crate::guest::is_microvm_daemon(),
@@ -5290,10 +5470,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
+            holds_host_row,
             connection_env,
             home_dir,
             seal_injection,
             leaf,
+            start_gate,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
             chord_flush_deadline: None,
             guard,
@@ -5391,6 +5573,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no prompt at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
+                // Read before `take_if` below can empty `pending`: with no
+                // stashed pty error, the only way `step` errs is
+                // `Message::Kill`, so the end was asked for.
+                let requested = pending.is_none();
 
                 // Notify *before* the reap when the process may still be
                 // running, because `wait` below is unbounded — see
@@ -5413,14 +5599,29 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // hakoniwa's own account is logged from the process handle,
                 // which has no span and so names no session, and the binding's
                 // prompt line never happens with nothing attached.
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    session = %self.session_name,
-                    ?code,
-                    abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
-                    exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
-                    "session process reaped after pty/step error",
-                );
+                //
+                // A requested teardown is logged at info: its SIGKILL reaps
+                // with the same abnormal reason an OOM kill does, and a warn
+                // for every destroy would bury the deaths nobody asked for.
+                if requested {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after requested teardown",
+                    );
+                } else {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after pty/step error",
+                    );
+                }
 
                 // Otherwise notify *after* it, which is the whole point: only
                 // the reap can say whether that shell exited or was killed, and
@@ -5701,7 +5902,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                 // decide `is_alive` would report a live host
                                 // dead.
                                 Ok(()) => {
-                                    tokio::spawn(async move {
+                                    crate::traced::spawn(async move {
                                         // The binding dropping mid-prompt — a
                                         // detach, a shed, a daemon shutdown —
                                         // is the nobody-attached case again.
@@ -5747,7 +5948,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         // they run.
                         let root = self.workspace_root.clone();
                         let delta = self.delta.clone();
-                        tokio::spawn(async move {
+                        crate::traced::spawn(async move {
                             let _ = s.send(crate::session_delta::assess(root, delta).await);
                         });
                     }
@@ -6053,6 +6254,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             self.delta.clone(),
             self.session_name.clone(),
             self.archives_dir.clone(),
+            self.holds_host_row,
         )
         .await;
 
@@ -6068,6 +6270,19 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         }
 
         self.set_size(sz);
+
+        // A host minted for hooks holds its shell at the start gate until a
+        // client is here for it: released now, with the binding installed and
+        // the pty sized, so the shell's startup runs after the activate hooks
+        // and on the terminal that attached — the order a shell minted by an
+        // attach has always had.
+        if let Some(gate) = self.start_gate.take() {
+            tracing::info!(
+                session = %self.session_name,
+                "released the hook-launched session shell to start for the attaching client"
+            );
+            gate.release();
+        }
 
         // After the binding is installed and sized, so a hook writing to
         // the terminal reaches the client that just attached.

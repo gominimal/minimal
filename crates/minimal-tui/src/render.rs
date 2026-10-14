@@ -493,53 +493,79 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
             "No network policy (NoNet)",
             Style::default().fg(Color::Gray),
         ));
+        // A lane the box declared is still shown, marked as not in effect,
+        // as `min session policy` shows it (NET-134).
+        if let Some(network) = network
+            && detail
+                .and_then(|d| d.policy.as_ref())
+                .is_some_and(|p| p.credentialed_upstream.is_some())
+        {
+            lines.push(Line::raw(format!(
+                "  {}",
+                sessions::CredentialedUpstream::policy_row(network)
+            )));
+        }
     } else {
         match detail.and_then(|d| d.policy.as_ref()) {
-            None => lines.push(Line::styled(
-                "loading policy…",
-                Style::default().fg(Color::Gray),
-            )),
+            None => match detail.and_then(|d| d.policy_error.as_deref()) {
+                // Named, not left loading: an older daemon without the
+                // effective-policy RPC lands here, and "loading" would wait
+                // on an answer that never comes.
+                Some(error) => lines.push(Line::styled(
+                    format!("policy unavailable: {error}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                None => lines.push(Line::styled(
+                    "loading policy…",
+                    Style::default().fg(Color::Gray),
+                )),
+            },
             Some(policy) => {
                 lines.push(Line::styled(
                     "egress",
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
-                match &policy.egress {
-                    None => lines.push(Line::raw("  allow-all")),
-                    // A declared deny-all — every allow list present and
-                    // empty — prints by name, as `min session policy` does,
-                    // never as rows of blankness.
-                    Some(egress)
-                        if egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
-                            && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-                            && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty) =>
-                    {
-                        lines.push(Line::raw("  deny-all"));
+                // The verdict by name, from the same `sessions` helper
+                // `min session policy` prints: a default marked as one, a
+                // declared deny-all unmarked (the box chose it), never rows
+                // of blankness.
+                if let Some(label) = policy.egress.summary_label() {
+                    lines.push(Line::raw(format!("  {label}")));
+                } else if let sessions::EffectiveEgress::Declared(egress) = &policy.egress {
+                    policy_list(&mut lines, "subnets", &egress.allow_subnets);
+                    policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
+                    match &egress.allow_protocols {
+                        None => lines.push(Line::raw("  protocols  allow-all")),
+                        Some(protos) => lines.push(Line::raw(format!(
+                            "  protocols  {}",
+                            protos
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))),
                     }
-                    Some(egress) => {
-                        policy_list(&mut lines, "subnets", &egress.allow_subnets);
-                        policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
-                        match &egress.allow_protocols {
-                            None => lines.push(Line::raw("  protocols  allow-all")),
-                            Some(protos) => lines.push(Line::raw(format!(
-                                "  protocols  {}",
-                                protos
-                                    .iter()
-                                    .map(|p| p.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ))),
-                        }
-                        // The denied ranges are subtractive — carved out of
-                        // what the allow fields admit — so unlike the allow
-                        // fields an unset row means "nothing denied", not
-                        // "allow-all".
-                        match &egress.deny_subnets {
-                            None => lines.push(Line::raw("  deny subnets  (none)")),
-                            Some(subnets) => lines
-                                .push(Line::raw(format!("  deny subnets  {}", subnets.join(", ")))),
+                    // The denied ranges are subtractive — carved out of
+                    // what the allow fields admit — so unlike the allow
+                    // fields an unset row means "nothing denied", not
+                    // "allow-all".
+                    match &egress.deny_subnets {
+                        None => lines.push(Line::raw("  deny subnets  (none)")),
+                        Some(subnets) => {
+                            lines.push(Line::raw(format!("  deny subnets  {}", subnets.join(", "))))
                         }
                     }
+                }
+                // The credentialed-upstream lane (NET-134), in the row text
+                // `min session policy` prints: shown whenever the box
+                // declared it, marked where its mode leaves it without
+                // effect. A mode not yet loaded prints the unmarked row.
+                if policy.credentialed_upstream.is_some() {
+                    let row = network.map_or_else(
+                        || sessions::CredentialedUpstream::POLICY_ROW.to_string(),
+                        sessions::CredentialedUpstream::policy_row,
+                    );
+                    lines.push(Line::raw(format!("  {row}")));
                 }
                 // Ingress is an own-address surface: the switch's static
                 // forwarder is the only per-session ingress minimald applies,
@@ -584,6 +610,11 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
 fn policy_list(lines: &mut Vec<Line>, label: &str, values: &Option<Vec<String>>) {
     match values {
         None => lines.push(Line::raw(format!("  {label}  allow-all"))),
+        // Present and empty grants nothing in its dimension — the shape an
+        // absent destination list resolves to (NET-074) — and is spelled
+        // `(none)`, the spelling `min session policy` prints, never a blank
+        // value.
+        Some(values) if values.is_empty() => lines.push(Line::raw(format!("  {label}  (none)"))),
         Some(values) => lines.push(Line::raw(format!("  {label}  {}", values.join(", ")))),
     }
 }
@@ -897,6 +928,7 @@ mod tests {
             status: sessions::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }
     }
@@ -992,6 +1024,127 @@ mod tests {
         assert!(
             !out.contains("hidden-sess"),
             "collapsed session leaked:\n{out}"
+        );
+    }
+
+    /// The Policy pane's text for one session with this mode and policy.
+    fn policy_text(network: sessions::NetworkMode, policy: sessions::SessionPolicy) -> String {
+        let key = SessionKey {
+            provider: "host".to_string(),
+            id: sid(1),
+        };
+        let record = sessions::Record {
+            id: sid(1),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/src/x").unwrap(),
+            network,
+            policy: policy.clone(),
+            status: sessions::SessionStatus::Active,
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: None,
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            attrs: std::collections::BTreeMap::new(),
+        };
+        let mut model = Model::new(Utc::now());
+        model.details.insert(
+            key.clone(),
+            crate::app::Detail {
+                record: Some(record),
+                policy: Some(sessions::EffectiveSessionPolicy {
+                    egress: policy
+                        .egress
+                        .clone()
+                        .map_or(sessions::EffectiveEgress::DenyAll, |egress| {
+                            sessions::EffectiveEgress::Declared(egress)
+                        }),
+                    ingress: policy.ingress.clone(),
+                    credentialed_upstream: policy.credentialed_upstream.clone(),
+                }),
+                policy_error: None,
+            },
+        );
+        policy_lines(&model, &key)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// NET-074: a destination list resolved to present and empty is spelled
+    /// `(none)` in the pane, as `min session policy` spells it, never left
+    /// blank — a names-only box shows its names and no subnet reach, a
+    /// subnets-only box the reverse.
+    #[test]
+    fn policy_pane_spells_a_resolved_empty_list_as_none() {
+        let pane = |allow_subnets: Vec<&str>, allow_dns_hosts: Vec<&str>| {
+            let list = |entries: Vec<&str>| Some(entries.into_iter().map(String::from).collect());
+            policy_text(
+                sessions::NetworkMode::OwnIp,
+                sessions::SessionPolicy {
+                    egress: Some(sessions::EgressPolicy {
+                        allow_subnets: list(allow_subnets),
+                        allow_dns_hosts: list(allow_dns_hosts),
+                        allow_protocols: None,
+                        deny_subnets: None,
+                    }),
+                    ingress: None,
+                    credentialed_upstream: None,
+                },
+            )
+        };
+
+        let names_only = pane(vec![], vec!["github.com"]);
+        assert!(
+            names_only.contains("egress\n  subnets  (none)\n  dns hosts  github.com\n"),
+            "a names-only box must spell its empty subnets row, got:\n{names_only}"
+        );
+        let subnets_only = pane(vec!["10.0.0.0/8"], vec![]);
+        assert!(
+            subnets_only.contains("egress\n  subnets  10.0.0.0/8\n  dns hosts  (none)\n"),
+            "a subnets-only box must spell its empty names row, got:\n{subnets_only}"
+        );
+    }
+
+    /// NET-134: the pane shows a declared credentialed-upstream lane in the
+    /// same row text `min session policy` prints — unmarked on an
+    /// own-address box, marked as not in effect on a host-address one —
+    /// and prints no row for a box that declared no lane.
+    #[test]
+    fn policy_pane_shows_the_credentialed_upstream_lane_when_declared() {
+        let laned = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+        };
+        let unlaned = sessions::SessionPolicy {
+            credentialed_upstream: None,
+            ..laned.clone()
+        };
+
+        let own = policy_text(sessions::NetworkMode::OwnIp, laned.clone());
+        assert!(
+            own.contains(
+                "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
+            ),
+            "a laned own-address box must show the lane row, got:\n{own}"
+        );
+
+        let bare = policy_text(sessions::NetworkMode::OwnIp, unlaned);
+        assert!(
+            !bare.contains("credentialed upstream"),
+            "a box without a lane must show no lane row, got:\n{bare}"
+        );
+
+        let host = policy_text(sessions::NetworkMode::HostNet, laned);
+        assert!(
+            host.contains(
+                "  credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+            ),
+            "a laned host-address box must show the lane, marked, got:\n{host}"
         );
     }
 }

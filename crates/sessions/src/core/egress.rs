@@ -2132,6 +2132,19 @@ impl ReplyFlows {
     pub fn refused_at_cap(&self) -> u64 {
         self.refused_at_cap
     }
+
+    /// Whether a record live at `now` names `peer` as its client — the
+    /// address-reuse check's question: a conversation the box is still in
+    /// with that address, one neither side's FIN or RST has ended and the
+    /// record's timers have not expired, holds the address against being
+    /// handed to anyone else. Read-only, like [`Self::record_of`]: an
+    /// expired record is not swept here, only answered `false`.
+    #[must_use]
+    pub fn names_peer(&self, peer: [u8; 4], now: Instant) -> bool {
+        self.flows
+            .iter()
+            .any(|(tuple, record)| tuple.src == peer && record.deadline > now)
+    }
 }
 
 impl Default for ReplyFlows {

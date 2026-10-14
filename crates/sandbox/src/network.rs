@@ -5,11 +5,11 @@
 //! [`Config::with_network`](crate::Config::with_network). The built-in
 //! [`HostNet`]/[`NoNet`] cover the consumer-agnostic modes; richer modes (e.g.
 //! an own-IP gvproxy switch attach) are supplied by consumers as out-of-crate
-//! `impl Network`, keeping switch/tap/relay logic out of `sandbox2`.
+//! `impl Network`, keeping switch/tap/relay logic out of `sandbox`.
 //!
 //! This respects the deployment-model ownership rule (spec R1.4): the gvproxy
 //! **process** is owned by `minimald` (DM2) or `minvmd` (DM1/3/4), never by
-//! `sandbox2`. `sandbox2` only decides netns isolation (pre-spawn) and invokes
+//! `sandbox`. `sandbox` only decides netns isolation (pre-spawn) and invokes
 //! the consumer-provided wiring against an already-running switch (post-spawn).
 
 use std::future::Future;
@@ -72,17 +72,20 @@ pub enum Resolver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketSeal {
     /// Admits the families the box's own network namespace confines — unix,
-    /// inet, inet6, netlink, packet — and refuses everything else with
-    /// `EAFNOSUPPORT`, the namespace-bypass families (`AF_VSOCK`) included,
-    /// so no socket reaches past the namespace. The seal every plan but
+    /// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only), packet — and
+    /// refuses every other family with `EAFNOSUPPORT`, the namespace-bypass
+    /// families (`AF_VSOCK`) included, and every other netlink protocol with
+    /// `EPROTONOSUPPORT`, so no socket reaches past the namespace. The seal every plan but
     /// [`NetPlan::none`] runs under, so an own-address or host-address box
     /// keeps its inet sockets; `AF_PACKET` is admitted here and refused by
     /// the missing `CAP_NET_RAW` no box holds, as NET-083 binds.
     ConfinedFamilies,
     /// Admits the families the box's own network namespace confines — unix,
-    /// inet, inet6, netlink — so the box can use its own loopback, and
-    /// refuses every other family with `EAFNOSUPPORT`, the
-    /// namespace-bypass families (`AF_VSOCK`) included.  The `none` plan's
+    /// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only) — so the box
+    /// can use its own loopback, and refuses every other family with
+    /// `EAFNOSUPPORT`, the namespace-bypass families (`AF_VSOCK`) included,
+    /// and every other netlink protocol with `EPROTONOSUPPORT`.  The `none`
+    /// plan's
     /// seal: the namespace already holds only `lo`, so admitting inet
     /// blocks nothing the namespace does not already block.  It applies
     /// only inside that namespace; see [`SocketSeal::in_netns`].
@@ -194,7 +197,8 @@ impl NetPlan {
 
     /// A none box: an unshared network namespace that will never get a tap,
     /// with every socket family but the ones its own namespace confines
-    /// (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`) refused on top
+    /// (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` with `NETLINK_ROUTE`
+    /// only) refused on top
     /// (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
     /// [`NetPlan::isolated`], which an own-address box also starts from when
     /// its tap is moved in after spawn, this plan is the promise of no reach
@@ -289,7 +293,7 @@ impl Network for NetPlan {
     }
 }
 
-/// An error from [`Network::attach`]. Wraps a consumer error so `sandbox2` need
+/// An error from [`Network::attach`]. Wraps a consumer error so `sandbox` need
 /// not know the concrete failure type.
 #[derive(Debug)]
 pub struct NetworkError(pub Box<dyn std::error::Error + Send + Sync>);

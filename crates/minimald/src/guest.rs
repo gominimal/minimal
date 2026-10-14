@@ -16,8 +16,8 @@
 //!   is the hostname proxy's: the box zone is the VM host daemon's to answer
 //!   (NET-138), so no answerer port is ever handed to a guest.
 //!
-//! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
-//! reaping bites".
+//! pid 1 does not stay the daemon: it forks the daemon off and stays behind
+//! as an orphan reaper (see [`crate::reaper`]).
 
 use std::ffi::CString;
 use std::time::Duration;
@@ -31,7 +31,7 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 const BOOT_MARKER_PORT: u32 = 7350;
 
 /// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
-/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// devpts is capped at [`sandbox::config::BOX_PTY_MAX`] by its own remount,
 /// but every instance still draws from the one kernel-wide counter, so the
 /// pool must be large enough for several boxes at their cap plus the session
 /// host's own shells. 65536 is a working value.
@@ -89,6 +89,27 @@ pub fn handed_publish_generation() -> Option<u64> {
 /// Decodes a handed publish generation from its raw boot-token value.
 fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
     raw?.trim().parse::<u64>().ok()
+}
+
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its egress opt-out (NET-077): whether the operator opted the
+/// guest out of the deny-all egress default. Mirrors the token `minvmd`'s
+/// `vm.rs` writes — keep the two in step.
+pub const HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL_OPT_OUT";
+
+/// Whether the VM host handed this boot an egress opt-out (NET-077): the
+/// operator set the opt-out on the host, and the guest daemon runs the egress
+/// default its host was started with. Truthy like the host's reader
+/// (`1`/`true`/`yes`/`on`, case-insensitive) through the one parse both
+/// sides share ([`sessions::egress_deny_all_opt_out_from_raw`]); an absent
+/// token — an older minvmd, a native run — or any other value is `false`,
+/// the egress default.
+pub fn handed_egress_deny_all_opt_out() -> bool {
+    sessions::egress_deny_all_opt_out_from_raw(
+        std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// A boot token the host put a port on that does not carry one (NET-025):
@@ -168,14 +189,19 @@ pub fn probe_handed_node_port(proxy_port: Option<u16>) -> std::io::Result<()> {
 /// kernel runs the initramfs `/init` (this binary) as pid-1, and nothing else
 /// satisfies both halves.
 ///
-/// The lib side of the check `main` keeps for its own gating
-/// (`is_minimal_microvm` there, for `reboot(2)`): `argv[0]` is
+/// `main` gates on it too (`is_minimal_microvm` there, for `reboot(2)`):
+/// `argv[0]` is
 /// caller-controlled, so it cannot be trusted alone, and pid-1 alone is also
 /// no proof — a native daemon running as a container's init satisfies it. The
 /// classifier asks it one question only a guest answers "yes" to (design
 /// §7.1): a box this daemon cannot place is a box it refuses.
+///
+/// Also true in the daemon [`crate::reaper::split_init`] forks off the
+/// microVM's init, which is no longer pid 1 itself: only pid 1, having
+/// passed this same check, marks that child, so the mark stays unspoofable.
 pub fn is_microvm_daemon() -> bool {
-    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
+    crate::reaper::forked_from_microvm_init()
+        || is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
 }
 
 /// Pure form of [`is_microvm_daemon`], so the spoofing cases stay testable —
@@ -445,7 +471,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // the question is about.
     let mountinfo =
         std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
-    let delegated = sandbox2::classifier::host_cgroup2_mounts(&mountinfo)
+    let delegated = sandbox::classifier::host_cgroup2_mounts(&mountinfo)
         .into_iter()
         .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
     match (failure, delegated) {
@@ -1115,6 +1141,55 @@ fn set_nofile_limit(soft: libc::rlim_t, hard: libc::rlim_t) -> std::io::Result<(
         .ok_or_else(std::io::Error::last_os_error)
 }
 
+/// The VM-wide kernel settings the microVM's init writes at boot, as paths
+/// under `/proc/sys` and the values written to them.
+///
+/// Every box maps onto the daemon's one kernel uid, so these are shared by all
+/// the sessions on the VM, and the kernel defaults are sized for one user:
+///
+/// * inotify. Every watcher in every box (dev servers, `tsc --watch`, language
+///   servers) charges the same per-uid counters, which default to 128
+///   instances and a watch count scaled to 1% of guest RAM (~31k on a 4 GiB
+///   guest). One session's watchers would exhaust them for every other
+///   session. 8192 instances and 524288 watches are the common dev-machine
+///   values. They are ceilings, not reservations: a watch costs about 1 KiB of
+///   kernel memory on 64-bit only while it exists, charged to the memory cgroup
+///   of the box holding it, so the full 524288 (~512 MiB) is reached only by
+///   boxes that actually watch that many files.
+/// * the kernel log. With `dmesg_restrict` at 0 any box can read the VM's
+///   kernel log, which names other boxes' processes (OOM-kill records among
+///   them). At 1, reading it needs `CAP_SYSLOG`, which no box holds.
+pub const MICROVM_SYSCTLS: &[(&str, &str)] = &[
+    ("fs/inotify/max_user_instances", "8192"),
+    ("fs/inotify/max_user_watches", "524288"),
+    ("kernel/dmesg_restrict", "1"),
+];
+
+/// Writes [`MICROVM_SYSCTLS`] through `/proc/sys`. Best effort: a setting the
+/// kernel refuses is logged and the rest are still applied, since the kernel
+/// default is the prior behaviour, not a reason to refuse to boot.
+pub fn apply_microvm_sysctls() {
+    for (path, error) in write_sysctls(std::path::Path::new("/proc/sys"), MICROVM_SYSCTLS) {
+        tracing::warn!(sysctl = path, error = %error, "could not apply a VM-wide kernel setting");
+    }
+}
+
+/// Writes each `(path, value)` under `root`, continuing past failures, and
+/// returns the ones that failed.
+fn write_sysctls(
+    root: &std::path::Path,
+    settings: &[(&'static str, &str)],
+) -> Vec<(&'static str, std::io::Error)> {
+    settings
+        .iter()
+        .filter_map(|&(path, value)| {
+            std::fs::write(root.join(path), value)
+                .err()
+                .map(|e| (path, e))
+        })
+        .collect()
+}
+
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
 
 /// How far the guest's `CLOCK_REALTIME` may sit from the host's before we step
@@ -1327,12 +1402,14 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // daemon relay carries no gate, so it emits no deprecation notice; its
     // lease is the daemon's own address (NET-084: a frame out of this tap
     // whose source is anything else is rejected at the relay), and the
-    // subnet passed is the one the guest is configured on above.
-    let relay = switch::attach_to_switch_vsock(
+    // subnet passed is the one the guest is configured on above. It carries
+    // the node's DNS layer: every host-address box shares this namespace, so
+    // its lookups to the gateway leave through here and reach upstream only
+    // through that layer (NET-003).
+    let relay = switch::attach_node_to_switch_vsock(
         tap_fd,
         VSOCK_HOST_CID,
         VSOCK_GVPROXY_SHUTTLE_PORT,
-        None,
         ip,
         DEFAULT_SUBNET,
     )
@@ -1592,6 +1669,34 @@ mod tests {
         assert_eq!(parse_publish_generation(Some("42")), Some(42));
         assert_eq!(parse_publish_generation(None), None);
         assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
+
+    /// The egress opt-out the host handed is read off the boot line (NET-077):
+    /// a truthy token opts out, an absent or non-truthy one runs the default.
+    // SAFETY: env mutation here races only other reads of the same variable,
+    // and nextest runs every test in its own process.
+    #[test]
+    fn the_egress_opt_out_is_read_off_the_boot_line() {
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "1") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "true") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, " ON ") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        // Fail closed: anything outside the truthy set keeps the default.
+        for value in ["no", "0", "", "garbage", "enabled", "1x"] {
+            unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, value) };
+            assert!(
+                !handed_egress_deny_all_opt_out(),
+                "{value:?} must not opt out"
+            );
+        }
+
+        unsafe { std::env::remove_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN) };
+        assert!(!handed_egress_deny_all_opt_out());
     }
 
     /// The handed port is read off the environment the kernel passes
@@ -1914,5 +2019,52 @@ mod tests {
             before.rlim_max,
             "an unreachable request must still leave us at the hard limit",
         );
+    }
+
+    /// The boot settings raise the shared inotify ceilings to the dev-machine
+    /// values and restrict the kernel log, all as paths relative to
+    /// `/proc/sys` (an absolute one would make `join` drop the root).
+    #[test]
+    fn the_boot_sysctls_widen_inotify_and_restrict_the_kernel_log() {
+        let settings: std::collections::HashMap<_, _> = MICROVM_SYSCTLS.iter().copied().collect();
+        assert_eq!(
+            settings.len(),
+            MICROVM_SYSCTLS.len(),
+            "no setting is listed twice"
+        );
+        assert_eq!(settings["fs/inotify/max_user_instances"], "8192");
+        assert_eq!(settings["fs/inotify/max_user_watches"], "524288");
+        assert_eq!(settings["kernel/dmesg_restrict"], "1");
+        assert!(
+            MICROVM_SYSCTLS
+                .iter()
+                .all(|(path, _)| !path.starts_with('/')),
+            "every path must be relative to /proc/sys",
+        );
+    }
+
+    /// Each setting is written to its file under the root, and one the kernel
+    /// refuses (here, a missing file) is reported without stopping the rest.
+    #[test]
+    fn sysctls_are_written_under_the_root_past_a_failure() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["fs/inotify", "kernel"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        let settings = [
+            ("fs/inotify/max_user_watches", "524288"),
+            ("vm/missing", "1"),
+            ("kernel/dmesg_restrict", "1"),
+        ];
+
+        let failed = write_sysctls(root.path(), &settings);
+
+        assert_eq!(
+            failed.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            ["vm/missing"],
+        );
+        let read = |path: &str| std::fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read("fs/inotify/max_user_watches"), "524288");
+        assert_eq!(read("kernel/dmesg_restrict"), "1");
     }
 }

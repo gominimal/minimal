@@ -35,7 +35,7 @@ pub enum Error {
         code: i32,
         reason: String,
         stderr: String,
-        /// Last ~4 KiB of stdout (captured by sandbox2 alongside stderr).
+        /// Last ~4 KiB of stdout (captured by `sandbox` alongside stderr).
         /// Useful when build scripts redirect stderr away (e.g.
         /// `pip install ... 2>/dev/null || true`) and the real
         /// diagnostic only appears on stdout.
@@ -259,13 +259,13 @@ impl From<check::Error> for Error {
     }
 }
 
-impl From<sandbox2::Error> for Error {
-    fn from(value: sandbox2::Error) -> Self {
+impl From<sandbox::Error> for Error {
+    fn from(value: sandbox::Error) -> Self {
         match value {
-            sandbox2::Error::IO(s, p, e) => Self::IO(s, p, e),
-            sandbox2::Error::HardlinkFailed(e) => e.into(),
-            sandbox2::Error::Execution(e) => match e {
-                sandbox2::error::ExecutionError::InvocationFailed {
+            sandbox::Error::IO(s, p, e) => Self::IO(s, p, e),
+            sandbox::Error::HardlinkFailed(e) => e.into(),
+            sandbox::Error::Execution(e) => match e {
+                sandbox::error::ExecutionError::InvocationFailed {
                     idx,
                     code,
                     reason,
@@ -279,25 +279,25 @@ impl From<sandbox2::Error> for Error {
                     stdout,
                 },
                 #[cfg(target_os = "linux")]
-                sandbox2::error::ExecutionError::SpawnFailed(e) => {
+                sandbox::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }
-                sandbox2::error::ExecutionError::Cancelled => {
+                sandbox::error::ExecutionError::Cancelled => {
                     Self::Other(anyhow::anyhow!("execution cancelled"))
                 }
-                sandbox2::error::ExecutionError::MountError { .. } => {
+                sandbox::error::ExecutionError::MountError { .. } => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
-                sandbox2::error::ExecutionError::NetworkIsolationUnavailable => {
+                sandbox::error::ExecutionError::NetworkIsolationUnavailable => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
             },
-            sandbox2::Error::Output(e) => Self::Other(e.into()),
-            sandbox2::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
+            sandbox::Error::Output(e) => Self::Other(e.into()),
+            sandbox::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
                 "internal: file {} mapped to rootfs",
                 p.display()
             )),
-            sandbox2::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
+            sandbox::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
         }
     }
 }
@@ -315,18 +315,39 @@ impl From<common::HardlinkError> for Error {
 
 impl From<rcache::Error<common::fetchers::AnyRespError>> for Error {
     fn from(value: rcache::Error<common::fetchers::AnyRespError>) -> Self {
-        // The two arms are NOT interchangeable, though they look it:
-        // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
-        // Debug-formats itself — so the fallback arm renders a `Config` as
-        // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
-        // variant name and escaped quotes included. Destructuring `Config` and
-        // formatting the inner `msg` is what yields the clean, user-facing
-        // message; collapsing this to one arm reintroduces the panic-era output
-        // it replaced.
-        match value {
-            rcache::Error::Config(msg) => Self::Other(anyhow::anyhow!("{msg}")),
-            other => Self::Other(anyhow::anyhow!("{other}")),
-        }
+        Self::Other(rcache_cause(value))
+    }
+}
+
+/// Renders an `rcache::Error` as a user-facing cause.
+fn rcache_cause(value: rcache::Error<common::fetchers::AnyRespError>) -> anyhow::Error {
+    // The two arms are NOT interchangeable, though they look it:
+    // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
+    // Debug-formats itself — so the fallback arm renders a `Config` as
+    // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
+    // variant name and escaped quotes included. Destructuring `Config` and
+    // formatting the inner `msg` is what yields the clean, user-facing
+    // message; collapsing this to one arm reintroduces the panic-era output
+    // it replaced.
+    match value {
+        rcache::Error::Config(msg) => anyhow::anyhow!("{msg}"),
+        other => anyhow::anyhow!("{other}"),
+    }
+}
+
+/// The error for a failed remote artifact cache setup: the rcache cause under
+/// a fixed context line, with `hint` in parentheses when the caller's user
+/// has a switch to name. Render it with `{:#}` to keep the cause.
+pub fn remote_cache_setup_error(
+    e: rcache::Error<common::fetchers::AnyRespError>,
+    hint: Option<&str>,
+) -> anyhow::Error {
+    let cause = rcache_cause(e);
+    match hint {
+        Some(hint) => cause.context(format!(
+            "failed to set up the remote artifact cache ({hint})"
+        )),
+        None => cause.context("failed to set up the remote artifact cache"),
     }
 }
 
@@ -343,6 +364,31 @@ mod tests {
         assert_eq!(
             Error::MFile(mfile::Error::NotFound).to_string(),
             "minimal.toml: not found",
+        );
+    }
+
+    /// A remote cache setup failure keeps its cause under `{:#}`, rendered
+    /// from rcache's `Config` message rather than its Debug form.
+    #[test]
+    fn remote_cache_setup_error_keeps_clean_cause() {
+        let err = remote_cache_setup_error(rcache::Error::Config("bad url".into()), None);
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to set up the remote artifact cache: bad url",
+        );
+    }
+
+    /// The caller's hint lands in parentheses on the context line.
+    #[test]
+    fn remote_cache_setup_error_carries_hint() {
+        let err = remote_cache_setup_error(
+            rcache::Error::Config("bad url".into()),
+            Some("pass --no-fetch to build without it"),
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to set up the remote artifact cache \
+             (pass --no-fetch to build without it): bad url",
         );
     }
 }

@@ -11,7 +11,7 @@ use globset::GlobSet;
 use graph::{BuildDep, BuildSpec, BuildSpecRef, SubsetInput, Transitives};
 use lcache::{CacheErr, MetaInner, PendingDir};
 use ot::{OpTracker, Operation};
-use sandbox2::config::SandboxMapped;
+use sandbox::config::SandboxMapped;
 use tracing::info;
 
 /// The return value of a successful build of a build-spec.
@@ -208,14 +208,14 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     #[cfg(target_os = "linux")]
     async fn execute_in_sandbox(
         &mut self,
-        sandbox: &mut sandbox2::Sandbox<()>,
+        sandbox: &mut sandbox::Sandbox<()>,
         build: &BuildSpec,
     ) -> Result<(), Error> {
         sandbox
             .run_with_cancel(
                 self.invocations(build)?
                     .into_iter()
-                    .map(|(program, args)| sandbox2::config::Invocation {
+                    .map(|(program, args)| sandbox::config::Invocation {
                         executable: program,
                         args,
                         envs: Default::default(),
@@ -233,7 +233,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     #[cfg(not(target_os = "linux"))]
     async fn execute_in_sandbox(
         &mut self,
-        _sandbox: &mut sandbox2::Sandbox<()>,
+        _sandbox: &mut sandbox::Sandbox<()>,
         _build: &BuildSpec,
     ) -> Result<(), Error> {
         Err(crate::sandbox_unsupported())
@@ -310,7 +310,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         let channel = ();
 
-        let mut config = sandbox2::config::Config::new(&build.name)
+        let mut config = sandbox::config::Config::new(&build.name)
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
             .with_dns(needs_dns)
@@ -319,9 +319,9 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             // rather than as a mode: a build is not a PTask and has never had
             // one, and the sandbox layer acts on plans.
             .with_plan(if !needs_dns && !needs_internet {
-                sandbox2::NetPlan::isolated()
+                sandbox::NetPlan::isolated()
             } else {
-                sandbox2::NetPlan::host()
+                sandbox::NetPlan::host()
             });
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
