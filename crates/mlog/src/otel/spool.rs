@@ -122,15 +122,14 @@ pub(crate) fn dir() -> Option<PathBuf> {
 /// `MINIMAL_OTEL_SPOOL_DIR` says: where a refused directory falls back to
 /// ([`SpoolFile::open`]).
 pub(crate) fn state_dir_spool() -> Option<PathBuf> {
-    // minimal_state_dir panics when no home can be resolved: no spool then.
-    std::panic::catch_unwind(paths::minimal_state_dir)
-        .ok()
-        .map(|d| {
-            d.as_utf8_path()
-                .as_std_path()
-                .join("telemetry")
-                .join("spool")
-        })
+    // No state or home directory: no spool then, and no panic to catch (a
+    // caught one still ran the panic hook, and `panic = "abort"` has none).
+    paths::try_minimal_state_dir().map(|d| {
+        d.as_utf8_path()
+            .as_std_path()
+            .join("telemetry")
+            .join("spool")
+    })
 }
 
 /// Why a spool directory is not written to.
