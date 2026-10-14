@@ -109,6 +109,43 @@ someone touches it.
   baseline the gate is `not_evaluated` and the report says so.
 - A gate over a block that was not measured is `not_evaluated`, never `pass`.
 
+## Dashboard and history
+
+The nightly run appends its snapshot to the `metrics-data` branch as
+`<date>-<sha7>.json`, so the file names sort chronologically and say when a
+snapshot was taken without opening it. The scripts below read that directory
+and nothing else.
+
+`scripts/metrics/dashboard.py <history> <out>` writes one self-contained
+`index.html`: inline SVG, a style block, no script, nothing fetched, so it
+opens from a file or a static host and renders in a sandbox with no network.
+It charts, over snapshot date, the workspace coverage of lines, the strict
+and complexity lint totals, the unused dependencies, the lines of code, and
+the layer edges carried as exceptions beside the unexcepted ones. Every chart
+has a heading and a table of the values it draws directly below it, so the
+numbers are reachable without the picture. A metric a snapshot did not
+measure is a gap in the line, never a zero. From the newest snapshot the page
+also lists the gates with their results, the top hotspots with their
+components, and the strict lints at zero that are ready to promote. Files
+that fail `schema.py` are skipped and named on the page. The page carries no
+timestamp: the same history renders the same bytes, and it reads in light
+and dark mode.
+
+`scripts/metrics/prune.py <history>` keeps every snapshot dated within ninety
+days of the newest one and, beyond that, the earliest snapshot of each
+calendar month; everything else is removed, decided from the file names
+alone. `--dry-run` prints what would go, `--today YYYY-MM-DD` moves the
+reference date.
+
+| Command | What it does |
+|---|---|
+| `just metrics-dashboard` | Renders `.scratch/metrics/history` into `.scratch/metrics/dashboard/index.html`. |
+| `just metrics-prune` | Prunes `.scratch/metrics/history` in place; `just metrics-prune .scratch/metrics/history --dry-run` only lists. |
+
+Both take the history directory as their first argument, to read another
+checkout of the branch: `just metrics-dashboard path/to/history`. The fixture
+history for the harness lives under `scripts/metrics/testdata/history/`.
+
 ## Writing about it
 
 Prose here and in the spec is Vale-linted. Name the items or point at the

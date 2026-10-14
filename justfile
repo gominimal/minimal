@@ -362,6 +362,25 @@ metrics MODE="full" *args:
 metrics-layers:
     python3 scripts/metrics/layers.py --rules metrics/layers.toml
 
+# HISTORY is a checkout of the `metrics-data` branch: one <date>-<sha7>.json per
+# nightly snapshot. The nightly job fetches origin/metrics-data into
+# .scratch/metrics/history (a later change adds that script); point HISTORY at
+# any other checkout. The page is one self-contained index.html, inline SVG,
+# no script, nothing fetched; every chart has a table of its values below it.
+#
+# Render the quality dashboard from a snapshot history into .scratch/metrics/dashboard/.
+metrics-dashboard HISTORY=".scratch/metrics/history":
+    python3 scripts/metrics/dashboard.py {{HISTORY}} .scratch/metrics/dashboard
+
+# Keeps every snapshot of the last ninety days and the earliest of each month
+# beyond that, decided from the file names alone (QM-015). `--dry-run` lists
+# without deleting; `--today YYYY-MM-DD` sets the reference date (default: the
+# newest snapshot's).
+#
+# Prune a snapshot history to daily for ninety days, then monthly.
+metrics-prune HISTORY=".scratch/metrics/history" *args:
+    python3 scripts/metrics/prune.py {{HISTORY}} {{args}}
+
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
 #

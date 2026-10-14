@@ -1,0 +1,356 @@
+{
+ "crates": {
+  "common": {
+   "clippy": {
+    "complexity": {
+     "cognitive_complexity": 1,
+     "too_many_arguments": 0,
+     "too_many_lines": 0
+    },
+    "complexity_total": 1,
+    "strict": {
+     "clippy::indexing_slicing": 1,
+     "clippy::mem_forget": 1,
+     "clippy::unwrap_used": 2
+    },
+    "strict_total": 4,
+    "workspace_lints": 0
+   },
+   "coverage": {
+    "functions": {
+     "covered": 30,
+     "pct": 75.0,
+     "total": 40
+    },
+    "lines": {
+     "covered": 300,
+     "pct": 75.0,
+     "total": 400
+    },
+    "regions": {
+     "covered": 60,
+     "pct": 75.0,
+     "total": 80
+    }
+   },
+   "crap": null,
+   "deps": {
+    "internal": [],
+    "unused": [
+     "serde"
+    ]
+   },
+   "experimental": null,
+   "layer": "leaf",
+   "modules": {
+    "acyclic": true,
+    "error": null,
+    "orphans": 0
+   },
+   "mutants": null,
+   "size": {
+    "blanks": 20,
+    "code": 400,
+    "comments": 40,
+    "files": 3,
+    "test_code": 100
+   }
+  },
+  "graph": {
+   "clippy": {
+    "complexity": {
+     "cognitive_complexity": 1,
+     "too_many_arguments": 0,
+     "too_many_lines": 1
+    },
+    "complexity_total": 2,
+    "strict": {
+     "clippy::indexing_slicing": 2,
+     "clippy::mem_forget": 0,
+     "clippy::unwrap_used": 3
+    },
+    "strict_total": 5,
+    "workspace_lints": 0
+   },
+   "coverage": {
+    "functions": {
+     "covered": 50,
+     "pct": 55.56,
+     "total": 90
+    },
+    "lines": {
+     "covered": 500,
+     "pct": 55.56,
+     "total": 900
+    },
+    "regions": {
+     "covered": 100,
+     "pct": 55.56,
+     "total": 180
+    }
+   },
+   "crap": null,
+   "deps": {
+    "internal": [],
+    "unused": []
+   },
+   "experimental": null,
+   "layer": "build",
+   "modules": {
+    "acyclic": true,
+    "error": null,
+    "orphans": 0
+   },
+   "mutants": null,
+   "size": {
+    "blanks": 45,
+    "code": 900,
+    "comments": 90,
+    "files": 3,
+    "test_code": 225
+   }
+  },
+  "mip": {
+   "clippy": {
+    "complexity": {
+     "cognitive_complexity": 2,
+     "too_many_arguments": 1,
+     "too_many_lines": 1
+    },
+    "complexity_total": 4,
+    "strict": {
+     "clippy::indexing_slicing": 3,
+     "clippy::mem_forget": 0,
+     "clippy::unwrap_used": 4
+    },
+    "strict_total": 7,
+    "workspace_lints": 0
+   },
+   "coverage": {
+    "functions": {
+     "covered": 60,
+     "pct": 50.0,
+     "total": 120
+    },
+    "lines": {
+     "covered": 600,
+     "pct": 50.0,
+     "total": 1200
+    },
+    "regions": {
+     "covered": 120,
+     "pct": 50.0,
+     "total": 240
+    }
+   },
+   "crap": null,
+   "deps": {
+    "internal": [],
+    "unused": [
+     "anyhow"
+    ]
+   },
+   "experimental": null,
+   "layer": "product",
+   "modules": {
+    "acyclic": true,
+    "error": null,
+    "orphans": 0
+   },
+   "mutants": null,
+   "size": {
+    "blanks": 60,
+    "code": 1200,
+    "comments": 120,
+    "files": 3,
+    "test_code": 300
+   }
+  }
+ },
+ "gates": {
+  "ceiling:clippy.workspace_lints": {
+   "kind": "ceiling",
+   "result": "pass",
+   "threshold": 0,
+   "value": 0
+  },
+  "ceiling:layers.unassigned": {
+   "kind": "ceiling",
+   "result": "pass",
+   "threshold": 0,
+   "value": 0
+  },
+  "ceiling:layers.unexcepted": {
+   "kind": "ceiling",
+   "result": "fail",
+   "threshold": 0,
+   "value": 1
+  },
+  "ceiling:modules.cycles": {
+   "kind": "ceiling",
+   "result": "pass",
+   "threshold": 0,
+   "value": 0
+  },
+  "floor:coverage.lines_pct": {
+   "kind": "floor",
+   "result": "pass",
+   "threshold": 50.0,
+   "value": 56.0
+  },
+  "ratchet:clippy.strict.total": {
+   "baseline": null,
+   "baseline_sha7": null,
+   "direction": "down",
+   "kind": "ratchet",
+   "result": "not_evaluated",
+   "tolerance": 0,
+   "value": 16
+  }
+ },
+ "git": {
+  "dirty": false,
+  "ref": "main",
+  "sha": "1a2b3c41a2b3c41a2b3c41a2b3c41a2b3c4abcde",
+  "sha7": "1a2b3c4"
+ },
+ "hotspots": {
+  "candidates": 3,
+  "coverage_included": true,
+  "files": [
+   {
+    "churn": 12,
+    "complexity": 2,
+    "crate": "mip",
+    "path": "crates/mip/src/main.rs",
+    "score": 108.0,
+    "strict": 4,
+    "uncovered_lines": 300
+   },
+   {
+    "churn": 6,
+    "complexity": 1,
+    "crate": "graph",
+    "path": "crates/graph/src/plan.rs",
+    "score": 36.0,
+    "strict": 3,
+    "uncovered_lines": 200
+   },
+   {
+    "churn": 3,
+    "complexity": 1,
+    "crate": "common",
+    "path": "crates/common/src/lib.rs",
+    "score": 10.5,
+    "strict": 2,
+    "uncovered_lines": 50
+   }
+  ],
+  "findings_included": true,
+  "window_days": 90
+ },
+ "kind": "snapshot",
+ "layers": {
+  "edges": 3,
+  "exceptions": 2,
+  "stale_exceptions": [],
+  "unassigned": [],
+  "unexcepted": 1,
+  "unknown": [],
+  "violations": [
+   {
+    "excepted": true,
+    "from": "common",
+    "to": "graph"
+   },
+   {
+    "excepted": true,
+    "from": "common",
+    "to": "graph"
+   },
+   {
+    "excepted": false,
+    "from": "mip",
+    "to": "common"
+   }
+  ]
+ },
+ "run": {
+  "host": {
+   "arch": "x86_64",
+   "os": "linux"
+  },
+  "mode": "full",
+  "not_measured": {}
+ },
+ "schema_version": 1,
+ "scope": {
+  "crates": [
+   "common",
+   "graph",
+   "mip"
+  ],
+  "excluded": {}
+ },
+ "toolchain": {
+  "rustc": "1.90.0"
+ },
+ "tools": {
+  "cargo-llvm-cov": "0.6.0",
+  "tokei": "12.1.2"
+ },
+ "verdict": "fail",
+ "workspace": {
+  "clippy": {
+   "complexity": {
+    "cognitive_complexity": 4,
+    "too_many_arguments": 1,
+    "too_many_lines": 2
+   },
+   "complexity_total": 7,
+   "scope_complete": true,
+   "strict": {
+    "clippy::indexing_slicing": 6,
+    "clippy::mem_forget": 1,
+    "clippy::unwrap_used": 9
+   },
+   "strict_total": 16,
+   "workspace_lints": 0
+  },
+  "coverage": {
+   "functions": {
+    "covered": 140,
+    "pct": 56.0,
+    "total": 250
+   },
+   "lines": {
+    "covered": 1400,
+    "pct": 56.0,
+    "total": 2500
+   },
+   "regions": {
+    "covered": 280,
+    "pct": 56.0,
+    "total": 500
+   }
+  },
+  "crates": 3,
+  "deps": {
+   "unused_total": 2,
+   "unused_workspace": []
+  },
+  "modules": {
+   "cycles": 0,
+   "errors": [],
+   "orphans": 0
+  },
+  "size": {
+   "blanks": 125,
+   "code": 2500,
+   "comments": 250,
+   "files": 9,
+   "test_code": 625
+  },
+  "strict_promotable": []
+ }
+}
