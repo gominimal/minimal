@@ -241,7 +241,7 @@ With telemetry off, that file is the only change to `min bug`.
 
 | Scope | How |
 |---|---|
-| One command | Unset `MINIMAL_TELEMETRY`, or set `DO_NOT_TRACK` to any value, or set `OTEL_SDK_DISABLED=true`. |
+| One command | Unset `MINIMAL_TELEMETRY`, or set `DO_NOT_TRACK` to any non-empty value, or set `OTEL_SDK_DISABLED=true`. |
 | The daemons | Run `min stop` and start the next command from a shell where telemetry is off. A running daemon keeps the setting it started with, and records nothing for a command that runs with telemetry off. |
 | One signal | `MINIMAL_OTEL_TRACES_EXPORTER=none` or `MINIMAL_OTEL_LOGS_EXPORTER=none`. |
 | The spool only | `MINIMAL_OTEL_SPOOL=0`. |

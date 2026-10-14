@@ -59,8 +59,9 @@ joins the outer trace through the daemon. The host `min` is different: with
 its telemetry off it sends the opt-out and no `TRACEPARENT` (TEL-045). `minvmd` and the guest daemon adopt an inbound
 context only while they export.
 
-A `min` whose telemetry decision is off, for any cause, sends an explicit
-opt-out with each request and no `TRACEPARENT`. The marker is
+A host `min` whose telemetry decision is off, for any cause, sends an
+explicit opt-out with each request and no `TRACEPARENT` (the in-box `min`
+above is the exception: it forwards what it inherited). The marker is
 `MINIMAL_OTEL=off`: in the channel environment, in the `direct-tcpip`
 originator for a forward, and as the same variable on the OpenSSH attach
 path. A daemon that is on gives that request's spans an unsampled parent
