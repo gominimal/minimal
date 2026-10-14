@@ -334,6 +334,7 @@ specific PR:
 | **MSRV**: `cargo hack check --rust-version --workspace --all-targets` | cheap enough for PR too, if an MSRV is declared; official Cargo guide method |
 | **miri** on pure protocol/logic crates (vsock framing, supervision state machines) | expensive; high value on unsafe/protocol code |
 | **Hygiene**: `cargo-machete` (unused deps), `actionlint` + `zizmor` (workflow lint/security) | low cost, low urgency |
+| **Quality metrics**: the architectural-health snapshot ([spec 30](specs/30-spec-quality-metrics/30-spec-quality-metrics.md)), published to the `metrics-data` branch | coverage and mutation testing are too slow for a PR; a nightly trend is what the gates ratchet against |
 | **Cache priming**: the nightly run itself writes fresh caches on main | wasmtime runs a daily cron explicitly to "prime caches for GitHub Actions and the merge queue" |
 
 Nightly failures should notify (issue-on-failure or Slack), not just rot in the Actions tab.
@@ -361,6 +362,10 @@ Nightly failures should notify (issue-on-failure or Slack), not just rot in the 
 - **Hygiene** — the `hygiene` job (`continue-on-error`); `zizmor`'s pin policy and the
   documented finding ignores live in `.github/zizmor.yml`, `actionlint`'s runner-label
   allowlist in `.github/actionlint.yaml`.
+- **Quality metrics** — the `metrics` job (`continue-on-error`) runs `just metrics`, renders
+  the dashboard, uploads both as the `metrics` artifact, and pushes the snapshot to the
+  orphan `metrics-data` branch with `scripts/metrics/publish-snapshot.sh`; it never writes
+  to main. `metrics/README.md` describes the snapshot and the gates.
 - **Cache priming** — `session-e2e-soak` and the `msrv`/`miri` jobs restore+save their own
   cache classes (`save-if` main-only) so a scheduled main run keeps them warm.
 
@@ -433,6 +438,7 @@ that bevy (`cargo run -p ci`) and propolis (`cargo xtask phd`) use; here the jus
 | `cargo update` latest-deps canary | - | - | ✅ non-blocking |
 | miri (protocol crates) | - | - | ✅ non-blocking |
 | Hygiene: cargo-machete, actionlint/zizmor | - | - | ✅ non-blocking |
+| Quality metrics snapshot + dashboard (`just metrics`) | `just metrics-layers` in `just ci` | - | ✅ non-blocking |
 | Shell-installer suite (runner-image drift) | path-scoped | - | ✅ blocking |
 | Cache write (`save-if`) | ❌ restore-only | ✅ | ✅ (primes caches) |
 

@@ -659,6 +659,59 @@ PY
         && ok "one more function over the threshold than the baseline fails the ratchet" || bad "crap ratchet against baseline"
 }
 
+publish_targets_history_ref_only() {   # QM-014: the publish script pushes to the history branch and never to main
+    local remote="$tmp/pub-remote" repo="$tmp/pub-repo"
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
+    git -c init.templateDir= init -q --bare "$remote" 2>/dev/null
+    git -c init.templateDir= init -q "$repo" 2>/dev/null
+    mkdir -p "$repo/scripts/metrics"
+    cp "$here/metrics/publish-snapshot.sh" "$here/metrics/prune.py" "$repo/scripts/metrics/"
+    echo "main" > "$repo/README.md"
+    git -C "$repo" add -A && git -C "$repo" commit -q -m "main" && git -C "$repo" branch -M main
+    git -C "$repo" remote add origin "$remote" && git -C "$repo" push -q origin main
+    local main_before; main_before="$(git -C "$remote" rev-parse main)"
+    # A full, clean snapshot out of the fixture set, sha7 and date fixed.
+    python3 - "$data/history" "$tmp/pub-snap.json" <<'PY'
+import json, sys, glob
+s = json.load(open(sorted(glob.glob(sys.argv[1] + "/*.json"))[-1]))
+s["run"]["mode"] = "full"; s["git"]["dirty"] = False; s["git"]["sha7"] = "abc1234"
+json.dump(s, open(sys.argv[2], "w"))
+PY
+    local status=0
+    (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-snap.json" --date 2026-10-14 >"$tmp/pub.out" 2>&1) || status=$?
+    [ "$status" -eq 0 ] && ok "first publish creates the orphan branch and pushes" || bad "publish exit $status: $(cat "$tmp/pub.out")"
+    git -C "$remote" rev-parse --verify -q refs/heads/metrics-data >/dev/null && ok "metrics-data exists on the remote" || bad "no metrics-data on the remote"
+    [ "$(git -C "$remote" rev-parse main)" = "$main_before" ] && ok "main on the remote is untouched" || bad "main moved"
+    [ "$(git -C "$remote" rev-list --count metrics-data)" = "1" ] && ok "the data branch is an orphan with one commit" || bad "data branch history: $(git -C "$remote" rev-list --count metrics-data)"
+    git -C "$remote" ls-tree --name-only -r metrics-data | grep -q '^history/2026-10-14-abc1234.json$' && ok "the snapshot is named by date and sha7 under history/" || bad "tree: $(git -C "$remote" ls-tree --name-only -r metrics-data)"
+    [ "$(git -C "$repo" rev-parse --abbrev-ref HEAD)" = "main" ] && [ -z "$(git -C "$repo" status --porcelain)" ] && ok "the working checkout is left on its branch, clean" || bad "working checkout disturbed"
+    # Second publish appends; same snapshot twice is a no-op.
+    status=0
+    (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-snap.json" --date 2026-10-15 >/dev/null 2>&1) || status=$?
+    [ "$(git -C "$remote" rev-list --count metrics-data)" = "2" ] && ok "a second publish appends one commit" || bad "second publish"
+    (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-snap.json" --date 2026-10-15 >"$tmp/pub2.out" 2>&1) || status=$?
+    grep -q "nothing to publish" "$tmp/pub2.out" && ok "the same snapshot again is a no-op" || bad "repeat publish: $(cat "$tmp/pub2.out")"
+    # Refusals: a darwin run and a dirty tree are not history.
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["run"]["mode"]="darwin"; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-darwin.json"
+    status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-darwin.json" >/dev/null 2>&1) || status=$?
+    [ "$status" -eq 2 ] && ok "a darwin snapshot is refused" || bad "darwin snapshot exit $status"
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["dirty"]=True; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-dirty.json"
+    status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-dirty.json" >/dev/null 2>&1) || status=$?
+    [ "$status" -eq 2 ] && ok "a dirty-tree snapshot is refused" || bad "dirty snapshot exit $status"
+    [ "$(git -C "$remote" rev-parse main)" = "$main_before" ] && ok "main is still untouched after every publish" || bad "main moved later"
+}
+
+nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the spec's bound
+    local wf="$root/.github/workflows/nightly-tests.yml"
+    [ -f "$wf" ] || { echo "skip - no nightly workflow in this tree"; return; }
+    local budget
+    budget="$(awk '/^  metrics:$/{p=1} p && /timeout-minutes:/{print $2; exit}' "$wf")"
+    [ "$budget" = "120" ] && ok "the metrics job declares timeout-minutes 120" || bad "metrics job timeout: '$budget'"
+    awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$wf" | grep -q 'continue-on-error: true' && ok "the job is non-blocking" || bad "metrics job blocks"
+    awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$wf" | grep -q 'publish-snapshot.sh' && ok "the job publishes through the script" || bad "no publish step"
+    awk '/^  notify:$/{p=1} p' "$wf" | grep -q 'needs:.*metrics' && bad "notify depends on metrics (it must not while non-blocking)" || ok "notify does not depend on metrics"
+}
+
 clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors clippy.toml
     python3 - "$root" <<'PY'
 import sys, tomllib
@@ -1046,6 +1099,8 @@ all_cases=(
     mutants_scope_follows_mode
     untracked_file_is_listed
     crap_counts_over_threshold
+    publish_targets_history_ref_only
+    nightly_budget_is_declared
     clippy_thresholds_agree
     base_thresholds_win_when_stricter
     no_baseline_means_not_evaluated
