@@ -2,7 +2,9 @@ let Tys = [| 'Builder, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Su
 in
 let attrs_schema = import "attr_classes.ncl" in
 # Rules that span attributes (inbox#511): a ledger entry implies a revision,
-# and both need an upstream_version to qualify.
+# and both need an upstream_version to qualify. A recipe carrying patches
+# across an upstream bump keeps revision >= 1: pkgmgr restarts the counter at
+# 1, not 0, when any patch survives the bump (spec REV-002).
 let attrs_consistent = fun attrs =>
     let has = fun field => std.record.has_field field attrs in
     let revision = if has "revision" then attrs.revision else 0 in

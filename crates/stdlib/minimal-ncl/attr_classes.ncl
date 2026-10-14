@@ -46,8 +46,10 @@ in
 # These contracts fail CLOSED on malformed entries: a blank or misshapen
 # `cve` / `origin` / `sha256` / `upstream_commit` refuses to parse rather
 # than producing an SBOM row that quietly asserts nothing.
+# CVE syntax: a four-digit sequence may be zero-padded (CVE-2026-0001); one of
+# five or more digits may not start with zero (CVE-2026-01234 is malformed).
 let CveId = std.contract.custom (fun _label value =>
-    if std.typeof value == 'String && std.string.is_match m%"^CVE-[0-9]{4}-[0-9]{4,}$"% value then
+    if std.typeof value == 'String && std.string.is_match m%"^CVE-[0-9]{4}-([0-9]{4}|[1-9][0-9]{4,})$"% value then
         'Ok value
     else
         'Error { message = "expected a CVE id of the form CVE-YYYY-NNNN…" }
@@ -141,8 +143,11 @@ let patch_entry = std.contract.custom (fun label value =>
         value
 )
 in
-# Every entry is checked when the ledger is, because a consumer that reads
-# attrs as values sees an array's elements without their contracts.
+# Every entry is checked when the ledger is, folded eagerly so a bad entry is
+# reported with its own message (which field, which kind) at load time. Since
+# #2047 a consumer reading attrs as values also applies an array's pending
+# element contracts, so `Array patch_entry` alone would be enforced too; the
+# fold is kept for the per-entry error messages.
 let patch_ledger = std.contract.custom (fun label value =>
     if !(std.is_array value) then
         'Error { message = "patches must be an array of ledger entries" }
@@ -191,7 +196,7 @@ in
     },
     revision = {
         name = "patch revision",
-        desc = "Counts the patch-sets applied on top of upstream_version that change the artifact. 0 (or absent) = pristine upstream. Owned by pkgmgr — never hand-edited — and resets to 0 on any upstream version bump. Rendered as `-rN` into published version strings (SBOM, OpenVEX, secdb) by the publish-boundary helper.",
+        desc = "Counts the patch-sets applied on top of upstream_version that change the artifact. 0 (or absent) = pristine upstream. Owned by pkgmgr — never hand-edited. On an upstream version bump it restarts: 0 when no patch survives the bump, otherwise 1, because an artifact still carrying a patch is not pristine upstream (the ledger rule below rejects patches with revision 0). Rendered as `-rN` into published version strings (SBOM, OpenVEX, secdb) by the publish-boundary helper.",
         validate = std.contract.custom (fun _label value =>
             if std.typeof value == 'Number && value >= 0 && value == std.number.floor value then
                 'Ok value

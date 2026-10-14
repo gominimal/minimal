@@ -557,6 +557,12 @@ mod tests {
         // A security fix without its CVE or commit, or with a blank one.
         assert!(!ok(&e.replace("cve = \"CVE-2026-1234\", ", "")));
         assert!(!ok(&e.replace("CVE-2026-1234\"", "\"")));
+        // CVE sequence syntax: four digits may be zero-padded, five or more
+        // may not start with zero.
+        assert!(ok(&e.replace("CVE-2026-1234", "CVE-2026-0001")));
+        assert!(ok(&e.replace("CVE-2026-1234", "CVE-2026-12345")));
+        assert!(!ok(&e.replace("CVE-2026-1234", "CVE-2026-01234")));
+        assert!(!ok(&e.replace("CVE-2026-1234", "CVE-2026-123")));
         assert!(!ok(&e.replace(", upstream_commit = \"deadbeef0\"", "")));
         assert!(!ok(&e.replace("deadbeef0", "not-a-commit")));
         // A blank origin, a misshapen digest, a missing file.
@@ -585,6 +591,23 @@ mod tests {
         assert!(with("revision = 0, patches = []"));
         assert!(!with(&format!("patches = [{entry}]")));
         assert!(!with(&format!("revision = 0, patches = [{entry}]")));
+    }
+
+    /// REV-002 across an upstream bump: a build patch that survives the bump
+    /// leaves the artifact non-pristine, so pkgmgr restarts the counter at 1,
+    /// not 0. That state loads; the reset-to-0-with-patches state does not, so
+    /// a bump PR can never be written in a shape that fails to parse.
+    #[test]
+    fn a_patch_surviving_an_upstream_bump_keeps_revision_one() {
+        let bumped =
+            |rest: &str| attrs_accepted(&format!("{{upstream_version = \"2.0\", {rest}}}"));
+        let build = format!(
+            "{{ file = \"aarch64-build.patch\", kind = 'build, sha256 = \"{SHA}\", origin = \"https://example.org/bug/1\" }}"
+        );
+        assert!(bumped(&format!("revision = 1, patches = [{build}]")));
+        assert!(!bumped(&format!("revision = 0, patches = [{build}]")));
+        // Every patch dropped in review: back to pristine upstream.
+        assert!(bumped("revision = 0, patches = []"));
     }
 
     /// REV-011: a label with no upstream half is not a label.
