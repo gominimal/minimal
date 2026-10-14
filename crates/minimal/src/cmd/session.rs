@@ -335,11 +335,20 @@ pub(crate) async fn release_held_name_after_attach(
 /// VM host daemon did not make — one that predates the verbs, or did not
 /// answer — leaves nothing to undo, so neither the second lookup nor the
 /// release is made.
+///
+/// Only a VM host daemon holds names, so the re-hold is for `Minvmd` alone,
+/// as the activation's hold is: the native daemon's control socket answers
+/// only the answerer verbs, and asking it was a refusal warned on every
+/// native attach and exec's stderr (#2213).
 pub(crate) async fn rehold_held_name_before_attach(
+    kind: paths::ProviderKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     record: Option<&boxes::Record>,
 ) {
+    if kind != paths::ProviderKind::Minvmd {
+        return;
+    }
     let Some(record) = record else {
         return;
     };
@@ -1746,6 +1755,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 
     let host_asks = host_asks_box(global, name.as_deref());
     session_via_ssh(
+        daemon_provider_kind(global),
         &sock,
         id,
         None,
@@ -1825,7 +1835,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    session_via_ssh(&sock, r.id, wire, None, None).await
+    session_via_ssh(daemon_provider_kind(global), &sock, r.id, wire, None, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
@@ -1857,6 +1867,7 @@ pub async fn cmd_session_run(
     );
 
     session_via_ssh(
+        daemon_provider_kind(global),
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone
@@ -2008,6 +2019,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// (exec ssh, or exit with the attach's status) that [`run`] finishes once
 /// the command's `cmd` span has ended, so callers return it untouched.
 pub(crate) async fn session_via_ssh(
+    kind: paths::ProviderKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     wire: Option<String>,
@@ -2053,7 +2065,7 @@ pub(crate) async fn session_via_ssh(
     // The name hold a `host_ip` session without a row depends on may not
     // have survived a VM host daemon restart; re-make it before the
     // attach or the exec, idempotently.
-    rehold_held_name_before_attach(sock, id, record.as_ref()).await;
+    rehold_held_name_before_attach(kind, sock, id, record.as_ref()).await;
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
@@ -7173,14 +7185,15 @@ mod tests {
         assert!(record.box_addresses.is_none());
 
         // A record that is not there: nothing to re-hold by.
-        rehold_held_name_before_attach(&ssh_sock, id, None).await;
+        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, None).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "no record read, no hold re-made"
         );
 
         // The session's own hold, re-made before the attach.
-        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, Some(&record))
+            .await;
         {
             let seen = requests.lock().unwrap();
             assert_eq!(seen.len(), 1, "one hold, one request");
@@ -7207,7 +7220,8 @@ mod tests {
             minimald_rpc::Errorable::Ok(_) => {}
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
-        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, Some(&record))
+            .await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 3, "a hold, then its release");
         let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
@@ -7217,6 +7231,44 @@ mod tests {
         };
         assert_eq!(request.name, "web");
         assert_eq!(request.session_id, Some(id));
+    }
+
+    /// The native daemon holds no names: its control socket answers only
+    /// the answerer verbs, so an attach or exec there has no hold to re-make
+    /// and asks for none. Asking anyway was a refusal warned on every native
+    /// attach and exec's stderr (#2213).
+    #[tokio::test]
+    async fn a_native_attach_reholds_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"error":"the native daemon's control socket answers only the answerer verbs"}"#
+                .to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        assert_eq!(record.network, boxes::NetworkMode::HostNet);
+
+        rehold_held_name_before_attach(paths::ProviderKind::Minimald, &ssh_sock, id, Some(&record))
+            .await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the native daemon is asked for no hold"
+        );
     }
 
     /// A destroy, then a new session under the same name, both landing
@@ -7260,7 +7312,8 @@ mod tests {
         )
         .await;
 
-        rehold_held_name_before_attach(&ssh_sock, gone, Some(&record)).await;
+        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, gone, Some(&record))
+            .await;
         let seen = requests.lock().unwrap();
         let holds: Vec<_> = seen
             .iter()
@@ -7334,7 +7387,8 @@ mod tests {
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
 
-        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, Some(&record))
+            .await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 1, "the refused hold, and nothing after it");
         assert!(matches!(
