@@ -20,6 +20,8 @@ data="$here/metrics/testdata"
 collect="$here/metrics/collect.py"
 layers="$here/metrics/layers.py"
 schema="$here/metrics/schema.py"
+prune="$here/metrics/prune.py"
+dashboard="$here/metrics/dashboard.py"
 command -v python3 >/dev/null 2>&1 || { echo "python3 required" >&2; exit 1; }
 
 tmp="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-metrics)"
@@ -330,6 +332,135 @@ darwin_scope_lists_uncovered_crates() {   # QM-013: the snapshot side; the repor
         && ok "static collectors still cover every crate" || bad "size missing outside scope"
 }
 
+prune_keeps_daily_then_monthly() {   # QM-015, property over generated histories
+    # keep(f) iff age(f, today) <= 90 days or f is the earliest snapshot of its
+    # month: checked against generated names over about 400 days, with gaps,
+    # doubled days and several reference dates.
+    python3 - "$prune" <<'PY'
+import importlib.util, random, sys
+from datetime import date, timedelta
+spec = importlib.util.spec_from_file_location("prune", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+random.seed(15)
+start = date(2025, 9, 1)
+for trial in range(20):
+    names = []
+    for day in range(400):
+        if random.random() < 0.8:
+            d = start + timedelta(days=day)
+            for k in range(2 if random.random() < 0.1 else 1):
+                names.append(f"{d.isoformat()}-{random.randrange(16**7):07x}")
+    names = [n + ".json" for n in dict.fromkeys(names)]
+    today = start + timedelta(days=random.choice((100, 250, 399, 450)))
+    kept = m.keep(names, today)
+    by_month = {}
+    for n in names:
+        by_month.setdefault(n[:7], []).append(n)
+    for n in names:
+        age = (today - date.fromisoformat(n[:10])).days
+        earliest = n == min(by_month[n[:7]])
+        assert (n in kept) == (age <= 90 or earliest), (trial, n, today, age, earliest, n in kept)
+    for month, ns in by_month.items():
+        old = [n for n in ns if (today - date.fromisoformat(n[:10])).days > 90]
+        if len(old) == len(ns):
+            assert len(kept & set(ns)) == 1, (trial, month, kept & set(ns))
+    assert kept <= set(names)
+    assert m.keep(names + ["README.md", "2025-13-40-abcdefg.json"], today) == kept
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "keep(f) iff age <= 90 days or earliest of its month, over twenty generated histories" || bad "prune property"
+    # On a copy of the fixtures plus a second June file: --dry-run removes
+    # nothing; the real run removes only the later June snapshot.
+    local hist="$tmp/prune-hist"; rm -rf "$hist"; mkdir -p "$hist"
+    cp "$data/history/"*.json "$hist/"
+    cp "$data/history/2026-06-05-1a2b3c4.json" "$hist/2026-06-20-fffffff.json"
+    echo "not a snapshot" > "$hist/notes.txt"
+    local before after
+    before="$(find "$hist" -mindepth 1 -printf '%f\n' | sort)"
+    python3 "$prune" "$hist" --dry-run >"$tmp/prune-dry.out" 2>/dev/null
+    after="$(find "$hist" -mindepth 1 -printf '%f\n' | sort)"
+    [ "$before" = "$after" ] && ok "--dry-run removes nothing" || bad "--dry-run changed the directory"
+    grep -q '^would remove 2026-06-20-fffffff.json$' "$tmp/prune-dry.out" && ok "--dry-run names what it would remove" || bad "dry-run output: $(cat "$tmp/prune-dry.out")"
+    python3 "$prune" "$hist" >"$tmp/prune.out" 2>/dev/null
+    [ ! -f "$hist/2026-06-20-fffffff.json" ] && [ -f "$hist/2026-06-05-1a2b3c4.json" ] && [ -f "$hist/notes.txt" ] \
+        && ok "the later June snapshot goes; the earliest, the recent ones and a non-snapshot stay" || bad "prune removed the wrong files: $(ls "$hist")"
+    grep -q '^remove 2026-06-20-fffffff.json$' "$tmp/prune.out" && ok "the removal is printed" || bad "prune output: $(cat "$tmp/prune.out")"
+}
+
+dashboard_renders_offline_with_tables() {   # QM-016
+    local out="$tmp/dash"
+    python3 "$dashboard" "$data/history" "$out" >/dev/null 2>&1 || { bad "dashboard.py failed over the fixtures"; return; }
+    [ -f "$out/index.html" ] && ok "index.html written" || { bad "no index.html"; return; }
+    # Structure: a table after every svg, headings, no script, no URL in any
+    # src or href. Checked with html.parser, no third-party package.
+    python3 - "$out/index.html" <<'PY'
+import sys
+from html.parser import HTMLParser
+class P(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.seq = []; self.scripts = 0; self.urls = []; self.headings = []; self.titles = 0
+        self.in_h = None; self.links = 0
+    def handle_starttag(self, tag, attrs):
+        if tag in ("svg", "table"): self.seq.append(tag)
+        if tag == "script": self.scripts += 1
+        if tag == "title": self.titles += 1
+        if tag in ("link", "img", "iframe", "object", "embed"): self.links += 1
+        if tag in ("h1", "h2"): self.in_h = tag
+        for k, v in attrs:
+            if k in ("src", "href", "xlink:href", "data") and v and ("http://" in v or "https://" in v or v.startswith("//")):
+                self.urls.append(v)
+    def handle_endtag(self, tag):
+        if tag in ("h1", "h2"): self.in_h = None
+    def handle_data(self, data):
+        if self.in_h and data.strip(): self.headings.append(data.strip())
+p = P(); p.feed(open(sys.argv[1], encoding="utf-8").read())
+svgs = [i for i, t in enumerate(p.seq) if t == "svg"]
+assert svgs, "no svg"
+for i in svgs:
+    assert i + 1 < len(p.seq) and p.seq[i + 1] == "table", ("svg without a table after it", i, p.seq)
+assert p.scripts == 0, "script tag"
+assert p.links == 0, "external resource tag"
+assert not p.urls, p.urls
+assert p.titles == len(svgs) + 1, (p.titles, len(svgs))  # the page title plus one per chart
+for h in ("Quality metrics", "Coverage, lines covered", "Strict lint hits", "Complexity lint hits",
+          "Unused dependencies", "Code size, lines of code", "Layer edges", "Latest gates", "Top hotspots",
+          "Promotable strict lints"):
+    assert h in p.headings, (h, p.headings)
+html = open(sys.argv[1], encoding="utf-8").read()
+assert "not measured" in html, "the null coverage snapshot is not shown as a gap"
+assert "clippy::mem_forget" in html, "promotable lint missing"
+assert "crates/mip/src/main.rs" in html, "hotspot path missing"
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "every svg is followed by a table; headings present; no script, no URL" || bad "dashboard structure"
+    # Gap, not zero: the August snapshot has coverage null, so the coverage
+    # line is two segments (four points) and no point sits on the axis.
+    python3 - "$out/index.html" <<'PY'
+import re, sys
+html = open(sys.argv[1], encoding="utf-8").read()
+cov = re.search(r'<section id="coverage">(.*?)</section>', html, re.S).group(1)
+assert len(re.findall(r'<path class="line"', cov)) == 2, "coverage line is not broken at the gap"
+assert len(re.findall(r'<circle', cov)) == 4, "a null coverage drew a marker"
+print("ok")
+PY
+    [ $? -eq 0 ] && ok "a null metric is a gap in the line, not a zero" || bad "gap rendering"
+    # Deterministic: a second run over the same history is byte-identical.
+    sleep 1
+    python3 "$dashboard" "$data/history" "$tmp/dash2" >/dev/null 2>&1
+    cmp -s "$out/index.html" "$tmp/dash2/index.html" && ok "two runs give byte-identical pages" || bad "pages differ between runs"
+    # One snapshot: points and tables, no lines, still every table.
+    local one="$tmp/one-hist"; mkdir -p "$one"
+    cp "$data/history/2026-10-01-5e6f7a8.json" "$one/"
+    python3 "$dashboard" "$one" "$tmp/dash-one" >/dev/null 2>&1 \
+        && grep -q '<circle' "$tmp/dash-one/index.html" && ! grep -q '<path class="line"' "$tmp/dash-one/index.html" \
+        && [ "$(grep -o '<svg' "$tmp/dash-one/index.html" | wc -l)" -eq "$(grep -o '<svg' "$out/index.html" | wc -l)" ] \
+        && ok "a single snapshot renders points and tables, no lines" || bad "single-snapshot render"
+    # A file that fails the schema is skipped and listed on the page.
+    cp "$data/history/"*.json "$one/"
+    echo '{"kind": "nope"}' > "$one/2026-10-02-bad0bad.json"
+    python3 "$dashboard" "$one" "$tmp/dash-skip" >/dev/null 2>&1
+    grep -q '2026-10-02-bad0bad.json' "$tmp/dash-skip/index.html" && ok "an invalid snapshot is skipped and listed" || bad "invalid snapshot not listed"
+}
+
 clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors clippy.toml
     python3 - "$root" <<'PY'
 import sys, tomllib
@@ -368,6 +499,8 @@ all_cases=(
     hotspots_without_coverage
     module_cycles_from_dot
     darwin_scope_lists_uncovered_crates
+    prune_keeps_daily_then_monthly
+    dashboard_renders_offline_with_tables
     clippy_thresholds_agree
 )
 cases=("${all_cases[@]}")
