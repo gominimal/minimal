@@ -87,6 +87,29 @@ fn spool_files(spool: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// The spool as it is being written: only lines that end in a newline, and
+/// only those that parse. A read that lands mid-write of a large line reads
+/// as "not yet", not as a failure; the strict [`spool_lines`] is for after
+/// the VM is stopped and nothing writes.
+#[cfg(minvmd_libkrun)]
+fn spool_lines_settled(spool: &Path) -> Vec<serde_json_lenient::Value> {
+    let mut out = Vec::new();
+    for p in spool_files(spool) {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for l in text.split_inclusive('\n') {
+            let Some(l) = l.strip_suffix('\n') else {
+                continue; // the last line, still being written
+            };
+            if let Ok(v) = serde_json_lenient::from_str(l) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
 #[expect(
     clippy::unwrap_used,
     reason = "a test helper: an unreadable or malformed spool must fail the test loudly"
@@ -321,8 +344,19 @@ fn boot_and_stop(
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    // The VM is stopped whatever happens from here: a panic in `during`
+    // (the `guest.ready` wait, say) or in a later assertion must not leave
+    // a detached supervisor and VMM on the host after the state dir is gone.
+    let mut guard = StopOnDrop {
+        state: state.path().to_path_buf(),
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect(),
+        stopped: false,
+    };
     during(state.path());
-    let stop = minvmd_vm(state.path(), env, &["stop"]);
+    let stop = guard.stop();
     assert!(
         stop.status.success(),
         "minvmd stop: {}",
@@ -344,6 +378,42 @@ fn boot_and_stop(
         })
         .unwrap_or_else(|| panic!("no boot line logged under {}", logs.display()));
     (state, line)
+}
+
+/// Stops the detached VM once, on the happy path or on unwind.
+#[cfg(minvmd_libkrun)]
+struct StopOnDrop {
+    state: std::path::PathBuf,
+    env: Vec<(String, String)>,
+    stopped: bool,
+}
+
+#[cfg(minvmd_libkrun)]
+impl StopOnDrop {
+    fn stop(&mut self) -> std::process::Output {
+        self.stopped = true;
+        let env: Vec<(&str, String)> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        minvmd_vm(&self.state, &env, &["stop"])
+    }
+}
+
+#[cfg(minvmd_libkrun)]
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let out = self.stop();
+            if !out.status.success() {
+                eprintln!(
+                    "stop on unwind failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
 }
 
 /// Plan T15 (spec 25 TEL-032, TEL-033, TEL-034, TEL-035): boot a microVM
@@ -416,7 +486,7 @@ fn a_boot_and_stop_share_one_trace_with_the_guest_daemon() {
         // `guest.ready` ended before READY; the door batches for at most a
         // second, so wait for it in the host spool before stopping.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !spans(&spool_lines(&spool))
+        while !spans(&spool_lines_settled(&spool))
             .iter()
             .any(|(_, s)| s["name"] == "guest.ready")
         {
