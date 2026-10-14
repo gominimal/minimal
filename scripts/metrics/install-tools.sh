@@ -8,8 +8,14 @@
 # `cargo install --locked` compiles each tool (minutes). Neither is required
 # for a tool already installed at the pinned version.
 #
-# Usage: scripts/metrics/install-tools.sh [--check]
-#   --check   report what is missing or mispinned, install nothing; exit 1 if any.
+# Usage: scripts/metrics/install-tools.sh [--check] [--experimental]
+#   --check         report what is missing or mispinned, install nothing;
+#                   exit 1 if any.
+#   --experimental  also install the experimental collectors (rustqual,
+#                   cargo-anatomy). Without it `--check` lists them as
+#                   optional and they never count as missing: what they
+#                   measure is recorded, never gated (QM-005), so a host
+#                   without them still writes a complete snapshot.
 #
 # Also needs the toolchain's `llvm-tools-preview` for coverage; rustup hosts
 # get it from `rustup component add`, others set LLVM_COV/LLVM_PROFDATA to a
@@ -24,9 +30,21 @@ pins=(
     "cargo-nextest   cargo-nextest   0.9.148 cargo nextest --version"
     "tokei           tokei           15.0.0  tokei --version"
 )
+# The experimental collectors (metrics/README.md, "Experimental coupling
+# metrics"). cargo-anatomy documents only the short `-V`.
+experimental_pins=(
+    "rustqual        rustqual        1.8.3   rustqual --version"
+    "cargo-anatomy   cargo-anatomy   0.7.7   cargo anatomy -V"
+)
 
-check_only=0
-[ "${1:-}" = "--check" ] && check_only=1
+check_only=0 experimental=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) check_only=1 ;;
+        --experimental) experimental=1 ;;
+        *) echo "usage: $0 [--check] [--experimental]" >&2; exit 1 ;;
+    esac
+done
 
 # Installed version of a tool, or empty. Every tool prints its version
 # somewhere in the first line; the first dotted number is it.
@@ -37,13 +55,18 @@ installed_version() {
 }
 
 missing=()
-for pin in "${pins[@]}"; do
+# check_pin <required 0|1> <pin row>: report the row; a required row that is
+# not at its pin joins `missing`.
+check_pin() {
+    local required="$1" tool crate want have
     # shellcheck disable=SC2086 # the pin row is meant to split
-    set -- $pin
+    set -- $2
     tool="$1" crate="$2" want="$3"; shift 3
     have="$(installed_version "$tool" "$@")"
     if [ "$have" = "$want" ]; then
         echo "ok        $tool $want"
+    elif [ "$required" -eq 0 ]; then
+        echo "optional  $tool ${have:-missing} (want $want; install with --experimental)"
     elif [ -z "$have" ]; then
         echo "missing   $tool (want $want)"
         missing+=("$crate@$want")
@@ -51,15 +74,19 @@ for pin in "${pins[@]}"; do
         echo "mispinned $tool $have (want $want)"
         missing+=("$crate@$want")
     fi
-done
+}
+for pin in "${pins[@]}"; do check_pin 1 "$pin"; done
+for pin in "${experimental_pins[@]}"; do check_pin "$experimental" "$pin"; done
 
 if [ "${#missing[@]}" -eq 0 ]; then
     echo "metrics tools: all pinned versions present"
     exit 0
 fi
 if [ "$check_only" -eq 1 ]; then
+    hint=""
+    [ "$experimental" -eq 1 ] && hint=" --experimental"
     echo "metrics tools: missing or mispinned: ${missing[*]}" >&2
-    echo "install with: scripts/metrics/install-tools.sh" >&2
+    echo "install with: scripts/metrics/install-tools.sh$hint" >&2
     exit 1
 fi
 

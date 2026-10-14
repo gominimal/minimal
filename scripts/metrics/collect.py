@@ -372,6 +372,130 @@ def collect_shear(path: Path | None, attr: Attributor):
     return per_crate, sorted(workspace_unused)
 
 
+# ------------------------------------------------------------ experimental
+# Recorded, never read by a gate (QM-005): `metric()` has no entry for these
+# blocks and `evaluate_gates` reads nothing but `metric()`. Neither tool
+# installed in the sandbox this was written in, so the shapes come from the
+# tools' published docs (testdata/SHAPES.md) and every lookup is a `.get`.
+
+
+def collect_rustqual(directory: Path | None):
+    """One `<crate>.json` per crate from `rustqual <crate>/src --format json`,
+    or `{"error": ...}` where run.sh recorded that the tool could not run.
+
+    Fields per book/reference-output-formats.md at
+    https://github.com/SaschaOnTour/rustqual: `summary` is documented key by
+    key; `coupling.cycles` (CP-001), `coupling.sdp_violations` (CP-002),
+    `dead_code` and `duplicates` are documented as arrays whose entries are
+    elided, so only their lengths are read.
+    """
+    if directory is None:
+        return None
+    out = {}
+    for path in sorted(directory.glob("*.json")):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict) or "summary" not in doc:
+            out[path.stem] = {"error": doc.get("error", "no summary in output") if isinstance(doc, dict) else "not an object"}
+            continue
+        summary = doc.get("summary") or {}
+        coupling = doc.get("coupling") or {}
+        # field per https://github.com/SaschaOnTour/rustqual/blob/main/book/coupling-quality.md
+        # (the prose defines a module's instability; the JSON key is
+        # unverified against a run, so a different name yields null)
+        instabilities = [
+            m["instability"]
+            for m in coupling.get("modules") or []
+            if isinstance(m, dict) and isinstance(m.get("instability"), (int, float))
+        ]
+        out[path.stem] = {
+            "score": summary.get("quality_score"),
+            "iosp_score": summary.get("iosp_score"),
+            "iosp_violations": summary.get("violations"),
+            "complexity_findings": summary.get("complexity_warnings"),
+            "dead_code": len(doc.get("dead_code") or []),
+            "duplicates": len(doc.get("duplicates") or []),
+            "cycles": len(coupling.get("cycles") or []),
+            "sdp_violations": len(coupling.get("sdp_violations") or []),
+            "max_instability": max(instabilities) if instabilities else None,
+            "dimension_scores": summary.get("dimension_scores"),
+        }
+    return out
+
+
+def collect_anatomy(path: Path | None):
+    """`cargo anatomy` over the workspace: `crates[].metrics` per
+    docs/output-schema.md at https://github.com/cutsea110/cargo-anatomy
+    (I = Ce / (Ce + Ca), D = |A + I - 1| / sqrt 2, H = (R + 1) / N)."""
+    doc = read_json(path)
+    if doc is None:
+        return None
+    out = {}
+    for entry in doc.get("crates") or []:
+        m = entry.get("metrics") or {}
+        out[entry.get("crate_name")] = {
+            "ca": m.get("ca"),
+            "ce": m.get("ce"),
+            "instability": m.get("i"),
+            "abstractness": m.get("a"),
+            "distance": m.get("d"),
+            "cohesion": m.get("h"),
+        }
+    return out
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def rustqual_totals(crates: dict) -> dict:
+    """The workspace view of the per-crate rustqual blocks: the score weighted
+    by lines of code (a small crate at 1.0 must not offset a large one at
+    0.5), the plain mean beside it, and the finding counts summed."""
+    blocks = {
+        n: c["experimental"]["rustqual"]
+        for n, c in crates.items()
+        if c["experimental"] and c["experimental"]["rustqual"]
+    }
+    scored = {n: b for n, b in blocks.items() if _is_number(b.get("score"))}
+    weights = {n: ((crates[n]["size"] or {}).get("code") or 0) for n in scored}
+    weighted = None
+    if sum(weights.values()) > 0:
+        weighted = round(sum(b["score"] * weights[n] for n, b in scored.items()) / sum(weights.values()), 4)
+    counts = ("iosp_violations", "complexity_findings", "dead_code", "duplicates", "cycles", "sdp_violations")
+    return {
+        "errors": sorted(n for n, b in blocks.items() if "error" in b),
+        "score_loc_weighted": weighted,
+        "score_mean": round(sum(b["score"] for b in scored.values()) / len(scored), 4) if scored else None,
+        **{k: sum(b.get(k) or 0 for b in scored.values()) for k in counts},
+    }
+
+
+def anatomy_totals(crates: dict) -> dict:
+    blocks = {
+        n: c["experimental"]["anatomy"]
+        for n, c in crates.items()
+        if c["experimental"] and c["experimental"]["anatomy"]
+    }
+    distances = [b["distance"] for b in blocks.values() if _is_number(b.get("distance"))]
+    # D > 0.5 is far from the main sequence; A + I < 1 puts the crate on the
+    # concrete-and-stable side of it, which is the zone of pain (the other
+    # side is the zone of uselessness). The simplest flag until the history
+    # says where the line belongs.
+    pain = sorted(
+        n
+        for n, b in blocks.items()
+        if _is_number(b.get("distance"))
+        and b["distance"] > 0.5
+        and _is_number(b.get("abstractness"))
+        and _is_number(b.get("instability"))
+        and b["abstractness"] + b["instability"] < 1
+    )
+    return {
+        "mean_distance": round(sum(distances) / len(distances), 4) if distances else None,
+        "crates_in_zone_of_pain": pain,
+    }
+
+
 def churn(window_days: int) -> Counter:
     """Commits touching each Rust file in the window, from the current history."""
     out = subprocess.run(
@@ -555,6 +679,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tokei", type=Path)
     ap.add_argument("--modules", type=Path)
     ap.add_argument("--shear", type=Path)
+    ap.add_argument("--rustqual-dir", type=Path, help="directory of <crate>.json from rustqual --format json")
+    ap.add_argument("--anatomy", type=Path, help="cargo anatomy output")
     ap.add_argument("--tools", type=Path, help="JSON: tool name -> version")
     ap.add_argument("--toolchain", type=Path, help="JSON: channel, rustc, cargo")
     ap.add_argument("--scope", type=Path, help="one crate name per line that compiling collectors covered")
@@ -581,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
     size = collect_size(args.tokei, attr)
     modules = collect_modules(args.modules)
     shear, workspace_unused = collect_shear(args.shear, attr)
+    rustqual = collect_rustqual(args.rustqual_dir)
+    anatomy = collect_anatomy(args.anatomy)
     layer_result = layers_mod.analyse(meta, rules)
     layer_of = {c: l for l, cs in rules["layers"].items() for c in cs}
     scope = read_lines(args.scope) or sorted(members)
@@ -620,7 +748,15 @@ def main(argv: list[str] | None = None) -> int:
             crate["deps"] = {"internal": internal, "unused": None}
         crate["mutants"] = None
         crate["crap"] = None
-        crate["experimental"] = None
+        # Null only when neither tool ran; a crate one tool skipped (rustqual
+        # on remote-proto) keeps the other's sub-block.
+        if rustqual is None and anatomy is None:
+            crate["experimental"] = None
+        else:
+            crate["experimental"] = {
+                "rustqual": rustqual.get(name) if rustqual is not None else None,
+                "anatomy": anatomy.get(name) if anatomy is not None else None,
+            }
         crates[name] = crate
 
     measured = [c for c in crates.values()]
@@ -672,6 +808,13 @@ def main(argv: list[str] | None = None) -> int:
         }
     else:
         workspace["deps"] = None
+    if rustqual is None and anatomy is None:
+        workspace["experimental"] = None
+    else:
+        workspace["experimental"] = {
+            "rustqual": rustqual_totals(crates) if rustqual is not None else None,
+            "anatomy": anatomy_totals(crates) if anatomy is not None else None,
+        }
 
     hotspot_cfg = thresholds.get("hotspots", {})
     if args.no_hotspots:

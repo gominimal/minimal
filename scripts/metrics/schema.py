@@ -33,7 +33,9 @@ CRATE_BLOCKS: dict[str, tuple[str, ...]] = {
     "deps": ("internal", "unused"),
     "mutants": ("tested", "caught", "missed"),
     "crap": ("functions", "over_threshold"),
-    "experimental": (),
+    # Recorded, never gated (QM-005): one sub-block per tool, each null when
+    # that tool did not run; the whole block is null when neither did.
+    "experimental": ("rustqual", "anatomy"),
 }
 
 

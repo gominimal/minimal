@@ -160,9 +160,59 @@ for _ in range(50):
         c["experimental"] = {"rustqual": {"score": random.random() * 100, "cycles": random.randint(0, 9)},
                              "anatomy": {"instability": random.random(), "distance": random.random()}}
     assert m.verdict(m.evaluate_gates(s, th, None)) == base
+# The gate code never names the block: the property holds by construction,
+# not by the luck of the fixture.
+import inspect
+assert "experimental" not in inspect.getsource(m.metric) + inspect.getsource(m.evaluate_gates)
 print("ok")
 PY
-    [ $? -eq 0 ] && ok "fifty random experimental sections leave the verdict unchanged" || bad "experimental changed the verdict"
+    [ $? -eq 0 ] && ok "fifty random experimental sections leave the verdict unchanged; metric() never reads the block" || bad "experimental changed the verdict"
+    # The real shape: fixtures standing in for `rustqual <crate>/src --format
+    # json` (graph and decode only, as remote-proto would be left out in the
+    # tree) and `cargo anatomy` (every crate).
+    local real="$tmp/exp-real/snapshot.json" plain="$out/snapshot.json"
+    run_collect "$tmp/exp-real" "${standard[@]}" --rustqual-dir "$data/rustqual" --anatomy "$data/anatomy.json" >/dev/null 2>&1 || true
+    [ -f "$real" ] || { bad "no snapshot with the experimental fixtures"; return; }
+    python3 "$schema" "$real" >/dev/null && ok "a snapshot with experimental blocks validates" || bad "experimental snapshot invalid"
+    [ "$(py "$real" "s['verdict']")" = "$(py "$plain" "s['verdict']")" ] \
+        && ok "the verdict is the same with and without the experimental collectors" || bad "verdict differs with experimental collectors"
+    [ "$(py "$real" "json.dumps(s['gates'], sort_keys=True)")" = "$(py "$plain" "json.dumps(s['gates'], sort_keys=True)")" ] \
+        && ok "every gate result is the same with and without them" || bad "gates differ with experimental collectors"
+    [ "$(py "$real" "s['crates']['graph']['experimental']['rustqual']['score']")" = "0.823" ] \
+        && ok "crates.graph.experimental.rustqual.score is populated" || bad "rustqual score: $(py "$real" "s['crates']['graph']['experimental']['rustqual']")"
+    [ "$(py "$real" "(s['crates']['graph']['experimental']['rustqual']['cycles'], s['crates']['decode']['experimental']['rustqual']['sdp_violations'], s['crates']['graph']['experimental']['rustqual']['max_instability'])")" = "(1, 1, 1.0)" ] \
+        && ok "CP-001 cycles, CP-002 violations and the module instability maximum are counted" || bad "rustqual coupling counts"
+    [ "$(py "$real" "(s['crates']['common']['experimental']['rustqual'], s['crates']['common']['experimental']['anatomy']['instability'])")" = "(None, 0.0)" ] \
+        && ok "a crate one tool skipped keeps the other tool's sub-block" || bad "mixed sub-blocks: $(py "$real" "s['crates']['common']['experimental']")"
+    [ "$(py "$real" "s['workspace']['experimental']['anatomy']['crates_in_zone_of_pain']")" = "['mip']" ] \
+        && ok "the zone-of-pain flag names the concrete, stable, distant crate" || bad "zone of pain: $(py "$real" "s['workspace']['experimental']['anatomy']")"
+    [ "$(py "$real" "s['workspace']['experimental']['rustqual']['score_loc_weighted'] is not None")" = "True" ] \
+        && ok "the workspace score is weighted by lines of code" || bad "no weighted score"
+    [ "$(py "$plain" "s['crates']['graph']['experimental']")" = "None" ] \
+        && ok "with neither tool the block is null" || bad "block not null without the tools"
+}
+
+experimental_missing_tool_is_not_measured() {   # QM-005 with QM-001's failure clause: absent tools are recorded, never faked
+    if ! (cd "$root" && cargo metadata --format-version 1 --no-deps --offline >/dev/null 2>&1); then
+        echo "skip - cargo metadata --offline does not run here, and run.sh needs it"
+        return
+    fi
+    # A PATH with every directory that holds either tool taken out.
+    local clean_path
+    clean_path="$(python3 -c 'import os; print(":".join(d for d in os.environ["PATH"].split(":") if not any(os.path.exists(os.path.join(d, t)) for t in ("rustqual", "cargo-anatomy"))))')"
+    local status=0 snap="$tmp/run-exp/snapshot.json"
+    (cd "$root" && PATH="$clean_path" bash "$here/metrics/run.sh" full --out "$tmp/run-exp" \
+        --no-coverage --no-modules --no-clippy --no-hotspots >/dev/null 2>&1) || status=$?
+    [ -f "$snap" ] || { bad "run.sh full wrote no snapshot (exit $status)"; return; }
+    [ "$(py "$snap" "s['run']['not_measured'].get('experimental.rustqual', '').startswith('rustqual not installed')")" = "True" ] \
+        && ok "experimental.rustqual is under run.not_measured with its reason" || bad "rustqual reason: $(py "$snap" "s['run']['not_measured']")"
+    [ "$(py "$snap" "s['run']['not_measured'].get('experimental.anatomy', '').startswith('cargo-anatomy not installed')")" = "True" ] \
+        && ok "experimental.anatomy is under run.not_measured with its reason" || bad "anatomy reason: $(py "$snap" "s['run']['not_measured']")"
+    [ "$(py "$snap" "s['crates']['common']['experimental']")" = "None" ] \
+        && ok "the experimental block is null, not zero" || bad "experimental block not null"
+    [ "$(py "$snap" "s['tools']['rustqual']")" = "" ] \
+        && ok "no version is recorded for an absent tool" || bad "a version for an absent tool"
+    [ "$status" -ne 3 ] && ok "a missing experimental tool does not mark the snapshot incomplete" || bad "exit 3 for a missing experimental tool"
 }
 
 report_is_byte_stable() {   # QM-006
@@ -491,6 +541,7 @@ all_cases=(
     strict_counts_and_promotable
     coverage_excludes_tests_and_generated
     experimental_never_changes_verdict
+    experimental_missing_tool_is_not_measured
     report_is_byte_stable
     forbidden_edge_is_reported
     excepted_edge_is_counted_not_failed

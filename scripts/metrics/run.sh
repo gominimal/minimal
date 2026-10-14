@@ -9,10 +9,16 @@
 #                     history. What the gate tier and a cold sandbox can afford.
 #   --out DIR         where snapshot.json, clippy-hits.json and meta.json land
 #                     (default .scratch/metrics/<mode>)
-#   --no-coverage, --no-modules, --no-clippy, --no-hotspots
+#   --no-coverage, --no-modules, --no-clippy, --no-hotspots, --no-experimental
 #                     skip one collector; it is recorded as not measured
 #   -p CRATE          pin the compiling collectors to these crates (the
 #                     justfile does this on macOS); repeatable
+#
+# The experimental step (full mode only) runs rustqual per crate and
+# cargo-anatomy once when they are on PATH. What they measure is recorded and
+# read by no gate (QM-005), so neither can fail the run; a missing tool is a
+# skip, a tool that falls over on one crate leaves an error in that crate's
+# block.
 #
 # Every collector that cannot run is recorded in the snapshot as not measured
 # with its reason, and the run still writes the snapshot (QM-001). Exit codes:
@@ -31,13 +37,13 @@ here="scripts/metrics"
 mode="${1:-}"
 case "$mode" in
     full|static) shift ;;
-    "") echo "usage: $0 full|static [--out DIR] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [-p CRATE]..." >&2; exit 1 ;;
+    "") echo "usage: $0 full|static [--out DIR] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [-p CRATE]..." >&2; exit 1 ;;
     *) echo "metrics: unknown mode '$mode'" >&2; exit 1 ;;
 esac
 command -v python3 >/dev/null 2>&1 || { echo "metrics: python3 is required" >&2; exit 127; }
 
 out=".scratch/metrics/$mode"
-want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1
+want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1 want_experimental=1
 scope=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -46,13 +52,14 @@ while [ "$#" -gt 0 ]; do
         --no-modules) want_modules=0; shift ;;
         --no-clippy) want_clippy=0; shift ;;
         --no-hotspots) want_hotspots=0; shift ;;
+        --no-experimental) want_experimental=0; shift ;;
         -p) scope+=("$2"); shift 2 ;;
         -p*) scope+=("${1#-p}"); shift ;;
         *) echo "metrics: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
 if [ "$mode" = "static" ]; then
-    want_coverage=0 want_modules=0 want_clippy=0
+    want_coverage=0 want_modules=0 want_clippy=0 want_experimental=0
 fi
 
 work="$out/raw"
@@ -92,6 +99,8 @@ add_tool cargo-llvm-cov "$(tool_version cargo-llvm-cov cargo llvm-cov --version)
 add_tool cargo-modules "$(tool_version cargo-modules cargo modules --version)"
 add_tool cargo-nextest "$(tool_version cargo-nextest cargo nextest --version)"
 add_tool clippy "$(tool_version cargo-clippy cargo clippy --version)"
+add_tool rustqual "$(tool_version rustqual rustqual --version)"
+add_tool cargo-anatomy "$(tool_version cargo-anatomy cargo anatomy -V)"
 printf '%s}\n' "${tools_json%, }" > "$work/tools.json"
 
 # ----------------------------------------------------------------- metadata
@@ -264,6 +273,56 @@ PY
     done < "$work/scope.txt"
     collect_args+=(--modules "$work/modules.jsonl")
     durations+=("modules=$(since "$t0")")
+fi
+
+# ------------------------------------------------------------- experimental
+# Coupling and design metrics from young tools, recorded per crate and read
+# by no gate (QM-005). Nothing in this step can fail the run: a missing tool
+# is a skip, a tool that cannot run is a skip with its reason, and a crate
+# rustqual chokes on carries the error in its own block.
+if [ "$want_experimental" -eq 0 ]; then
+    skip experimental.rustqual "$mode mode"
+    skip experimental.anatomy "$mode mode"
+else
+    if command -v rustqual >/dev/null 2>&1; then
+        t0="$(now)"
+        mkdir -p "$work/rustqual" "$out/rustqual"
+        while read -r crate; do
+            [ -n "$crate" ] || continue
+            # A source-level tool: the generated crate has no source to read,
+            # so it is left out rather than scored on an empty tree.
+            [ "$crate" = "remote-proto" ] && continue
+            src="$(python3 -c 'import json,os,sys; meta=json.load(open(sys.argv[1])); pkg=next(p for p in meta["packages"] if p["name"]==sys.argv[2]); print(os.path.dirname(pkg["manifest_path"]))' "$work/metadata.json" "$crate")/src"
+            [ -d "$src" ] || continue
+            # Exit 1 means findings, which is the point; anything else did not run.
+            status=0
+            rustqual "$src" --format json > "$work/rustqual/$crate.json" 2> "$work/rustqual/$crate.err" || status=$?
+            if [ "$status" -gt 1 ] || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$work/rustqual/$crate.json" 2>/dev/null; then
+                printf '{"error": "rustqual exited %s (%s)"}\n' "$status" "$(head -c 200 "$work/rustqual/$crate.err" | tr '\n"' '  ')" > "$work/rustqual/$crate.json"
+                echo "metrics: experimental.rustqual: $crate not analysed (exit $status)" >&2
+            fi
+            # The SARIF copy is an artifact for a person's viewer; nothing reads it.
+            rustqual "$src" --format sarif > "$out/rustqual/$crate.sarif" 2>/dev/null || true
+        done < "$work/scope.txt"
+        collect_args+=(--rustqual-dir "$work/rustqual")
+        durations+=("experimental.rustqual=$(since "$t0")")
+    else
+        skip experimental.rustqual "rustqual not installed (scripts/metrics/install-tools.sh --experimental)"
+    fi
+    if command -v cargo-anatomy >/dev/null 2>&1; then
+        t0="$(now)"
+        status=0
+        # Compact JSON over the whole workspace is its default output.
+        cargo anatomy > "$work/anatomy.json" 2> "$work/anatomy.err" || status=$?
+        if [ "$status" -eq 0 ] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$work/anatomy.json" 2>/dev/null; then
+            collect_args+=(--anatomy "$work/anatomy.json")
+        else
+            skip experimental.anatomy "cargo anatomy exited $status ($(head -c 200 "$work/anatomy.err" | tr '\n' ' '))"
+        fi
+        durations+=("experimental.anatomy=$(since "$t0")")
+    else
+        skip experimental.anatomy "cargo-anatomy not installed (scripts/metrics/install-tools.sh --experimental)"
+    fi
 fi
 
 # ------------------------------------------------------------------ collect
