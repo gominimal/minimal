@@ -76,7 +76,7 @@ three reasons, each with a test:
    `a_batch_is_one_strict_json_request_serialized_from_the_parsed_lines`,
    `a_guests_minimal_attributes_are_dropped_at_every_level`,
    `a_reconnect_does_not_reset_the_byte_budget`,
-   `the_guest_budget_is_a_small_share_of_the_host_spool`,
+   `the_guest_budget_fills_only_the_guests_own_spool`,
    `an_oversized_or_empty_frame_ends_the_connection_after_a_flush`,
    `a_stream_cut_mid_frame_keeps_what_came_before`.
 
