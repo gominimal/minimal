@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
 # Architectural-health snapshot: run the collectors, hand their output to
-# collect.py (spec 30).
+# collect.py, and in the grading modes grade the result with diff.py (spec 30).
 #
-# Usage: scripts/metrics/run.sh MODE [OPTIONS] [-p CRATE ...]
+# Usage: scripts/metrics/run.sh MODE [BASE] [OPTIONS] [-p CRATE ...]
 #
 #   MODE      full    every collector; the nightly run and `just metrics`
 #             static  no compiler: layers, size, unused deps, hotspots from
-#                     history. What the gate tier and a cold sandbox can afford.
+#                     history. What a cold sandbox can afford.
+#             gate    grade the change without a compiler: layers, size and
+#                     hotspots, then the report against the base ref. The
+#                     review runtime's probe and the tail of `agent-verify`
+#                     (.minimal/minimal.toml); QM-012.
+#             diff    gate plus clippy over the crates the change touched;
+#                     `just metrics-diff`. --coverage adds llvm-cov over the
+#                     same crates.
 #             mutants [BASE]
 #                     the static collectors plus cargo-mutants over the lines
 #                     changed since the merge-base with BASE (default
 #                     origin/main). Linux only (QM-017).
-#   --out DIR         where snapshot.json, clippy-hits.json and meta.json land
+#   BASE              gate, diff and mutants: the ref to grade against. Empty
+#                     or absent means the merge-base with origin/main (then
+#                     main), the rule scripts/clippy-strict.sh follows.
+#   --out DIR         where snapshot.json, clippy-hits.json, meta.json and (in
+#                     the grading modes) report.md, report.json land
 #                     (default .scratch/metrics/<mode>)
+#   --history-ref REF gate and diff: the ref holding history/*.json baselines
+#                     (default origin/metrics-data)
+#   --coverage        diff: run llvm-cov over the scope too
 #   --no-coverage, --no-modules, --no-clippy, --no-hotspots, --no-experimental, --no-mutants
 #                     skip one collector; it is recorded as not measured
 #   -p CRATE          pin the compiling collectors to these crates (the
@@ -27,45 +41,66 @@
 # Every collector that cannot run is recorded in the snapshot as not measured
 # with its reason, and the run still writes the snapshot (QM-001). Exit codes:
 #   0  snapshot written, verdict pass or warn
-#   2  snapshot written, verdict fail
+#   2  snapshot written, verdict fail (in the grading modes: the report's)
 #   3  snapshot written, but a collector could not run (read it as incomplete)
 #   1  nothing written: a crash, or no python3
 # None of the non-zero ones is ever read as clean.
 #
+# The grading modes end stdout with one line the review runtime records as
+# evidence, whatever the exit code:
+#   quality-gate: <verdict> report=<path to report.json> sha256=<hex>
+# report.json carries no times, so the hash identifies what was measured.
+#
+# Gate mode runs nothing that reaches rustc: `cargo metadata --no-deps` reads
+# the manifests alone, but cargo-shear resolves the whole dependency graph,
+# and that probes `rustc -vV` and may need the registry, so the gate records
+# unused deps as not measured and leaves them to diff and full.
+#
 # Tool versions are read from the binaries and recorded, so the snapshot says
-# what measured it; install-tools.sh holds the pins.
+# what measured it; install-tools.sh holds the pins. Only the tools a mode runs
+# are probed: asking clippy for its version already runs rustc.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 here="scripts/metrics"
 mode="${1:-}"
 case "$mode" in
-    full|static|mutants) shift ;;
-    "") echo "usage: $0 full|static|mutants [BASE] [--out DIR] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [--no-mutants] [-p CRATE]..." >&2; exit 1 ;;
+    full|static|gate|diff|mutants) shift ;;
+    "") echo "usage: $0 full|static|gate|diff|mutants [BASE] [--out DIR] [--history-ref REF] [--coverage] [--no-coverage] [--no-modules] [--no-clippy] [--no-hotspots] [--no-experimental] [--no-mutants] [-p CRATE]..." >&2; exit 1 ;;
     *) echo "metrics: unknown mode '$mode'" >&2; exit 1 ;;
 esac
 command -v python3 >/dev/null 2>&1 || { echo "metrics: python3 is required" >&2; exit 127; }
 
-base=""
-if [ "$mode" = "mutants" ]; then
+grading=0
+case "$mode" in gate|diff) grading=1 ;; esac
+if [ "$mode" = "mutants" ] && [ "$(uname -s)" = "Darwin" ]; then
     # cargo-mutants runs the baseline suite before any mutant and stops when
     # it fails; the suite is green only on Linux (.minimal/minimal.toml).
-    if [ "$(uname -s)" = "Darwin" ]; then
-        echo "metrics: mutants mode needs Linux: cargo-mutants wants the baseline suite green, and it is green only there" >&2
-        exit 1
-    fi
-    # The justfile passes BASE through even when it is empty.
-    if [ "$#" -gt 0 ]; then
-        case "$1" in -*) ;; *) base="$1"; shift ;; esac
-    fi
+    echo "metrics: mutants mode needs Linux: cargo-mutants wants the baseline suite green, and it is green only there" >&2
+    exit 1
+fi
+
+# The grading modes and mutants take an optional positional BASE first. The
+# justfile passes it quoted, so it may be the empty string; an option is never
+# a base.
+base=""
+if { [ "$grading" -eq 1 ] || [ "$mode" = "mutants" ]; } && [ "$#" -gt 0 ]; then
+    case "$1" in
+        -*) ;;
+        *) base="$1"; shift ;;
+    esac
 fi
 
 out=".scratch/metrics/$mode"
-want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1 want_experimental=1 want_mutants=1
+history_ref="origin/metrics-data"
+want_coverage=1 want_modules=1 want_clippy=1 want_hotspots=1 want_deps=1 want_experimental=1 want_mutants=1
+opt_coverage=0
 scope=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --out) out="$2"; shift 2 ;;
+        --history-ref) history_ref="$2"; shift 2 ;;
+        --coverage) opt_coverage=1; shift ;;
         --no-coverage) want_coverage=0; shift ;;
         --no-modules) want_modules=0; shift ;;
         --no-clippy) want_clippy=0; shift ;;
@@ -79,6 +114,8 @@ while [ "$#" -gt 0 ]; do
 done
 case "$mode" in
     static) want_coverage=0 want_modules=0 want_clippy=0 want_experimental=0 want_mutants=0 ;;
+    gate)   want_coverage=0 want_modules=0 want_clippy=0 want_deps=0 want_experimental=0 want_mutants=0 ;;
+    diff)   want_modules=0 want_experimental=0 want_mutants=0; [ "$opt_coverage" -eq 1 ] || want_coverage=0 ;;
     mutants) want_coverage=0 want_modules=0 want_clippy=0 want_experimental=0 ;;
 esac
 
@@ -105,8 +142,42 @@ tool_version() {   # tool_version <name> <command...>: first dotted number of th
     "$@" 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
 }
 
+# ------------------------------------------------------------ changed lines
+# What the change touched, from the library clippy-strict.sh shares, so the
+# two gates agree on which lines are the branch's own. Resolved before the
+# collectors because diff mode scopes clippy to the changed crates.
+if [ "$grading" -eq 1 ]; then
+    # lint-shell.sh checks the library as a script of its own.
+    # shellcheck disable=SC1091
+    . "scripts/lib/changed-lines.sh"
+    base_ref="$base"
+    base="$(changed_lines_base "$base")"
+    merge_base="$(git merge-base "$base" HEAD)"
+    changed_lines_diff "$merge_base" "$work/changed.diff"
+    changed_lines_untracked "$work/untracked.txt"
+    changed_crates "$merge_base" "$work/untracked.txt" > "$work/changed-crates.txt"
+    no_rust_changes=0
+    if [ ! -s "$work/changed.diff" ] && [ ! -s "$work/untracked.txt" ]; then
+        no_rust_changes=1
+    fi
+    # An explicit scope wins (macOS pins one); otherwise the changed crates,
+    # or the workspace when Rust outside crates/ changed. Without Rust changes
+    # there is nothing to lint, and `cargo clippy --workspace` would spend the
+    # budget proving it.
+    if [ "$mode" = diff ] && [ "${#scope[@]}" -eq 0 ]; then
+        if [ "$no_rust_changes" -eq 1 ]; then
+            want_clippy=0 want_coverage=0
+        elif [ -s "$work/changed-crates.txt" ]; then
+            mapfile -t scope < "$work/changed-crates.txt"
+        fi
+    fi
+fi
+
 # ---------------------------------------------------------------- toolchain
-rustc_v="$(tool_version rustc rustc --version)"
+compiles=0
+if [ "$want_clippy" -eq 1 ] || [ "$want_coverage" -eq 1 ] || [ "$want_modules" -eq 1 ]; then compiles=1; fi
+rustc_v=""
+[ "$compiles" -eq 1 ] && rustc_v="$(tool_version rustc rustc --version)"
 cargo_v="$(tool_version cargo cargo --version)"
 channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null | head -n1)"
 printf '{"channel": "%s", "rustc": "%s", "cargo": "%s"}\n' "$channel" "$rustc_v" "$cargo_v" > "$work/toolchain.json"
@@ -114,15 +185,32 @@ printf '{"channel": "%s", "rustc": "%s", "cargo": "%s"}\n' "$channel" "$rustc_v"
 tools_json="{"
 add_tool() { tools_json="$tools_json\"$1\": \"$2\", "; }
 add_tool tokei "$(tool_version tokei tokei --version)"
-add_tool cargo-shear "$(tool_version cargo-shear cargo shear --version)"
-add_tool cargo-llvm-cov "$(tool_version cargo-llvm-cov cargo llvm-cov --version)"
-add_tool cargo-modules "$(tool_version cargo-modules cargo modules --version)"
-add_tool cargo-nextest "$(tool_version cargo-nextest cargo nextest --version)"
-add_tool clippy "$(tool_version cargo-clippy cargo clippy --version)"
-add_tool rustqual "$(tool_version rustqual rustqual --version)"
-add_tool cargo-anatomy "$(tool_version cargo-anatomy cargo anatomy -V)"
-add_tool cargo-mutants "$(tool_version cargo-mutants cargo mutants --version)"
-add_tool cargo-crap "$(tool_version cargo-crap cargo crap --version)"
+shear_v=""; cov_v=""; modules_v=""; nextest_v=""; clippy_v=""; mutants_v=""; crap_v=""; rustqual_v=""; anatomy_v=""
+[ "$want_deps" -eq 1 ] && shear_v="$(tool_version cargo-shear cargo shear --version)"
+if [ "$want_coverage" -eq 1 ]; then
+    cov_v="$(tool_version cargo-llvm-cov cargo llvm-cov --version)"
+    nextest_v="$(tool_version cargo-nextest cargo nextest --version)"
+    crap_v="$(tool_version cargo-crap cargo crap --version)"
+fi
+[ "$want_modules" -eq 1 ] && modules_v="$(tool_version cargo-modules cargo modules --version)"
+[ "$want_clippy" -eq 1 ] && clippy_v="$(tool_version cargo-clippy cargo clippy --version)"
+if [ "$want_mutants" -eq 1 ]; then
+    mutants_v="$(tool_version cargo-mutants cargo mutants --version)"
+    [ -n "$nextest_v" ] || nextest_v="$(tool_version cargo-nextest cargo nextest --version)"
+fi
+if [ "$want_experimental" -eq 1 ]; then
+    rustqual_v="$(tool_version rustqual rustqual --version)"
+    anatomy_v="$(tool_version cargo-anatomy cargo anatomy -V)"
+fi
+add_tool cargo-shear "$shear_v"
+add_tool cargo-llvm-cov "$cov_v"
+add_tool cargo-modules "$modules_v"
+add_tool cargo-nextest "$nextest_v"
+add_tool clippy "$clippy_v"
+add_tool rustqual "$rustqual_v"
+add_tool cargo-anatomy "$anatomy_v"
+add_tool cargo-mutants "$mutants_v"
+add_tool cargo-crap "$crap_v"
 printf '%s}\n' "${tools_json%, }" > "$work/tools.json"
 
 # ----------------------------------------------------------------- metadata
@@ -168,7 +256,9 @@ else
 fi
 
 # -------------------------------------------------------------- unused deps
-if command -v cargo-shear >/dev/null 2>&1; then
+if [ "$want_deps" -eq 0 ]; then
+    skip deps "$mode mode: cargo shear resolves the dependency graph, which probes rustc"
+elif command -v cargo-shear >/dev/null 2>&1; then
     t0="$(now)"
     status=0
     cargo shear --format json --offline > "$work/shear.json" 2> "$work/shear.err" || status=$?
@@ -185,7 +275,11 @@ fi
 
 # ------------------------------------------------------------------- clippy
 if [ "$want_clippy" -eq 0 ]; then
-    skip clippy "$mode mode"
+    if [ "$mode" = diff ] && [ "${no_rust_changes:-0}" -eq 1 ]; then
+        skip clippy "no Rust changes since $base"
+    else
+        skip clippy "$mode mode"
+    fi
 else
     lint_args=()
     while read -r lint; do lint_args+=(-W "$lint"); done < "$work/strict-lints.txt"
@@ -228,8 +322,12 @@ run_crap() {
 
 rm -f "$out/lcov.info"
 if [ "$want_coverage" -eq 0 ]; then
-    skip coverage "$mode mode"
-    skip crap "$mode mode"
+    if [ "$mode" = diff ] && [ "${no_rust_changes:-0}" -eq 1 ]; then
+        skip coverage "no Rust changes since $base"
+    else
+        skip coverage "$mode mode"
+    fi
+    skip crap "coverage not measured"
 elif ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     skip coverage "cargo-llvm-cov not installed (scripts/metrics/install-tools.sh)"
     skip crap "coverage not measured"
@@ -467,6 +565,30 @@ if [ ! -f "$out/snapshot.json" ] || { [ "$status" -ne 0 ] && [ "$status" -ne 2 ]
     exit 1
 fi
 echo "metrics: wrote $out/snapshot.json"
+
+# -------------------------------------------------------------------- grade
+# The snapshot's own verdict used the head's thresholds and no baseline; the
+# report's verdict is the one that grades the change, so it replaces it here.
+if [ "$grading" -eq 1 ]; then
+    diff_args=(--head "$out" --out "$out" --history-ref "$history_ref"
+               --changed "$work/changed.diff" --untracked "$work/untracked.txt")
+    [ -n "$base_ref" ] && diff_args+=(--base-ref "$base_ref")
+    status=0
+    rm -f "$out/report.json"
+    python3 "$here/diff.py" "${diff_args[@]}" || status=$?
+    if [ ! -f "$out/report.json" ] || { [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; }; then
+        echo "metrics: diff.py failed (exit $status); no report written" >&2
+        exit 1
+    fi
+    echo "metrics: wrote $out/report.md"
+    verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$out/report.json")"
+    digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$out/report.json")"
+    [ "$failed" -eq 0 ] || echo "metrics: a collector could not run; the snapshot is incomplete" >&2
+    echo "quality-gate: $verdict report=$out/report.json sha256=$digest"
+    [ "$failed" -eq 0 ] || exit 3
+    exit "$status"
+fi
+
 if [ "$failed" -eq 1 ]; then
     echo "metrics: a collector could not run; the snapshot is incomplete" >&2
     exit 3

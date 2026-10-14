@@ -347,6 +347,17 @@ metrics-tools:
 metrics MODE="full" *args:
     scripts/metrics/run.sh {{MODE}} {{strict-scope}} {{args}}
 
+# Clippy over the crates the branch touched (scoped like `just clippy-strict`),
+# the static collectors, then the report in .scratch/metrics/diff/ against the
+# newest snapshot of the base ref. `just metrics-diff "" --coverage` adds
+# llvm-cov over the same crates. The no-compiler form is the `quality-gate` task
+# in .minimal/minimal.toml (`scripts/metrics/run.sh gate`). Exit 2 is a failing
+# verdict, 3 an incomplete snapshot; neither reads as clean.
+#
+# Grade this branch's change against its base ref; BASE defaults to the merge-base with origin/main.
+metrics-diff BASE="" *args:
+    scripts/metrics/run.sh diff "{{BASE}}" {{strict-scope}} {{args}}
+
 # Seconds, no compile: the table in metrics/layers.toml against cargo metadata.
 # Part of `just ci`. Exit 2 names the forbidden edge or the unassigned crate.
 #
