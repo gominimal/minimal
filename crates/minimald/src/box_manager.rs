@@ -1457,82 +1457,106 @@ impl BoxManager {
             }
             // Deletes a session: tears down its running host and actor (if
             // any), then removes its on-disk record.
+            //
+            // The mainloop resolves the record and claims the actor; the
+            // teardown itself runs on a task of its own. Awaiting the actor
+            // here held every queued caller behind it: the reap of a session
+            // whose client gave up on `min session activate` while the
+            // actor was inside a stalled package-graph clone parked `min ls`
+            // for the rest of the clone's connect timeout (70 s in the lab,
+            // 710d).
             ManagerMessage::DeleteSession(id, r) => {
-                r.handle(async {
-                    if self.in_shutdown.is_cancelled() {
-                        return Err(BoxManagerError::new(
+                if self.in_shutdown.is_cancelled() {
+                    r.handle(async {
+                        Err(BoxManagerError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             minimald_rpc::SHUTDOWN_REFUSAL,
-                        ));
+                        ))
+                    })
+                    .await;
+                    return;
+                }
+                let handle = match self.store.find(RecordPredicate::Id(id)).await {
+                    Ok(Some(handle)) => handle,
+                    Ok(None) => {
+                        r.handle(async {
+                            Err(std::io::Error::new(
+                                NotFound,
+                                format!(
+                                    "{} `{}`",
+                                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                                    id.as_ref()
+                                ),
+                            ))
+                        })
+                        .await;
+                        return;
                     }
-                    let handle =
-                        self.store
-                            .find(RecordPredicate::Id(id))
-                            .await?
-                            .ok_or_else(|| {
-                                std::io::Error::new(
-                                    NotFound,
-                                    format!(
-                                        "{} `{}`",
-                                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
-                                        id.as_ref()
-                                    ),
-                                )
-                            })?;
-                    // Teardown belongs to the actor, so an idle session gets
-                    // one brought up rather than having its record deleted
-                    // out from under it. That used to be a fair shortcut —
-                    // "nothing to undo" — but a session's `on_destroy` hooks
-                    // now run on this path, and skipping the actor skipped
-                    // them silently for any session whose actor had been
-                    // reaped (every session, after a daemon restart).
-                    //
-                    // Spawning is cheap: the actor reads its record and
-                    // composition, and only mints a sandbox if there are
-                    // destroy hooks to run in one.
-                    let actor = match self.running.remove(&id) {
-                        Some(hnd) => Some(hnd),
-                        None => match BoxActor::run(self.session_config(handle.clone())).await {
-                            Ok(hnd) => Some(hnd),
-                            // A record the actor refuses to come up on — a
-                            // restart-orphaned `Materializing` one is the
-                            // known case — must still be destroyable, so
-                            // fall through to deleting it directly. A
-                            // session that cannot be torn down is worse
-                            // than one torn down without its hooks.
-                            Err(e) => {
-                                tracing::warn!(
-                                    session_id = %id,
-                                    error = %e,
-                                    "could not start the session to run its destroy hooks; \
-                                     removing its record without them",
-                                );
-                                None
-                            }
-                        },
-                    };
-                    match actor {
-                        Some(hnd) => {
-                            let hook_failures = hnd.destroy().await?;
-                            // Belt-and-braces: a dead actor (self-terminated
-                            // but not yet evicted) reads as `Ok` above, and
-                            // may have died *without* deleting its record
-                            // (its own delete failed). Remove any leftover;
-                            // `NotFound` is the normal already-deleted case.
-                            if let Err(e) = handle.delete().await
-                                && e.kind() != NotFound
-                            {
-                                return Err(e);
-                            }
-                            Ok(hook_failures)
-                        }
-                        None => {
-                            handle.delete().await?;
-                            Ok(Vec::new())
-                        }
+                    Err(e) => {
+                        r.handle(async { Err(e) }).await;
+                        return;
                     }
-                })
-                .await
+                };
+                // Teardown belongs to the actor, so an idle session gets
+                // one brought up rather than having its record deleted
+                // out from under it. That used to be a fair shortcut —
+                // "nothing to undo" — but a session's `on_destroy` hooks
+                // now run on this path, and skipping the actor skipped
+                // them silently for any session whose actor had been
+                // reaped (every session, after a daemon restart).
+                //
+                // Spawning is cheap: the actor reads its record and
+                // composition, and only mints a sandbox if there are
+                // destroy hooks to run in one.
+                let actor = match self.running.remove(&id) {
+                    Some(hnd) => Some(hnd),
+                    None => match BoxActor::run(self.session_config(handle.clone())).await {
+                        Ok(hnd) => Some(hnd),
+                        // A record the actor refuses to come up on — a
+                        // restart-orphaned `Materializing` one is the
+                        // known case — must still be destroyable, so
+                        // fall through to deleting it directly. A
+                        // session that cannot be torn down is worse
+                        // than one torn down without its hooks.
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %id,
+                                error = %e,
+                                "could not start the session to run its destroy hooks; \
+                                 removing its record without them",
+                            );
+                            None
+                        }
+                    },
+                };
+                // Claimed: the session is out of `running`, so a `List`
+                // served meanwhile no longer probes an actor that is busy
+                // tearing down. The caller gets the outcome when it ends.
+                crate::traced::spawn(async move {
+                    r.handle(async {
+                        match actor {
+                            Some(hnd) => {
+                                let hook_failures = hnd.destroy().await?;
+                                // Belt-and-braces: a dead actor (self-terminated
+                                // but not yet evicted) reads as `Ok` above, and
+                                // may have died *without* deleting its record
+                                // (its own delete failed). Remove any leftover;
+                                // `NotFound` is the normal already-deleted case.
+                                if let Err(e) = handle.delete().await
+                                    && e.kind() != NotFound
+                                {
+                                    return Err(e);
+                                }
+                                Ok(hook_failures)
+                            }
+                            None => {
+                                handle.delete().await?;
+                                Ok(Vec::new())
+                            }
+                        }
+                    })
+                    .await;
+                });
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {

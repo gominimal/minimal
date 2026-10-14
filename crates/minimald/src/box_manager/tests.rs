@@ -442,6 +442,59 @@ async fn destroy_tears_down_a_running_session() {
     drop(handle);
 }
 
+/// A destroy that waits on its actor must not hold the mainloop. Here
+/// the wait is an `on_destroy` hook that sleeps; in the lab (710d) it
+/// was the reap of a session whose actor sat inside a stalled
+/// package-graph clone after its client gave up, and `min ls` queued
+/// behind it for 70 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_destroy_does_not_hold_the_mainloop() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 5".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    // Let the destroy reach its hook before measuring.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), mngr.list())
+        .await
+        .expect("`list` queued behind a destroy that was waiting on its actor")
+        .unwrap();
+    assert!(
+        !destroy.is_finished(),
+        "the destroy hook should still be running"
+    );
+
+    let hook_failures = destroy.await.unwrap().unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record should be gone after destroy"
+    );
+}
+
 /// Destroying an unknown ID is a `NotFound` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroy_unknown_id_errors() {
