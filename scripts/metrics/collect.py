@@ -241,17 +241,109 @@ def collect_size(path: Path | None, attr: Attributor):
     return per_crate
 
 
+DOT_EDGE_RE = re.compile(r'^\s*"([^"]+)"\s*->\s*"([^"]+)"\s*\[label="uses"')
+
+
+def module_cycles(dot_paths: list[Path]) -> list[list[str]]:
+    """Strongly connected components of size > 1 in the module `uses` graph.
+
+    The DOT files come from `cargo modules dependencies` with functions,
+    traits and types filtered out, so every node is a module and every
+    `uses` edge is one module reaching into another. A crate's targets share
+    the graph: a cycle through a binary-only module is still a cycle. Edges
+    touching the crate root or a test module are left out (see `structural`).
+    """
+    def structural(node: str) -> bool:
+        # The crate root re-exports its children and the children reach back
+        # with `use crate::`; that pair is how a Rust crate is laid out, not a
+        # cycle worth a finding. Test modules reach anywhere by design.
+        if "::" not in node:
+            return True
+        segments = node.split("::")[1:]
+        return any(
+            seg == "tests" or seg.endswith("_tests") or seg in ("test_util", "test_harness")
+            for seg in segments
+        )
+
+    edges: dict[str, set[str]] = defaultdict(set)
+    for dot in dot_paths:
+        if not dot.is_file():
+            continue
+        for line in dot.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = DOT_EDGE_RE.match(line)
+            if not m or m.group(1) == m.group(2):
+                continue
+            if structural(m.group(1)) or structural(m.group(2)):
+                continue
+            edges[m.group(1)].add(m.group(2))
+            edges.setdefault(m.group(2), set())
+    # Tarjan, iterative: module graphs are small, recursion limits are not.
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    cycles: list[list[str]] = []
+    counter = 0
+    for root in sorted(edges):
+        if root in index:
+            continue
+        work = [(root, iter(sorted(edges[root])))]
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for nxt in it:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(sorted(edges[nxt]))))
+                    advanced = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                component = []
+                while True:
+                    top = stack.pop()
+                    on_stack.discard(top)
+                    component.append(top)
+                    if top == node:
+                        break
+                if len(component) > 1:
+                    cycles.append(sorted(component))
+    return sorted(cycles)
+
+
 def collect_modules(path: Path | None):
-    """run.sh writes one JSON object per crate: {crate, acyclic, orphans, error}."""
+    """run.sh writes one JSON object per crate: {crate, targets: [{target, dot, orphans, error}]}."""
     if path is None:
         return None
     out = {}
     for line in read_lines(path):
         rec = json.loads(line)
+        targets = rec.get("targets", [])
+        dots = [Path(t["dot"]) for t in targets if t.get("dot")]
+        orphan_sets = [set(t.get("orphans") or []) for t in targets]
+        orphans = sorted(set.intersection(*orphan_sets)) if orphan_sets else []
+        errors = [f"{t['target']}: {t['error']}" for t in targets if t.get("error")]
+        cycles = module_cycles(dots)
         out[rec["crate"]] = {
-            "acyclic": rec.get("acyclic"),
-            "orphans": rec.get("orphans"),
-            "error": rec.get("error"),
+            "acyclic": not cycles if not errors else None,
+            "cycles": cycles,
+            "orphans": len(orphans),
+            "orphan_files": orphans,
+            "error": "; ".join(errors) or None,
         }
     return out
 
@@ -566,7 +658,7 @@ def main(argv: list[str] | None = None) -> int:
     workspace["coverage"] = coverage_ws
     if modules is not None:
         workspace["modules"] = {
-            "cycles": sum(1 for m in modules.values() if m.get("acyclic") is False),
+            "cycles": sum(len(m.get("cycles") or []) for m in modules.values()),
             "orphans": sum(m.get("orphans") or 0 for m in modules.values()),
             "errors": sorted(k for k, m in modules.items() if m.get("error")),
         }
