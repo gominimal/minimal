@@ -772,6 +772,8 @@ def summary_markdown(snapshot: dict) -> str:
         rows.append(("Workspace lint hits", ws["clippy"]["workspace_lints"]))
     if ws.get("coverage"):
         rows.append(("Line coverage %", ws["coverage"].get("lines", {}).get("pct")))
+        if ws["coverage"].get("test_failures"):
+            rows.append(("Tests failing under coverage", ws["coverage"]["test_failures"]))
     if ws.get("modules"):
         rows.append(("Module cycles", ws["modules"]["cycles"]))
         rows.append(("Orphan modules", ws["modules"]["orphans"]))
@@ -818,6 +820,9 @@ def summary_markdown(snapshot: dict) -> str:
                 f"| `{f['path']}` | {f['churn']} | {f['complexity']} | {f['strict']} | {_fmt(f['uncovered_lines'])} | {_fmt(f['score'])} |"
             )
 
+    failed_tests = (ws.get("coverage") or {}).get("failed_tests") or []
+    if failed_tests:
+        lines += ["", "### Tests that failed under the coverage build", ""] + [f"- `{t}`" for t in failed_tests]
     if run["not_measured"]:
         lines += ["", "### Not measured", ""] + [f"- {k}: {v}" for k, v in sorted(run["not_measured"].items())]
     return "\n".join(lines) + "\n"
@@ -847,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--clippy-complete", action="store_true", help="clippy covered the whole workspace")
     ap.add_argument("--strict-lints", type=Path, help="one lint name per line")
     ap.add_argument("--coverage", type=Path)
+    ap.add_argument("--coverage-tests", type=Path, help="JSON: tests, failures, failed[] from nextest's junit")
     ap.add_argument("--tokei", type=Path)
     ap.add_argument("--modules", type=Path)
     ap.add_argument("--shear", type=Path)
@@ -993,6 +999,13 @@ def main(argv: list[str] | None = None) -> int:
         workspace["clippy"] = None
         workspace["strict_promotable"] = None
     workspace["coverage"] = coverage_ws
+    coverage_tests = read_json(args.coverage_tests)
+    if coverage_ws is not None and coverage_tests is not None:
+        # Tests that failed under the instrumented build: the coverage of
+        # what ran still stands, but the number is read with this beside it.
+        workspace["coverage"]["tests"] = coverage_tests.get("tests")
+        workspace["coverage"]["test_failures"] = coverage_tests.get("failures")
+        workspace["coverage"]["failed_tests"] = coverage_tests.get("failed") or []
     if modules is not None:
         workspace["modules"] = {
             "cycles": sum(len(m.get("cycles") or []) for m in modules.values()),

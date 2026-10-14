@@ -274,6 +274,10 @@ if [ "$want_deps" -eq 0 ]; then
 elif command -v cargo-shear >/dev/null 2>&1; then
     t0="$(now)"
     status=0
+    # cargo-shear resolves the full dependency graph, so every git dependency
+    # has to be in the cargo home first; on a fresh runner nothing has
+    # fetched yet. The fetch is what the compiling collectors need anyway.
+    cargo fetch --locked > "$work/fetch.out" 2> "$work/fetch.err" || true
     cargo shear --format json --offline > "$work/shear.json" 2> "$work/shear.err" || status=$?
     # 0 clean, 1 findings; anything else did not run.
     if [ "$status" -le 1 ] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$work/shear.json" 2>/dev/null; then
@@ -368,10 +372,26 @@ else
     # Test sources, fuzz targets, build scripts and generated code are kept
     # out of the denominator (QM-004). The lcov file is for the tools that
     # read coverage per function (cargo-crap) and for a person's viewer.
+    # --ignore-run-fail: a test that fails under the instrumented build (a
+    # hard-coded target/debug path, a host-dependent probe) must not take
+    # the coverage of everything that ran with it. The failures are counted
+    # from nextest's junit and recorded in the snapshot instead.
     cargo llvm-cov nextest "${cargo_scope[@]}" --locked --profile coverage --no-tests=fail \
+        --ignore-run-fail \
         --ignore-filename-regex '(^|/)(tests|benches|fuzz|examples)/|build\.rs$|/target/' \
         --json --summary-only --output-path "$work/llvm-cov.json" \
         > "$work/coverage.out" 2> "$work/coverage.err" || status=$?
+    junit="$(find target/llvm-cov-target -path '*nextest/coverage/junit.xml' 2>/dev/null | head -n1 || true)"
+    if [ -n "$junit" ]; then
+        python3 - "$junit" <<'PY' > "$work/coverage-tests.json" || true
+import json, sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+tests = int(root.get("tests") or 0); failures = int(root.get("failures") or 0); errors = int(root.get("errors") or 0)
+failed = sorted(f"{c.get('classname')}::{c.get('name')}" for c in root.iter("testcase") if c.find("failure") is not None or c.find("error") is not None)
+print(json.dumps({"tests": tests, "failures": failures + errors, "failed": failed}))
+PY
+        collect_args+=(--coverage-tests "$work/coverage-tests.json")
+    fi
     if [ "$status" -eq 0 ]; then
         collect_args+=(--coverage "$work/llvm-cov.json")
         cargo llvm-cov report --lcov --output-path "$out/lcov.info" >/dev/null 2>&1 || true
