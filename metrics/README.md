@@ -22,8 +22,8 @@ edits: the thresholds and the layer table. The code is under
 
 | Command | What it does |
 |---|---|
-| `just metrics-tools` | Installs the pinned tools (`scripts/metrics/install-tools.sh`). |
-| `just metrics` | Full snapshot into `.scratch/metrics/full/`: lint density, coverage, size, module cycles, unused dependencies, layers, hotspots. Minutes to tens of minutes. |
+| `just metrics-tools` | Installs the pinned tools (`scripts/metrics/install-tools.sh`); `scripts/metrics/install-tools.sh --experimental` adds the experimental collectors. |
+| `just metrics` | Full snapshot into `.scratch/metrics/full/`: lint density, coverage, size, module cycles, unused dependencies, layers, hotspots, and the experimental coupling metrics when their tools are installed. Minutes to tens of minutes. |
 | `just metrics static` | The no-compiler subset into `.scratch/metrics/static/`: size, unused dependencies, layers, hotspots by churn. Seconds. |
 | `just metrics-layers` | The layer check alone, against `cargo metadata`. Part of `just ci`. |
 
@@ -47,8 +47,8 @@ the same tree, baseline and thresholds produce the same bytes. Times live in
 | `git` | `sha`, `sha7`, `ref`, `dirty`. |
 | `toolchain`, `tools` | Versions that measured the tree. |
 | `scope` | `crates` the compiling collectors covered; `excluded` crates source-level tools cannot see, with the reason. |
-| `crates.<name>` | `layer`, then one block per collector, each `null` when not measured: `size` (files, code, comments, blanks, test code), `clippy` (workspace lints, every strict lint's count, complexity lint counts, the two totals), `coverage` (lines, functions, regions as covered, total, pct), `modules` (acyclic, orphans), `deps` (internal, unused), `mutants`, `crap`, `experimental`. |
-| `workspace` | The same blocks summed, plus `strict_promotable`: the strict lints at zero across the whole tree, present only when clippy covered the whole workspace. |
+| `crates.<name>` | `layer`, then one block per collector, each `null` when not measured: `size` (files, code, comments, blanks, test code), `clippy` (workspace lints, every strict lint's count, complexity lint counts, the two totals), `coverage` (lines, functions, regions as covered, total, pct), `modules` (acyclic, orphans), `deps` (internal, unused), `mutants`, `crap`, `experimental` (`rustqual` and `anatomy` sub-blocks, each `null` when that tool did not run; the whole block `null` when neither did). |
+| `workspace` | The same blocks summed, plus `strict_promotable`: the strict lints at zero across the whole tree, present only when clippy covered the whole workspace. `experimental` carries the rustqual score weighted by lines of code with the finding counts summed, and the mean distance from the main sequence with the crates in the zone of pain. |
 | `layers` | Every forbidden edge with whether an exception names it, the counts `unexcepted` and `exceptions`, the `unassigned` crates, and stale exceptions. |
 | `hotspots` | Files ranked by churn over `window_days` multiplied by findings, with each file's components. |
 | `gates` | One entry per threshold, keyed `<kind>:<metric>` (`floor:coverage.lines_pct`, `ratchet:clippy.strict.total`): value, threshold or baseline, result (`pass`, `warn`, `fail`, `not_evaluated`). |
@@ -99,6 +99,47 @@ better on every axis. With no coverage the uncovered term is dropped and
 ranking is churn alone and `findings_included` is false. A hotspot is where a
 refactor pays back first: a complex file nobody touches costs nothing until
 someone touches it.
+
+### Experimental coupling metrics
+
+Two tools measure how the code is coupled, inside a crate and between
+crates. Both run in `full` mode when installed, and `--no-experimental`
+skips them.
+
+- **rustqual** reads a crate's `src/` and scores it. IOSP (Integration
+  Operation Segregation Principle) asks that a function either orchestrates
+  calls or holds logic, never both; a function doing both is an IOSP
+  violation. Per module it computes fan-in, fan-out and instability
+  (`fan_out / (fan_in + fan_out)`), reports circular module dependencies
+  (`CP-001`) and a stable module depending on an unstable one, the Stable
+  Dependencies Principle (`CP-002`). It also counts complexity findings,
+  dead code, duplicates and LCOM4-style cohesion on structs. The snapshot
+  keeps the overall score, those counts and each crate's highest module
+  instability; a SARIF copy per crate lands under `rustqual/` beside the
+  snapshot for a viewer, and nothing reads it.
+- **cargo-anatomy** reads the whole workspace through `cargo metadata` and
+  computes Robert Martin's package metrics per crate: afferent and efferent
+  coupling (`Ca`, `Ce`), instability `I = Ce / (Ce + Ca)`, abstractness `A`
+  (the share of traits among the crate's types), the distance from the main
+  sequence `D = |A + I - 1| / sqrt 2`, and relational cohesion
+  `H = (R + 1) / N`. A crate that is concrete and stable sits in the zone of
+  pain: everything depends on it and nothing in it can change cheaply. The
+  workspace block lists the crates with `D > 0.5` on that side.
+
+Neither feeds a gate, and `thresholds.toml` has no key for them: the tools
+are young and their numbers move between releases, so a gate on them would
+make the verdict depend on a tool's release notes rather than on the tree.
+The snapshot records them, and the history decides whether a gate is
+warranted (QM-005). `remote-proto` is left out of rustqual because its code
+is generated into `OUT_DIR` and has no source to read; it stays in
+cargo-anatomy, which reads the dependency graph.
+
+Install both with `scripts/metrics/install-tools.sh --experimental`; without
+the flag `--check` lists them as optional. A host without them writes a
+complete snapshot with the two collectors under `run.not_measured`. The
+collectors' field names were taken from the tools' published docs
+(`scripts/metrics/testdata/SHAPES.md` says which were verified against a
+run), and every lookup tolerates an absent key.
 
 ### Gates
 
