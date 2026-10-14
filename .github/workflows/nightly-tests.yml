@@ -498,6 +498,11 @@ jobs:
         run: rustup component add llvm-tools-preview
       - name: Install the pinned metrics tools
         run: just metrics-tools
+      - name: Install the experimental tools (best effort)
+        # rustqual and cargo-anatomy compile from crates.io (no prebuilt
+        # binaries); a failed install leaves their blocks not measured, which
+        # the snapshot says, rather than failing the run.
+        run: scripts/metrics/install-tools.sh --experimental || echo "experimental tools not installed; recorded as not measured"
       - name: Fetch the snapshot history
         # Missing on the first run; the dashboard then renders this run alone.
         run: |
