@@ -1486,7 +1486,7 @@ pub fn shutdown(timeout: Duration) {
             clippy::let_underscore_must_use,
             reason = "best effort: a telemetry failure is a silent no-op (spec 25 principle 8)"
         )]
-        let _ = rx.recv_timeout(timeout + Duration::from_millis(250));
+        let _ = rx.recv_timeout(timeout.saturating_add(Duration::from_millis(250)));
     }
 }
 
