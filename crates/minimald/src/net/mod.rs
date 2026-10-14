@@ -1946,7 +1946,7 @@ mod tests {
             SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
                 .with_hostname_proxy_port(Some(7654)),
         ));
-        let waiter = tokio::spawn({
+        let waiter = crate::traced::spawn({
             let switch = Arc::clone(&switch);
             async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
         });
@@ -1969,7 +1969,7 @@ mod tests {
                 .with_hostname_proxy_port(None)
                 .with_hostname_proxy_pending(true),
         ));
-        let waiter = tokio::spawn({
+        let waiter = crate::traced::spawn({
             let switch = Arc::clone(&switch);
             async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
         });

@@ -56,7 +56,7 @@ demand.
 
 `hakoniwa` uses LGPL-3.0-only WITH LGPL-3.0-linking-exception, so static
 linking is expressly permitted without LGPL relink obligations. Its
-footprint is Linux-only. `sandbox2` and `minimald` use it, and it no
+footprint is Linux-only. `sandbox` and `minimald` use it, and it no
 longer reaches macOS builds since #721 decoupled `mctx` from it.
 
 ## Redistributed third-party code in release artifacts

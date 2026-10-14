@@ -31,7 +31,7 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 const BOOT_MARKER_PORT: u32 = 7350;
 
 /// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
-/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// devpts is capped at [`sandbox::config::BOX_PTY_MAX`] by its own remount,
 /// but every instance still draws from the one kernel-wide counter, so the
 /// pool must be large enough for several boxes at their cap plus the session
 /// host's own shells. 65536 is a working value.
@@ -471,7 +471,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // the question is about.
     let mountinfo =
         std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
-    let delegated = sandbox2::classifier::host_cgroup2_mounts(&mountinfo)
+    let delegated = sandbox::classifier::host_cgroup2_mounts(&mountinfo)
         .into_iter()
         .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
     match (failure, delegated) {

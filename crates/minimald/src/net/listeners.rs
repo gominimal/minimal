@@ -1183,7 +1183,18 @@ impl ListenWatcher {
             leader = ?leader,
             "listen watcher started"
         );
-        let task = tokio::spawn(async move {
+        // Detached: the watcher lives as long as the box, so spawned in the
+        // caller's span (the host-launch message's) it would hold that span
+        // open for the box's whole life and parent every poll to a one-shot
+        // message. Its own root links back to the launch instead
+        // (`traced::spawn_detached`).
+        let root = tracing::info_span!(
+            parent: None,
+            "net.listen_watcher",
+            session = %plan.box_name,
+            lease = %plan.lease,
+        );
+        let task = crate::traced::spawn_detached(root, async move {
             let mut state = WatchState::new(plan, leader);
             loop {
                 state.poll().await;
@@ -2600,7 +2611,7 @@ mod tests {
         let listener = UnixListener::bind(&path).expect("the control socket binds");
         let (tx, rx) = mpsc::channel(64);
         let decide = std::sync::Arc::new(decide);
-        let handle = tokio::spawn(async move {
+        let handle = crate::traced::spawn(async move {
             // Sequential on purpose: the watcher publishes and withdraws one
             // port at a time, awaited, so one connection served at a time is
             // its shape.
@@ -2685,6 +2696,28 @@ mod tests {
         );
     }
 
+    /// Two any-bound listeners on adjacent ports, as [`adjacent_listeners`]
+    /// pairs a loopback and an any bind: a range spanning the two names
+    /// exactly the ports this test holds, so no listener another process
+    /// bound elsewhere in the ephemeral range is published beside them.
+    fn adjacent_any_listeners() -> (TcpListener, TcpListener) {
+        const ATTEMPTS: usize = 64;
+        for _ in 0..ATTEMPTS {
+            let first = listening_socket();
+            let Some(next) = port_of(&first).checked_add(1) else {
+                continue;
+            };
+            match TcpListener::bind((Ipv4Addr::UNSPECIFIED, next)) {
+                Ok(second) => return (first, second),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("binding the adjacent any-address listener failed: {error}"),
+            }
+        }
+        panic!(
+            "no adjacent any/any port pair after {ATTEMPTS} tries; the ephemeral range is crowded"
+        );
+    }
+
     /// The box's lease on the test switch.
     const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
     /// The box's published address (NET-010).
@@ -2694,10 +2727,17 @@ mod tests {
     /// range covering exactly `port`, and the stance that lets listening
     /// publish (NET-016).
     fn permit_policy(port: u16) -> sessions::SessionPolicy {
+        permit_range_policy(port, port)
+    }
+
+    /// [`permit_policy`] over `low..=high`, for a proof that holds every
+    /// port in the range itself — so the range admits nothing it does not
+    /// hold (see [`adjacent_any_listeners`]).
+    fn permit_range_policy(low: u16, high: u16) -> sessions::SessionPolicy {
         sessions::SessionPolicy {
             ingress: Some(sessions::IngressPolicy {
                 port_mappings: Vec::new(),
-                dynamic_allowed_range: Some((port, port)),
+                dynamic_allowed_range: Some((low, high)),
                 dynamic_ingress: Some(sessions::DynamicIngress::Allow),
             }),
             egress: None,
@@ -2976,6 +3016,60 @@ mod tests {
                 .all(|served| served.local != format!("{PUBLISHED}:{other}")),
             "no request ever names the port the rules do not permit: {records:?}"
         );
+        server.abort();
+    }
+
+    /// The watcher lives as long as the box, so it runs in a root span of
+    /// its own and the span it was started in (the host launch's message)
+    /// closes when the launch is done, while the watcher runs on.
+    #[tokio::test]
+    async fn a_watcher_does_not_hold_its_launch_span_open() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::registry::LookupSpan as _;
+        // Layered: a bare `Registry` never frees a closed span's slot (the
+        // close is `Layered::try_close`'s), so every span would read open.
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(tracing_subscriber::layer::Identity::new()),
+        );
+        let is_open = |id: &tracing::Id| {
+            tracing::dispatcher::get_default(|d| {
+                d.downcast_ref::<tracing_subscriber::Registry>()
+                    .unwrap()
+                    .span(id)
+                    .is_some()
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        let (server, _served) = spawn_forwarder(sock.clone());
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(1),
+            SwitchSubnet::default(),
+            None,
+        ));
+        let state_dir = state_dir_beside(&sock);
+        let plan = ListenPlan::new(
+            "listen-box".into(),
+            LEASE,
+            PUBLISHED,
+            ControlChannel::Unix(sock),
+            gate,
+            BoxPublications::default(),
+            state_dir,
+        );
+        let launch = tracing::info_span!("session.host.message");
+        let launch_id = launch.id().unwrap();
+        let watcher =
+            launch.in_scope(|| ListenWatcher::start(plan, Leader::Resolved(std::process::id())));
+        drop(launch);
+        tokio::task::yield_now().await;
+        assert!(
+            !is_open(&launch_id),
+            "the launch's span closed while the watcher runs"
+        );
+        watcher.stop().await;
         server.abort();
     }
 
@@ -3425,7 +3519,7 @@ mod tests {
             let gate = Arc::clone(&gate);
             let ever_admitted = Arc::clone(&ever_admitted);
             let sampling = Arc::clone(&sampling);
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 while sampling.load(Ordering::SeqCst) {
                     if gate.admits_tcp(port) {
                         ever_admitted.store(true, Ordering::SeqCst);
@@ -4026,32 +4120,69 @@ mod tests {
     /// own streak's first — said, at the poll's own cadence — and the streak
     /// still ends the way every one does: the port publishes the moment the
     /// forwarder accepts.
+    ///
+    /// The entry goes with a poll that reads a table without the port, and
+    /// that read leaves no line of its own, so the proof holds a witness
+    /// beside the port: an any-bound listener at the next port up, which the
+    /// forwarder accepts, closed together with the port. The withdrawal the
+    /// poll writes for the witness is the proof that the table both had left
+    /// was read — the line is written after the unexpose and before the poll
+    /// drops the entries whose ports that table no longer names. A fixed wait
+    /// is not that proof: a stall of the test's process that outlasts the
+    /// wait leaves the poll and the test due together, the runtime polls the
+    /// test's body before the watcher's task, and the rebind lands before the
+    /// table is read — so the port never left it and the entry stands.
     #[tokio::test]
     async fn a_backed_off_port_that_closes_starts_a_fresh_streak() {
-        let listener = listening_socket();
+        let (listener, witness) = adjacent_any_listeners();
         let port = port_of(&listener);
+        let witness_port = port_of(&witness);
+        let port_local = format!("{PUBLISHED}:{port}");
+        let witness_local = format!("{PUBLISHED}:{witness_port}");
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("gvproxy.sock");
-        // The forwarder refuses every expose while the test says so, so both
-        // servers' publishes fail under it until the test clears the flag.
+        // The forwarder refuses the port's every expose while the test says
+        // so — both servers' publishes fail under it until the test clears
+        // the flag — and accepts the witness's.
         let refusing = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&refusing);
+        let refused = port_local.clone();
         let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
-            if served.path.ends_with("/expose") && flag.load(Ordering::SeqCst) {
+            if served.path.ends_with("/expose")
+                && served.local == refused
+                && flag.load(Ordering::SeqCst)
+            {
                 500
             } else {
                 200
             }
         });
         let (lines, _guard) = captured_lines();
-        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+        let (watcher, gate) = watcher_at(sock, &permit_range_policy(port, witness_port));
 
-        // The first server's publish is refused and said — one streak's first
-        // failure, at the poll's own cadence: the fresh wait is one poll
-        // (`retry_in` below).
-        let first_attempt = next_served(&mut served).await;
-        assert_eq!(first_attempt.path, "/services/forwarder/expose");
-        assert_eq!(first_attempt.local, format!("{PUBLISHED}:{port}"));
+        // The first poll asks for both ports, in the table's own order: the
+        // witness publishes, and the port's publish is refused and said —
+        // one streak's first failure, at the poll's own cadence: the fresh
+        // wait is one poll (`retry_in` below).
+        let asked = [
+            next_served(&mut served).await,
+            next_served(&mut served).await,
+        ];
+        for attempt in &asked {
+            assert_eq!(
+                attempt.path, "/services/forwarder/expose",
+                "the first poll only publishes: {attempt:?}"
+            );
+        }
+        let mut asked_for = [asked[0].local.as_str(), asked[1].local.as_str()];
+        asked_for.sort_unstable();
+        let mut held = [port_local.as_str(), witness_local.as_str()];
+        held.sort_unstable();
+        assert_eq!(
+            asked_for, held,
+            "the first poll asks for the port and its witness, nothing else"
+        );
+        soon(|| gate.admits_tcp(witness_port)).await;
         soon(|| {
             !lines_saying(
                 &lines.contents(),
@@ -4060,12 +4191,43 @@ mod tests {
             .is_empty()
         })
         .await;
+        assert!(
+            !gate.admits_tcp(port),
+            "nothing is published while the switch refuses the bind"
+        );
 
-        // The first server closes, and a poll reads its port gone — two
-        // poll intervals leave no doubt the fresh table was read — so the
-        // streak it never finished goes with it.
+        // The first server closes, and the witness with it. The poll that
+        // reads the table both have left withdraws the witness and says so;
+        // the port's streak, which that same read ends, leaves no line of
+        // its own. The withdrawal's line is written after the unexpose and
+        // before the poll drops the entries whose ports the table no longer
+        // names, so once it is read here the port's entry is gone.
         drop(listener);
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        drop(witness);
+        // If this process stalled past the poll interval between the first
+        // poll and the drop, the port's retried expose is served before the
+        // witness's withdrawal; the withdrawal is the proof, and anything
+        // served before it can only be that retry.
+        let withdrawn = loop {
+            let next = next_served(&mut served).await;
+            if next.path == "/services/forwarder/unexpose" {
+                break next;
+            }
+            assert_eq!(next.path, "/services/forwarder/expose", "{next:?}");
+            assert_eq!(
+                next.local, port_local,
+                "only the refused port retries: {next:?}"
+            );
+        };
+        assert_eq!(withdrawn.local, witness_local);
+        soon(|| {
+            !lines_saying(
+                &lines.contents(),
+                "withdrew a listening port from the box's address",
+            )
+            .is_empty()
+        })
+        .await;
         assert_eq!(
             lines_saying(
                 &lines.contents(),
@@ -4087,7 +4249,7 @@ mod tests {
             second_attempt,
             Served {
                 path: "/services/forwarder/expose".into(),
-                local: format!("{PUBLISHED}:{port}"),
+                local: port_local.clone(),
                 remote: format!("{LEASE}:{port}"),
                 protocol: "tcp".into(),
             },
@@ -4122,14 +4284,14 @@ mod tests {
         refusing.store(false, Ordering::SeqCst);
         let published = next_served(&mut served).await;
         assert_eq!(published.path, "/services/forwarder/expose");
-        assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
+        assert_eq!(published.local, port_local);
         soon(|| gate.admits_tcp(port)).await;
 
         drop(second);
         watcher.stop().await;
         let withdrawn = next_served(&mut served).await;
         assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
-        assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
+        assert_eq!(withdrawn.local, port_local);
         assert!(!gate.admits_tcp(port));
         server.abort();
     }
@@ -4860,7 +5022,7 @@ mod tests {
         use tokio::io::AsyncBufReadExt as _;
         let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
         let (seen_tx, seen) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
+        let task = crate::traced::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (read, mut write) = stream.into_split();
                 let mut line = String::new();
@@ -4922,7 +5084,7 @@ mod tests {
         let door = dir.path().join("report-door.sock");
         let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
         let (seen_tx, mut seen) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
+        let task = crate::traced::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
                 let (read, mut write) = stream.into_split();

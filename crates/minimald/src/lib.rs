@@ -28,8 +28,11 @@ pub mod session_sop;
 mod sessions;
 mod sftp;
 mod store;
+#[cfg(target_os = "linux")]
+pub mod telemetry_forward;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_harness;
+pub mod traced;
 
 /// Env var that the client must set (via `env_request`) before the SFTP
 /// subsystem request, naming which session the SFTP channel attaches to.
@@ -59,8 +62,8 @@ pub struct ChannelConfig {
 /// refusal carries too.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn userns_restriction_fix(restriction: sandbox2::UsernsRestriction) -> String {
-    restriction.remedy(sandbox2::RemedyTarget::Daemon {
+pub fn userns_restriction_fix(restriction: sandbox::UsernsRestriction) -> String {
+    restriction.remedy(sandbox::RemedyTarget::Daemon {
         bin: &server::this_daemon_path(),
     })
 }

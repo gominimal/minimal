@@ -23,6 +23,17 @@ __min_rpc() {
     local error="false"
     local env_pairs=()
     local bar_open=0
+    # The exec that runs this helper hands the box its TRACEPARENT (the exec
+    # span's W3C context). Forward it ahead of the request so the daemon's
+    # work for it (StartMaterialize, ExposeDynamic, ...) joins that trace
+    # instead of the channel actor's own root (scenarios 717b, 770). Only a
+    # value in the 55-character W3C form crosses: anything in the box can
+    # set TRACEPARENT, and a `%` in it would shift the daemon's split of the
+    # line.
+    local prefix=""
+    if [[ "${TRACEPARENT:-}" =~ ^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$ ]]; then
+        prefix="traceparent%${TRACEPARENT}%"
+    fi
 
     while IFS= read -r line; do
         local tag="${line%%:*}"
@@ -74,7 +85,7 @@ __min_rpc() {
                 break
                 ;;
         esac
-    done < <(echo "${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    done < <(echo "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
 
     if [[ "$bar_open" -eq 1 ]]; then
         printf '\r\033[K'

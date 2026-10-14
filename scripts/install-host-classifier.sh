@@ -85,7 +85,7 @@
 # table that is not the one this step rendered.
 set -euo pipefail
 
-# Mirrors sandbox2::classifier's constants (crates/sandbox2/src/lib.rs): the
+# Mirrors sandbox::classifier's constants (crates/sandbox/src/lib.rs): the
 # tree this script lays out is the one the daemon looks for at startup.
 readonly DEFAULT_TREE_ROOT=/sys/fs/cgroup/minimald.slice
 readonly DAEMON_LEAF=daemon

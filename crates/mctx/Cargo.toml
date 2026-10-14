@@ -23,7 +23,7 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
-sandbox2.workspace = true
+sandbox.workspace = true
 
 args.workspace = true
 lcache.workspace = true

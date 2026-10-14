@@ -32,7 +32,7 @@
 //!
 //! To run locally you need a host that allows unprivileged user namespaces and
 //! a C compiler:
-//! `cargo nextest run -p sandbox2 boxes_lack_cap_net_raw`
+//! `cargo nextest run -p sandbox boxes_lack_cap_net_raw`
 //!
 //! A failing run of the CI lane that runs this proof reports an exit code and
 //! nothing else unless the proof names itself: nextest captures what a test
@@ -45,8 +45,8 @@
 //! check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
 
-use sandbox2::NetPlan;
-use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
+use sandbox::NetPlan;
+use sandbox::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -125,7 +125,7 @@ fn announce_to_the_runner(proof: &str) {
             previous_hook(info);
         }));
     });
-    tell_the_runner(&format!("sandbox2 capability proof started: {proof}"));
+    tell_the_runner(&format!("sandbox capability proof started: {proof}"));
 }
 
 /// C source for a tiny static probe that reports a box's identity and
@@ -428,7 +428,7 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
 /// hold together in the one launch closure that applies both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boxes_lack_cap_net_raw() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping boxes_lack_cap_net_raw: this host denies the \
              unprivileged user namespace every sandbox starts by unsharing: \

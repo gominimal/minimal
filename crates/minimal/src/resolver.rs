@@ -2681,7 +2681,7 @@ const LINUX_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on t
 pub(crate) const APPARMOR_DIR: &str = "/etc/apparmor.d";
 
 /// The classifier tree the privileged step lays out
-/// (`sandbox2::classifier::TREE_ROOT`, spelled here because the CLI does
+/// (`sandbox::classifier::TREE_ROOT`, spelled here because the CLI does
 /// not build the sandbox crate on every host).
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const CLASSIFIER_TREE_ROOT: &str = "/sys/fs/cgroup/minimald.slice";

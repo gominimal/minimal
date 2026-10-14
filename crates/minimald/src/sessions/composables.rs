@@ -206,6 +206,7 @@ pub(crate) enum ProjectResolution {
 /// mfile error, and a graph that does not resolve, are returned as
 /// `InvalidInput`, so activation fails rather than dropping every
 /// package contribution.
+#[tracing::instrument(level = "info", name = "compose.resolve_project", skip_all, fields(project_path = %project_path))]
 pub(crate) fn resolve_project_ctx_and_graph(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
@@ -243,7 +244,11 @@ pub(crate) fn resolve_project_ctx_and_graph(
         }
     };
     let mut ctx = mctx::Context::from_daemon(Arc::clone(daemon_ctx), mfile);
-    match ctx.graph_from_all_packages() {
+    let graph = {
+        let _g = tracing::info_span!("compose.graph_from_all_packages").entered();
+        ctx.graph_from_all_packages()
+    };
+    match graph {
         Ok(graph) => Ok(ProjectResolution::Full(Box::new(ctx), Box::new(graph))),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

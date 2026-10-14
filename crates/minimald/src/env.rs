@@ -10,13 +10,13 @@
 //! ## The in-sandbox `min` command channel
 //!
 //! Packages, tasks and checks can be driven from *inside* a running session via
-//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox2`]'s listener
+//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox`]'s listener
 //! is synchronous — a blocking `accept()` loop on its own OS thread — which is
 //! why the equivalent handler in `mctx` has to spin up a fresh tokio runtime per
 //! command. Here we bridge that synchronous world to the daemon's async runtime
 //! with an actor:
 //!
-//! - [`BridgeChannel`] is the trivial synchronous [`sandbox2::Channel`]. For each
+//! - [`BridgeChannel`] is the trivial synchronous [`sandbox::Channel`]. For each
 //!   request it clones the connection and forwards it (with the request line)
 //!   down an mpsc to the actor, then returns immediately.
 //! - [`SessionChannel`] is the actor: it owns the context and graph and processes
@@ -33,6 +33,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
+use crate::traced::spawn_blocking;
 use camino::{Utf8Path, Utf8PathBuf};
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
@@ -40,11 +41,11 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
-use sandbox2::config::{ClassifierLeaf, Config, SandboxMapped};
-use sandbox2::{Container, Sandbox};
+use sandbox::config::{ClassifierLeaf, Config, SandboxMapped};
+use sandbox::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::JoinHandle;
 
 /// The min helper script installed at `/usr/bin/min` inside the sandbox.
 const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
@@ -207,12 +208,12 @@ const ATTACH_ENV_HOOK_NU: &str = constcat::concat!(
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
 /// the same directory at [`SessionChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
-pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_DEFAULT_WD);
 
 /// Where the session's home directory appears inside the sandbox, backed by
 /// [`SessionChannel::home`]. The second of the two directories a sandbox path
 /// can name on the daemon's side.
-pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
 /// The parameters used to construct an [`Env`].
 ///
@@ -233,11 +234,15 @@ pub struct EnvArgs {
     patches: Option<EnvPatches>,
     env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
-    network: sandbox2::NetPlan,
+    network: sandbox::NetPlan,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
     session: crate::session::WeakSessionHandle,
+    /// The owning session's id, for the helper channel's request spans
+    /// (`session.id`), beside the box id: host-side facts about who is
+    /// asking, never read from the request.
+    session_id: Option<sessions::SessionId>,
     /// When true (default), [`Env::build`] consumes package
     /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
     /// When false, the caller supplies both via `env_vars` /
@@ -276,11 +281,21 @@ impl EnvArgs {
             patches: None,
             env_vars: None,
             ot: None,
-            network: sandbox2::NetPlan::host(),
+            network: sandbox::NetPlan::host(),
             session,
+            session_id: None,
             include_package_attr_wiring: true,
             classifier_leaf: None,
         }
+    }
+
+    /// Names the owning session, so every helper request the box sends is
+    /// served in a span that carries `session.id` (the host's knowledge of
+    /// the asker, beside `box.id`).
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: sessions::SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
     }
 
     /// Opts out of consuming `env_vars` / `fs_mappings` from
@@ -350,7 +365,7 @@ impl EnvArgs {
     /// Sets what the session sandbox's network looks like when no provider
     /// decides it — a plan, because that is what the sandbox layer acts on.
     #[must_use]
-    pub fn with_network(mut self, plan: sandbox2::NetPlan) -> Self {
+    pub fn with_network(mut self, plan: sandbox::NetPlan) -> Self {
         self.network = plan;
         self
     }
@@ -598,13 +613,19 @@ impl Env {
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
             box_id,
+            session_id: args.session_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
             ctx,
             graph,
             rx,
         };
-        let actor = tokio::spawn(channel.run());
+        // The actor serves the box's in-session `min` for the env's life, past
+        // the launch that built it: a root of its own, linked to the launch.
+        let actor = crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "session.env"),
+            channel.run(),
+        );
 
         Ok(Self {
             sandbox,
@@ -624,7 +645,7 @@ impl Env {
     }
 
     /// Creates a fresh container in this environment's sandbox.
-    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> std::io::Result<Container> {
+    pub fn container(&mut self, plan: &sandbox::NetPlan) -> std::io::Result<Container> {
         self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
     }
 
@@ -641,18 +662,18 @@ impl Env {
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn closure_report_path(
         &self,
-        leaf: &sandbox2::config::ClassifierLeaf,
+        leaf: &sandbox::config::ClassifierLeaf,
     ) -> std::path::PathBuf {
         self.sandbox.closure_report_path(leaf)
     }
 
     /// Holds the program of every command `container` spawns at a start gate
-    /// until the returned gate is released; see [`sandbox2::Sandbox::hold_start`].
+    /// until the returned gate is released; see [`sandbox::Sandbox::hold_start`].
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn hold_start(
         &self,
         container: &mut Container,
-    ) -> std::io::Result<sandbox2::StartGate> {
+    ) -> std::io::Result<sandbox::StartGate> {
         self.sandbox
             .hold_start(container)
             .map_err(sandbox_err_to_io)
@@ -722,8 +743,8 @@ fn err_to_io(e: Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// Converts a [`sandbox2::Error`] into an [`std::io::Error`].
-fn sandbox_err_to_io(e: sandbox2::Error) -> std::io::Error {
+/// Converts a [`sandbox::Error`] into an [`std::io::Error`].
+fn sandbox_err_to_io(e: sandbox::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
@@ -820,7 +841,7 @@ struct ChannelRequest {
     stream: UnixStream,
 }
 
-/// The synchronous [`sandbox2::Channel`] that bridges the listener thread to the
+/// The synchronous [`sandbox::Channel`] that bridges the listener thread to the
 /// async [`SessionChannel`] actor. It does no work itself beyond handing each
 /// request off; the connection clone stays open in the actor until the handler
 /// finishes, at which point dropping it closes the connection and the client's
@@ -829,7 +850,7 @@ struct BridgeChannel {
     tx: mpsc::Sender<ChannelRequest>,
 }
 
-impl sandbox2::Channel for BridgeChannel {
+impl sandbox::Channel for BridgeChannel {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, _rootfs: &Path) {
         let stream = match stream.try_clone() {
             Ok(s) => s,
@@ -879,6 +900,9 @@ struct SessionChannel {
     /// in one, else the session's name — so the daemon's own fetches are
     /// recorded with the box that asked for them.
     box_id: String,
+    /// The owning session's id ([`EnvArgs::with_session_id`]); `None` for
+    /// an env built without one (tests).
+    session_id: Option<sessions::SessionId>,
     ot: Option<OpTracker>,
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
@@ -888,12 +912,95 @@ struct SessionChannel {
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
+/// The span one helper request is handled in, and the request with its
+/// trace prefix removed.
+///
+/// The helper (`env_min_helper.sh`, `__min_rpc`) sends
+/// `traceparent%<w3c traceparent>%<method>%<data>` when the box has a
+/// `TRACEPARENT` — the exec span's context, handed to the box by
+/// [`crate::exec`] — and the bare `<method>%<data>` otherwise. The actor runs
+/// for the env's life under its own `session.env` root, so without this a
+/// request's mailbox messages (`StartMaterialize`, `ExposeDynamic`) and the
+/// spans they open were children of that root, in a trace of their own
+/// (scenarios 717b and 770). Here the request gets a root of its own that
+/// adopts the forwarded context ([`crate::exec::adopt_trace`] records the
+/// ids and `remember`s them for [`crate::traced::caller_context`]), so the
+/// messages sent while handling it join the exec that ran the helper.
+///
+/// `box_id` and `session_id` are the host's own knowledge of who is asking
+/// (the channel was built for that box, by that session): they go on the
+/// span as `box.id` and `session.id`, and nothing the box sends can set
+/// them. The box-supplied part of the line (the traceparent) only parents
+/// the span, and the method is recorded as one of [`CHANNEL_METHODS`] or
+/// `other` ([`channel_method`]), never as the text the box sent.
+fn channel_request_span<'a>(
+    line: &'a str,
+    box_id: &str,
+    session_id: Option<sessions::SessionId>,
+) -> (tracing::Span, &'a str) {
+    let (traceparent, request) = match line.split_once('%') {
+        Some(("traceparent", rest)) => match rest.split_once('%') {
+            Some((tp, request)) => (Some(tp), request),
+            None => (None, rest),
+        },
+        _ => (None, line),
+    };
+    let method = channel_method(request);
+    let span = tracing::info_span!(
+        parent: None,
+        "session.channel",
+        method,
+        box.id = box_id,
+        session.id = session_id.as_ref().map(tracing::field::display),
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    let client_ctx = traceparent.and_then(minimald_rpc::trace::TraceContext::parse_traceparent);
+    crate::exec::adopt_trace(&span, client_ctx);
+    (span, request)
+}
+
+/// The methods [`SessionChannel::handle`] dispatches: the only values the
+/// `session.channel` span's `method` takes besides `other`. Keep it in step
+/// with the arms of `handle`.
+const CHANNEL_METHODS: &[&str] = &[
+    "add-transient",
+    "add-build",
+    "add-runtime",
+    "add-session",
+    "search",
+    "check",
+    "patched-pkg",
+    "run",
+    "build",
+    "materialize",
+    "net-expose",
+];
+
+/// The `method` a helper request is recorded under: the text before its
+/// first `%` when that is a method [`SessionChannel::handle`] dispatches,
+/// else `other` (a line with no `%` is never dispatched, so it is `other`
+/// too). The line comes from inside the box and the span is exported and
+/// spooled, so no box-chosen text, of any length, reaches the host's
+/// telemetry through this field.
+fn channel_method(request: &str) -> &'static str {
+    request
+        .split_once('%')
+        .and_then(|(method, _)| CHANNEL_METHODS.iter().find(|known| **known == method))
+        .copied()
+        .unwrap_or("other")
+}
+
 impl SessionChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
         while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
             tracing::trace!("session channel handling: {line}");
-            self.handle(&line, &mut stream).await;
+            let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
+            // Boxed: the handler's future is large (every subcommand's state in
+            // one `async fn`) and it is awaited once per request, not per byte.
+            tracing::Instrument::instrument(Box::pin(self.handle(line, &mut stream)), span).await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
@@ -976,6 +1083,8 @@ impl SessionChannel {
                 self.expose_port(stream, port).await;
                 None
             }
+            // A new arm above also goes in `CHANNEL_METHODS`, or its span
+            // records `other`.
             _ => {
                 let _ = writeln!(stream, "error: unhandled input '{line}'");
                 None
@@ -1174,7 +1283,7 @@ impl SessionChannel {
         crate::sandbox_progress::FetchRecord {
             box_id: self.box_id.clone(),
             leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
-                sandbox2::classifier::TREE_ROOT,
+                sandbox::classifier::TREE_ROOT,
             )),
             cache_host: crate::net::classifier::cache_host(
                 &self.ctx.daemon_context().config().remote_cache_url(),
@@ -2103,6 +2212,186 @@ impl tokio::io::AsyncWrite for StreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A helper request arrives as `traceparent%<tp>%<method>%<data>` when
+    /// the box has a `TRACEPARENT`, and bare otherwise; the prefix is taken
+    /// off before dispatch and the request's span is named for the method.
+    /// Without a subscriber the adopted ids are not observable here; the
+    /// shape of the request is.
+    #[test]
+    fn channel_request_span_strips_the_traceparent_prefix() {
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let expose = format!("traceparent%{tp}%net-expose%8770");
+        let (_, request) = super::channel_request_span(&expose, "b", None);
+        assert_eq!(request, "net-expose%8770");
+        let materialize = format!("traceparent%{tp}%materialize%/workbench%--output o o717b");
+        let (_, request) = super::channel_request_span(&materialize, "b", None);
+        assert_eq!(request, "materialize%/workbench%--output o o717b");
+        let (_, request) = super::channel_request_span("net-expose%8770", "b", None);
+        assert_eq!(request, "net-expose%8770");
+        // A prefix with no request after it is handed on as-is, to be refused
+        // by the dispatcher as unhandled input rather than guessed at.
+        let (_, request) = super::channel_request_span("traceparent%garbage", "b", None);
+        assert_eq!(request, "garbage");
+    }
+
+    /// A request from inside a box is served in a span that
+    /// names the box and the session it belongs to, as the host knows them
+    /// (the channel was built for that box by that session), whatever the
+    /// line says: the box-supplied traceparent parents the span and sets
+    /// nothing else.
+    #[test]
+    fn a_box_request_span_carries_the_host_side_box_identity() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let session_id =
+            sessions::SessionId::parse_str("7b3e1f2a-9c4d-4e5f-8a6b-1c2d3e4f5a6b").unwrap();
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = format!("traceparent%{tp}%net-expose%8770");
+        let (span, request) = super::channel_request_span(&line, "leaf-7", Some(session_id));
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "method", "net-expose");
+        assert_eq!(served.field("box.id"), Some("leaf-7"), "{served:?}");
+        assert_eq!(
+            served.field("session.id"),
+            Some(session_id.to_string().as_str()),
+            "{served:?}"
+        );
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the line's traceparent parents the span"
+        );
+
+        // Without a session id the field is simply absent; the box id stays.
+        let (span, _) = super::channel_request_span("net-expose%8770", "solo", None);
+        drop(span);
+        let bare = log.find("session.channel", "box.id", "solo");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].field("session.id"), None);
+    }
+
+    /// The span's `method` is one of the methods the channel
+    /// dispatches, or `other`: a line with no `%`, an unknown method, or a
+    /// long one never puts box-chosen text on the host's span.
+    #[test]
+    fn a_box_request_span_names_only_a_dispatched_method() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let long = "x".repeat(64 * 1024);
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        for (line, method) in [
+            ("net-expose%8770".to_string(), "net-expose"),
+            (format!("traceparent%{tp}%materialize%/w%o"), "materialize"),
+            ("add-session%jq".to_string(), "add-session"),
+            ("net-expose".to_string(), "other"),
+            ("no percent sign at all".to_string(), "other"),
+            ("rm-rf%/".to_string(), "other"),
+            (format!("{long}%x"), "other"),
+            (long.clone(), "other"),
+            (format!("traceparent%{tp}%{long}"), "other"),
+        ] {
+            let (span, _) = super::channel_request_span(&line, "m", None);
+            drop(span);
+            let served = log.find("session.channel", "box.id", "m");
+            let last = served.last().expect("a session.channel span");
+            assert_eq!(last.field("method"), Some(method), "{:.40}", line);
+        }
+        for method in super::CHANNEL_METHODS {
+            assert_eq!(super::channel_method(&format!("{method}%")), *method);
+        }
+    }
+
+    /// TEL-025: a `min` inside a box (the shipped helper, `__min_rpc`)
+    /// hands the box's inherited `TRACEPARENT` to the daemon as the request
+    /// line's `traceparent%` prefix, and the daemon serves the request in a
+    /// span that adopts it, so the daemon's work for it joins the outer
+    /// trace. The inner `min` is a shell function: it has no exporter and
+    /// exports nothing. The helper runs under bash with a `socat` stand-in
+    /// that records the line it would send; the span is the one the channel
+    /// actor serves that line in. A value that is not the 55-character W3C
+    /// form is not forwarded at all, so a `%` in it cannot shift the split.
+    #[cfg(unix)]
+    #[test]
+    fn a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+        let sent_line = tmp.path().join("line");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!("#!/bin/sh\ncat > '{}'\necho done:\n", sent_line.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let send = |traceparent: Option<&str>| -> String {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(format!(
+                    ". '{}'; __min_rpc net-expose 8770",
+                    helper.display()
+                ))
+                .env("PATH", &path)
+                .env_remove("TRACEPARENT");
+            if let Some(tp) = traceparent {
+                cmd.env("TRACEPARENT", tp);
+            }
+            let out = cmd.output().expect("run bash");
+            assert!(out.status.success(), "{out:?}");
+            std::fs::read_to_string(&sent_line)
+                .unwrap()
+                .trim_end_matches('\n')
+                .to_string()
+        };
+
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = send(Some(tp));
+        assert_eq!(line, format!("traceparent%{tp}%net-expose%8770"));
+
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (span, request) = super::channel_request_span(&line, "inner", None);
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "box.id", "inner");
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the daemon's span joins the outer trace: {served:?}"
+        );
+        assert_eq!(
+            served.field("parent_span_id"),
+            Some("ed105930ec67df47"),
+            "{served:?}"
+        );
+
+        // Not the W3C form: the request goes bare, and the daemon mints.
+        for bad in [
+            "",
+            "garbage",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-0",
+            "00-af79b928d8ae574b659f1fbf40208758%ed105930ec67df4-01",
+            "00-AF79B928D8AE574B659F1FBF40208758-ED105930EC67DF47-01",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01%x",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01 x",
+        ] {
+            assert_eq!(send(Some(bad)), "net-expose%8770", "{bad:?}");
+        }
+        assert_eq!(send(None), "net-expose%8770");
+    }
 
     /// Every session rootfs carries the per-attach environment hook for every
     /// shell we support, at that shell's own vendor/system integration point
@@ -2480,6 +2769,7 @@ exit $rc
                 .unwrap(),
             has_packages: HashSet::new(),
             box_id: "a session in a test".to_string(),
+            session_id: None,
             ot: None,
             session,
             runtime_env: RuntimeEnv::default(),

@@ -250,17 +250,17 @@ pub async fn run_task(
     // an unconfined mip) that denial otherwise surfaces only when the first
     // spawn dies writing /proc/self/uid_map, with nothing useful in the log.
     // Warn once at the start of the first task run instead, with the fix —
-    // the cause's own, spelled by `sandbox2` for this binary: the installer's
+    // the cause's own, spelled by `sandbox` for this binary: the installer's
     // profile attaches to minimald alone, so mip's AppArmor remedy is the
     // loader with `--path` for this mip, never `min finalize-install`.
-    if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+    if let Some(restriction) = sandbox::user_namespaces_restriction() {
         let bin = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))
             .unwrap_or_else(|| "<path to this mip binary>".to_string());
         warn!(
             reason = %restriction,
-            fix = restriction.remedy(sandbox2::RemedyTarget::Mip {
+            fix = restriction.remedy(sandbox::RemedyTarget::Mip {
                 bin: &bin,
                 data_dir: paths::minimal_data_dir().as_str(),
             }),
@@ -293,7 +293,7 @@ pub async fn run_task(
     let (_interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
 
     for (i, inv) in invocations.iter().enumerate() {
-        // One launch per invocation, as `sandbox2::run_with_cancel` does: a
+        // One launch per invocation, as `sandbox::run_with_cancel` does: a
         // spawn is what gets a namespace, so each needs its own plan.
         let planned = env.plan_launch().await?;
         let container = env
@@ -306,7 +306,7 @@ pub async fn run_task(
             .spawn()
             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?;
         let guard = match planned
-            .attach(sandbox2::Spawned::from_child(&mut child))
+            .attach(sandbox::Spawned::from_child(&mut child))
             .await
         {
             Ok(guard) => guard,

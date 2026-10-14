@@ -5,11 +5,11 @@
 //! [`Config::with_network`](crate::Config::with_network). The built-in
 //! [`HostNet`]/[`NoNet`] cover the consumer-agnostic modes; richer modes (e.g.
 //! an own-IP gvproxy switch attach) are supplied by consumers as out-of-crate
-//! `impl Network`, keeping switch/tap/relay logic out of `sandbox2`.
+//! `impl Network`, keeping switch/tap/relay logic out of `sandbox`.
 //!
 //! This respects the deployment-model ownership rule (spec R1.4): the gvproxy
 //! **process** is owned by `minimald` (DM2) or `minvmd` (DM1/3/4), never by
-//! `sandbox2`. `sandbox2` only decides netns isolation (pre-spawn) and invokes
+//! `sandbox`. `sandbox` only decides netns isolation (pre-spawn) and invokes
 //! the consumer-provided wiring against an already-running switch (post-spawn).
 
 use std::future::Future;
@@ -293,7 +293,7 @@ impl Network for NetPlan {
     }
 }
 
-/// An error from [`Network::attach`]. Wraps a consumer error so `sandbox2` need
+/// An error from [`Network::attach`]. Wraps a consumer error so `sandbox` need
 /// not know the concrete failure type.
 #[derive(Debug)]
 pub struct NetworkError(pub Box<dyn std::error::Error + Send + Sync>);

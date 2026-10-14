@@ -2499,7 +2499,7 @@ mod tests {
         assert_eq!(HOSTNAME_SUFFIX, "min.internal");
         assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
         assert_eq!(crate::net::switch::HOST_MIN_INTERNAL, "host.min.internal");
-        assert_eq!(sandbox2::HOST_MIN_INTERNAL, HOST_ROW_NAME);
+        assert_eq!(sandbox::HOST_MIN_INTERNAL, HOST_ROW_NAME);
         let yaml = ::switch::render_gvproxy_config(::switch::SwitchSubnet::default(), &[]);
         assert!(
             yaml.contains(&format!(
@@ -4013,7 +4013,7 @@ mod tests {
         pending.reset_hand_verdict_deadline(30_000);
         let waiting = {
             let pending = std::sync::Arc::clone(&pending);
-            tokio::spawn(async move { pending.await_vouch_for(handed).await })
+            crate::traced::spawn(async move { pending.await_vouch_for(handed).await })
         };
         // Landed only once the waiter is parked, so the landing is what
         // answers it — not a verdict it read before it began to wait.
@@ -4080,7 +4080,7 @@ mod tests {
         let mut waiters = Vec::new();
         for _ in 0..WAITERS {
             let book = std::sync::Arc::clone(&never);
-            waiters.push(tokio::spawn(async move {
+            waiters.push(crate::traced::spawn(async move {
                 let began = std::time::Instant::now();
                 let vouched = book.await_vouch_for(handed).await;
                 (vouched, began.elapsed())
@@ -4113,7 +4113,7 @@ mod tests {
         let waiters: Vec<_> = (0..WAITERS)
             .map(|_| {
                 let book = std::sync::Arc::clone(&pending);
-                tokio::spawn(async move { book.await_vouch_for(handed).await })
+                crate::traced::spawn(async move { book.await_vouch_for(handed).await })
             })
             .collect();
         while pending.verdict_waiters() < WAITERS {

@@ -148,7 +148,7 @@ const NODE_PROXY_PORT: &str = "7654";
 const NODE_ANSWERER_PORT: &str = "7656";
 
 /// The classifier tree the guest daemon mounts and renders for:
-/// `sandbox2::classifier::TREE_ROOT` (the sandbox layer is not a `minvmd`
+/// `sandbox::classifier::TREE_ROOT` (the sandbox layer is not a `minvmd`
 /// dependency, so the one path is spelled here beside the digest that would
 /// catch it drifting).
 const GUEST_TREE_ROOT: &str = "/sys/fs/cgroup/minimald.slice";

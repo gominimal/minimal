@@ -701,12 +701,12 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-083** THE SYSTEM SHALL run every box without `CAP_NET_RAW`.
   tier:     T0
-  verify:   cargo nextest run -p sandbox2 boxes_lack_cap_net_raw
+  verify:   cargo nextest run -p sandbox boxes_lack_cap_net_raw
   <!-- S10a/AC3; prose 53; ubiquitous -->
 
 - **NET-137** THE SYSTEM SHALL refuse a process in a box every socket whose family the box's network namespace does not confine, `AF_VSOCK` included, whatever the box's network mode.
   tier:     T0
-  verify:   cargo nextest run -p sandbox2 every_box_refuses_namespace_bypass_families
+  verify:   cargo nextest run -p sandbox every_box_refuses_namespace_bypass_families
   <!-- S10a/AC3; prose 53; ubiquitous; design §4.1's precision rule (no reachable switch or tunnel control surface, by socket permissions) as the box-level seal: a vsock socket is not scoped by the box's network namespace and reaches the host-side helper's listeners directly, which is the seal a `none` box already carries (NET-038); every box whose network namespace confines the inet families keeps them, a `none` box included, because its fresh namespace holds only loopback -->
   - WHEN the daemon starts a process inside a running box by joining its namespaces (exec, attach, a hook) THE SYSTEM SHALL apply the same refusal to that process.
     tier:   T0
@@ -714,7 +714,7 @@ included, with every refusal logged (NET-001 to NET-004).
     <!-- S10a/AC3; prose 53; event-driven; a seal set only at box start does not reach a process the daemon injects from outside -->
   - IF a path other than `socket(2)` or `socketpair(2)` can create such a socket for a process in a box, `io_uring` included, THEN THE SYSTEM SHALL refuse that path to the box.
     tier:   T0
-    verify: cargo nextest run -p sandbox2 box_io_uring_socket_refused
+    verify: cargo nextest run -p sandbox box_io_uring_socket_refused
     <!-- S10a/AC3; prose 53; unwanted; the SHALL above names every socket, not every `socket(2)`: a socket an `io_uring` operation creates reaches the same families, so the seal refuses the creating path (`io_uring_setup`) inside the box; the published profile for box processes (architecture AT9, open gap 2) is a default-deny syscall allowlist, which refuses a new socket-creating path by construction, and on a VM-backed host a `socket_create` LSM hook keyed on the box's cgroup, which decides every creation path at once; guest-local vsock is removed from the guest kernel as well, so no reach survives a seal that fails -->
 
 - **NET-139** WHILE the daemon is VM-hosted THE SYSTEM SHALL accept a vsock connection to its RPC listener only from peer CID 2 (`VMADDR_CID_HOST`), deciding at accept before any request byte is read, and SHALL refuse every other CID with one rate-limited audited line naming the peer CID.

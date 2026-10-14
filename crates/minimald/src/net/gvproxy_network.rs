@@ -17,7 +17,7 @@ use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use sandbox2::NetGuard;
+use sandbox::NetGuard;
 use tokio::sync::Mutex;
 
 use crate::net::dns;
@@ -241,7 +241,7 @@ impl NetGuard for OwnIpGuard {
 /// The lease was already allocated and gvproxy already ensured-running by the
 /// provider's plan, so this only does the post-spawn relay + ingress. A failure
 /// here just propagates: the release of that lease stays with the launch
-/// (`sandbox2::PlannedLaunch`), and detaching as well would double-decrement
+/// (`sandbox::PlannedLaunch`), and detaching as well would double-decrement
 /// gvproxy's attach count.
 ///
 /// `handed_from_host` says whether `lease`'s address is the address the VM host
@@ -545,7 +545,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use sandbox2::NetGuard as _;
+    use sandbox::NetGuard as _;
     use switch::MacAddr;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -631,7 +631,7 @@ mod tests {
     fn spawn_control_channel_capturing(path: PathBuf, requests: usize) -> mpsc::Receiver<Vec<u8>> {
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = mpsc::channel(requests);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             for _ in 0..requests {
                 let (mut sock, _) = listener
                     .accept()
@@ -1127,7 +1127,7 @@ mod tests {
         handed: mpsc::Sender<UnixStream>,
     ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -2354,7 +2354,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::channel(4);
         let mut accepted_rx = Some(accepted_rx);
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -2367,7 +2367,7 @@ mod tests {
                     // response; this stand-in *is* the switch side from here
                     // on.
                     if let Some(accepted_rx) = accepted_rx.take() {
-                        tokio::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
+                        crate::traced::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
                     }
                     continue;
                 }
@@ -2403,7 +2403,7 @@ mod tests {
                                             .expect("the stand-in's forwards lock")
                                             .insert(local.to_string(), stop_tx);
                                         let accepted_tx = accepted_tx.clone();
-                                        tokio::spawn(async move {
+                                        crate::traced::spawn(async move {
                                             let mut stop_rx = stop_rx;
                                             let stopped: Option<oneshot::Sender<()>> = loop {
                                                 tokio::select! {
