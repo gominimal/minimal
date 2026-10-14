@@ -19,10 +19,11 @@ described in [Tasks](./tasks.md).
 
 ## Where loadouts live
 
-Each loadout is a single TOML file at:
+Loadouts live under `<config>/minimal/loadouts/`, in either of two layouts:
 
 ```
-<config>/minimal/loadouts/<name>.toml
+<config>/minimal/loadouts/<name>.toml          # a loadout that is just a file
+<config>/minimal/loadouts/<name>/loadout.toml  # a loadout you keep in git
 ```
 
 `<config>` is the platform user config directory: `$XDG_CONFIG_HOME` on Linux
@@ -31,19 +32,54 @@ consistency with Minimal's state and cache dirs. The global
 [`--config-dir`](./cli-min.md#global-flags) flag overrides the base, and
 `min dirs` prints the resolved loadouts directory.
 
-The filename stem **is** the loadout's identifier:
+The two layouts are equivalent in every way but where the bytes sit. Pick the
+second when you want the whole loadout — its definition, the files it
+[ships](#loadout_root), its [hook scripts](#lifecycle_hooks) — to be one
+self-contained directory you can put under version control:
 
-- Nothing inside the file names it, so renaming the file renames the
-  loadout.
-- Names are trimmed and must be non-empty, with no `/`, `\`, or NUL
-  characters.
+```console
+$ git clone git@example.com:you/helix-loadout ~/.config/minimal/loadouts/dev
+$ min session activate . --loadout dev
+```
+
+Nothing else changes between them, because a loadout's own directory is
+`<config>/minimal/loadouts/<name>/` under both — see
+[`$LOADOUT_ROOT`](#loadout_root). To migrate an existing loadout, move it
+inside the directory its files already live in:
+
+```console
+$ cd ~/.config/minimal/loadouts && mkdir -p dev && mv dev.toml dev/loadout.toml
+```
+
+The **filesystem** names the loadout — the filename stem for `<name>.toml`, the
+directory name for `<name>/loadout.toml`:
+
+- Nothing inside the file names it, so renaming the file (or the directory)
+  renames the loadout.
+- Names are trimmed and must be usable as a single directory entry: non-empty,
+  neither `.` nor `..`, and with no `/`, `\`, or NUL characters. (A dot is only
+  special as the whole name — `dev.v2` is fine.)
 - A file that still carries the old `name` field loads anyway, with a
   warning that the field is no longer required. If the declared name
   disagrees with the filename, the warning says so and the filename wins;
   the declared name is discarded.
+- Defining one name in **both** layouts at once is an error, not a
+  precedence rule. `min loadout list` names both files and exits non-zero, and
+  so does an activation that selects the name — whichever file lost would
+  otherwise go on looking live while having no effect.
 
-The directory is not created automatically; create it and drop
-`<name>.toml` files there to get started.
+The directory is not created automatically; create it and add loadouts in
+either shape to get started.
+
+Two things to know if you do version-control a loadout:
+
+- A cloned `<name>/` contains a `.git` directory, which a broad
+  `$LOADOUT_ROOT/**/*` patch source would sweep into your session along with
+  everything else. Prefer patterns that name what you actually want.
+- `<name>/` must be a real directory, not a symlink into a dotfiles repo
+  elsewhere: a loadout's [external hook scripts](#lifecycle_hooks) refuse a
+  symlinked anchor, so they would fail to resolve. Clone into
+  `loadouts/<name>/` directly.
 
 ## Example
 
@@ -74,6 +110,10 @@ VISUAL    = "hx"
 [[lifecycle_hooks]]
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
+
+`[[lifecycle_hooks]]` is top-level here because this is a loadout; in a
+project `minimal.toml` the same hooks nest under `[session]`, written
+`[[session.lifecycle_hooks]]`.
 
 Saved as `<config>/minimal/loadouts/dev.toml`, this is applied with
 `min session activate --loadout dev`, or automatically via
@@ -138,6 +178,11 @@ MUXER = { inherit = true }               # inherit from the host env
 ```
 
 - A **literal** string sets the variable to that value.
+- `PATH` is the one exception to literal values. A `PATH` that contains
+  `$PATH` or `${PATH}` expands that reference to the session's default
+  `PATH`. So `PATH = "/opt/bin:$PATH"` puts `/opt/bin` before the default
+  directories instead of replacing them. A `PATH` without a reference stays
+  verbatim, and every other variable stays literal.
 - `{ inherit = true }` passes the variable through from the environment of
   the `min` process on the host. If the host does not have it set, the
   variable is dropped from the session (with a warning) rather than failing
@@ -203,6 +248,13 @@ so list entries only make sense with per-entry dests or glob entries):
   with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
+- A plain directory path (no glob metacharacters) is shorthand for
+  `dir/**/*`: `source = "~/dotfiles"` copies the whole tree. Common
+  VCS and dependency directories (`.git`, `.hg`, `.svn`, `CVS`, `.jj`,
+  `node_modules`) are excluded by default, and the total size of a
+  plain-directory source is capped at 100 MiB — a larger tree fails the
+  activation rather than being copied silently. Use an explicit glob to
+  narrow the copy.
 - `..` components are rejected wherever they appear.
 - A source path that does not exist on the host is dropped with a warning
   at activation rather than failing it, so opportunistically patching a
@@ -236,17 +288,22 @@ to the session user, whatever it was owned by on your host.
 
 Not every file a loadout patches in belongs in your dotfiles. For the ones
 that exist only to serve this loadout, keep them beside it and name them
-with `$LOADOUT_ROOT`, which expands to a directory named after the loadout
-next to its `.toml` -- the same directory its
-[external hook scripts](#lifecycle_hooks) resolve against:
+with `$LOADOUT_ROOT`, which expands to a directory named after the loadout --
+the same directory its [external hook scripts](#lifecycle_hooks) resolve
+against.
+
+That directory is `<config>/minimal/loadouts/<name>/` under
+[either layout](#where-loadouts-live). With a flat `dev.toml` it sits beside
+the file; with `dev/loadout.toml` it *is* the directory the definition lives
+in, which is what makes a loadout and its files one version-controllable tree:
 
 ```
-<config>/minimal/loadouts/
-├── dev.toml
-└── dev/
-    ├── config.toml
-    └── themes/
-        └── nord.toml
+<config>/minimal/loadouts/        <config>/minimal/loadouts/
+├── dev.toml                      └── dev/
+└── dev/                              ├── loadout.toml
+    ├── config.toml                   ├── config.toml
+    └── themes/                       └── themes/
+        └── nord.toml                     └── nord.toml
 ```
 
 ```toml
@@ -259,7 +316,8 @@ patches = [
 It resolves against the loadouts directory actually in use, so a
 `--config-dir` or `$XDG_CONFIG_HOME` that moves your config takes the
 loadout's files with it -- which a hard-coded `~/.config/minimal/loadouts/dev/`
-would not.
+would not. It is derived from the loadout's *name*, so it is also the same
+directory whichever layout the loadout is filed in.
 
 Details worth knowing:
 
@@ -271,9 +329,10 @@ Details worth knowing:
 - The name is **reserved** here: a loadout that also declares a
   `LOADOUT_ROOT` variable still patches from its own directory. The variable
   reaches the session normally -- only patch sources ignore it.
-- `$LOADOUT_ROOT` alone names a directory, and a patch source matches files,
-  so it patches in nothing. Write `$LOADOUT_ROOT/**/*` to take the whole
-  tree.
+- `$LOADOUT_ROOT` alone names a directory, which is a plain-directory
+  source: it copies the whole tree (equivalent to `$LOADOUT_ROOT/**/*`),
+  with the default VCS/dependency directory excludes and the 100 MiB size
+  cap applied. Write an explicit glob to narrow the copy.
 - The directory is optional. A loadout that never references it does not
   need one, and -- like any other source -- a path that isn't there is
   skipped with a warning rather than failing the activation.
@@ -321,25 +380,27 @@ resolve against the daemon, not the session. Default to POSIX `sh` where you
 can — it is the one interpreter a session is guaranteed to have.
 
 External script paths must be relative (absolute paths and `..` components
-are rejected at parse time). A loadout's scripts are anchored at a directory
-beside the loadout file, named after the loadout — so `dev.toml`'s scripts
-live in `dev/`:
+are rejected at parse time). A loadout's scripts are anchored at the directory
+named after the loadout — so `dev.toml`'s scripts live in `dev/`, and a
+`dev/loadout.toml`'s live beside it:
 
 ```
-<config>/minimal/loadouts/
-├── dev.toml
-└── dev/
-    ├── activate.sh
-    └── teardown.sh
+<config>/minimal/loadouts/        <config>/minimal/loadouts/
+├── dev.toml                      └── dev/
+└── dev/                              ├── loadout.toml
+    ├── activate.sh                   ├── activate.sh
+    └── teardown.sh                   └── teardown.sh
 ```
 
 This is the same directory [`$LOADOUT_ROOT`](#loadout_root) names, so a
 loadout's scripts and the files it patches in live together.
 
 A script must resolve to a regular file inside that directory. Symlinks are
-rejected rather than followed, at every path component — a symlink is the one
-way a path that passes every other check could still reach outside the
-anchor. All of this is checked on your machine before a session is created,
+rejected rather than followed, at every path component *and at the directory
+itself* — a symlink is the one way a path that passes every other check could
+still reach outside the anchor. (This is why a version-controlled loadout
+directory has to be a real checkout rather than a symlink into a dotfiles
+repo.) All of this is checked on your machine before a session is created,
 so a mistyped path fails immediately and names the file.
 
 Hooks from multiple contributors concatenate in declaration order, and run in
@@ -404,7 +465,7 @@ from two flags:
 
 | Flag | Description |
 |------|-------------|
-| `--loadout <NAME>` | Apply `<config>/minimal/loadouts/<NAME>.toml`. Repeatable. If given, the config file's `default_loadouts` are ignored |
+| `--loadout <NAME>` | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable. If given, the config file's `default_loadouts` are ignored |
 | `--no-loadouts` | Apply no loadouts at all. Conflicts with `--loadout` |
 
 Resolution order:
@@ -583,12 +644,38 @@ file means an empty policy; a fresh install activates fine without it.
 The interactive shell minted by [`min session attach`](./cli-min.md#session-attach)
 is bash unless a loadout says otherwise — see
 [`SHELL`](#session-shell) below. bash is started as
-`bash --noprofile --rcfile <daemon rc> -i`: it sources **none** of your
-startup files (not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so
-rc-file patches cannot influence it — the only rc it reads is the daemon's
-own, which installs the [attached terminal](#attached-terminal) hook and
-nothing else. Interactive setup travels through the environment instead,
-i.e. through `[vars]`:
+`bash --noprofile --rcfile <daemon rc> -i`, so it finds none of its startup
+files on its own: the daemon's rc is the only file it is given. That rc
+installs the [attached terminal](#attached-terminal) hook and then sources
+**your `~/.bashrc`** out of the session home, so a [patched-in](#patches)
+`.bashrc` applies — the same way a patched `.zshrc` or `config.fish` does
+for those shells.
+
+`~/.bashrc`, and nothing else — that is the file bash would read here on
+its own, had `--rcfile` not displaced it. A session shell is an interactive
+**non-login** bash, and the login chain (`~/.bash_profile`,
+`~/.bash_login`, `~/.profile`) belongs to a login shell, which this is not:
+`shopt login_shell` reports off inside it. Those files hold once-per-login
+setup, so running them here would be a thing bash does nowhere else.
+
+If your bash setup lives in `~/.bash_profile`, point the patch at
+`.bashrc` — a patch names its own destination, so the file's name on your
+host doesn't have to be the name it lands under:
+
+```toml
+patches = [
+    { dest = ".bashrc", source = "~/dotfiles/bash_profile" },
+]
+```
+
+The daemon's hook goes in before your file runs, which leaves one sharp
+edge: bash's refresh is a `DEBUG` trap, and a `~/.bashrc` that installs a
+`DEBUG` trap of its own replaces it. Have your trap call
+`__minimal_attach_env` to keep the [`TERM` refresh](#attached-terminal)
+working.
+
+Interactive setup can also travel through the environment, i.e. through
+`[vars]`, which is where the prompt and the banner live:
 
 - **Prompt**: the session launcher seeds a baseline environment
   (a stock `PS1`, plus the [orientation banner](#orientation-banner)
@@ -651,15 +738,17 @@ which five shells there are to choose from. Nothing fails either way.
 
 This is the loadout's `SHELL`, not the `$SHELL` of the terminal you ran
 `min` from: a session is a declared environment, and the shell it hands
-you is part of the declaration.
+you is part of the declaration. A project sets it the same way through its
+[`[session.vars]`](./minimal-dot-toml.md#session).
 
-Three things worth knowing:
+Four things worth knowing:
 
-- **bash is unchanged**, rc suppression included. Every other shell reads
-  its own startup files from the session home — which is where
-  [patches](#patches) land, so a patched-in `config.fish` or `.zshrc`
-  applies. That asymmetry is deliberate: bash's behaviour predates this
-  and stays as it was.
+- **Every shell reads your startup file.** zsh, fish, and nushell find
+  theirs in the session home — which is where [patches](#patches) land —
+  on their own; bash is handed none of its own files, so the daemon's rc
+  sources yours for it ([above](#vars-in-the-attach-shell)). The one
+  exception is `sh`, whose startup file *is* `$ENV` by POSIX rule, and
+  `$ENV` is the daemon's.
 - **The shell is chosen once**, at the attach that mints the session
   shell, and that shell outlives later attaches. Changing `SHELL`
   afterwards takes a new session.
@@ -726,7 +815,9 @@ up. bash's `DEBUG` trap covers both cases on its own.
 bash uses a trap rather than `PROMPT_COMMAND` for the same reason the
 mechanism is not a var at all: `PROMPT_COMMAND` is composed, and the MOTD
 recipe unsets it. A trap is shell state, which nothing in a composition can
-reach.
+reach. Your own `~/.bashrc` can, though — the same rc sources it, right
+after setting the trap — so a `DEBUG` trap you install there replaces this
+one; have your trap call `__minimal_attach_env` to keep the refresh.
 
 #### Other POSIX shells {#attached-terminal-posix}
 

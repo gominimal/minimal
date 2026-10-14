@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "ff15baa9a765148b7ec28f18b1019e12adeaa4da"
+locked_commit = "bd62e6e271b891c48666cc47c13c542a23d14ffb"
 
 [stack]
 use = "rust"
@@ -21,7 +21,7 @@ runtime_packages = [
 state_key = "dev"
 
 [session]
-packages = ["just", "shellcheck", "python"]
+packages = ["just", "shellcheck", "python", "cargo-nextest"]
 
 [tasks.build]
 description = "Builds the minimal CLI"
@@ -68,6 +68,67 @@ set -e
 cargo test --verbose
 # cargo fmt -- --check
 # cargo clippy --all-targets -- -D warnings
+"""
+
+# The agent runtime runs this one on the coder's files and amends the result
+# into its last commit (runner/runner/jobs/implement.py, `run_fmt`). It must be
+# `bash = `: a `spec.get("bash")` that is not a string reads as "no fmt task",
+# and the PR then lands red on CI's `fmt` job for whitespace.
+[tasks.fmt]
+description = "rustfmt across the workspace; the runtime amends it into the coder's commit"
+inherit_cwd = true
+bash = """
+set -e
+cargo fmt --all
+"""
+
+# The gate the agent runtime runs after a task's `test:` lines, in a fresh
+# clone at the pushed sha under a 10-minute budget (probeWallClockSeconds,
+# worker/src/config.ts). The runtime prefers this name over `verify`.
+# Without either block it falls back to the plan survey's `just test-one`,
+# which has no filter to run.
+#
+# rustfmt, then clippy and the test suite of each crate the coder touched,
+# read off `MINIMAL_CHANGED_PATHS` — the changed files the runtime puts in
+# this task's env, one per line. No paths means no suites and a
+# workspace-wide clippy. Clippy is scoped like nextest because a cold
+# workspace clippy alone ran 9 m 10 s of the gate's 600 s on #1673 and the
+# gate was stopped before nextest began; `-p` still checks every dependency
+# of the touched crates, so a warning there is still caught.
+[tasks.agent-verify]
+description = "the gate the agent runtime runs after a task's test lines"
+inherit_cwd = true
+bash = """
+set -e
+cargo fmt --all -- --check
+
+# Crate names out of `crates/<name>/...`, deduplicated; other paths ignored.
+crates=$(printf '%s\\n' "${MINIMAL_CHANGED_PATHS:-}" \\
+  | sed -n 's|^crates/\\([^/][^/]*\\)/.*|\\1|p' \\
+  | sort -u)
+
+args=""
+for c in $crates; do args="$args -p $c"; done
+# shellcheck disable=SC2086 - the package flags are meant to split
+cargo clippy --all-targets --locked $args -- -D warnings
+
+if [ -n "$crates" ]; then
+  # shellcheck disable=SC2086 - the package flags are meant to split
+  cargo nextest run --locked $args
+fi
+"""
+
+# `min task run verify` — the same two checks a person can run over the
+# whole tree. No crate scoping: nothing sets MINIMAL_CHANGED_PATHS at a
+# terminal, and a gate that silently narrows itself is worse than one that
+# says what it covers.
+[tasks.verify]
+description = "rustfmt and clippy over the whole workspace"
+inherit_cwd = true
+bash = """
+set -e
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
 """
 
 [outputs.bash-img]

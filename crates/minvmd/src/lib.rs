@@ -10,9 +10,14 @@
 //! cfg; the portable surface (errors, state, image resolution) compiles
 //! everywhere.
 
+pub mod bep_attach;
+pub mod box_registry;
 pub mod cmd;
 pub mod config;
+pub mod control;
+pub mod diag;
 pub mod error;
+pub mod guest_telemetry;
 pub mod image;
 pub mod lifecycle;
 pub mod metrics;
@@ -20,6 +25,7 @@ pub mod net;
 pub(crate) mod rpc_client;
 pub mod sock;
 pub mod state;
+pub mod telemetry;
 pub mod timekeep;
 pub mod vm;
 pub mod volume;

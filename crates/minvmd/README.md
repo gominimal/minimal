@@ -24,7 +24,7 @@ Prereqs:
 - `brew install slp/krun/libkrun` — third-party tap; required by minvmd.
 - The `minimal` shim on `PATH` (`~/.minimal/shim/bin/minimal`). On macOS,
   `materialize` runs `minimal` inside a Linux VM; a from-source macOS build
-  cannot run the build pipeline (sandbox2 is Linux-only).
+  cannot run the build pipeline (the `sandbox` crate is Linux-only).
 
 ```sh
 # 1. Materialize the kernel + GENERIC guest rootfs INTO THE REPO.
@@ -218,7 +218,8 @@ CI runs it (informational) in the `boot-e2e` job.
   boot-to-READY).
 - The kernel boots the **initramfs** (`krun_set_kernel`'s initramfs arg): it
   unpacks into a RAM root and runs `/init` (= minimald) as PID 1. cmdline is just
-  `console=hvc0` — no `root=`/`init=` (those are for a block root).
+  `console=hvc0 ipv6.disable=1` — no `root=`/`init=` (those are for a block
+  root).
 - minimald-as-`/init` mounts `/dev` (devtmpfs; the kernel does NOT auto-mount it
   for an initramfs root), mounts the rootfs (`krun_add_disk2` → `/dev/vda`) and
   `chroot`s into it so `/bin/sh` + libs resolve, then writes `READY\n` on vsock

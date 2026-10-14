@@ -1,10 +1,16 @@
 name: promote-cli
 
+# Point a channel at a staged, SMOKED version behind a human approval gate.
+# Promoting a semver row to `stable` also publishes it: the draft GitHub
+# Release the versioned build parked is published — which creates the
+# v<semver> tag, last, on the already-smoked commit (publish-packages.yml).
+# The AUR / Homebrew publishers run only when the `publish_packages` input is
+# checked (off by default).
 on:
     workflow_dispatch:
         inputs:
-            sha:
-                description: "Staged version (short SHA) to promote (leave empty for latest staged in bucket)"
+            version:
+                description: "Staged version to promote: a semver (0.6.0, from a versioned release build) or a nightly short SHA. Leave empty for the latest staged nightly SHA."
                 required: false
                 type: string
             target:
@@ -21,7 +27,12 @@ on:
                 type: boolean
                 default: false
             override_provenance:
-                description: "EMERGENCY ONLY — promote a version even if it was not built by the nightly workflow"
+                description: "EMERGENCY ONLY — promote a version whose staged bytes were never smoked by a release run (no versions/<version>/smoked marker, or one that no longer matches)"
+                required: false
+                type: boolean
+                default: false
+            publish_packages:
+                description: "Stable semver promotions only: also publish the AUR and Homebrew packages after the GitHub Release. Off by default: the GitHub Release is published, the packages are not."
                 required: false
                 type: boolean
                 default: false
@@ -54,20 +65,22 @@ jobs:
                   ACTOR: ${{ github.triggering_actor }}
                   SERVER_URL: ${{ github.server_url }}
                   RUN_ID: ${{ github.run_id }}
-                  SHA_INPUT: ${{ inputs.sha }}
+                  VERSION_INPUT: ${{ inputs.version }}
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  PUBLISH_PACKAGES: ${{ inputs.publish_packages }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
                   **Workflow:** \`${WORKFLOW}\`
                   **Requested by:** @${ACTOR}
                   **Run:** ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}
-                  **SHA input:** \`${SHA_INPUT:-<latest staged>}\`
+                  **Version input:** \`${VERSION_INPUT:-<latest staged nightly sha>}\`
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
-                  **Nightly-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
+                  **Publish AUR + Homebrew (stable semver only):** \`${PUBLISH_PACKAGES}\`
+                  **Smoke-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
                   Closing this issue without an approval comment counts as denial.
@@ -163,8 +176,8 @@ jobs:
         permissions:
             contents: "read"
             id-token: "write"
-            # verify-nightly-provenance.sh lists nightly workflow runs.
-            actions: "read"
+        outputs:
+            version: ${{ steps.promote.outputs.version }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -181,44 +194,34 @@ jobs:
                   DRY_RUN: ${{ inputs.dry_run }}
                   # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
                   # to avoid shell template injection — see GitHub's hardening guide.
-                  INPUT_SHA: ${{ inputs.sha }}
+                  INPUT_VERSION: ${{ inputs.version }}
                   INPUT_TARGET: ${{ inputs.target }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
-                  # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
-                  SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                  # Trim leading/trailing whitespace; users often paste versions with stray spaces.
+                  VERSION="$(printf '%s' "$INPUT_VERSION" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
                   TARGET="$(printf '%s' "$INPUT_TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
-                  if [ -z "$SHA" ]; then
-                    echo "No SHA provided; finding the most recently staged version in gs://minimal-one..."
-                    # Each staged version has a versions/<sha>/components manifest;
-                    # sort those by creation time (col 2 of `ls -l`) and take the newest.
-                    # `|| true`: on an empty match `gcloud` errors and/or the
-                    # `grep -v` emits nothing (exit 1), which under `pipefail`
-                    # would abort via `set -e` before the emptiness check below.
-                    LATEST=$(gcloud storage ls -l "gs://minimal-one/versions/*/components" \
-                      | grep -v "^TOTAL:" \
-                      | sort -k2 \
-                      | tail -1 \
-                      | awk '{print $NF}' || true)
-                    if [ -z "$LATEST" ]; then
-                      echo "ERROR: no staged versions found under gs://minimal-one/versions/"
-                      exit 1
-                    fi
-                    # gs://minimal-one/versions/<sha>/components → <sha>
-                    SHA="$(basename "$(dirname "$LATEST")")"
-                    echo "Latest staged SHA: ${SHA}"
+                  if [ -z "$VERSION" ]; then
+                    echo "No version provided; finding the most recently staged nightly commit in gs://minimal-one..."
+                    # The lookup lives in scripts/latest-staged-version.sh
+                    # (tested by its _test.sh): it filters the rows to commit
+                    # shas — a versioned (semver) row is promoted by name,
+                    # deliberately, never as "whatever is newest".
+                    VERSION="$(scripts/latest-staged-version.sh --bucket gs://minimal-one)"
+                    echo "Latest staged SHA: ${VERSION}"
                   fi
 
-                  # Only versions the nightly workflow actually built may be
-                  # promoted; the override exists for emergency hotfixes and is
-                  # surfaced in the approval issue above.
+                  # Provenance gate: the row's bytes must be the bytes a
+                  # release run smoked (scripts/verify-smoked.sh compares the
+                  # live components manifest against the smoked marker). Runs
+                  # on the default path; the override exists for documented
+                  # emergencies only and is surfaced in the approval issue above.
                   if [ "$OVERRIDE_PROVENANCE" = "true" ]; then
-                    echo "WARNING: nightly-provenance check SKIPPED (override_provenance=true)."
+                    echo "::warning::smoke-provenance check SKIPPED (override_provenance=true)."
                   else
-                    scripts/verify-nightly-provenance.sh --sha "$SHA"
+                    scripts/verify-smoked.sh --version "$VERSION" --bucket gs://minimal-one
                   fi
 
                   # set-channel.sh verifies the version is actually staged before it
@@ -227,12 +230,30 @@ jobs:
                   [ "$DRY_RUN" = "true" ] && DRY_FLAG="--dry-run"
                   scripts/set-channel.sh \
                     --channel "$TARGET" \
-                    --version "$SHA" \
+                    --version "$VERSION" \
                     --bucket gs://minimal-one \
                     $DRY_FLAG
 
-                  # Export resolved SHA for the docs-rebuild dispatch step below.
-                  echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+                  # The commit behind the row, for the docs rebuild below
+                  # (its contract is a commit sha, never a version): a
+                  # nightly row IS its short sha; a versioned (semver) row
+                  # records its commit in the smoked marker
+                  # (scripts/record-smoked.sh --sha). Only an emergency
+                  # override can reach here without a marker; then a semver
+                  # has no commit to offer and the docs step skips itself.
+                  if [[ "$VERSION" =~ ^[0-9a-f]{7,40}$ ]]; then
+                    SHA="$VERSION"
+                  else
+                    SHA="$(gcloud storage cat "gs://minimal-one/versions/$VERSION/smoked" 2>/dev/null | jq -r '.sha // empty' || true)"
+                    [ -n "$SHA" ] || echo "::warning::no commit recorded for versions/$VERSION (no smoked marker) — the docs rebuild will be skipped"
+                  fi
+
+                  # Export the resolved version and commit for the publish and
+                  # docs steps below.
+                  {
+                    echo "version=${VERSION}"
+                    echo "sha=${SHA}"
+                  } >> "$GITHUB_OUTPUT"
 
             # Mint a short-lived token scoped to gominimal/webapp via the
             # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
@@ -252,17 +273,43 @@ jobs:
                   repositories: webapp
 
             - name: Trigger docs rebuild
+              # client_payload[sha] is a COMMIT sha (the webapp pins its docs
+              # sync to it as MINIMAL_DOCS_SHA), resolved above; a version
+              # string would not do.
               env:
                   GH_TOKEN: ${{ steps.docs-token.outputs.token }}
                   DRY_RUN: ${{ inputs.dry_run }}
+                  VERSION: ${{ steps.promote.outputs.version }}
                   SHA: ${{ steps.promote.outputs.sha }}
               run: |
                   set -euo pipefail
-                  if [ "$DRY_RUN" = "true" ]; then
-                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${SHA}"
-                  else
-                    gh api repos/gominimal/webapp/dispatches \
-                      -f event_type=reference-docs-promoted \
-                      -F "client_payload[sha]=${SHA}"
-                    echo "Dispatched reference-docs-promoted to gominimal/webapp for ${SHA}"
+                  if [ -z "$SHA" ]; then
+                    echo "::warning::no commit sha for ${VERSION}; not dispatching reference-docs-promoted (rerun docs-hotfix.yml by hand)"
+                    exit 0
                   fi
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${VERSION} (commit ${SHA})"
+                  else
+                     gh api repos/gominimal/webapp/dispatches \
+                       -f event_type=reference-docs-promoted \
+                       -F "client_payload[sha]=${SHA}"
+                     echo "Dispatched reference-docs-promoted to gominimal/webapp for ${VERSION} (commit ${SHA})"
+                   fi
+
+    publish:
+        # A stable promotion of a versioned (semver) row publishes it: the
+        # draft GitHub Release is published — creating the v<semver> tag, last
+        # — then, when `publish_packages` is checked (off by default), the AUR
+        # and Homebrew publishers run. publish-packages.yml skips itself with a
+        # notice when the promoted version is a nightly sha (nothing versioned
+        # to publish). A rehearsal promotion (dry_run) publishes nothing
+        # anywhere.
+        needs: promote
+        if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
+        permissions:
+            contents: write # publishing the draft release creates the tag
+        uses: ./.github/workflows/publish-packages.yml
+        with:
+            version: ${{ needs.promote.outputs.version }}
+            publish_packages: ${{ inputs.publish_packages }}
+        secrets: inherit # zizmor: ignore[secrets-inherit] first-party same-repo reusable workflow needs the AUR/brew publishing secrets

@@ -5,27 +5,44 @@ use common::SpecOrigin;
 use graph::{Graph, PlanErr};
 
 /// The errors possible when driving top-level minimal APIs.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Config(super::ConfigError),
-    IO(&'static str, PathBuf, std::io::Error),
-    Format(toml::de::Error),
-    MFile(mfile::Error),
+    #[error("config error: {0}")]
+    Config(#[from] super::ConfigError),
+    #[error("{} I/O error at path {}: {}", .0, .1.display(), .2)]
+    IO(&'static str, PathBuf, #[source] std::io::Error),
+    #[error("invalid TOML: {0}")]
+    Format(#[source] toml::de::Error),
+    #[error("{prefix}: {0}", prefix = mfile::MFILE_NAME)]
+    MFile(#[from] mfile::Error),
+    #[error("{}", GraphDisplay(.0))]
     Graph(Box<graph::Error>),
 
+    #[error("{}", PlanDisplay(.0))]
     Plan(Box<(Graph, PlanErr)>),
+    #[error(
+        "{}",
+        ExecutionDisplay {
+            idx,
+            code,
+            reason,
+            stderr,
+            stdout
+        }
+    )]
     Execution {
         idx: usize,
         code: i32,
         reason: String,
         stderr: String,
-        /// Last ~4 KiB of stdout (captured by sandbox2 alongside stderr).
+        /// Last ~4 KiB of stdout (captured by `sandbox` alongside stderr).
         /// Useful when build scripts redirect stderr away (e.g.
         /// `pip install ... 2>/dev/null || true`) and the real
         /// diagnostic only appears on stdout.
         stdout: String,
     },
 
+    #[error("{0}")]
     Other(anyhow::Error),
 }
 
@@ -88,94 +105,79 @@ impl Error {
         }
     }
     pub fn report_to_stderr(&self) {
-        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
+        common::report_to_stderr(|w| self.report_to(w));
     }
 }
 
-impl fmt::Display for Error {
+/// Renders [`Error::Graph`]'s codespan diagnostic into a single line.
+struct GraphDisplay<'a>(&'a graph::Error);
+
+impl fmt::Display for GraphDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Config(e) => write!(f, "config error: {}", e),
-            Error::IO(ctx, path, e) => {
-                write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
-            }
-            Error::Format(e) => write!(f, "invalid TOML: {}", e),
-            Error::MFile(e) => write!(f, "{}: {}", mfile::MFILE_NAME, e),
-            Error::Graph(e) => {
-                // Render the codespan diagnostic (source location + caret)
-                // into a buffer. NEVER use `{:?}` here — graph::Error's
-                // Decode(Nickel(..)) variant carries a
-                // codespan_reporting::files::Files index with every loaded
-                // source file's contents embedded, so Debug-dumping it
-                // floods the output with the ~5k-line Nickel stdlib plus
-                // every other file in the chain. `report_to` uses the same
-                // codespan facility to emit the human-readable diagnostic
-                // without the embedded source tree.
-                use codespan_reporting::term::termcolor::NoColor;
-                let mut buf: Vec<u8> = Vec::new();
-                e.report_to(&mut NoColor::new(&mut buf));
-                write!(f, "graph: {}", String::from_utf8_lossy(&buf).trim_end())
-            }
-            Error::Plan(e) => {
-                let (graph, PlanErr::Cycles(c)) = e.as_ref();
-                {
-                    write!(
-                        f,
-                        "Planning failed: unable to progress with unresolvable dependency cycles"
-                    )?;
-                    write!(f, "Cycles:")?;
-                    for c in c.iter() {
-                        write!(
-                            f,
-                            "\t{}",
-                            c.iter()
-                                .map(|bsr| graph.get(bsr).unwrap().name.clone())
-                                .collect::<Vec<_>>()
-                                .join(" -> "),
-                        )?;
-                    }
-                    Ok(())
-                }
-            }
-
-            Error::Execution {
-                idx,
-                code,
-                reason,
-                stderr,
-                stdout,
-            } => {
-                if *code == 125 {
-                    write!(f, "invocation {idx} failed: {reason}")?;
-                } else {
-                    write!(f, "invocation {idx} failed: exit code {code}")?;
-                }
-                if !stderr.is_empty() {
-                    write!(f, "\nstderr:\n{stderr}")?;
-                }
-                if !stdout.is_empty() {
-                    write!(f, "\nstdout:\n{stdout}")?;
-                }
-                Ok(())
-            }
-            Error::Other(e) => write!(f, "{}", e),
-        }
+        // Render the codespan diagnostic (source location + caret)
+        // into a buffer. NEVER use `{:?}` here — graph::Error's
+        // Decode(Nickel(..)) variant carries a
+        // codespan_reporting::files::Files index with every loaded
+        // source file's contents embedded, so Debug-dumping it
+        // floods the output with the ~5k-line Nickel stdlib plus
+        // every other file in the chain. `report_to` uses the same
+        // codespan facility to emit the human-readable diagnostic
+        // without the embedded source tree.
+        use codespan_reporting::term::termcolor::NoColor;
+        let mut buf: Vec<u8> = Vec::new();
+        self.0.report_to(&mut NoColor::new(&mut buf));
+        write!(f, "graph: {}", String::from_utf8_lossy(&buf).trim_end())
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Config(e) => Some(e),
-            Error::IO(_, _, e) => Some(e),
-            Error::Format(e) => Some(e),
-            Error::MFile(e) => Some(e),
-            Error::Graph(_e) => None,
-            Error::Plan(_) => None,
-            Error::Execution { .. } => None,
-            Error::Other(_e) => None,
+/// Renders [`Error::Plan`]'s unresolvable-cycle message.
+struct PlanDisplay<'a>(&'a (Graph, PlanErr));
+
+impl fmt::Display for PlanDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (graph, PlanErr::Cycles(c)) = self.0;
+        write!(
+            f,
+            "Planning failed: unable to progress with unresolvable dependency cycles"
+        )?;
+        write!(f, "Cycles:")?;
+        for c in c.iter() {
+            write!(
+                f,
+                "\t{}",
+                c.iter()
+                    .map(|bsr| graph.get(bsr).unwrap().name.clone())
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+            )?;
         }
+        Ok(())
+    }
+}
+
+/// Renders [`Error::Execution`]'s conditional exit-code message.
+struct ExecutionDisplay<'a> {
+    idx: &'a usize,
+    code: &'a i32,
+    reason: &'a String,
+    stderr: &'a String,
+    stdout: &'a String,
+}
+
+impl fmt::Display for ExecutionDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self.code == 125 {
+            write!(f, "invocation {} failed: {}", self.idx, self.reason)?;
+        } else {
+            write!(f, "invocation {} failed: exit code {}", self.idx, self.code)?;
+        }
+        if !self.stderr.is_empty() {
+            write!(f, "\nstderr:\n{}", self.stderr)?;
+        }
+        if !self.stdout.is_empty() {
+            write!(f, "\nstdout:\n{}", self.stdout)?;
+        }
+        Ok(())
     }
 }
 
@@ -229,12 +231,6 @@ impl From<op::Error> for Error {
     }
 }
 
-impl From<super::ConfigError> for Error {
-    fn from(value: super::ConfigError) -> Self {
-        Error::Config(value)
-    }
-}
-
 impl From<orchestrator::Error> for Error {
     fn from(value: orchestrator::Error) -> Self {
         match value {
@@ -263,13 +259,13 @@ impl From<check::Error> for Error {
     }
 }
 
-impl From<sandbox2::Error> for Error {
-    fn from(value: sandbox2::Error) -> Self {
+impl From<sandbox::Error> for Error {
+    fn from(value: sandbox::Error) -> Self {
         match value {
-            sandbox2::Error::IO(s, p, e) => Self::IO(s, p, e),
-            sandbox2::Error::HardlinkFailed(e) => e.into(),
-            sandbox2::Error::Execution(e) => match e {
-                sandbox2::error::ExecutionError::InvocationFailed {
+            sandbox::Error::IO(s, p, e) => Self::IO(s, p, e),
+            sandbox::Error::HardlinkFailed(e) => e.into(),
+            sandbox::Error::Execution(e) => match e {
+                sandbox::error::ExecutionError::InvocationFailed {
                     idx,
                     code,
                     reason,
@@ -283,25 +279,25 @@ impl From<sandbox2::Error> for Error {
                     stdout,
                 },
                 #[cfg(target_os = "linux")]
-                sandbox2::error::ExecutionError::SpawnFailed(e) => {
+                sandbox::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }
-                sandbox2::error::ExecutionError::Cancelled => {
+                sandbox::error::ExecutionError::Cancelled => {
                     Self::Other(anyhow::anyhow!("execution cancelled"))
                 }
-                sandbox2::error::ExecutionError::MountError { .. } => {
+                sandbox::error::ExecutionError::MountError { .. } => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
-                sandbox2::error::ExecutionError::NetworkIsolationUnavailable { .. } => {
+                sandbox::error::ExecutionError::NetworkIsolationUnavailable => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
             },
-            sandbox2::Error::Output(e) => Self::Other(e.into()),
-            sandbox2::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
+            sandbox::Error::Output(e) => Self::Other(e.into()),
+            sandbox::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
                 "internal: file {} mapped to rootfs",
                 p.display()
             )),
-            sandbox2::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
+            sandbox::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
         }
     }
 }
@@ -317,9 +313,41 @@ impl From<common::HardlinkError> for Error {
     }
 }
 
-impl From<mfile::Error> for Error {
-    fn from(value: mfile::Error) -> Self {
-        Self::MFile(value)
+impl From<rcache::Error<common::fetchers::AnyRespError>> for Error {
+    fn from(value: rcache::Error<common::fetchers::AnyRespError>) -> Self {
+        Self::Other(rcache_cause(value))
+    }
+}
+
+/// Renders an `rcache::Error` as a user-facing cause.
+fn rcache_cause(value: rcache::Error<common::fetchers::AnyRespError>) -> anyhow::Error {
+    // The two arms are NOT interchangeable, though they look it:
+    // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
+    // Debug-formats itself — so the fallback arm renders a `Config` as
+    // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
+    // variant name and escaped quotes included. Destructuring `Config` and
+    // formatting the inner `msg` is what yields the clean, user-facing
+    // message; collapsing this to one arm reintroduces the panic-era output
+    // it replaced.
+    match value {
+        rcache::Error::Config(msg) => anyhow::anyhow!("{msg}"),
+        other => anyhow::anyhow!("{other}"),
+    }
+}
+
+/// The error for a failed remote artifact cache setup: the rcache cause under
+/// a fixed context line, with `hint` in parentheses when the caller's user
+/// has a switch to name. Render it with `{:#}` to keep the cause.
+pub fn remote_cache_setup_error(
+    e: rcache::Error<common::fetchers::AnyRespError>,
+    hint: Option<&str>,
+) -> anyhow::Error {
+    let cause = rcache_cause(e);
+    match hint {
+        Some(hint) => cause.context(format!(
+            "failed to set up the remote artifact cache ({hint})"
+        )),
+        None => cause.context("failed to set up the remote artifact cache"),
     }
 }
 
@@ -336,6 +364,31 @@ mod tests {
         assert_eq!(
             Error::MFile(mfile::Error::NotFound).to_string(),
             "minimal.toml: not found",
+        );
+    }
+
+    /// A remote cache setup failure keeps its cause under `{:#}`, rendered
+    /// from rcache's `Config` message rather than its Debug form.
+    #[test]
+    fn remote_cache_setup_error_keeps_clean_cause() {
+        let err = remote_cache_setup_error(rcache::Error::Config("bad url".into()), None);
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to set up the remote artifact cache: bad url",
+        );
+    }
+
+    /// The caller's hint lands in parentheses on the context line.
+    #[test]
+    fn remote_cache_setup_error_carries_hint() {
+        let err = remote_cache_setup_error(
+            rcache::Error::Config("bad url".into()),
+            Some("pass --no-fetch to build without it"),
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to set up the remote artifact cache \
+             (pass --no-fetch to build without it): bad url",
         );
     }
 }

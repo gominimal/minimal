@@ -208,12 +208,6 @@ impl Error {
             Label::primary(span.src_id, span.start.to_usize()..span.end.to_usize())
         }
 
-        /// Create a secondary label from a span.
-        #[allow(dead_code)]
-        fn secondary(span: &RawSpan) -> Label<FileId> {
-            Label::secondary(span.src_id, span.start.to_usize()..span.end.to_usize())
-        }
-
         match self {
             IO(e) => writeln!(writer, "IO Error: {}", e).unwrap(),
             Other(msg) => writeln!(writer, "Error: {}", msg).unwrap(),
@@ -403,8 +397,7 @@ impl Error {
 
     /// Writes a human-friendly representation of the error to standard out.
     pub fn report_to_stderr(&self) {
-        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
+        common::report_to_stderr(|w| self.report_to(w));
     }
 }
 
@@ -585,6 +578,17 @@ mod tests {
             out.contains("not a valid target"),
             "expected 'not a valid target' in: {out:?}"
         );
+    }
+
+    #[test]
+    fn attr_too_deep_reports_max_depth() {
+        let e = Error::AttrTooDeep { max_depth: 42 };
+        let out = capture(&e);
+        assert!(
+            out.contains("nested too deeply"),
+            "expected 'nested too deeply' in: {out:?}"
+        );
+        assert!(out.contains("42"), "expected max depth in: {out:?}");
     }
 
     #[test]

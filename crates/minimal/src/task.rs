@@ -1,12 +1,14 @@
 //! `min task run <task>`: run a declared project task in an ephemeral
 //! session.
 //!
-//! The activate→exec→destroy loop as one command: create a session for the
+//! The activate→exec→end loop as one command: create a session for the
 //! project (named `task-<task>-<hex>`), upload the project per the normal
 //! activate rules, exec the canonical in-box `min task run <task>` over the
 //! native SSH exec channel with the task's output streamed through, exit
-//! with the task's exit code, and destroy the session afterwards — success,
-//! failure, or Ctrl-C — unless `--keep` retains it as an attachable session.
+//! with the task's exit code, and leave the session's end to the daemon —
+//! it owns the box the run created, so it destroys it once the task's exit
+//! status is on the wire (NET-131), whether or not this client is still
+//! here — unless `--keep` retains it as an attachable session.
 //!
 //! Deliberately composed from the same client/RPC primitives `cmd_activate`
 //! uses (`SessionConfig`, `CreateSession`, the upload gates,
@@ -14,7 +16,7 @@
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
 
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Read as _};
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
@@ -51,6 +53,44 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
             "task ended without reporting an exit status"
         )),
     }
+}
+
+/// The exec request a task run sends: the task, its declared arguments, plus
+/// the owns-box flag — set unless `--keep` retains the session (NET-131). The
+/// flag is what moves the destroy off this client: with it set, the daemon
+/// ends the session once the task's exit status is on the wire, whether or
+/// not this process is still there. `--keep` withholds it, because a kept
+/// session is meant to outlive the run — its end stays with whoever holds it.
+/// `cwd` is the invocation directory relative to the uploaded tree (see
+/// [`task_run_cwd`]), where a task declaring `inherit_cwd` starts.
+fn task_run_request(
+    task: &str,
+    args: &[String],
+    keep: bool,
+    cwd: String,
+) -> minimald_rpc::exec::ExecRequest {
+    minimald_rpc::exec::ExecRequest::TaskRun {
+        task: task.to_string(),
+        owns_box: !keep,
+        args: args.to_vec(),
+        cwd,
+    }
+}
+
+/// The invocation directory relative to the upload root, `/`-separated:
+/// `sub/inner` for a run started there, empty when the user is at the root.
+/// The daemon starts a task that declares `inherit_cwd` at the same place
+/// inside the uploaded tree.
+fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Path) -> String {
+    invocation_dir
+        .strip_prefix(upload_root)
+        .map(|rel| {
+            rel.components()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
 }
 
 /// Mint the ephemeral session name `task-<task>-<hex>`: the task name is
@@ -342,7 +382,9 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
 /// phase, modeled on [`crate::arm_activation_interrupt`]: the primary
 /// connection is parked in the exec bridge, so the handler works over a
 /// fresh connection. Without `--keep` the first Ctrl-C best-effort
-/// `DestroySession`s the box; with it the session is left alive and the
+/// `DestroySession`s the box and releases the name hold an attach or exec
+/// may have re-made for it ([`release_task_name_hold`]); with it the
+/// session is left alive and the
 /// handler says how to reach it. Either way the process exits 130. The
 /// destroy leg is bounded: the connect-and-destroy runs under the same
 /// 10-second cleanup ceiling as [`crate::best_effort_destroy`], and a
@@ -372,6 +414,10 @@ fn arm_task_run_interrupt(
 ) -> TaskRunInterrupt {
     let sock =
         crate::client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    let control_sock = crate::vm_host_control_sock(
+        crate::daemon_provider_kind(global),
+        global.minimal_dir.as_deref(),
+    );
     let task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
@@ -403,6 +449,9 @@ fn arm_task_run_interrupt(
                     .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
                     .await;
             }
+            // The run's own return never comes on this path, so the release
+            // it owes is made here, inside the same bound.
+            release_task_name_hold(control_sock, session_id, &session_name, false).await;
         };
         tokio::select! {
             res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
@@ -430,14 +479,14 @@ fn arm_task_run_interrupt(
 ///
 /// stdin is pumped into the channel only when it is NOT a terminal: a piped
 /// stdin EOFs and half-closes the channel like the git helper's does, but a
-/// terminal stdin never EOFs — and tokio's stdin is an uncancellable
-/// blocking read that would hold the runtime open after the task exits — so
-/// a terminal caller half-closes immediately and a stdin-reading task sees
-/// EOF instead of hanging. The upshot: tasks run non-interactively; stdin
-/// content reaches the task only when piped. That is not just the tokio
-/// constraint — the daemon's exec channel has no PTY (only the shell path
-/// does), so interactive tasks are structurally unsupported here anyway;
-/// interactive work belongs in `min session attach`.
+/// terminal stdin never EOFs — and a blocking stdin read cannot be
+/// cancelled once the task exits — so a terminal caller half-closes
+/// immediately and a stdin-reading task sees EOF instead of hanging. The
+/// upshot: tasks run non-interactively; stdin content reaches the task only
+/// when piped. That is not just the cancellation constraint — the daemon's
+/// exec channel has no PTY (only the shell path does), so interactive tasks
+/// are structurally unsupported here anyway; interactive work belongs in
+/// `min session attach`.
 async fn bridge_exec(
     mut channel: russh::Channel<russh::client::Msg>,
 ) -> Result<Option<u32>, anyhow::Error> {
@@ -446,12 +495,35 @@ async fn bridge_exec(
         None
     } else {
         let mut to_channel = channel.make_writer();
+        // Read stdin on a detached thread, not `tokio::io::stdin()`: the
+        // latter parks a blocking `read(0)` on tokio's blocking pool, which
+        // `pump.abort()` cannot interrupt — so a piped stdin whose writer
+        // stays open would hold the runtime open forever after the task
+        // exits. A detached thread is abandoned on exit instead of awaited.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         // Both results are deliberately dropped: the remote side may close
         // the channel before consuming all our input, and that surfaces
         // through the channel loop below, not here.
         Some(tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let _ = tokio::io::copy(&mut stdin, &mut to_channel).await;
+            while let Some(chunk) = rx.recv().await {
+                if to_channel.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
             let _ = to_channel.shutdown().await;
         }))
     };
@@ -482,8 +554,8 @@ async fn bridge_exec(
 }
 
 /// Run a declared task in an ephemeral session: create, upload, exec the
-/// canonical in-box `min task run <task>`, relay its exit code, destroy —
-/// or keep with `--keep`.
+/// canonical in-box `min task run <task>`, relay its exit code, and let the
+/// daemon end the session with the run (NET-131) — or keep it with `--keep`.
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
@@ -582,6 +654,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         project_path: abs_path.clone(),
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
+        task_addresses: Vec::new(),
+        box_id: None,
+        box_addresses: None,
         // Same default as an activate with no flags, matching the
         // loadout handling below. `min task run` has no `--no-hooks` of
         // its own; a `--keep` session is attachable later, so its hooks
@@ -619,6 +694,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
+    // Sent only for a task that declares `inherit_cwd`; any other task
+    // starts at the root of the uploaded tree.
+    let task_cwd = if declared.inherit_cwd {
+        task_run_cwd(&upload_root, &utf8_path)
+    } else {
+        String::new()
+    };
     let skip_empty_or_home = crate::file_upload::is_empty_or_home(
         upload_root.as_std_path(),
         std::env::home_dir().as_deref(),
@@ -654,7 +736,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                     config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
-                bail!("CreateSession failed: {error}");
+                bail!("{error}");
             }
         }
     };
@@ -714,16 +796,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches
     // approved through a Pending gate are appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
+    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     let configured = client
         .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
@@ -803,8 +876,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     }
     let _ = initial_policy;
 
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    minimal_client::dedup_patch_uploads(&mut collected_patches);
     if let Err(e) = crate::upload_and_finalize(
         &mut client,
         id,
@@ -828,25 +900,67 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &minimald_rpc::exec::ExecRequest::TaskRun(args.task.clone()).encode(),
+            &task_run_request(&args.task, &args.args, args.keep, task_cwd).encode(),
             &task_env,
         )
         .await
     {
         Ok(channel) => bridge_exec(channel).await,
-        Err(e) => Err(e),
+        // The exec never started, so the daemon's owns-box destroy will
+        // never fire either (NET-131 ends the box when the run's command
+        // exits, and there is no run): resolve the box here, as the client
+        // always did. A run that bridged leaves its box to the daemon.
+        Err(e) => {
+            if !args.keep {
+                crate::best_effort_destroy(&mut client, id).await;
+            }
+            Err(e)
+        }
     };
 
-    // Resolve the box — success, failure, or exec error alike — before the
-    // exit code (or error) propagates.
+    // A run that bridged ends its own box from the daemon's side of the
+    // exec's exit (NET-131) — destroying here too would race it and undo
+    // the point of the flag: a client killed mid-run must strand nothing.
+    // `--keep` retains the session as an attachable box instead.
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
-    } else {
-        crate::best_effort_destroy(&mut client, id).await;
     }
+    release_task_name_hold(
+        crate::vm_host_control_sock(
+            crate::daemon_provider_kind(global),
+            global.minimal_dir.as_deref(),
+        ),
+        id,
+        &session_name,
+        args.keep,
+    )
+    .await;
     drop(run_guard);
 
     exit_outcome(outcome?)
+}
+
+/// Releases the name hold a finished run's session may carry on the VM
+/// host daemon, best-effort. A task run holds no name of its own, but a
+/// `min session attach` or `min exec` into its running session re-makes
+/// one (`rehold_held_name_before_attach` cannot tell a task session
+/// apart), and the daemon ends the session with the run, where no client
+/// destroy releases it; an interrupted run's raw `DestroySession` releases
+/// nothing either, so its handler calls this too. The release is by the
+/// session's `id`, so it frees
+/// only this session's hold, and a name nothing held is the goal state
+/// already holding. `keep` withholds it: a kept session lives on, and its
+/// destroy releases its hold.
+pub(crate) async fn release_task_name_hold(
+    control_sock: Option<std::path::PathBuf>,
+    id: sessions::SessionId,
+    name: &str,
+    keep: bool,
+) {
+    if keep {
+        return;
+    }
+    crate::release_held_box_name(control_sock, id, Some(name), None).await;
 }
 
 #[cfg(test)]
@@ -948,6 +1062,75 @@ mod tests {
             "got: {err}"
         );
         assert!(err.downcast_ref::<TaskExit>().is_none());
+    }
+
+    /// NET-131 from the client side: a `min task run` that does not `--keep`
+    /// sends the owns-box flag, which is what moves the destroy to the
+    /// daemon — it ends the session once the task's exit status is on the
+    /// wire, whether or not this client is still there. `--keep` withholds
+    /// the flag, because a kept session is meant to outlive the run; its end
+    /// stays with whoever holds it. The daemon-backed half — the box actually
+    /// ending — needs a live daemon and is covered by the `minimald` exec
+    /// tests and the session e2e, not a unit test.
+    #[test]
+    fn task_run_leaves_destroy_to_daemon() {
+        use minimald_rpc::exec::ExecRequest;
+
+        // A normal run: the request names the box as the run's own.
+        let req = task_run_request("build", &[], false, String::new());
+        assert_eq!(
+            req,
+            ExecRequest::TaskRun {
+                task: "build".to_string(),
+                owns_box: true,
+                args: vec![],
+                cwd: String::new(),
+            }
+        );
+        // The flag is carried, not inferred: it survives the wire.
+        assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
+
+        // `--keep` keeps the box: no owns-box flag, nothing ends it here.
+        let kept = task_run_request("build", &[], true, String::new());
+        assert_eq!(
+            kept,
+            ExecRequest::TaskRun {
+                task: "build".to_string(),
+                owns_box: false,
+                args: vec![],
+                cwd: String::new(),
+            }
+        );
+        assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
+    }
+
+    /// `inherit_cwd` from the client side: the invocation directory is sent
+    /// relative to the upload root — the tree the daemon unpacks at
+    /// `/workbench` — and is empty when the user is at the root itself.
+    #[test]
+    fn task_run_cwd_is_relative_to_the_upload_root() {
+        use camino::Utf8Path;
+
+        let root = Utf8Path::new("/home/dev/project");
+        assert_eq!(
+            task_run_cwd(root, Utf8Path::new("/home/dev/project/sub/inner")),
+            "sub/inner"
+        );
+        assert_eq!(task_run_cwd(root, root), "");
+
+        // The cwd rides the request to the daemon intact.
+        let req = task_run_request(
+            "ic",
+            &[],
+            false,
+            task_run_cwd(root, Utf8Path::new("/home/dev/project/sub")),
+        );
+        let minimald_rpc::exec::ExecRequest::TaskRun { cwd, .. } =
+            minimald_rpc::exec::ExecRequest::parse(&req.encode()).unwrap()
+        else {
+            panic!("a task run must parse back as a task run");
+        };
+        assert_eq!(cwd, "sub");
     }
 
     /// The empty `[vars]` policy — a fresh install, where nothing is
@@ -1484,6 +1667,7 @@ mod tests {
             task: "deploy".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)
@@ -1492,5 +1676,111 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unknown task 'deploy'"), "got: {msg}");
         assert!(msg.contains("declared tasks: build"), "got: {msg}");
+    }
+
+    /// `cmd_task_run` resolves a task's `env_vars` against the invoking
+    /// shell *before* it ever touches the daemon. With an empty policy and
+    /// no terminal, a declared `{ inherit = true }` variable is refused by
+    /// the non-interactive hook, so the run fails client-side — naming the
+    /// task, the count, and the policy file to edit — with no session
+    /// created and no daemon required. This pins the policy-rejection leg
+    /// of the entry path; the daemon-backed run/finalize legs need a live
+    /// daemon and are covered by the session e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_refuses_an_unapproved_inherited_var_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\nexec = 'true'\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\n",
+        )
+        .unwrap();
+
+        // An empty `[vars]` policy, isolated from the developer's real
+        // config, so the variable is always unapproved and the run always
+        // reaches the refusal asserted below rather than the inherited
+        // lookup a permissive developer policy would allow.
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(minimal_dir.join("user_policy.toml"), "[vars]\n").unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "build".into(),
+            path: None,
+            keep: false,
+            args: vec![],
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an unapproved inherited variable must be refused before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'build'"), "names the task: {msg}");
+        assert!(
+            msg.contains("1 environment variable"),
+            "names the count: {msg}"
+        );
+        assert!(
+            msg.contains("policy does not allow"),
+            "names the gate: {msg}"
+        );
+    }
+
+    /// `cmd_task_run` resolves a task's `env_vars` against the invoking
+    /// shell *before* it ever touches the daemon: an `{ inherit = true }`
+    /// variable the policy allows but that is not set in this shell fails
+    /// client-side — naming the task, the variable, and the fix — with no
+    /// session created and no daemon required. This pins the unset-inherited
+    /// leg of the entry path; the daemon-backed run/finalize legs need a
+    /// live daemon and are covered by the session e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_rejects_an_unset_inherited_var_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\nexec = 'true'\nenv_vars.ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED = { inherit = true }\n",
+        )
+        .unwrap();
+
+        // A policy that allows the variable, so the gate does not refuse it
+        // and the unset-inherited lookup is what fails.
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(
+            minimal_dir.join("user_policy.toml"),
+            "[vars]\nallow = [\"ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED\"]\n",
+        )
+        .unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "build".into(),
+            path: None,
+            keep: false,
+            args: vec![],
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an unset inherited variable must be rejected before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'build'"), "names the task: {msg}");
+        assert!(
+            msg.contains("ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED"),
+            "names the variable: {msg}"
+        );
+        assert!(msg.contains("export it"), "names the fix: {msg}");
     }
 }

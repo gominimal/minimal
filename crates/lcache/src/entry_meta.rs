@@ -14,12 +14,14 @@ use crate::fs::{DirEntry, FileSystem};
 pub enum MetaInner {
     Spec(String),       // name
     Subset(SubsetSpec), // (build-spec, output-names), both sorted
+    Container(String),  // name
 }
 
 impl MetaInner {
     pub fn spec_name(&self) -> Option<&String> {
         match self {
             MetaInner::Spec(sn) => Some(sn),
+            MetaInner::Container(sn) => Some(sn),
             _ => None,
         }
     }
@@ -29,6 +31,7 @@ impl Display for MetaInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MetaInner::Spec(n) => write!(f, "package {}", n),
+            MetaInner::Container(n) => write!(f, "container {}", n),
             MetaInner::Subset(s) => write!(
                 f,
                 "subset of {} with outputs [{}]",
@@ -146,7 +149,7 @@ impl EntryMeta {
                 };
 
                 match entry.inner {
-                    MetaInner::Subset(_) => {}
+                    MetaInner::Subset(_) | MetaInner::Container(_) => {}
                     MetaInner::Spec(spec_name) => {
                         if spec_name == name {
                             let p = e.path()?;

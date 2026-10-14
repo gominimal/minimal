@@ -98,6 +98,12 @@ impl op::ProjectEnv for ProjectSetup {
             .map_err(|e| op::Error::Other(anyhow::Error::from(e)))
     }
 
+    fn update_checkout(&mut self, remote: &str) -> Result<(), op::Error> {
+        self.vcs
+            .update_remote(remote)
+            .map_err(|e| op::Error::Other(anyhow::Error::from(e)))
+    }
+
     fn graph_from_chain(&mut self, link: LinkConfig, target: Target) -> Result<Graph, op::Error> {
         Graph::new_from_chain(
             self.vcs.clone(),

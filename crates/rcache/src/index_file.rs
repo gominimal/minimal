@@ -285,9 +285,9 @@ mod tests {
 /// inert `[u8; 32]` wrapper.
 ///
 /// Run: `cargo kani -p rcache` (or `just kani`, or `scripts/kani.sh`).
-/// Kani pinned at 0.67.0 in CI — older releases give spurious failures
-/// on arrays > 64 elements (kani#2416/#4408), and one wire record is
-/// 68 bytes.
+/// Kani pinned at 0.68.0 in CI — releases before 0.67.0 give spurious
+/// failures on arrays > 64 elements (kani#2416/#4408), and one wire
+/// record is 68 bytes.
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;

@@ -34,6 +34,7 @@
 //! reports what happened.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -118,6 +119,13 @@ pub(crate) struct InjectedCommands {
     pub(crate) leader_pid: u32,
     pub(crate) cwd: String,
     pub(crate) vars: BTreeMap<String, String>,
+    /// Whether the process must reinstall the none-box socket-family filter
+    /// after joining the namespaces. The launch-time filter is inherited only
+    /// by children of the filtered process, and an injected hook is neither:
+    /// it joins later, so on a `--network none` session it has to load the
+    /// filter itself or it could open sockets — `AF_VSOCK` to the host
+    /// included — from inside a sealed box.
+    pub(crate) seal_none_box: bool,
 }
 
 impl SessionCommands for InjectedCommands {
@@ -129,11 +137,15 @@ impl SessionCommands for InjectedCommands {
     ) -> std::io::Result<std::process::Command> {
         let mut vars = self.vars.clone();
         vars.extend(extra_env);
-        crate::nsenter::Injection::new(self.leader_pid, program, args)
+        let injection = crate::nsenter::Injection::new(self.leader_pid, program, args)
             .with_cwd(self.cwd.clone())
-            .with_env(vars)
-            .command()
-            .map_err(std::io::Error::other)
+            .with_env(vars);
+        let injection = if self.seal_none_box {
+            injection.seal_none_box()
+        } else {
+            injection
+        };
+        injection.command().map_err(std::io::Error::other)
     }
 }
 
@@ -208,6 +220,33 @@ pub(crate) enum HookStatus {
     /// Never ran: the command could not be built or spawned, or its
     /// script could not be read.
     NotRun { reason: String },
+}
+
+impl fmt::Display for HookStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => write!(f, "succeeded"),
+            Self::Failed { code: Some(code) } => write!(f, "exited with status {code}"),
+            Self::Failed { code: None } => write!(f, "was killed by a signal"),
+            Self::TimedOut { after, budgeted } => {
+                // Whole seconds read as declared timeouts do; a teardown
+                // budget can leave a fraction, which `as_secs` would
+                // truncate to a misleading "0s".
+                if after.subsec_nanos() == 0 {
+                    write!(f, "timed out after {}s", after.as_secs())?;
+                } else if after.as_secs() == 0 {
+                    write!(f, "timed out after {}ms", after.as_millis())?;
+                } else {
+                    write!(f, "timed out after {:.1}s", after.as_secs_f64())?;
+                }
+                if *budgeted {
+                    write!(f, " (teardown budget)")?;
+                }
+                Ok(())
+            }
+            Self::NotRun { reason } => write!(f, "did not run: {reason}"),
+        }
+    }
 }
 
 /// How long output tails are kept in an outcome. Enough to see a
@@ -429,6 +468,8 @@ pub(crate) struct HookContext<'a> {
     pub(crate) workspace: DaemonAbsPath,
 }
 
+// Left positional: a private helper with a single call site, so a struct would
+// be single-use ceremony.
 #[allow(clippy::too_many_arguments)]
 async fn run_one<C: SessionCommands>(
     commands: &C,
@@ -1039,6 +1080,59 @@ mod tests {
         assert!(outcomes[0].output.contains("oops"));
     }
 
+    /// Each variant renders as a plain sentence, not Rust debug output.
+    #[test]
+    fn hook_status_displays_as_words() {
+        assert_eq!(HookStatus::Ok.to_string(), "succeeded");
+        assert_eq!(
+            HookStatus::Failed { code: Some(3) }.to_string(),
+            "exited with status 3"
+        );
+        assert_eq!(
+            HookStatus::Failed { code: None }.to_string(),
+            "was killed by a signal"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_secs(30),
+                budgeted: false,
+            }
+            .to_string(),
+            "timed out after 30s"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_secs(4),
+                budgeted: true,
+            }
+            .to_string(),
+            "timed out after 4s (teardown budget)"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_millis(250),
+                budgeted: true,
+            }
+            .to_string(),
+            "timed out after 250ms (teardown budget)"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_millis(2500),
+                budgeted: true,
+            }
+            .to_string(),
+            "timed out after 2.5s (teardown budget)"
+        );
+        assert_eq!(
+            HookStatus::NotRun {
+                reason: "no shell".to_string(),
+            }
+            .to_string(),
+            "did not run: no shell"
+        );
+    }
+
     /// A hook that outlives its timeout is killed and reported as timed
     /// out, not left running.
     #[tokio::test]
@@ -1411,5 +1505,60 @@ mod tests {
         let tail = tail_of(long.as_bytes(), b"");
         assert!(tail.len() <= OUTPUT_TAIL_BYTES + 2);
         assert!(long.ends_with(&tail));
+    }
+
+    /// The injected argv of a hook, as strings, so a test can ask what the
+    /// shim was told to do.
+    async fn injected_argv(seal_none_box: bool) -> Vec<String> {
+        // A plain host process shares every namespace with us, so the join set
+        // is empty and nothing privileged is asked of the runner.
+        let mut hold = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a stand-in session leader");
+        let commands = InjectedCommands {
+            leader_pid: hold.id(),
+            cwd: String::new(),
+            vars: BTreeMap::new(),
+            seal_none_box,
+        };
+        let built = commands
+            .command("/bin/true", &[], BTreeMap::new())
+            .await
+            .expect("building the injected hook command");
+        let _ = hold.kill();
+        let _ = hold.wait();
+        built
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A hook on a `--network none` session joins the session's namespaces
+    /// rather than being forked from the filtered shell, so the seal has to
+    /// ride along as an instruction to the shim: without `--seal-none-box` the
+    /// shim never installs the filter and the hook process can open
+    /// `AF_INET`/`AF_VSOCK` sockets from inside a sealed box.
+    #[tokio::test]
+    async fn a_none_box_hook_injection_carries_the_socket_seal() {
+        assert!(
+            injected_argv(true)
+                .await
+                .contains(&"--seal-none-box".to_string()),
+            "a sealing session must pass --seal-none-box to the hook's shim",
+        );
+    }
+
+    /// The flag is the none box's alone: a `host_ip` or `own_ip` session's
+    /// hooks keep the plain injection, so their sockets are governed by the
+    /// network namespace rather than refused by a socket-family filter.
+    #[tokio::test]
+    async fn a_networked_session_hook_injection_is_not_sealed() {
+        assert!(
+            !injected_argv(false)
+                .await
+                .contains(&"--seal-none-box".to_string()),
+            "only a none box may pass --seal-none-box to the hook's shim",
+        );
     }
 }

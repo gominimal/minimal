@@ -18,6 +18,15 @@ struct Cli {
     /// Runtime files live under `<dir>/providers/local-minvmd0/`.
     #[arg(long, global = true)]
     minimal_state_dir: Option<paths::CwdRelative<paths::Daemon>>,
+
+    /// Name the VM to act on (default: `default`).
+    ///
+    /// A named VM keeps its own state directory, socket, and daemon under
+    /// `<dir>/providers/local-minvmd0/<NAME>/`; the default VM's paths are
+    /// unchanged. Names are at most 24 bytes of ASCII lowercase letters,
+    /// digits and `-`, starting with a letter or digit; `guest` is reserved.
+    #[arg(long = "vm", global = true, value_name = "NAME")]
+    vm: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -49,6 +58,13 @@ enum Command {
         /// Print status as a JSON object.
         #[arg(long)]
         json: bool,
+        /// Print the read-only row verb's reply for this box's row
+        /// (NET-138) instead of the lifecycle report: the row's switch
+        /// address, egress allow-list and declared and runtime-admitted
+        /// ports while a live box holds the name, the no-row marker once
+        /// none does. Exit 0 when a row answered, 1 on the no-row marker.
+        #[arg(long, value_name = "NAME")]
+        row: Option<String>,
     },
     /// Show or set persisted per-VM resource configuration (applied next boot).
     Config {
@@ -82,10 +98,11 @@ enum ConfigAction {
 }
 
 fn main() -> Result<()> {
-    // Parse and apply the state-dir override BEFORE installing tracing: the
-    // detached log dir derives from the state dir. Nothing in between may
-    // call `tracing::*` (it would be silently dropped); clap prints its own
-    // parse errors to stderr, which is fine.
+    // Parse and apply the state-dir override and the VM name BEFORE installing
+    // tracing: the detached log dir derives from the state dir, and every path
+    // the process resolves derives from both. Nothing in between may call
+    // `tracing::*` (it would be silently dropped); clap prints its own parse
+    // errors to stderr, which is fine.
     let cli = Cli::parse();
 
     if let Some(dir) = &cli.minimal_state_dir {
@@ -95,31 +112,92 @@ fn main() -> Result<()> {
         minvmd::state::set_state_dir_override(dir);
     }
 
-    let _log_guard = init_tracing()?;
+    if let Some(vm) = &cli.vm {
+        minvmd::state::set_vm_name(vm).map_err(|e| anyhow::anyhow!("--vm: {e}"))?;
+    }
 
-    match cli.command {
-        Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),
+    // The VMM child (`__krun-vmm`) exports nothing of its own: it hands the
+    // process to libkrun, which never returns, and its only telemetry job is
+    // forwarding settings to the guest boot line (`vm::with_guest_env`).
+    // `completions` writes a script to stdout and has nothing to report.
+    let telemetry = !matches!(cli.command, Command::KrunVmm | Command::Completions { .. });
+    if let Some(log_guard) = init_tracing(telemetry)? {
+        minvmd::control::set_log_flusher(log_guard);
+    }
+
+    // One root span per process, a child of the caller's `TRACEPARENT` (the
+    // `min` that autospawned this VM, or the minvmd that re-exec'd this one)
+    // when telemetry is on. It must end before the flush below, so the
+    // command runs inside it (`dispatch` ends it) and the exit code is
+    // applied after.
+    let root = minvmd::telemetry::root_span(command_name(&cli.command));
+    let result = dispatch(cli.command, root);
+    mlog::otel::shutdown(std::time::Duration::from_secs(2));
+    // A `run` supervisor stopped by SIGTERM/SIGINT ends by that signal, so
+    // its exit status says what stopped it. Dying by the signal flushes the
+    // log first, from this thread or from the stop-signal watcher's, so the
+    // signal stop's last lines reach the log before the process ends.
+    minvmd::control::die_by_received_stop_signal();
+    minvmd::control::flush_log();
+    match result {
+        Ok(0) => Ok(()),
+        Ok(code) => std::process::exit(code),
+        Err(e) => Err(e),
+    }
+}
+
+/// The subcommand's name, for the root span.
+fn command_name(c: &Command) -> &'static str {
+    match c {
+        Command::Boot { .. } => "boot",
+        Command::Completions { .. } => "completions",
+        Command::Run { .. } => "run",
+        Command::Status { .. } => "status",
+        Command::Config { .. } => "config",
+        Command::Stop => "stop",
+        Command::KrunVmm => "__krun-vmm",
+    }
+}
+
+/// Run one subcommand inside `root`, the process's root span, which has ended
+/// by the time this returns; `Ok(code)` is the process exit code (non-zero
+/// only for `status`, whose code is its answer).
+///
+/// `run` takes the root over: its supervisor ends it once the VM is ready
+/// rather than when the process exits, which is the VM's whole life later
+/// (see `minvmd::telemetry::SupervisorStart`). Every other subcommand runs to
+/// completion inside it.
+fn dispatch(command: Command, root: tracing::Span) -> Result<i32> {
+    let root = root.entered();
+    match command {
+        Command::Boot { foreground } => minvmd::cmd::boot::run(foreground).map(|()| 0),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
-            Ok(())
+            Ok(0)
         }
-        Command::Run { detach, timeout } => minvmd::cmd::run::run(detach, timeout),
-        Command::Status { json } => {
-            let exit = minvmd::cmd::status::run(json)?;
-            let code = exit.code();
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
+        Command::Run { detach, timeout } => {
+            minvmd::cmd::run::run(detach, timeout, root).map(|()| 0)
         }
+        Command::Status { json, row } => Ok(minvmd::cmd::status::run(json, row)?.code()),
         Command::Config { action } => match action {
-            ConfigAction::Show { json } => minvmd::cmd::config::run_show(json),
-            ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
+            ConfigAction::Show { json } => minvmd::cmd::config::run_show(json).map(|()| 0),
+            ConfigAction::Set { vcpus, ram_mib } => {
+                minvmd::cmd::config::run_set(vcpus, ram_mib).map(|()| 0)
+            }
         },
-        Command::Stop => minvmd::cmd::stop::run(),
-        Command::KrunVmm => minvmd::cmd::vmm_child::run(),
+        Command::Stop => {
+            // No stop line here (NET-055): the one-per-stop line belongs to
+            // the witness that observes the VM die — the `run` supervisor, or
+            // a foreground `boot` (see `log_stopping_vm`). `stop` only
+            // signals once a supervisor's alive lock says one is watching
+            // that very child, so a line here too would log one stop twice —
+            // and a no-op stop (already stopped, stale state) would log a
+            // stop that never happened.
+            minvmd::cmd::stop::run().map(|()| 0)
+        }
+        Command::KrunVmm => minvmd::cmd::vmm_child::run().map(|()| 0),
     }
 }
 
@@ -130,14 +208,39 @@ fn main() -> Result<()> {
 /// mirroring minimald's scheme so `min bug` finds both daemons' logs in one
 /// place. The returned guard must outlive the process — dropping it flushes
 /// pending records.
-fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+///
+/// With `telemetry` (every subcommand but the VMM child and `completions`),
+/// spans and events also go to minimal's OpenTelemetry export and spool when
+/// the user opted in (`mlog::otel`); off, the layers are `None` and nothing
+/// else happens.
+///
+/// The `RUST_LOG` filter belongs to the console or file layer alone, as in
+/// `min` and `minimald`: as a global layer it also gated the OTel layers, and
+/// `RUST_LOG=warn` silenced minvmd's export and spool of every info-level span
+/// (`vm.boot` included). The OTel layers carry
+/// their own `MINIMAL_OTEL_FILTER` (default `info`).
+fn init_tracing(telemetry: bool) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = mlog::otel::quiet(filter);
+    if telemetry {
+        mlog::otel::init("minvmd");
+    }
 
     if std::env::var_os(minvmd::DETACHED_ENV).is_none() {
+        // Colours only on a terminal: piped output — CI logs, `boot.log`
+        // captures, the e2e harnesses, `grep vm=` — must stay plain text, or
+        // the VM name and state dir a line carries are not searchable.
+        use std::io::IsTerminal as _;
         tracing_subscriber::registry()
-            .with(fmt::layer())
-            .with(filter)
+            .with(
+                fmt::layer()
+                    .with_ansi(std::io::stdout().is_terminal())
+                    .with_filter(filter),
+            )
+            .with(mlog::otel::span_layer())
+            .with(mlog::otel::log_layer())
             .init();
+        mlog::otel::report_init();
         return Ok(None);
     }
 
@@ -156,9 +259,11 @@ fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>>
         .lossy(false)
         .finish(appender);
     tracing_subscriber::registry()
-        .with(mlog::json_file_layer(writer, "minvmd"))
-        .with(filter)
+        .with(mlog::json_file_layer(writer, "minvmd").with_filter(filter))
+        .with(mlog::otel::span_layer())
+        .with(mlog::otel::log_layer())
         .init();
+    mlog::otel::report_init();
     tracing::info!(
         log_dir = %log_dir.display(),
         "detached minvmd: routing tracing output to daily-rotated log file",

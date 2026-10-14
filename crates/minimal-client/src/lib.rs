@@ -4,8 +4,12 @@
 //! domain socket, authenticates (passwordless), and invokes oneshot RPCs
 //! defined in the `minimald-rpc` wire contract.
 
+pub mod ask_dialog;
 pub mod attach;
+pub mod box_registration;
 pub mod file_upload;
+pub mod session_name;
+pub mod tty_relay;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,11 +21,77 @@ use minimald_rpc::OneshotSshRpc;
 /// The process-wide trace context, minted once at command dispatch. The
 /// root span carries its ids into every log line, and the SSH client sends
 /// the same context to the daemon as a `TRACEPARENT` channel env request —
-/// one grep joins host and guest records.
+/// one grep joins host and guest records — unless telemetry is off
+/// ([`set_telemetry_opted_out`]), when the channel says so instead.
 pub fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
-    static CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
-        std::sync::OnceLock::new();
-    CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+    TRACE_CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+}
+
+static TRACE_CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
+    std::sync::OnceLock::new();
+
+/// Whether this process's telemetry decision is off, whatever the cause
+/// (not opted in, `DO_NOT_TRACK`, `OTEL_SDK_DISABLED`). Set by the CLI at
+/// dispatch ([`set_telemetry_opted_out`]); off by default, so a caller that
+/// never says sends its `TRACEPARENT` as before.
+static TELEMETRY_OPTED_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this process's telemetry decision is off. From then on every
+/// channel to the daemon carries the opt-out marker (`MINIMAL_OTEL=off`)
+/// and no `TRACEPARENT`, so the daemon records nothing of this process's
+/// requests either (its request spans are unsampled, and it keeps their
+/// command lines out of its own records). The process's trace context is
+/// still minted: the CLI's own file log keeps joining its lines by it.
+pub fn set_telemetry_opted_out(off: bool) {
+    TELEMETRY_OPTED_OUT.store(off, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_telemetry_opted_out`] was last given `true`.
+#[must_use]
+pub fn telemetry_opted_out() -> bool {
+    TELEMETRY_OPTED_OUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the process-wide trace context before its first use (the CLI's root
+/// span decides it, so exported spans, log fields and the propagated
+/// `TRACEPARENT` agree). Ignored once the context exists.
+pub fn init_trace_context(ctx: minimald_rpc::trace::TraceContext) {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "a second init keeps the first value, which is the intent"
+    )]
+    let _ = TRACE_CONTEXT.set(ctx);
+}
+
+// ── VM name ─────────────────────────────────────────────────────────────────
+
+static VM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Set the process-wide VM name (`--vm <NAME>`) so every provider dir this
+/// process resolves names the same VM (NET-052). First call wins; must be
+/// called at command dispatch, before any path resolution. A name outside
+/// the allowlist is rejected here rather than resolved to a directory outside
+/// the provider dir.
+///
+/// # Errors
+///
+/// [`paths::Error::InvalidVmName`] when `vm` breaks the naming rule
+/// ([`paths::validate_vm_name`]).
+pub fn set_vm_name(vm: &str) -> Result<(), paths::Error> {
+    paths::validate_vm_name(vm)?;
+    let _ = VM_NAME.set(vm.to_owned());
+    Ok(())
+}
+
+/// The VM this process talks to: the `--vm` name when set, else the default VM
+/// ([`paths::DEFAULT_VM_NAME`], whose paths are unchanged — NET-053).
+#[must_use]
+pub fn vm_name() -> &'static str {
+    VM_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(paths::DEFAULT_VM_NAME)
 }
 
 /// Build a spinner bar on the process-global `MultiProgress` with the house
@@ -137,9 +207,9 @@ fn add_patches_bar(total: u64) -> indicatif::ProgressBar {
 }
 
 /// Max retries when connecting to the daemon UDS.
-const CONNECT_RETRIES: u32 = 20;
+pub const CONNECT_RETRIES: u32 = 20;
 /// Delay between connection retries.
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
+pub const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Deadline for the SSH handshake + auth once the socket has accepted.
 ///
 /// A connect is not proof that anyone is home: on the VM backend the socket is
@@ -148,7 +218,7 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// the CLI blocks there forever (#730). Generous — a healthy endpoint answers in
 /// milliseconds, so this only bounds the pathological case. Mirrors `minvmd`'s
 /// own client, which guards the same bridge.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for a whole oneshot RPC round-trip.
 ///
 /// The handshake deadline covers a peer that never speaks SSH; it does not
@@ -156,7 +226,43 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// libkrun's always-accepting bridge), where the reply wait would block
 /// forever. Generous — a healthy daemon answers in milliseconds, so this
 /// only bounds the pathological case.
-const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// The leash a caller is expected to run a [`Client::probe`] under: the
+/// probe's connect, its handshake, and the one RPC the caller makes on it,
+/// end to end. The retry ([`CONNECT_RETRIES`]), the handshake deadline and
+/// the RPC deadline each bound one wedge on their own; stacked, they hold a
+/// caller that spans every VM for about 72 s per wedged VM. A probe is of a
+/// VM the caller did not select — one answer among several, not the daemon
+/// the operator asked for — so it gets a short leash instead: the same 4 s
+/// the TUI allows a mid-run reconnect. The caller applies it, because the
+/// RPC it makes is the caller's.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Why [`Client::probe`] could not reach a daemon: the classification a
+/// caller of a VM it did not select needs, so "this VM is not running" is an
+/// answer it can act on rather than an error it must warn about.
+#[derive(Debug)]
+pub enum ProbeRefusal {
+    /// Nothing answers at the socket path — the stale `ssh.sock` of a VM
+    /// that is down, or a path that vanished since the caller looked. Not a
+    /// fault: a VM that is not running is a normal thing to find mid-list.
+    NotRunning,
+    /// The path is there and something is wrong beyond that: a wedged
+    /// handshake, an unexpected connect error, a refused auth. Worth a
+    /// warning, and worth the caller's attention.
+    Unreachable(anyhow::Error),
+}
+
+impl std::fmt::Display for ProbeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeRefusal::NotRunning => write!(f, "not running"),
+            ProbeRefusal::Unreachable(e) => write!(f, "unreachable: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeRefusal {}
 
 /// russh client handler that accepts any ephemeral host key.
 ///
@@ -191,7 +297,69 @@ impl Client {
     /// race on macOS where the libkrun bridge UDS appears slightly after the
     /// `vm-up` line, and bounds the handshake by [`HANDSHAKE_TIMEOUT`] so a
     /// wedged daemon behind an accepting socket fails instead of hanging.
+    /// That retry is for the VM this process *selected* — the one it just
+    /// ensured and is about to drive. A VM it did not select gets
+    /// [`Client::probe`] instead: waiting out the retry on a daemon nobody
+    /// promised would charge every stopped VM on the host to the caller.
+    #[tracing::instrument(level = "info", name = "client.connect", skip_all)]
     pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, "minimal-cli").await
+    }
+
+    /// Connect scoped to one session: the SSH username is the session's
+    /// UUID.
+    ///
+    /// The daemon's `direct-tcpip` handler parses the SSH username as the
+    /// session a channel belongs to, so channels opened on this connection
+    /// dial from that session's box (its own network namespace, when it has
+    /// one) rather than from the daemon's. Everything else — retries,
+    /// handshake deadline, RPC vocabulary — is [`Client::connect`].
+    pub async fn connect_scoped(
+        sock_path: &Path,
+        session: sessions::SessionId,
+    ) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, &session.to_string()).await
+    }
+
+    /// Connect for a probe of a VM this process did not select: one attempt,
+    /// no retry, with the refusal classified.
+    ///
+    /// A stopped VM leaves its `ssh.sock` behind, so a present path is not
+    /// proof of a running daemon — and a VM nobody selected is not one to
+    /// wait for. One connect attempt, and the caller reads
+    /// [`ProbeRefusal::NotRunning`] as the answer it is rather than a fault
+    /// to warn about. Everything else — the handshake deadline, the SSH
+    /// vocabulary — is [`Client::connect`]. The caller runs the probe under
+    /// [`PROBE_TIMEOUT`] so a wedged VM answers one probe quickly instead of
+    /// holding a listing or a resolution that spans every VM.
+    pub async fn probe(sock_path: &Path) -> Result<Self, ProbeRefusal> {
+        let stream = match tokio::net::UnixStream::connect(sock_path).await {
+            Ok(stream) => stream,
+            // Nothing answers at the path: the socket file a stopped VM
+            // left behind (`ConnectionRefused`), or one that vanished since
+            // the caller's existence check (`NotFound`) — both are "this VM
+            // is not running", not a fault.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    || e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Err(ProbeRefusal::NotRunning);
+            }
+            Err(e) => {
+                return Err(ProbeRefusal::Unreachable(anyhow::anyhow!(
+                    "connect to daemon at {}: {}",
+                    sock_path.display(),
+                    e
+                )));
+            }
+        };
+        let handle = Self::handshake(stream, "minimal-cli", sock_path)
+            .await
+            .map_err(ProbeRefusal::Unreachable)?;
+        Ok(Client { handle })
+    }
+
+    async fn connect_as(sock_path: &Path, username: &str) -> Result<Self, anyhow::Error> {
         let stream = {
             let mut conn = None;
             let mut last_err = None;
@@ -216,6 +384,18 @@ impl Client {
             })?
         };
 
+        let handle = Self::handshake(stream, username, sock_path).await?;
+        Ok(Client { handle })
+    }
+
+    /// The SSH handshake over an already-connected stream: version exchange
+    /// and `none` auth as `username`, bounded by [`HANDSHAKE_TIMEOUT`] — a
+    /// connect is not proof anyone is home (#730).
+    async fn handshake(
+        stream: tokio::net::UnixStream,
+        username: &str,
+        sock_path: &Path,
+    ) -> Result<russh::client::Handle<MinimalClientHandler>, anyhow::Error> {
         // The client deliberately runs without keepalives: a laptop closed
         // for an hour should reconnect transparently on wake rather than have
         // the link torn down mid-sleep. The server's long-interval keepalive
@@ -228,7 +408,7 @@ impl Client {
                 .context("ssh connect")?;
 
             let auth = handle
-                .authenticate_none("minimal-cli")
+                .authenticate_none(username)
                 .await
                 .context("authenticate")?;
 
@@ -238,16 +418,46 @@ impl Client {
             Ok(handle)
         };
 
-        let handle = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
                     "connect to {}: SSH handshake timed out after {HANDSHAKE_TIMEOUT:?}",
                     sock_path.display()
                 )
-            })??;
+            })?
+    }
 
-        Ok(Client { handle })
+    /// Open a `direct-tcpip` channel to `host:port`, as seen from the
+    /// session this connection is scoped to.
+    ///
+    /// On a [`Client::connect_scoped`] connection the daemon relays the
+    /// channel onto the address as dialed from the session's box, so
+    /// `127.0.0.1` is the box's own loopback — which is the point: a service
+    /// bound inside the box answers as if the request had come from there.
+    /// The caller owns both halves of the relay from here.
+    pub async fn open_direct_tcpip(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        // The open request carries no channel env, and the daemon dials the
+        // target itself, so the originator address has no meaning for it:
+        // this process's trace context rides there instead (the daemon's
+        // `forward` span adopts it, so the relay and the session's
+        // TrackForward join this command's trace; TEL-028). An OpenSSH
+        // client's real address in that field parses as nothing there. With
+        // telemetry off the field carries the opt-out instead
+        // (`MINIMAL_OTEL=off`), as `send_trace_context` does on a channel.
+        let originator = if telemetry_opted_out() {
+            minimald_rpc::trace::OTEL_OFF_ORIGINATOR.to_owned()
+        } else {
+            trace_context().traceparent()
+        };
+        self.handle
+            .channel_open_direct_tcpip(host, u32::from(port), &originator, 0)
+            .await
+            .with_context(|| format!("open direct-tcpip channel to {host}:{port}"))
     }
 
     /// Issue a oneshot RPC: open a channel, request the subsystem, write the
@@ -293,6 +503,7 @@ impl Client {
             .await
     }
 
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs()))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -308,7 +519,7 @@ impl Client {
                 .await
                 .with_context(|| format!("open channel for {}", R::NAME))?;
 
-            send_traceparent(&channel).await;
+            send_trace_context(&channel).await;
             // want_reply = true so an unknown subsystem (CLI/daemon version
             // skew) surfaces as a Failure instead of the client writing into a
             // channel nobody serves (#901).
@@ -404,7 +615,7 @@ impl Client {
             .channel_open_session()
             .await
             .context("open exec channel")?;
-        send_traceparent(&channel).await;
+        send_trace_context(&channel).await;
         if let Some(id) = session_id {
             channel
                 .set_env(true, "MINIMAL_SESSION_ID", id.to_string())
@@ -556,66 +767,91 @@ impl Client {
         // fully queued into the encoder at that point, even if it
         // hasn't been fully compressed or shipped yet.
         let bar = add_patches_bar(patches.len() as u64);
-        let bar_for_loop = bar.clone();
-        let result = self
-            .stream_upload(
-                session_id,
-                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst"),
-                "composition patch",
-                async |writer| {
-                    // Route through the pipe helper because SSH channel
-                    // writers aren't Sync but `TarZstArchive` requires
-                    // Sync. The pipe's tx (a `DuplexStream`) is Sync;
-                    // its rx pumps into the channel writer on the same
-                    // task.
-                    crate::file_upload::stream_via_pipe(writer, async |tx| {
-                        let mut archive = crate::file_upload::TarZstArchive::new(tx);
-                        // Always finalize the archive, even on
-                        // build error: `async_tar::Builder` panics
-                        // from its `Drop` impl if dropped without
-                        // `finish()` (async-tar 0.6 builder.rs:668),
-                        // and `?`-propagation isn't a panic-unwind
-                        // so the Drop guard fires. If both branches
-                        // fail, prefer the build error — it's
-                        // usually the root cause (encoder writes
-                        // then error with "broken pipe" once the
-                        // upstream file read has already failed).
-                        let build_result: Result<(), anyhow::Error> = async {
-                            for (host_path, dest) in patches {
-                                archive
-                                    .add_file(
-                                        host_path,
-                                        dest.as_str(),
-                                        // Default options: the source's own
-                                        // mode rides the tar header. See the
-                                        // method docs.
-                                        crate::file_upload::AddFileOptions::default(),
-                                    )
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "adding patch {} → {}",
-                                            host_path.display(),
-                                            dest.as_str()
-                                        )
-                                    })?;
-                                bar_for_loop.inc(1);
-                            }
-                            Ok(())
-                        }
-                        .await;
-                        let finish_result = archive.finish().await;
-                        match (build_result, finish_result) {
-                            (Err(build), _) => Err(build),
-                            (Ok(()), r) => r,
-                        }
-                    })
-                    .await
-                },
-            )
-            .await;
+        let result = self.upload_patches_with(session_id, patches, &bar).await;
         bar.finish_and_clear();
         result
+    }
+
+    /// [`Self::upload_patches`] without terminal progress output.
+    /// For callers that own the screen themselves (the `min dash` TUI),
+    /// where a progress bar would corrupt the frame.
+    pub async fn upload_patches_quiet(
+        &mut self,
+        session_id: sessions::SessionId,
+        patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+    ) -> Result<(), anyhow::Error> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        // A hidden bar that is never added to the global MultiProgress
+        // renders nowhere; the upload loop still gets its counter.
+        let bar = indicatif::ProgressBar::hidden();
+        self.upload_patches_with(session_id, patches, &bar).await
+    }
+
+    async fn upload_patches_with(
+        &mut self,
+        session_id: sessions::SessionId,
+        patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+        bar: &indicatif::ProgressBar,
+    ) -> Result<(), anyhow::Error> {
+        let bar_for_loop = bar.clone();
+        self.stream_upload(
+            session_id,
+            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst"),
+            "composition patch",
+            async |writer| {
+                // Route through the pipe helper because SSH channel
+                // writers aren't Sync but `TarZstArchive` requires
+                // Sync. The pipe's tx (a `DuplexStream`) is Sync;
+                // its rx pumps into the channel writer on the same
+                // task.
+                crate::file_upload::stream_via_pipe(writer, async |tx| {
+                    let mut archive = crate::file_upload::TarZstArchive::new(tx);
+                    // Always finalize the archive, even on
+                    // build error: `async_tar::Builder` panics
+                    // from its `Drop` impl if dropped without
+                    // `finish()` (async-tar 0.6 builder.rs:668),
+                    // and `?`-propagation isn't a panic-unwind
+                    // so the Drop guard fires. If both branches
+                    // fail, prefer the build error — it's
+                    // usually the root cause (encoder writes
+                    // then error with "broken pipe" once the
+                    // upstream file read has already failed).
+                    let build_result: Result<(), anyhow::Error> = async {
+                        for (host_path, dest) in patches {
+                            archive
+                                .add_file(
+                                    host_path,
+                                    dest.as_str(),
+                                    // Default options: the source's own
+                                    // mode rides the tar header. See the
+                                    // method docs.
+                                    crate::file_upload::AddFileOptions::default(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "adding patch {} → {}",
+                                        host_path.display(),
+                                        dest.as_str()
+                                    )
+                                })?;
+                            bar_for_loop.inc(1);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let finish_result = archive.finish().await;
+                    match (build_result, finish_result) {
+                        (Err(build), _) => Err(build),
+                        (Ok(()), r) => r,
+                    }
+                })
+                .await
+            },
+        )
+        .await
     }
 
     /// Stream a zstd-compressed tarball of external lifecycle-hook
@@ -719,7 +955,7 @@ impl Client {
             .await
             .with_context(|| format!("open channel for {what} upload"))?;
 
-        send_traceparent(&channel).await;
+        send_trace_context(&channel).await;
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
             .await
@@ -810,7 +1046,7 @@ impl Client {
             .await
             .context("open channel for diagnostic bundle")?;
 
-        send_traceparent(&channel).await;
+        send_trace_context(&channel).await;
         channel
             .request_subsystem(true, minimald_rpc::DIAG_BUNDLE_SUBSYSTEM)
             .await
@@ -960,6 +1196,42 @@ fn skew_override_set() -> bool {
     std::env::var_os(SKEW_OVERRIDE_VAR).is_some_and(|v| !v.is_empty())
 }
 
+/// The client-side patches of a loadout contribution as
+/// `(host path, sandbox destination)` upload pairs, for
+/// [`Client::upload_patches`].
+///
+/// Collect them *before* the contribution moves into the
+/// `ConfigureLoadout` RPC: they land in the final composition whether
+/// the response is `Materialized` or `Pending`, so the client is
+/// authoritative for them. Every activate path — `min session
+/// activate`, `min task run`, the `min dash` create — collects through
+/// this one function, then [`dedup_patch_uploads`] before the upload.
+#[must_use]
+pub fn contribution_patch_uploads(
+    contribution: &sessions::wire::request::WireContribution,
+) -> Vec<(std::path::PathBuf, paths::SandboxRelPath)> {
+    contribution
+        .patches
+        .iter()
+        .map(|p| {
+            (
+                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
+                p.patch.destination.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Sort patch upload pairs by sandbox destination and collapse
+/// same-destination duplicates. Dedup by destination, not host path:
+/// two loadouts may name the same destination, and the composer's
+/// post-gate check guarantees such duplicates are exact matches (same
+/// source), so collapsing is safe.
+pub fn dedup_patch_uploads(patches: &mut Vec<(std::path::PathBuf, paths::SandboxRelPath)>) {
+    patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+    patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+}
+
 /// This CLI's build, to be asserted by an RPC that acts before it replies —
 /// today `CreateSessionRequest::must_match_version`.
 ///
@@ -1081,42 +1353,273 @@ pub fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Pat
 /// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
 /// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
+///
+/// This is the default VM ([`paths::DEFAULT_VM_NAME`]); [`vm_name()`] selects the
+/// process's VM, so call [`set_vm_name`] first to talk to a named VM.
 pub fn resolve_provider_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
+    resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm_name())
+}
+
+/// [`resolve_provider_dir`] for an explicit VM. A named VM nests under its own
+/// subdirectory of the provider dir (NET-052/NET-054):
+/// `<state dir>/providers/local-minvmd0/<name>`; the default VM keeps the
+/// provider dir itself (NET-053). The native `minimald` backend hosts no VMs,
+/// so a named VM is an error there rather than a silent fall-back to the base
+/// provider dir — a `--vm` that resolves to the default daemon's directory
+/// would mean a different VM than the one asked for.
+///
+/// # Errors
+///
+/// [`std::io::Error`] with [`paths::Error::InvalidVmName`] when `vm` breaks
+/// the naming rule, with a "named VMs need the minvmd provider" message when
+/// the backend is native `minimald`, or when `minimal_dir_override` is not
+/// usable.
+pub fn resolve_provider_dir_named(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+    vm: &str,
+) -> std::io::Result<std::path::PathBuf> {
     let base = resolve_state_base(minimal_dir_override)?;
-    Ok(
-        paths::provider_instance_dir(&base, client_provider_kind(use_minvmd), 0)
-            .as_utf8_path()
-            .as_std_path()
-            .to_path_buf(),
-    )
+    let kind = client_provider_kind(use_minvmd);
+    if kind != paths::ProviderKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
+        return Err(std::io::Error::other(
+            "named VMs need the minvmd provider (`--provider local-minvmd`); \
+             the native local-minimald backend hosts no VMs",
+        ));
+    }
+    let dir = if kind == paths::ProviderKind::Minvmd {
+        paths::provider_instance_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
+    } else {
+        paths::provider_instance_dir(&base, kind, 0)
+    };
+    Ok(dir.as_utf8_path().as_std_path().to_path_buf())
 }
 
 /// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
 /// serves this endpoint under its own provider dir, so `use_minvmd` must select
 /// the same backend the daemon was spawned as.
+///
+/// This is the default VM's socket; a named VM serves its own (see
+/// [`resolve_provider_dir_named`]).
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(resolve_provider_dir(minimal_dir_override, use_minvmd)?.join(paths::SSH_SOCK_FILE))
+    resolve_socket_path_named(minimal_dir_override, use_minvmd, vm_name())
 }
 
-/// Sends the process trace context as a `TRACEPARENT` channel env request.
-/// Best-effort and reply-less: trace propagation is a diagnostic aid, and a
-/// daemon predating the variable ignores unknown env names anyway.
-async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
-    use minimald_rpc::trace::TRACEPARENT_ENV;
-    let _ = channel
-        .set_env(false, TRACEPARENT_ENV, trace_context().traceparent())
-        .await;
+/// [`resolve_socket_path`] for an explicit VM: `<named provider dir>/ssh.sock`.
+///
+/// # Errors
+///
+/// As [`resolve_provider_dir_named`].
+pub fn resolve_socket_path_named(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+    vm: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    Ok(
+        resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm)?
+            .join(paths::SSH_SOCK_FILE),
+    )
+}
+
+/// One VM's daemon socket with the name that selects it: the pair a client
+/// needs to reach one VM's daemon in particular — `--vm` selects it, and a
+/// listing (NET-057) or a box-name resolution (NET-058) spans every entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmSocket {
+    /// The VM's name: [`paths::DEFAULT_VM_NAME`] for the default VM, the
+    /// subdirectory's name for a named one.
+    pub vm: String,
+    /// The socket that VM's daemon serves.
+    pub sock: std::path::PathBuf,
+}
+
+/// Enumerate every VM's socket on this host, default VM first: the default
+/// VM's provider dir plus one entry per named VM that has a state dir
+/// (NET-052's layout). A VM that is not running is still enumerated — its
+/// daemon simply is not answering, which each caller reports its own way —
+/// so the set is the host's, not the running half of it.
+///
+/// The native `minimald` backend hosts no VMs, so it enumerates nothing:
+/// callers fall back to [`resolve_socket_path`], the one socket that backend
+/// serves (and the path that refuses a named `--vm` there, as it must).
+/// Directories whose name breaks the naming rule are skipped rather than
+/// reported: the provider dir also holds non-VM trappings — `ssh.sock`, the
+/// reserved `guest/` payload dir — and a stray must not fail a listing.
+///
+/// # Errors
+///
+/// [`std::io::Error`] when `minimal_dir_override` is not usable or the
+/// provider dir cannot be read. A provider dir that does not exist yet
+/// (no VM created, ever) is not an error: the default VM is still reported,
+/// with a socket nothing serves yet.
+pub fn enumerate_vm_sockets(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+) -> std::io::Result<Vec<VmSocket>> {
+    let base = resolve_state_base(minimal_dir_override)?;
+    let kind = client_provider_kind(use_minvmd);
+    if kind != paths::ProviderKind::Minvmd {
+        return Ok(Vec::new());
+    }
+    let provider = paths::provider_instance_dir(&base, kind, 0);
+    let dir = provider.as_utf8_path().as_std_path();
+    let mut vms = vec![VmSocket {
+        vm: paths::DEFAULT_VM_NAME.to_string(),
+        sock: dir.join(paths::SSH_SOCK_FILE),
+    }];
+    // Deterministic order for the named half: alphabetical, after the
+    // default VM's entry, so a resolution that reports the VMs it looked at
+    // always reports them in the same order.
+    let mut named: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // No provider dir yet: no VM has ever been created on this host.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vms),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // `default` is the unnamed VM, already first; a name that breaks the
+        // rule is not a VM (see the provider dir's other trappings).
+        if name != paths::DEFAULT_VM_NAME && paths::validate_vm_name(name).is_ok() {
+            named.push(name.to_string());
+        }
+    }
+    named.sort_unstable();
+    for vm in named {
+        vms.push(VmSocket {
+            sock: dir.join(&vm).join(paths::SSH_SOCK_FILE),
+            vm,
+        });
+    }
+    Ok(vms)
+}
+
+/// Sends the process trace context as a `TRACEPARENT` channel env request,
+/// or, when this process's telemetry is off ([`telemetry_opted_out`]), the
+/// opt-out marker (`MINIMAL_OTEL=off`) and no `TRACEPARENT`. Best-effort
+/// and reply-less: trace propagation is a diagnostic aid, and a daemon
+/// predating either variable ignores unknown env names anyway.
+async fn send_trace_context(channel: &russh::Channel<russh::client::Msg>) {
+    use minimald_rpc::trace::{OTEL_ENV, OTEL_OFF, TRACEPARENT_ENV};
+    let sent = if telemetry_opted_out() {
+        channel.set_env(false, OTEL_ENV, OTEL_OFF).await
+    } else {
+        channel
+            .set_env(false, TRACEPARENT_ENV, trace_context().traceparent())
+            .await
+    };
+    if let Err(error) = sent {
+        tracing::debug!(%error, "trace context not sent on the channel");
+    }
+}
+
+/// Per-probe deadline for the `git` calls [`fill_git_info`] runs: a list
+/// response must stay fast even when a session's project sits on a wedged
+/// filesystem.
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upper bound on concurrent `git` child processes [`fill_git_info`] spawns.
+/// `ListSessions` returns every persisted session and session creation has no
+/// count limit, so an unbounded probe fan-out could exhaust process resources
+/// or degrade CLI/TUI listing.
+const MAX_CONCURRENT_GIT_PROBES: usize = 16;
+
+/// Runs `git -C <path> <args...>` under [`GIT_PROBE_TIMEOUT`], returning the
+/// trimmed stdout on a clean success and `None` otherwise (not a repo, no git
+/// binary, a timeout, or a non-zero exit).
+async fn git_probe(path: &Path, args: &[&str]) -> Option<String> {
+    let out = tokio::time::timeout(
+        GIT_PROBE_TIMEOUT,
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
+}
+
+/// Probes the git context of `path` for [`minimald_rpc::GitInfo`]. The branch
+/// is read with `symbolic-ref --short HEAD` (falling back to `HEAD` for a
+/// detached checkout) because `rev-parse --abbrev-ref HEAD` exits 128 on an
+/// unborn `HEAD` and would discard the rest of the metadata; the toplevel and
+/// git directory are queried separately. `--absolute-git-dir` (not `--git-dir`)
+/// keeps the worktree comparison exact — the relative form prints `.git` when
+/// `path` is the toplevel. Anything but a clean success — not a repo, no git
+/// binary, a timeout — yields `None`.
+///
+/// Runs on the host (the CLI/TUI process), not in the daemon: on macOS the
+/// daemon lives in the minvmd guest, where the host's project paths do not
+/// exist and git is not on PATH, so a daemon-side probe always returns
+/// `None`.
+pub async fn probe_git_info(path: &Path) -> Option<minimald_rpc::GitInfo> {
+    let branch = match git_probe(path, &["symbolic-ref", "--short", "HEAD"]).await {
+        Some(branch) if !branch.is_empty() => branch,
+        _ => "HEAD".to_string(),
+    };
+    let toplevel = git_probe(path, &["rev-parse", "--show-toplevel"]).await?;
+    let git_dir = git_probe(path, &["rev-parse", "--absolute-git-dir"]).await?;
+    let is_worktree = git_dir != format!("{toplevel}/.git");
+    Some(minimald_rpc::GitInfo {
+        branch,
+        repo_root: toplevel,
+        is_worktree,
+    })
+}
+
+/// Fills each entry's `git` field by probing its project path on the host,
+/// in parallel, bounded to [`MAX_CONCURRENT_GIT_PROBES`] in-flight probes.
+/// Entries without a project path are left as `None`.
+pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
+    let mut set = tokio::task::JoinSet::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_GIT_PROBES));
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(path) = entry.project_path.as_ref() else {
+            continue;
+        };
+        let path = path.as_utf8_path().as_std_path().to_path_buf();
+        let permits = Arc::clone(&permits);
+        set.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            (idx, probe_git_info(&path).await)
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok((idx, git)) = res {
+            entries[idx].git = git.map(Box::new);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, resolve_socket_path};
+    use super::{Client, resolve_provider_dir, resolve_socket_path};
     use std::path::Path;
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
@@ -1186,6 +1689,146 @@ mod tests {
         assert_eq!(
             sock,
             Path::new("/tmp/minimal-test/providers/local-minvmd0/ssh.sock")
+        );
+    }
+
+    /// A named VM must resolve to its own provider dir and socket under a
+    /// per-name subdirectory (NET-052/NET-054).
+    #[test]
+    fn named_vm_gets_its_own_dir_and_socket() {
+        let dir =
+            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+                .unwrap();
+        assert_eq!(
+            dir,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+        );
+
+        let sock =
+            super::resolve_socket_path_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+                .unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+        );
+    }
+
+    /// The default VM's paths must be byte-for-byte unchanged, whether the name
+    /// is spelled `default` or left unset (NET-053).
+    #[test]
+    fn default_vm_paths_are_unchanged() {
+        let base = Path::new("/tmp/minimal-test/providers/local-minvmd0");
+        for name in [None, Some("default")] {
+            let dir = super::resolve_provider_dir_named(
+                Some(Path::new("/tmp/minimal-test")),
+                true,
+                name.unwrap_or("default"),
+            )
+            .unwrap();
+            assert_eq!(dir, base);
+            let sock = super::resolve_socket_path_named(
+                Some(Path::new("/tmp/minimal-test")),
+                true,
+                name.unwrap_or("default"),
+            )
+            .unwrap();
+            assert_eq!(sock, base.join("ssh.sock"));
+        }
+    }
+
+    /// The native `minimald` backend hosts no VMs, so a named VM must be
+    /// refused there rather than silently resolved to the base provider dir:
+    /// `min --vm alpha` against the native backend would otherwise talk to
+    /// the default daemon while claiming to talk to alpha. The default VM
+    /// still resolves — it is the only VM that backend has.
+    ///
+    /// Linux-only: `client_provider_kind` forces Minvmd on macOS, so a
+    /// `false` there is not the native backend.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_backend_refuses_a_named_vm() {
+        let err =
+            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
+                .expect_err("a named VM on the native backend must be refused");
+        assert!(
+            err.to_string()
+                .contains("named VMs need the minvmd provider"),
+            "the refusal must say what a named VM needs: {err}"
+        );
+
+        assert_eq!(
+            super::resolve_provider_dir_named(
+                Some(Path::new("/tmp/minimal-test")),
+                false,
+                paths::DEFAULT_VM_NAME,
+            )
+            .unwrap(),
+            Path::new("/tmp/minimal-test/providers/local-minimald0")
+        );
+    }
+
+    /// A VM name outside the allowlist must be refused, not resolved to a
+    /// directory outside the provider dir; the refusal states the rule.
+    #[test]
+    fn vm_name_must_fit_the_allowlist() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../sibling",
+            "a b",
+            "Alpha",
+            "-alpha",
+            "guest",
+        ] {
+            let err =
+                super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid VM name"),
+                "name {name:?} must be rejected as invalid, got: {err}"
+            );
+        }
+        assert!(super::set_vm_name("a/b").is_err());
+    }
+
+    /// `--vm` published at dispatch must steer every default-arg resolve this
+    /// process makes (NET-052). The global is process-wide and first-call-wins,
+    /// so the assertion runs in a spawned copy of this test binary: under
+    /// plain `cargo test` the crate's tests share one process, and a global
+    /// set in this test would leak into the default-VM tests above (nextest
+    /// isolates per test, but the crate must pass under both).
+    #[test]
+    fn set_vm_name_steers_the_default_resolvers() {
+        const CHILD: &str = "MINIMAL_CLIENT_VM_STEER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // The child, whose process-global starts unset: the assertion.
+            super::set_vm_name("alpha").unwrap();
+            assert_eq!(super::vm_name(), "alpha");
+            let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            assert_eq!(
+                dir,
+                Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+            );
+            let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            assert_eq!(
+                sock,
+                Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+            );
+            return;
+        }
+        // The parent: re-run just this test in a child process carrying the
+        // marker, so the global is set — and stays — in the child alone.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("set_vm_name_steers_the_default_resolvers")
+            .env(CHILD, "1")
+            .output()
+            .expect("spawning the test binary for the steering assertion");
+        assert!(
+            out.status.success(),
+            "the steering assertion failed in the child:\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
@@ -1266,5 +1909,455 @@ mod tests {
         let assertion = |override_set: bool| (!override_set).then(|| version::VERSION.to_string());
         assert_eq!(assertion(false).as_deref(), Some(version::VERSION));
         assert_eq!(assertion(true), None);
+    }
+
+    /// `probe_git_info` answers branch and toplevel for a plain repo, the
+    /// worktree flag for a linked worktree, and `None` for a non-repo
+    /// directory. Skipped where no git binary exists.
+    #[tokio::test]
+    async fn probe_git_info_reports_branch_toplevel_and_worktree() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no git binary in this environment");
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "initial"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("wt");
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            wt_path.to_str().unwrap(),
+        ]);
+        let plain = tempfile::tempdir().unwrap();
+
+        // `--show-toplevel` canonicalizes; tempdir paths may pass through
+        // symlinks (/var → /private/var on macOS).
+        let repo_root = std::fs::canonicalize(repo.path()).unwrap();
+        let repo_info = super::probe_git_info(repo.path())
+            .await
+            .expect("repo must have git info");
+        assert_eq!(repo_info.branch, "main");
+        assert_eq!(
+            std::fs::canonicalize(&repo_info.repo_root).unwrap(),
+            repo_root
+        );
+        assert!(!repo_info.is_worktree);
+
+        let wt_info = super::probe_git_info(&wt_path)
+            .await
+            .expect("worktree must have git info");
+        assert_eq!(wt_info.branch, "feature");
+        assert!(wt_info.is_worktree, "linked worktree must be flagged");
+
+        // Detach the non-repo fixture from any enclosing worktree:
+        // `tempfile::tempdir` may land under a Git worktree (e.g. a
+        // repo-scoped TMPDIR), and `git -C` would then discover the enclosing
+        // repository and return `Some`. Ceiling discovery at `plain` itself so
+        // the probe sees a non-repository.
+        let plain_ceiling = plain.path().to_str().unwrap().to_string();
+        let prev_ceiling = std::env::var_os("GIT_CEILING_DIRECTORIES");
+        unsafe { std::env::set_var("GIT_CEILING_DIRECTORIES", &plain_ceiling) };
+        let plain_probe = super::probe_git_info(plain.path()).await;
+        match prev_ceiling {
+            Some(v) => unsafe { std::env::set_var("GIT_CEILING_DIRECTORIES", v) },
+            None => unsafe { std::env::remove_var("GIT_CEILING_DIRECTORIES") },
+        }
+        assert_eq!(plain_probe, None, "non-repo must probe to None");
+    }
+
+    /// Enumerating the host's VMs covers the default VM plus every named one
+    /// with a state dir — default first, the rest alphabetical — and skips the
+    /// trappings a provider dir also holds (NET-057 lists across every entry
+    /// this returns; NET-058's resolution probes them).
+    #[test]
+    fn enumerates_the_default_vm_then_every_named_one() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        for vm in ["beta", "alpha"] {
+            std::fs::create_dir_all(provider.join(vm)).unwrap();
+        }
+        // The provider dir's own trappings: a socket file and a reserved,
+        // non-VM directory. Neither is a VM, and neither must fail the
+        // enumeration.
+        std::fs::write(provider.join("ssh.sock"), b"").unwrap();
+        std::fs::create_dir_all(provider.join("guest")).unwrap();
+
+        let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
+        assert_eq!(
+            vms,
+            vec![
+                super::VmSocket {
+                    vm: "default".to_string(),
+                    sock: provider.join("ssh.sock"),
+                },
+                super::VmSocket {
+                    vm: "alpha".to_string(),
+                    sock: provider.join("alpha").join("ssh.sock"),
+                },
+                super::VmSocket {
+                    vm: "beta".to_string(),
+                    sock: provider.join("beta").join("ssh.sock"),
+                },
+            ]
+        );
+    }
+
+    /// A host with no provider dir yet still enumerates the default VM: a
+    /// socket nothing serves yet is a valid probe, not an error — the host's
+    /// set is enumerated, not the running half of it.
+    #[test]
+    fn a_host_with_no_provider_dir_still_lists_the_default_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
+        assert_eq!(
+            vms,
+            vec![super::VmSocket {
+                vm: paths::DEFAULT_VM_NAME.to_string(),
+                sock: base
+                    .path()
+                    .join("providers")
+                    .join("local-minvmd0")
+                    .join("ssh.sock"),
+            }]
+        );
+    }
+
+    /// The native `minimald` backend hosts no VMs, so it enumerates nothing:
+    /// callers fall back to the one socket that backend serves. (Linux-only,
+    /// as [`super::native_backend_refuses_a_named_vm`]: `client_provider_kind`
+    /// forces the minvmd kind on macOS, so a `false` there is not the native
+    /// backend.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_native_backend_enumerates_no_vms() {
+        let base = tempfile::tempdir().unwrap();
+        assert!(
+            super::enumerate_vm_sockets(Some(base.path()), false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An initialized repository with an unborn `HEAD` (no commits yet) still
+    /// reports its branch, toplevel, and git dir: the branch probe reads
+    /// `symbolic-ref --short HEAD` (which resolves even before the first
+    /// commit) instead of failing the whole probe on `rev-parse --abbrev-ref
+    /// HEAD`'s exit 128. Skipped where no git binary exists.
+    #[tokio::test]
+    async fn probe_git_info_reports_an_unborn_repository() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no git binary in this environment");
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "init",
+                "-b",
+                "main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let info = super::probe_git_info(repo.path())
+            .await
+            .expect("unborn repo must have git info");
+        assert_eq!(info.branch, "main");
+        assert!(!info.is_worktree);
+        assert_eq!(
+            std::fs::canonicalize(&info.repo_root).unwrap(),
+            std::fs::canonicalize(repo.path()).unwrap()
+        );
+    }
+
+    /// A wire patch from a user loadout, as `compose_user_contribution`
+    /// emits one.
+    fn wire_patch(host: &str, dest: &str) -> sessions::wire::primitives::WireSessionPatch {
+        sessions::wire::primitives::WireSessionPatch {
+            patch: sessions::wire::primitives::WireResolvedPatch {
+                host_path: paths::HostAbsPath::try_new(host).unwrap(),
+                destination: paths::SandboxRelPath::try_new(dest).unwrap(),
+            },
+            source: sessions::wire::primitives::WireSource::UserLoadout {
+                name: "dev".to_string(),
+            },
+        }
+    }
+
+    /// The shared collection every activate path uploads from: each wire
+    /// patch maps to its `(host path, sandbox destination)` pair, the pairs
+    /// sort by destination, and same-destination duplicates collapse. A
+    /// composition without patches collects nothing, so its upload is a
+    /// no-op.
+    #[test]
+    fn patch_uploads_map_sort_and_dedup_by_destination() {
+        let contribution = sessions::wire::request::WireContribution {
+            patches: vec![
+                wire_patch("/tmp/first.patch", "zeta/first.patch"),
+                wire_patch("/tmp/second.patch", "alpha/second.patch"),
+                wire_patch("/tmp/third.patch", "alpha/second.patch"),
+            ],
+            ..Default::default()
+        };
+        let mut patches = super::contribution_patch_uploads(&contribution);
+        super::dedup_patch_uploads(&mut patches);
+        assert_eq!(
+            patches,
+            vec![
+                (
+                    std::path::PathBuf::from("/tmp/second.patch"),
+                    paths::SandboxRelPath::try_new("alpha/second.patch").unwrap(),
+                ),
+                (
+                    std::path::PathBuf::from("/tmp/first.patch"),
+                    paths::SandboxRelPath::try_new("zeta/first.patch").unwrap(),
+                ),
+            ],
+            "sorted by destination, duplicates collapsed"
+        );
+        assert!(
+            super::contribution_patch_uploads(&sessions::wire::request::WireContribution::default())
+                .is_empty(),
+            "a patchless composition uploads nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opt_out_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in daemon that records what each channel open and request
+    /// carries, accepts everything, and ends every subsystem channel at
+    /// once (the client's RPC then fails to decode, which is not the point).
+    #[derive(Clone, Default)]
+    struct Recorder {
+        env: Arc<Mutex<Vec<(String, String)>>>,
+        originators: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl russh::server::Handler for Recorder {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn env_request(
+            &mut self,
+            id: russh::ChannelId,
+            name: &str,
+            value: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.env
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), value.to_owned()));
+            session.channel_success(id)?;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: russh::ChannelId,
+            _: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(id)?;
+            session.eof(id)?;
+            session.close(id)?;
+            Ok(())
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            _: &str,
+            _: u32,
+            originator_address: &str,
+            _: u32,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.originators
+                .lock()
+                .unwrap()
+                .push(originator_address.to_owned());
+            reply.accept().await;
+            Ok(())
+        }
+    }
+
+    /// One RPC and one direct-tcpip open against the recorder, through the
+    /// real client; returns the channel env requests and the originator
+    /// addresses it sent.
+    async fn drive(sock: &std::path::Path) {
+        let mut client = super::Client::connect(sock).await.unwrap();
+        // The recorder ends the RPC channel unanswered and accepts the
+        // forward: neither outcome is the point, what was sent is.
+        drop(client.oneshot_rpc::<minimald_rpc::GetVersion>(()).await);
+        drop(client.open_direct_tcpip("127.0.0.1", 8080).await);
+        drop(client);
+    }
+
+    /// With the process's telemetry off (`DO_NOT_TRACK`, no opt-in, or
+    /// `OTEL_SDK_DISABLED`: the CLI's one decision), every channel to the
+    /// daemon carries `MINIMAL_OTEL=off` and no `TRACEPARENT`, and a
+    /// forward's open carries the same marker as its originator. With it
+    /// on, the `TRACEPARENT` goes and no marker. Both run here in order on
+    /// the process-wide flag, so this is the one test that sets it.
+    #[tokio::test]
+    async fn do_not_track_sends_the_opt_out_and_no_traceparent() {
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let dir = tempfile::Builder::new()
+            .prefix("mcot")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sock = dir.path().join("ssh.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let recorder = Recorder::default();
+        let server = {
+            let (config, recorder) = (config.clone(), recorder.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (config, recorder) = (config.clone(), recorder.clone());
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, recorder).await
+                        {
+                            drop(session.await);
+                        }
+                    });
+                }
+            })
+        };
+        let env = |r: &Recorder| r.env.lock().unwrap().clone();
+        let originators = |r: &Recorder| r.originators.lock().unwrap().clone();
+
+        super::set_telemetry_opted_out(true);
+        drive(&sock).await;
+        let sent = env(&recorder);
+        assert!(
+            sent.iter()
+                .any(|(k, v)| k == minimald_rpc::trace::OTEL_ENV
+                    && v == minimald_rpc::trace::OTEL_OFF),
+            "the opt-out marker was sent: {sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|(k, _)| k == minimald_rpc::trace::TRACEPARENT_ENV),
+            "and no TRACEPARENT: {sent:?}"
+        );
+        assert_eq!(
+            originators(&recorder),
+            [minimald_rpc::trace::OTEL_OFF_ORIGINATOR.to_owned()],
+            "the forward's originator is the marker"
+        );
+
+        recorder.env.lock().unwrap().clear();
+        recorder.originators.lock().unwrap().clear();
+        super::set_telemetry_opted_out(false);
+        drive(&sock).await;
+        let sent = env(&recorder);
+        let tp = super::trace_context().traceparent();
+        assert!(
+            sent.iter()
+                .any(|(k, v)| k == minimald_rpc::trace::TRACEPARENT_ENV && *v == tp),
+            "with telemetry on the TRACEPARENT is sent: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(k, _)| k == minimald_rpc::trace::OTEL_ENV),
+            "and no marker: {sent:?}"
+        );
+        assert_eq!(originators(&recorder), [tp]);
+
+        // The OpenSSH attach path picks the same one variable.
+        super::set_telemetry_opted_out(true);
+        assert_eq!(
+            super::attach::trace_env(),
+            (
+                minimald_rpc::trace::OTEL_ENV,
+                minimald_rpc::trace::OTEL_OFF.to_owned()
+            )
+        );
+        super::set_telemetry_opted_out(false);
+        assert_eq!(
+            super::attach::trace_env(),
+            (
+                minimald_rpc::trace::TRACEPARENT_ENV,
+                super::trace_context().traceparent()
+            )
+        );
+        server.abort();
     }
 }

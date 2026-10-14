@@ -113,6 +113,18 @@ pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
     resolve_or_default("MINVMD_INITRAMFS", DEFAULT_INITRAMFS_FILE)
 }
 
+/// Resolve all three boot image paths at once.
+///
+/// Errors with the first resolver failure encountered. Used by the supervisor
+/// to log the images a VM will boot before handing them to the VMM child, and
+/// by tests that prove a fresh install resolves its payload with no overrides.
+pub fn resolve_boot_images() -> Result<(PathBuf, PathBuf, PathBuf), VmError> {
+    let kernel = resolve_kernel_path()?;
+    let rootfs = resolve_rootfs_path()?;
+    let initramfs = resolve_initramfs_path()?;
+    Ok((kernel, rootfs, initramfs))
+}
+
 /// Resolve the host gvproxy binary path: the `MINVMD_GVPROXY_BIN` override,
 /// then the installed location — the user-local `bin/gvproxy-min` the curl|sh
 /// installer stamps, else a system-wide path ([`switch::installed_gvproxy_bin`],
@@ -270,6 +282,44 @@ mod tests {
             "expected a system-wide switch path, got {got:?}"
         );
         clear_gvproxy_env();
+    }
+
+    #[test]
+    fn default_image_paths_resolve_from_install() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("minimal");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let want_kernel = data.join(DEFAULT_KERNEL_FILE);
+        let want_rootfs = data.join(DEFAULT_ROOTFS_FILE);
+        let want_initramfs = data.join(DEFAULT_INITRAMFS_FILE);
+        std::fs::write(&want_kernel, b"kernel").unwrap();
+        std::fs::write(&want_rootfs, b"rootfs").unwrap();
+        std::fs::write(&want_initramfs, b"initramfs").unwrap();
+
+        // No overrides and no HOME — only XDG_DATA_HOME points at the installed
+        // layout. This is exactly the fresh-install case: the installer stamps
+        // the three guest images into the data prefix and the daemon resolves
+        // them with no env setup.
+        unsafe {
+            std::env::remove_var("MINVMD_KERNEL_PATH");
+            std::env::remove_var("MINVMD_ROOTFS_PATH");
+            std::env::remove_var("MINVMD_INITRAMFS");
+            std::env::set_var("XDG_DATA_HOME", tmp.path());
+        }
+
+        let (kernel, rootfs, initramfs) = resolve_boot_images().unwrap();
+        assert_eq!(kernel, want_kernel);
+        assert_eq!(rootfs, want_rootfs);
+        assert_eq!(initramfs, want_initramfs);
+
+        // Per-resolver checks match the combined helper.
+        assert_eq!(resolve_kernel_path().unwrap(), want_kernel);
+        assert_eq!(resolve_rootfs_path().unwrap(), want_rootfs);
+        assert_eq!(resolve_initramfs_path().unwrap(), want_initramfs);
+
+        clear_env("MINVMD_KERNEL_PATH");
     }
 
     #[cfg(minvmd_libkrun)]

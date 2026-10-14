@@ -37,3 +37,11 @@ retries = 0
 fail-fast = true
 slow-timeout = { period = "120s", terminate-after = 3 }
 leak-timeout = "5s"
+
+# NET-068's end-to-end toolchain run composes the box, boots it, and then
+# downloads real packages over the network; the per-tool timeout is capped at
+# 60s, but the whole test including boot and compose can run past the default
+# vm profile's 6-minute kill. Give this one test a longer leash.
+[[profile.vm.overrides]]
+filter = 'test(hostname_allowlist_toolchain_completes)'
+slow-timeout = { period = "180s", terminate-after = 4 }

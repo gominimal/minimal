@@ -42,6 +42,24 @@ impl From<UpstreamReqwestUrl> for ReqwestUrl {
     }
 }
 
+impl ReqwestUrl {
+    /// The host the URL names, without its scheme or port: the host a fetch
+    /// of this URL leaves for, read from the parsed URL rather than from a
+    /// rendering of it.
+    pub fn host_str(&self) -> Option<&str> {
+        self.0.host_str()
+    }
+
+    /// The port the URL names, when it has one: the other half of the host
+    /// a fetch record spells from, read from the parsed URL the same way
+    /// [`host_str`]'s half is, never from a rendering of it. Whether the
+    /// record carries that port is the record's own one port rule's to
+    /// say, so this hands back the URL's own fact and nothing more.
+    pub fn port(&self) -> Option<u16> {
+        self.0.port()
+    }
+}
+
 /// The response to an RPC for some resource.
 pub trait FetchResponse: std::fmt::Debug + Sized {
     type Error: std::fmt::Debug;

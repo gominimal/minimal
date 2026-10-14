@@ -1,4 +1,5 @@
 //! Top-level API for minimal tooling.
+#![recursion_limit = "256"]
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -18,14 +19,14 @@ use ot::OpTracker;
 use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWriter};
 
 mod error;
-pub use error::Error;
+pub use error::{Error, remote_cache_setup_error};
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
 mod env;
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
-pub use sandbox2::config::Invocation;
+pub use sandbox::config::Invocation;
 
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
@@ -33,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -72,11 +73,73 @@ pub trait PackageSelection {
                 .unwrap()
                 .map(|n| match g.by_name(n) {
                     Some(bsr) => Ok(*bsr),
-                    None => Err(Error::Other(anyhow!("No such package: {}", n))),
+                    None => Err(Error::Other(anyhow!(package_not_found_message(g, n)))),
                 })
                 .collect::<Result<_, _>>()
         }
     }
+}
+
+/// Builds the `No such package` error message, suggesting close package
+/// names when any exist.
+fn package_not_found_message(g: &Graph, input: &str) -> String {
+    let suggestions = package_suggestions(g, input);
+    // Show the name the suggestions were computed from, not stray padding.
+    let input = input.trim();
+    if suggestions.is_empty() {
+        format!(
+            "No such package: {} (try 'min package search {}')",
+            input, input
+        )
+    } else {
+        format!(
+            "No such package: {} (did you mean: {}?)",
+            input,
+            suggestions.join(", ")
+        )
+    }
+}
+
+/// Collects up to three package names close to `input`, preferring names
+/// that share a prefix with the input before fuzzier matches.
+fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
+    use common::fuzzy_search::fuzzy_match;
+
+    let input = input.trim().to_lowercase();
+    // An empty name is a prefix of every package, so it has no close match.
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut exact: Vec<&str> = Vec::new();
+    let mut prefix_of_input: Vec<&str> = Vec::new();
+    let mut input_prefix_of: Vec<&str> = Vec::new();
+    let mut fuzzy: Vec<(&str, common::fuzzy_search::SearchMatch)> = Vec::new();
+
+    for name in g.names() {
+        let lower = name.to_lowercase();
+        if lower == input {
+            exact.push(name);
+        } else if input.starts_with(&lower) {
+            prefix_of_input.push(name);
+        } else if lower.starts_with(&input) {
+            input_prefix_of.push(name);
+        } else if let Some(m) = fuzzy_match(&input, name) {
+            fuzzy.push((name, m));
+        }
+    }
+
+    exact.sort_unstable();
+    prefix_of_input.sort_by_key(|n| (n.len(), *n));
+    input_prefix_of.sort_by_key(|n| (n.len(), *n));
+    fuzzy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    candidates.extend(exact.into_iter().map(str::to_string));
+    candidates.extend(prefix_of_input.into_iter().map(str::to_string));
+    candidates.extend(input_prefix_of.into_iter().map(str::to_string));
+    candidates.extend(fuzzy.into_iter().map(|(n, _)| n.to_string()));
+    candidates.truncate(3);
+    candidates
 }
 
 impl PackageSelection for Vec<String> {
@@ -428,14 +491,14 @@ impl Context {
 
     /// Builds a [`ProjectSetup`] from this context, for running project-setup
     /// operations (e.g. [`op::UpdateProject`]) that refresh the `minimal.toml`.
-    pub fn project_setup(&self) -> ProjectSetup {
-        ProjectSetup::from_parts(
+    pub fn project_setup(&self) -> Result<ProjectSetup, Error> {
+        Ok(ProjectSetup::from_parts(
             self.daemon.config.clone(),
             self.daemon.vcs.clone(),
             self.daemon.stdlib_dir.clone(),
             self.mfile.clone(),
-            self.repo_dir().to_path_buf(),
-        )
+            self.repo_dir()?.to_path_buf(),
+        ))
     }
 
     /// Returns a handle to the local cache.
@@ -488,10 +551,22 @@ impl Context {
     }
 
     /// Returns the path to the root of the repo.
-    pub fn repo_dir(&self) -> &Path {
+    ///
+    /// The repo root is the minimal file's own directory when it has an on-disk
+    /// location, else the configured `-C` override. When neither is available —
+    /// the minimal file was decoded without a path and no override is set —
+    /// there is no repo root to name, so this reports it rather than panicking.
+    pub fn repo_dir(&self) -> Result<&Path, Error> {
         self.mfile
             .repo_path()
-            .unwrap_or_else(|| self.daemon.config.repo_dir_override().as_ref().unwrap())
+            .or_else(|| self.daemon.config.repo_dir_override())
+            .ok_or_else(|| {
+                Error::Other(anyhow!(
+                    "cannot determine the repository directory: the location of \
+                     the minimal file on disk is unknown and no repository \
+                     directory override is set"
+                ))
+            })
     }
     /// Returns a path to the standard library.
     pub fn stdlib_dir(&self) -> &PathBuf {
@@ -539,7 +614,10 @@ impl Context {
         let url = self.daemon.config.remote_cache_url();
         let gcs_storage = if matches!(url, AnyUrl::Gcs(_)) {
             let backend = if auth {
-                GcsStorage::builder().build().await.unwrap()
+                GcsStorage::builder()
+                    .build()
+                    .await
+                    .map_err(|e| RemoteError::Config(format!("initializing GCS storage: {e}")))?
             } else {
                 GcsStorage::builder()
                     .with_credentials(
@@ -547,7 +625,7 @@ impl Context {
                     )
                     .build()
                     .await
-                    .unwrap()
+                    .map_err(|e| RemoteError::Config(format!("initializing GCS storage: {e}")))?
             };
             Some(backend)
         } else {
@@ -616,7 +694,10 @@ impl Context {
                  or a bare bucket name"
                 )
             })?;
-        let backend = GcsStorage::builder().build().await.unwrap();
+        let backend = GcsStorage::builder()
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("initializing GCS storage: {e}"))?;
         let res = RemoteCacheWriter::new(backend, bucket, self.daemon.config.ot.clone()).await?;
         tracing::trace!("remote cache writer init took {:?}", start.elapsed());
         Ok(res)
@@ -638,8 +719,8 @@ impl Context {
     }
 
     /// Returns a [SpecOrigin] representing the top-level repository.
-    pub fn repo_origin(&self) -> SpecOrigin {
-        SpecOrigin::from_dir(self.repo_dir())
+    pub fn repo_origin(&self) -> Result<SpecOrigin, Error> {
+        Ok(SpecOrigin::from_dir(self.repo_dir()?))
     }
     /// Returns the [OpTracker] to be used as the root for tracking long-running operations.
     pub fn op_tracker(&self) -> Option<OpTracker> {
@@ -665,11 +746,20 @@ impl Context {
     /// Builds & returns a graph of all packages for a specific target.
     pub fn graph_from_all_packages_with_target(&mut self, target: Target) -> Result<Graph, Error> {
         let start = SystemTime::now();
+        let repo_dir = self.repo_dir()?;
         let res = Graph::new_from_chain(
             self.vcs_manager(),
             &mut graph::LayerCacheDir(self.daemon.config.layer_cache_dir()),
             LinkConfig::Dir {
-                dir: self.repo_dir().to_str().unwrap().to_string(),
+                dir: repo_dir
+                    .to_str()
+                    .ok_or_else(|| {
+                        Error::Other(anyhow!(
+                            "repo path is not valid UTF-8: {}",
+                            repo_dir.display()
+                        ))
+                    })?
+                    .to_string(),
             },
             self.daemon.stdlib_dir.clone(),
             target,
@@ -721,7 +811,7 @@ impl Context {
     ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.daemon.config.use_remote_cache() {
-            Some(self.remote_cache(false, false).await.unwrap())
+            Some(self.remote_cache(false, false).await?)
         } else {
             None
         };
@@ -839,10 +929,12 @@ impl Context {
     }
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
+    // Left positional: public library API with borrowed `'a` args; a params
+    // struct would reshape the interface without improving this forwarder.
     #[allow(clippy::too_many_arguments)]
-    /// Builds an [`env::Env`] with the default `HostNet` sandbox network. Use
-    /// [`make_env_with_network`](Self::make_env_with_network) to run the sandbox
-    /// in another [`sandbox2::NetworkMode`] (e.g. a `NoNet`/`OwnIp` PTask).
+    /// Builds an [`env::Env`] whose sandbox shares the host network. Use
+    /// [`make_env_with_network`](Self::make_env_with_network) to run it under
+    /// another [`sandbox::Network`] (e.g. an isolated PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -862,20 +954,29 @@ impl Context {
             patches,
             env_vars,
             packages,
-            sandbox2::NetworkMode::HostNet,
+            std::sync::Arc::new(sandbox::HostNet),
             home,
+            WdLayout::BoundDir,
         )
         .await
     }
 
-    /// Like [`make_env`](Self::make_env) but runs the sandbox in the given
-    /// [`sandbox2::NetworkMode`], so callers (e.g. the minimald task-exec path)
-    /// can give a task the same network isolation as its session rather than
-    /// always `HostNet`.
+    /// Like [`make_env`](Self::make_env) but runs the sandbox under the given
+    /// [`sandbox::Network`], so callers (e.g. the minimald task-exec path) can
+    /// give a task the same network as its session rather than always the
+    /// host's. A provider, not a mode: the caller owns the mode and what it
+    /// means, and the sandbox layer acts on what the provider says to do.
     ///
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
     /// the conversion read the ambient one.
+    ///
+    /// `wd_layout` chooses how the sandbox's working directory is laid out;
+    /// see [`WdLayout`]. Callers that run a task inside a session pass
+    /// [`WdLayout::Session`] so the task sees `/workbench` and `/home` rather
+    /// than the daemon's internal tree.
+    // Left positional: public library API; `make_env` already forwards here, so
+    // a struct would only relocate the same argument list.
     #[allow(clippy::too_many_arguments)]
     pub async fn make_env_with_network<'a, S: PackageSelection>(
         &'a mut self,
@@ -886,8 +987,9 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
-        network_mode: sandbox2::NetworkMode,
+        network: std::sync::Arc<dyn sandbox::Network>,
         home: PatchHome,
+        wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -895,12 +997,17 @@ impl Context {
         let wd = if let Some(wd) = wd {
             wd
         } else {
-            self.repo_dir().to_path_buf()
+            self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
             Some(name) if !name.is_empty() => mfile
                 .state_dir(name, self.daemon.config.state_base_dir())
-                .unwrap(),
+                .ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "cannot determine state directory for state key {name:?}: \
+                         the location of the minimal file on disk is unknown"
+                    ))
+                })?,
             _ => {
                 let tmp = self.daemon.cache.temp_dir().map_err(|e| {
                     Error::Other(
@@ -957,11 +1064,12 @@ impl Context {
                 state_base_dir,
                 transitives: transitive_deps,
                 cwd: wd,
+                wd_layout,
                 patches,
                 home,
                 env_vars,
                 hostname: Some(name.to_string()),
-                override_network_mode: Some(network_mode),
+                network,
                 ot: self.daemon.config.ot.clone(),
             },
         )
@@ -1023,18 +1131,7 @@ impl Context {
         graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
-        // The two arms are NOT interchangeable, though they look it.
-        // `rcache::Error`'s Display is `write!(f, "{:?}", self)` — it
-        // Debug-formats itself — so the fallback arm renders a Config as
-        // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
-        // variant name and escaped quotes included. Destructuring Config and
-        // formatting the inner `msg` is what yields the clean, user-facing
-        // message. Collapsing this to one arm reintroduces the panic-era
-        // output this replaced.
-        let rc = self.remote_cache(false, true).await.map_err(|e| match e {
-            RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
-            other => Error::Other(anyhow::anyhow!("{other}")),
-        })?;
+        let rc = self.remote_cache(false, true).await?;
         let mut task_set = tokio::task::JoinSet::new();
         let fetch_start = SystemTime::now();
         let semaphore = Arc::new(Semaphore::new(8));
@@ -1050,7 +1147,10 @@ impl Context {
                 let rc_clone = rc.clone(); // TODO: This is trash
                 let cache_clone = self.daemon.cache.clone();
                 let semaphore = semaphore.clone();
-                task_set.spawn(async move {
+                // A spawned task starts with no current span: without this every
+                // package fetch (`materialize`) began a trace of its own, cut off
+                // from the activation that needed it.
+                let fetch = async move {
                     let sema = semaphore.acquire().await;
                     let res = rc_clone
                         .materialize(&spec_hash, &cache_clone, &name)
@@ -1069,7 +1169,11 @@ impl Context {
                         });
                     drop(sema);
                     res
-                });
+                };
+                task_set.spawn(tracing::Instrument::instrument(
+                    fetch,
+                    tracing::Span::current(),
+                ));
             }
         }
 
@@ -1077,9 +1181,11 @@ impl Context {
         // to the cache as it is finished being staged
         while let Some(result) = task_set.join_next().await {
             let (pending_dir, meta) = result
-                .unwrap()
+                .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
                 .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
-            pending_dir.finalize(meta).unwrap();
+            pending_dir
+                .finalize(meta)
+                .map_err(|e| Error::Other(e.into()))?;
         }
         tracing::trace!("package fetch took {:?}", fetch_start.elapsed());
 
@@ -1119,7 +1225,7 @@ impl Context {
         match mode {
             AddDepMode::BuildPackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
                     println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1129,7 +1235,7 @@ impl Context {
             }
             AddDepMode::RuntimePackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
                     println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1142,7 +1248,7 @@ impl Context {
                     && let Some(t) = tasks.get_mut(&name)
                     && let Some(t) = t.as_table_mut()
                 {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
                     println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1153,7 +1259,7 @@ impl Context {
             }
             AddDepMode::SessionPackages => {
                 if let Some(h) = doc["session"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
                 } else {
                     doc.insert(
                         "session",
@@ -1189,28 +1295,94 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
+fn upsert_toml_packages_list<T: TableLike>(
+    t: &mut T,
+    key: &str,
+    upsert: &[String],
+) -> Result<bool, Error> {
     if let Some(bp) = t.get_mut(key) {
-        let mut existing: Vec<_> = bp
-            .as_array()
-            .unwrap()
+        let arr = bp.as_array_mut().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "`{key}` in minimal.toml must be an array of package names"
+            ))
+        })?;
+
+        let mut existing: Vec<String> = arr
             .iter()
-            .map(|i| i.as_str().unwrap())
-            .collect();
+            .map(|i| {
+                i.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "`{key}` in minimal.toml must be an array of package names"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // For multi-line arrays, copy the last element's prefix decor so pushed
+        // elements land on their own line with matching indentation.
+        let last_prefix = arr
+            .iter()
+            .last()
+            .and_then(|v| v.decor().prefix())
+            .and_then(|p| p.as_str())
+            .and_then(|s| s.rfind('\n').map(|i| s[i..].to_owned()));
 
         let mut did_edit = false;
-        upsert.iter().for_each(|p| {
-            if !existing.contains(&p.as_str()) {
-                existing.push(p);
+        for p in upsert {
+            if !existing.iter().any(|e| e == p) {
+                let mut value = Value::from(p.as_str());
+                if let Some(prefix) = &last_prefix {
+                    let carried = if did_edit {
+                        String::new()
+                    } else {
+                        detach_array_close(arr)
+                    };
+                    value.decor_mut().set_prefix(carried + prefix);
+                }
+                arr.push(value);
+                existing.push(p.clone());
                 did_edit = true;
             }
-        });
-        *bp = Item::Value(Value::Array(Array::from_iter(existing)));
-        did_edit
+        }
+        Ok(did_edit)
     } else {
         t.insert(key, Item::Value(Value::Array(Array::from_iter(upsert))));
-        true
+        Ok(true)
     }
+}
+
+/// Prepares a multi-line array for appending after its last element.
+///
+/// Whatever follows the last element up to its final line break, such as a
+/// same-line comment, is cut out and returned so the caller can put it ahead of
+/// the appended element and keep it on the old last element's line. The final
+/// line break and anything after it become the array's trailing text, so the
+/// appended element closes the array the same way the old last element did.
+/// Without a trailing comma that text sits in the last element's suffix,
+/// otherwise in the array's trailing.
+fn detach_array_close(arr: &mut Array) -> String {
+    let trailing = arr.trailing().as_str().unwrap_or_default().to_owned();
+    let suffix = arr
+        .iter()
+        .last()
+        .and_then(|v| v.decor().suffix())
+        .and_then(|s| s.as_str())
+        .filter(|s| s.contains('\n'))
+        .map(str::to_owned);
+    let (tail, rest) = match suffix {
+        Some(suffix) => {
+            if let Some(last) = arr.iter_mut().last() {
+                last.decor_mut().set_suffix("");
+            }
+            (suffix, trailing)
+        }
+        None => (trailing, String::new()),
+    };
+    let Some(i) = tail.rfind('\n') else {
+        return String::new();
+    };
+    arr.set_trailing(format!("{}{rest}", &tail[i..]));
+    tail[..i].trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -1454,7 +1626,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let container = env.container().unwrap();
+            let planned = env.plan_launch().await.unwrap();
+            let container = env.container(planned.plan()).unwrap();
 
             // Smoketest: date command should succeed, and regardless of the time the output should contain a colon.
             let output = env
@@ -1587,6 +1760,139 @@ mod tests {
     }
 
     #[test]
+    fn upsert_packages_preserves_multiline_layout() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base", # essential
+              "vim",
+              "git",
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base", # essential
+                  "vim",
+                  "git",
+                  "python",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_last_element_comment_in_place() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git", # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(
+                doc.as_table_mut(),
+                "packages",
+                &["python".to_string(), "vim".to_string()]
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git", # pinned
+                  "python",
+                  "vim",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_without_trailing_comma() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git"
+            ]
+            tools = [
+              "base",
+              "git" # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        for key in ["packages", "tools"] {
+            assert!(
+                upsert_toml_packages_list(doc.as_table_mut(), key, &["python".to_string()])
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git",
+                  "python"
+                ]
+                tools = [
+                  "base",
+                  "git", # pinned
+                  "python"
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_single_line() {
+        let mut doc = "packages = [\"base\", \"vim\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            "packages = [\"base\", \"vim\", \"python\"]\n"
+        );
+    }
+
+    #[test]
+    fn upsert_packages_errors_on_non_array() {
+        let mut doc = "packages = \"base\"\n".parse::<DocumentMut>().unwrap();
+
+        let err =
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`packages` in minimal.toml must be an array of package names"
+        );
+    }
+
+    #[test]
     #[ignore] // Do not run in github- does not support nested namespaces
     fn task_resolve_string_interpolation() {
         let (cache, state) = (tempdir().unwrap(), tempdir().unwrap());
@@ -1657,5 +1963,91 @@ mod tests {
                 },]
             );
         });
+    }
+
+    /// Builds a small graph containing the named packages for the
+    /// package-not-found suggestion tests.
+    fn suggestion_graph(names: &[&str]) -> Graph {
+        let mut opts = decode::LoadOptions::for_test();
+        opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../stdlib/minimal-ncl");
+
+        let specs = names
+            .iter()
+            .map(|n| format!("({{ name = \"{n}\", build_deps = [], cmd = \"\" }} | BuildSpec)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let layer = decode::Layer::new_for_test_with(
+            format!("let {{BuildSpec, ..}} = import \"minimal.ncl\" in [{specs}]"),
+            &opts,
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        Graph::new().ingest(layer).unwrap()
+    }
+
+    #[test]
+    fn package_not_found_suggests_prefix_of_input() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["nodejs".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: nodejs (did you mean: node?)"
+        );
+    }
+
+    #[test]
+    fn empty_package_name_gets_no_suggestions() {
+        let graph = suggestion_graph(&["node", "python"]);
+        assert!(package_suggestions(&graph, "").is_empty());
+        assert!(package_suggestions(&graph, "  ").is_empty());
+    }
+
+    #[test]
+    fn package_not_found_suggests_fuzzy_match() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["pyhton".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: pyhton (did you mean: python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_without_candidates_suggests_search() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["zzzz".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: zzzz (try 'min package search zzzz')"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_case_insensitive_match() {
+        let graph = suggestion_graph(&["Python"]);
+        let err = vec!["python".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: python (did you mean: Python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_exact_name_for_other_case() {
+        let graph = suggestion_graph(&["node", "nodejs", "python"]);
+        for input in ["NODE", "Node", "node "] {
+            let err = vec![input.to_string()].as_bsrs(&graph).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "No such package: {} (did you mean: node, nodejs?)",
+                    input.trim()
+                )
+            );
+        }
     }
 }

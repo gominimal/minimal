@@ -1,5 +1,6 @@
 [package]
 name = "mctx"
+description = "Top-level 'minimal context' API tying configuration, decoding, graph, and cache together."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -12,6 +13,7 @@ check.workspace = true
 codespan-reporting.workspace = true
 google-cloud-auth.workspace = true
 google-cloud-storage.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 tempfile.workspace = true
@@ -21,7 +23,7 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
-sandbox2.workspace = true
+sandbox.workspace = true
 
 args.workspace = true
 lcache.workspace = true
@@ -37,5 +39,9 @@ orchestrator.workspace = true
 stdlib.workspace = true
 
 [dev-dependencies]
+decode.workspace = true
 indoc.workspace = true
 serial_test.workspace = true
+
+[lints]
+workspace = true

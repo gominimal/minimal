@@ -33,6 +33,12 @@ execution rather than disclosure. A project must be allow-listed before any
 hook it declares will run. Hooks declared in your own loadouts are not gated —
 they are your files already.
 
+A patch is also execution when its `dest` is a file something reads at
+startup. The [session shell](./loadouts.md#session-shell) sources a patched
+`~/.bashrc` (or `~/.zshrc`, `config.fish`) on every attach, so allowing a
+project's patch to such a destination allows that project's code to run in
+your shell: weigh the `dest` as well as the source.
+
 Packages are effectively out of scope. A package cannot supply file
 patches, nor environment variables that carry host data (values inherited from
 your shell), nor lifecycle hooks; because packages cannot transfer host data

@@ -18,13 +18,28 @@ impl Repo {
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
         let url = url.into();
-        let base = base.into();
+        // Absolute, because every git call below pairs `current_dir(base)`
+        // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
+        // that new working directory.
+        let base = std::path::absolute(base.into())?;
 
         if base.join("HEAD").exists() {
-            // Double-check its the right remote
+            // Double-check its the right remote. Read the clone's stored value,
+            // not `git remote get-url`: the latter applies `url.<base>.insteadOf`
+            // rewrites from any config level, so a rewritten clone would never
+            // match and every cache open would fail with InvalidPath.
+            // `--local` so a `remote.origin.url` in global or system config
+            // cannot stand in for a cache whose own config lacks one.
             let output = Command::new("git")
-                .args(["remote", "get-url", "origin"])
+                .args(["config", "--local", "--get", "remote.origin.url"])
                 .current_dir(&base)
+                // Explicit GIT_DIR so git recognises the bare repo as
+                // intentional even when `safe.bareRepository = explicit` is
+                // configured (planned as the default in Git 3.0). Under that
+                // setting, missing it makes this command fail and fall
+                // through to a clone into the already-populated directory,
+                // which can surface as `clone ... already exists`.
+                .env("GIT_DIR", &base)
                 .output()?;
 
             if output.status.success() {
@@ -55,12 +70,22 @@ impl Repo {
         if !output.status.success() {
             return Err(Error::GitCommandFailed {
                 command: "clone".to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                stderr: scrub_stderr(&url, &output.stderr),
                 status: output.status.to_string(),
             });
         }
 
-        Ok(Self { url, bare: base })
+        // A bare clone writes only `refs/heads/*`; every branch lookup in this
+        // crate goes through `refs/remotes/origin/*`, so populate those now
+        // rather than leaving the first branch checkout to fail on a ref the
+        // clone never wrote. A clone that cannot be fetched is not a usable
+        // cache entry: take the directory with the error.
+        let mut repo = Self { url, bare: base };
+        if let Err(err) = repo.fetch() {
+            let _ = std::fs::remove_dir_all(&repo.bare);
+            return Err(err);
+        }
+        Ok(repo)
     }
 
     /// Returns the path to the bare git repository.
@@ -123,44 +148,71 @@ impl Repo {
     }
 
     /// Creates a new worktree at the given path, checked-out to the given ref.
+    ///
+    /// Every worktree is a detached checkout, a branch included. Git lets a
+    /// branch be checked out by at most one worktree of a repository, so a
+    /// worktree *on* `main` makes the next `new_worktree` for `main` fail
+    /// (`cannot force update the branch 'main' used by worktree at ...`) —
+    /// and that next request is routine, because every [`crate::Manager`]
+    /// over a shared cache dir carries its own snapshot of the checkout
+    /// registry, and one that predates another's checkout asks for its own.
+    /// Detached, the worktrees are independent; a branch checkout is
+    /// refreshed by [`Self::worktree_checkout`] via `origin/<branch>`
+    /// regardless, which detaches too.
+    ///
+    /// A branch is added at `origin/<branch>`, the ref [`Self::fetch`]
+    /// updates, not at the bare name: that resolves to the bare clone's own
+    /// `refs/heads/<branch>`, which nothing refreshes after the clone, so the
+    /// worktree would land on the clone-time tip and a branch created
+    /// upstream since would not resolve at all.
     pub fn new_worktree(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
-        if let GitRef::Branch(b) = &git_ref {
-            self.run_git_bare(
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain([
-                        "worktree",
-                        "add",
-                        "-f",
-                        "--track",
-                        "-B",
-                        b.as_str(),
-                        path.to_str().unwrap(),
-                        b.as_str(),
-                    ])
-                    .collect::<Vec<_>>(),
-            )?;
-        } else {
-            self.run_git_bare(
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain([
-                        "worktree",
-                        "add",
-                        "-f",
-                        "--checkout",
-                        path.to_str().unwrap(),
-                        git_ref.as_str(),
-                    ])
-                    .collect::<Vec<_>>(),
-            )?;
-        }
+        // Drop registrations whose directories are gone first, so a stale
+        // entry cannot claim the path this add is about to use.
+        self.run_git_bare(
+            GIT_SEC_ARGS
+                .into_iter()
+                .chain(["worktree", "prune"])
+                .collect::<Vec<_>>(),
+        )?;
+        let target = match &git_ref {
+            // A cache cloned before remote-tracking refs were fetched at clone
+            // time, and never updated since, carries only `refs/heads/<b>`;
+            // offline that is the only copy of the branch there is.
+            GitRef::Branch(b) => {
+                let tracking = format!("refs/remotes/origin/{b}");
+                if self.ref_exists(&tracking) {
+                    tracking
+                } else {
+                    format!("refs/heads/{b}")
+                }
+            }
+            GitRef::Commit(s) | GitRef::Tag(s) => s.clone(),
+        };
+        self.run_git_bare(
+            GIT_SEC_ARGS
+                .into_iter()
+                .chain([
+                    "worktree",
+                    "add",
+                    "-f",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    target.as_str(),
+                ])
+                .collect::<Vec<_>>(),
+        )?;
 
         let output = self.run_git_checkout(&path, ["rev-parse", "HEAD"].into())?;
         Ok(Checkout {
             version: git_ref,
             rev: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         })
+    }
+
+    /// Whether the bare repository has the given fully-qualified ref.
+    fn ref_exists(&self, full_ref: &str) -> bool {
+        self.run_git_bare(["show-ref", "--verify", "--quiet", full_ref].into())
+            .is_ok()
     }
 
     /// Returns a list of all tags in the repository.
@@ -200,13 +252,14 @@ impl Repo {
             .current_dir(self.bare_repo_path())
             // Explicitly set GIT_DIR so git recognises the bare repo as
             // intentional even when `safe.bareRepository = explicit` is set
-            // in the system or global config (the default since git 2.49).
+            // in the system or global config (planned as the default in
+            // Git 3.0).
             .env("GIT_DIR", self.bare_repo_path())
             .args(&args)
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = scrub_stderr(&self.url, &output.stderr);
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
@@ -230,7 +283,7 @@ impl Repo {
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = scrub_stderr(&self.url, &output.stderr);
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
@@ -248,4 +301,30 @@ impl std::fmt::Debug for Repo {
             .field("bare", &self.bare)
             .finish()
     }
+}
+
+/// Git's stderr, with the secret parts of `url` taken out: the whole URL is
+/// replaced by the scrubbed remote, and then any userinfo or query/fragment
+/// left is removed on its own, because git echoes the URL it was given
+/// ("unable to access '…'"), sometimes with its own userinfo already gone.
+/// A token in the URL must not reach an error message (spec 25 TEL-041).
+fn scrub_stderr(url: &str, stderr: &[u8]) -> String {
+    let mut stderr = String::from_utf8_lossy(stderr).into_owned();
+    let scrubbed = crate::scrubbed_remote(url);
+    if scrubbed == url {
+        return stderr;
+    }
+    stderr = stderr.replace(url, &scrubbed);
+    let (base, tail) = url
+        .find(['?', '#'])
+        .map_or((url, ""), |at| url.split_at(at));
+    if !tail.is_empty() {
+        stderr = stderr.replace(tail, "");
+    }
+    let authority = base.split_once("://").map_or(base, |(_, rest)| rest);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    if let Some((userinfo, _)) = authority.rsplit_once('@') {
+        stderr = stderr.replace(&format!("{userinfo}@"), "");
+    }
+    stderr
 }

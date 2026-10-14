@@ -90,7 +90,8 @@ impl Store {
             store: l,
         };
 
-        tokio::spawn(store.mainloop());
+        // Lives for the daemon: a root of its own (see `traced::spawn_detached`).
+        crate::traced::spawn_detached(tracing::info_span!(parent: None, "store"), store.mainloop());
         Ok(handle)
     }
 }
@@ -391,8 +392,15 @@ mod tests {
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
             network: NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_addresses: None,
             hooks_enabled: true,
             status: SessionStatus::default(),
+            // No launch has recorded anything: these records are built
+            // straight from disk-side seeds, never launched.
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
             attrs: Default::default(),
         }
     }
@@ -473,6 +481,11 @@ mod tests {
             handle.record().await.unwrap().name.as_deref(),
             Some("named")
         );
+
+        // A different casing resolves to the same record: names are unique
+        // under ASCII case folding.
+        let folded = open(&store, RecordPredicate::Name("NAMED".to_string())).await;
+        assert_eq!(*folded.id(), ids[0]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

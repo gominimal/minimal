@@ -406,7 +406,6 @@ impl SubsetInput {
 
 /// An entry in a build spec's `build_deps` array.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum BuildDep {
     Build(BuildRef),
     Source(SourceInput),
@@ -418,7 +417,7 @@ pub enum BuildDep {
     Subset(SubsetInput),
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 impl BuildDep {
     /// Returns the underlying build-spec reference if this value was the Build variant.
     pub(crate) fn as_build(&self) -> Option<&BuildRef> {
@@ -532,7 +531,6 @@ impl BuildDep {
 
 /// An output from a build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
     Library { glob: String, allow_data: bool },
@@ -715,7 +713,6 @@ impl RuntimeDep {
 
 /// Some task or build in the dependency graph.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct BuildDecl {
     /// The human-readable name declared on the build decl.
     pub name: String,

@@ -1,187 +1,594 @@
 ---
 title: Release pipeline
-description: How releases are built, staged, smoke-tested, promoted, and installed: release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer.
+description: "How to cut a stable release, and how the pipeline builds, stages, smoke-tests, promotes, and installs releases: release.yml, nightly.yml, promote.yml, publish-packages.yml, prune-releases.yml, and the curl|sh installer."
 ---
 
 > This is internal documentation. It is not published to the docs site.
 
 # Release pipeline
 
-Distribution is bucket-centric. A release run stages an **immutable**
-`gs://minimal-one/versions/<short-sha>/` folder (artifacts + a `components`
-manifest); which version users actually receive is decided separately by
-mutable **channel pointer files** (`stable`, `unstable`, `nightly`) at the
-bucket root, written by [`scripts/set-channel.sh`](../../scripts/set-channel.sh).
-Staging is inert; flipping a pointer is the single, cheap, reversible action
-that ships (or rolls back) a version. All GCS writes authenticate via GitHub
-OIDC / Workload Identity Federation.
+A release goes out in two separate steps. First, a release run builds and
+tests the artifacts. It uploads them to a write-once folder in the
+`gs://minimal-one` bucket. Nobody receives that build yet. Second, a promotion
+moves a channel pointer (`stable`, `unstable`, or `nightly`) to the folder.
+Users install whatever their channel points at.
 
-## release.yml: build, sign, stage
+## Cut a stable release
 
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml) runs on
-manual `workflow_dispatch` (inputs: `dry_run`, `skip_ci_verify`), via
-`workflow_call` from nightly.yml, or on a `vMAJOR.MINOR.PATCH[-suffix]` tag
-push.
+Follow these steps in order. The examples use version `X.Y.Z` and commit
+`<commit>`. Replace both with your values.
 
-**verify-ci gate.** The `verify-ci` job requires the five lane aggregators,
+### Before you start
+
+- You start each promotion run in steps 6 and 7, and a second person on the
+  approver list in `promote.yml` approves it. The workflow does not let you
+  approve your own run.
+- Make sure that the repository secrets `AUR_SSH_PRIVATE_KEY` and
+  `BREW_TAP_TOKEN` exist, and that the `gominimal/homebrew-minimal` repository
+  exists, before you promote with `publish_packages=true`. No check reads
+  them before that. If one is missing, its publish job fails.
+- A version number is permanent. After step 4 stages `X.Y.Z`, that number
+  always means that build. To release a later fix, bump `package.version` in
+  a PR and cut the next version.
+
+### 1. Choose the commit and check the version
+
+Choose a `main` commit. These required checks must be green on it:
 `ci-success`, `ci-linux-native-success`, `ci-linux-kvm-success`,
-`ci-macos-success`, `ci-shell-installer-success` (the required checks on
-`main`; see [docs/ci-strategy.md](../ci-strategy.md)), to have reported
-success on the exact commit being released. `skip_ci_verify` is an admin
-override for green-but-unreported commits.
+`ci-macos-success`, and `ci-shell-installer-success`. A commit that a nightly
+run built and smoked meets this rule, because the nightly run makes the same
+check.
+
+The version comes from `package.version` in the root `Cargo.toml`. Check it
+at the commit:
+
+```sh
+git switch --detach <commit>
+just check-version
+```
+
+Do not push a `v*` tag. The promotion in step 6 creates the tag.
+
+### 2. Give the commit a branch
+
+GitHub starts a manual workflow run on a branch or a tag, not on a commit
+hash. Push a branch that points at the commit, even when the commit is the
+tip of `main`. A run on `main` builds the commit that `main` points at when
+the run starts, and `main` can move between steps 3 and 4.
+
+```sh
+git push origin <commit>:refs/heads/release/X.Y.Z
+```
+
+Nothing in the pipeline reads the branch name. The draft release and the tag
+point at the commit.
+
+### 3. Rehearse the release run
+
+```sh
+gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=true
+```
+
+A dry run builds, signs, packages, and smoke-tests everything. It uploads
+nothing and does not use up the version number. Wait for it to pass.
+
+### 4. Stage the release
+
+```sh
+gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=false
+```
+
+When the run passes, it did these things:
+
+- It staged `gs://minimal-one/versions/X.Y.Z/`. The folder is write-once.
+- It smoke-tested the artifacts and wrote `versions/X.Y.Z/smoked`, the record
+  that step 6 checks.
+- It created a draft GitHub Release `vX.Y.Z` with the notes and every
+  artifact attached. A draft has no tag.
+- It did not move any channel. `unstable` follows `main`, and only a
+  promotion points a channel at `X.Y.Z`.
+
+If the run fails after the staging job, fix the cause and run it again with
+`-f restage=true`. A restage deletes the smoke record first, so you cannot
+promote the version until its new smoke passes.
+
+### 5. Test the staged release
+
+Make sure that the smoke record exists:
+
+```sh
+curl -fsS https://storage.googleapis.com/minimal-one/versions/X.Y.Z/smoked
+```
+
+No channel points at the staged release, so write a private pointer to
+install it the way a user does. Any name made of `A-Za-z0-9._-` works. You
+need write access to the bucket, and anyone who knows the name can install
+from it. Delete the pointer when you finish.
+
+```sh
+scripts/set-channel.sh --channel rc --version X.Y.Z --bucket gs://minimal-one
+curl -fsSL https://storage.googleapis.com/minimal-one/versions/X.Y.Z/install.sh | sh -s -- rc
+gcloud storage rm gs://minimal-one/rc
+```
+
+### 6. Promote to stable
+
+Rehearse first. A dry-run promotion runs the approval step and the smoke
+check, and changes nothing:
+
+```sh
+gh workflow run promote.yml -f target=stable -f version=X.Y.Z -f dry_run=true
+```
+
+Then promote for real:
+
+```sh
+gh workflow run promote.yml -f target=stable -f version=X.Y.Z
+```
+
+The workflow opens an approval issue. The second person comments `approved`
+on it. Then the workflow does these things, in this order:
+
+1. It checks the smoke record against the staged files, and refuses the
+   version if they do not match.
+2. It moves `stable` to `X.Y.Z`. Users of the install script get the new
+   version from this point.
+3. It tells the docs site to rebuild from the release commit.
+4. It publishes the draft GitHub Release, which creates the `vX.Y.Z` tag and
+   marks the release Latest.
+
+The AUR and Homebrew packages do not change by default. The
+`publish_packages` input is off. You publish them in step 7.
+
+If the release publish job fails, fix the cause and use **Re-run failed jobs**
+on the same run.
+
+### 7. Publish the AUR and Homebrew packages
+
+Run the promotion again for the same version, with `publish_packages` on:
+
+```sh
+gh workflow run promote.yml -f target=stable -f version=X.Y.Z -f publish_packages=true
+```
+
+The run goes through approval and the smoke check again. It writes the
+`stable` pointer again, which changes nothing while `stable` points at
+`X.Y.Z`. The release is already public, so the release publish job checks
+that the `vX.Y.Z` tag is on the release commit and changes nothing. Then the
+run publishes the AUR package and the Homebrew formula. If a package job
+fails, fix the cause and use **Re-run failed jobs** on the same run.
+
+When both publishers work for a real release, publish the packages in step 6
+instead: add `-f publish_packages=true` to the promotion.
+
+If the workflow cannot publish the packages, run the two publishers by hand.
+You need the AUR key and the tap token. Run them from the tagged commit:
+
+```sh
+PKGVER=X.Y.Z AUR_SSH_PRIVATE_KEY="$(cat aur-key)" scripts/publish-aur.sh
+PKGVER=X.Y.Z BREW_TAP_REPO=https://github.com/gominimal/homebrew-minimal.git \
+  GITHUB_TOKEN=<tap token> scripts/publish-brew.sh
+```
+
+The AUR publisher needs `makepkg`, so run it on an Arch host or in an
+`archlinux:base-devel` container. Run each publisher with `--dry-run` first to
+read the diff that it pushes.
+
+### 8. Clean up
+
+Delete the branch from step 2:
+
+```sh
+git push origin --delete release/X.Y.Z
+```
+
+Also delete any private pointer that you wrote in step 5.
+
+### Roll back
+
+Run the promotion again with `target=stable` and an earlier version that has a
+smoke record. The promotion refuses a version without a smoke record. Choose
+your rollback version before you promote. Use `override_provenance=true` only
+in an emergency. The approval issue shows that you used it.
+
+Keep `publish_packages` off for a rollback. If it is on, the run publishes the
+earlier version to the AUR and Homebrew, which downgrades the users of those
+packages.
+
+## We test every artifact we release
+
+This is our policy. Every artifact that a user can install must pass a test
+of the exact bytes that we publish, before a channel points at them. The
+release run tests the artifacts it built, then records a hash of the staged
+manifest. The promotion checks that hash, so it moves a channel only to bytes
+that passed.
+
+The table shows what the pipeline tests today. A row that says **gap** does not
+meet the policy yet.
+
+| Artifact | How the release run tests it |
+| --- | --- |
+| Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
+| `minzoned` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-zoned-links.sh`](../../scripts/check-zoned-links.sh)) on the binary it built. The release workflow runs the gate again on every renamed and signed artifact before upload. On macOS it also checks the signature against the designated requirement that `min` uses. |
+| amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
+| arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
+| macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
+| Linux arm64 `min`, `minimald`, `minvmd`, `gvproxy-min` on a Linux host | **Gap.** No smoke job runs on a Linux arm64 host. |
+| Linux `mip`, amd64 and arm64 | **Gap.** `smoke-linux-kvm` downloads `mip`, but no job runs it. |
+| amd64 `.deb` | `smoke-linux-amd64` installs it and checks that `min -V` shows the release version. Versioned runs only. |
+| arm64 `.deb`, every `.rpm`, every `.apk` | **Gap.** No job installs them. |
+| `install.sh` and the AppArmor profile installer | The `ci-shell-installer` lane tests both scripts on each PR that changes them. **Gap:** no release job installs the staged folder through `install.sh`. |
+| Homebrew formula and AUR package | `just test-shell` tests the publish scripts against fixture remotes, and CI runs it. **Gap:** no job installs the published package. |
+| `completions.tar.gz` and the legacy `minimalone-<sha>.tar.zst` bundle | **Gap.** No job tests them. |
+
+## Pipeline reference
+
+### Staged folders and channels
+
+Each release run uploads one folder, `gs://minimal-one/versions/<version>/`.
+It holds the artifacts, a `components` manifest, a copy of `install.sh`, and
+the release notes as `notes.md`. A versioned release also has the packages in
+`pkg/`. Each manifest row gives one component, its OS and architecture, its
+SHA-256, and where it installs. The folder never changes after upload.
+
+A channel is a small file at the bucket root, such as
+`gs://minimal-one/stable`. It holds one version name.
+[`scripts/set-channel.sh`](../../scripts/set-channel.sh) writes it, after it
+makes sure that the version folder exists. To move a channel, or to roll it
+back, you write this file again. All bucket writes use GitHub OIDC and
+Workload Identity Federation.
+
+A release run makes a nightly build or a versioned release:
+
+| | Nightly build | Versioned release |
+| --- | --- | --- |
+| Folder name | Short commit hash, such as `versions/9b763dd5/` | Version number, such as `versions/0.6.0/` |
+| Started by | `nightly.yml` every day, or a manual run without `versioned` | A manual run with `versioned: true` |
+| Version the binaries report | `0.6.0-dev.70.g9b763dd5` | `0.6.0` |
+| GitHub Release | `release-<sha>`, deleted later by `prune-releases` | Draft `vX.Y.Z`, published in step 6 |
+| Git tag | None | `vX.Y.Z`, created in step 6 |
+| Packages (`.deb`, `.rpm`, `.apk`) | None | In `pkg/` and on the GitHub Release |
+| Stable promotion publishes | Nothing | GitHub Release, plus AUR and Homebrew with `publish_packages=true` |
+
+### release.yml: build, test, stage
+
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) starts
+from a manual run or from `nightly.yml`. Its inputs are `versioned`,
+`dry_run`, `skip_ci_verify`, and `restage`. A tag push starts nothing.
+
+**CI gate.** The `verify-ci` job requires the five required checks listed in
+step 1 of the release steps to be green on the exact commit. See
+[docs/ci-strategy.md](../ci-strategy.md). `skip_ci_verify` is an admin
+override for a commit whose checks are green but did not report.
+
+**Version.** The `version` crate sets the version string at build time
+([`crates/version/src/scheme.rs`](../../crates/version/src/scheme.rs)). When
+the build environment sets `MINIMAL_RELEASE_VERSION`, the binaries report
+that value, such as `0.6.0` in place of `0.6.0-dev.7.g<sha>`. The value
+must equal `package.version` in `Cargo.toml`. The build script enforces this,
+and [`scripts/assert-release-version.sh`](../../scripts/assert-release-version.sh)
+checks it for builds outside this pipeline.
+
+The `assert-version` job reads `package.version` for a versioned run. It
+refuses a version that already has a tag. It also runs
+[`scripts/next-version.sh --check`](../../scripts/next-version.sh), the same
+check that runs on every PR. That script reads the full commit messages since
+the last release tag. A `feat:` commit requires a minor bump. A breaking
+change under any type also requires a minor bump, and appears first in the
+notes. At 0.x it does not bump the major version. Anything else requires a
+patch. The same check runs as the
+workspace `package_version` test and as `just check-version`. It fails a PR
+whose `package.version` is stale or not above the newest `v*` tag.
 
 **Build jobs.**
 
-- `build-release-linux-{amd64,arm64}`: static musl builds of `mip`, `min`
-  (package `minimal`), `minimald`, and `minvmd`, one cargo invocation per
-  package so the fat-LTO links serialize. `minvmd` links a static `libkrun.a`
-  built from the vendored pin by the `build-libkrun-static-linux` composite
-  ([`scripts/build-libkrun-linux.sh`](../../scripts/build-libkrun-linux.sh)),
-  so it ships as a single self-contained binary with no `lib/` sibling, no
-  RUNPATH, and no glibc floor — and both arches ship it, where only amd64 had
-  a (dynamic) `minvmd` before. Each job asserts the result is `statically
-  linked` or `static-pie linked` (amd64 musl emits a static PIE, which
-  `file(1)` names differently) and really contains the KVM backend, since a
-  stub `minvmd` builds and links just as cleanly.
-- `build-release-macos-arm64` (self-hosted Apple Silicon, gated on the
-  `RUN_MACOS_CI` kill-switch): builds `minvmd` (libkrun /
-  Hypervisor.framework) and `min`, rewrites minvmd's libkrun linkage to
-  `@rpath` ([`scripts/rewrite-macos-linkage.sh`](../../scripts/rewrite-macos-linkage.sh)),
-  verifies `min` links only system libraries, and Developer-ID-signs both
-  (hardened runtime + timestamp, notarization-ready).
-- `build-libkrun-macos-arm64`: builds the trimmed `libkrun.1.dylib` shipped to
-  macOS users (same pinned build every macOS CI lane tests against) on a
-  hosted runner; `sign-macos-artifacts` re-signs it and the darwin `gvproxy`
-  with the Developer ID identity on the self-hosted runner.
-- `fetch-release-guest-artifacts`: guest kernel Image and ext4 rootfs (cache
-  pulls keyed by the pinned upstream commit) plus pin-verified `gvproxy`
-  binaries, for both guest arches.
-- `build-release-initramfs`: packs the guest initramfs (minimald as pid-1)
-  from the same shipped musl `minimald` binaries.
-- `compute-version-string`: reads the version out of a built binary so the
-  GitHub Release name matches `minimald -V` exactly.
+- `build-release-linux-{amd64,arm64}` builds static musl binaries of `mip`,
+  `min` (package `minimal`), `minimald`, and `minvmd`. Each package has its
+  own cargo command, so the LTO links run one after another. `minvmd`
+  links a static `libkrun.a` from the vendored pin
+  ([`scripts/build-libkrun-linux.sh`](../../scripts/build-libkrun-linux.sh)).
+  The result is one binary with no `lib/` folder and no glibc requirement.
+  The job checks that each binary is static and that `minvmd` contains the
+  KVM backend.
+- `build-release-macos-arm64` runs on the self-hosted Apple Silicon runner
+  when `RUN_MACOS_CI` is not `false`. It builds `minvmd`, `min`, and
+  `minzoned`, changes the libkrun link path in `minvmd` to `@rpath`
+  ([`scripts/rewrite-macos-linkage.sh`](../../scripts/rewrite-macos-linkage.sh)),
+  and checks that `min` and `minzoned` link only system libraries. It
+  signs `minvmd`, `min`, and `minzoned` with the Developer ID, the
+  hardened runtime, and a timestamp. Then it notarizes all of them. See the
+  **Notarization** paragraph below.
+- `build-libkrun-macos-arm64` builds the `libkrun.1.dylib` for macOS users on
+  a hosted runner. `sign-macos-artifacts` signs it and the macOS `gvproxy`
+  with the Developer ID on the self-hosted runner.
+- `fetch-release-guest-artifacts` gets the guest kernel and the ext4 rootfs
+  from the cache, and the pinned `gvproxy` binaries, for both guest
+  architectures.
+- `build-release-initramfs` packs the guest initramfs, with the release
+  `minimald` as process 1.
+- `compute-version-string` reads the version from a built binary. The GitHub
+  Release name uses it. On a versioned run, the job checks that it equals the
+  release version.
 
-**release job.** Downloads everything, generates shell completions for `mip`,
-`min`, and `minimald`, then:
+**minzoned.** Every release that publishes `min` must also publish the
+box-zone answerer binary. The session-start advisory (NET-122) copies it
+into a root-owned host-service path. The scripts in this repository do their
+half of the work:
 
-- uploads a legacy `minimalone-<sha>.tar.zst` bundle to
-  `gs://minimal-shim/archives/`, retained for backward compatibility with
-  the legacy `minimal-shim` archive path;
-- creates the GitHub Release (tag `release-<sha>`, or the pushed `v*` tag; a
-  suffixed tag becomes a prerelease) with all binaries, guest artifacts, and
-  `completions.tar.gz`.
+- [`scripts/dist-build.sh`](../../scripts/dist-build.sh) builds `minzoned`
+  in its own cargo invocation. A build beside `-p minvmd` or a `--workspace`
+  build unifies the KVM backend into the binary, and a root host service must
+  never contain it. The script then runs the link gate
+  ([`scripts/check-zoned-links.sh`](../../scripts/check-zoned-links.sh))
+  on the binary. Every library must resolve from a system directory. The
+  binary must have no embedded search path, and its interpreter must be a
+  system loader. If the gate fails, the build fails.
+- [`scripts/stage-release.sh`](../../scripts/stage-release.sh) stages
+  `bin/minzoned` beside `bin/min` on every platform that has `min`. The
+  staged copy is only the source that the advisory copies. No unit file and
+  no `launchd` property list refers to it at its user-writable path.
+- [`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) and
+  [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) put
+  `/usr/bin/minzoned` in every `.deb`, `.rpm`, and `.apk`. The packages
+  do not install a service. The advisory's privileged command is the only
+  privileged step.
+- [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
+  and replaces it on upgrade, like every other `bin` row.
 
-**stage-installer job** (skipped entirely on `dry_run`):
+*Still optional in the scripts.* The release workflow uploads `minzoned`
+on every platform, but `stage-release.sh` and `package-nfpm.sh` still accept
+a missing `minzoned` artifact with a warning that names the omitted row.
+They stage or package all other artifacts. A release staged without it gives
+no `minzoned` to the host. The advisory then shows the state `this release
+ships no minzoned; the answerer service step is unavailable` and does not
+offer the step. Both optional lists go after a release publishes the
+artifact on every platform.
 
-- [`scripts/stage-release.sh`](../../scripts/stage-release.sh) uploads the
-  artifacts and a `components` manifest (one row per component/os/arch with
-  its SHA-256, kind, and install destination: the authoritative per-platform
-  component list) to immutable `gs://minimal-one/versions/<short-sha>/`;
-- a version-pinned copy of [`scripts/install.sh`](../../scripts/install.sh)
-  is uploaded next to them, so each version's install path is self-contained;
-- [`scripts/set-channel.sh`](../../scripts/set-channel.sh) points the
-  `unstable` channel at the new version. `unstable` auto-advances on every
-  release: no gate.
+*Identity model.* Each check runs where it has meaning:
 
-## nightly.yml: daily cut + smoke + nightly channel
+- **The release proves link-cleanliness.** The link gate runs on the binary
+  that `dist-build.sh` built. The release workflow runs it again on every signed
+  and renamed artifact, as the last check before upload. The uploaded bytes
+  are then the bytes that the gate checked. The user's machine does not run
+  the gate.
+- **The user side checks identity.** The source is beside `min` in a prefix
+  that its user can write, so each user-side check is only a pre-check. On
+  macOS, the advisory runs `codesign --verify --strict -R` with the Developer
+  ID designated requirement. The requirement names Apple's Developer ID chain,
+  the team in `subject.OU`, and the signing identifier.
+- The release build of `min` gets the team ID and the identifier at compile
+  time, from `MINIMAL_ZONED_TEAMID` and `MINIMAL_ZONED_IDENTIFIER`.
+  Without them, a release `min` does not offer the step, and it gives the
+  reason `this build carries no signing identity`. It never falls back to
+  `codesign --strict` alone, because any ad-hoc signature passes that check.
+  Debug and test builds skip the check.
+- On both operating systems, the advisory then pins the SHA-256 of the bytes
+  that it checked.
+- **The privileged step checks the root-owned copy again** (design §7.1,
+  post-install custody). The rendered root command examines the destination
+  directory and each parent directory up to `/`. It stops at the first one
+  that is not owned by root, that group or others can write to, or that has
+  the sticky bit. The message names that directory. Without this check, a
+  user can rename a directory on the path between the check and the rename.
+  Both destinations pass on a stock host: `/Library/PrivilegedHelperTools` on
+  macOS and `/usr/local/lib/minimal` on Linux. The command then runs
+  `install` to an exclusive `mktemp` name in that directory and hashes the
+  copy. If the hash is different, it removes the copy and exits with both
+  hashes in the message. On macOS it runs the `codesign -R` check on the copy
+  again. Then it renames the copy into place. Only after that does it write
+  the unit or property list that names the copy.
 
-[`.github/workflows/nightly.yml`](../../.github/workflows/nightly.yml) runs at
-10:00 UTC. A `check` job skips the rebuild when HEAD is already staged (public
-HEAD request on the version's `components` manifest), then invokes release.yml
-via `workflow_call`. Three smoke jobs run the shared session e2e
-([`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)) against the
-**shipped** artifacts (native Linux daemon, Linux + KVM microVM, and the
-signed macOS binaries assembled in the installer layout), feeding a
-skip-tolerant `smoke-success` aggregator. Only then does `promote-nightly`
-flip the `nightly` pointer via set-channel.sh. `nightly-tests.yml` is the
-separate 06:00 UTC nightly *test* tier, unrelated to releasing; see
-[docs/ci-strategy.md](../ci-strategy.md).
+The release workflow
+([`.github/workflows/release.yml`](../../.github/workflows/release.yml))
+handles `minzoned` with the same steps that the other binaries have:
 
-## promote.yml: gated promotion to stable
+- `build-release-linux-{amd64,arm64}`: the shared entry point builds and
+  link-gates `minzoned` already. The rename step adds
+  `mv minzoned minzoned-linux-<arch>`. A new step runs the link gate
+  on the renamed file, and one `upload-artifact` step uploads it.
+- `build-release-macos-arm64`: the job's `env` gets
+  `MINIMAL_ZONED_TEAMID` and `MINIMAL_ZONED_IDENTIFIER`, so the `min`
+  that it builds has the signing identity. The job builds `minzoned` in
+  its own invocation, link-gates it, and renames it to
+  `minzoned-macos-arm64`.
+- The job signs it with the Developer ID, the hardened runtime, a timestamp,
+  and `--identifier "$MINIMAL_ZONED_IDENTIFIER"`. The signature has no
+  entitlements, unlike the `minvmd` signature. There is no hypervisor
+  entitlement, no `disable-library-validation`, no
+  `allow-dyld-environment-variables`, and no JIT. The job then checks the
+  signature with the designated requirement that `min` uses.
+- After the signature check, the link gate runs again on the signed
+  artifact, and the job uploads it.
+- The job notarizes `minzoned` with the other macOS binaries. See
+  the **Notarization** paragraph below.
+- The release job and the stage-installer job stay the same. They collect
+  artifacts by the platform-suffixed names, so the new names go into the
+  GitHub Release, the `components` manifest, and the packages. The SHA-256
+  columns of the manifest are the checksums.
 
-[`.github/workflows/promote.yml`](../../.github/workflows/promote.yml)
-(workflow name `promote-cli`) is the manual path that moves the `stable` (or
-`unstable`) pointer. Inputs: `sha` (defaults to the latest staged version in
-the bucket), `target`, `dry_run`, `override_provenance`. The `gate` job opens a
-promotion-approval GitHub issue, notifies Slack, and polls until someone on the
-workflow's approver allowlist (the initiating user is excluded) comments
-`approved` / `denied`; closing the issue without approval counts as denial.
+This section does not close these residuals:
 
-**nightly-provenance gate.** Before flipping the pointer, the `promote` job
-runs [`scripts/verify-nightly-provenance.sh --sha "$SHA"`](../../scripts/verify-nightly-provenance.sh),
-which queries GitHub Actions to confirm the version was built by a successful
-`nightly.yml` run whose Linux smoke jobs actually ran and passed (the
-skip-tolerant `smoke-success` aggregator alone is not trusted, so a no-op
-nightly run that skipped its smokes cannot vouch for a SHA; `smoke-macos` may
-be skipped by the `RUN_MACOS_CI` kill-switch). This rejects manually
-dispatched release.yml runs and tag-push builds. Staging a version does not
-make it promotable. The `override_provenance`
-emergency input bypasses this gate when checked; use it only for documented
-emergency releases that skip the nightly path.
+- A shell-installer install on Linux, into the user's prefix, has no
+  signature. The privileged step accepts the copy only up to the hash pin.
+  That limit is inside the single-operator premise of design §7.1.
+- A `.deb` or `.rpm` install copies from the root-owned `/usr/bin`. That
+  closes the residual on packaged hosts.
+- `answerer_survives_session_stop` is the e2e proof that the installed
+  answerer service continues after a session stops. It installs a root-run
+  unit, and no macOS lane can run `sudo` without a password.
+  [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh) skips it there. A
+  privileged macOS e2e runner is still necessary for that proof.
 
-The `promote` job then runs set-channel.sh, which verifies the version is
-actually staged before flipping the pointer. Finally it dispatches a
-`reference-docs-promoted` repository event that triggers a rebuild of the
-published reference docs at docs.minimal.dev.
+**Notarization.** After the signature checks and the last link gate,
+`build-release-macos-arm64` sends `min`, `minvmd`, and `minzoned` to
+the Apple notary service before it uploads them. The step puts each binary
+in a zip made with `ditto`, because `notarytool` does not take a bare
+Mach-O file. It runs `xcrun notarytool submit --wait` on each zip. The
+release fails unless each result is `Accepted`. On any other result, the
+step prints the notary log for that submission. Notarization does not
+change the file, so the job uploads the same signed bytes.
 
-## prune-releases.yml: GitHub Release housekeeping
+The job does not staple. The release publishes each binary as a bare Mach-O
+file, and `stapler` can attach a ticket only to an app bundle, a `.pkg`, or
+a `.dmg`. Gatekeeper gets the ticket from Apple online when it checks a
+binary.
+
+The step needs two things that the workflow cannot set up:
+
+- A `notarytool` keychain profile in the signing keychain
+  (`minimal-signing.keychain-db`) on the self-hosted macOS runner. Create it
+  as the runner user with
+  `xcrun notarytool store-credentials <profile> --keychain
+  ~/Library/Keychains/minimal-signing.keychain-db`. Give it an App Store
+  Connect API key (`--key`, `--key-id`, `--issuer`), or an Apple ID with an
+  app-specific password and team `3G47C5HY64`. The step unlocks the keychain
+  with the `KC_PW` secret, as the signing steps do.
+- The repository variable `MACOS_NOTARY_PROFILE`, set to the profile name.
+  If the variable is empty, the step fails before it submits anything.
+
+`libkrun.1.dylib` and the macOS `gvproxy`, which `sign-macos-artifacts`
+signs, are not notarized.
+
+**release job.** This job downloads all build outputs. It writes the release
+notes with `scripts/next-version.sh --notes` and generates shell completions
+for `mip`, `min`, and `minimald`. On a versioned run it builds the `.deb`,
+`.rpm`, and `.apk` for both Linux architectures from the same binaries
+([`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh)). Then it does
+two things:
+
+- It uploads the legacy `minimalone-<sha>.tar.zst` bundle to
+  `gs://minimal-shim/archives/` for the old `minimal-shim` install path.
+- It creates the GitHub Release with the notes, the binaries, the guest
+  artifacts, `completions.tar.gz`, and the packages. A nightly build gets
+  `release-<sha>`. A versioned run gets a draft `vX.Y.Z` that points at the
+  commit. A version with a `-` suffix is a prerelease.
+
+**stage-installer job.** A dry run skips this job.
+[`scripts/stage-release.sh`](../../scripts/stage-release.sh) uploads the
+version folder. It refuses to start if the folder already has a `components`
+manifest, and every upload uses `--if-generation-match=0`, so no upload can
+replace a file. The `restage` input turns this off for one run. It deletes
+the `smoked` record first, so the folder needs a new smoke before anyone
+can promote it.
+
+**Smoke jobs.** The smoke jobs run the session e2e
+([`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)) against the release
+artifacts. `smoke-linux-amd64` uses the host daemon, `smoke-linux-kvm` uses a
+KVM microVM, and `smoke-macos` uses the signed macOS files in the installer
+layout. On a versioned run, `smoke-linux-amd64` also installs the amd64
+`.deb`. The smokes also run on a dry run. The section on artifact tests above
+lists what they do not cover.
+
+**record-smoked job.** After the smokes and the staging pass,
+[`scripts/record-smoked.sh`](../../scripts/record-smoked.sh) writes
+`versions/<version>/smoked`. The file holds the SHA-256 of the staged
+`components` manifest, the commit, and the run URL. The promotion compares
+this hash with the live manifest, so a folder that someone stages again does
+not keep an old result. For a nightly or plain build, `set-channel.sh` then
+moves `unstable` to the version, with no approval. A versioned build does not
+move `unstable`.
+
+### nightly.yml: the daily build
+
+[`.github/workflows/nightly.yml`](../../.github/workflows/nightly.yml) starts
+at 10:00 UTC. Its `check` job skips the build when the current `main` commit
+already has a staged folder. Otherwise it calls `release.yml`, which builds,
+stages, and smoke-tests as described in the release.yml section. If that
+passes, or the build had nothing to do, `promote-nightly` checks the smoke
+record with `verify-smoked.sh` and moves the `nightly` channel. A night with
+nothing to build cannot move `nightly` to a folder that failed its smoke.
+
+`nightly-tests.yml` at 06:00 UTC is a separate test run. It releases nothing.
+See [docs/ci-strategy.md](../ci-strategy.md).
+
+### promote.yml: move a channel
+
+[`.github/workflows/promote.yml`](../../.github/workflows/promote.yml), named
+`promote-cli` in the Actions list, moves `stable` or `unstable`. Its inputs are
+`version`, `target`, `dry_run`, `override_provenance`, and `publish_packages`. `version` is a
+version number or a nightly commit hash. When you leave it empty, the
+workflow uses the newest staged nightly build.
+
+**Approval.** The `gate` job opens an approval issue, posts to Slack, and
+waits. A person on the approver list, other than the person who started the
+run, comments `approved` or `denied`. If someone closes the issue without an
+approval, the workflow stops.
+
+**Smoke check.** The `promote` job runs
+[`scripts/verify-smoked.sh`](../../scripts/verify-smoked.sh). It compares the
+hash in the `smoked` record with a new hash of the live `components` manifest.
+A version with no record fails. A folder that someone staged again after its
+smoke also fails. `override_provenance` skips this check in an emergency, and the
+approval issue shows that choice.
+
+**Channel move and docs.** `set-channel.sh` moves the channel. The job then
+sends a `reference-docs-promoted` event to `gominimal/webapp` with the release
+commit, and the docs site at docs.minimal.dev rebuilds from that commit.
+
+### publish-packages.yml: publish a stable release
+
+A `stable` promotion that is not a dry run calls
+[`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml).
+The AUR and Homebrew jobs run only with `publish_packages=true`.
+
+- `publish-release` publishes the draft `vX.Y.Z`. Publication creates the tag
+  on the release commit. It does not start a build. The job fails if the
+  release does not exist. If the release is already public, the job changes
+  nothing, but it fails if the `vX.Y.Z` tag is missing or is not on the
+  release commit. For a nightly commit hash, it prints a notice and does
+  nothing.
+- `publish-aur` publishes `minimal-bin` to the AUR from the staged folder.
+- `publish-brew` updates the formula in `gominimal/homebrew-minimal` from the
+  GitHub Release.
+
+A prerelease, such as `0.6.0-rc1`, gets a public GitHub Release but no AUR
+or Homebrew update. Neither can hold a prerelease. The `apt`, `dnf`, and `apk`
+repositories come from the `pkg/` folder, and the infra repository builds them.
+
+### prune-releases.yml: delete old nightly releases
 
 [`.github/workflows/prune-releases.yml`](../../.github/workflows/prune-releases.yml)
-runs at 04:17 UTC on Mondays and Fridays (plus manual dispatch, which defaults
-to a dry-run preview) and deletes auto-cut `release-<sha>` GitHub Releases and
-their tags once they age out (default: older than 2 months, always keeping the
-10 newest). The logic lives in
-[`scripts/prune-releases.sh`](../../scripts/prune-releases.sh); exact
-`vMAJOR.MINOR.PATCH` releases are never deleted (hard guard), and the
-installer serves from GCS, so pruning removes redundant copies, not live
-install targets.
+starts at 04:17 UTC on Mondays and Fridays. A manual run defaults to a
+preview. It deletes `release-<sha>` GitHub Releases and their tags after two
+months, and it always keeps the newest ten. The logic is in
+[`scripts/prune-releases.sh`](../../scripts/prune-releases.sh). It never
+deletes a `vX.Y.Z` release. The installer reads from the bucket, so pruning
+does not remove anything that users install.
 
-## install.sh: channel → version → components
+### install.sh: from channel to installed files
 
-[`scripts/install.sh`](../../scripts/install.sh) is the strict-POSIX `curl |
-sh` installer. Against `https://storage.googleapis.com/minimal-one` it fetches
-the channel pointer (default `stable`; the per-channel endpoints under
-`go.minimal.dev/<channel>` serve this same script with a
-`MINIMAL_INSTALL_TARGET_OVERRIDE=<channel>` line injected to pin the target),
-resolves the version, fetches the
-immutable `versions/<version>/components` manifest (refusing an unknown
-`# format:` header), and for each row matching the host os/arch downloads,
-SHA-256-verifies, and atomically installs the file. The on-disk hash is the
-skip oracle, so reruns only touch changed components, and a running daemon is
-stopped before an executable is swapped. Per-platform sets (from
-stage-release.sh's `COMPONENTS` table): Linux amd64/arm64 get `bin/min`,
-`bin/mip`, `bin/minimald`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min`
-symlink, the guest payload (`data/{vmlinuz,rootfs.img,initramfs.cpio}`), and the
-AppArmor profile/tunable/loader under `data/`; macOS arm64 gets `bin/min`,
-`bin/minvmd`, `bin/gvproxy-min`, `lib/libkrun.1.dylib`, the `git-remote-min`
-symlink, and the same guest payload. Only macOS carries a `lib/` component:
-the Linux `minvmd` links libkrun statically.
-It also wires shell integration (PATH init files, `min` completions, one
-marker-fenced rc block). `--uninstall` reverses all of it offline from the
-local install record, keeping user-modified files unless `--force`;
-`--purge` also removes the data/state/cache trees.
+[`scripts/install.sh`](../../scripts/install.sh) is the `curl | sh`
+installer, in strict POSIX `sh`. It works in these steps:
 
-## Runbook
+1. It reads the channel file from `https://storage.googleapis.com/minimal-one`.
+   The default channel is `stable`. `go.minimal.dev/<channel>` serves the
+   same script with a `MINIMAL_INSTALL_TARGET_OVERRIDE=<channel>` line added.
+2. It downloads `versions/<version>/components`. It refuses a manifest with an
+   unknown `# format:` header.
+3. For each row that matches the host OS and architecture, it downloads the
+   file, checks its SHA-256, and moves it into place. A file whose hash on
+   disk already matches stays as it is. The installer stops a running daemon
+   before it replaces an executable.
 
-**Cut a release.**
+The components come from the `COMPONENTS` table in `stage-release.sh`:
 
-1. Pick a `main` commit whose five lane aggregators are green.
-2. Actions → *Release* → Run workflow (use `dry_run` to rehearse), or push a
-   `vX.Y.Z` tag for a versioned GitHub Release.
-3. The run stages `gs://minimal-one/versions/<short-sha>/` and auto-points
-   `unstable` at it. Nightly runs do the same for `nightly` after smoke.
+- Linux amd64 and arm64: `bin/min`, `bin/minzoned`, `bin/mip`,
+  `bin/minimald`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min` symlink,
+  the guest files (`data/vmlinuz`, `data/rootfs.img`, `data/initramfs.cpio`),
+  and the AppArmor profile, tunable, and loader under `data/`.
+- macOS arm64: `bin/min`, `bin/minzoned`, `bin/minvmd`,
+  `bin/gvproxy-min`, `lib/libkrun.1.dylib`, the `git-remote-min` symlink, and
+  the same guest files. Only macOS has a `lib/` folder, because the Linux
+  `minvmd` links libkrun statically.
 
-**Promote to stable.**
+`bin/minzoned` is the box-zone answerer binary that the session-start
+advisory copies into its root-owned service path. The installer puts it
+beside `min`, and nothing else refers to it there. Manifest rows write no
+unit file and no `launchd` property list. None of them names the root-owned
+service path that the advisory's privileged command creates.
 
-1. **Verify the SHA was nightly-built.** The promote workflow rejects versions
-   not built and smoke-tested by `nightly.yml`: manually dispatched or
-   tag-staged SHAs fail the provenance gate after the multi-hour approval
-   completes, even if a later no-op nightly run carries the same SHA. If you
-   need to promote a non-nightly version in an emergency, check
-   `override_provenance` when dispatching.
-2. Actions → *promote-cli* → Run workflow with `target: stable` (optionally a
-   specific staged `sha`; empty means the latest staged).
-3. A second person from the approver allowlist comments `approved` on the
-   auto-opened issue (the initiator cannot self-approve).
-4. The provenance check runs, then set-channel.sh flips the `stable` pointer.
-   Rollback is the same workflow pointed at a previously staged version.
+The installer also adds shell setup: PATH init files, `min` completions, and
+one marked block in the shell rc file. `--uninstall` removes all of it with no
+network access, from the local install record. It keeps files that you
+changed unless you add `--force`. `--purge` also deletes the data, state, and
+cache folders.

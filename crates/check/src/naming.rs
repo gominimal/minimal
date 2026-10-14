@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use anyhow::anyhow;
+
 use super::Error;
 use crate::{CheckCtx, CheckResult, CheckVerdict};
 use graph::{BuildOutput, Graph};
@@ -243,12 +245,16 @@ impl crate::GraphBasedChecker for EnumerateBins {
 
             let mut collected_bins = std::fs::read_dir(&bins_dir)
                 .map_err(|e| Error::IO("listing bins", bins_dir.clone(), e))?
-                .map(|e| match e {
-                    Err(e) => Err(e),
-                    Ok(e) => Ok(e.file_name().to_str().unwrap().to_string()),
+                .map(|e| {
+                    let entry = e.map_err(|e| Error::IO("stat binary", bins_dir.clone(), e))?;
+                    entry.file_name().into_string().map_err(|name| {
+                        Error::Other(anyhow!(
+                            "binary name is not valid UTF-8: {}",
+                            name.to_string_lossy()
+                        ))
+                    })
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| Error::IO("stat binary", bins_dir, e))?;
+                .collect::<Result<Vec<String>, Error>>()?;
 
             let has_bins_wildcard = build.outputs.iter().any(|o| {
                 matches!(o.1, BuildOutput::Binary { glob, allow_missing_interpreter: _ }

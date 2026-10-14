@@ -1601,7 +1601,7 @@ mod tests {
 /// and why these proofs exist.
 ///
 /// Run: `cargo kani -p sessions` (or `just kani`). Kani pinned at
-/// 0.67.0 in CI.
+/// 0.68.0 in CI.
 #[cfg(kani)]
 mod kani_proofs {
     use super::PathDecision::{self, Allowed, Denied, Ignored, NeedsApproval};

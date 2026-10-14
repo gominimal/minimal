@@ -347,45 +347,54 @@ fn pgraph_copy_subset(
 
     let mut cpy = DiGraph::new();
     let mut copied_nodes = HashMap::new();
-    for nd in node_indices.iter() {
-        if let Some(NodeData::BuildSpec(bsr)) = pgraph.node_weight(*nd) {
-            let state = TraversalState { depth: 0 };
-            pgraph_copy_subset_for_node(
-                graph,
-                pgraph,
-                args,
-                *nd,
-                bsr,
-                &state,
-                &mut cpy,
-                &mut copied_nodes,
-            );
+    {
+        let mut ctx = SubsetCtx {
+            graph,
+            pgraph,
+            args,
+            cpy: &mut cpy,
+            copied_nodes: &mut copied_nodes,
+        };
+        for nd in node_indices.iter() {
+            if let Some(NodeData::BuildSpec(bsr)) = pgraph.node_weight(*nd) {
+                let state = TraversalState { depth: 0 };
+                pgraph_copy_subset_for_node(&mut ctx, *nd, bsr, &state);
+            }
         }
     }
     Ok(cpy)
 }
 
+/// The walk's fixed inputs and outputs, threaded through every recursive visit
+/// so each call names only the node it is on: the source graph, the CLI
+/// constraints, and the copy being built.
+struct SubsetCtx<'a> {
+    graph: &'a Graph,
+    pgraph: &'a DiGraph<NodeData, EdgeData>,
+    args: &'a PkgDepArgs,
+    cpy: &'a mut DiGraph<NodeData, EdgeData>,
+    copied_nodes: &'a mut HashMap<NodeData, NodeIndex>,
+}
+
 /// Recursive function for traversing the graph and collecting (copying) nodes
 /// and edges that match the criteria given in the CLI args.  Resulting petgraph
 /// is the mutabe cpy output parameter.
-#[allow(clippy::too_many_arguments)]
 fn pgraph_copy_subset_for_node(
-    graph: &Graph,
-    pgraph: &DiGraph<NodeData, EdgeData>,
-    args: &PkgDepArgs,
+    ctx: &mut SubsetCtx<'_>,
     node_index: NodeIndex,
     bsr: &BuildSpecRef,
     state: &TraversalState,
-    cpy: &mut DiGraph<NodeData, EdgeData>,
-    copied_nodes: &mut HashMap<NodeData, NodeIndex>,
 ) {
+    let graph = ctx.graph;
+    let pgraph = ctx.pgraph;
+    let args = ctx.args;
     let bs = graph.get(bsr).unwrap();
     if matches!(args.excludes, Some(ref strs) if strs.contains(&bs.name)) {
         return;
     }
     let node_data = pgraph[node_index].clone();
 
-    let (cpy_node_index, _) = add_uniq_node(cpy, copied_nodes, node_data);
+    let (cpy_node_index, _) = add_uniq_node(ctx.cpy, ctx.copied_nodes, node_data);
 
     let edges = pgraph.edges_directed(node_index, Direction::Outgoing);
     for e in edges {
@@ -414,20 +423,17 @@ fn pgraph_copy_subset_for_node(
                                 .is_some_and(|names| names.contains(&target_data_bsname))
                         {
                             let (cpy_target, already_exists) =
-                                add_uniq_node(cpy, copied_nodes, target_data.clone());
-                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                                add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                            ctx.cpy
+                                .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                             if !already_exists {
                                 pgraph_copy_subset_for_node(
-                                    graph,
-                                    pgraph,
-                                    args,
+                                    ctx,
                                     target,
                                     target_bsr,
                                     &TraversalState {
                                         depth: state.depth + 1,
                                     },
-                                    cpy,
-                                    copied_nodes,
                                 );
                             }
                         }
@@ -439,15 +445,17 @@ fn pgraph_copy_subset_for_node(
                     } => {
                         if args.local_deps {
                             let (cpy_target, _) =
-                                add_uniq_node(cpy, copied_nodes, target_data.clone());
-                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                                add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                            ctx.cpy
+                                .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                         }
                     }
                     NodeData::Source(SourceNode { url, sha256 }) => {
                         if args.source_deps {
                             let (cpy_target, _) =
-                                add_uniq_node(cpy, copied_nodes, target_data.clone());
-                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                                add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                            ctx.cpy
+                                .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                         }
                     }
                     _ => panic!("Unexpected input dep target node type"),
@@ -468,20 +476,17 @@ fn pgraph_copy_subset_for_node(
                             .is_some_and(|names| names.contains(&target_data_bsname))
                         {
                             let (cpy_target, already_exists) =
-                                add_uniq_node(cpy, copied_nodes, target_data.clone());
-                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                                add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                            ctx.cpy
+                                .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                             if !already_exists {
                                 pgraph_copy_subset_for_node(
-                                    graph,
-                                    pgraph,
-                                    args,
+                                    ctx,
                                     target,
                                     target_bsr,
                                     &TraversalState {
                                         depth: state.depth + 1,
                                     },
-                                    cpy,
-                                    copied_nodes,
                                 );
                             }
                         }
@@ -493,8 +498,9 @@ fn pgraph_copy_subset_for_node(
                 NodeData::BuildSpec(target_bsr) => {
                     if args.bootstrap {
                         let (cpy_target, already_exists) =
-                            add_uniq_node(cpy, copied_nodes, target_data.clone());
-                        cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                            add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                        ctx.cpy
+                            .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                     }
                 }
                 _ => panic!("Unexpected input dep target node type"),
@@ -503,8 +509,9 @@ fn pgraph_copy_subset_for_node(
                 NodeData::Need(name) => {
                     if args.needs {
                         let (cpy_target, already_exists) =
-                            add_uniq_node(cpy, copied_nodes, target_data.clone());
-                        cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                            add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                        ctx.cpy
+                            .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                     }
                 }
                 _ => panic!("Unexpected input dep target node type"),
@@ -513,8 +520,9 @@ fn pgraph_copy_subset_for_node(
                 NodeData::Need(name) => {
                     if args.provides {
                         let (cpy_target, already_exists) =
-                            add_uniq_node(cpy, copied_nodes, target_data.clone());
-                        cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                            add_uniq_node(ctx.cpy, ctx.copied_nodes, target_data.clone());
+                        ctx.cpy
+                            .add_edge(cpy_node_index, cpy_target, edge_data.clone());
                     }
                 }
                 _ => panic!("Unexpected input dep target node type"),

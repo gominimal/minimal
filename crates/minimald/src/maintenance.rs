@@ -12,7 +12,9 @@
 //! that reclaims gigabytes inside the VM reclaims nothing the user can see on
 //! their disk. So every clean that ran is followed by an `FITRIM`
 //! ([`guest::trim_state_volume`](crate::guest::trim_state_volume)), which is
-//! what actually punches the freed extents out of the image.
+//! what actually punches the freed extents out of the image. Blocks the
+//! sessions themselves free between cleans would otherwise wait out the whole
+//! [`CLEAN_INTERVAL`], so the trim also runs alone every [`TRIM_INTERVAL`].
 //!
 //! Cleaning is an actor, not a bare timer, because there is more than one way
 //! to ask for one: the periodic tick, and anything that wants a clean *now*.
@@ -50,6 +52,13 @@ const STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
 /// being followed by a redundant one.
 const CLEAN_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// How often the state volume is trimmed independently of the cache clean.
+/// The clean runs every [`CLEAN_INTERVAL`] (6 hours), but freed extents should
+/// be returned to the host promptly — a trim that only follows a clean strands
+/// space for hours. This timer fires a standalone trim on a short cadence so
+/// the backing image shrinks as soon as the filesystem frees blocks.
+const TRIM_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// How long a cache entry must have gone unread before it is reclaimed. Packages
 /// needed by sessions are retained separately.
 const UNUSED_FOR: Duration = Duration::from_secs(5 * 24 * 60 * 60);
@@ -81,6 +90,9 @@ struct Maintenance {
     receiver: mpsc::Receiver<MaintenanceMessage>,
     /// The server shutdown token; ends the loop between cleans.
     shutdown: CancellationToken,
+    /// How many times the standalone trim arm has fired, for the timer test.
+    #[cfg(test)]
+    standalone_trims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Maintenance {
@@ -91,6 +103,7 @@ impl Maintenance {
     /// here needs a lock.
     async fn mainloop(mut self) {
         let mut next_tick = Instant::now() + STARTUP_DELAY;
+        let mut next_trim = Instant::now() + TRIM_INTERVAL;
         loop {
             // A pending shutdown wins over a due clean (`biased`), so the loop
             // never starts one it would have to be aborted out of.
@@ -104,26 +117,51 @@ impl Maintenance {
                     None => break,
                     Some(MaintenanceMessage::CleanNow { older_than, events, responder }) => {
                         let older_than = older_than.unwrap_or(UNUSED_FOR);
-                        let report = clean(&self.state, older_than, events).await;
+                        // A clean is daemon-internal work: give it a span of its own, so the
+                        // session-manager messages it sends (List, then GetSession per active
+                        // session) are its children instead of a root trace each.
+                        let report = tracing::Instrument::instrument(
+                            clean(&self.state, older_than, events),
+                            tracing::info_span!("maintenance.clean", trigger = "request"),
+                        )
+                        .await;
                         // The trim finishes before the caller is answered: a
                         // reply means the whole reclaim is done, on the host's
                         // disk as well as inside the guest. Answering early
                         // would have `mip cache clean` return while the space
                         // it reported is still not back, which is the one
-                        // question the caller is asking.
-                        if report.is_ok() {
-                            trim_state_volume_if_mounted(&self.state).await;
-                        }
+                        // question the caller is asking. The trim runs even
+                        // when the clean failed, so a failed sweep does not
+                        // strand the extents earlier work already freed.
+                        trim_state_volume_if_mounted(&self.state).await;
                         responder.handle(std::future::ready(report)).await;
                         next_tick = Instant::now() + CLEAN_INTERVAL;
+                        // The clean just trimmed; reset the standalone trim
+                        // timer so it does not fire right after.
+                        next_trim = Instant::now() + TRIM_INTERVAL;
                     }
                 },
                 () = tokio::time::sleep_until(next_tick) => {
                     // Nobody is waiting on this one; `clean` logged the outcome.
-                    if clean(&self.state, UNUSED_FOR, None).await.is_ok() {
-                        trim_state_volume_if_mounted(&self.state).await;
-                    }
+                    // The trim runs regardless of the clean's outcome, so a
+                    // failed sweep does not strand earlier-freed extents.
+                    let _report = tracing::Instrument::instrument(
+                        clean(&self.state, UNUSED_FOR, None),
+                        tracing::info_span!("maintenance.clean", trigger = "tick"),
+                    )
+                    .await;
+                    trim_state_volume_if_mounted(&self.state).await;
                     next_tick = Instant::now() + CLEAN_INTERVAL;
+                    // The clean just trimmed; reset the standalone trim timer
+                    // so it does not fire right after.
+                    next_trim = Instant::now() + TRIM_INTERVAL;
+                }
+                () = tokio::time::sleep_until(next_trim) => {
+                    #[cfg(test)]
+                    self.standalone_trims
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trim_state_volume_if_mounted(&self.state).await;
+                    next_trim = Instant::now() + TRIM_INTERVAL;
                 }
             }
         }
@@ -196,8 +234,15 @@ pub(crate) fn spawn(state: ServerStateHandle, shutdown: CancellationToken) -> Ma
         state,
         receiver,
         shutdown,
+        #[cfg(test)]
+        standalone_trims: Default::default(),
     };
-    let abort = tokio::spawn(actor.mainloop()).abort_handle();
+    // Lives until shutdown: a root of its own (see `traced::spawn_detached`).
+    let abort = crate::traced::spawn_detached(
+        tracing::info_span!(parent: None, "maintenance"),
+        actor.mainloop(),
+    )
+    .abort_handle();
 
     MaintenanceHandle { sender, abort }
 }
@@ -237,7 +282,7 @@ async fn clean(
     let daemon_ctx = state.daemon_context().await;
     let cache = daemon_ctx.local_cache();
     let (tx, rx) = event_chan::unbounded();
-    let renderer = tokio::spawn(log_events(rx, relay));
+    let renderer = crate::traced::spawn(log_events(rx, relay));
 
     let op = CleanCache {
         older_than,
@@ -259,7 +304,7 @@ async fn clean(
     // error is rendered in there too — `op::Error` is a large enum, and only
     // its message crosses back.
     let result =
-        tokio::task::spawn_blocking(move || op.run(&cache).map_err(|e| e.to_string())).await;
+        crate::traced::spawn_blocking(move || op.run(&cache).map_err(|e| e.to_string())).await;
     let _ = renderer.await;
 
     match result {
@@ -282,7 +327,7 @@ async fn clean(
     }
 }
 
-/// Hand the blocks the clean just freed back to the host image — the trim half
+/// Hand the blocks the guest has freed back to the host image — the trim half
 /// of the module doc. No-op unless the boot path actually mounted a data volume
 /// at the state dir, which in practice means the microVM: a native daemon's
 /// state dir is a directory on the user's own filesystem, not this daemon's to
@@ -293,7 +338,7 @@ async fn clean(
 /// still has a correct cache. `Unsupported` is the ordinary case for a
 /// filesystem or block driver without discard (a native-Linux `minimald` run
 /// with a state volume, a virtio-blk without `discard` negotiated), and would
-/// otherwise warn every [`CLEAN_INTERVAL`] forever, so it logs at debug.
+/// otherwise warn every [`TRIM_INTERVAL`] forever, so it logs at debug.
 ///
 /// Deliberately unbounded, unlike the shutdown quiesce's 10 s ceiling. A
 /// requesting client does wait on this — [`MaintenanceHandle::clean_now`]
@@ -303,7 +348,11 @@ async fn clean(
 /// over extents still undiscarded. It shares the shutdown hazard documented on
 /// [`clean`] — a trim in flight when the `Shutdown` RPC quiesces the volume is
 /// walking a filesystem being synced and unmounted — bounded the same way, by
-/// [`MaintenanceHandle::abort`] and the ext4 journal.
+/// [`MaintenanceHandle::abort`] and the ext4 journal. The standalone
+/// [`TRIM_INTERVAL`] cadence makes that overlap routine rather than rare, and
+/// `abort` does not stop a `FITRIM` already on the blocking pool: its open fd
+/// makes the quiesce's plain unmount fail `EBUSY`, and the quiesce's lazy
+/// detach covers that case, after the `syncfs` and read-only remount.
 #[cfg(target_os = "linux")]
 async fn trim_state_volume_if_mounted(state: &ServerStateHandle) {
     if !state.state_volume_mounted().await {
@@ -312,10 +361,13 @@ async fn trim_state_volume_if_mounted(state: &ServerStateHandle) {
     let mountpoint = state.minimal_state_dir().await;
     // `FITRIM` walks the whole filesystem's block groups; like the clean
     // itself, that belongs on the blocking pool.
-    let trim = tokio::task::spawn_blocking(move || {
+    let trim = crate::traced::spawn_blocking(move || {
         crate::guest::trim_state_volume(mountpoint.as_utf8_path().as_str())
     });
     match trim.await {
+        // Most standalone trims find nothing new (ext4 skips unchanged
+        // groups); an info line for those would repeat every TRIM_INTERVAL.
+        Ok(Ok(0)) => tracing::debug!("state volume trimmed; nothing to discard"),
         Ok(Ok(discarded)) => {
             tracing::info!(discarded_bytes = discarded, "state volume trimmed")
         }
@@ -459,5 +511,118 @@ mod tests {
             "one clean took both entries, the other none"
         );
         assert_eq!(cache.iter_entries().count(), 0);
+    }
+
+    /// The standalone trim arm fires on its own cadence, not only behind a
+    /// clean. `STARTUP_DELAY` equals `TRIM_INTERVAL`, so the startup clean wins
+    /// the biased select first and resets the trim deadline; the trim arm must
+    /// then fire twice before the next clean is due. The state volume is
+    /// not mounted, so the trim itself is a no-op and touches no real disk.
+    #[tokio::test(start_paused = true)]
+    async fn trim_timer_fires_independently_of_clean() {
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(crate::server::test_config(dir.path()), None)
+            .await
+            .unwrap();
+        let (_sender, receiver) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let standalone_trims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let actor = Maintenance {
+            state,
+            receiver,
+            shutdown: shutdown.clone(),
+            standalone_trims: standalone_trims.clone(),
+        };
+        let task = crate::traced::spawn(actor.mainloop());
+
+        // The paused clock auto-advances while the runtime is idle, so this
+        // walks virtual time forward until the arm has fired twice. The next
+        // clean is due a full `CLEAN_INTERVAL` after the startup one, so
+        // firing within that window is firing on the trim's own cadence.
+        let fired_twice = async {
+            while standalone_trims.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        tokio::time::timeout(CLEAN_INTERVAL, fired_twice)
+            .await
+            .expect("standalone trim fired twice before the next clean was due");
+
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    /// TEL-027: a periodic clean (the timer's, nobody asked)
+    /// runs in a root of its own: `maintenance.clean` under the actor's
+    /// `maintenance` span, which has no parent, whatever span was current
+    /// when the daemon started the actor. Time is paused, so the startup
+    /// delay passes at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_periodic_clean_runs_in_a_root_span() {
+        use tracing::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (_dir, _state, _maintenance) = daemon().instrument(tracing::info_span!("boot")).await;
+        let ticked = || !log.find("maintenance.clean", "trigger", "tick").is_empty();
+        for _ in 0..20 {
+            if ticked() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        let clean = log.one("maintenance.clean", "trigger", "tick");
+        let actor = log
+            .parent_of(&clean)
+            .expect("the clean runs in the actor's span");
+        assert_eq!(actor.name, "maintenance");
+        assert!(
+            actor.parent.is_none(),
+            "the actor's span is a root: {actor:?}"
+        );
+    }
+
+    /// TEL-027: a clean a request asked for (`mip cache clean`,
+    /// the CleanCache RPC) runs under the maintenance actor's root too, never
+    /// in the requester's trace: `maintenance.clean` (`trigger=request`) is
+    /// the `maintenance` root's child, and the session lookup it makes starts
+    /// no span in the caller's trace.
+    #[tokio::test]
+    async fn a_requested_clean_runs_under_the_maintenance_root() {
+        use tracing::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (_dir, _state, maintenance) = daemon().await;
+        let request = tracing::info_span!(
+            "rpc",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        );
+        let ctx = minimald_rpc::trace::TraceContext::parse_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        crate::exec::adopt_trace(&request, ctx);
+        maintenance
+            .clean_now(None, None)
+            .instrument(request)
+            .await
+            .unwrap();
+        let clean = log.one("maintenance.clean", "trigger", "request");
+        let actor = log
+            .parent_of(&clean)
+            .expect("the clean runs in the actor's span");
+        assert_eq!(actor.name, "maintenance");
+        assert!(
+            actor.parent.is_none(),
+            "the actor's span is a root: {actor:?}"
+        );
+        let list = log.one("sessions.manager.message", "kind", "List");
+        assert_ne!(
+            list.field("trace_id"),
+            Some("0af7651916cd43dd8448eb211c80319c"),
+            "the clean's session lookup is not in the caller's trace: {list:?}"
+        );
     }
 }

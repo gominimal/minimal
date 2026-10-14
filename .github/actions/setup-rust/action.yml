@@ -26,10 +26,17 @@ runs:
     - name: Free Disk Space
       uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
       with:
-        remove_android: true
+        # Removed by the next step instead.
+        remove_android: false
         remove_dotnet: true
         remove_haskell: true
         remove_tool_cache: true
+    - name: Remove the Android SDK in the background
+      # ~11 GB in many small files: deleting it in the foreground costs
+      # 50-130 s. Detached, it finishes while the cache restores, before the
+      # build needs the space.
+      shell: bash
+      run: setsid nohup sudo rm -rf /usr/local/lib/android >/dev/null 2>&1 &
     - name: Install protoc
       shell: bash
       run: sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'

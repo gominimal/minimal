@@ -296,23 +296,35 @@ impl CheckCache {
                     name.ends_with(b"__libpthread_version_placeholder")
                         || name.ends_with(b"__libdl_version_placeholder")
                         || name.ends_with(b"__librt_version_placeholder")
+                        || name.ends_with(b"__libresolv_version_placeholder")
                 });
 
-                let mut symbols: HashSet<String> = export_names
-                    .iter()
-                    .map(|name| String::from_utf8(name.to_vec()).unwrap())
-                    .chain(elf.dynamic_symbols().map(|s| s.name().unwrap().to_string()))
-                    .collect();
+                let mut symbols: HashSet<String> = HashSet::new();
+                for name in &export_names {
+                    let name = String::from_utf8(name.to_vec()).map_err(|e| {
+                        anyhow!("non-UTF-8 export name in {}: {e}", full_path.display())
+                    })?;
+                    symbols.insert(name);
+                }
+                for s in elf.dynamic_symbols() {
+                    let name = s.name().map_err(|e| {
+                        anyhow!("reading dynamic symbol of {}: {e}", full_path.display())
+                    })?;
+                    symbols.insert(name.to_string());
+                }
 
                 if likely_glibc_stub_lib {
                     let libc_path = dep_path.join("usr/lib/libc.so.6");
                     let data = std::fs::read(&libc_path)
                         .map_err(|e| anyhow!("reading libc {}: {e}", libc_path.display()))?;
-                    let libc = object::File::parse(&*data).unwrap();
-                    symbols.extend(
-                        libc.dynamic_symbols()
-                            .map(|s| s.name().unwrap().to_string()),
-                    );
+                    let libc = object::File::parse(&*data)
+                        .map_err(|e| anyhow!("parsing {}: {e}", libc_path.display()))?;
+                    for s in libc.dynamic_symbols() {
+                        let name = s.name().map_err(|e| {
+                            anyhow!("reading dynamic symbol of {}: {e}", libc_path.display())
+                        })?;
+                        symbols.insert(name.to_string());
+                    }
                 }
 
                 Ok(Arc::new(symbols))
@@ -351,6 +363,8 @@ pub struct CheckCtx {
 }
 
 impl CheckCtx {
+    // Left positional: a params type would exist only to feed this constructor
+    // (each field is copied straight into `Self`), so it is pure ceremony.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         filter_names: Vec<String>,
@@ -437,16 +451,29 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         Err(e) => return Err(Error::IO("reading package dirs", packages_dir.clone(), e)),
     }
     .into_iter()
-    // Filter based on any given filter names
-    .filter_map(|fpath| {
-        let dir = fpath.parent().unwrap();
-        let pkg = dir.file_name().unwrap().to_str().unwrap().to_string();
-        if ctx.filter_names.is_empty() || ctx.filter_names.contains(&pkg) {
-            Some((pkg, dir.to_path_buf()))
-        } else {
-            None
-        }
+    .map(|fpath| {
+        let dir = fpath.parent().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "package declaration has no parent directory: {}",
+                fpath.display()
+            ))
+        })?;
+        let pkg = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                Error::Other(anyhow!(
+                    "package directory name is not valid UTF-8: {}",
+                    dir.display()
+                ))
+            })?
+            .to_string();
+        Ok((pkg, dir.to_path_buf()))
     })
+    .collect::<Result<Vec<_>, Error>>()?
+    // Filter based on any given filter names
+    .into_iter()
+    .filter(|(pkg, _)| ctx.filter_names.is_empty() || ctx.filter_names.contains(pkg))
     .collect();
 
     Ok(package_dirs
@@ -472,32 +499,30 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
 
 #[tracing::instrument(skip_all, err)]
 fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
-    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&stacks_dir) {
+    let dirs: Vec<String> = match std::fs::read_dir(&stacks_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(Error::IO("reading stack dirs", stacks_dir.clone(), e)),
         Ok(dirs) => dirs
-            .filter_map(|e| match e {
-                Err(e) => Some(Err(e)),
-                Ok(e) => {
-                    if !e.file_type().unwrap().is_dir() {
-                        None
-                    } else {
-                        Some(Ok(e.file_name()))
-                    }
-                }
+            .map(|e| {
+                let e = e?;
+                Ok(e.file_type()?.is_dir().then(|| e.file_name()))
             })
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, std::io::Error>>()
             .map_err(|e| Error::IO("listing stack", stacks_dir.clone(), e))?
             .into_iter()
-            // Filter based on any given filter names
-            .filter_map(|dir| {
-                let n = dir.as_os_str().to_str().unwrap().to_string();
-                if ctx.filter_names.is_empty() || ctx.filter_names.contains(&n) {
-                    Some(dir)
-                } else {
-                    None
-                }
+            .flatten()
+            .map(|dir| {
+                dir.into_string().map_err(|dir| {
+                    Error::Other(anyhow!(
+                        "stack directory name is not valid UTF-8: {}",
+                        dir.to_string_lossy()
+                    ))
+                })
             })
+            .collect::<Result<Vec<String>, Error>>()?
+            // Filter based on any given filter names
+            .into_iter()
+            .filter(|n| ctx.filter_names.is_empty() || ctx.filter_names.contains(n))
             .collect(),
     };
 
@@ -508,7 +533,7 @@ fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFu
             let stacks_dir = stacks_dir.clone();
 
             Box::pin(async move {
-                let name = pd.to_str().unwrap().to_string();
+                let name = pd;
                 let _permit = tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => {
@@ -703,12 +728,16 @@ impl FileBasedChecker for ParseCheck {
             ),
         ]));
 
+        let build_ncl = pkg_dir.join("build.ncl");
+        let build_ncl = build_ncl.to_str().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "package build file path is not valid UTF-8: {}",
+                build_ncl.display()
+            ))
+        })?;
         let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
             .add_source(
-                std::io::Cursor::new(format!(
-                    "import \"{}\"",
-                    pkg_dir.join("build.ncl").as_os_str().to_str().unwrap()
-                )),
+                std::io::Cursor::new(format!("import \"{build_ncl}\"")),
                 "toplevel",
             )
             .add_import_paths([ctx.stdlib_dir.as_path()].iter())
@@ -797,11 +826,20 @@ impl FileBasedChecker for ImportLineCheck {
         {
             let e =
                 e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
-            if e.file_type().unwrap().is_dir() {
+            if e.file_type()
+                .map_err(|err| Error::IO("reading file type", e.path(), err))?
+                .is_dir()
+            {
                 continue;
             }
             let name = e.file_name();
-            if !name.to_str().unwrap().ends_with(".ncl") {
+            let Some(name) = name.to_str() else {
+                return Err(Error::Other(anyhow!(
+                    "nickel file name is not valid UTF-8: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            if !name.ends_with(".ncl") {
                 continue;
             }
 
@@ -828,11 +866,9 @@ impl FileBasedChecker for ImportLineCheck {
                     .filter_map(|ident| {
                         if !rest.contains(ident) {
                             if !fix {
-                                result.err.push(format!(
-                                    "{}: {} imported but not used",
-                                    name.to_str().unwrap(),
-                                    ident
-                                ));
+                                result
+                                    .err
+                                    .push(format!("{}: {} imported but not used", name, ident));
                             }
                             None
                         } else {
@@ -857,10 +893,9 @@ impl FileBasedChecker for ImportLineCheck {
                 });
 
                 if !fix && sorted_identifiers != used_identifiers {
-                    result.err.push(format!(
-                        "{}: identifiers not in canonical order",
-                        name.to_str().unwrap()
-                    ));
+                    result
+                        .err
+                        .push(format!("{}: identifiers not in canonical order", name));
                 }
                 if fix
                     && (sorted_identifiers != used_identifiers || identifiers != used_identifiers)
@@ -910,11 +945,20 @@ impl FileBasedChecker for FmtCheck {
         {
             let e =
                 e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
-            if e.file_type().unwrap().is_dir() {
+            if e.file_type()
+                .map_err(|err| Error::IO("reading file type", e.path(), err))?
+                .is_dir()
+            {
                 continue;
             }
             let name = e.file_name();
-            if !name.to_str().unwrap().ends_with(".ncl") {
+            let Some(name) = name.to_str() else {
+                return Err(Error::Other(anyhow!(
+                    "nickel file name is not valid UTF-8: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            if !name.ends_with(".ncl") {
                 continue;
             }
 
@@ -924,11 +968,9 @@ impl FileBasedChecker for FmtCheck {
 
             match nickel_lang_core::format::format(&data[..], &mut out) {
                 Err(e) => {
-                    result.err.push(format!(
-                        "formatting {} failed: {:?}",
-                        name.to_str().unwrap(),
-                        e
-                    ));
+                    result
+                        .err
+                        .push(format!("formatting {} failed: {:?}", name, e));
                     result.verdict = CheckVerdict::Skip;
                 }
                 Ok(()) => {
@@ -986,73 +1028,77 @@ impl GraphBasedChecker for StandaloneTestCheck {
             let cancel = ctx.cancel.clone();
             let daemon_id = ctx.daemon_id.clone();
             drop(graph);
-            result = tokio::task::spawn(async move {
-                let mut result = result;
-                for (name, test) in tests {
-                    if test.build_test {
-                        continue; // We only do standalone tests here
-                    }
-                    // This task is detached, so it outlives a dropped check
-                    // stream: without this it would keep running tests (and
-                    // their sandboxes) after the caller has given up.
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
+            let span = tracing::Span::current();
+            result = tokio::task::spawn(tracing::Instrument::instrument(
+                async move {
+                    let mut result = result;
+                    for (name, test) in tests {
+                        if test.build_test {
+                            continue; // We only do standalone tests here
+                        }
+                        // This task is detached, so it outlives a dropped check
+                        // stream: without this it would keep running tests (and
+                        // their sandboxes) after the caller has given up.
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
-                    let stdout_buf = SharedBuf::new();
-                    let stderr_buf = SharedBuf::new();
-                    let mut t = StandaloneTest {
-                        spec: &bsr,
-                        test_name: name.as_str(),
-                        stdout_writer: Some(Box::new(stdout_buf.clone())),
-                        stderr_writer: Some(Box::new(stderr_buf.clone())),
-                        cancel: cancel.clone(),
-                    };
-                    let opts = Options {
-                        cache: cache.clone(),
-                        exec_base: temp_dir.path().to_path_buf(),
-                        graph: &graph2,
-                        ot: ot.clone(),
-                        daemon_id: daemon_id.clone(),
-                    };
+                        let stdout_buf = SharedBuf::new();
+                        let stderr_buf = SharedBuf::new();
+                        let mut t = StandaloneTest {
+                            spec: &bsr,
+                            test_name: name.as_str(),
+                            stdout_writer: Some(Box::new(stdout_buf.clone())),
+                            stderr_writer: Some(Box::new(stderr_buf.clone())),
+                            cancel: cancel.clone(),
+                        };
+                        let opts = Options {
+                            cache: cache.clone(),
+                            exec_base: temp_dir.path().to_path_buf(),
+                            graph: &graph2,
+                            ot: ot.clone(),
+                            daemon_id: daemon_id.clone(),
+                        };
 
-                    match t.run(&opts).await {
-                        Ok(errors) => {
-                            if !errors.is_empty() {
-                                result.verdict = CheckVerdict::Fail;
-                                errors.iter().for_each(|e| {
-                                    result.err.push(format!(
-                                        "{}: {} {} had exit code {}",
-                                        name,
-                                        e.program,
-                                        e.args.join(" "),
-                                        e.exit_code
-                                    ))
-                                });
-                                let stdout = stdout_buf.into_string();
-                                let stderr = stderr_buf.into_string();
-                                if !stdout.is_empty() {
-                                    result.err.push(format!("stdout:\n{}", stdout));
-                                }
-                                if !stderr.is_empty() {
-                                    result.err.push(format!("stderr:\n{}", stderr));
+                        match t.run(&opts).await {
+                            Ok(errors) => {
+                                if !errors.is_empty() {
+                                    result.verdict = CheckVerdict::Fail;
+                                    errors.iter().for_each(|e| {
+                                        result.err.push(format!(
+                                            "{}: {} {} had exit code {}",
+                                            name,
+                                            e.program,
+                                            e.args.join(" "),
+                                            e.exit_code
+                                        ))
+                                    });
+                                    let stdout = stdout_buf.into_string();
+                                    let stderr = stderr_buf.into_string();
+                                    if !stdout.is_empty() {
+                                        result.err.push(format!("stdout:\n{}", stdout));
+                                    }
+                                    if !stderr.is_empty() {
+                                        result.err.push(format!("stderr:\n{}", stderr));
+                                    }
                                 }
                             }
-                        }
-                        Err(op::Error::Cache(CacheErr::NotFound)) => {
-                            result.verdict = CheckVerdict::Skip;
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::from(e)
-                                .context(format!("running tests for spec {}", build.name))
-                                .context(format!("failed setup for test {}", name)));
+                            Err(op::Error::Cache(CacheErr::NotFound)) => {
+                                result.verdict = CheckVerdict::Skip;
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::Error::from(e)
+                                    .context(format!("running tests for spec {}", build.name))
+                                    .context(format!("failed setup for test {}", name)));
+                            }
                         }
                     }
-                }
-                Ok::<_, anyhow::Error>(result)
-            })
+                    Ok::<_, anyhow::Error>(result)
+                },
+                span,
+            ))
             .await
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?
             .map_err(Error::Other)?;
@@ -1095,11 +1141,20 @@ impl FileBasedChecker for ImportsCheck {
         {
             let e =
                 e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
-            if e.file_type().unwrap().is_dir() {
+            if e.file_type()
+                .map_err(|err| Error::IO("reading file type", e.path(), err))?
+                .is_dir()
+            {
                 continue;
             }
             let name = e.file_name();
-            if !name.to_str().unwrap().ends_with(".ncl") {
+            let Some(name) = name.to_str() else {
+                return Err(Error::Other(anyhow!(
+                    "nickel file name is not valid UTF-8: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            if !name.ends_with(".ncl") {
                 continue;
             }
 
@@ -1116,9 +1171,7 @@ impl FileBasedChecker for ImportsCheck {
                 if identifier != folder {
                     result.err.push(format!(
                         "{}: identifier '{}' doesn't match folder '{}' in import",
-                        name.to_str().unwrap(),
-                        identifier,
-                        folder
+                        name, identifier, folder
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }
@@ -1128,8 +1181,7 @@ impl FileBasedChecker for ImportsCheck {
                 {
                     result.err.push(format!(
                         "{}: adjacent package '{}' imported but not used",
-                        name.to_str().unwrap(),
-                        identifier,
+                        name, identifier,
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }

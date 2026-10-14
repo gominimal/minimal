@@ -1,9 +1,10 @@
 use crate::{
-    BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceFetch, SpecHash,
+    BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Error, Graph, RuntimeDep, SourceFetch, SpecHash,
 };
 use blake3::Hasher;
 use common::{SubsetSpec, Target, target};
-use decode::AttrValue;
+use decode::{AttrValue, Container};
+use nickel_lang_core::term::IndexMap;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::io::Write;
@@ -418,6 +419,174 @@ impl SubsetHasher {
     }
 }
 
+/// Computes the [SpecHash] for a container.
+///
+/// A container is a declaration *over* packages rather than a build of its own,
+/// so its hash combines two things: the packages it embeds, hashed **by
+/// content** (their [SpecHash], not their name — an image must change when what
+/// goes into it changes), and every field of the image config it declares.
+///
+/// A package's own [SpecHash] already covers its transitive runtime closure, so
+/// the closure needs no separate walk here.
+pub struct ContainerHasher;
+
+impl ContainerHasher {
+    /// Computes the [SpecHash] of `container` against the packages in `graph`.
+    ///
+    /// The [`SpecEncoder`] chosen here is the whole surface a future hash epoch
+    /// touches for containers.
+    ///
+    /// Returns [`Error::NoSuchPkg`] if a named package is not in the graph.
+    pub fn hash(graph: &Graph, container: &Container) -> Result<SpecHash, Error> {
+        let mut enc = LegacyEncoder::new();
+        Self::encode(graph, container, &mut enc)?;
+        Ok(enc.finish())
+    }
+
+    /// The encoding pass, generic over the encoder for the same reason
+    /// [`SpecHasher::encode`] is: the hash *format* is the encoder's choice.
+    fn encode<E: SpecEncoder>(
+        graph: &Graph,
+        container: &Container,
+        enc: &mut E,
+    ) -> Result<(), Error> {
+        // Destructured exhaustively on purpose: a field added to Container
+        // fails to compile here rather than silently falling out of the hash.
+        let Container {
+            name,
+            packages,
+            entrypoint,
+            cmd,
+            arch,
+            working_dir,
+            env_vars,
+            exposed_ports,
+            volumes,
+            user,
+            stop_signal,
+            labels,
+            config,
+        } = container;
+
+        enc.tag(b"container");
+        enc.bytes(name.as_bytes());
+
+        // Packages enter as a set of *content* hashes: an image must change
+        // when what goes into it changes, but not when the same packages are
+        // listed in a different order, or listed twice.
+        enc.tag(b"-packages");
+        let mut package_hashes = Vec::with_capacity(packages.len());
+        for pkg in packages {
+            let bsr = graph.by_name(pkg).ok_or_else(|| Error::NoSuchPkg {
+                name: pkg.to_string(),
+            })?;
+            package_hashes.push(graph.spec_hash(bsr));
+        }
+        package_hashes.sort_unstable();
+        package_hashes.dedup();
+        enc.index(package_hashes.len());
+        for hash in &package_hashes {
+            enc.bytes(hash.as_bytes());
+        }
+
+        enc.tag(b"-entrypoint");
+        encode_opt_argv(entrypoint.as_deref(), enc);
+        enc.tag(b"-cmd");
+        encode_opt_argv(cmd.as_deref(), enc);
+
+        enc.tag(b"-arch");
+        encode_opt_bytes(arch.as_ref().map(|a| a.as_nickel_str()), enc);
+        enc.tag(b"-working_dir");
+        encode_opt_bytes(working_dir.as_deref(), enc);
+        enc.tag(b"-user");
+        encode_opt_bytes(user.as_deref(), enc);
+        enc.tag(b"-stop_signal");
+        encode_opt_bytes(stop_signal.as_deref(), enc);
+
+        enc.tag(b"-env_vars");
+        encode_string_map(env_vars, enc);
+
+        // Both become keys of a JSON object in the image config, so both are
+        // sets: `ExposedPorts` keyed `"80/tcp"`, and `Volumes` keyed by path.
+        enc.tag(b"-exposed_ports");
+        encode_string_set(
+            exposed_ports
+                .iter()
+                .map(|p| format!("{}/{}", p.port, p.proto))
+                .collect(),
+            enc,
+        );
+
+        enc.tag(b"-volumes");
+        encode_string_set(volumes.iter().map(String::as_str).collect(), enc);
+
+        enc.tag(b"-labels");
+        encode_string_map(labels, enc);
+        enc.tag(b"-config");
+        encode_string_map(config, enc);
+
+        Ok(())
+    }
+}
+
+/// An absent optional field carries a marker rather than being skipped:
+/// skipping is what lets "unset" alias "set to the next field's value".
+fn encode_opt_bytes<E: SpecEncoder>(value: Option<&str>, enc: &mut E) {
+    match value {
+        Some(v) => {
+            enc.tag(b"some");
+            enc.bytes(v.as_bytes());
+        }
+        None => enc.tag(b"none"),
+    }
+}
+
+fn encode_opt_argv<E: SpecEncoder>(argv: Option<&[String]>, enc: &mut E) {
+    match argv {
+        Some(argv) => {
+            enc.tag(b"some");
+            enc.index(argv.len());
+            for arg in argv {
+                enc.bytes(arg.as_bytes());
+            }
+        }
+        None => enc.tag(b"none"),
+    }
+}
+
+/// Length-prefixed and sorted by key, so the declaration order of a map that
+/// becomes an unordered image-config object does not reach the hash — see
+/// [`ContainerHasher`]. Keys are unique within an [`IndexMap`], so the sort is
+/// total and needs no dedup.
+///
+/// The `k`/`v` markers are the legacy scheme's idiom for maps, matching
+/// `build_attrs_hash`'s `build_args` encoding: without them `{AB: "C"}` and
+/// `{A: "BC"}` are the same bytes.
+fn encode_string_map<E: SpecEncoder>(map: &IndexMap<String, String>, enc: &mut E) {
+    let mut entries: Vec<(&String, &String)> = map.iter().collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+
+    enc.index(entries.len());
+    for (key, value) in entries {
+        enc.tag(b"k");
+        enc.bytes(key.as_bytes());
+        enc.tag(b"v");
+        enc.bytes(value.as_bytes());
+    }
+}
+
+/// Length-prefixed, sorted, and deduplicated: the collection describes a set in
+/// the image config, so neither order nor a repeat says anything.
+fn encode_string_set<E: SpecEncoder, S: AsRef<str> + Ord>(mut values: Vec<S>, enc: &mut E) {
+    values.sort_unstable();
+    values.dedup();
+
+    enc.index(values.len());
+    for value in &values {
+        enc.bytes(value.as_ref().as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +857,326 @@ mod tests {
             SpecHash::from_hex("c5c005aebf5871b30387126e5052e48206f19112fb9d2c5127c5303195726780")
                 .unwrap(),
         );
+    }
+
+    // ── Container hashing ────────────────────────────────────────────────────
+
+    /// A graph with two packages plus a container that embeds both, with every
+    /// image-config field set — the shape the golden hash below pins.
+    fn container_fixture() -> (Graph, Container) {
+        use decode::{ExposedPort, ExposedPortProto};
+
+        let mut g = Graph::new();
+        g.insert_build(BuildSpec {
+            name: "glibc".into(),
+            cmds: vec![vec!["make".into()]],
+            ..Default::default()
+        });
+        g.insert_build(BuildSpec {
+            name: "nginx".into(),
+            cmds: vec![vec!["configure".into()]],
+            ..Default::default()
+        });
+
+        let container = Container {
+            name: "web".into(),
+            packages: vec!["glibc".into(), "nginx".into()],
+            entrypoint: Some(vec!["/usr/bin/nginx".into(), "-g".into()]),
+            cmd: Some(vec!["-c".into(), "/etc/nginx/nginx.conf".into()]),
+            arch: Some(target::Arch::Amd64),
+            working_dir: Some("/srv".into()),
+            env_vars: IndexMap::from_iter([("PORT".to_string(), "8080".to_string())]),
+            exposed_ports: vec![
+                ExposedPort {
+                    proto: ExposedPortProto::Tcp,
+                    port: 80,
+                },
+                ExposedPort {
+                    proto: ExposedPortProto::Udp,
+                    port: 443,
+                },
+            ],
+            volumes: vec!["/var/lib/nginx".into()],
+            user: Some("nginx".into()),
+            stop_signal: Some("SIGQUIT".into()),
+            labels: IndexMap::from_iter([(
+                "org.opencontainers.image.title".to_string(),
+                "web".to_string(),
+            )]),
+            config: IndexMap::from_iter([("StopTimeout".to_string(), "30".to_string())]),
+        };
+        (g, container)
+    }
+
+    /// Golden hash. Built in Rust rather than Nickel, so it is stable across
+    /// architectures — see [`representative_spec`].
+    #[test]
+    fn container_hash() {
+        let (g, c) = container_fixture();
+
+        // println!("{}", ContainerHasher::hash(&g, &c).unwrap().0.to_hex());
+        assert_eq!(
+            ContainerHasher::hash(&g, &c).unwrap(),
+            SpecHash::from_hex("ddaa6e2ea3b3921d2c977bb6ff34597a762de4686503c1bb2020fd42a66f87dc")
+                .unwrap(),
+        );
+    }
+
+    /// The point of hashing packages by [SpecHash] rather than by name: an
+    /// image must change when what goes into it changes, even though the
+    /// container declaration is untouched.
+    #[test]
+    fn container_hash_tracks_package_contents() {
+        let (g, c) = container_fixture();
+        let before = ContainerHasher::hash(&g, &c).unwrap();
+
+        let mut g2 = Graph::new();
+        g2.insert_build(BuildSpec {
+            name: "glibc".into(),
+            cmds: vec![vec!["make".into()]],
+            ..Default::default()
+        });
+        g2.insert_build(BuildSpec {
+            name: "nginx".into(),
+            // The one difference: nginx builds with a different command.
+            cmds: vec![vec!["configure".into(), "--with-http_v3_module".into()]],
+            ..Default::default()
+        });
+
+        assert_ne!(
+            before,
+            ContainerHasher::hash(&g2, &c).unwrap(),
+            "a package rebuild must change the hash of the image embedding it"
+        );
+    }
+
+    /// The `k`/`v` markers and the list-length prefixes earn their keep: without
+    /// them the legacy scheme's raw concatenation hashes both of these pairs
+    /// identically.
+    #[test]
+    fn container_hash_separates_string_boundaries() {
+        let (g, base) = container_fixture();
+
+        let ab_c = Container {
+            env_vars: IndexMap::from_iter([("AB".to_string(), "C".to_string())]),
+            ..base.clone()
+        };
+        let a_bc = Container {
+            env_vars: IndexMap::from_iter([("A".to_string(), "BC".to_string())]),
+            ..base.clone()
+        };
+        assert_ne!(
+            ContainerHasher::hash(&g, &ab_c).unwrap(),
+            ContainerHasher::hash(&g, &a_bc).unwrap(),
+            "key/value boundary must be part of the hash"
+        );
+
+        // Same property across a list's element boundaries.
+        let split = Container {
+            volumes: vec!["/a".into(), "/b".into()],
+            ..base.clone()
+        };
+        let joined = Container {
+            volumes: vec!["/a/b".into()],
+            ..base
+        };
+        assert_ne!(
+            ContainerHasher::hash(&g, &split).unwrap(),
+            ContainerHasher::hash(&g, &joined).unwrap(),
+            "element boundaries must be part of the hash"
+        );
+    }
+
+    /// What the `k`/`v` markers do *not* fix, pinned so the state of play is
+    /// visible rather than folklore: they are in-band, so content containing a
+    /// marker still aliases. `Av` + `B` and `A` + `vB` both encode to `kAvvB`.
+    ///
+    /// This is inherited from the legacy scheme, not specific to containers.
+    /// **Flip this to `assert_ne!` when the injective encoder lands** — it is
+    /// the executable form of that migration's success criterion.
+    #[test]
+    fn container_hash_marker_aliasing_is_a_known_legacy_gap() {
+        let (g, base) = container_fixture();
+
+        let key_holds_marker = Container {
+            env_vars: IndexMap::from_iter([("Av".to_string(), "B".to_string())]),
+            ..base.clone()
+        };
+        let value_holds_marker = Container {
+            env_vars: IndexMap::from_iter([("A".to_string(), "vB".to_string())]),
+            ..base
+        };
+
+        assert_eq!(
+            ContainerHasher::hash(&g, &key_holds_marker).unwrap(),
+            ContainerHasher::hash(&g, &value_holds_marker).unwrap(),
+            "if this now differs, the encoder gained framing: flip to assert_ne"
+        );
+    }
+
+    /// An unset field must not hash like a set-but-empty one — the reason
+    /// optional fields carry a present/absent marker instead of being skipped.
+    #[test]
+    fn container_hash_distinguishes_absent_from_empty() {
+        let (g, base) = container_fixture();
+
+        let unset = Container {
+            user: None,
+            cmd: None,
+            ..base.clone()
+        };
+        let empty = Container {
+            user: Some(String::new()),
+            cmd: Some(Vec::new()),
+            ..base
+        };
+        assert_ne!(
+            ContainerHasher::hash(&g, &unset).unwrap(),
+            ContainerHasher::hash(&g, &empty).unwrap(),
+        );
+    }
+
+    /// Collections that become unordered image-config objects are hashed as
+    /// sets: reordering a declaration describes the same image and must reach
+    /// the same cache entry.
+    #[test]
+    fn container_hash_ignores_collection_order() {
+        use decode::{ExposedPort, ExposedPortProto};
+
+        let (g, base) = container_fixture();
+        let baseline = ContainerHasher::hash(&g, &base).unwrap();
+
+        let reordered = Container {
+            packages: vec!["nginx".into(), "glibc".into()],
+            exposed_ports: vec![
+                ExposedPort {
+                    proto: ExposedPortProto::Udp,
+                    port: 443,
+                },
+                ExposedPort {
+                    proto: ExposedPortProto::Tcp,
+                    port: 80,
+                },
+            ],
+            ..base.clone()
+        };
+        assert_eq!(
+            baseline,
+            ContainerHasher::hash(&g, &reordered).unwrap(),
+            "packages and ports are sets, not sequences"
+        );
+
+        // Maps, over more than one entry so the order can actually differ.
+        let pairs = [
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ];
+        let reversed: Vec<_> = pairs.iter().rev().cloned().collect();
+        let declared = Container {
+            env_vars: IndexMap::from_iter(pairs.clone()),
+            labels: IndexMap::from_iter(pairs.clone()),
+            config: IndexMap::from_iter(pairs),
+            ..base.clone()
+        };
+        let declared_reversed = Container {
+            env_vars: IndexMap::from_iter(reversed.clone()),
+            labels: IndexMap::from_iter(reversed.clone()),
+            config: IndexMap::from_iter(reversed),
+            ..base.clone()
+        };
+        assert_eq!(
+            ContainerHasher::hash(&g, &declared).unwrap(),
+            ContainerHasher::hash(&g, &declared_reversed).unwrap(),
+            "env_vars, labels and config are unordered in an image config"
+        );
+
+        // But argv order is argv's whole meaning.
+        let flipped_argv = Container {
+            cmd: Some(vec!["/etc/nginx/nginx.conf".into(), "-c".into()]),
+            ..base
+        };
+        assert_ne!(
+            baseline,
+            ContainerHasher::hash(&g, &flipped_argv).unwrap(),
+            "cmd is a sequence"
+        );
+    }
+
+    /// Naming a package twice adds nothing to an image, so it must not change
+    /// the hash — the set is deduplicated, not merely sorted.
+    #[test]
+    fn container_hash_ignores_duplicate_set_entries() {
+        let (g, base) = container_fixture();
+        let baseline = ContainerHasher::hash(&g, &base).unwrap();
+
+        let with_repeats = Container {
+            packages: vec!["glibc".into(), "nginx".into(), "glibc".into()],
+            volumes: vec!["/var/lib/nginx".into(), "/var/lib/nginx".into()],
+            ..base
+        };
+        assert_eq!(baseline, ContainerHasher::hash(&g, &with_repeats).unwrap());
+    }
+
+    /// Sorting must not blur *which* values are present: a set that ignores
+    /// order still distinguishes contents.
+    #[test]
+    fn container_hash_tracks_set_membership() {
+        let (g, base) = container_fixture();
+        let baseline = ContainerHasher::hash(&g, &base).unwrap();
+
+        let dropped_package = Container {
+            packages: vec!["glibc".into()],
+            ..base.clone()
+        };
+        assert_ne!(
+            baseline,
+            ContainerHasher::hash(&g, &dropped_package).unwrap()
+        );
+
+        let extra_env = Container {
+            env_vars: IndexMap::from_iter([
+                ("PORT".to_string(), "8080".to_string()),
+                ("TZ".to_string(), "UTC".to_string()),
+            ]),
+            ..base
+        };
+        assert_ne!(baseline, ContainerHasher::hash(&g, &extra_env).unwrap());
+    }
+
+    /// A graph decoded off the wire carries whatever containers the peer sent,
+    /// with no package validation — so this is an error, not a panic.
+    #[test]
+    fn container_hash_rejects_unknown_package() {
+        let (g, base) = container_fixture();
+        let c = Container {
+            packages: vec!["glibc".into(), "not-in-this-graph".into()],
+            ..base
+        };
+
+        let err = ContainerHasher::hash(&g, &c).unwrap_err();
+        assert!(
+            matches!(err, Error::NoSuchPkg { ref name } if name == "not-in-this-graph"),
+            "got {err:?}"
+        );
+    }
+
+    /// The leading `container` tag keeps the keyspace disjoint from the build
+    /// specs' (which open with a discovery index) and subsets' (`subset`): a
+    /// container whose only content is one package must not hash like that
+    /// package.
+    #[test]
+    fn container_hash_does_not_alias_spec_hash() {
+        let mut g = Graph::new();
+        let pkg = g.insert_build(BuildSpec {
+            name: "solo".into(),
+            ..Default::default()
+        });
+        let c = Container {
+            name: "solo".into(),
+            packages: vec!["solo".into()],
+            ..Default::default()
+        };
+
+        assert_ne!(ContainerHasher::hash(&g, &c).unwrap(), g.spec_hash(&pkg));
     }
 }

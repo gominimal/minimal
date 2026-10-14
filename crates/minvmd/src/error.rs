@@ -4,54 +4,68 @@
 //! `anyhow::Result`. `Backend` preserves the original libkrun errno so the
 //! source magnitude survives any wrap-and-rethrow.
 
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
 /// Errors produced by `minvmd`'s VM layer.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum VmError {
     /// A libkrun FFI call returned a negative errno. `op` names the libkrun
     /// function so the caller can attribute the failure without parsing
     /// strings; `source` carries the errno as an [`io::Error`] (libkrun
     /// returns negative errnos; the sign is stripped when constructing it).
+    #[error("libkrun {op} failed: {source}")]
     Backend { op: &'static str, source: io::Error },
 
     /// A caller-supplied path contained a NUL byte and cannot be passed across
     /// the C FFI boundary. `what` identifies the parameter for diagnostics.
+    #[error(
+        "{what} path contains a NUL byte and cannot cross the FFI boundary: {}",
+        path.display()
+    )]
     NulInPath { what: &'static str, path: PathBuf },
 
     /// A caller-supplied string (e.g. an env var or argv entry) contained a
     /// NUL byte and cannot be passed across the C FFI boundary.
+    #[error("{what} contains a NUL byte and cannot cross the FFI boundary: {value:?}")]
     NulInString { what: &'static str, value: String },
 
     /// `krun_start_enter` returned a non-negative value. libkrun's docs state
     /// the function only returns on error (on success it `exit()`s the host
     /// process with the guest workload's exit code), so a non-negative
     /// return is a protocol violation. `ret` is the raw libkrun return.
+    #[error("krun_start_enter returned {ret} but libkrun's docs say it only returns on error")]
     StartEnterReturnedUnexpectedly { ret: i32 },
 
     /// A required environment variable was unset or empty.
+    #[error("required environment variable {var} is unset or empty")]
     MissingEnv { var: &'static str },
 
     /// The `MINVMD_KRUN_LOG` environment variable was set to a value that is
     /// not a recognised libkrun log level (a name `off`/`error`/`warn`/`info`/
     /// `debug`/`trace` or the numeric level `0`–`5`). `value` is the offending
     /// setting.
+    #[error(
+        "MINVMD_KRUN_LOG value {value:?} is not a valid log level \
+         (expected off/error/warn/info/debug/trace or 0-5)"
+    )]
     InvalidLogLevel { value: String },
 
     /// A required image could not be located: the override env var was unset or
     /// empty, and no file exists at the default install location. `var` names
     /// the override; `default` is the path that was checked.
+    #[error("{var} is unset and no file exists at the default location {}", default.display())]
     MissingImage { var: &'static str, default: PathBuf },
 
     /// An I/O error outside the libkrun FFI boundary (e.g. creating or
     /// checking the socket directory, R3.2).
+    #[error("I/O error: {source}")]
     Io { source: io::Error },
 
     /// A VM configuration is not valid for the active deployment model (R2.5):
     /// `what` names the offending field and `reason` explains why it is rejected.
+    #[error("invalid VM configuration ({what}): {reason}")]
     Configuration {
         what: &'static str,
         reason: &'static str,
@@ -63,83 +77,11 @@ pub enum VmError {
     /// subnet is named where it can be fixed, rather than surfacing opaquely
     /// when #553's egress-enforcement layer parses it. `cidr` is the offending
     /// entry.
+    #[error(
+        "invalid VM configuration (vm_egress): allow_subnets entry \
+         {cidr:?} is not a valid CIDR prefix"
+    )]
     InvalidEgressSubnet { cidr: String },
-}
-
-impl fmt::Display for VmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Backend { op, source } => {
-                write!(f, "libkrun {op} failed: {source}")
-            }
-            Self::NulInPath { what, path } => {
-                write!(
-                    f,
-                    "{what} path contains a NUL byte and cannot cross the FFI boundary: {}",
-                    path.display()
-                )
-            }
-            Self::NulInString { what, value } => {
-                write!(
-                    f,
-                    "{what} contains a NUL byte and cannot cross the FFI boundary: {value:?}"
-                )
-            }
-            Self::StartEnterReturnedUnexpectedly { ret } => {
-                write!(
-                    f,
-                    "krun_start_enter returned {ret} but libkrun's docs say it only returns on error"
-                )
-            }
-            Self::MissingEnv { var } => {
-                write!(f, "required environment variable {var} is unset or empty")
-            }
-            Self::InvalidLogLevel { value } => {
-                write!(
-                    f,
-                    "MINVMD_KRUN_LOG value {value:?} is not a valid log level \
-                     (expected off/error/warn/info/debug/trace or 0-5)"
-                )
-            }
-            Self::MissingImage { var, default } => {
-                write!(
-                    f,
-                    "{var} is unset and no file exists at the default location {}",
-                    default.display()
-                )
-            }
-            Self::Io { source } => {
-                write!(f, "I/O error: {source}")
-            }
-            Self::Configuration { what, reason } => {
-                write!(f, "invalid VM configuration ({what}): {reason}")
-            }
-            Self::InvalidEgressSubnet { cidr } => {
-                write!(
-                    f,
-                    "invalid VM configuration (vm_egress): allow_subnets entry \
-                     {cidr:?} is not a valid CIDR prefix"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for VmError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Backend { source, .. } => Some(source),
-            Self::NulInPath { .. }
-            | Self::NulInString { .. }
-            | Self::StartEnterReturnedUnexpectedly { .. }
-            | Self::MissingEnv { .. }
-            | Self::InvalidLogLevel { .. }
-            | Self::MissingImage { .. }
-            | Self::Configuration { .. }
-            | Self::InvalidEgressSubnet { .. } => None,
-            Self::Io { source } => Some(source),
-        }
-    }
 }
 
 #[cfg(test)]

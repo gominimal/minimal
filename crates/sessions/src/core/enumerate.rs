@@ -8,6 +8,23 @@ use crate::core::compose::ComposeError;
 use crate::core::primitives::{FileSet, PatchDest, PatchError};
 use crate::core::source::{Provenanced, Source};
 
+/// Directory names excluded by default when walking a plain-directory
+/// patch source. These are common VCS and dependency directories that
+/// are almost never intended to be patched into a session.
+///
+/// This is a fixed allowlist of well-known names, not a `.gitignore`
+/// walk. A `.gitignore`-driven exclusion would be a moving target:
+/// it varies per directory, can be negated (`!keep/`), and would
+/// silently change what a loadout copies depending on which ignore
+/// files happen to exist on the host. Keeping the list explicit makes
+/// the copy set predictable and reviewable.
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &[".git", ".hg", ".svn", "CVS", ".jj", "node_modules"];
+
+/// Maximum total size in bytes for files enumerated from a single
+/// plain-directory patch source (100 MiB). Exceeding this produces a
+/// hard error rather than silently copying an unbounded tree.
+const MAX_PLAIN_DIR_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Per-file entry derived from a [`Patch`] after its source
 /// [`FileSet`] is walked. `link_path` is `Some` only when symlink
 /// resolution produced a distinct path (i.e. `follow_symlinks: true`
@@ -65,6 +82,12 @@ pub(crate) struct ExpandedProvenancedPatch {
     /// [`expand_patch_sources`]: crate::core::compose::expand_patch_sources
     /// [`ProvenancedPatch`]: crate::core::source::ProvenancedPatch
     pub(crate) follow_symlinks: bool,
+    /// Whether the source was a plain directory (no glob metacharacters
+    /// naming an existing directory) that expansion rewrote to
+    /// `dir/**/*`. The default-directory excludes and the total-size
+    /// cap apply only to these sources; explicit globs and literal
+    /// files are copied verbatim.
+    pub(crate) plain_directory: bool,
 }
 
 /// Walk each pre-expanded patch's `FileSet` and produce one
@@ -109,22 +132,13 @@ pub(crate) fn enumerate_patch_files(
         };
         let walk_root_path = walk_root.as_utf8_path().to_path_buf();
         let dest_root = pp.dest.as_sandbox_path().as_utf8_path();
-        for entry_result in
-            walkdir::WalkDir::new(walk_root_path.as_std_path()).follow_links(follow_symlinks)
-        {
+        let plain_directory = pp.plain_directory;
+        let mut total_bytes: u64 = 0;
+        let walker = walk_entries(&walk_root_path, follow_symlinks, plain_directory);
+        for entry_result in walker {
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(source) => {
-                    // `NotFound` is treated as "user doesn't have
-                    // this on their host" — warn and move on.
-                    // `walkdir::Error::path()` reports the specific
-                    // item that failed, which is either the walk
-                    // root itself (the common case) or a subitem
-                    // that vanished mid-walk (the race). Log both
-                    // the pattern's declared root and the failing
-                    // path so operators can distinguish. `.io_error()`
-                    // returns `None` for the loop-detection variant;
-                    // those still fail hard.
                     if source
                         .io_error()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
@@ -144,22 +158,17 @@ pub(crate) fn enumerate_patch_files(
                     continue;
                 }
             };
-            if !entry.file_type().is_file() {
-                // A *literal* patch source that is itself a symlink is
-                // the walk root (depth 0). With follow_symlinks off the
-                // walker won't traverse it, so it's dropped here with no
-                // other signal — warn, mirroring the missing-source case,
-                // rather than failing open silently. Deeper symlinks come
-                // from glob enumeration, whose no-follow behavior is
-                // documented, so they stay quiet.
-                if !follow_symlinks && entry.depth() == 0 && entry.file_type().is_symlink() {
+            match classify_entry(&entry, follow_symlinks, &walk_root_path) {
+                EntryClass::Skip => continue,
+                EntryClass::WarnSymlinkDrop => {
                     tracing::warn!(
                         source_pattern = %pp.source.pattern(),
                         walk_root = %walk_root_path,
                         "patch source is a symlink and follow_symlinks is off; dropping (set follow_symlinks = true to include it)"
                     );
+                    continue;
                 }
-                continue;
+                EntryClass::Process => {}
             }
             let link_path = match Utf8PathBuf::from_path_buf(entry.into_path()) {
                 Ok(p) => p,
@@ -173,38 +182,23 @@ pub(crate) fn enumerate_patch_files(
             if !pp.source.is_match(&link_path) {
                 continue;
             }
-            // Walker-yielded paths are descended from `walk_root_path`,
-            // which is an absolute path because expansion already
-            // rejected anything else. `new_unchecked` is sound.
-            let walker_path = HostAbsPath::new_unchecked(link_path.clone());
-            // When `follow_symlinks` is true, canonicalize each match
-            // to obtain the symlink target. Default mode skips this:
-            // walkdir filters symlinks-to-files at the `is_file()`
-            // check above, so the walker-yielded path *is* the
-            // canonical form (or near enough), and canonicalizing
-            // would swap in OS-level prefix-symlink forms (e.g.
-            // macOS's `/tmp` → `/private/tmp`) that policy patterns
-            // don't anticipate.
-            let (link_path, target_path) = if follow_symlinks {
-                let canonical = match canonicalize_utf8(&link_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        accumulated_errors.push(e);
-                        continue;
+            if plain_directory {
+                match accumulate_size(&mut total_bytes, &link_path, &walk_root_path) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        accumulated_errors.push(err);
+                        break;
                     }
-                };
-                let target = HostAbsPath::new_unchecked(canonical);
-                // `Some(link)` only if the canonical target actually
-                // differs from the walker path. For non-symlink
-                // files, target == walker_path and we record None.
-                let link = if target.as_utf8_path() == walker_path.as_utf8_path() {
-                    None
-                } else {
-                    Some(walker_path)
-                };
-                (link, target)
-            } else {
-                (None, walker_path)
+                }
+            }
+            let walker_path = HostAbsPath::new_unchecked(link_path.clone());
+            let Some((link_path, target_path)) = resolve_symlink_target(
+                follow_symlinks,
+                &link_path,
+                &walker_path,
+                &mut accumulated_errors,
+            ) else {
+                continue;
             };
             let user_facing = link_path.as_ref().unwrap_or(&target_path);
             let dest = compute_dest(user_facing.as_utf8_path(), &walk_root_path, dest_root);
@@ -222,6 +216,127 @@ pub(crate) fn enumerate_patch_files(
     Err(ComposeError::PatchWalk {
         sources: accumulated_errors,
     })
+}
+
+/// Build the walkdir iterator for a patch source. Plain-directory
+/// sources apply the default-directory excludes; explicit globs and
+/// literal files walk everything.
+fn walk_entries(
+    walk_root_path: &Utf8PathBuf,
+    follow_symlinks: bool,
+    plain_directory: bool,
+) -> Box<dyn Iterator<Item = walkdir::Result<walkdir::DirEntry>>> {
+    let walker = walkdir::WalkDir::new(walk_root_path.as_std_path())
+        .follow_links(follow_symlinks)
+        .into_iter();
+    if plain_directory {
+        Box::new(walker.filter_entry(|e| !is_default_excluded_dir(e)))
+    } else {
+        Box::new(walker)
+    }
+}
+
+/// Classification of a walkdir entry for [`enumerate_patch_files`].
+enum EntryClass {
+    /// Skip this entry (directory, excluded dir, non-file).
+    Skip,
+    /// The walk root is a symlink to a file and `follow_symlinks` is
+    /// off — warn and skip.
+    WarnSymlinkDrop,
+    /// A regular file — process it.
+    Process,
+}
+
+/// Classify a walkdir entry: skip excluded directories, warn on
+/// symlink-to-file walk roots when not following, and identify
+/// regular files for processing.
+fn classify_entry(
+    entry: &walkdir::DirEntry,
+    follow_symlinks: bool,
+    walk_root_path: &Utf8PathBuf,
+) -> EntryClass {
+    if !entry.file_type().is_file() {
+        // A literal patch source that is itself a symlink to a
+        // *file* is the walk root (depth 0). With follow_symlinks
+        // off the walker won't traverse it, so it's dropped with no
+        // other signal — warn. A symlink to a *directory* is
+        // different: the OS resolves it during path resolution, so
+        // walkdir *does* traverse into it and files are copied —
+        // suppress the warning in that case.
+        if !follow_symlinks
+            && entry.depth() == 0
+            && entry.file_type().is_symlink()
+            && !walk_root_path.as_std_path().is_dir()
+        {
+            return EntryClass::WarnSymlinkDrop;
+        }
+        return EntryClass::Skip;
+    }
+    EntryClass::Process
+}
+
+/// Whether a walkdir entry is a default-excluded directory name.
+fn is_default_excluded_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| DEFAULT_EXCLUDED_DIRS.contains(&n))
+}
+
+/// Add `path`'s file size to `total` and return a
+/// [`PatchError::SizeCapExceeded`] if the cap is breached. A metadata
+/// read failure is a hard error: the file's size is unknown, so the
+/// cap cannot be enforced and the file must not be emitted.
+fn accumulate_size(
+    total: &mut u64,
+    path: &Utf8PathBuf,
+    root: &Utf8PathBuf,
+) -> Result<(), PatchError> {
+    let meta = path
+        .as_std_path()
+        .metadata()
+        .map_err(|source| PatchError::SizeMetadataFailure {
+            path: path.clone(),
+            source,
+        })?;
+    *total = total.saturating_add(meta.len());
+    if *total > MAX_PLAIN_DIR_TOTAL_BYTES {
+        Err(PatchError::SizeCapExceeded {
+            root: root.clone(),
+            limit_bytes: MAX_PLAIN_DIR_TOTAL_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve a symlink target when `follow_symlinks` is true.
+/// Returns `Some((link_path, target_path))` on success, or pushes an
+/// error and returns `None` on failure.
+fn resolve_symlink_target(
+    follow_symlinks: bool,
+    link_path: &Utf8PathBuf,
+    walker_path: &HostAbsPath,
+    errors: &mut Vec<PatchError>,
+) -> Option<(Option<HostAbsPath>, HostAbsPath)> {
+    if !follow_symlinks {
+        return Some((None, walker_path.clone()));
+    }
+    let canonical = match canonicalize_utf8(link_path) {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(e);
+            return None;
+        }
+    };
+    let target = HostAbsPath::new_unchecked(canonical);
+    let link = if target.as_utf8_path() == walker_path.as_utf8_path() {
+        None
+    } else {
+        Some(walker_path.clone())
+    };
+    Some((link, target))
 }
 
 /// [`std::fs::canonicalize`] with UTF-8 enforcement.
@@ -376,6 +491,7 @@ mod tests {
                 name: "symsrc".to_string(),
             },
             follow_symlinks,
+            plain_directory: false,
         };
 
         let dropped = enumerate_patch_files(vec![make_item(false)]).unwrap();
@@ -448,6 +564,7 @@ mod tests {
                     name: "follow".to_string(),
                 },
                 follow_symlinks: true,
+                plain_directory: false,
             },
             ExpandedProvenancedPatch {
                 source: FileSet::try_new(format!("{}/*.conf", nofollow_dir.as_str())).unwrap(),
@@ -456,6 +573,7 @@ mod tests {
                     name: "nofollow".to_string(),
                 },
                 follow_symlinks: false,
+                plain_directory: false,
             },
         ];
 
@@ -491,5 +609,92 @@ mod tests {
             "no-follow patch should yield the real file only",
         );
         assert!(nofollow_files[0].link_path.is_none());
+    }
+
+    // =================================================================
+    // Default excludes + size cap
+    // =================================================================
+
+    /// A plain-directory source skips default-excluded directory
+    /// names (`.git`, `node_modules`, etc.) at any depth.
+    #[test]
+    fn plain_directory_source_skips_default_excluded_dirs() {
+        use crate::core::primitives::{FileSet, PatchDest};
+        use crate::core::source::Source;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        std::fs::write(root.join("keep.txt").as_std_path(), "k").unwrap();
+        std::fs::create_dir(root.join(".git").as_std_path()).unwrap();
+        std::fs::write(root.join(".git").join("config").as_std_path(), "g").unwrap();
+        std::fs::create_dir(root.join("node_modules").as_std_path()).unwrap();
+        std::fs::write(root.join("node_modules").join("dep.js").as_std_path(), "n").unwrap();
+
+        let item = ExpandedProvenancedPatch {
+            source: FileSet::try_new(format!("{}/**/*", root.as_str())).unwrap(),
+            dest: PatchDest::try_new("dest").unwrap(),
+            provenance: Source::UserLoadout {
+                name: "excludes".to_string(),
+            },
+            follow_symlinks: false,
+            plain_directory: true,
+        };
+
+        let files = enumerate_patch_files(vec![item]).unwrap();
+        let dests: Vec<_> = files.iter().map(|f| f.dest.as_str()).collect();
+        assert_eq!(dests, vec!["dest/keep.txt"]);
+    }
+
+    /// A symlinked *directory* source copies files without the false
+    /// "dropping" warning — the OS resolves the symlink during path
+    /// resolution, so walkdir traverses into it even with
+    /// `follow_symlinks` off.
+    #[test]
+    fn symlinked_directory_source_copies_files_without_dropping() {
+        use crate::core::primitives::{FileSet, PatchDest};
+        use crate::core::source::Source;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let real_dir = root.join("real");
+        std::fs::create_dir(real_dir.as_std_path()).unwrap();
+        std::fs::write(real_dir.join("file.txt").as_std_path(), "x").unwrap();
+        let link_dir = root.join("link");
+        std::os::unix::fs::symlink(real_dir.as_std_path(), link_dir.as_std_path()).unwrap();
+
+        let item = ExpandedProvenancedPatch {
+            source: FileSet::try_new(format!("{}/**/*", link_dir.as_str())).unwrap(),
+            dest: PatchDest::try_new("dest").unwrap(),
+            provenance: Source::UserLoadout {
+                name: "symdir".to_string(),
+            },
+            follow_symlinks: false,
+            plain_directory: false,
+        };
+
+        let files = enumerate_patch_files(vec![item]).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "symlinked directory source must copy its files",
+        );
+        assert_eq!(files[0].dest.as_str(), "dest/file.txt");
+    }
+
+    /// A plain-directory source exceeding the size cap produces a
+    /// `SizeCapExceeded` error rather than silently copying. Tested
+    /// via `accumulate_size` directly to avoid writing 100 MiB of
+    /// fixture data.
+    #[test]
+    fn plain_directory_source_over_size_cap_errors() {
+        let root = Utf8PathBuf::from("/tmp/plain-dir");
+        // Seed total just below the cap.
+        let mut total = MAX_PLAIN_DIR_TOTAL_BYTES - 1;
+        // A 2-byte file pushes it over.
+        let tmp = tempfile::tempdir().unwrap();
+        let small = Utf8PathBuf::from_path_buf(tmp.path().join("small.bin")).unwrap();
+        std::fs::write(small.as_std_path(), vec![0u8; 2]).unwrap();
+        let err = accumulate_size(&mut total, &small, &root).unwrap_err();
+        assert!(matches!(err, PatchError::SizeCapExceeded { .. }));
     }
 }

@@ -12,6 +12,8 @@ pub use remote_storage::RemoteStorage;
 pub mod renameat2;
 
 pub mod repo_spec;
+mod report;
+pub use report::report_to_stderr;
 mod spec_hash;
 pub use spec_hash::SpecHash;
 mod subsets;

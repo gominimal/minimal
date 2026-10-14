@@ -160,7 +160,7 @@ impl OciImage<'_> {
                                 .collect::<Vec<_>>(),
                         );
                     }
-                    cb.build().unwrap()
+                    cb.build()?
                 })
                 .build()?,
         )?;
@@ -220,8 +220,7 @@ impl OciImage<'_> {
                         PlatformBuilder::default()
                             .os("linux")
                             .architecture(arch)
-                            .build()
-                            .unwrap(),
+                            .build()?,
                     )
                     .annotations(HashMap::from([(
                         ANNOTATION_REF_NAME.to_string(),
@@ -230,7 +229,7 @@ impl OciImage<'_> {
                     .build()?,
             ])
             .build()?;
-        let image_index_str = image_index.to_string().unwrap();
+        let image_index_str = image_index.to_string()?;
         let image_index_b = image_index_str.as_bytes();
         let mut th = tar::Header::new_gnu();
         th.set_path("index.json").unwrap();

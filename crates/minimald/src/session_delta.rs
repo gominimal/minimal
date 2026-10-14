@@ -75,7 +75,7 @@ impl DeltaSource {
     /// rather than misreporting or stalling activation.
     pub(crate) async fn arm(root: PathBuf) -> Option<Arc<Self>> {
         let walk_root = root.clone();
-        let walk = tokio::task::spawn_blocking(move || snapshot(&walk_root));
+        let walk = crate::traced::spawn_blocking(move || snapshot(&walk_root));
         let baseline = tokio::time::timeout(WALK_TIMEOUT, walk)
             .await
             .ok()?
@@ -91,7 +91,7 @@ impl DeltaSource {
     /// the caller should not claim anything about the workspace.
     pub(crate) async fn changed_files(self: &Arc<Self>) -> Option<Vec<String>> {
         let src = Arc::clone(self);
-        let walk = tokio::task::spawn_blocking(move || {
+        let walk = crate::traced::spawn_blocking(move || {
             let now = snapshot(&src.root).ok()?;
             Some(diff(&src.baseline, &now))
         });
@@ -108,7 +108,7 @@ impl DeltaSource {
     /// delta could not be computed.
     pub(crate) async fn changed_paths(self: &Arc<Self>) -> Option<Vec<PathBuf>> {
         let src = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        crate::traced::spawn_blocking(move || {
             let now = snapshot(&src.root).ok()?;
             Some(changed_rel_paths(&src.baseline, &now))
         })
@@ -128,7 +128,7 @@ impl DeltaSource {
         dest: PathBuf,
     ) -> std::io::Result<()> {
         let src = Arc::clone(self);
-        tokio::task::spawn_blocking(move || write_archive(&src.root, &files, &dest))
+        crate::traced::spawn_blocking(move || write_archive(&src.root, &files, &dest))
             .await
             .map_err(std::io::Error::other)?
     }
@@ -303,7 +303,7 @@ fn is_same_dir(a: &Path, b: &Path) -> bool {
 async fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(root).args(args);
-    let task = tokio::task::spawn_blocking(move || cmd.output());
+    let task = crate::traced::spawn_blocking(move || cmd.output());
     let out = tokio::time::timeout(WALK_TIMEOUT, task)
         .await
         .ok()?

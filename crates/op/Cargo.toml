@@ -1,5 +1,6 @@
 [package]
 name = "op"
+description = "Complex operations over the graph and packages (builds, cache object construction)."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -27,6 +28,7 @@ shlex.workspace = true
 size.workspace = true
 tar.workspace = true
 tempfile.workspace = true
+thiserror.workspace = true
 toml_edit.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -39,4 +41,8 @@ decode.workspace = true
 graph.workspace = true
 mfile.workspace = true
 ot.workspace = true
-sandbox2.workspace = true
+rcache.workspace = true
+sandbox.workspace = true
+
+[lints]
+workspace = true

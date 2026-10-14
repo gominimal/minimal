@@ -1,5 +1,6 @@
 [package]
 name = "remote-proto"
+description = "Protobuf / wire types for the Remote Execution Service (RES)."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -30,3 +31,6 @@ ignored = [
     "prost-build",
     "tonic-prost-build",
 ]
+
+[lints]
+workspace = true

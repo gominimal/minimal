@@ -9,11 +9,21 @@ ignore = [
     "RUSTSEC-2024-0436",
     # Bitmaps unmaintained
     "RUSTSEC-2026-0247",
+    # imbl-sized-chunks < 0.2.0 double-frees when an element's Drop panics
+    # mid-removal. Reached via nickel-lang-core -> nickel-lang-vector, which
+    # stores nickel values whose Drop impls only decrement a refcount. Fixed
+    # in 0.2.0, but nickel master still pins "0.1"; drop this ignore once a
+    # nickel rev carrying the 0.2 bump is pinned in Cargo.toml.
+    "RUSTSEC-2026-0292",
+    # serde_yaml 0.9 (deprecated) -> unsafe-libyaml, unmaintained; reached via
+    # nickel-lang-core. Drop once nickel moves off serde_yaml.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
 unused-allowed-license = "deny"
 allow = [
+    "0BSD",
     "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0",
     "BSD-2-Clause",
@@ -29,7 +39,7 @@ allow = [
 
 # LGPL exceptions, documented in docs/internal/licensing.md:
 # - hakoniwa: LGPL-3.0-only WITH LGPL-3.0-linking-exception — the linking
-#   exception permits static linking; Linux-only footprint (sandbox2/minimald).
+#   exception permits static linking; Linux-only footprint (sandbox/minimald).
 # - malachite family: LGPL-3.0-only, statically linked, pulled in via the
 #   nickel-lang-core git dependency; stance is document-and-accept (complete
 #   corresponding source is public and relinkable, satisfying LGPL-3.0 §4).
@@ -71,4 +81,13 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
+    # smoltcp -> heapless 0.9, beside postcard's 0.7
+    { name = "heapless", version = "0.9.3" },
+]
+deny = [
+    # bitmaps is pinned below 3.2.0 in Cargo.lock because 3.2.x is affected by
+    # RUSTSEC-2025-0167 (unsound, no patched release). Remove together with
+    # the RUSTSEC-2026-0292 ignore once nickel moves to imbl-sized-chunks 0.2,
+    # which drops bitmaps.
+    { crate = "bitmaps:>=3.2.0", reason = "RUSTSEC-2025-0167: keep bitmaps pinned below 3.2.0" },
 ]

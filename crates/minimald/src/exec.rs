@@ -23,14 +23,19 @@ use russh::{
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    spawn,
 };
 use tracing::Instrument as _;
+
+// Every task this module spawns carries the caller's span (TEL-022): the
+// clippy `disallowed-methods` for the crate names tokio's own spawn.
+use crate::traced::spawn;
+
+use diagnostics::redact::scrub_secrets;
 
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
@@ -86,7 +91,12 @@ pub trait Process: Send + 'static {
 #[derive(Debug, Clone)]
 pub struct TaskExec {
     pub task: String,
-    pub args: Option<args::ArgsSet>,
+    /// The task's declared arguments, as the client typed them after the
+    /// task name. Parsed against the task's `args` schema in
+    /// [`task_producer`], where the schema is first available. Empty when
+    /// the client sent none — an older `min`, or a task that declares no
+    /// args — in which case the task's defaults apply.
+    pub args: Vec<String>,
     /// The task's `env_vars`, already resolved against the invoking shell
     /// by the client and carried on the channel environment (see
     /// [`minimald_rpc::taskenv`]). Applied over the task's own
@@ -106,6 +116,39 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// The client's invocation directory relative to the uploaded tree,
+    /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
+    /// is absolute or holds a `..`. A task that declares `inherit_cwd`
+    /// starts there (see [`task_start_dir`]); empty means the root.
+    pub cwd: String,
+}
+
+/// Where a task starts inside its session-layout sandbox, when not at the
+/// default `/workbench`.
+///
+/// `Ok(Some(dir))` is `/workbench/<cwd>` for a task that declares
+/// `inherit_cwd` when `<cwd>` is a directory of the uploaded tree at
+/// `working`. `Ok(None)` keeps the default: the task does not inherit, or
+/// the client ran from the root. `Err(notice)` also keeps the default, with
+/// the one-line notice to show on the task's stderr: the directory is not in
+/// the uploaded tree (an upload that was skipped, or a path the upload
+/// excluded).
+fn task_start_dir(
+    inherit_cwd: bool,
+    cwd: &str,
+    working: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !inherit_cwd || cwd.is_empty() {
+        return Ok(None);
+    }
+    if working.join(cwd).is_dir() {
+        Ok(Some(format!("/{}/{cwd}", sandbox::SESSION_DEFAULT_WD)))
+    } else {
+        Err(format!(
+            "minimal: {cwd} is not in the uploaded tree; running the task at /{}\n",
+            sandbox::SESSION_DEFAULT_WD
+        ))
+    }
 }
 
 impl Exec for TaskExec {
@@ -125,7 +168,7 @@ impl Exec for TaskExec {
         // spawned child has finished — which is exactly when the
         // consumer drops the stream, the channels close, this task
         // exits, and `env` falls out of scope.
-        tokio::spawn(task_producer(self, session, req_rx, proc_tx));
+        crate::traced::spawn(task_producer(self, session, req_rx, proc_tx));
 
         // Pull-based stream: each `poll_next` sends a request and waits
         // for the producer's response. `None` from either channel ends
@@ -137,6 +180,165 @@ impl Exec for TaskExec {
         })
         .boxed()
     }
+}
+
+/// The network a task gets: the provider for its session's mode (017-005),
+/// carrying the session's *effective* egress (NET-074) — a task in an
+/// own-address session runs under whatever the session's own gate enforces:
+/// the deny-all default in force, allow-all behind the opt-out — and none of
+/// its ingress. Shared by the two ways a
+/// task starts — over an exec channel here, and from inside the session
+/// (`env::SessionChannel::run_task`).
+///
+/// The mode, not the identity: an own-IP task is a second PTask beside the
+/// session's, on the same switch at the same time, so it registers under its
+/// own name and carries none of the session's ingress — forwards a task
+/// applied would come down again at its teardown. It carries no registry
+/// handle either: a task owns no proxy route of its own, so no lease is ever
+/// reported for it. `phase` is the rollout phase to resolve the egress under
+/// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
+/// build ships, while the tests pass the phase by name so each arm's posture
+/// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// read through the session handle so a task resolves its egress exactly as
+/// the launcher did. It carries no classifier decision either (NET-079):
+/// a task places no leaf in the cohort's subtrees, so no per-box verdict
+/// is its plan's to follow.
+///
+/// A gate is attached only where that egress has rules to enforce: the
+/// deny-all section the in-force default resolves an absent declaration to,
+/// or the box's own declaration. An absent section — the allow-all the
+/// opt-out (or the announced phase) leaves in place — passes `None`, as
+/// every task did before the deny-all default: a gate with no ingress
+/// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
+/// so attaching one where nothing needs gating would change behaviour the
+/// opt-out exists to keep.
+pub(crate) fn task_network(
+    record: &sessions::Record,
+    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    phase: sessions::EgressDefaultPhase,
+    deny_all_opt_out: bool,
+) -> std::sync::Arc<dyn sandbox::Network> {
+    let id = record.id.to_string();
+    let session = record.name.as_deref().unwrap_or(&id);
+    let egress = crate::session::effective_egress_section(
+        &record.policy,
+        record.network,
+        phase,
+        deny_all_opt_out,
+    );
+    crate::net::provider::task_network_for(
+        record.network,
+        switch,
+        &format!("{session}-task"),
+        egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
+        // Never the record's handed box addresses (T66): the task's sandbox
+        // is not the box the registration named — attaching it at the
+        // session box's address would key its frames to the session's row.
+        // A task attaches at one of the task addresses the same
+        // registration filed with the box (NET-138), each a host-side row
+        // carrying the box's id and egress, so no daemon-side draw happens
+        // once a control socket exists. A native daemon, whose record holds
+        // none, draws from its reserve (`crate::net::self_allocation_run`);
+        // an in-VM one refuses the draw (`SwitchClient::attach`). There is
+        // no classifier decision to carry (NET-079): a task places no leaf
+        // in the cohort's subtrees.
+        record.task_addresses.clone(),
+    )
+}
+
+/// Refuses a task run of a registered box whose host-side row is not its
+/// own any more (NET-138): a task attaches at one of the task addresses
+/// filed with the box's row, and those task rows stand exactly as long as
+/// the box's row, so the run asks the VM host daemon whether the row of
+/// the box's id still stands at its switch address before it attaches. A
+/// row the host handed another box at that address answers no, so the run
+/// never attaches under another box's row. A record that names no box id,
+/// and a host that cannot be asked, read as no row: fail-closed. A box the
+/// host registered nothing for (a native host, a `host_ip` or `none` box)
+/// asks nothing.
+async fn ensure_task_rows_stand(
+    record: &sessions::Record,
+    switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
+) -> io::Result<()> {
+    let Some(addresses) = record.box_addresses else {
+        return Ok(());
+    };
+    let standing = match record.box_id {
+        Some(box_id) => {
+            let control = crate::session::switch_control_of(switch).await;
+            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
+                .await
+                == Some(true)
+        }
+        None => false,
+    };
+    if standing {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "box {}'s row on the VM host has ended, so a task run in it would reach \
+             nothing; destroy and re-activate the session",
+            record.name.as_deref().unwrap_or("(unnamed)")
+        )))
+    }
+}
+
+/// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
+/// be tested without a container.
+trait Reapable {
+    /// Kill the process and wait for it, so it does not outlive its sandbox.
+    fn kill_and_reap(&mut self);
+}
+
+impl Reapable for hakoniwa::Child {
+    fn kill_and_reap(&mut self) {
+        // `wait` runs regardless of `kill`: the process may have already exited.
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+}
+
+/// Step 3 of a task launch: wire the process's namespace, or kill and reap the
+/// process so it does not run on with the network it failed to get — as
+/// `sandbox::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
+async fn attach_or_reap<P: Reapable>(
+    planned: sandbox::PlannedLaunch,
+    spawned: sandbox::Spawned,
+    child: &mut P,
+) -> io::Result<Box<dyn sandbox::NetGuard>> {
+    match planned.attach(spawned).await {
+        Ok(guard) => Ok(guard),
+        Err(e) => {
+            child.kill_and_reap();
+            Err(io::Error::other(format!(
+                "attaching the task network failed: {e}"
+            )))
+        }
+    }
+}
+
+/// Parse a task run's argv against the task's declared `args` schema.
+///
+/// Returns `None` when the task declares no args (nothing to bind), and
+/// `Some` otherwise — even for an empty argv, which `parse_argv_named`
+/// fills with the task's defaults. This mirrors the in-sandbox path in
+/// `mctx::env`, so a task using `%{arg}` resolves the same way whether it
+/// runs in-box or through the daemon.
+///
+/// `name` is the task's name, so a usage error shows the command the user
+/// can copy (`min task run <name> --arg <value>`), as `mip run` does.
+fn parse_task_args(
+    name: &str,
+    task: &mfile::Task,
+    argv: &[String],
+) -> Result<Option<args::ArgsSet>, String> {
+    if task.args.is_empty() {
+        return Ok(None);
+    }
+    task.args
+        .parse_argv_named(&format!("min task run {name}"), argv.iter().cloned())
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
@@ -162,7 +364,9 @@ async fn task_producer(
         if let Some(task) = ctx.minimal_file().task(&exec.task)
             && task.action.as_echo().is_some()
         {
-            let task = mctx::interpolate_task_strings(&task, exec.args.as_ref())
+            let parsed_args = parse_task_args(&exec.task, &task, &exec.args)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let task = mctx::interpolate_task_strings(&task, parsed_args.as_ref())
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let text = task.action.as_echo().unwrap_or_default().to_string();
             if req_rx.recv().await.is_some() {
@@ -179,7 +383,7 @@ async fn task_producer(
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
-        let (mut ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (mut ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
             (ctx, r)
         })
@@ -190,6 +394,12 @@ async fn task_producer(
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // Parse the client's args against the task's declared schema. This
+        // is where the schema is first available: the dispatch arm only has
+        // the raw argv off the wire. An empty argv still parses, applying
+        // the task's defaults — the all-defaults case the issue reports.
+        let parsed_args = parse_task_args(&exec.task, &task, &exec.args)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         // Values the client resolved against the invoking shell win over the
         // task's own declarations. That is what turns `{ inherit = true }`
         // into something the daemon can apply: resolving it here would read
@@ -207,28 +417,33 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
-        // A task inherits its session's network isolation, through the same
-        // sandbox2 `Network` seam the interactive session uses, rather than the
-        // old hardcoded `HostNet` (which leaked host egress to a no-net
-        // session's tasks). `NoNet`/`HostNet` are fully handled by sandbox2's
-        // netns decision. `OwnIp` additionally needs the per-PTask tap/switch
-        // attach (as `attach_own_ip` does for sessions); wiring that into the
-        // task-exec producer/consumer is a follow-up (and is blocked by the
-        // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
-        // falls back to `HostNet` here instead of running in an empty,
-        // egress-less netns.
-        let network_mode = match session.record().await?.network {
-            m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
-            // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
-            // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
-            // so any future mode also takes the safe HostNet default.
-            _ => sandbox2::NetworkMode::HostNet,
-        };
+        let record = session.record().await?;
+        let switch = session.net_switch().await?;
+        ensure_task_rows_stand(&record, &switch).await?;
+        let network = task_network(
+            &record,
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            session.deny_all_opt_out().await?,
+        );
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
         // dropped package-declared files onto the read-only rootfs (#1204).
-        let session_home = session.paths().await?.home;
+        // The task then runs in the session layout (home at `/home`, tree at
+        // `/workbench`), and a patch that expanded into either directory is
+        // mounted at the matching path there, keeping its declared mode.
+        let session_paths = session.paths().await?;
+        // `inherit_cwd`: start where the client was invoked, inside the
+        // uploaded tree, or fall back to the root with a notice.
+        let (start_dir, mut start_notice) = match task_start_dir(
+            task.inherit_cwd,
+            &exec.cwd,
+            session_paths.working.as_utf8_path().as_std_path(),
+        ) {
+            Ok(dir) => (dir, None),
+            Err(notice) => (None, Some(notice)),
+        };
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -238,18 +453,19 @@ async fn task_producer(
                 Some(&task.patch),
                 Some(&task.vars),
                 task.packages.clone(),
-                network_mode,
-                mctx::PatchHome::Session(session_home),
+                network,
+                mctx::PatchHome::Session(session_paths.home.clone()),
+                mctx::WdLayout::Session {
+                    home: session_paths.home.as_utf8_path().to_path_buf().into(),
+                    working: session_paths.working.as_utf8_path().to_path_buf().into(),
+                },
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
         let (_interactive, invocations) = env
-            .task_invocations(&task, exec.args.as_ref())
+            .task_invocations(&task, parsed_args.as_ref())
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let container = env
-            .container()
-            .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
 
         for inv in invocations {
             // Wait for the consumer to ask. `None` means the consumer
@@ -257,25 +473,45 @@ async fn task_producer(
             if req_rx.recv().await.is_none() {
                 return Ok(());
             }
-            let result = (|| -> io::Result<TaskProcess> {
+            let result = async {
+                // One plan, container and attach per invocation: hakoniwa
+                // unshares per `spawn()`, so each needs its own address.
+                let planned = env.plan_launch().await.map_err(|e| {
+                    io::Error::other(format!("planning the task network failed: {e}"))
+                })?;
+                let container = env
+                    .container(planned.plan())
+                    .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
+                if let Some(dir) = &start_dir {
+                    cmd.current_dir(dir);
+                }
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
-                let child = cmd
+                let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child)))
-            })();
+                let spawned = sandbox::Spawned::from_child(&mut child);
+                let guard = attach_or_reap(planned, spawned, &mut child).await?;
+                let mut process = HakoniwaProcess::new(child, guard);
+                // The fallback notice leads the first invocation's stderr.
+                process.stderr_notice = start_notice.take();
+                Ok(TaskProcess::Sandbox(process))
+            }
+            .await;
             if let Err(send_err) = proc_tx.send(result).await {
                 // Receiver dropped between our `recv` returning `Some`
                 // and our `send`. If we just spawned a child, kill it
                 // before `env` drops so it doesn't outlive its sandbox
-                // rootfs.
+                // rootfs — and reap it, which is what releases its network.
                 if let Ok(mut proc) = send_err.0 {
                     let _ = proc.start_kill();
+                    crate::traced::spawn(async move {
+                        let _ = proc.wait().await;
+                    });
                 }
                 return Ok(());
             }
@@ -314,6 +550,58 @@ async fn task_producer(
 pub struct HakoniwaProcess {
     pid: libc::pid_t,
     state: WaitState,
+    /// The network wiring this task's namespace got, released at the end of
+    /// [`wait`](Process::wait).
+    net: NetRelease,
+    /// A line the daemon shows ahead of the child's own stderr, such as the
+    /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
+    stderr_notice: Option<String>,
+}
+
+/// The release of a task's network, owed once its process is gone.
+///
+/// [`Process::wait`] is polled inside a `select!` and may be dropped at any
+/// await, so the teardown cannot be awaited in place: dropped mid-teardown, a
+/// guard would never detach. It runs on its own task instead, and `wait`
+/// awaits the handle, which survives being dropped and re-awaited.
+struct NetRelease {
+    guard: Option<Box<dyn sandbox::NetGuard>>,
+    /// The teardown in flight, once started.
+    running: Option<JoinHandle<()>>,
+}
+
+impl Drop for NetRelease {
+    /// A process dropped before its `wait` completed — an aborted bridge —
+    /// still owes its network back. `Drop` cannot await, so the teardown goes
+    /// onto the runtime; with none running there is nothing to release to.
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(guard.teardown());
+        }
+    }
+}
+
+impl NetRelease {
+    fn new(guard: Box<dyn sandbox::NetGuard>) -> Self {
+        Self {
+            guard: Some(guard),
+            running: None,
+        }
+    }
+
+    /// Runs the teardown to completion, once. Cancel-safe: a dropped call
+    /// leaves the teardown running, and the next call waits for it.
+    async fn release(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            self.running = Some(crate::traced::spawn(guard.teardown()));
+        }
+        if let Some(running) = &mut self.running {
+            let _ = running.await;
+            self.running = None;
+        }
+    }
 }
 
 enum WaitState {
@@ -337,10 +625,12 @@ enum WaitState {
 }
 
 impl HakoniwaProcess {
-    fn new(child: hakoniwa::Child) -> Self {
+    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
+            net: NetRelease::new(net_guard),
+            stderr_notice: None,
         }
     }
 }
@@ -370,7 +660,7 @@ impl Process for HakoniwaProcess {
                 unreachable!();
             };
             let mut child = *child;
-            self.state = WaitState::Waiting(tokio::task::spawn_blocking(move || child.wait()));
+            self.state = WaitState::Waiting(crate::traced::spawn_blocking(move || child.wait()));
         }
 
         // Waiting → Exited / Failed. The `await` is the cancel point —
@@ -386,6 +676,10 @@ impl Process for HakoniwaProcess {
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
         }
+
+        // Terminal either way, so the network goes back now — on the `Failed`
+        // arm too, where the process is equally gone.
+        self.net.release().await;
 
         match &self.state {
             WaitState::Exited(code) => Ok(*code),
@@ -427,6 +721,8 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => {
                 let (i, o, e) = p.take_stdio()?;
+                let notice = p.stderr_notice.take().unwrap_or_default();
+                let e = std::io::Cursor::new(notice.into_bytes()).chain(e);
                 Some((Box::pin(i), Box::pin(o), Box::pin(e)))
             }
             TaskProcess::Echo(p) => p.take_stdio(),
@@ -499,6 +795,11 @@ pub struct TokioExec {
     pub argv: String,
     pub cwd: DaemonAbsPath,
     pub env: BTreeMap<String, String>,
+    /// Environment variables to strip from the child process. Used to
+    /// keep Git repository-location variables inherited from the daemon
+    /// from redirecting `git init` / `git upload-pack` away from the
+    /// session workspace.
+    pub drop_env: BTreeSet<String>,
 }
 
 impl Exec for TokioExec {
@@ -515,10 +816,36 @@ impl Exec for TokioExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            cmd.spawn().map(TokioProcess)
+            for name in &self.drop_env {
+                cmd.env_remove(name);
+            }
+            cmd.spawn().map(TokioProcess::new)
         })
         .boxed()
     }
+}
+
+/// Git environment variables that relocate a repository away from the
+/// process working directory. Inheriting any of these from the daemon
+/// would make `git init` / `git upload-pack` target a repository other
+/// than the session workspace, so they are stripped from the child
+/// process.
+fn git_repo_location_env() -> BTreeSet<String> {
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_QUARANTINE_PATH",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// What to run inside the session, and whether a shell stands between the
@@ -556,6 +883,9 @@ impl SessionProgram {
 #[derive(Debug, Clone)]
 pub struct SessionExec {
     pub program: SessionProgram,
+    /// Variables layered over the session's own for this one process: the
+    /// exec's `TRACEPARENT` on telemetry opt-in ([`minimald_rpc::taskenv::trace_env`]).
+    pub extra_env: BTreeMap<String, String>,
     /// The SSH username, needed only if the session has no host running and one
     /// has to be launched to service this request.
     pub conn_username: String,
@@ -579,7 +909,9 @@ impl Exec for SessionExec {
                 .await
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             let (program, args) = self.program.argv();
-            let command = host.command_in_session(&program, &args).await?;
+            let command = host
+                .command_in_session_env(&program, &args, self.extra_env)
+                .await?;
 
             let mut command = Command::from(command);
             command
@@ -590,7 +922,7 @@ impl Exec for SessionExec {
             // This spawns the shim — us, re-exec'd — not the user's command, so
             // a bare ENOENT reads as a missing shell. Name the path (#1175).
             let shim = command.as_std().get_program().to_owned();
-            command.spawn().map(TokioProcess).map_err(|e| {
+            command.spawn().map(TokioProcess::shim).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -606,7 +938,37 @@ impl Exec for SessionExec {
 
 /// `Process` implementation backed by [`tokio::process::Child`].
 #[derive(Debug)]
-pub struct TokioProcess(Child);
+pub struct TokioProcess {
+    child: Child,
+    /// Whether [`Process::start_kill`] sends SIGTERM, with a SIGKILL
+    /// escalation in [`Process::wait`], rather than an immediate SIGKILL.
+    /// Only the injection shim handles SIGTERM by killing its whole process
+    /// group; any other child gets the immediate SIGKILL.
+    graceful: bool,
+    /// Whether a graceful [`Process::start_kill`] has asked the child to
+    /// exit, which arms the escalation in [`Process::wait`].
+    terminating: bool,
+}
+
+impl TokioProcess {
+    /// A child that [`Process::start_kill`] SIGKILLs at once.
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            graceful: false,
+            terminating: false,
+        }
+    }
+
+    /// The injection shim, which [`Process::start_kill`] SIGTERMs so its
+    /// handler can kill the injected process's whole group.
+    fn shim(child: Child) -> Self {
+        Self {
+            graceful: true,
+            ..Self::new(child)
+        }
+    }
+}
 
 impl Process for TokioProcess {
     type Stdin = ChildStdin;
@@ -615,18 +977,53 @@ impl Process for TokioProcess {
 
     fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
         Some((
-            self.0.stdin.take()?,
-            self.0.stdout.take()?,
-            self.0.stderr.take()?,
+            self.child.stdin.take()?,
+            self.child.stdout.take()?,
+            self.child.stderr.take()?,
         ))
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        self.0.wait().await.map(|s| s.code())
+        // Never asked to die: a plain wait, as before.
+        if !self.terminating {
+            return self.child.wait().await.map(|s| s.code());
+        }
+        // Longer than the shim's own grace period for the group, so the shim
+        // always delivers the group's SIGKILL itself; this one is the fallback
+        // for a wedged shim (see `nsenter::GROUP_GRACE`).
+        match tokio::time::timeout(crate::nsenter::SHIM_ESCALATION, self.child.wait()).await {
+            Ok(status) => status.map(|s| s.code()),
+            // The shim did not exit: escalate to SIGKILL and wait it out.
+            Err(_elapsed) => {
+                self.child.start_kill()?;
+                self.child.wait().await.map(|s| s.code())
+            }
+        }
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
-        self.0.start_kill()
+        if !self.graceful {
+            return self.child.start_kill();
+        }
+        // The shim is the direct child; SIGTERM reaches it and, through the
+        // handler it installs, its whole process group, which the shim SIGKILLs
+        // after its grace period. If the shim itself does not exit within
+        // `SHIM_ESCALATION`, `wait` escalates to SIGKILL (above).
+        // `id()` is `None` once the child has been reaped; nothing to signal.
+        if let Some(pid) = self.child.id() {
+            // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
+            // async-signal-safe and has no Rust-side invariants.
+            if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
+                let err = io::Error::last_os_error();
+                // ESRCH means it already exited between `id()` and `kill`; that
+                // is success, not an error the caller must handle.
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(err);
+                }
+            }
+        }
+        self.terminating = true;
+        Ok(())
     }
 }
 
@@ -647,24 +1044,126 @@ struct ExecTask<S: Exec> {
 }
 
 impl<S: Exec> ExecTask<S> {
-    pub async fn run(self, channel: Channel<Msg>) {
-        let (mut rs, ws) = channel.split();
+    /// Drives the exec to completion over the channel and reports the
+    /// SSH-encoded exit code it ended with. The status is on the wire and
+    /// the channel is closed once this returns — the point at which a box
+    /// created for the run can end (NET-131).
+    pub async fn run(self, channel: Channel<Msg>) -> u32 {
+        let (rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
         let mut w = ws.make_writer();
         let mut e = ws.make_writer_ext(Some(1));
-        let mut r = rs.make_reader();
+
+        // Drive `rs.wait()` directly rather than `rs.make_reader()` so we
+        // see `ChannelMsg::Close` and `None` (sender dropped) — the signals
+        // that the SSH client is gone. `make_reader()` reduces the read half
+        // to a bare `AsyncRead`, which only surfaces `ChannelMsg::Data` and
+        // `ChannelMsg::Eof`; a lost client then looks like a normal stdin
+        // EOF, and a silent child (sleep, quiet build) keeps running
+        // indefinitely (gominimal/inbox#813).
+        // An in-memory pipe: unlike pipe(2) it cannot fail (no fds to run
+        // out of), and dropping the pump's half still gives the bridge EOF.
+        let (stdin_tx, mut stdin_rx) = tokio::io::duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = watch::channel(false);
+
+        let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
+            rs.wait().await.map(|msg| (msg, rs))
+        }));
+        let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
 
         let stream = self.exec.exec(self.session.clone());
-        let exit_status = bridge(self.channel_id, stream, &mut r, &mut w, &mut e).await;
+        let mngr = self.serv.sessions_manager().await;
+        let exit_status = bridge_noting_shutdown(
+            self.channel_id,
+            stream,
+            &mut stdin_rx,
+            &mut w,
+            &mut e,
+            client_lost_rx,
+            || mngr.is_shutting_down(),
+        )
+        .await;
 
+        pump.abort();
         let _ = w.flush().await;
         let _ = e.flush().await;
 
-        drop(r);
+        drop(stdin_rx);
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        exit_status
+    }
+}
+
+/// The line an exec the daemon's shutdown ended leaves on stderr, so the
+/// client is told why its command stopped rather than handed a bare 137.
+const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
+
+/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
+/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+///
+/// `shutting_down` is asked once the bridge returns. It reads the sessions
+/// manager's shutdown state, which is set before the manager stops any box,
+/// rather than the server's shutdown token, which is cancelled only after the
+/// manager is done and so after the command is already gone.
+async fn bridge_noting_shutdown<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<bool>,
+    shutting_down: impl FnOnce() -> bool,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
+    if shutting_down() {
+        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    }
+    exit_status
+}
+
+/// Forwards the SSH channel's read half into the exec's stdin pipe and
+/// reports when the client is gone.
+///
+/// `Data` is written to `stdin`. `Eof` closes `stdin` (the child sees
+/// EOF) but keeps watching the channel: `min task run` from a terminal
+/// half-closes stdin straight away, so a disconnect almost always
+/// arrives *after* EOF and must still be seen. `Close`, or the end of
+/// `msgs` (the channel's sender dropped with the connection), sets
+/// `client_lost` to `true` and returns.
+async fn pump_channel_input<M, W>(mut msgs: M, stdin: W, client_lost: watch::Sender<bool>)
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stdin = Some(stdin);
+    loop {
+        match msgs.next().await {
+            Some(russh::ChannelMsg::Data { data }) => {
+                // A failed write means the pipe's read end is gone; drop
+                // the data but keep watching for a disconnect.
+                if let Some(w) = stdin.as_mut()
+                    && w.write_all(&data).await.is_err()
+                {
+                    stdin = None;
+                }
+            }
+            Some(russh::ChannelMsg::Eof) => stdin = None,
+            Some(russh::ChannelMsg::Close) | None => {
+                let _ = client_lost.send(true);
+                return;
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -675,6 +1174,11 @@ impl<S: Exec> ExecTask<S> {
 /// the whole sequence; only child stdio is re-grabbed per step. If the
 /// SSH client sends stdin EOF mid-sequence, subsequent children get
 /// immediate EOF on their stdin without us having to keep reading.
+///
+/// `client_lost` is a watch receiver set to `true` when the SSH client
+/// disconnects (channel close or sender drop). The bridge kills the
+/// current child and stops the sequence when it fires, whatever exit
+/// code that child reports.
 ///
 /// On any non-zero exit the sequence stops and that code is returned —
 /// matching `set -e` shell semantics for chained task invocations. If
@@ -690,6 +1194,7 @@ async fn bridge<S, P, R, W, E>(
     r: &mut R,
     w: &mut W,
     e: &mut E,
+    mut client_lost: watch::Receiver<bool>,
 ) -> u32
 where
     P: Process,
@@ -716,8 +1221,20 @@ where
                 break;
             }
         };
-        last_exit = bridge_one(channel_id.clone(), process, r, w, e, &mut stdin_open).await;
-        if last_exit != 0 {
+        last_exit = bridge_one(
+            channel_id.clone(),
+            process,
+            r,
+            w,
+            e,
+            &mut stdin_open,
+            &mut client_lost,
+        )
+        .await;
+        // `changed()` fires once per transition, so a later step would
+        // never see a disconnect an earlier step already consumed: a child
+        // that exits 0 just as the client goes must still end the sequence.
+        if last_exit != 0 || *client_lost.borrow() {
             break;
         }
     }
@@ -741,8 +1258,8 @@ where
 /// unaffected.
 ///
 /// So the loop ends on the *first* of: both output streams at EOF, the
-/// child exiting, or an SSH-channel write failing. On child exit we
-/// then, in order:
+/// child exiting, the SSH client disconnecting, or an SSH-channel write
+/// failing. On child exit we then, in order:
 ///
 /// 1. **Drain what is already buffered** ([`drain_ready`]): everything
 ///    the child wrote before exiting is sitting in the pipe and still
@@ -756,20 +1273,24 @@ where
 ///
 /// The trade is that a grandchild's output after we return is silently
 /// discarded; `nohup cmd >/dev/null 2>&1 &` is the way to detach
-/// cleanly (documented in `docs/reference/cli-min.md`).
+/// cleanly (documented in `docs/reference/cli-min.md`). A `nohup`'d job
+/// stays in the exec's process group, which a client lost mid-exec ends
+/// (see `nsenter::GROUP_GRACE`), so a job that must survive the client
+/// going away is started with `setsid`: `setsid nohup cmd >/dev/null 2>&1 &`.
 ///
 /// Polling the I/O sources in a single `select!` lets a slow consumer
 /// on one side apply backpressure without starving the others, which is
 /// why the branches stay unbiased rather than ranking `process.wait()`
 /// last. The cost is that `wait` can win a race against readable
 /// output; step 1 is what makes that harmless. Nothing is lost to the
-/// branches `select!` cancels either way: `read` is cancel-safe, and
-/// the SSH writes live in branch *handlers*, which run after the
-/// `select!` has already resolved.
+/// branches `select!` cancels either way: `read` and the child-stdin
+/// `write` are cancel-safe, and the SSH-channel writes live in branch
+/// *handlers*, which run after the `select!` has already resolved.
 ///
-/// On an SSH-channel write failure we stop and `start_kill` the child:
-/// with no one reading its output the pipe buffer would fill, the child
-/// would block on write, and `wait` would never resolve.
+/// On an SSH-channel write failure or client disconnect we stop and
+/// `start_kill` the child: with no one reading its output the pipe
+/// buffer would fill, the child would block on write, and `wait` would
+/// never resolve.
 ///
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
@@ -781,6 +1302,7 @@ async fn bridge_one<P, R, W, E>(
     w: &mut W,
     e: &mut E,
     stdin_open: &mut bool,
+    client_lost: &mut watch::Receiver<bool>,
 ) -> u32
 where
     P: Process,
@@ -809,6 +1331,13 @@ where
     // signal, since anything still holding the pipes open past this
     // point is a grandchild we do not wait for.
     let mut child_exit: Option<io::Result<Option<i32>>> = None;
+    // Cleared once the client-loss sender is dropped without signalling:
+    // `changed()` would then resolve `Err` on every poll and spin the loop.
+    let mut client_watch_open = true;
+    // A stdin read parked behind a full child pipe. The bytes are copied
+    // out of `stdin_buf` because the read branch borrows it on the next
+    // iteration. Cleared by the write branch as it drains the slice.
+    let mut pending: Option<(Vec<u8>, usize)> = None;
 
     while (stdout_open || stderr_open) && !ssh_write_failed && child_exit.is_none() {
         tokio::select! {
@@ -816,8 +1345,11 @@ where
             // stdin pipe broke mid-step (write failure below) we stop
             // reading from `r` for the rest of this step, but leave
             // `*stdin_open` set so the next child in the sequence picks
-            // up where we left off.
-            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() => {
+            // up where we left off. Gated on a drained `pending` so at
+            // most one chunk the child has not accepted is ever queued.
+            // `select!` evaluates every gate before it builds any branch
+            // future, so a gate may borrow what a future later holds.
+            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() && pending.is_none() => {
                 match read_res {
                     Ok(0) => {
                         *stdin_open = false;
@@ -834,14 +1366,43 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        if let Some(cs) = child_stdin.as_mut()
-                            && let Err(err) = cs.write_all(&stdin_buf[..n]).await
-                        {
-                            tracing::warn!(
-                                %channel_id, error = %err,
-                                "exec: failed to write stdin to child; closing child stdin",
-                            );
-                            child_stdin = None;
+                        pending = Some((stdin_buf[..n].to_vec(), 0));
+                    }
+                }
+            }
+            // Drives a parked stdin write to the child from inside the
+            // select, so a slow child cannot keep the loop from polling
+            // the child's stdout and stderr. `write` is cancel-safe: a
+            // branch that loses the select loses nothing the child has
+            // not already accepted, which the offset below accounts for.
+            write_res = async {
+                match (child_stdin.as_mut(), pending.as_mut()) {
+                    (Some(cs), Some((data, offset))) => cs.write(&data[*offset..]).await,
+                    _ => std::future::pending::<io::Result<usize>>().await,
+                }
+            }, if pending.is_some() && child_stdin.is_some() => {
+                match write_res {
+                    Ok(0) => {
+                        tracing::warn!(
+                            %channel_id,
+                            "exec: child accepted zero bytes of stdin; closing child stdin",
+                        );
+                        child_stdin = None;
+                        pending = None;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            %channel_id, error = %err,
+                            "exec: failed to write stdin to child; closing child stdin",
+                        );
+                        child_stdin = None;
+                        pending = None;
+                    }
+                    Ok(n) => {
+                        let (data, offset) = pending.as_mut().expect("gated on a pending write");
+                        *offset += n;
+                        if *offset >= data.len() {
+                            pending = None;
                         }
                     }
                 }
@@ -894,13 +1455,31 @@ where
             // `drain_ready` covers. Nothing here touches `process`, so
             // the `&mut process` this future holds is uncontended.
             status = process.wait() => child_exit = Some(status),
+
+            // The SSH client disconnected (channel close or sender
+            // drop). Kill the child and stop — same path as a failed
+            // SSH write (gominimal/inbox#813).
+            res = client_lost.changed(), if client_watch_open => {
+                if res.is_err() {
+                    client_watch_open = false;
+                } else if *client_lost.borrow() {
+                    tracing::warn!(
+                        %channel_id,
+                        "exec: ssh client disconnected; killing child",
+                    );
+                    ssh_write_failed = true;
+                }
+            }
         }
     }
+    // Stdin still in `pending` when the child exits or both output pipes
+    // close is dropped here, as bytes left unread in the child's pipe are.
 
     // Nobody is reading the child's output any more, so it would wedge
     // on a full pipe and never be reapable. Kill, then fall through to
     // the `wait` below.
     if ssh_write_failed {
+        // A `--detach` exec, if one is ever added, must not reach this client-loss kill.
         let _ = process.start_kill();
     }
 
@@ -948,7 +1527,29 @@ where
 
     let status = match child_exit {
         Some(status) => status,
-        None => process.wait().await,
+        // Already killed, or no disconnect signal left to watch.
+        None if ssh_write_failed || !client_watch_open => process.wait().await,
+        // The loop also ends when the child closes stdout and stderr but
+        // keeps running; a disconnect from then on must still kill it.
+        None => {
+            tokio::select! {
+                status = process.wait() => status,
+                // Reduced to a bool in the branch: the `watch::Ref` it
+                // yields is not `Send` and must not live across the wait.
+                lost = async { client_lost.wait_for(|lost| *lost).await.is_ok() } => {
+                    if lost {
+                        tracing::warn!(
+                            %channel_id,
+                            "exec: ssh client disconnected; killing child",
+                        );
+                        // A `--detach` exec, if one is ever added, must not reach this
+                        // client-loss kill.
+                        let _ = process.start_kill();
+                    }
+                    process.wait().await
+                }
+            }
+        }
     };
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
@@ -1069,7 +1670,10 @@ where
         %channel_id,
         "exec: child exited with its stdio still held open; draining in the background",
     );
-    spawn(async move {
+    // Detached: a grandchild holding the pipes can keep this draining for
+    // as long as it likes, and the exec's span must not stay open for it.
+    let drain = tracing::info_span!(parent: None, "exec.drain", %channel_id);
+    crate::traced::spawn_detached(drain, async move {
         async fn discard<S: AsyncRead + Unpin>(src: Option<S>) {
             let Some(mut src) = src else { return };
             let mut buf = [0u8; 8 * 1024];
@@ -1095,6 +1699,8 @@ where
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
 ///    with the trailing session ID. Matched before the vocabulary below, and
 ///    not part of it: git speaks the pack protocol, not exec requests.
+///  * `git-upload-pack min://<session ID>` - handles a git upload-pack, routing
+///    with the trailing session ID the same way.
 ///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
 ///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
 ///    `min://package/build` and `min://check` — are each routed via a
@@ -1131,6 +1737,10 @@ pub(crate) async fn handle_exec(
         return handle_git_receive(ident, serv, conn, id, session, channel, config).await;
     }
 
+    if let Some(ident) = argv.strip_prefix("git-upload-pack min://") {
+        return handle_git_upload(ident, serv, conn, id, session, channel, config).await;
+    }
+
     if config.pty.is_some() {
         tracing::warn!("channel {id}: pty requested but not yet supported",);
         session.channel_failure(id)?;
@@ -1153,8 +1763,21 @@ pub(crate) async fn handle_exec(
         return Ok(());
     };
 
+    // The exec span (which adopts the client's TRACEPARENT) is opened before
+    // the session lookup, so the manager's GetSession is a child of the
+    // caller's trace instead of a root of its own.
+    let (span, traceparent) = exec_span(&config, session_id, &argv);
+    let trace_env = minimald_rpc::taskenv::trace_env(
+        mlog::otel::exporting(),
+        traceparent,
+        minimald_rpc::trace::opted_out(&config.env_vars),
+    );
     let mngr = serv.sessions_manager().await;
-    let session_handle = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+    let session_handle = match mngr
+        .get_session(SessionKeyPredicate::Id(session_id))
+        .instrument(span.clone())
+        .await
+    {
         Ok(Some(h)) => h,
         Ok(None) => {
             tracing::warn!(%session_id, "execution request rejected: unknown session");
@@ -1171,8 +1794,15 @@ pub(crate) async fn handle_exec(
     // Logged for every accepted form, before the dispatch that decides which
     // one it is: an operator reading the log should see what a client asked to
     // run, whether it was serviced by the daemon, handed to the session, or
-    // refused below.
-    tracing::info!(%session_id, command = %argv, "exec request");
+    // refused below. The command is scrubbed so a credential passed as an
+    // argument never lands in the log verbatim. For a client that opted out
+    // of telemetry the line says so and carries no command at all: the log
+    // exporter would otherwise ship the one record of what it ran.
+    if minimald_rpc::trace::opted_out(&config.env_vars) {
+        tracing::info!(%session_id, telemetry = OPT_OUT, "exec request (command not recorded)");
+    } else {
+        tracing::info!(%session_id, command = %scrub_secrets(&argv), "exec request");
+    }
 
     // Parsed, never sniffed. The vocabulary in `minimald_rpc::exec` is the only
     // way to ask for one of the daemon's own forms, so a session command can no
@@ -1202,7 +1832,7 @@ pub(crate) async fn handle_exec(
                 ExecRequest::Argv(words) => SessionProgram::Argv(words),
                 _ => unreachable!("the match arm admits only Shell and Argv"),
             };
-            let span = exec_span(&config, session_id, &argv);
+            let span = span.clone();
             session.channel_success(id)?;
             spawn(
                 run_in_session(
@@ -1213,11 +1843,17 @@ pub(crate) async fn handle_exec(
                     channel,
                     program,
                     conn_username,
+                    trace_env,
                 )
                 .instrument(span),
             );
         }
-        ExecRequest::TaskRun(task) => {
+        ExecRequest::TaskRun {
+            task,
+            owns_box,
+            args,
+            cwd,
+        } => {
             let task = task.trim().to_string();
             if task.is_empty() {
                 tracing::warn!(%session_id, "execution request rejected: task/run names no task");
@@ -1228,38 +1864,65 @@ pub(crate) async fn handle_exec(
             // shell and carried on the channel environment (#585). Empty from a
             // client that predates it — in which case the task path resolves
             // them the old way, daemon-side.
-            let task_env = minimald_rpc::taskenv::from_channel_env(&config.env_vars);
+            // Plus the exec span's TRACEPARENT on opt-in (TEL-023):
+            // a `min` the task runs joins the caller's trace.
+            let task_env = minimald_rpc::taskenv::with_trace(
+                minimald_rpc::taskenv::from_channel_env(&config.env_vars),
+                trace_env.clone(),
+            );
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
+            let span = span.clone();
             session.channel_success(id)?;
-            spawn(async move {
-                let exec_task = ExecTask {
-                    conn,
-                    serv,
-                    session: session_handle,
-                    channel_id: id,
-                    exec: TaskExec {
-                        args: None,
-                        task,
-                        env: task_env,
-                        drop_env,
-                    },
-                };
-                exec_task.run(channel).await;
-            });
+            spawn(tracing::Instrument::instrument(
+                async move {
+                    // `ExecTask::run` consumes the server handle; the box's end
+                    // needs one after the bridge returns.
+                    let end_serv = serv.clone();
+                    let exec_task = ExecTask {
+                        conn,
+                        serv,
+                        session: session_handle,
+                        channel_id: id,
+                        exec: TaskExec {
+                            args,
+                            // The name stays behind for the run-box-end log line.
+                            task: task.clone(),
+                            env: task_env,
+                            drop_env,
+                            cwd,
+                        },
+                    };
+                    let exit_status = exec_task.run(channel).await;
+                    // The exit status is on the wire and the channel closed: the
+                    // run is over whether or not its client is still here, so a
+                    // box created for it ends now (NET-131).
+                    if owns_box {
+                        end_run_box(&end_serv, session_id, &task, exit_status).await;
+                    }
+                },
+                span,
+            ));
         }
         ExecRequest::PackageBuild(args) => {
+            let span = span.clone();
             session.channel_success(id)?;
             let build_args = args.trim().to_string();
-            spawn(async move {
-                run_build_exec(session_handle, id, channel, build_args).await;
-            });
+            spawn(tracing::Instrument::instrument(
+                async move {
+                    run_build_exec(session_handle, id, channel, build_args).await;
+                },
+                span,
+            ));
         }
         ExecRequest::Check(args) => {
             session.channel_success(id)?;
             let check_args = args.trim().to_string();
-            spawn(async move {
-                run_check_exec(session_handle, id, channel, check_args).await;
-            });
+            spawn(tracing::Instrument::instrument(
+                async move {
+                    run_check_exec(session_handle, id, channel, check_args).await;
+                },
+                span,
+            ));
         }
     }
 
@@ -1299,32 +1962,192 @@ fn unsupported_command_message(reason: &str) -> String {
 /// with the daemon's. A missing or malformed value mints a fresh context:
 /// propagation is a diagnostic aid and must never fail a request. The command
 /// rides on the span, so every record the exec emits names what was asked for.
-fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> tracing::Span {
+/// The exec span, and its context as a `TRACEPARENT` (what a box gets on
+/// opt-in, so a `min` run inside joins this trace) — `None` unless the span
+/// is actually recorded (see [`box_traceparent`]).
+fn exec_span(
+    config: &ChannelConfig,
+    session_id: SessionId,
+    argv: &str,
+) -> (tracing::Span, Option<String>) {
+    // Two callsites, not one span with a recorded field: the opted-out
+    // request's span never carries the command, not even in the file log's
+    // span fields, and the recorded one is what the exec-span tests read
+    // at creation.
+    let span = if minimald_rpc::trace::opted_out(&config.env_vars) {
+        tracing::info_span!(
+            "exec",
+            %session_id,
+            command = tracing::field::Empty,
+            telemetry = OPT_OUT,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        )
+    } else {
+        tracing::info_span!(
+            "exec",
+            %session_id,
+            command = %scrub_secrets(argv),
+            telemetry = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        )
+    };
+    let adopted = adopt_client_trace(&span, config);
+    let tp = box_traceparent(&adopted);
+    (span, tp)
+}
+
+/// The value of a request span's `telemetry` field when its client opted
+/// out: the one mark the file log keeps of such a request (the span is
+/// recorded nowhere else).
+pub(crate) const OPT_OUT: &str = "opt-out";
+
+/// A span's trace context, and whether that span is recorded by the export
+/// (its ids are the exported span's ids).
+pub(crate) struct AdoptedTrace {
+    ctx: minimald_rpc::trace::TraceContext,
+    /// False with export off, and with the export filter not admitting the
+    /// span (`MINIMAL_OTEL_FILTER=warn` against an info-level span): the ids
+    /// were minted for the file log only, and no exporter or spool ever sees
+    /// a span with them.
+    recorded: bool,
+}
+
+/// The `TRACEPARENT` a box may be given for `adopted`: only one that names a
+/// recorded span. Under `MINIMAL_OTEL_FILTER=warn`
+/// the daemon handed the box a `TRACEPARENT` whose span id was spooled and
+/// exported nowhere, so a `min` run inside parented itself to an orphan. A
+/// trace nobody can follow is worse than a fresh one: hand the box nothing.
+fn box_traceparent(adopted: &AdoptedTrace) -> Option<String> {
+    adopted.recorded.then(|| adopted.ctx.traceparent())
+}
+
+/// Makes `span` a child of the client's `TRACEPARENT` (channel env) and
+/// records its ids. With OTel export on and the span admitted, the exported
+/// span's ids are the ids; otherwise adopt-or-mint exactly as before. The
+/// span must declare the `trace_id`, `span_id` and `parent_span_id` fields.
+pub(crate) fn adopt_client_trace(span: &tracing::Span, config: &ChannelConfig) -> AdoptedTrace {
     use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
 
+    if minimald_rpc::trace::opted_out(&config.env_vars) {
+        return adopt_opt_out(span);
+    }
     let client_ctx = config
         .env_vars
         .get(TRACEPARENT_ENV)
         .and_then(|v| TraceContext::parse_traceparent(v));
-    let ctx = client_ctx
-        .as_ref()
-        .map(TraceContext::child)
-        .unwrap_or_else(TraceContext::mint);
-    let span = tracing::info_span!(
-        "exec",
-        %session_id,
-        command = %argv,
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
-        parent_span_id = tracing::field::Empty,
+    adopt_trace(span, client_ctx)
+}
+
+/// The client opted out of telemetry (`MINIMAL_OTEL=off` on the channel,
+/// or in a forward's originator field): make `span`, and every span under
+/// it, non-recording ([`mlog::otel::opt_out`]), mark it `telemetry =
+/// opt-out`, and give it ids for the file log only. Nothing is adopted: an
+/// opted-out client sends no `TRACEPARENT`, and one that did would still
+/// get no span in its trace. The result is never `recorded`, so the box
+/// gets no `TRACEPARENT` either ([`box_traceparent`]). The span must
+/// declare the `trace_id`, `span_id`, `parent_span_id` and `telemetry`
+/// fields.
+pub(crate) fn adopt_opt_out(span: &tracing::Span) -> AdoptedTrace {
+    use minimald_rpc::trace::TraceContext;
+
+    // `record` drops a field the span did not declare without a word, and
+    // the opt-out mark would be lost (the `git_receive`/`git_upload` spans
+    // once lacked it): fail loudly in tests instead.
+    debug_assert!(
+        span.metadata()
+            .is_none_or(|m| m.fields().field("telemetry").is_some()),
+        "span {:?} must declare `telemetry` to be opted out",
+        span.metadata().map(tracing::Metadata::name)
     );
+    let ctx = mlog::otel::opt_out(span)
+        .map(|(t, s, f)| TraceContext::from_parts(t, s, f))
+        .unwrap_or_else(|| TraceContext::mint().unsampled());
+    span.record("telemetry", OPT_OUT);
+    span.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    span.record("span_id", tracing::field::display(ctx.span_id_hex()));
+    // The mailbox messages sent from inside carry these unsampled ids, so
+    // the `*.message` spans they open are opted out too (`adopt_trace`
+    // aligns them under a flags-00 parent).
+    crate::traced::remember(span, ctx);
+    AdoptedTrace {
+        ctx,
+        recorded: false,
+    }
+}
+
+/// Makes `span` a child of `client_ctx` — the client's context however it
+/// travelled (the channel env for session channels and RPCs, the open
+/// request's originator field for a direct-tcpip forward) — and records its
+/// ids. With OTel export on and the span admitted, the exported span's ids
+/// are the ids; otherwise adopt-or-mint exactly as before. The span must
+/// declare the `trace_id`, `span_id` and `parent_span_id` fields.
+pub(crate) fn adopt_trace(
+    span: &tracing::Span,
+    client_ctx: Option<minimald_rpc::trace::TraceContext>,
+) -> AdoptedTrace {
+    use minimald_rpc::trace::TraceContext;
+
+    let aligned = mlog::otel::align(span, client_ctx.as_ref().map(TraceContext::parts))
+        .map(|(t, s, f)| TraceContext::from_parts(t, s, f));
+    let recorded = aligned.is_some();
+    let ctx = aligned.unwrap_or_else(|| {
+        client_ctx
+            .as_ref()
+            .map(TraceContext::child)
+            .unwrap_or_else(TraceContext::mint)
+    });
+    span.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    span.record("span_id", tracing::field::display(ctx.span_id_hex()));
     if let Some(client_ctx) = &client_ctx {
         span.record(
             "parent_span_id",
             tracing::field::display(client_ctx.span_id_hex()),
         );
     }
-    span
+    // For a mailbox message sent from inside this span (or anything it
+    // encloses) to carry these ids: see `traced::caller_context`.
+    crate::traced::remember(span, ctx);
+    AdoptedTrace { ctx, recorded }
+}
+
+#[cfg(test)]
+mod box_traceparent_tests {
+    use super::{AdoptedTrace, box_traceparent};
+
+    /// A box gets a `TRACEPARENT` only for a recorded span: with export off,
+    /// or the export filter not admitting the exec span, the context exists
+    /// (the file log uses it) but names a span no exporter or spool sees.
+    #[test]
+    fn an_unrecorded_exec_span_gives_the_box_no_traceparent() {
+        let ctx = minimald_rpc::trace::TraceContext::mint();
+        assert_eq!(
+            box_traceparent(&AdoptedTrace {
+                ctx,
+                recorded: false
+            }),
+            None
+        );
+        assert_eq!(
+            box_traceparent(&AdoptedTrace {
+                ctx,
+                recorded: true
+            }),
+            Some(ctx.traceparent())
+        );
+    }
+
+    /// Without an exporter installed (this test process), `align` admits
+    /// nothing, so the adopted trace is never marked recorded.
+    #[test]
+    fn without_an_exporter_nothing_is_recorded() {
+        assert!(!mlog::otel::exporting());
+        let span = tracing::info_span!("exec");
+        assert!(mlog::otel::align(&span, None).is_none());
+    }
 }
 
 /// Runs `argv` inside the session's sandbox, streamed over the SSH channel.
@@ -1332,6 +2155,8 @@ fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> traci
 /// The fallback for every exec request the daemon does not service itself. It
 /// needs the session's sandbox up, which [`SessionExec`] arranges — launching a
 /// host for an idle session if there isn't one.
+// Left positional: a single call site that immediately packs the arguments into
+// an `ExecTask`, so a struct would be single-use ceremony.
 #[allow(clippy::too_many_arguments)]
 async fn run_in_session(
     serv: ServerStateHandle,
@@ -1341,6 +2166,7 @@ async fn run_in_session(
     channel: Channel<Msg>,
     program: SessionProgram,
     conn_username: String,
+    extra_env: BTreeMap<String, String>,
 ) {
     let exec_task = ExecTask {
         conn,
@@ -1350,9 +2176,56 @@ async fn run_in_session(
         exec: SessionExec {
             program,
             conn_username,
+            extra_env,
         },
     };
     exec_task.run(channel).await;
+}
+
+/// Ends the box a task run owns, from the daemon's side of the exec's exit
+/// (NET-131). The destroy used to be the client's, issued after a normal
+/// run; left there, a client killed mid-run would strand its session — the
+/// abandoned-launch reap covers only un-finalized sessions and there is no
+/// idle stop to catch one. The teardown is the `DestroySession` RPC's own
+/// path, so the box ends exactly as a client-issued destroy ends it.
+///
+/// The one info line this emits on success is what a diagnostic bundle's
+/// daemon-log tail reads the end of a run box from: it names the session,
+/// the run and the exit code.
+async fn end_run_box(
+    serv: &ServerStateHandle,
+    session_id: SessionId,
+    task: &str,
+    exit_status: u32,
+) {
+    let mngr = serv.sessions_manager().await;
+    // The name for the log line, resolved before the delete for the same
+    // reason `serve_destroy_session` resolves it there: once the record is
+    // gone there is nothing left to resolve it against.
+    let session_name = mngr
+        .get_record(SessionKeyPredicate::Id(session_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.name);
+    match mngr.delete_session(session_id).await {
+        Ok(_) => tracing::info!(
+            session_id = %session_id,
+            session_name = session_name.as_deref().unwrap_or("<anonymous>"),
+            task = %task,
+            exit = exit_status,
+            "run box ended",
+        ),
+        // Most plausibly the interrupt path's own destroy won the race; the
+        // error names what actually blocked the teardown.
+        Err(e) => tracing::warn!(
+            session_id = %session_id,
+            task = %task,
+            exit = exit_status,
+            error = %e,
+            "ending the run's box failed",
+        ),
+    }
 }
 
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
@@ -1518,6 +2391,12 @@ async fn run_check_exec(
     let _ = ws.close().await; // needed to release the remote
 }
 
+/// Serves `git-receive-pack min://<session>` (a `min` push to a session's
+/// workspace) on channel `id`.
+///
+/// Runs in a `git_receive` span that adopts the client's `TRACEPARENT`: the
+/// session lookup and the spawned receive-pack process's work are its
+/// children, so a push is one trace with the CLI's (TEL-022).
 async fn handle_git_receive(
     ident: &str,
     serv: ServerStateHandle,
@@ -1547,8 +2426,22 @@ async fn handle_git_receive(
         }
     };
 
+    // The lookup runs in this push's span, so its manager message is not a
+    // trace root of its own (as for an exec: see `handle_exec`).
+    let span = tracing::info_span!(
+        "git_receive",
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    adopt_client_trace(&span, &config);
     let mngr = serv.sessions_manager().await;
-    let session_handle = match mngr.get_session(session_pred).await {
+    let session_handle = match mngr
+        .get_session(session_pred)
+        .instrument(span.clone())
+        .await
+    {
         Ok(Some(h)) => h,
         Ok(None) => {
             tracing::warn!("git-receive-pack rejected: unknown session");
@@ -1563,7 +2456,10 @@ async fn handle_git_receive(
     };
     session.channel_success(id)?;
 
-    spawn(async move {
+    // The receive-pack process ends with this channel: request-bounded work,
+    // so it runs as the span's child (`traced::spawn` carries the entered
+    // span), not as a root of its own.
+    let task = async move {
         let paths = match session_handle.paths().await {
             Ok(paths) => paths,
             // The actor died between resolve and this call (raced an
@@ -1580,11 +2476,12 @@ async fn handle_git_receive(
             // the first push to populate. Create an empty git
             // repo, and make sure its configured to checkout
             // the ref it recieves.
-            let res = tokio::process::Command::new("git")
-                .arg("init")
-                .current_dir(paths.working.as_utf8_path())
-                .output()
-                .await;
+            let mut init = tokio::process::Command::new("git");
+            init.arg("init").current_dir(paths.working.as_utf8_path());
+            for name in git_repo_location_env() {
+                init.env_remove(name);
+            }
+            let res = init.output().await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "git init failed");
                 channel.close().await.unwrap();
@@ -1664,11 +2561,127 @@ async fn handle_git_receive(
                 ),
                 cwd: paths.working,
                 env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
             },
         };
         exec_task.run(channel).await;
         drop(hooks_tmp);
-    });
+    };
+    span.in_scope(|| crate::traced::spawn(task));
+
+    Ok(())
+}
+
+/// Serves `git-upload-pack min://<session>` (a `min` fetch, clone or
+/// ls-remote of a session's workspace) on channel `id`.
+///
+/// Runs in a `git_upload` span that adopts the client's `TRACEPARENT`, as a
+/// push runs in `git_receive`: the session lookup and the spawned pack
+/// process's work are its children, so a fetch is one trace with the CLI's
+/// (TEL-022) rather than a root `GetSession` of its own.
+async fn handle_git_upload(
+    ident: &str,
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    id: ChannelId,
+    session: &mut Session,
+    channel: Channel<Msg>,
+    config: ChannelConfig,
+) -> Result<(), ConnectionError> {
+    let session_pred = {
+        match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
+            Some(id_str) => match SessionId::parse_str(id_str) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => {
+                    tracing::warn!(
+                        value = %id_str,
+                        "git-upload-pack rejected on channel {id}: {MINIMAL_SESSION_ID_ENV} is not a uuid",
+                    );
+                    session.channel_failure(id)?;
+                    return Ok(());
+                }
+            },
+            None => match SessionId::parse_str(ident) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+            },
+        }
+    };
+
+    // The lookup runs in this fetch's span, so its manager message is not a
+    // trace root of its own (as for a push: see `handle_git_receive`).
+    let span = tracing::info_span!(
+        "git_upload",
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    adopt_client_trace(&span, &config);
+    let mngr = serv.sessions_manager().await;
+    let lookup = mngr
+        .get_session(session_pred)
+        .instrument(span.clone())
+        .await;
+    let session_handle = match lookup {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            span.in_scope(|| tracing::warn!("git-upload-pack rejected: unknown session"));
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Err(e) => {
+            span.in_scope(|| tracing::warn!(error = %e, "git-upload-pack rejected: lookup failed"));
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
+    session.channel_success(id)?;
+
+    // The pack process ends with this channel: request-bounded work, so it
+    // runs as the span's child (`traced::spawn` carries the entered span).
+    let task = async move {
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(error = %e, "git-upload-pack aborted: session is gone");
+                let _ = channel.close().await;
+                return;
+            }
+        };
+
+        let dotgit_dir = paths.working.as_utf8_path().join(".git");
+        if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
+            // A read-only request (ls-remote, fetch, clone) must not create
+            // a repository in the session workspace: `git init` would write
+            // a `.git` directory as the daemon user on an operation the
+            // client believes is read-only, and would turn an
+            // uploaded/generated workspace into a repo with an unborn
+            // branch. Reject instead of initializing.
+            let msg = "minimald: session has no repository yet\n";
+            tracing::warn!("git-upload-pack rejected: session has no repository");
+            let _ = channel.extended_data(1, msg.as_bytes()).await;
+            let _ = channel.exit_status(1).await;
+            let _ = channel.eof().await;
+            let _ = channel.close().await;
+            return;
+        }
+
+        let exec_task = ExecTask {
+            conn,
+            serv,
+            session: session_handle,
+            channel_id: id,
+            exec: TokioExec {
+                argv: "git upload-pack .".to_string(),
+                cwd: paths.working,
+                env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
+            },
+        };
+        exec_task.run(channel).await;
+    };
+    span.in_scope(|| crate::traced::spawn(task));
 
     Ok(())
 }
@@ -1821,11 +2834,566 @@ pub(crate) mod testing {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "upstream's tests spawn plain tokio tasks; the traced-spawn rule is for request handling"
+)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+    use super::{bridge, bridge_noting_shutdown};
+
+    /// A never-firing client-loss signal for tests that exercise the
+    /// bridge without modelling a disconnect.
+    fn client_lost() -> tokio::sync::watch::Receiver<bool> {
+        tokio::sync::watch::channel(false).1
+    }
+
+    /// `start_kill` asks the shim to exit with SIGTERM, not SIGKILL: SIGTERM
+    /// is what runs the shim's handler, which kills the injected process's
+    /// whole group. A SIGKILL here would leave the grandchildren running.
+    #[tokio::test]
+    async fn start_kill_sends_sigterm() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::shim(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGTERM")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    }
+
+    /// Any child other than the shim (the git service path's `/bin/sh -c`)
+    /// has no group-kill handler, so `start_kill` SIGKILLs it at once.
+    #[tokio::test]
+    async fn start_kill_sigkills_a_plain_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::new(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGKILL")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    /// A child that ignores SIGTERM is not waited on forever: after the grace
+    /// period, `wait` escalates to SIGKILL.
+    #[tokio::test]
+    async fn wait_escalates_to_sigkill_when_sigterm_is_ignored() {
+        use super::{Process as _, TokioProcess};
+
+        // The ignored disposition survives the `exec`, so `sleep` itself
+        // ignores SIGTERM. The marker line says the trap is installed.
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 600"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning sh");
+        let mut process = TokioProcess::shim(child);
+        let mut stdout = process.child.stdout.take().expect("piped stdout");
+        let mut ready = [0u8; 6];
+        stdout
+            .read_exact(&mut ready)
+            .await
+            .expect("reading the ready marker");
+
+        process.start_kill().expect("signalling the child");
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
+            .await
+            .expect("the escalation to SIGKILL ends the wait")
+            .expect("reaping the child");
+        assert_eq!(code, None, "a signalled child has no exit code");
+    }
+
+    /// `inherit_cwd` on the daemon side: a task that declares it starts at
+    /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
+    /// falls back to `/workbench` with a stderr notice when it is not. A task
+    /// without `inherit_cwd`, or a run from the root, keeps `/workbench`.
+    #[test]
+    fn task_start_dir_honours_inherit_cwd() {
+        use super::task_start_dir;
+
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join("sub/inner")).unwrap();
+
+        assert_eq!(
+            task_start_dir(true, "sub/inner", tree.path()),
+            Ok(Some("/workbench/sub/inner".to_string()))
+        );
+        assert_eq!(task_start_dir(false, "sub/inner", tree.path()), Ok(None));
+        assert_eq!(task_start_dir(true, "", tree.path()), Ok(None));
+
+        let notice = task_start_dir(true, "sub/gone", tree.path()).unwrap_err();
+        assert!(notice.contains("sub/gone"), "{notice}");
+        assert!(notice.contains("/workbench"), "{notice}");
+        assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
+    }
+
+    /// A session record carrying `mode`, with everything else at its default.
+    #[cfg(target_os = "linux")]
+    fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
+        sessions::Record {
+            id: sessions::SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
+            network: mode,
+            policy: sessions::SessionPolicy::default(),
+            task_addresses: Vec::new(),
+            box_addresses: None,
+            status: sessions::SessionStatus::Active,
+            hooks_enabled: true,
+            // No launch ever minted these records, so none has recorded its
+            // outcome on one.
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            attrs: Default::default(),
+        }
+    }
+
+    /// NET-138: a task run of a registered box whose record names no box
+    /// id is refused before anything attaches — the host cannot be asked
+    /// for that box's row, and an address-only answer could be another
+    /// box's — while a box the host registered nothing for asks nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
+        let switch = tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        );
+        let unregistered = record_with(sessions::NetworkMode::OwnIp);
+        super::ensure_task_rows_stand(&unregistered, &switch)
+            .await
+            .expect("a box with no host registration asks nothing");
+
+        let mut registered = record_with(sessions::NetworkMode::OwnIp);
+        registered.name = Some("web".to_string());
+        registered.box_addresses = Some(sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        });
+        registered.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
+        let refused = super::ensure_task_rows_stand(&registered, &switch)
+            .await
+            .expect_err("a registered box with no id is never answered as standing");
+        assert!(
+            refused.to_string().contains("row on the VM host has ended"),
+            "{refused}"
+        );
+    }
+
+    /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
+    /// is the case that matters, as it used to arrive as `HostNet`. The switch
+    /// is `HostShuttle`, so an own-IP plan is pure bookkeeping.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_takes_the_network_of_its_session() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ));
+
+        let host = super::task_network(
+            &record_with(sessions::NetworkMode::HostNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        assert!(!host.plan().await.unwrap().isolates_netns());
+
+        let no_net = super::task_network(
+            &record_with(sessions::NetworkMode::NoNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        let plan = no_net.plan().await.unwrap();
+        assert!(plan.isolates_netns() && plan.tap().is_none());
+
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.name = Some("web".to_string());
+        record.policy.ingress = Some(sessions::IngressPolicy::default());
+        // A VM host's switch draws nothing (NET-138): the task attaches at a
+        // task address its box's registration filed.
+        record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
+        let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let plan = own_ip.plan().await.unwrap();
+        assert!(
+            plan.isolates_netns(),
+            "an own-IP task gets its own namespace"
+        );
+        assert!(matches!(plan.resolver(), sandbox::Resolver::Nameservers(_)));
+        // Its own identity on the switch, and the session's *effective*
+        // egress (NET-074) — resolved under the phase this build ships, so
+        // the same rules the session's own gate enforces, whatever the
+        // rollout leaves in force — but none of its ingress, because the
+        // session's PTask is attached at the same time. The gate exists only
+        // where that egress has rules, so the answer follows the shipped
+        // phase rather than a literal a cutover would invalidate.
+        let gated = crate::session::effective_egress_section(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        )
+        .is_some();
+        let described = format!("{own_ip:?}");
+        assert!(
+            described.contains("\"web-task\"")
+                && described.contains(&format!("has_policy: {gated}")),
+            "got {described}"
+        );
+        own_ip.abandon().await;
+
+        // No name: the session id, rather than an empty hostname.
+        let unnamed = super::task_network(
+            &record_with(sessions::NetworkMode::OwnIp),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+    }
+
+    /// A VM host's switch, which hands every address and draws none
+    /// (NET-138).
+    #[cfg(target_os = "linux")]
+    fn vm_host_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ))
+    }
+
+    /// NET-138 for a task run, whichever door started it — `min run` from
+    /// inside the box and a task run over exec both plan through
+    /// [`super::task_network`]: the task's sandbox attaches at a task
+    /// address its box's registration filed, the first one no run holds,
+    /// and never draws one of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn in_box_run_task_draws_a_task_slot() {
+        let switch = vm_host_switch();
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.task_addresses = vec![
+            std::net::Ipv4Addr::new(100, 64, 128, 2),
+            std::net::Ipv4Addr::new(100, 64, 128, 3),
+        ];
+        let first = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        first.plan().await.expect("a free task address");
+        let second = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        second.plan().await.expect("a second free task address");
+        let held: Vec<_> = switch
+            .lock()
+            .await
+            .leases()
+            .iter()
+            .map(|lease| lease.ip)
+            .collect();
+        assert_eq!(
+            held, record.task_addresses,
+            "each run holds one task address"
+        );
+
+        let third = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = third.plan().await.expect_err("every task address is held");
+        assert!(
+            err.to_string()
+                .contains("2 task runs already in progress for this session"),
+            "{err}"
+        );
+        first.abandon().await;
+        third
+            .plan()
+            .await
+            .expect("the address the first run held is free again");
+    }
+
+    /// A VM session record from before task addresses were registered
+    /// carries none: its task run is refused, naming the remedy, rather
+    /// than drawn an address no host row is keyed by.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
+        let switch = vm_host_switch();
+        let record = record_with(sessions::NetworkMode::OwnIp);
+        let task = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = task.plan().await.expect_err("nothing is drawn");
+        assert!(
+            err.to_string()
+                .contains("destroy the session and re-activate it"),
+            "{err}"
+        );
+        assert!(switch.lock().await.leases().is_empty());
+    }
+
+    /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
+    /// egress default its session does, and nothing else changes with it. A
+    /// gate is attached only where the effective egress has rules to enforce,
+    /// because a gate with no ingress declaration blocks a task's *inbound*
+    /// too. Under InForce, the shipped phase, a bare own-address task with no
+    /// opt-out carries the deny-all gate. The retired announced arm, pinned
+    /// here by name, attaches the same task ungated, as every task did before
+    /// the deny-all default.
+    ///
+    /// The phase decides only the *default* for a box that declared nothing.
+    /// A box that declared an `egress` section is enforced on its session's
+    /// own PTask in every phase, so a task in such a session carries that
+    /// declaration's gate under either phase — the same inbound posture the
+    /// in-force case below accepts: a task PTask holds no ingress of its own,
+    /// so its gate default-blocks unsolicited inbound.
+    ///
+    /// The phase is passed by name, not read from the shipped constant, so
+    /// both arms stay proven whichever one ships. `own_ip_default_deny_all`
+    /// proves what the deny-all section itself enforces.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_gate_follows_the_egress_default() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ));
+        // A bare own-address box: no egress declaration, so its egress is
+        // whatever the default resolves for an absent one.
+        let record = record_with(sessions::NetworkMode::OwnIp);
+
+        // Announced, no opt-out: an absent section still allows all, so the
+        // task gets no gate at all — its inbound stays as open as it was
+        // before the default was announced.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::Announced,
+                false,
+            ),
+            None,
+            "an announced default resolves an absent section to allow-all"
+        );
+        let announced = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::Announced,
+            false,
+        );
+        assert!(
+            format!("{announced:?}").contains("has_policy: false"),
+            "an announced default gates nothing: {announced:?}"
+        );
+
+        // In force, no opt-out: the same absent section is the deny-all one,
+        // and the task carries the gate built from it.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::InForce,
+                false,
+            ),
+            Some(sessions::EgressPolicy::deny_all()),
+            "the in-force default resolves an absent section to deny-all"
+        );
+        let in_force = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        );
+        assert!(
+            format!("{in_force:?}").contains("has_policy: true"),
+            "the in-force default gates a bare box's task: {in_force:?}"
+        );
+
+        // A box that *declared* an egress section is the other case where
+        // the task path attaches a gate, and the announcement does not defer
+        // it: the declaration is enforced on the session's own PTask in every
+        // phase, so a task in that session resolves the same section its
+        // session's gate did — the declaration, not the deny-all section and
+        // not nothing — under either phase. In force, the default also
+        // decides the destination list the declaration left absent
+        // (`allow_dns_hosts`): present and empty, granting nothing
+        // (NET-074); announced, the section is carried as declared.
+        let section = sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        };
+        let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
+        declared_record.policy.egress = Some(section.clone());
+        for (phase, expected) in [
+            (sessions::EgressDefaultPhase::Announced, section.clone()),
+            (
+                sessions::EgressDefaultPhase::InForce,
+                sessions::EgressPolicy {
+                    allow_dns_hosts: Some(Vec::new()),
+                    ..section.clone()
+                },
+            ),
+        ] {
+            assert_eq!(
+                crate::session::effective_egress_section(
+                    &declared_record.policy,
+                    declared_record.network,
+                    phase,
+                    false,
+                ),
+                Some(expected),
+                "a declared egress section reaches the task's gate as the \
+                 default resolves it while the default is {phase:?}",
+            );
+        }
+        let declared = super::task_network(
+            &declared_record,
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        assert!(
+            format!("{declared:?}").contains("has_policy: true"),
+            "a declared egress section gates the task under the shipped \
+             phase too: {declared:?}"
+        );
+    }
+
+    /// 017-005. An own-IP task whose attach is refused stops with the
+    /// provider's error: the process is killed and reaped, and the plan it was
+    /// built from was the provider's, never the host's.
+    #[tokio::test]
+    async fn a_refused_task_attach_stops_the_task() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Refuses;
+        impl sandbox::Network for Refuses {
+            fn plan(&self) -> sandbox::PlanFuture<'_> {
+                Box::pin(std::future::ready(Ok(sandbox::NetPlan::isolated())))
+            }
+            fn attach(&self, _: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+                Box::pin(std::future::ready(Err(sandbox::NetworkError::new(
+                    std::io::Error::other("switch refused the client"),
+                ))))
+            }
+        }
+
+        struct Child {
+            reaped: bool,
+        }
+        impl super::Reapable for Child {
+            fn kill_and_reap(&mut self) {
+                self.reaped = true;
+            }
+        }
+
+        let planned = sandbox::PlannedLaunch::begin(Arc::new(Refuses))
+            .await
+            .expect("planning succeeds; it is the attach that fails");
+        assert!(planned.plan().isolates_netns());
+
+        let mut child = Child { reaped: false };
+        let err = super::attach_or_reap(planned, sandbox::Spawned::new(1), &mut child)
+            .await
+            .err()
+            .expect("a refused attach must surface as an error");
+        assert!(child.reaped, "the task must not run on");
+        assert!(
+            err.to_string().contains("switch refused the client"),
+            "the provider's reason must reach the caller, got: {err}",
+        );
+    }
+
+    /// A guard whose teardown blocks until told to finish, then counts.
+    struct SlowGuard {
+        go: std::sync::Arc<tokio::sync::Notify>,
+        done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl sandbox::NetGuard for SlowGuard {
+        fn teardown(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                self.go.notified().await;
+                self.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// 017-003 on the task path. `wait` is polled inside a `select!` and can
+    /// be dropped while the network is being released; the release must still
+    /// run, once, and the next `wait` must not return before it is done. A
+    /// process dropped before any `wait` completed releases the same way.
+    #[tokio::test]
+    async fn a_dropped_wait_still_releases_the_network_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let go = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(AtomicUsize::new(0));
+        let guard = || {
+            Box::new(SlowGuard {
+                go: go.clone(),
+                done: done.clone(),
+            })
+        };
+
+        // The first `wait` is dropped mid-release, as `select!` does.
+        let mut net = super::NetRelease::new(guard());
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(20), net.release())
+            .await
+            .is_err();
+        assert!(dropped, "the release must still be in flight");
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+
+        // The next `wait` waits for the same release, which then finishes;
+        // a later one has nothing left to do.
+        go.notify_one();
+        net.release().await;
+        net.release().await;
+        assert_eq!(done.load(Ordering::SeqCst), 1, "released exactly once");
+
+        // Dropped before any `wait`: `Drop` spawns the release; let it run.
+        drop(super::NetRelease::new(guard()));
+        go.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            2,
+            "a dropped process still releases"
+        );
+    }
 
     /// Bytes flow client→child stdin and child stdout/stderr→client,
     /// and the child's exit code propagates to the bridge's return.
@@ -1845,13 +3413,14 @@ mod tests {
         let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
         let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -1882,6 +3451,297 @@ mod tests {
         assert_eq!(err, b"err!");
 
         assert!(!ctrl.was_killed());
+    }
+
+    /// A child that stops reading stdin must not stop the bridge from
+    /// relaying the child's output to the client, nor from delivering the
+    /// queued stdin once the child reads again. The child's stdin pipe
+    /// holds 64 KiB; a 256 KiB write to it parks, and with the write
+    /// parked inside the loop's select the child's stdout would never be
+    /// polled and this test would time out.
+    #[tokio::test]
+    async fn bridge_relays_output_while_a_stdin_write_is_blocked() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                mut stdin_reader,
+                mut stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        // Far more than the child's stdin pipe holds; this writer blocks
+        // once both pipes are full, which is the point.
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 256 * 1024]).await;
+        });
+
+        // Reads the child's output as the bridge relays it; the final
+        // read_exact would hang if any of the payload stalled behind the
+        // blocked stdin write.
+        let reader = tokio::spawn(async move {
+            let mut received = vec![0u8; 256 * 1024];
+            client_stdout.read_exact(&mut received).await.unwrap();
+            received
+        });
+
+        // With a stdin write parked behind a full pipe, output from the
+        // child must still reach the client.
+        let payload = vec![b'o'; 256 * 1024];
+        timeout(Duration::from_secs(10), stdout_writer.write_all(&payload))
+            .await
+            .expect("child output must keep flowing while a stdin write is blocked")
+            .unwrap();
+
+        let out = timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the client must receive child output while a stdin write is blocked")
+            .unwrap();
+        assert_eq!(out, payload);
+
+        // The queued stdin reaches the child as soon as it reads.
+        let mut received_stdin = vec![0u8; 256 * 1024];
+        timeout(
+            Duration::from_secs(10),
+            stdin_reader.read_exact(&mut received_stdin),
+        )
+        .await
+        .expect("queued stdin must reach the child once it reads")
+        .unwrap();
+        assert_eq!(received_stdin, vec![b'x'; 256 * 1024]);
+        feeder.await.unwrap();
+
+        // Both output pipes at EOF end the loop; the child then exits.
+        drop(stdout_writer);
+        ctrl.signal_exit(0).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("the bridge must end once both output pipes close and the child exits")
+            .unwrap();
+        assert_eq!(exit, 0);
+        assert!(!ctrl.was_killed());
+    }
+
+    /// A real child that writes its output before it reads more input
+    /// (`cat`) gets several MB streamed through it in both directions at
+    /// once: every byte comes back in order, and the child sees EOF only
+    /// after the queued stdin has drained. With the stdin write parked
+    /// inside the loop's select, `cat` blocks on a full stdout pipe, stops
+    /// reading stdin, and the bridge never finishes.
+    #[tokio::test]
+    async fn bridge_streams_megabytes_through_cat() {
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        use futures::stream;
+        use tokio::time::timeout;
+
+        use super::TokioProcess;
+
+        const LEN: usize = 4 * 1024 * 1024;
+
+        let child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning cat");
+        let processes = stream::iter(vec![Ok::<_, std::io::Error>(TokioProcess::new(child))]);
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                processes,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let sent = payload.clone();
+        // Dropping the write half once the payload is in is the client's EOF.
+        let feeder = tokio::spawn(async move {
+            client_stdin.write_all(&sent).await.unwrap();
+        });
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(LEN);
+            client_stdout.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let exit = timeout(Duration::from_secs(60), bridge_task)
+            .await
+            .expect("cat must finish while its stdin and stdout stream at once")
+            .unwrap();
+        assert_eq!(exit, 0);
+        feeder.await.unwrap();
+        let received = reader.await.unwrap();
+        assert_eq!(received.len(), LEN);
+        assert!(received == payload, "cat must echo the payload in order");
+    }
+
+    /// A child that exits with stdin still queued behind its full pipe
+    /// drops the queued bytes and still reports its own exit status.
+    ///
+    /// Every pipe end stays open until the bridge returns, so the only
+    /// way out of the loop is the `wait` branch with a chunk still
+    /// queued: closing the child's stdin first would instead end the
+    /// parked write with `BrokenPipe` and take the write-failure path.
+    #[tokio::test]
+    async fn bridge_reports_exit_when_child_exits_with_stdin_queued() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                // Not read until the bridge returns: the child's stdin
+                // pipe fills and a chunk queues behind it.
+                mut stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
+        });
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        // Let the bridge fill the child's stdin pipe and queue a chunk.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        // The child is reaped while every pipe end is still open.
+        ctrl.signal_exit(3).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a child exiting with stdin queued must end the bridge")
+            .unwrap();
+        assert_eq!(exit, 3);
+        assert!(!ctrl.was_killed());
+
+        // The child's stdin holds exactly what fit in its pipe, then EOF:
+        // the queued chunk was dropped, not delivered late.
+        let mut delivered = Vec::new();
+        timeout(
+            Duration::from_secs(10),
+            stdin_reader.read_to_end(&mut delivered),
+        )
+        .await
+        .expect("the bridge must close the child's stdin on return")
+        .unwrap();
+        assert_eq!(delivered.len(), 64 * 1024);
+
+        drop(stdout_writer);
+        drop(stderr_writer);
+        feeder.abort();
+    }
+
+    /// An exec the daemon's shutdown ends tells the client why on stderr,
+    /// after whatever the command itself wrote there, and still reports the
+    /// command's own status. One that ends outside a shutdown gets no notice.
+    #[tokio::test]
+    async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
+        for shutting_down in [true, false] {
+            let (
+                process,
+                MockEndpoints {
+                    stdin_reader: _stdin_reader,
+                    stdout_writer,
+                    mut stderr_writer,
+                    ctrl,
+                },
+            ) = build_mock();
+
+            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+            drop(closed_stdin_w);
+            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+            let bridge_task = crate::traced::spawn(async move {
+                let exit = bridge_noting_shutdown(
+                    "test",
+                    process,
+                    &mut bridge_stdin,
+                    &mut bridge_stdout,
+                    &mut bridge_stderr,
+                    client_lost(),
+                    || shutting_down,
+                )
+                .await;
+                (exit, bridge_stderr)
+            });
+
+            stderr_writer.write_all(b"err!").await.unwrap();
+            drop(stderr_writer);
+            drop(stdout_writer);
+            // What a box killed by the shutdown reports: 128 + SIGKILL.
+            ctrl.signal_exit(137).await;
+
+            let (exit, bridge_stderr) = bridge_task.await.unwrap();
+            assert_eq!(exit, 137, "the command's own status passes through");
+            drop(bridge_stderr);
+
+            let mut err = Vec::new();
+            client_stderr.read_to_end(&mut err).await.unwrap();
+            let expected: &[u8] = if shutting_down {
+                b"err!minimald is shutting down; the command was stopped\n"
+            } else {
+                b"err!"
+            };
+            assert_eq!(
+                err,
+                expected,
+                "shutting down: {shutting_down}; stderr was {:?}",
+                String::from_utf8_lossy(&err),
+            );
+        }
     }
 
     /// When the SSH-channel write side fails, the bridge must call
@@ -1915,13 +3775,14 @@ mod tests {
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
         drop(closed_stdin_w);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -1934,6 +3795,370 @@ mod tests {
         // maps to exit status 1.
         assert_eq!(exit, 1);
         assert!(ctrl.was_killed());
+    }
+
+    /// NET-015: a lost client on a non-PTY exec ends the command that exec
+    /// spawned — and only it. The lost client is the SSH write side failing
+    /// (the channel's peer is gone): the bridge kills the child it was
+    /// driving, reports the kill as exit 1, and stops the sequence without
+    /// ever pulling the next process, so nothing beyond the exec's own
+    /// command was touched. The box the exec ran against is the session
+    /// plane's concern (`session::tests` proves it survives the same loss).
+    #[tokio::test]
+    async fn lost_exec_client_kills_only_its_own_process() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (iter, mut endpoints) = build_mock_seq(2);
+        let second = endpoints.pop().unwrap();
+        let MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer: mut first_stdout,
+            stderr_writer: first_stderr,
+            ctrl: first_ctrl,
+        } = endpoints.pop().unwrap();
+        // Nothing on stderr; its EOF is the ordinary case.
+        drop(first_stderr);
+
+        // The client hung up: writes to its stdout side fail at once.
+        let (lost_client, mut bridge_stdout) = duplex(64);
+        drop(lost_client);
+        // bridge_stderr exists only because the signature requires it; the
+        // bridge never touches it in this test.
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64);
+        // The client's stdin went with it: EOF.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+
+        let bridge_task = crate::traced::spawn(async move {
+            bridge(
+                "test",
+                iter,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        // The child prints; forwarding it to the dead channel is the write
+        // that models the lost client.
+        first_stdout.write_all(b"output").await.unwrap();
+        drop(first_stdout);
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must end the exec promptly, not hang the bridge")
+            .unwrap();
+        // A killed mock waits back Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1);
+        assert!(
+            first_ctrl.was_killed(),
+            "the exec's own command must be killed when its client is lost"
+        );
+        assert!(
+            !second.ctrl.was_killed(),
+            "nothing beyond the exec's own command was spawned, let alone killed"
+        );
+    }
+
+    /// gominimal/inbox#813: a lost client on the *read* side — the SSH
+    /// channel closes or its sender drops while the child is silent —
+    /// must still kill the child. `make_reader()` used to reduce the
+    /// read half to a bare `AsyncRead`, which only surfaces `Data` and
+    /// `Eof`; a lost client then looked like stdin EOF and a silent
+    /// child (sleep, quiet build) kept running indefinitely. The
+    /// client-loss watch signal must end the bridge and kill the child
+    /// even though the child never writes a byte.
+    #[tokio::test]
+    async fn bridge_kills_silent_child_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                // Held, never written: a silent child keeps its stdio
+                // open. Dropping them would let output EOF end the loop
+                // before the client-loss branch wins the `select!`.
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // A silent child: nothing on stdout or stderr, and it never
+        // exits on its own.
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client-loss signal fires: the SSH channel closed.
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = crate::traced::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must kill a silent child promptly, not hang the bridge")
+            .unwrap();
+        // A killed mock waits back Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1);
+        assert!(
+            ctrl.was_killed(),
+            "a silent child must be killed when its client disconnects"
+        );
+    }
+
+    /// gominimal/inbox#813: stdin EOF alone — the client closing its
+    /// input but keeping the channel open — must NOT kill a silent
+    /// child. EOF is a normal close, not a disconnect; the child keeps
+    /// running and the bridge returns the child's own exit code.
+    #[tokio::test]
+    async fn bridge_does_not_kill_silent_child_on_stdin_eof() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // A silent child: nothing on stdout or stderr.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client-loss signal never fires: the channel stays open.
+        let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = crate::traced::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // The child exits cleanly on its own; the bridge must return its
+        // code without killing it.
+        ctrl.signal_exit(7).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("stdin EOF alone must not hang the bridge")
+            .unwrap();
+        assert_eq!(exit, 7);
+        assert!(
+            !ctrl.was_killed(),
+            "stdin EOF is a normal close, not a disconnect; the child must not be killed"
+        );
+    }
+
+    /// A child that never reads stdin leaves the bridge parked writing
+    /// into a full stdin pipe. A disconnect arriving then must still
+    /// kill the child rather than wait on a write that never completes.
+    #[tokio::test]
+    async fn bridge_kills_child_blocked_on_stdin_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                // Held but never read: the child's stdin pipe fills.
+                stdin_reader: _stdin_reader,
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        // Far more than the child's stdin pipe holds; this writer blocks
+        // once both pipes are full, which is the point.
+        let feeder = crate::traced::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
+        });
+
+        let bridge_task = crate::traced::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // Let the bridge fill the child's stdin pipe and park on it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must interrupt a blocked stdin write")
+            .unwrap();
+        assert_eq!(exit, 1);
+        assert!(ctrl.was_killed());
+        feeder.abort();
+    }
+
+    /// A child that closes stdout and stderr but keeps running ends the
+    /// I/O loop with the child still alive. A disconnect arriving while
+    /// the bridge waits on it must still kill the child; if it did not,
+    /// this test times out, since nothing else ever ends the child.
+    #[tokio::test]
+    async fn bridge_kills_child_with_closed_output_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // Output closed, but the child never exits on its own.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = crate::traced::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // Let the loop see both EOFs and park on the final wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must kill a child whose output is already closed")
+            .unwrap();
+        assert_eq!(exit, 1);
+        assert!(ctrl.was_killed());
+    }
+
+    /// `min task run` from a terminal half-closes stdin before anything
+    /// else, so a disconnect arrives *after* EOF. The pump must close the
+    /// child's stdin on EOF yet keep watching, and still signal client
+    /// loss when the channel then closes.
+    #[tokio::test]
+    async fn pump_signals_client_loss_after_stdin_eof() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        let (stdin_w, mut stdin_r) = duplex(64);
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+
+        msg_tx
+            .send(russh::ChannelMsg::Data {
+                data: b"hi".as_slice().into(),
+            })
+            .unwrap();
+        msg_tx.send(russh::ChannelMsg::Eof).unwrap();
+
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
+            .await
+            .expect("stdin EOF must close the child's stdin")
+            .unwrap();
+        assert_eq!(got, b"hi");
+        assert!(!*lost_rx.borrow(), "stdin EOF is not a disconnect");
+        assert!(!pump.is_finished(), "the pump must outlive stdin EOF");
+
+        msg_tx.send(russh::ChannelMsg::Close).unwrap();
+        timeout(Duration::from_secs(10), lost_rx.changed())
+            .await
+            .expect("a close after EOF must still signal client loss")
+            .unwrap();
+        assert!(*lost_rx.borrow());
+        pump.await.unwrap();
+    }
+
+    /// The channel's sender dropping (the connection died without a
+    /// `Close`) ends the message stream; that is a disconnect too.
+    #[tokio::test]
+    async fn pump_signals_client_loss_when_channel_sender_drops() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<russh::ChannelMsg>();
+        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        let (stdin_w, _stdin_r) = duplex(64);
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+
+        drop(msg_tx);
+        timeout(Duration::from_secs(10), lost_rx.changed())
+            .await
+            .expect("a dropped channel must signal client loss")
+            .unwrap();
+        assert!(*lost_rx.borrow());
+        pump.await.unwrap();
     }
 
     /// A grandchild that inherited the child's stdout keeps the pipe
@@ -1968,13 +4193,14 @@ mod tests {
         let (mut client_stdout, mut bridge_stdout) = duplex(1024 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2034,13 +4260,14 @@ mod tests {
         let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 iter,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2058,6 +4285,64 @@ mod tests {
         // The second process was never spawned, so its kill flag should
         // still be unset.
         assert!(!second.ctrl.was_killed());
+    }
+
+    /// A disconnect consumed by the first step must still stop the
+    /// sequence when that child reports exit 0 (it exited just before
+    /// the kill landed, or ignores kill like `EchoProcess`). The watch
+    /// transition is already spent, so a second, silent child would
+    /// never see it: the bridge must not start it. If it did, this test
+    /// times out, since nothing ever ends the second child.
+    #[tokio::test]
+    async fn bridge_stops_sequence_on_client_loss_after_zero_exit() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (iter, mut endpoints) = build_mock_seq(2);
+        // Silent and never exiting: stdio held open, ctrl never signalled.
+        let second = endpoints.pop().unwrap();
+        let MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer: first_stdout,
+            stderr_writer: first_stderr,
+            ctrl: first_ctrl,
+        } = endpoints.pop().unwrap();
+        drop(first_stdout);
+        drop(first_stderr);
+        first_ctrl.signal_exit(0).await;
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client is gone and the transition is already observed, as
+        // the first step's `changed()` branch would have left it.
+        let (client_lost_tx, mut client_lost_rx) = tokio::sync::watch::channel(false);
+        client_lost_tx.send(true).unwrap();
+        client_lost_rx.borrow_and_update();
+
+        let bridge_task = crate::traced::spawn(async move {
+            bridge(
+                "test",
+                iter,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must end the sequence, not start the next child")
+            .unwrap();
+        assert!(
+            !second.ctrl.was_killed(),
+            "the second child must never be started"
+        );
+        drop(client_lost_tx);
     }
 
     /// A two-process sequence where both children exit cleanly: the
@@ -2086,13 +4371,14 @@ mod tests {
         let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 iter,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2132,13 +4418,14 @@ mod tests {
         let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
         let (mut client_stderr, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 &mut echo_stream,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2231,6 +4518,75 @@ mod tests {
             );
         }
 
+        /// Brings a session to `Active` with a task-only `minimal.toml` in
+        /// its workspace: the create → populate → configure → finalize
+        /// sequence a task run's client drives, shared by every test here
+        /// that execs a task.
+        ///
+        /// The mfile holds only echo tasks — `tasks.echo_ok`, plus
+        /// `tasks.greet`, which declares one defaulted arg — whose entire
+        /// output lives in their declarations: no `[upstream]`, package
+        /// graph, or sandbox:
+        /// the echo short-circuit never builds a graph, so nothing here
+        /// reaches the (network-bound) package machinery. A task-only mfile
+        /// gates nothing, so the loadout composes in one shot, and this
+        /// composition has no patches, so `FinalizeSession` takes the
+        /// empty-composition shortcut past the marker check and promotes
+        /// the record to `Active` in one call.
+        async fn active_session_with_echo_task(
+            server: &TestServer,
+            client: &mut TestClient,
+            name: &str,
+        ) -> SessionId {
+            use minimald_rpc::{
+                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+                FinalizeSessionRequest,
+            };
+
+            let session_id = client
+                .call::<CreateSession>(&create_session_req(name, "/tmp"))
+                .await
+                .unwrap()
+                .id;
+
+            // Drop a task-only `minimal.toml` into the session workspace,
+            // standing in for the e2e test's SFTP upload.
+            server
+                .seed_workspace_mfile(
+                    session_id,
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n\n\
+                     [tasks.greet]\n\
+                     args.name = { type = \"string\", default = \"world\" }\n\
+                     echo = \"hi %{name}\"\n",
+                )
+                .await;
+
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+
+            match client
+                .call::<FinalizeSession>(&FinalizeSessionRequest {
+                    session_id,
+                    report_shared_port_collisions: false,
+                })
+                .await
+            {
+                minimald_rpc::Errorable::Ok(_) => {}
+                minimald_rpc::Errorable::Err { error } => {
+                    panic!("FinalizeSession failed: {error}");
+                }
+            }
+
+            session_id
+        }
+
         /// End-to-end happy path for `min run <task>`: an `echo` task is
         /// serviced straight from the workspace `minimal.toml` — no
         /// package graph, upstream, or sandbox — and its text (plus a
@@ -2244,63 +4600,22 @@ mod tests {
         /// to resolve a task against) surfaces without needing a VM.
         #[tokio::test]
         async fn exec_runs_echo_task() {
-            use minimald_rpc::{
-                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
-                FinalizeSessionRequest,
-            };
-
             let server = TestServer::new().await;
             let mut client = server.connect().await;
-            let session_id = client
-                .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
-                .await
-                .unwrap()
-                .id;
+            let session_id = active_session_with_echo_task(&server, &mut client, "exec-test").await;
             let session_str = session_id.to_string();
-
-            // Drop a task-only `minimal.toml` into the session workspace,
-            // standing in for the e2e test's SFTP upload. No `[upstream]`:
-            // the echo short-circuit never builds a graph, so nothing here
-            // reaches the (network-bound) package machinery.
-            server
-                .seed_workspace_mfile(
-                    session_id,
-                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
-                )
-                .await;
-
-            // A task-only mfile gates nothing, so the loadout composes in
-            // one shot rather than erroring or pending.
-            crate::test_harness::unwrap_ready(
-                client
-                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
-                        session_id,
-                        contribution: Default::default(),
-                    })
-                    .await
-                    .unwrap(),
-            );
-
-            // ConfigureLoadout leaves the record `Materializing`; exec
-            // (and its `context()` gate) requires `Active`. This
-            // composition has no patches, so FinalizeSession takes the
-            // empty-composition shortcut past the marker check and
-            // promotes the record to `Active` in one call.
-            match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
-                .await
-            {
-                minimald_rpc::Errorable::Ok(_) => {}
-                minimald_rpc::Errorable::Err { error } => {
-                    panic!("FinalizeSession failed: {error}");
-                }
-            }
 
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun("echo_ok".to_string()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: false,
+                        args: vec![],
+                        cwd: String::new(),
+                    }
+                    .encode(),
                     &[],
                 )
                 .await
@@ -2312,6 +4627,182 @@ mod tests {
                 out.stderr.is_empty(),
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
+            );
+        }
+
+        /// A task run's args reach the task: the daemon parses the argv off
+        /// the wire against the task's declared `args`, so `%{name}` binds
+        /// to the default when none is given, to the value when one is, and
+        /// an undeclared flag fails the run rather than being dropped.
+        #[tokio::test]
+        async fn exec_binds_task_args_and_defaults() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = active_session_with_echo_task(&server, &mut client, "args-test").await;
+            let session_str = session_id.to_string();
+
+            let run = |args: Vec<String>| {
+                ExecRequest::TaskRun {
+                    task: "greet".to_string(),
+                    owns_box: false,
+                    args,
+                    cwd: String::new(),
+                }
+                .encode()
+            };
+
+            // No args: the declared default applies.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec![]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.stdout, b"hi world\n");
+            assert_eq!(out.exit_status, Some(0));
+
+            // An explicit value overrides the default.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec!["--name".into(), "Alice".into()]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.stdout, b"hi Alice\n");
+            assert_eq!(out.exit_status, Some(0));
+
+            // An undeclared flag fails the run instead of being ignored.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec!["--nope".into(), "x".into()]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
+            assert_ne!(out.exit_status, Some(0));
+        }
+
+        /// NET-131: a box created for a run ends when the run's command
+        /// exits, whether or not the client that started it is still here.
+        /// The request carries the owns-box flag; the daemon destroys the
+        /// session after the exit status is on the wire — the destroy the
+        /// client used to issue after a normal run, moved here so a client
+        /// killed mid-run strands nothing.
+        ///
+        /// The destroy runs after the channel closes, so this client's exec
+        /// can return before the box is gone: the end is polled for, not
+        /// raced on. The info line the run's end emits is asserted too — it
+        /// is what a diagnostic bundle's daemon-log tail reads the end of a
+        /// run box from.
+        #[tokio::test]
+        async fn run_box_ends_when_its_run_ends() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+
+            let capture = crate::test_harness::captured_log();
+
+            let session_id =
+                active_session_with_echo_task(&server, &mut client, "run-box-ends").await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: true,
+                        args: vec![],
+                        cwd: String::new(),
+                    }
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
+
+            // The box ends after the channel closes; poll until the listing
+            // is empty rather than racing the destroy.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+                if listed.sessions.is_empty() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the run's box must end once its task exits, but {} session(s) are still \
+                     listed: {:?}",
+                    listed.sessions.len(),
+                    listed.sessions,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            // The one info line the run's end emits, naming the session, the
+            // exec and the exit code.
+            let logged = capture.contents();
+            assert!(
+                logged.contains("run box ended"),
+                "expected the run-box-end info line, got: {logged}"
+            );
+            assert!(logged.contains(&session_str), "names the session: {logged}");
+            assert!(logged.contains("echo_ok"), "names the exec: {logged}");
+            assert!(logged.contains("exit=0"), "names the exit code: {logged}");
+        }
+
+        /// A task run that does not own its box leaves the session standing:
+        /// the daemon ends only what the run owns, and the unflagged
+        /// spelling — what `min session run` sends, and what every client
+        /// from before the flag sent — keeps the box for whoever holds it.
+        /// After the exec has returned, and the moment a stray destroy would
+        /// have needed, the session is still listed.
+        #[tokio::test]
+        async fn run_box_survives_when_run_keeps_it() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id =
+                active_session_with_echo_task(&server, &mut client, "run-box-kept").await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: false,
+                        args: vec![],
+                        cwd: String::new(),
+                    }
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
+
+            // The exec is over; the box is not. Give the moment a stray
+            // destroy would have needed before asserting.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+            assert_eq!(
+                listed.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+                vec![session_id],
+                "a run that keeps its box must not end it; got {:?}",
+                listed.sessions,
             );
         }
 
@@ -2332,7 +4823,13 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun("some_task".to_string()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: "some_task".to_string(),
+                        owns_box: false,
+                        args: vec![],
+                        cwd: String::new(),
+                    }
+                    .encode(),
                     &[],
                 )
                 .await;
@@ -2347,7 +4844,13 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun(String::new()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: String::new(),
+                        owns_box: false,
+                        args: vec![],
+                        cwd: String::new(),
+                    }
+                    .encode(),
                     &[],
                 )
                 .await;
@@ -2567,6 +5070,340 @@ mod tests {
                 "got {:?}",
                 String::from_utf8_lossy(&out.stderr),
             );
+        }
+
+        /// An argv exec carrying a credential-shaped token emits an `exec
+        /// request` line without the token and with the rest of the command
+        /// intact.
+        #[tokio::test]
+        async fn exec_request_scrubs_credentials_from_log() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+
+            let capture = crate::test_harness::captured_log();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::Argv(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/".to_string(),
+                    ])
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("an argv request is serviced over the channel");
+
+            // The exec itself may fail (no sandbox), but the log line must
+            // be scrubbed.
+            let logged = capture.contents();
+            assert!(
+                logged.contains("exec request"),
+                "expected an exec request line, got: {logged}"
+            );
+            assert!(
+                !logged.contains("ghp_FAKETOKEN"),
+                "token must be scrubbed from the exec request line, got: {logged}"
+            );
+            assert!(
+                logged.contains("<redacted:len=13>"),
+                "token must be replaced with placeholder, got: {logged}"
+            );
+            // The rest of the command is intact.
+            assert!(
+                logged.contains("curl -H 'Authorization: Bearer"),
+                "non-credential parts of the command must survive, got: {logged}"
+            );
+            assert!(
+                logged.contains("https://x/"),
+                "URL must survive, got: {logged}"
+            );
+
+            // The exec outcome is not the point of this test.
+            let _ = out;
+        }
+    }
+}
+
+/// The exec channel's spans (OTel TEL-021, TEL-022, TEL-043): the client's
+/// `TRACEPARENT` reaches the `exec` and `git_*` spans, and the session
+/// lookup those channels make runs inside them. Export is off here, so the
+/// ids are the ones `adopt_trace` records for the file log; with export on
+/// they are the exported ids (the same code path, see `adopt_trace`).
+#[cfg(test)]
+mod trace_tests {
+    use crate::test_harness::{ExecRejected, SpanLog, TestServer};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    const PARENT: &str = "b7ad6b7169203331";
+    /// A session id no fresh server knows.
+    const UNKNOWN: &str = "6f1c1f9e-5a1b-4c2d-8e3f-000000000001";
+
+    fn traceparent() -> String {
+        format!("00-{TRACE}-{PARENT}-01")
+    }
+
+    /// `command` on `argv`'s channel of a fresh server, with the client's
+    /// `TRACEPARENT` and `MINIMAL_SESSION_ID` naming no session: the request
+    /// is refused after the lookup. Returns what the spans looked like.
+    async fn exec_unknown_session(command: &str) -> SpanLog {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session = UNKNOWN.to_owned();
+        let tp = traceparent();
+        let env = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::TRACEPARENT_ENV, tp.as_str()),
+        ];
+        let outcome = client.exec(&env, false, command, b"").await;
+        assert_eq!(outcome.err(), Some(ExecRejected), "an unknown session");
+        log
+    }
+
+    /// `verb min://<session>` on a channel of a fresh server's configured
+    /// session, with the client's `TRACEPARENT`: the lookup succeeds and the
+    /// pack task runs (to whatever end; its outcome is not the point).
+    /// Returns what the spans looked like.
+    async fn exec_known_session(verb: &str) -> SpanLog {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session =
+            crate::test_harness::create_configured_session(&mut client, "git-trace", "/tmp")
+                .await
+                .to_string();
+        let tp = traceparent();
+        let env = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::TRACEPARENT_ENV, tp.as_str()),
+        ];
+        let command = format!("{verb} min://{session}");
+        let run = client.exec(&env, false, &command, b"");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), run)
+            .await
+            .expect("the pack task ends with its channel");
+        assert!(outcome.is_ok(), "a known session is accepted");
+        log
+    }
+
+    /// The span `name`, in the client's trace, is the parent of the pack
+    /// task's `GetPaths` session message: the task runs in it.
+    fn assert_task_in(log: &SpanLog, name: &str) {
+        let span = log.one(name, "trace_id", TRACE);
+        let paths: Vec<_> = log
+            .find("session.message", "kind", "GetPaths")
+            .into_iter()
+            .filter(|m| m.field("trace_id") == Some(TRACE))
+            .collect();
+        assert_eq!(
+            paths.len(),
+            1,
+            "one GetPaths in the client's trace: {paths:#?}"
+        );
+        assert_eq!(
+            paths[0].field("parent_span_id"),
+            span.field("span_id"),
+            "the pack task runs in {name}: {paths:?}"
+        );
+    }
+
+    /// The span `name` is the client's span's child, and the manager's
+    /// `GetSession` message (the session lookup) is that span's child, all
+    /// in the client's trace.
+    fn assert_lookup_in(log: &SpanLog, name: &str) -> crate::test_harness::LoggedSpan {
+        let span = log.one(name, "trace_id", TRACE);
+        assert_eq!(span.field("parent_span_id"), Some(PARENT), "{span:?}");
+        let lookup = log.one("sessions.manager.message", "kind", "GetSession");
+        assert_eq!(lookup.field("trace_id"), Some(TRACE), "{lookup:?}");
+        assert_eq!(
+            lookup.field("parent_span_id"),
+            span.field("span_id"),
+            "the lookup is a child of {name}: {lookup:?}"
+        );
+        span
+    }
+
+    /// TEL-021, TEL-022: an exec adopts the client's `TRACEPARENT`,
+    /// and its session lookup is a child of the exec span. TEL-043: the command
+    /// line on the span is scrubbed of secrets.
+    #[tokio::test]
+    async fn an_exec_session_lookup_runs_in_the_exec_span() {
+        let log =
+            exec_unknown_session("curl -H 'Authorization: Bearer abc123def456' https://x/").await;
+        let exec = assert_lookup_in(&log, "exec");
+        let command = exec.field("command").unwrap_or_default();
+        assert!(!command.contains("abc123def456"), "{command}");
+        assert!(
+            command.contains("Authorization: Bearer <redacted"),
+            "{command}"
+        );
+    }
+
+    /// An exec whose client opted out of telemetry
+    /// (`MINIMAL_OTEL=off` on the channel, no `TRACEPARENT`) leaves no
+    /// span in the daemon's export: a tracer under the daemon's subscriber
+    /// sees nothing of it or of what ran in it, while the same exec from a
+    /// client that did not opt out exports its `exec` span. The file log
+    /// still has the span, marked `telemetry=opt-out`, with unsampled ids
+    /// its session lookup shares, and no command line.
+    ///
+    /// The lookup's own `sessions.manager.message` span is a root that
+    /// adopts the request's ids through `mlog::otel::align`, which asks the
+    /// process-wide tracer and so cannot be driven by this test's; the
+    /// flags-00 ids it adopts are the mechanism TEL-024 proves.
+    #[tokio::test]
+    async fn an_opted_out_request_leaves_no_daemon_span() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("t")))
+                .with(log.clone()),
+        );
+        let exported = || -> Vec<(String, String)> {
+            exporter
+                .get_finished_spans()
+                .unwrap()
+                .iter()
+                .map(|s| (s.name.to_string(), s.span_context.trace_id().to_string()))
+                .collect()
+        };
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session = UNKNOWN.to_owned();
+        let command = "curl -H 'Authorization: Bearer abc123def456' https://x/";
+
+        let off = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::OTEL_ENV, minimald_rpc::trace::OTEL_OFF),
+        ];
+        let outcome = client.exec(&off, false, command, b"").await;
+        assert_eq!(outcome.err(), Some(ExecRejected), "an unknown session");
+        let exec = log.one("exec", "telemetry", super::OPT_OUT);
+        assert_eq!(exec.field("command"), None, "no command line: {exec:?}");
+        assert_eq!(exec.field("parent_span_id"), None, "{exec:?}");
+        let trace_id = exec
+            .field("trace_id")
+            .expect("ids for the file log")
+            .to_owned();
+        let lookup = log.one("sessions.manager.message", "kind", "GetSession");
+        assert_eq!(
+            lookup.field("trace_id"),
+            Some(trace_id.as_str()),
+            "the lookup joins the request in the file log: {lookup:?}"
+        );
+        let sent = exporter
+            .get_finished_spans()
+            .unwrap()
+            .iter()
+            .filter(|s| s.name == "exec" || s.span_context.trace_id().to_string() == trace_id)
+            .count();
+        assert_eq!(
+            sent,
+            0,
+            "nothing of the request was exported: {:?}",
+            exported()
+        );
+
+        let tp = traceparent();
+        let on = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::TRACEPARENT_ENV, tp.as_str()),
+        ];
+        let outcome = client.exec(&on, false, command, b"").await;
+        assert_eq!(outcome.err(), Some(ExecRejected), "an unknown session");
+        assert!(
+            exported().iter().any(|(name, _)| name == "exec"),
+            "a client that did not opt out is exported: {:?}",
+            exported()
+        );
+        assert!(
+            log.one("exec", "trace_id", TRACE)
+                .field("command")
+                .is_some_and(|c| c.contains("<redacted")),
+            "and its span carries the scrubbed command"
+        );
+    }
+
+    /// TEL-022: a push's session lookup runs in the
+    /// `git_receive` span, in the client's trace.
+    #[tokio::test]
+    async fn a_git_receive_lookup_runs_in_its_span() {
+        let log = exec_unknown_session(&format!("git-receive-pack min://{UNKNOWN}")).await;
+        assert_lookup_in(&log, "git_receive");
+    }
+
+    /// TEL-022: a fetch's session lookup runs in the
+    /// `git_upload` span, in the client's trace.
+    #[tokio::test]
+    async fn a_git_upload_lookup_runs_in_its_span() {
+        let log = exec_unknown_session(&format!("git-upload-pack min://{UNKNOWN}")).await;
+        assert_lookup_in(&log, "git_upload");
+    }
+
+    /// TEL-022: a push's receive-pack task runs in `git_receive`,
+    /// so its session messages join the client's trace instead of rooting
+    /// their own.
+    #[tokio::test]
+    async fn a_git_receive_task_runs_in_its_span() {
+        let log = exec_known_session("git-receive-pack").await;
+        assert_task_in(&log, "git_receive");
+    }
+
+    /// TEL-022: a fetch's upload-pack task runs in `git_upload`
+    /// (here it refuses a session with no repository, after `GetPaths`).
+    #[tokio::test]
+    async fn a_git_upload_task_runs_in_its_span() {
+        let log = exec_known_session("git-upload-pack").await;
+        assert_task_in(&log, "git_upload");
+    }
+
+    /// A push or a fetch from a client that opted out
+    /// (`MINIMAL_OTEL=off` on the channel) marks its git span
+    /// `telemetry=opt-out`, with ids for the file log and no parent. This
+    /// runs `adopt_opt_out` on both git spans, so its debug assertion that
+    /// the span declares `telemetry` fails here if either span loses it.
+    #[tokio::test]
+    async fn an_opted_out_git_span_is_marked_opt_out() {
+        for (verb, name) in [
+            ("git-receive-pack", "git_receive"),
+            ("git-upload-pack", "git_upload"),
+        ] {
+            let log = SpanLog::default();
+            let _g =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let env = [
+                (crate::MINIMAL_SESSION_ID_ENV, UNKNOWN),
+                (minimald_rpc::trace::OTEL_ENV, minimald_rpc::trace::OTEL_OFF),
+            ];
+            let outcome = client
+                .exec(&env, false, &format!("{verb} min://{UNKNOWN}"), b"")
+                .await;
+            assert_eq!(
+                outcome.err(),
+                Some(ExecRejected),
+                "{verb}: an unknown session"
+            );
+            let span = log.one(name, "telemetry", super::OPT_OUT);
+            assert_eq!(span.field("parent_span_id"), None, "{span:?}");
+            assert!(span.field("trace_id").is_some(), "file-log ids: {span:?}");
         }
     }
 }

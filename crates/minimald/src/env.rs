@@ -10,13 +10,13 @@
 //! ## The in-sandbox `min` command channel
 //!
 //! Packages, tasks and checks can be driven from *inside* a running session via
-//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox2`]'s listener
+//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox`]'s listener
 //! is synchronous — a blocking `accept()` loop on its own OS thread — which is
 //! why the equivalent handler in `mctx` has to spin up a fresh tokio runtime per
 //! command. Here we bridge that synchronous world to the daemon's async runtime
 //! with an actor:
 //!
-//! - [`BridgeChannel`] is the trivial synchronous [`sandbox2::Channel`]. For each
+//! - [`BridgeChannel`] is the trivial synchronous [`sandbox::Channel`]. For each
 //!   request it clones the connection and forwards it (with the request line)
 //!   down an mpsc to the actor, then returns immediately.
 //! - [`SessionChannel`] is the actor: it owns the context and graph and processes
@@ -33,20 +33,19 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
+use crate::traced::spawn_blocking;
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::StreamExt as _;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
-use sandbox2::config::{Config, SandboxMapped};
-use sandbox2::{Container, Sandbox};
-use sessions::NetworkMode;
+use sandbox::config::{ClassifierLeaf, Config, SandboxMapped};
+use sandbox::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::JoinHandle;
 
 /// The min helper script installed at `/usr/bin/min` inside the sandbox.
 const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
@@ -59,7 +58,10 @@ const ATTACH_ENV_HOOK_MARKER: &str = "minimal: per-attach environment";
 /// Directory and file name of the bash rc the session shell is started with
 /// (`--rcfile`). Not a shell-owned integration point like the others — this
 /// build of bash has no `/etc/bash.bashrc` — so the daemon names it on the
-/// shell's own argv; see [`install_attach_env_hooks`].
+/// shell's own argv; see [`install_attach_env_hooks`]. Because it is the
+/// *only* file a session bash reads, it does both jobs the other shells split
+/// between a system rc and a user one: the attach-env hook, then the user's
+/// own startup file ([`ATTACH_ENV_BASH_USER_RC`]).
 const ATTACH_ENV_BASH_RC_DIR: &str = "usr/share/minimal";
 const ATTACH_ENV_BASH_RC_NAME: &str = "attach-env.bash";
 
@@ -124,6 +126,44 @@ const ATTACH_ENV_HOOK_BASH: &str = constcat::concat!(
     "\n    return 0\n}\ntrap '__minimal_attach_env' DEBUG\n",
 );
 
+/// The second half of the bash rc: the user's own startup file.
+///
+/// A session bash is started `--noprofile --rcfile <this file>`, so this is
+/// the only place a `~/.bashrc` patched into the session home can be reached
+/// from. Without it bash is the one shell whose startup file a loadout patch
+/// cannot reach — zsh, fish, and nushell all read theirs out of the session
+/// home, which is where patches land, on their own.
+///
+/// Sourced *after* the hook above, which is the ordering every other shell
+/// gets from its own vendor integration point (`/etc/zsh/zshrc` runs before
+/// `~/.zshrc`, `vendor_conf.d` before `config.fish`): the refresh is in place
+/// before anything a loadout wrote can run, and a `DEBUG` trap set by the
+/// user's file is free to take over from there.
+///
+/// `~/.bashrc` and nothing else, because that is the file bash itself would
+/// have read here. The session shell is an interactive *non-login* bash —
+/// no `-l`, and an `argv[0]` of `/usr/bin/bash` with no leading `-`, which
+/// are the only two ways bash becomes a login shell — and `~/.bashrc` is
+/// what such a shell reads. `--rcfile` displaced it; this puts it back.
+///
+/// The login chain (`~/.bash_profile`, `~/.bash_login`, `~/.profile`) is
+/// deliberately NOT read. bash consults those only for a login shell, and it
+/// would consult exactly one of them; a shell that reports `shopt
+/// login_shell` as off has no business running files whose whole purpose is
+/// once-per-login setup (agent startup, unguarded `PATH` prepends). A
+/// dotfiles tree that keeps its bash setup in `~/.bash_profile` reaches this
+/// shell by naming the patch `dest = ".bashrc"` — the destination is the
+/// user's to choose, unlike the layout of a real home directory.
+const ATTACH_ENV_BASH_USER_RC: &str = r#"# minimal: user startup file
+if [ -n "${HOME:-}" ] && [ -r "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+"#;
+
+/// The whole bash rc: the attach-env hook, then the user's startup file.
+const ATTACH_ENV_BASH_RC_BODY: &str =
+    constcat::concat!(ATTACH_ENV_HOOK_BASH, ATTACH_ENV_BASH_USER_RC);
+
 /// zsh: `precmd`, its per-prompt hook. Installed into the global rc, so it
 /// runs before any user `~/.zshrc`, which cannot unset a hook it never saw.
 const ATTACH_ENV_HOOK_ZSH: &str = constcat::concat!(
@@ -168,12 +208,12 @@ const ATTACH_ENV_HOOK_NU: &str = constcat::concat!(
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
 /// the same directory at [`SessionChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
-pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_DEFAULT_WD);
 
 /// Where the session's home directory appears inside the sandbox, backed by
 /// [`SessionChannel::home`]. The second of the two directories a sandbox path
 /// can name on the daemon's side.
-pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
 /// The parameters used to construct an [`Env`].
 ///
@@ -194,13 +234,15 @@ pub struct EnvArgs {
     patches: Option<EnvPatches>,
     env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
-    network_mode: NetworkMode,
-    own_ip_tap: Option<sandbox2::config::OwnIpTap>,
-    own_ip_dns: Option<std::net::Ipv4Addr>,
+    network: sandbox::NetPlan,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
     session: crate::session::WeakSessionHandle,
+    /// The owning session's id, for the helper channel's request spans
+    /// (`session.id`), beside the box id: host-side facts about who is
+    /// asking, never read from the request.
+    session_id: Option<sessions::SessionId>,
     /// When true (default), [`Env::build`] consumes package
     /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
     /// When false, the caller supplies both via `env_vars` /
@@ -209,6 +251,13 @@ pub struct EnvArgs {
     ///
     /// [`SetupForPackages`]: graph::SetupForPackages
     include_package_attr_wiring: bool,
+
+    /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
+    /// decided on, and the one every process of the box is placed in.
+    /// `None` on a host that places no box — the tree the privileged step
+    /// installs is absent — whose environments launch exactly as they did
+    /// before the classifier existed, never refused on that ground.
+    classifier_leaf: Option<ClassifierLeaf>,
 }
 
 impl EnvArgs {
@@ -232,12 +281,21 @@ impl EnvArgs {
             patches: None,
             env_vars: None,
             ot: None,
-            network_mode: NetworkMode::HostNet,
-            own_ip_tap: None,
-            own_ip_dns: None,
+            network: sandbox::NetPlan::host(),
             session,
+            session_id: None,
             include_package_attr_wiring: true,
+            classifier_leaf: None,
         }
+    }
+
+    /// Names the owning session, so every helper request the box sends is
+    /// served in a span that carries `session.id` (the host's knowledge of
+    /// the asker, beside `box.id`).
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: sessions::SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
     }
 
     /// Opts out of consuming `env_vars` / `fs_mappings` from
@@ -304,29 +362,21 @@ impl EnvArgs {
         self
     }
 
-    /// Sets the network isolation mode for the session sandbox.
+    /// Sets what the session sandbox's network looks like when no provider
+    /// decides it — a plan, because that is what the sandbox layer acts on.
     #[must_use]
-    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
-        self.network_mode = mode;
+    pub fn with_network(mut self, plan: sandbox::NetPlan) -> Self {
+        self.network = plan;
         self
     }
 
-    /// Sets the own-IP user-mode tap parameters (native/DM2 own-IP). When set,
-    /// the sandbox's TAP is created + configured in-namespace by hakoniwa
-    /// (rootless) and the caller relays its fd to the switch. `None` keeps the
-    /// host/VM behaviour.
+    /// Places this environment's box in `leaf`, its own classifier leaf
+    /// (NET-079) — the cgroup its egress verdict is decided on and the one
+    /// every process of the box is placed in. The leaf must already exist:
+    /// the launcher creates it before the spawn.
     #[must_use]
-    pub fn with_own_ip_tap(mut self, tap: Option<sandbox2::config::OwnIpTap>) -> Self {
-        self.own_ip_tap = tap;
-        self
-    }
-
-    /// Sets the own-IP DNS server for the sandbox's `/etc/resolv.conf` (the
-    /// switch gateway). Set for every own-IP sandbox, independent of the tap
-    /// params, so both the DM2 and DM1/3/4 own-IP paths get a working resolver.
-    #[must_use]
-    pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
-        self.own_ip_dns = dns;
+    pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
+        self.classifier_leaf = Some(leaf);
         self
     }
 }
@@ -339,6 +389,12 @@ impl EnvArgs {
 /// thus the sandbox's backing files).
 pub struct Env {
     sandbox: Sandbox<BridgeChannel>,
+    /// The working directory commands in this session start in, resolved from
+    /// the sandbox config once at build time. Fixed for the sandbox's lifetime,
+    /// so resolving it here keeps the [`command_environment`] accessor total.
+    ///
+    /// [`command_environment`]: Self::command_environment
+    command_cwd: String,
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
     /// Variables the channel actor has added since launch; see
@@ -388,6 +444,18 @@ fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<Str
         .collect()
 }
 
+/// Looks up a session package by name in `graph`.
+///
+/// The one lookup both [`Env::build`] (at launch) and session activation's
+/// finalize check use, so a name activation accepts is one the launch
+/// resolves, and both report an unknown name in the same words.
+pub(crate) fn session_package(graph: &Graph, name: &str) -> std::io::Result<BuildSpecRef> {
+    graph
+        .by_name(name)
+        .copied()
+        .ok_or_else(|| std::io::Error::other(format!("no such package: {name}")))
+}
+
 impl Env {
     /// Build a runtime environment. Resolves and locally builds the
     /// requested packages (plus `bash`/`socat` for the `min`
@@ -399,12 +467,7 @@ impl Env {
         graph.top_levels = args
             .packages
             .iter()
-            .map(|n| {
-                graph
-                    .by_name(n)
-                    .copied()
-                    .ok_or_else(|| std::io::Error::other(format!("no such package: {n}")))
-            })
+            .map(|n| session_package(&graph, n))
             .collect::<Result<_, _>>()?;
         for helper_dep in ["bash", "socat"] {
             if let Some(bsr) = graph.by_name(helper_dep).copied()
@@ -494,14 +557,32 @@ impl Env {
             )
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
-            .with_network_mode(args.network_mode)
-            // Own-IP tap params are `None` for host/VM modes and the
-            // vsock-shuttle path. DNS is set on every own-IP sandbox.
-            .with_own_ip_tap(args.own_ip_tap)
-            .with_own_ip_dns(args.own_ip_dns)
+            .with_plan(args.network)
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
+        // NET-080: the box's own id, for the fetch records its installs
+        // produce — the leaf's name, the same id the tree's rules match,
+        // when the host placed it in one; else the session's name. Read
+        // before the leaf is moved into the sandbox config below.
+        let box_id = args
+            .classifier_leaf
+            .as_ref()
+            .and_then(|leaf| {
+                leaf.dir()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| args.name.clone());
+        // NET-079: the leaf the launcher created before this build, so the
+        // sandbox keeps the host's cgroup mounts out of a leaf-bearing box and
+        // names the leaf it entered on its launch log line. `None` on a host
+        // that places no box: the config above is the whole story, exactly as
+        // it was before the classifier existed.
+        let config = match args.classifier_leaf {
+            Some(leaf) => config.with_classifier_leaf(leaf),
+            None => config,
+        };
 
         // Wire up the channel actor and build the sandbox around the bridge.
         let (tx, rx) = mpsc::channel(8);
@@ -517,6 +598,7 @@ impl Env {
         }
         install_min_helpers(&sandbox.rootfs()).map_err(std::io::Error::other)?;
         sandbox.keep_dir(false);
+        let command_cwd = sandbox.command_cwd().map_err(sandbox_err_to_io)?;
 
         let runtime_env = RuntimeEnv::default();
         let channel = SessionChannel {
@@ -524,21 +606,30 @@ impl Env {
                 Utf8PathBuf::try_from(sandbox.rootfs().to_path_buf()).unwrap(),
             )
             .unwrap(),
+            name: args.name.clone(),
             runtime_env: runtime_env.clone(),
             state_dir: args.state_base_dir.clone(),
             working: args.cwd.clone(),
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
+            box_id,
+            session_id: args.session_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
             ctx,
             graph,
             rx,
         };
-        let actor = tokio::spawn(channel.run());
+        // The actor serves the box's in-session `min` for the env's life, past
+        // the launch that built it: a root of its own, linked to the launch.
+        let actor = crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "session.env"),
+            channel.run(),
+        );
 
         Ok(Self {
             sandbox,
+            command_cwd,
             actor: Some(actor),
             runtime_env,
             _temp_dirs: Vec::new(),
@@ -554,8 +645,38 @@ impl Env {
     }
 
     /// Creates a fresh container in this environment's sandbox.
-    pub fn container(&mut self) -> std::io::Result<Container> {
-        self.sandbox.new_container().map_err(sandbox_err_to_io)
+    pub fn container(&mut self, plan: &sandbox::NetPlan) -> std::io::Result<Container> {
+        self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
+    }
+
+    /// The host-side twin of the report file a leaf-bearing box's pre-exec
+    /// closure writes into its `/run`: the same file, through the sandbox's
+    /// read-write `/run` bind, named by the leaf. For the launch to read
+    /// after the spawn — which cover the box took over its classifier tree,
+    /// or the errno that killed the closure before the program ran — so it
+    /// is forwarded from the sandbox, which owns the directory the box's
+    /// `/run` is bound from and cannot have its path precomputed by a caller
+    /// (the base directory is named by [`Env::build`], per launch).
+    ///
+    /// [`Env::build`]: crate::env::Env::build
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn closure_report_path(
+        &self,
+        leaf: &sandbox::config::ClassifierLeaf,
+    ) -> std::path::PathBuf {
+        self.sandbox.closure_report_path(leaf)
+    }
+
+    /// Holds the program of every command `container` spawns at a start gate
+    /// until the returned gate is released; see [`sandbox::Sandbox::hold_start`].
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn hold_start(
+        &self,
+        container: &mut Container,
+    ) -> std::io::Result<sandbox::StartGate> {
+        self.sandbox
+            .hold_start(container)
+            .map_err(sandbox_err_to_io)
     }
 
     /// The assembled session rootfs on the daemon's filesystem.
@@ -598,7 +719,7 @@ impl Env {
         let mut vars = self.sandbox.command_env();
         vars.extend(self.runtime_env.snapshot());
         crate::session_host::SessionEnvironment {
-            cwd: self.sandbox.command_cwd(),
+            cwd: self.command_cwd.clone(),
             vars,
         }
     }
@@ -622,8 +743,8 @@ fn err_to_io(e: Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// Converts a [`sandbox2::Error`] into an [`std::io::Error`].
-fn sandbox_err_to_io(e: sandbox2::Error) -> std::io::Error {
+/// Converts a [`sandbox::Error`] into an [`std::io::Error`].
+fn sandbox_err_to_io(e: sandbox::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
@@ -656,10 +777,14 @@ fn install_min_helpers(rootfs: &Path) -> std::io::Result<()> {
 /// makes the very first command typed at a prompt drawn *before* the attach
 /// see the new terminal, rather than the value that was in force when that
 /// prompt was drawn. bash needs only the `DEBUG` trap, which already fires
-/// before every command. bash is missing here on purpose — this build has no
-/// `/etc/bash.bashrc`, so the session shell is pointed at
-/// [`ATTACH_ENV_BASH_RC`] with `--rcfile` instead (which also keeps the
-/// session from reading a user `~/.bashrc` it never read before).
+/// before every command.
+///
+/// bash's file is the odd one: this build has no `/etc/bash.bashrc`, so there
+/// is no integration point bash reads by itself and the session shell is
+/// pointed at [`ATTACH_ENV_BASH_RC`] with `--rcfile` instead. That makes it
+/// the only startup file a session bash reads, so it carries the user's own
+/// too ([`ATTACH_ENV_BASH_USER_RC`]) — the file the *shell's* rc would have
+/// sourced, had bash been reading one.
 ///
 /// Every hook hard-codes the file path rather than reading
 /// `$MINIMAL_ATTACH_ENV`: the variable is a convenience for anyone scripting
@@ -671,7 +796,7 @@ fn install_attach_env_hooks(rootfs: &Path) -> std::io::Result<()> {
         (
             Path::new(ATTACH_ENV_BASH_RC_DIR),
             ATTACH_ENV_BASH_RC_NAME,
-            ATTACH_ENV_HOOK_BASH,
+            ATTACH_ENV_BASH_RC_BODY,
         ),
         (
             Path::new(ATTACH_ENV_BASH_RC_DIR),
@@ -716,7 +841,7 @@ struct ChannelRequest {
     stream: UnixStream,
 }
 
-/// The synchronous [`sandbox2::Channel`] that bridges the listener thread to the
+/// The synchronous [`sandbox::Channel`] that bridges the listener thread to the
 /// async [`SessionChannel`] actor. It does no work itself beyond handing each
 /// request off; the connection clone stays open in the actor until the handler
 /// finishes, at which point dropping it closes the connection and the client's
@@ -725,7 +850,7 @@ struct BridgeChannel {
     tx: mpsc::Sender<ChannelRequest>,
 }
 
-impl sandbox2::Channel for BridgeChannel {
+impl sandbox::Channel for BridgeChannel {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, _rootfs: &Path) {
         let stream = match stream.try_clone() {
             Ok(s) => s,
@@ -754,6 +879,11 @@ impl sandbox2::Channel for BridgeChannel {
 struct SessionChannel {
     ctx: Context,
     graph: Graph,
+    /// The box's name, as the environment was built with it — the one fact
+    /// about the box that outlives its record, so the paths the record read
+    /// fails on can still say whose request they were in the one line every
+    /// expose request owes the log.
+    name: String,
     /// The sandbox rootfs, into which freshly-installed packages are hardlinked.
     rootfs: DaemonAbsPath,
     /// The host directory backing `/state`.
@@ -765,6 +895,14 @@ struct SessionChannel {
 
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
+    /// NET-080: the box this channel's installs are made for, named the way
+    /// the classifier tree names it — the box's leaf when the host placed it
+    /// in one, else the session's name — so the daemon's own fetches are
+    /// recorded with the box that asked for them.
+    box_id: String,
+    /// The owning session's id ([`EnvArgs::with_session_id`]); `None` for
+    /// an env built without one (tests).
+    session_id: Option<sessions::SessionId>,
     ot: Option<OpTracker>,
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
@@ -774,12 +912,95 @@ struct SessionChannel {
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
+/// The span one helper request is handled in, and the request with its
+/// trace prefix removed.
+///
+/// The helper (`env_min_helper.sh`, `__min_rpc`) sends
+/// `traceparent%<w3c traceparent>%<method>%<data>` when the box has a
+/// `TRACEPARENT` — the exec span's context, handed to the box by
+/// [`crate::exec`] — and the bare `<method>%<data>` otherwise. The actor runs
+/// for the env's life under its own `session.env` root, so without this a
+/// request's mailbox messages (`StartMaterialize`, `ExposeDynamic`) and the
+/// spans they open were children of that root, in a trace of their own
+/// (scenarios 717b and 770). Here the request gets a root of its own that
+/// adopts the forwarded context ([`crate::exec::adopt_trace`] records the
+/// ids and `remember`s them for [`crate::traced::caller_context`]), so the
+/// messages sent while handling it join the exec that ran the helper.
+///
+/// `box_id` and `session_id` are the host's own knowledge of who is asking
+/// (the channel was built for that box, by that session): they go on the
+/// span as `box.id` and `session.id`, and nothing the box sends can set
+/// them. The box-supplied part of the line (the traceparent) only parents
+/// the span, and the method is recorded as one of [`CHANNEL_METHODS`] or
+/// `other` ([`channel_method`]), never as the text the box sent.
+fn channel_request_span<'a>(
+    line: &'a str,
+    box_id: &str,
+    session_id: Option<sessions::SessionId>,
+) -> (tracing::Span, &'a str) {
+    let (traceparent, request) = match line.split_once('%') {
+        Some(("traceparent", rest)) => match rest.split_once('%') {
+            Some((tp, request)) => (Some(tp), request),
+            None => (None, rest),
+        },
+        _ => (None, line),
+    };
+    let method = channel_method(request);
+    let span = tracing::info_span!(
+        parent: None,
+        "session.channel",
+        method,
+        box.id = box_id,
+        session.id = session_id.as_ref().map(tracing::field::display),
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    let client_ctx = traceparent.and_then(minimald_rpc::trace::TraceContext::parse_traceparent);
+    crate::exec::adopt_trace(&span, client_ctx);
+    (span, request)
+}
+
+/// The methods [`SessionChannel::handle`] dispatches: the only values the
+/// `session.channel` span's `method` takes besides `other`. Keep it in step
+/// with the arms of `handle`.
+const CHANNEL_METHODS: &[&str] = &[
+    "add-transient",
+    "add-build",
+    "add-runtime",
+    "add-session",
+    "search",
+    "check",
+    "patched-pkg",
+    "run",
+    "build",
+    "materialize",
+    "net-expose",
+];
+
+/// The `method` a helper request is recorded under: the text before its
+/// first `%` when that is a method [`SessionChannel::handle`] dispatches,
+/// else `other` (a line with no `%` is never dispatched, so it is `other`
+/// too). The line comes from inside the box and the span is exported and
+/// spooled, so no box-chosen text, of any length, reaches the host's
+/// telemetry through this field.
+fn channel_method(request: &str) -> &'static str {
+    request
+        .split_once('%')
+        .and_then(|(method, _)| CHANNEL_METHODS.iter().find(|known| **known == method))
+        .copied()
+        .unwrap_or("other")
+}
+
 impl SessionChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
         while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
             tracing::trace!("session channel handling: {line}");
-            self.handle(&line, &mut stream).await;
+            let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
+            // Boxed: the handler's future is large (every subcommand's state in
+            // one `async fn`) and it is awaited once per request, not per byte.
+            tracing::Instrument::instrument(Box::pin(self.handle(line, &mut stream)), span).await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
@@ -855,6 +1076,15 @@ impl SessionChannel {
                 self.run_materialize(stream, request).await;
                 None
             }
+            // `<port>`: the box's own `min net expose <port>` (NET-043) — the
+            // port a process inside the box asks to publish, decided and
+            // published by the session that owns it.
+            Some(("net-expose", port)) => {
+                self.expose_port(stream, port).await;
+                None
+            }
+            // A new arm above also goes in `CHANNEL_METHODS`, or its span
+            // records `other`.
             _ => {
                 let _ = writeln!(stream, "error: unhandled input '{line}'");
                 None
@@ -911,11 +1141,24 @@ impl SessionChannel {
             }
         }
         // Stream build progress back to the client while the graph builds: a
-        // first-time `min add` fetches and extracts its packages right here,
-        // and previously drew nothing while the bytes downloaded. Rendered
-        // through the same `BuildRenderer` as `min build`, so both read
-        // identically; a fully-cached add emits no events and stays quiet.
-        let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
+        // first-time `min add` fetches and extracts its packages right here.
+        // `msg:` lines (`fetching go`, `building go`) name what started. The
+        // byte meter those fetches already track is painted as `bar:` lines
+        // on the next row; the in-sandbox helper redraws each one in place. A
+        // fully-cached add emits neither and stays quiet.
+        //
+        // Built before the two futures: `build` needs `&mut self.ctx` and
+        // `render` must not borrow it as well. NET-080: the scope is the
+        // record's as much as the meter's — every package this install may
+        // fetch is recorded as the daemon's own node-plane fetch, made for
+        // the box that asked — so the one walk feeds both.
+        let scope = install_scope(&new_graph, pkgs);
+        let progress = crate::sandbox_progress::SandboxProgress::new(
+            self.ctx.op_tracker(),
+            Some(scope.clone()),
+        )
+        .with_fetch_record(self.fetch_record(&new_graph, &scope));
+        let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
             // string in the same poll it appears, so `join!` never buffers it
@@ -926,14 +1169,13 @@ impl SessionChannel {
                 Err(e) => Some(e.to_string()),
             }
         };
-        let render = async {
-            let mut renderer = orchestrator::BuildRenderer::new(false);
-            while let Some(event) = log_rx.next().await {
+        let mut renderer = orchestrator::BuildRenderer::new(false);
+        let render =
+            crate::sandbox_progress::relay(stream, progress, log_rx, |event, progress, stream| {
                 if let Some(line) = renderer.render(event) {
-                    let _ = writeln!(stream, "msg:{}", line.text);
+                    progress.message(stream, &line.text);
                 }
-            }
-        };
+            });
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
             let _ = writeln!(stream, "error: {e}");
@@ -1011,6 +1253,43 @@ impl SessionChannel {
             pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
         );
         self.graph = new_graph;
+    }
+
+    /// NET-080: the context this install's fetches are recorded under — the
+    /// box the install was made for, the leaf this daemon's own fetches
+    /// leave from (where it stands in one), the host the daemon fetches the
+    /// configured remote cache from, and each package in the install's scope
+    /// spelled the way `min search` spells it, with its upstream version
+    /// when the graph knows one.
+    fn fetch_record(
+        &self,
+        graph: &Graph,
+        scope: &HashSet<String>,
+    ) -> crate::sandbox_progress::FetchRecord {
+        let objects = scope
+            .iter()
+            .map(|name| {
+                let spelled = graph
+                    .by_name(name)
+                    .and_then(|bsr| graph.get(bsr))
+                    .and_then(|build| build.upstream_version())
+                    .map_or_else(
+                        || name.clone(),
+                        |version| format!("{name} (version {version})"),
+                    );
+                (name.clone(), spelled)
+            })
+            .collect();
+        crate::sandbox_progress::FetchRecord {
+            box_id: self.box_id.clone(),
+            leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
+                sandbox::classifier::TREE_ROOT,
+            )),
+            cache_host: crate::net::classifier::cache_host(
+                &self.ctx.daemon_context().config().remote_cache_url(),
+            ),
+            objects,
+        }
     }
 
     /// Implements `min search <term>`.
@@ -1113,6 +1392,16 @@ impl SessionChannel {
 
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
+            let remote_cache = if ctx.use_remote_cache() {
+                // No flag to name: the daemon's context never sets no_fetch
+                // and the in-sandbox `min` helper takes no flags. `{:#}`
+                // keeps the cause.
+                Some(ctx.remote_cache(false, false).await.map_err(|e| {
+                    std::io::Error::other(format!("{:#}", mctx::remote_cache_setup_error(e, None)))
+                })?)
+            } else {
+                None
+            };
             let output_base = ctx.builds_base_dir();
             let _ = std::fs::create_dir_all(&output_base);
 
@@ -1123,6 +1412,7 @@ impl SessionChannel {
                 remote_fetcher: &remote_storage,
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
+                remote_cache: remote_cache.as_ref(),
             }
             .run(&op::Options {
                 cache,
@@ -1188,9 +1478,28 @@ impl SessionChannel {
             None
         };
 
+        let Some(session) = self.session.upgrade() else {
+            let _ = writeln!(stream, "error: session is gone");
+            return;
+        };
+
         let result: Result<(), Error> = async {
+            // A task started from inside the session is a PTask of that
+            // session's mode too (017-005).
+            let gone = |e: std::io::Error| Error::IO("reading the session", Default::default(), e);
+            // Two statements: `mctx::Error` is not `Send`, and one expression
+            // would hold it across the second await in a spawned future.
+            let record = session.record().await.map_err(gone)?;
+            let switch = session.net_switch().await.map_err(gone)?;
+            let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
+            let network = crate::exec::task_network(
+                &record,
+                &switch,
+                sessions::EGRESS_DEFAULT_PHASE,
+                opt_out,
+            );
             let mut env = ctx
-                .make_env(
+                .make_env_with_network(
                     task_name,
                     &mut graph,
                     task.inherit_cwd
@@ -1199,12 +1508,17 @@ impl SessionChannel {
                     Some(&task.patch),
                     Some(&task.vars),
                     task.packages.clone(),
+                    network,
                     // The session's own home, not the daemon's. `minimald` is
                     // pid 1 with `HOME=/` inside the guest, so the ambient
                     // home would expand a package's `~/.claude.json` onto the
                     // read-only rootfs (#1204); the session has a real,
                     // writable home and this channel already holds it.
                     mctx::PatchHome::Session(self.home.clone()),
+                    mctx::WdLayout::Session {
+                        home: self.home.as_utf8_path().to_path_buf().into(),
+                        working: self.working.as_utf8_path().to_path_buf().into(),
+                    },
                 )
                 .await?;
 
@@ -1262,16 +1576,21 @@ impl SessionChannel {
         use crate::session_sop::{BuildOutcome, BuildUpdate};
         let mut renderer = orchestrator::BuildRenderer::new(flag_verbose);
         let mut outcome = None;
-        while let Some(update) = events.recv().await {
+        // The same meter as `min add`. Unscoped: this build runs on the
+        // session's own side-op, so every package row on the tree is its.
+        let progress = crate::sandbox_progress::SandboxProgress::new(self.ctx.op_tracker(), None);
+        let updates = futures::stream::poll_fn(|cx| events.poll_recv(cx));
+        crate::sandbox_progress::relay(stream, progress, updates, |update, progress, stream| {
             match update {
                 BuildUpdate::Event(event) => {
                     if let Some(line) = renderer.render(event) {
-                        let _ = writeln!(stream, "msg:{}", line.text);
+                        progress.message(stream, &line.text);
                     }
                 }
                 BuildUpdate::Finished(o) => outcome = Some(o),
             }
-        }
+        })
+        .await;
 
         // Report the propagated outcome; only success claims completion.
         match outcome {
@@ -1378,6 +1697,151 @@ impl SessionChannel {
         let _ = writeln!(stream, "msg:{message} to {output}");
     }
 
+    /// Handles the box's own `min net expose <port>` (NET-043): the request a
+    /// process inside the box sends to publish one of its ports. The session
+    /// that owns this channel decides it against the box's `dynamic_ingress`
+    /// setting and publishes when it allows (NET-044); the reply carries the
+    /// address the port was published on and, said honestly, whether a
+    /// connection to it is answered by the box yet — bound on the host, but
+    /// a port the box did not declare waits for its relay gate to admit it,
+    /// and until then the relay answers, not the box — or the typed
+    /// refusal's own reason.
+    ///
+    /// A box decided `ask` makes this wait (NET-045): the session routes the
+    /// ask to whoever is attached — this peer's own terminal, when it is the
+    /// client the human answered from — and the reply that lands here is the
+    /// applied answer: the mapping the human allowed, or the typed refusal
+    /// for a deny and for nobody being attached to answer.
+    ///
+    /// One info line per request on every path (NET-044's observability): the
+    /// actor logs each request it sees, and this channel logs the ones no
+    /// actor can — a port that is not a number, a session that is gone, an
+    /// actor that dropped a request's reply channel before answering, and
+    /// the record the actor could not read, whose line the actor cannot
+    /// write because the box's name lives in that record and this channel
+    /// holds its own copy. Every line names the box, the port as given, and
+    /// the outcome.
+    async fn expose_port(&self, stream: &mut UnixStream, port: &str) {
+        let port_number = match port.parse::<u16>() {
+            Ok(number) => number,
+            Err(_) => {
+                tracing::info!(
+                    name = %self.name,
+                    port = %port,
+                    outcome = "refused",
+                    reason = %format_args!("'{port}' is not a port number"),
+                    "dynamic ingress expose"
+                );
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer that sent no port \
+                              number may be gone before the reply lands, and there is \
+                              nowhere to report that to"
+                )]
+                let _ = writeln!(stream, "error: '{port}' is not a port number");
+                return;
+            }
+        };
+        let session = match self.session.upgrade() {
+            Some(session) => session,
+            None => {
+                tracing::info!(
+                    name = %self.name,
+                    port = %port,
+                    outcome = "refused",
+                    // `%format_args!` keeps the reason unquoted, the shape the
+                    // other expose lines print.
+                    reason = %format_args!("the session is gone"),
+                    "dynamic ingress expose"
+                );
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before \
+                              the reply lands, and there is nowhere to report that to"
+                )]
+                let _ = writeln!(stream, "error: session is gone");
+                return;
+            }
+        };
+        match session.expose_dynamic(port_number).await {
+            Ok(mapping) => {
+                // The publish admitted the port at the box's relay gate
+                // before it answered (NET-044), so the port is reachable
+                // now; nothing listening on it yet is answered by the box's
+                // own kernel, not by the gate.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before \
+                              the reply lands, and there is nowhere to report that to"
+                )]
+                let _ = writeln!(
+                    stream,
+                    "msg:published port {} at {}",
+                    mapping.internal_port, mapping.local
+                );
+            }
+            Err(failure) => {
+                // The failures no actor could name, so this channel writes
+                // their lines itself: the record-read failure reached the
+                // actor but its line cannot be written there — the box's
+                // name lives in the record it could not read — and the
+                // dead-actor failure never reached one at all. Every other
+                // failure already left its line in the actor, which saw the
+                // record; logging here too would make two lines for one
+                // request.
+                let line = match &failure {
+                    crate::net::policy::ExposeFailure::RecordUnreadable { .. }
+                    | crate::net::policy::ExposeFailure::ActorGone { .. } => {
+                        tracing::info!(
+                            name = %self.name,
+                            port = %port,
+                            outcome = "refused",
+                            reason = %failure,
+                            "dynamic ingress expose"
+                        );
+                        format!("error: {failure}")
+                    }
+                    // A refusal names its way forward with the box's name
+                    // and the port asked for. The name is the record's, read
+                    // now: this channel's own copy is the creation-time one,
+                    // and `min session rename` has moved on from it by the
+                    // time a later request lands. The record's network mode
+                    // decides which way forward is open. A host-address
+                    // box's port needs no exposing at all, which is the goal
+                    // met rather than an error, so it is a plain message and
+                    // the helper exits 0.
+                    crate::net::policy::ExposeFailure::Refused(refusal) => {
+                        let (box_name, network) = match session.record().await {
+                            Ok(record) => (
+                                record.name.unwrap_or_else(|| self.name.clone()),
+                                record.network,
+                            ),
+                            Err(_) => (self.name.clone(), sessions::NetworkMode::OwnIp),
+                        };
+                        let text = refusal.for_caller(&box_name, network, port_number);
+                        if matches!(
+                            refusal,
+                            crate::net::policy::ExposeRefusal::NeedsNoExposing { .. }
+                        ) {
+                            format!("msg:{text}")
+                        } else {
+                            format!("error: {text}")
+                        }
+                    }
+                    crate::net::policy::ExposeFailure::Publish { .. } => {
+                        format!("error: {failure}")
+                    }
+                };
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before \
+                              the reply lands, and there is nowhere to report that to"
+                )]
+                let _ = writeln!(stream, "{line}");
+            }
+        }
+    }
+
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
     /// multi-line, richly-formatted report) followed by an `error:` terminator.
     fn write_error(e: &Error, stream: &mut UnixStream) {
@@ -1444,6 +1908,18 @@ impl SessionChannel {
             })
             .collect()
     }
+}
+
+/// Names of `pkgs` and of everything building or running them needs: the
+/// packages an install's progress meter reports on.
+fn install_scope(graph: &Graph, pkgs: &[(&str, BuildSpecRef)]) -> HashSet<String> {
+    let top_levels: Vec<BuildSpecRef> = pkgs.iter().map(|(_n, bsr)| *bsr).collect();
+    let deps = Transitives::for_toplevels(graph, top_levels.clone(), true);
+    top_levels
+        .iter()
+        .chain(deps.keys())
+        .filter_map(|bsr| graph.get(bsr).map(|b| b.name.clone()))
+        .collect()
 }
 
 /// A parsed `min materialize` invocation: what to materialize, plus where in
@@ -1736,6 +2212,186 @@ impl tokio::io::AsyncWrite for StreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A helper request arrives as `traceparent%<tp>%<method>%<data>` when
+    /// the box has a `TRACEPARENT`, and bare otherwise; the prefix is taken
+    /// off before dispatch and the request's span is named for the method.
+    /// Without a subscriber the adopted ids are not observable here; the
+    /// shape of the request is.
+    #[test]
+    fn channel_request_span_strips_the_traceparent_prefix() {
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let expose = format!("traceparent%{tp}%net-expose%8770");
+        let (_, request) = super::channel_request_span(&expose, "b", None);
+        assert_eq!(request, "net-expose%8770");
+        let materialize = format!("traceparent%{tp}%materialize%/workbench%--output o o717b");
+        let (_, request) = super::channel_request_span(&materialize, "b", None);
+        assert_eq!(request, "materialize%/workbench%--output o o717b");
+        let (_, request) = super::channel_request_span("net-expose%8770", "b", None);
+        assert_eq!(request, "net-expose%8770");
+        // A prefix with no request after it is handed on as-is, to be refused
+        // by the dispatcher as unhandled input rather than guessed at.
+        let (_, request) = super::channel_request_span("traceparent%garbage", "b", None);
+        assert_eq!(request, "garbage");
+    }
+
+    /// A request from inside a box is served in a span that
+    /// names the box and the session it belongs to, as the host knows them
+    /// (the channel was built for that box by that session), whatever the
+    /// line says: the box-supplied traceparent parents the span and sets
+    /// nothing else.
+    #[test]
+    fn a_box_request_span_carries_the_host_side_box_identity() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let session_id =
+            sessions::SessionId::parse_str("7b3e1f2a-9c4d-4e5f-8a6b-1c2d3e4f5a6b").unwrap();
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = format!("traceparent%{tp}%net-expose%8770");
+        let (span, request) = super::channel_request_span(&line, "leaf-7", Some(session_id));
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "method", "net-expose");
+        assert_eq!(served.field("box.id"), Some("leaf-7"), "{served:?}");
+        assert_eq!(
+            served.field("session.id"),
+            Some(session_id.to_string().as_str()),
+            "{served:?}"
+        );
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the line's traceparent parents the span"
+        );
+
+        // Without a session id the field is simply absent; the box id stays.
+        let (span, _) = super::channel_request_span("net-expose%8770", "solo", None);
+        drop(span);
+        let bare = log.find("session.channel", "box.id", "solo");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].field("session.id"), None);
+    }
+
+    /// The span's `method` is one of the methods the channel
+    /// dispatches, or `other`: a line with no `%`, an unknown method, or a
+    /// long one never puts box-chosen text on the host's span.
+    #[test]
+    fn a_box_request_span_names_only_a_dispatched_method() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let long = "x".repeat(64 * 1024);
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        for (line, method) in [
+            ("net-expose%8770".to_string(), "net-expose"),
+            (format!("traceparent%{tp}%materialize%/w%o"), "materialize"),
+            ("add-session%jq".to_string(), "add-session"),
+            ("net-expose".to_string(), "other"),
+            ("no percent sign at all".to_string(), "other"),
+            ("rm-rf%/".to_string(), "other"),
+            (format!("{long}%x"), "other"),
+            (long.clone(), "other"),
+            (format!("traceparent%{tp}%{long}"), "other"),
+        ] {
+            let (span, _) = super::channel_request_span(&line, "m", None);
+            drop(span);
+            let served = log.find("session.channel", "box.id", "m");
+            let last = served.last().expect("a session.channel span");
+            assert_eq!(last.field("method"), Some(method), "{:.40}", line);
+        }
+        for method in super::CHANNEL_METHODS {
+            assert_eq!(super::channel_method(&format!("{method}%")), *method);
+        }
+    }
+
+    /// TEL-025: a `min` inside a box (the shipped helper, `__min_rpc`)
+    /// hands the box's inherited `TRACEPARENT` to the daemon as the request
+    /// line's `traceparent%` prefix, and the daemon serves the request in a
+    /// span that adopts it, so the daemon's work for it joins the outer
+    /// trace. The inner `min` is a shell function: it has no exporter and
+    /// exports nothing. The helper runs under bash with a `socat` stand-in
+    /// that records the line it would send; the span is the one the channel
+    /// actor serves that line in. A value that is not the 55-character W3C
+    /// form is not forwarded at all, so a `%` in it cannot shift the split.
+    #[cfg(unix)]
+    #[test]
+    fn a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+        let sent_line = tmp.path().join("line");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!("#!/bin/sh\ncat > '{}'\necho done:\n", sent_line.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let send = |traceparent: Option<&str>| -> String {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(format!(
+                    ". '{}'; __min_rpc net-expose 8770",
+                    helper.display()
+                ))
+                .env("PATH", &path)
+                .env_remove("TRACEPARENT");
+            if let Some(tp) = traceparent {
+                cmd.env("TRACEPARENT", tp);
+            }
+            let out = cmd.output().expect("run bash");
+            assert!(out.status.success(), "{out:?}");
+            std::fs::read_to_string(&sent_line)
+                .unwrap()
+                .trim_end_matches('\n')
+                .to_string()
+        };
+
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = send(Some(tp));
+        assert_eq!(line, format!("traceparent%{tp}%net-expose%8770"));
+
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (span, request) = super::channel_request_span(&line, "inner", None);
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "box.id", "inner");
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the daemon's span joins the outer trace: {served:?}"
+        );
+        assert_eq!(
+            served.field("parent_span_id"),
+            Some("ed105930ec67df47"),
+            "{served:?}"
+        );
+
+        // Not the W3C form: the request goes bare, and the daemon mints.
+        for bad in [
+            "",
+            "garbage",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-0",
+            "00-af79b928d8ae574b659f1fbf40208758%ed105930ec67df4-01",
+            "00-AF79B928D8AE574B659F1FBF40208758-ED105930EC67DF47-01",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01%x",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01 x",
+        ] {
+            assert_eq!(send(Some(bad)), "net-expose%8770", "{bad:?}");
+        }
+        assert_eq!(send(None), "net-expose%8770");
+    }
 
     /// Every session rootfs carries the per-attach environment hook for every
     /// shell we support, at that shell's own vendor/system integration point
@@ -1803,6 +2459,157 @@ mod tests {
         }
     }
 
+    /// The bash rc carries both halves, hook first. A session bash reads
+    /// nothing else, so if the user's startup file were sourced before the
+    /// trap were set, a `~/.bashrc` could see a session without a `TERM`
+    /// refresh — the one ordering rule this file has.
+    #[test]
+    fn the_bash_rc_installs_the_hook_before_the_users_startup_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_min_helpers(tmp.path()).unwrap();
+
+        let body =
+            std::fs::read_to_string(tmp.path().join("usr/share/minimal/attach-env.bash")).unwrap();
+        let hook = body
+            .find("trap '__minimal_attach_env' DEBUG")
+            .expect("the rc must install the hook");
+        let user_rc = body
+            .find("$HOME/.bashrc")
+            .expect("the rc must reach the user's startup file");
+        assert!(hook < user_rc, "the hook must be installed first: {body}");
+    }
+
+    /// Runs a rootfs's bash rc the way an attach does — the argv
+    /// `crate::session_shell`'s table gives bash — with `home` standing in
+    /// for the session home, and returns the shell's stdout.
+    ///
+    /// `None` when the host has no bash to run it with: the caller skips,
+    /// matching the repo's self-skip-locally convention
+    /// (`crates/common/tests/shell_lint.rs`). The Linux lanes have bash, so
+    /// these run for real in CI.
+    fn run_session_bash(rootfs: &Path, home: &Path, command: &str) -> Option<String> {
+        let rc = rootfs
+            .join(ATTACH_ENV_BASH_RC_DIR)
+            .join(ATTACH_ENV_BASH_RC_NAME);
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--rcfile"])
+            .arg(&rc)
+            // `-i` is what makes bash read an `--rcfile` at all, and it is
+            // what a session bash is started with. Without a tty it warns
+            // about job control on stderr, which is why only stdout is read.
+            .args(["-i", "-c", command])
+            .env("HOME", home)
+            // The rc under test is the only startup file that may run: the
+            // developer's own environment must not reach it.
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .output()
+            .map_err(|e| eprintln!("no bash to run the session rc with — skipping: {e}"))
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "the session rc should leave a usable shell: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// A rootfs plus an empty session home, ready for [`run_session_bash`].
+    fn rootfs_and_home() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        install_min_helpers(&rootfs).unwrap();
+        (tmp, rootfs, home)
+    }
+
+    /// The point of the whole file: a `~/.bashrc` patched into the session
+    /// home runs, and runs *after* the daemon's hook is in place — so the
+    /// same `dest = ".bashrc"` patch that works for `.zshrc` and
+    /// `config.fish` works for bash.
+    #[test]
+    fn a_patched_bashrc_is_sourced_after_the_hook() {
+        let (_tmp, rootfs, home) = rootfs_and_home();
+        std::fs::write(
+            home.join(".bashrc"),
+            // `declare -F` asks whether the hook's function is defined yet,
+            // which is only true if the first half of the rc has run.
+            "echo bashrc-ran\ndeclare -F __minimal_attach_env >/dev/null && echo hook-first\n",
+        )
+        .unwrap();
+
+        let Some(out) = run_session_bash(&rootfs, &home, "echo prompt-ready") else {
+            return;
+        };
+        assert!(out.contains("bashrc-ran"), "got: {out}");
+        assert!(out.contains("hook-first"), "got: {out}");
+        assert!(out.contains("prompt-ready"), "got: {out}");
+    }
+
+    /// The login chain stays unread, which is what bash does: those files
+    /// belong to a *login* shell, and this one is not one. A home carrying
+    /// all four gets `~/.bashrc` alone — sourcing a `~/.bash_profile` here
+    /// would run once-per-login setup in a shell reporting `login_shell` as
+    /// off, which happens nowhere else a bash user has been.
+    #[test]
+    fn the_login_chain_is_not_sourced() {
+        let (_tmp, rootfs, home) = rootfs_and_home();
+        std::fs::write(home.join(".bashrc"), "echo bashrc-ran\n").unwrap();
+        for file in [".bash_profile", ".bash_login", ".profile"] {
+            std::fs::write(home.join(file), format!("echo {file}-ran\n")).unwrap();
+        }
+
+        let Some(out) = run_session_bash(&rootfs, &home, "echo prompt-ready") else {
+            return;
+        };
+        assert_eq!(
+            out.matches("bashrc-ran").count(),
+            1,
+            "the rc should be sourced exactly once, got: {out}"
+        );
+        for file in [".bash_profile", ".bash_login", ".profile"] {
+            assert!(
+                !out.contains(&format!("{file}-ran")),
+                "{file} is a login shell's file and must stay unread, got: {out}"
+            );
+        }
+    }
+
+    /// And a home carrying *only* a login-chain file gets nothing — the same
+    /// silence `docker exec -it … bash` or a Linux terminal emulator gives
+    /// it. The fix is the patch's `dest`, which is the user's to name.
+    #[test]
+    fn a_login_chain_file_alone_is_not_a_bashrc() {
+        for file in [".bash_profile", ".bash_login", ".profile"] {
+            let (_tmp, rootfs, home) = rootfs_and_home();
+            std::fs::write(home.join(file), format!("echo {file}-ran\n")).unwrap();
+
+            let Some(out) = run_session_bash(&rootfs, &home, "echo prompt-ready") else {
+                return;
+            };
+            assert!(
+                !out.contains(&format!("{file}-ran")),
+                "{file} must not stand in for ~/.bashrc, got: {out}"
+            );
+            assert!(out.contains("prompt-ready"), "got: {out}");
+        }
+    }
+
+    /// The common case — a session home with no dotfiles at all — starts a
+    /// shell that is quiet and whose first command sees a zero status, not
+    /// the failed `-r` test of a file that was never there.
+    #[test]
+    fn a_home_with_no_startup_file_starts_cleanly() {
+        let (_tmp, rootfs, home) = rootfs_and_home();
+
+        let Some(out) = run_session_bash(&rootfs, &home, r"echo status=$?") else {
+            return;
+        };
+        assert_eq!(out.trim(), "status=0", "got: {out}");
+    }
+
     /// A rootfs whose own packages ship a global zsh rc keeps it: the hook is
     /// appended, and appending is idempotent across launches.
     #[test]
@@ -1828,6 +2635,85 @@ mod tests {
             "the hook should be appended exactly once: {body}"
         );
     }
+
+    /// Runs the installed `min` helper with `__min_rpc` stubbed out, so a
+    /// `patched-build` invocation can be checked without a daemon socket.
+    /// Returns `None` when the host has no bash, matching the repo's
+    /// self-skip-locally convention.
+    fn run_min_helper(rootfs: &Path, args: &str) -> Option<(String, String, i32)> {
+        let script = rootfs.join("usr/bin/min");
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                r#"
+source "$1"
+__min_rpc() { echo "RPC-CALLED:$*" >&2; return 1; }
+min_patched_pkg $2
+rc=$?
+echo "rc=$rc"
+exit $rc
+"#,
+                "_",
+                script.to_str().unwrap(),
+                args,
+            ])
+            .output()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    }
+
+    /// `min package patched-build --help` prints usage, exits 0, and makes no
+    /// RPC — `--help` must not be forwarded to the daemon as a package name.
+    #[test]
+    fn patched_build_help_prints_usage_without_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        let Some((stdout, stderr, code)) = run_min_helper(rootfs, "--help") else {
+            return;
+        };
+        assert_eq!(code, 0, "help should exit 0, got: {stdout} {stderr}");
+        assert!(
+            stderr.contains("Usage: min package patched-build <package-name>"),
+            "help should print usage, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("RPC-CALLED"),
+            "help must not reach the daemon, got: {stderr}"
+        );
+        assert!(stdout.contains("rc=0"), "got: {stdout}");
+    }
+
+    /// A missing name or a `-`-prefixed argument prints usage, exits 1, and
+    /// makes no RPC — it is a usage error, not a package name.
+    #[test]
+    fn patched_build_rejects_missing_or_flag_like_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for args in ["", "--bogus"] {
+            let Some((stdout, stderr, code)) = run_min_helper(rootfs, args) else {
+                return;
+            };
+            assert_eq!(code, 1, "`{args}` should exit 1, got: {stdout} {stderr}");
+            assert!(
+                stderr.contains("Usage: min package patched-build <package-name>"),
+                "`{args}` should print usage, got: {stderr}"
+            );
+            assert!(
+                !stderr.contains("RPC-CALLED"),
+                "`{args}` must not reach the daemon, got: {stderr}"
+            );
+        }
+    }
+
     use camino::Utf8PathBuf;
     use mctx::ConfigBuilder;
     use std::io::{BufRead, BufReader};
@@ -1837,6 +2723,16 @@ mod tests {
     /// `SessionChannel` wired to them with a dummy receiver so handlers can be
     /// driven directly.
     fn setup_channel() -> (TempDir, TempDir, TempDir, SessionChannel) {
+        setup_channel_with(crate::session::WeakSessionHandle::dangling(), "web")
+    }
+
+    /// [`setup_channel`] for a channel bound to the session that owns it: the
+    /// session's weak handle and the box's name, so the paths that reach into
+    /// the session — the expose hop — can be driven against a live one.
+    fn setup_channel_with(
+        session: crate::session::WeakSessionHandle,
+        name: &str,
+    ) -> (TempDir, TempDir, TempDir, SessionChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -1856,6 +2752,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel(1);
         let channel = SessionChannel {
+            name: name.to_string(),
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(rootfs.path().to_path_buf()).unwrap(),
             )
@@ -1871,8 +2768,10 @@ mod tests {
             home: DaemonAbsPath::try_new(Utf8PathBuf::try_from(home.path().to_path_buf()).unwrap())
                 .unwrap(),
             has_packages: HashSet::new(),
+            box_id: "a session in a test".to_string(),
+            session_id: None,
             ot: None,
-            session: crate::session::WeakSessionHandle::dangling(),
+            session,
             runtime_env: RuntimeEnv::default(),
             ctx,
             graph,
@@ -1903,6 +2802,700 @@ mod tests {
         assert!(
             lines[0].contains("error: unhandled input 'garbage-input'"),
             "unexpected output: {lines:?}"
+        );
+    }
+
+    /// The box's `min net expose <port>` reaches the channel as
+    /// `net-expose%<port>` (NET-043) — the request shape the helper sends —
+    /// and the channel answers it rather than treating it as unknown input:
+    /// a non-numeric port is refused as one, and a numeric one is routed to
+    /// the session that owns the channel (here a dangling handle, so the
+    /// routing is what the reply names). The decision itself — against the
+    /// box's `dynamic_ingress` — is the session actor's, proven where it
+    /// lives.
+    #[tokio::test]
+    async fn net_expose_reaches_the_session_channel() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%http", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: 'http' is not a port number"],
+            "a non-numeric port is refused as one"
+        );
+
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: session is gone"],
+            "a numeric port is routed to the session that owns the channel"
+        );
+    }
+
+    /// NET-044's observability for the paths no session actor ever saw — the
+    /// ones a `min net expose` request can take without one deciding it: a
+    /// port that is not a number, a session that is gone, a reply channel an
+    /// actor dropped before answering, and a record the actor could not
+    /// read, whose line the actor cannot write because the box's name lives
+    /// in the record it could not read. This channel holds its own copy of
+    /// the name, so it writes those lines; each request leaves exactly one,
+    /// naming the box, the port as given, and the outcome. Every path the
+    /// actor did see — including a publish that failed, whatever the source
+    /// — leaves its own line there, pinned by the expose tests in `session`,
+    /// so the channel writes none for it: one request, one line, on every
+    /// path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_logs_every_path_from_the_channel() {
+        let capture = crate::test_harness::captured_log();
+
+        // A port that is not a number, and a session that is gone: two
+        // requests a dangling channel answers on its own. Under this test's
+        // own box name — the shared capture holds every test's lines, so
+        // each request's line below is found and counted by the box it
+        // names.
+        let (_state, _rootfs, _cwd, mut chan) =
+            setup_channel_with(crate::session::WeakSessionHandle::dangling(), "chanweb");
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%http", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: 'http' is not a port number"],
+            "a non-numeric port is refused as one"
+        );
+
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: session is gone"],
+            "a numeric port is routed to the session that owns the channel"
+        );
+
+        // A session whose record cannot be read: the actor returns its own
+        // typed failure — it cannot name the box — and the line is this
+        // channel's, which knows the name without the record.
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id =
+            crate::test_harness::create_configured_session(&mut client, "recweb", "/tmp").await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the session resolves");
+        // The record, made unreadable on disk: the read every expose request
+        // does now fails, before any decision exists to log.
+        let sessions_dir = server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path()
+            .join("sessions");
+        let records: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions_dir)
+            .expect("the state root holds the sessions dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+            .map(|entry| entry.path().join("record.json"))
+            .filter(|record| record.is_file())
+            .collect();
+        assert_eq!(records.len(), 1, "one session, one record: {records:?}");
+        std::fs::write(&records[0], "not a record").expect("the record is made unreadable");
+
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "recweb");
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1, "one reply: {lines:?}");
+        assert!(
+            lines[0].starts_with("error: reading the session record for port 3000 failed:"),
+            "the reply is the typed record-read failure: {lines:?}"
+        );
+
+        // A publish that failed with `ENOTCONN` out of a bind the actor did
+        // attempt: the actor saw the request, so its line is the actor's and
+        // this channel must not add one — a real `ENOTCONN` there is a
+        // `Publish` failure, not the dead-actor failure it must not be
+        // conflated with. A stand-in actor answers it, then drops the reply
+        // channel of the next request, which no actor saw: that one is the
+        // `ActorGone` failure, and its line is this channel's.
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(
+            crate::session::WeakSessionHandle::answering(vec![Err(
+                crate::net::policy::ExposeFailure::Publish {
+                    port: 3000,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "a bind answered ENOTCONN",
+                    ),
+                },
+            )]),
+            "bindweb",
+        );
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1, "one reply: {lines:?}");
+        assert!(
+            lines[0].starts_with("error: publishing port 3000 failed:")
+                && lines[0].contains("a bind answered ENOTCONN"),
+            "the reply is the typed publish failure, source intact: {lines:?}"
+        );
+
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1, "one reply: {lines:?}");
+        assert!(
+            lines[0].starts_with("error: the session actor for port 3000 is gone"),
+            "a reply channel the actor dropped is its own typed failure: {lines:?}"
+        );
+
+        // One line per request — four wrote one, and the ENOTCONN publish
+        // wrote none — each naming the box and the port as given. Counted
+        // and taken per box name: under the shared capture every test's
+        // lines ride one buffer, so a request's line is found by the box
+        // it names.
+        let logged = capture.contents();
+        let lines_for = |name: &str| -> Vec<&str> {
+            logged
+                .lines()
+                .filter(|line| {
+                    line.contains("dynamic ingress expose")
+                        && line.contains(&format!("name={name}"))
+                })
+                .collect()
+        };
+        assert_eq!(
+            lines_for("chanweb").len(),
+            2,
+            "one line per request the dangling channel answered on its own: {logged}"
+        );
+        assert_eq!(
+            lines_for("recweb").len(),
+            1,
+            "the record the actor could not read says its one line: {logged}"
+        );
+        assert_eq!(
+            lines_for("bindweb").len(),
+            1,
+            "the dropped reply channel says its one line: {logged}"
+        );
+        assert!(
+            !logged
+                .lines()
+                .any(|line| line.contains("publishing port 3000 failed")),
+            "a publish the actor attempted is the actor's line to write, and \
+             this channel must not add one for the same request: {logged}"
+        );
+        assert!(
+            lines_for("chanweb")[0].contains("port=http")
+                && lines_for("chanweb")[0].contains("outcome=\"refused\"")
+                && lines_for("chanweb")[0].contains("reason='http' is not a port number"),
+            "the non-numeric port's line names the port as given: {}",
+            lines_for("chanweb")[0]
+        );
+        assert!(
+            lines_for("chanweb")[1].contains("port=3000")
+                && lines_for("chanweb")[1].contains("outcome=\"refused\"")
+                && lines_for("chanweb")[1].contains("reason=the session is gone"),
+            "the gone session's line says so: {}",
+            lines_for("chanweb")[1]
+        );
+        assert!(
+            lines_for("recweb")[0].contains("port=3000")
+                && lines_for("recweb")[0].contains("outcome=\"refused\"")
+                && lines_for("recweb")[0]
+                    .contains("reason=reading the session record for port 3000 failed"),
+            "the record-read failure's line names the box, whose name the \
+             unreadable record could not: {}",
+            lines_for("recweb")[0]
+        );
+        assert!(
+            lines_for("bindweb")[0].contains("port=3000")
+                && lines_for("bindweb")[0].contains("outcome=\"refused\"")
+                && lines_for("bindweb")[0]
+                    .contains("reason=the session actor for port 3000 is gone"),
+            "the dropped reply channel's line is this channel's, naming the \
+             box: {}",
+            lines_for("bindweb")[0]
+        );
+    }
+
+    /// The publish reply is a plain fact for every port (NET-044): a port
+    /// the box declared was admitted when it attached, and a runtime-only
+    /// port in the same range is admitted by the publish itself, so neither
+    /// reply carries a "not yet reachable" caveat. One box, one flow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_reply_is_a_plain_publish_for_declared_and_runtime_ports() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        // The hand vouched for, so the registry publishes it: both publishes
+        // below bind at the box's own address.
+        let manager = server.state.sessions_manager().await;
+        manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+        let web = crate::session::tests::finalize_declared_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 51),
+            std::net::Ipv4Addr::new(127, 0, 64, 51),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the box launches its host");
+        let sock = handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket();
+        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
+
+        // The declared port: the gate admitted it when the box attached, so
+        // the reply is a fact — reachable now, no caveat.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["msg:published port 3000 at 127.0.64.51:3000"],
+            "a declared port's reply carries no reachability caveat"
+        );
+
+        // A runtime-only port in the same range: the publish admitted it at
+        // the box's gate, so its reply is the same plain fact.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3200", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["msg:published port 3200 at 127.0.64.51:3200"],
+            "a runtime-only port's reply carries no reachability caveat"
+        );
+        forwarder.abort();
+        assert_eq!(
+            served.lock().expect("served lock").len(),
+            2,
+            "one mapping is one request, and both publishes reached the switch"
+        );
+    }
+
+    /// Drives one in-box `min net expose <port>` against the session that
+    /// owns the channel and returns the reply lines, for the refusal tests
+    /// below: each pins the line the box's caller reads, which is where a
+    /// refusal names its way forward.
+    async fn expose_reply(
+        handle: &crate::session::SessionHandle,
+        name: &str,
+        port: u16,
+    ) -> Vec<String> {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), name);
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle(&format!("net-expose%{port}"), &mut ours).await;
+        drop(ours);
+        read_lines(&theirs)
+    }
+
+    /// The deny refusal names the way forward: the setting that allows a
+    /// publish, and the host-side forward that needs no policy change, with
+    /// the box's name and the port asked for filled in by the daemon. Still
+    /// an `error:` line, so the helper exits 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_deny_reply_names_the_way_forward() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 52),
+            std::net::Ipv4Addr::new(127, 0, 64, 52),
+            None,
+            None,
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is denied for this box. Re-activate with --network \
+                 own_ip and --dynamic-ingress allow --dynamic-range <lo>-<hi> (or \
+                 --dynamic-ingress ask) to allow it, or forward it from the host now: min \
+                 net forward web <local>:3001"
+            ],
+        );
+    }
+
+    /// The way forward names the box as it is called now, not as it was
+    /// created: the channel's own copy of the name is the creation-time one,
+    /// so a box renamed since would otherwise be pointed at a name no
+    /// command resolves. The line is built from the record the request is
+    /// decided against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_reply_names_the_renamed_box() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 54),
+            std::net::Ipv4Addr::new(127, 0, 64, 54),
+            None,
+            None,
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        handle
+            .rename("api".to_string())
+            .await
+            .expect("the box renames");
+        // The channel still carries the name the environment was built with.
+        let lines = expose_reply(&handle, "web", 3001).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with("min net forward api <local>:3001"),
+            "the way forward names the box as it is called now: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("web"),
+            "the creation-time name is not the one offered: {}",
+            lines[0]
+        );
+    }
+
+    /// A `--network none` box cannot carry dynamic ingress — the activation
+    /// refuses the flags off `own_ip` — so re-activating with them is no way
+    /// forward for it. The host-side forward is: it dials inside the box's
+    /// own namespace, so it reaches a port a `none` box listens on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_deny_reply_on_a_none_box_offers_only_the_forward() {
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let mut request = crate::test_harness::create_session_req("web", "/uwu");
+        request.config.network = sessions::NetworkMode::NoNet;
+        let id = client.call::<CreateSession>(&request).await.unwrap().id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        client
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                report_shared_port_collisions: false,
+            })
+            .await
+            .unwrap();
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is denied for this box: a --network none box has no \
+                 address to publish at. Forward it from the host instead: min net forward \
+                 web <local>:3001"
+            ],
+        );
+    }
+
+    /// An `ask` with nobody attached names the two ways forward: attach a
+    /// terminal and retry, or have the host forward the port. Still an
+    /// `error:` line, so the helper exits 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_ask_unattended_reply_names_the_way_forward() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 53),
+            std::net::Ipv4Addr::new(127, 0, 64, 53),
+            Some(sessions::DynamicIngress::Ask),
+            Some((3000, 3999)),
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        // No host is running, so nobody is attached to answer.
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is set to ask and nobody is attached to answer: \
+                 attach a terminal (min session attach web) and retry, or have the host \
+                 forward it (min net forward web <local>:3001)"
+            ],
+        );
+    }
+
+    /// A host-address box's port needs no exposing: the reply says where it
+    /// already answers, as a plain `msg:` line, so the helper exits 0 — the
+    /// goal is met, and an error would read as a failure. The harness daemon
+    /// is native, so the host's loopback is named beside the name; the
+    /// VM-backed rendering, without it, is pinned in `net::policy`'s tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_host_address_reply_is_a_plain_message() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::test_harness::create_configured_session(&mut client, "web", "/uwu").await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "msg:port 3001 needs no exposing: this box shares the host's network, so it \
+                 already answers at web.min.internal:3001 (and localhost:3001)"
+            ],
+        );
+    }
+
+    /// NET-043's host-side-only boundary: the dynamic ingress stance and
+    /// range are create inputs, and nothing a process inside the box can
+    /// send sets or widens them. The in-box expose request carries a port
+    /// and no policy field — a request spelling anything more than the
+    /// port is not a port number and is refused as one — so a publish,
+    /// allowed or refused, is decided against the stance the box was
+    /// created with and leaves the record's policy bit-identical. There is
+    /// no in-box verb that writes `IngressPolicy` at all; this pins the
+    /// boundary from the box's side: the only reachable request cannot
+    /// carry a stance, and the record the daemon holds after a successful
+    /// publish is the one the create stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_box_expose_cannot_change_ingress_policy() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        // The hand vouched for, so the registry publishes it: the allowed
+        // publish below binds at the box's own address.
+        let manager = server.state.sessions_manager().await;
+        manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+        let web = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 61),
+            std::net::Ipv4Addr::new(127, 0, 64, 61),
+            Some(sessions::DynamicIngress::Allow),
+            Some((3000, 3999)),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the box launches its host");
+        let sock = handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket();
+        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
+
+        // The stance the create stored — the fixed point every request below
+        // must leave bit-identical, including the range an in-box request
+        // would most want to widen.
+        let policy_at_create = client
+            .call::<minimald_rpc::GetSessionRecord>(&minimald_rpc::GetSessionRecordRequest::Id(web))
+            .await
+            .record
+            .expect("the create left a record")
+            .policy;
+        assert_eq!(
+            policy_at_create.ingress,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some((3000, 3999)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+            "the harness box is the one this test's stance describes"
+        );
+
+        // A publish the stance allows — the request that would have the
+        // best claim on the stance if any did.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["msg:published port 3000 at 127.0.64.61:3000"],
+            "the allowed publish is a fact, admitted at the gate (NET-044)"
+        );
+
+        // The refusal the range gives a port outside it — decided against
+        // the stored stance, typed as its own error.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%4200", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "error: port 4200 is outside this box's declared dynamic range 3000-3999"
+                    .to_string()
+            ],
+            "the out-of-range request is refused with its own typed error"
+        );
+
+        // A request trying to smuggle a stance in the port field: the
+        // request carries a port and no policy field, so this is not a port
+        // number — refused as one, not parsed as an in-box policy write.
+        for smuggle in [
+            "net-expose%3000:dynamic_ingress=allow",
+            "net-expose%3000-3999",
+        ] {
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            #[expect(
+                clippy::large_futures,
+                reason = "the handle future carries the harness's whole channel; the test awaits \
+                          it to completion"
+            )]
+            chan.handle(smuggle, &mut ours).await;
+            drop(ours);
+            let lines = read_lines(&theirs);
+            assert!(
+                lines
+                    == vec![format!(
+                        "error: '{}' is not a port number",
+                        smuggle
+                            .split_once('%')
+                            .expect("the request names its verb")
+                            .1
+                    )],
+                "{smuggle}: the request carries a port and no policy field, so \
+                 anything more is not a port number, got: {lines:?}"
+            );
+        }
+        forwarder.abort();
+        assert_eq!(
+            served.lock().expect("served lock").len(),
+            1,
+            "only the allowed publish reached the switch: the refusals asked \
+             it nothing"
+        );
+
+        // The record after it all: the stance and the range the create
+        // stored, unchanged by a publish and by every refusal — no in-box
+        // path rewrote the policy the box runs under.
+        let policy_after = client
+            .call::<minimald_rpc::GetSessionRecord>(&minimald_rpc::GetSessionRecordRequest::Id(web))
+            .await
+            .record
+            .expect("the record still reads")
+            .policy;
+        assert_eq!(
+            policy_after, policy_at_create,
+            "no in-box request can set or rewrite the ingress policy"
         );
     }
 

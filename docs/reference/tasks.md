@@ -60,6 +60,9 @@ all; useful for pointers and reminders:
 echo = "Docs live at https://docs.minimal.dev"
 ```
 
+Each task sets exactly one action. If a task sets two, such as `exec` and
+`bash`, the file fails to load with an error that names the task and both keys.
+
 When [args](#args) are set on the task, arguments can be substituted into the invocation using
 Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/syntax/#strings):
 
@@ -67,6 +70,23 @@ Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/synta
 [tasks.greet]
 args.name = "string"
 bash = "echo \"Hello %{name}!\""
+```
+
+Command strings are always evaluated as Nickel strings, whether or not the task
+defines any args, so `%{` is significant even in a command that references no
+argument. A shell format specifier containing `%{` — most commonly curl's
+`-w "%{http_code}"` — is otherwise read as interpolation of an undefined
+variable and fails with `nickel eval failed for string`. To pass a literal `%{`
+through, escape it as `%{"%"}{`:
+
+```toml
+# Fails: `%{http_code}` is read as interpolation of an undefined `http_code`.
+[tasks.probe_broken]
+exec = 'curl -s -o /dev/null -w "%{http_code}" https://example.com'
+
+# Works: `%{"%"}{` yields a literal `%{`.
+[tasks.probe]
+exec = 'curl -s -o /dev/null -w "%{"%"}{http_code}" https://example.com'
 ```
 
 
@@ -93,6 +113,16 @@ _Optional_
 [tasks.my_task]
 state_key = "dev" # Cache build artifacts under 'dev'
 ```
+
+`min task run`, and `min run` inside a session, run the task in the session
+layout. The working directory is the project tree at `/workbench`, and `$HOME`
+is the session home at `/home`. There, `state_key` backs only `XDG_CACHE_HOME`
+(`/state/cache`). `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME`
+point into the shared session home: `/home/.config`, `/home/.local/share` and
+`/home/.local/state`. `PATH` adds `/home/.local/bin`. The locale is
+`LANG=C.UTF-8` with no `LC_ALL`, as in the interactive session. `mip run` keeps
+the host working directory, the `/state`-backed `XDG_*` directories and
+`LANG`/`LC_ALL=en_US.utf8`.
 
 
 ### `env_vars` - Environment variables to set {#env_vars}
@@ -232,10 +262,17 @@ of file paths to be mapped in, and the corresponding map mode. The map mode may 
 string "read-only" / "ro" for read-only mappings, or the string "read-write" / "rw" for writeable
 mappings.
 
-If a mapped file or directory does not exist on the host, an empty file or directory is created.
+If a mapped file or directory does not exist on the host, a read-write mapping creates an empty
+file or directory. A read-only mapping never creates its source: the path must already exist, and a
+missing read-only source is an error naming the task and the patch declaration.
 
 Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
+
+In a task the daemon runs in the session layout, `~/` expands to the session home. The daemon
+mounts a mapping inside that home or the project tree at the matching path under `/home` or
+`/workbench`. It mounts the mapping on top of the read-write session mounts, so a read-only mapping
+stays read-only. It mounts any other absolute path at that same path.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
 
@@ -248,6 +285,10 @@ of the repository root.
 [tasks.my_task]
 inherit_cwd = true
 ```
+
+Under `min task run`, the task starts at the matching path under `/workbench`: run from
+`sub/inner`, it starts at `/workbench/sub/inner`. If that directory is not in the uploaded tree, the
+task starts at `/workbench` and prints a one-line notice on stderr.
 
 ### `args` - Pass arguments to tasks {#args}
 
@@ -275,6 +316,17 @@ error: the following required arguments were not provided:
 Usage: mip run greeter --name <name> --greeting <greeting>
 ```
 
+`min task run` takes the same flags after the task name:
+
+```shell
+$> min task run greeter --name Alice --greeting hi
+```
+
+`min task run` reads its own options (`--path`, `--keep`, `--help`) before the task's. To pass a
+task argument with one of those names, put it after `--`, as in
+`min task run deploy -- --path prod`. The project directory is the `--path` option, not a
+positional argument.
+
 Each argument's datatype may be:
 
 - a scalar: `"string"`, `"number"`, or `"boolean"` (alias `"bool"`);
@@ -291,3 +343,47 @@ Instead of a bare datatype string, an argument can be declared as a table with a
 args.name = { type = "string", help = "who to greet", default = "world" }
 exec = "echo Hello %{name}"
 ```
+
+## Networking {#networking}
+
+A task has no `--network` flag of its own. It uses the network of the
+session that runs it, which the session's
+[`--network` mode](./cli-min.md#session-activate) sets:
+
+- `min task run` composes an ephemeral session with the default mode,
+  `host_ip`.
+- `min run <task>` inside a session and
+  [`min session run <session> <task>`](./cli-min.md#session-run) run the task
+  in a session that already exists. The task takes that session's mode.
+
+`host_ip` (the default) shares the host's network namespace. The task
+reaches everything the host reaches. This includes the host-side hostname
+proxy, the port clients point `HTTP(S)_PROXY` at. `min ls` prints the port
+in use. On a native Linux host the proxy listens on `127.0.0.1:7654` by
+default, and picks a free port when 7654 is busy. On a native host only,
+[`minimald run --hostname-proxy-port`](./cli-minimald.md#run) pins it.
+
+On a host where Minimal runs in a VM (macOS), the task shares the VM's
+network, not your computer's. `127.0.0.1` inside the task is the VM's
+loopback. A service listening on your computer's loopback is not reachable
+at that address. The VM helper assigns the proxy port there, so read it from
+`min ls` rather than assuming 7654.
+
+`own_ip` gives the task its own address on the host's switch, in its own
+network namespace. This namespace is a second box beside the session's box,
+not the session's namespace. `127.0.0.1` inside the task is the task's own
+loopback, so a connection to it does not reach the hostname proxy on the host.
+Outbound traffic goes through the switch, so a task that fetches from the
+network does not need the proxy. The task also follows the session's egress
+policy: when the session cannot reach a destination, the task cannot reach it
+either.
+
+On a VM-backed host, which includes every macOS host, a task in an `own_ip`
+session has no outbound reach yet. The task takes a switch address that the
+host's table of boxes does not hold. The switch drops traffic from such an
+address. Run a task that needs the network in a `host_ip`
+session there.
+
+`none` gives the task no network. Every connection to a destination outside
+the task fails. When a task needs the network, give its session a mode that
+has one.

@@ -15,8 +15,6 @@ krun-prefix  := env('HOME') / ".krun"
 # Prefix for the STATIC libkrun the dev stack links (Linux). Built from the
 # vendored pin, not fetched; `just clean` removes it.
 krun-static  := scratch / "libkrun-static" / musl-target
-# Guest networking features baked into the initramfs (networking-wg deferred).
-features     := "networking-proxy"
 kernel       := scratch / "vmlinuz"
 rootfs       := scratch / "rootfs.img"
 initramfs    := scratch / "initramfs.cpio"
@@ -36,6 +34,10 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+# use, because the Linux-only crates do not build there. The script reports any
+# changed crate this leaves out, so the scope is never silently narrower.
+strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -101,9 +103,9 @@ gvproxy:
     @mkdir -p {{scratch}}
     @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
 
-# Cross-compile minimald → initramfs /init with the networking features.
+# Cross-compile minimald → initramfs /init.
 initramfs:
-    FEATURES={{features}} scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
+    scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
 # Compiles the guest minimald here, then hands the binary to
 # scripts/build-initramfs.sh via MINIMALD_BIN (its prebuilt mode), so the script
@@ -119,8 +121,7 @@ initramfs:
 #
 # Build minimald → initramfs /init using the cross toolchain on PATH (no container).
 initramfs-nodocker:
-    cargo zigbuild -p minimald --profile initramfs \
-      --target {{musl-target}} --features {{features}}
+    cargo zigbuild -p minimald --profile initramfs --target {{musl-target}}
     MINIMALD_BIN="{{justfile_directory()}}/target/{{musl-target}}/initramfs/minimald" \
       scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
@@ -143,14 +144,90 @@ minvmd-build: libkrun-static
     MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
       cargo build -p minvmd --bin minvmd --locked --target {{musl-target}}
 
+# Its own cargo invocation, never beside `-p minvmd`: cargo unifies features
+# across the packages one build selects, and minvmd's default `libkrun`
+# feature would stamp libkrun's load command into this root-run program.
+#
+# Build minzoned, the box-name service program, without libkrun.
+zoned-build:
+    cargo build -p minzoned --locked
+
+# The root-installed answerer copy must resolve no library from a
+# user-writable dir (a dylib reached through an rpath there is a root
+# escalation): otool -L on macOS, ldd on Linux, system paths only.
+#
+# Check that minzoned links only system libraries.
+zoned-link-check: zoned-build
+    scripts/check-zoned-links.sh target/debug/minzoned
+
+# The .icns is committed (packaging/macos/AppIcon.icns); this re-renders it
+# from packaging/macos/app-icon.svg after a change to the source. Needs
+# rsvg-convert (`brew install librsvg`) and iconutil.
+#
+# Render the macOS app icon from its SVG source.
+[macos]
+app-icon:
+    scripts/build-app-icon.sh
+
 # Build the `min` CLI.
 minimal-cli:
     cargo build -p minimal --locked
 
-# Build a host-native (glibc) minimald with the networking features (for `just up`).
+# Build a host-native (glibc) minimald (for `just up`).
 [linux]
 minimald-build:
-    cargo build -p minimald --features {{features}} --locked
+    cargo build -p minimald --locked
+
+# THE single build entrypoint for a shippable build: the four release binaries
+# for a target triple, built exactly the way release.yml's build jobs build
+# them (they call this same script), plus completions from the built `min`.
+# Per-package invocations (fat-LTO links serialize), FEATURES for the guest
+# minimald, and the fail-loud static-libkrun requirement for minvmd live in
+# scripts/dist-build.sh — read its header for the LIBKRUN_PREFIX /
+# COMPLETIONS_DIR / FEATURES env knobs.
+#
+# Linux-only: the shippable Linux build is musl-static, and running it from a
+# macOS host would skip minvmd's mandatory codesign and build minimald against
+# glibc — the [linux] attribute keeps the mistake unoffered (`just test-cross`
+# covers the Linux-only crates from macOS).
+[linux]
+dist-build target:
+    scripts/dist-build.sh {{quote(target)}}
+
+# Build the .deb/.rpm/.apk packages for a staged semver release from the
+# installer bucket via the pinned nfpm (fetched + sha256-verified by the
+# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
+# infra repo, not here. (The release workflow builds them from its own
+# artifacts instead — ARTIFACTS_DIR mode — before the row is staged.)
+#
+# The semver row must exist: every versioned release build stages one;
+# releases up to and including 0.5.3 need scripts/backfill-version-row.sh
+# first. Linux-only for the same host-check reason as dist-build: the script
+# downloads static musl ELFs and runs the downloaded `min` to generate
+# completions.
+[linux]
+pkg-nfpm pkgver:
+    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
+
+# Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
+# throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
+# accepts and records the exact version, every shipped path exists, the
+# binaries run on the box's libc, and an uninstall round-trip cleans up. This
+# is the pre-publish ritual from the review feedback — run it before staging a
+# tag; the CI-native container smoke is a separate, follow-up lane. Distrobox
+# drives everything (no apx, no raw podman — see the script header); boxes are
+# removed even on failure unless --keep-boxes is passed through.
+# Linux-only: needs distrobox and a container engine on the host.
+[linux]
+pkg-smoke pkgdir="dist" *args:
+    scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
+
+# Restage an already-shipped release under its semver so the command above can
+# see it (the one-time fix for releases staged before the semver-row
+# convention, e.g. `just backfill-version-row abc12345 0.5.3`).
+[linux]
+backfill-version-row sha version:
+    scripts/backfill-version-row.sh --sha {{quote(sha)}} --version {{quote(version)}}
 
 # ── run & inspect ────────────────────────────────────────────────────────────
 
@@ -219,7 +296,17 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again (safe to run mid-edit).
+# The strict clippy gate is not part of this loop. It ran here once, and
+# three agent rounds on the NET walk then rewrote lines their task never
+# named to clear it, two in conflict rounds whose only directive was the
+# merge (#1737, #1730, #1727): everything else this recipe prints is
+# something to fix, so a strict hit printed beside it reads the same way,
+# whatever a doc says. There is no autofix for that set either — `clippy
+# --fix` cannot be scoped to changed lines and would sweep legacy sites — so
+# the gate lives in `just clippy-strict` and `just ci`, which is the round
+# that owns the judgement.
+#
+# Autofix pass: fmt, clippy --fix, fmt again (runnable mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
@@ -236,6 +323,22 @@ fmt-check:
 # Clippy over all targets at this host's scope, warnings denied.
 clippy:
     cargo clippy {{scope}} --all-targets --locked -- -D warnings
+
+# CI: none — this is a local gate (scripts/clippy-strict.sh).
+#
+# The lints below are the ones the tree is not yet clean for: CI's clippy job
+# runs `-D warnings`, so they live here rather than in Cargo.toml and only the
+# lines you changed are reported. Run it once your change is ready, fix what it
+# reports on the lines your change introduced, and promote each lint into
+# [workspace.lints.clippy] as its count reaches zero.
+#
+# This recipe and `just ci` are the only callers; `just fix` does not run it. A
+# hit on a line the round's directive did not name is a note, not a licence to
+# edit it.
+#
+# Strict Clippy on the lines this branch changed, scoped to the crates you touched.
+clippy-strict BASE="":
+    scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
@@ -265,8 +368,8 @@ miri:
 
 # Kani bounded-verification harnesses over the pure security cores
 # (rcache index_file parse, sessions PathDecision lattice). See
-# scripts/kani.sh for install + the 0.67.0 pin rationale. #1109.
-kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup")
+# scripts/kani.sh for install + the 0.68.0 pin rationale. #1109.
+kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup")
     ./scripts/kani.sh
 
 # Each `fuzz/` dir is its OWN workspace (so the nightly/sanitizer build can't
@@ -301,13 +404,38 @@ fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked"
     [ -f "fuzz/{{target}}.dict" ] && dict="-dict=fuzz/{{target}}.dict"
     cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 $dict {{args}}
 
+# Extra arguments go to nextest positionally, so a filterset like
+# `-E 'not binary(/_integration$/)'` stays one word (the macOS lane's unit step).
+#
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
-test: _nextest
-    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
+[positional-arguments]
+test *args: _nextest
+    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail "$@"
+
+# The tight loop while writing one test. Output is shown, so a test that prints
+# a measurement is readable without remembering `--no-capture`, and
+# `--no-tests=fail` makes a filter that matches nothing say so rather than pass
+# silently. The filter is nextest's own substring match and every argument is
+# passed positionally, so no character in it needs escaping and a quoted
+# argument stays one word.
+#
+# Run the tests whose name contains a substring (`just test-one own_ip [-p minimald]`).
+[positional-arguments]
+test-one filter *args: _nextest
+    cargo nextest run {{ if args == "" { scope } else { "" } }} \
+        --locked --no-tests=fail --no-capture "$@"
 
 # Doctests — nextest can't run them, so they are their own surface.
 doctest:
     cargo test {{scope}} --doc --locked
+
+# CI: the macOS unit job stages this archive for the mini's hypervisor tier, so
+# the archived package set is whatever `scope` names, never a second list.
+#
+# Archive this host's test binaries for replay elsewhere (`just test-archive out.tar.zst`).
+[positional-arguments]
+test-archive file: _nextest
+    cargo nextest archive {{scope}} --locked --archive-file "$1"
 
 # Regenerate the minimal-tui insta snapshots after an intentional render change;
 # `just test` fails until these are updated. Review the diff, then `just test` to verify.
@@ -332,20 +460,46 @@ test-cross: (_need "cross" "cargo install cross --locked")
     cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
     CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
 
+# commitlint is not replicated by `just ci`; `just hooks` installs its local
+# twin as the commit-msg hook (scripts/git-hooks/commit-msg) for this clone,
+# every worktree included, so an over-long line is refused before the commit
+# exists instead of after the push.
+#
+# Point this clone's git hooks at scripts/git-hooks (commit-msg = commitlint's local twin).
+hooks:
+    #!/usr/bin/env sh
+    set -eu
+    # Repointing core.hooksPath silently disables every hook in the old
+    # directory, so refuse while that directory holds live (non-.sample) hooks.
+    old=$(git config --get core.hooksPath || git rev-parse --git-path hooks)
+    if [ "$old" != scripts/git-hooks ] && [ -d "$old" ]; then
+        live=$(find "$old" -maxdepth 1 -type f ! -name '*.sample' | sort)
+        if [ -n "$live" ]; then
+            echo "hooks: $old holds hooks that core.hooksPath = scripts/git-hooks would stop running:" >&2
+            echo "$live" | sed 's/^/  /' >&2
+            echo "hooks: remove them, or chain scripts/git-hooks/commit-msg from $old/commit-msg instead" >&2
+            exit 1
+        fi
+    fi
+    git config core.hooksPath scripts/git-hooks
+    echo "hooks: core.hooksPath = scripts/git-hooks (commit-msg checks the message before each commit)"
+
 # Not replicated: commitlint, the dogfood jobs, the installer lane (`just test-installer`).
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check clippy deny test doctest test-ignored
+ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored zoned-link-check
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check clippy deny test doctest
+ci: fmt-check check-version clippy clippy-strict deny test doctest zoned-link-check
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
-test-installer:
+# `case` runs one named scenario group (see the dispatch at the bottom of
+# scripts/install_test.sh); empty runs them all.
+test-installer case="":
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v shellcheck >/dev/null 2>&1; then
@@ -356,8 +510,8 @@ test-installer:
     fi
     for sh in sh dash; do
         command -v "$sh" >/dev/null 2>&1 || { echo "== $sh not found, skipping =="; continue; }
-        echo "== running install_test.sh under $sh =="
-        SH="$sh" "$sh" scripts/install_test.sh
+        echo "== running install_test.sh under $sh${case:+ (case: $case)} =="
+        SH="$sh" "$sh" scripts/install_test.sh {{case}}
     done
 
 # The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
@@ -367,20 +521,131 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
-# Shellcheck runs too, when present.
+# Names and descriptions come from each member's Cargo.toml, so the list cannot
+# drift from the workspace. Fails if any member lacks a description, which keeps
+# AGENTS.md §Workspace crates honest. Stdlib-only python3 is already a
+# prerequisite (AGENTS.md §System dependencies), so this adds no tool to any host.
 #
-# Run the promotion provenance gate's test harness (stubbed `gh`, no network or auth).
+# List workspace crates with their descriptions.
+crates:
+    #!/usr/bin/env python3
+    import json, subprocess, sys
+    meta = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"],
+        capture_output=True, text=True, check=True)
+    packages = json.loads(meta.stdout)["packages"]
+    for pkg in sorted(packages, key=lambda p: p["name"]):
+        print(pkg["name"] + "\t" + (pkg.get("description") or "-"))
+    missing = sorted(p["name"] for p in packages if not p.get("description"))
+    if missing:
+        sys.exit("missing description: " + ", ".join(missing))
+
+# Not a CI gate. Default lints the markdown this branch touches (changed
+# against main, staged, unstaged, and untracked) so the common loop stays
+# short; pass files for specific ones, or --all for the whole tree. The
+# existing tree carries thousands of alerts: drive files you touch to zero,
+# leave untouched files' alerts alone. `vale sync` fetches the pinned packages
+# into styles/ (gitignored) and runs again whenever `.vale.ini` changes, so a
+# bumped pin moves the lint; --no-global keeps a personal ~/.vale.ini from
+# leaking its styles into the repo's run.
+#
+# Vale prose-lint this branch's markdown (`just lint-prose [files|--all]`).
+lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
+    #!/usr/bin/env sh
+    set -eu
+    args={{quote(args)}}
+    # Re-sync when a package directory is missing, or when `.vale.ini` changed
+    # since the last sync. Vale keeps no version stamp of its own next to the
+    # synced styles, so an existence check alone would freeze a warm checkout
+    # at its first sync and ignore a later pin bump.
+    stamp="$(cksum .vale.ini)"
+    if [ ! -d styles/ai-tells ] || [ ! -d styles/ste ] \
+        || [ "$(cat styles/.sync-stamp 2>/dev/null || true)" != "$stamp" ]; then
+        vale sync
+        printf '%s\n' "$stamp" > styles/.sync-stamp
+    fi
+    # `quote()` joins the arguments into a single shell word, so the splits
+    # below are what separate them again; `set -f` keeps a path's glob
+    # characters literal. Repo paths carry no whitespace, so an argument
+    # holding a space is not supported.
+    set -f
+    if [ "$args" = "--all" ]; then
+        files="$(git ls-files '*.md')"
+    elif [ -n "$args" ]; then
+        files="$args"
+    else
+        base=main
+        git rev-parse -q --verify "$base" >/dev/null || base=origin/main
+        git rev-parse -q --verify "$base" >/dev/null || {
+            echo "lint-prose: no 'main' or 'origin/main' ref to diff against" >&2
+            exit 1
+        }
+        files="$(
+            { git diff --name-only "$base...HEAD" -- '*.md'
+              git diff --name-only --cached -- '*.md'
+              git diff --name-only -- '*.md'
+              git ls-files --others --exclude-standard -- '*.md'
+            } | sort -u
+        )"
+    fi
+    keep=""
+    for f in $files; do
+        if [ -f "$f" ]; then keep="$keep $f"; fi
+    done
+    [ -n "$keep" ] || { echo "lint-prose: no markdown to lint" >&2; exit 0; }
+    # `--` stops vale from parsing a leading-dash path as an option.
+    exec vale --no-global -- $keep
+
+# scripts/record-smoked.sh writes the smoke-provenance marker and
+# scripts/verify-smoked.sh reads it back, over a stubbed `gcloud` backed by a
+# directory: no network, no auth. Shellcheck runs too, when present.
+#
+# Run the promotion gate's test harness (stubbed `gcloud`, no network or auth).
 test-promote-gate:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v shellcheck >/dev/null 2>&1; then
         echo "== shellcheck =="
-        shellcheck scripts/verify-nightly-provenance.sh scripts/verify-nightly-provenance_test.sh
+        shellcheck scripts/record-smoked.sh scripts/verify-smoked.sh scripts/smoked_test.sh
     else
         echo "== shellcheck not found, skipping static check =="
     fi
-    echo "== running verify-nightly-provenance_test.sh =="
-    bash scripts/verify-nightly-provenance_test.sh
+    echo "== running smoked_test.sh =="
+    bash scripts/smoked_test.sh
+
+# package.version must be the declared NEXT release: strictly above the newest
+# v* tag and at least what the Conventional Commits since the last release
+# require (feat -> minor, else patch; no major while 0.x). The workspace
+# `package_version` test (crates/common/tests/package_version.rs) runs the same
+# check but self-skips on the hosted lanes' shallow, tagless checkouts, so this
+# recipe (part of `just ci`) is the proof that actually runs. Needs the tags.
+#
+# Assert Cargo.toml package.version against the commits since the last v* tag (scripts/next-version.sh --check).
+check-version:
+    scripts/next-version.sh --check
+
+# Run every scripts/*_test.sh harness in one go (the release/publishing logic:
+# semver resolution, version assertion, staged-version lookup, the packaging
+# renderer, and the AUR/brew publishers against fixture remotes). No network,
+# no credentials, no gcloud — the harnesses stub or fixture everything. CI runs
+# the same set through crates/common/tests/shell_harnesses.rs (part of
+# `just test`), which discovers them by convention so a new harness is never
+# forgotten.
+test-shell:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck =="
+        shellcheck scripts/*_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    failed=0
+    for t in scripts/*_test.sh; do
+        echo "== running $t =="
+        bash "$t" || failed=1
+    done
+    exit "$failed"
 
 # ── VM & e2e surfaces ────────────────────────────────────────────────────────
 
@@ -394,10 +659,10 @@ _kvm:
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: `test-kvm` / macOS `e2e`.
 [macos]
-test-vm: _nextest artifacts initramfs
+test-vm: _nextest artifacts initramfs gvproxy
     #!/usr/bin/env sh
     set -eu
-    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state"
+    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" MINVMD_GVPROXY_BIN="{{gvproxy}}"
     # CI's archive pattern: build EVERYTHING, codesign minvmd LAST (a later
     # cargo call would relink it → entitlement lost), run from the archive.
     cargo nextest archive -p minvmd --locked --archive-file "{{scratch}}/nextest-archive.tar.zst"
@@ -420,9 +685,10 @@ test-vm: _nextest artifacts initramfs
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
 [linux]
-test-vm: _nextest _kvm artifacts initramfs minvmd-build
+test-vm: _nextest _kvm artifacts initramfs minvmd-build gvproxy
     MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" \
       MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
+      MINVMD_GVPROXY_BIN="{{gvproxy}}" \
       cargo nextest run -p minvmd --profile vm --target {{musl-target}} \
       --run-ignored all --no-tests=fail \
       -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
@@ -440,7 +706,7 @@ test-root-integration: _nextest gvproxy
 # minvmd-build is LAST so its macOS codesign is the final touch on the binary.
 #
 # The unified session e2e against the VM-backed daemon. CI: the session e2e steps.
-e2e: _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+e2e: _kvm artifacts gvproxy initramfs minimal-cli zoned-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
 # CI: ci-linux-native.yml `native-daemon-e2e`.
@@ -450,7 +716,7 @@ e2e: _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
 e2e-native:
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
     @just _userns-check
-    ./scripts/session-e2e.sh
+    env -u E2E_VM ./scripts/session-e2e.sh
 
 # Boots switchless like CI's step — MINVMD_GVPROXY_BIN deliberately not set.
 #

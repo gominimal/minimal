@@ -14,7 +14,7 @@ content-addressed local cache.
 > the package/build plane directly. Most workflows are better served by the
 > [`min` session CLI](./cli-min.md).
 
-Generated from `--help` at `d9f20165`.
+Generated from `--help` at `43183a44`.
 
 ## Global flags
 
@@ -163,6 +163,23 @@ whose owning process is no longer running.
 
 `--older-than` takes a whole number of days, hours, or minutes (e.g.
 `30d`, `12h`, `45m`); the default is `14d`.
+
+### `cache notices`
+
+```
+mip cache notices <source_sha256>
+```
+
+Prints the upstream attribution files (`NOTICE` / `COPYRIGHT` / `COPYING`)
+recorded when the source archive with the given sha256 was last extracted,
+as pretty JSON. The sha256 is the one declared in the build spec.
+
+| Argument | Description |
+|----------|-------------|
+| `<source_sha256>` | The archive's sha256, as declared in the build spec |
+
+Errors if no notices are recorded for the given sha256 — extract the source
+first.
 
 ### `check` {#check}
 

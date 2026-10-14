@@ -16,6 +16,8 @@ We welcome contributions of all kinds — bug reports, documentation improvement
 This repository uses [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/),
 enforced in CI by **commitlint**. See [docs/commit-conventions.md](docs/commit-conventions.md)
 for the full standard, types, scopes, and examples.
+Run `just hooks` once per clone. It installs the local twin of that gate as the
+`commit-msg` hook, which refuses an over-long line before the commit exists.
 
 The most common trip-up: a commit has **one type**, and multiple scopes go
 *inside* the parentheses — `type(scope-a,scope-b): summary`, **not**
@@ -36,7 +38,8 @@ just ci
 which runs the same gates the PR lanes run (fmt, clippy, cargo-deny, the
 test suite, doctests — plus, on Linux, the locally-runnable `#[ignore]`
 tests via `just test-ignored`, which no CI lane covers), dispatched for your
-OS. On macOS, `just test-cross` additionally covers the Linux-only crates
+OS. It ends with `just clippy-strict`, which applies a stricter lint set to
+the lines your branch changed. Run that on its own to see just those. On macOS, `just test-cross` additionally covers the Linux-only crates
 (minimald et al.) via `cross`. If your change touches the VM/daemon path,
 also run `just e2e` (the session proof) and/or `just test-vm` (the VM
 integration harnesses).

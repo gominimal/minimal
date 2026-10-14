@@ -1,5 +1,6 @@
 [package]
 name = "decode"
+description = "Evaluates a Nickel config layer into in-memory packages/profiles/stacks."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -28,3 +29,6 @@ args.workspace = true
 common.workspace = true
 mfile.workspace = true
 stdlib.workspace = true
+
+[lints]
+workspace = true

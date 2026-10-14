@@ -76,8 +76,10 @@ the session ready in the background for you to attach to later.
 A few things happen during activation:
 
 1. `min` resolves the project path and, if the project has no `minimal.toml`
-   yet, offers to scaffold one (the session still comes up with a default
-   environment either way).
+   yet, offers to scaffold one on an interactive terminal; when prompts are
+   skipped (`--no-input`, or a non-terminal stdin) it prints a notice and
+   continues without writing anything to the directory. Either way the session
+   still comes up with a default environment.
 2. Your project files are uploaded into the session's workspace on the provider
    so it can read your config. You can opt out of this with `--sync none`.
 3. The session is composed from your project config plus any loadouts (see the
@@ -213,7 +215,9 @@ removes one session entirely and leaves the provider running to host the rest.
 Because `min` auto-spawns a provider on demand, the next `min` command after a
 stop simply brings one back up.
 
-You can inspect a session's effective networking policy as JSON:
+You can inspect a session's effective networking rules, rendered as text.
+Pass `-o json` for the machine-readable document; see the CLI reference's
+[`session policy`](../reference/cli-min.md#session-policy) section:
 
 ```console
 $ min session policy my-session

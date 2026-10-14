@@ -25,16 +25,22 @@ pub enum Source {
     /// The user's own [`Loadout`](crate::core::loadout::Loadout). Bypasses
     /// `allow`/`deny` checks (only `ignore` still applies).
     UserLoadout { name: String },
-    /// A project's `minimal.toml`, identified by the path of the
-    /// config file.
+    /// A project's `minimal.toml`, identified by the project root
+    /// directory on the client host (not the config file's path).
+    /// Repo-relative patch sources resolve against this directory.
     Project { path: HostPath },
     /// A specific package's declaration, identified by package name.
     Package { name: String },
 }
 
 impl Source {
-    /// The directory a loadout's own files live in: `<loadouts_dir>/<name>/`,
-    /// beside the `<name>.toml` that declared them.
+    /// The directory a loadout's own files live in: `<loadouts_dir>/<name>/`.
+    ///
+    /// Derived from the loadout's *name*, not from the path its
+    /// definition was read from, so it is the same directory under
+    /// either on-disk layout — beside a flat `<name>.toml`, or holding
+    /// the `<name>/loadout.toml` that declared them. See
+    /// [`client::disk`](crate::client::disk).
     ///
     /// One definition of "a loadout's directory", shared by everything
     /// that anchors against it — external hook scripts

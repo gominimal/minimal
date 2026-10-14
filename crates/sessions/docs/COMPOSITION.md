@@ -168,9 +168,10 @@ From the resolved graph, `build_composables` derives:
 
 Missing packages are reported at `warn!` and skipped per-name (not
 all-or-nothing) so an unresolvable `claude-code` doesn't wipe out
-every *other* package's contribution. A graph-resolution failure
-falls back to `ProjectResolution::MFileOnly` with a `warn!`, so
-project vars still land but package contributions are empty.
+every *other* package's contribution. A graph that does not resolve
+fails the whole activation: `resolve_project_ctx_and_graph` returns
+its error as `InvalidInput`, and the client prints that error and
+exits non-zero.
 
 `SessionComposer::compose` then drives the routing:
 

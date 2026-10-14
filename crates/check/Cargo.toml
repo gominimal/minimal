@@ -1,5 +1,6 @@
 [package]
 name = "check"
+description = "mip check linting of minimal.toml, packages, profiles, and stacks."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
@@ -25,3 +26,6 @@ graph.workspace = true
 lcache.workspace = true
 op.workspace = true
 ot.workspace = true
+
+[lints]
+workspace = true

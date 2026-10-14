@@ -1,5 +1,6 @@
 [package]
 name = "orchestrator"
+description = "Runtime orchestration of builds behind a pluggable Backend."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +15,7 @@ anyhow.workspace = true
 either.workspace = true
 futures.workspace = true
 generational-arena.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -25,4 +27,7 @@ decode.workspace = true
 graph.workspace = true
 op.workspace = true
 ot.workspace = true
-sandbox2.workspace = true
+sandbox.workspace = true
+
+[lints]
+workspace = true

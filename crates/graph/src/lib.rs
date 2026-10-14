@@ -5,6 +5,13 @@ use common::{SpecHash, SpecOrigin};
 use serde::{Deserialize, Serialize};
 
 /// An error during construction or processing of the dependency graph.
+///
+/// Left hand-rolled rather than converted to `thiserror`: its only
+/// `Display`-like output is the bespoke terminal renderer in [`Error::report_to`],
+/// and it has no `Display`/`std::error::Error` impl to reproduce. `thiserror`'s
+/// required `#[error("...")]` strings would therefore *introduce* new observable
+/// output instead of preserving existing bytes, and the lone `From<decode::Error>`
+/// below is not worth a derive on its own.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Error {
@@ -29,6 +36,8 @@ pub enum Error {
     ConflictingProfile { name: String },
     /// A stack has the same name as a stack in a higher layer.
     ConflictingStack { name: String },
+    /// A container has the same name as a container in a higher layer.
+    ConflictingContainer { name: String },
     /// A package with a certain name was requested, but not found in the graph.
     NoSuchPkg { name: String },
     /// Failed to load the source code for an upstream.
@@ -70,6 +79,9 @@ impl Error {
             Error::ConflictingStack { name } => {
                 writeln!(writer, "Error: stack '{}' already exists", name,).unwrap()
             }
+            Error::ConflictingContainer { name } => {
+                writeln!(writer, "Error: container '{}' already exists", name,).unwrap()
+            }
             Error::ConflictingPackage { from, .. } => {
                 writeln!(writer, "Error: package '{}' already exists", from.1,).unwrap()
             }
@@ -90,8 +102,7 @@ impl Error {
 
     /// Writes a human-friendly representation of the error to standard out.
     pub fn report_to_stderr(&self) {
-        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
+        common::report_to_stderr(|w| self.report_to(w));
     }
 }
 
@@ -202,7 +213,7 @@ pub use loader::{ChainLoader, LayerCache, LayerCacheDir, SourceProvider};
 pub mod wire;
 
 mod spec_hasher;
-pub use spec_hasher::SpecHasher;
+pub use spec_hasher::{ContainerHasher, SpecHasher};
 
 mod planner;
 pub use planner::Dep as PlannerDep;

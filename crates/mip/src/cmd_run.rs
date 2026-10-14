@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use common::Target;
 use graph::Graph;
 use mctx::{Config, Context, Error};
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// Specifies which task to run.
 #[derive(Debug, Clone)]
@@ -243,6 +243,33 @@ pub async fn run_task(
     mut graph: Graph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
+    // Preflight (advisory): every build sandbox starts by unsharing an
+    // unprivileged user namespace, forked from this process with no exec in
+    // between — so this process's own privileges and AppArmor label are what
+    // the kernel will check. On a restricted host (stock Ubuntu 24.04+ with
+    // an unconfined mip) that denial otherwise surfaces only when the first
+    // spawn dies writing /proc/self/uid_map, with nothing useful in the log.
+    // Warn once at the start of the first task run instead, with the fix —
+    // the cause's own, spelled by `sandbox` for this binary: the installer's
+    // profile attaches to minimald alone, so mip's AppArmor remedy is the
+    // loader with `--path` for this mip, never `min finalize-install`.
+    if let Some(restriction) = sandbox::user_namespaces_restriction() {
+        let bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_else(|| "<path to this mip binary>".to_string());
+        warn!(
+            reason = %restriction,
+            fix = restriction.remedy(sandbox::RemedyTarget::Mip {
+                bin: &bin,
+                data_dir: paths::minimal_data_dir().as_str(),
+            }),
+            docs = "https://docs.minimal.dev/reference/linux-host-setup",
+            "builds will fail to start: this host refuses the unprivileged user \
+             namespace every build sandbox needs"
+        );
+    }
+
     let mut env = ctx
         .make_env(
             task_name,
@@ -265,18 +292,35 @@ pub async fn run_task(
     // Resolve the invocations to run from the task definition.
     let (_interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
 
-    let container = env
-        .container()
-        .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
     for (i, inv) in invocations.iter().enumerate() {
+        // One launch per invocation, as `sandbox::run_with_cancel` does: a
+        // spawn is what gets a namespace, so each needs its own plan.
+        let planned = env.plan_launch().await?;
+        let container = env
+            .container(planned.plan())
+            .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
         let mut cmd = env
             .command(&container, &inv.executable, inv.args.iter())
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-        let status = cmd
+        let mut child = cmd
             .spawn()
-            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?;
+        let guard = match planned
+            .attach(sandbox::Spawned::from_child(&mut child))
+            .await
+        {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.into());
+            }
+        };
+        let status = child
             .wait()
-            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)));
+        guard.teardown().await;
+        let status = status?;
         if !status.success() {
             return Err(Error::Execution {
                 idx: i,

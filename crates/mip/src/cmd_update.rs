@@ -6,7 +6,7 @@ pub struct UpdateArgs {}
 
 pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Error> {
     // Refresh upstream/sideload checkouts and re-pin them in the minimal file.
-    let mut env = ctx.project_setup();
+    let mut env = ctx.project_setup()?;
     let report = UpdateProject.run(&mut env)?;
 
     if let Some(c) = &report.upstream {

@@ -4,9 +4,9 @@
 //! packages/profiles/stacks, then evaluating the resulting Nickel to decode them
 //! into in-memory structures.
 
-use common::{SpecOrigin, Target};
+use common::{SpecOrigin, Target, repo_spec::Repo};
 use generational_arena::Arena;
-use mfile::{EnvPatches, EnvVarValue, PatchSetting, Upstream};
+use mfile::{EnvVarValue, Upstream};
 use nickel_lang_core::eval::value::{NickelValue, RecordData};
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
@@ -78,6 +78,20 @@ pub struct Layer {
     read_ids: HashMap<u64, generational_arena::Index>,
 }
 
+/// Drops the userinfo (`user:token@`), query string and fragment from a
+/// repository URL, so an error that names the repository does not repeat
+/// credentials carried in any of them.
+fn without_credentials(url: &str) -> String {
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+        if let Some(at) = authority.rfind('@') {
+            return format!("{scheme}://{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 impl Layer {
     /// Fetches a build-decl by reference.
     pub fn get(&self, idx: generational_arena::Index) -> Option<&BuildDecl> {
@@ -115,7 +129,12 @@ impl Layer {
 
     /// Simple builder of literal nickel for a test.
     pub fn new_for_test(s: String) -> Result<Self, Error> {
-        let l = load::Loader::new(s, None, &load::LoadOptions::for_test())?;
+        Self::new_for_test_with(s, &load::LoadOptions::for_test())
+    }
+
+    /// Like [`Layer::new_for_test`], but with explicit [`LoadOptions`].
+    pub fn new_for_test_with(s: String, opts: &LoadOptions) -> Result<Self, Error> {
+        let l = load::Loader::new(s, None, opts)?;
         Self::from_loader(l, None)
     }
 
@@ -144,6 +163,22 @@ impl Layer {
             }
             Err(mfile::Error::NotFound) => (None, None, None),
             Err(mfile::Error::IO(_, _, e)) => return Err(Error::IO(e)),
+            Err(e @ mfile::Error::HarnessTable(_)) => {
+                // The mfile error already names the offending file. When
+                // the layer was fetched from a repository, that file is not
+                // on the user's disk by that name — name its source too,
+                // and what to do about it, instead of leaving the user to
+                // hunt through candidate local paths.
+                let mut msg = e.to_string();
+                if let SpecOrigin::Repo(Repo::Git { url, rev, .. }) = &opts.from {
+                    let url = without_credentials(url);
+                    msg.push_str(&format!(
+                        " (the layer's `minimal.toml` comes from {url} at rev \
+                         {rev}: update or re-pin this layer)"
+                    ));
+                }
+                return Err(Error::Other(msg));
+            }
             Err(e) => return Err(Error::Other(e.to_string())),
         };
 
@@ -335,7 +370,6 @@ impl DeclAccumulator for () {
 
 /// Markers for the various objects that are being generated in Nickel.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[allow(dead_code)]
 pub enum ObjTy {
     Builder,
     OutputLib,
@@ -422,125 +456,6 @@ pub(crate) fn record_data_from_val(
 /// Returns true if the value is a record (including an empty one).
 pub(crate) fn is_record(val: &NickelValue) -> bool {
     val.as_record().is_some()
-}
-
-#[allow(dead_code)]
-pub(crate) fn patches_from_term(
-    rt: &NickelValue,
-    program: &mut Program<CacheImpl>,
-) -> Result<EnvPatches, Error> {
-    let patch_rt = eval_if_closure(rt, program)?;
-
-    let mut dirs: Option<BTreeMap<String, PatchSetting>> = None;
-    let mut files: Option<BTreeMap<String, PatchSetting>> = None;
-
-    let Some(r) = record_data_from_val(&patch_rt) else {
-        return Err(Error::unexpected_type(
-            "`patches`",
-            "a record with `dir`/`dirs` and `file`/`files` fields",
-            &patch_rt,
-            program,
-        ));
-    };
-
-    r.fields
-        .iter()
-        .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-            match ident_and_loc.label() {
-                "dir" | "dirs" => {
-                    let dir_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
-
-                    let Some(r) = record_data_from_val(&dir_rt) else {
-                        return Err(Error::unexpected_type(
-                            format!("patch `{}`", ident_and_loc.label()),
-                            "a record of patch settings",
-                            &dir_rt,
-                            program,
-                        ));
-                    };
-                    if dirs.is_some() {
-                        todo!("error for both 'dirs' and 'dir' set");
-                    }
-                    dirs = Some(
-                        r.fields
-                            .iter()
-                            .map(
-                                |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                    let val: String = deserialize_field(
-                                        format!("patch `dir.{}`", ident_and_loc.label()),
-                                        "a string",
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?;
-                                    Ok((
-                                        ident_and_loc.label().to_string(),
-                                        match val.as_str() {
-                                            "ReadOnly" | "read-only" | "ro" => {
-                                                PatchSetting::ReadOnly
-                                            }
-                                            "ReadWrite" | "read-write" | "rw" => {
-                                                PatchSetting::ReadWrite
-                                            }
-                                            _ => todo!("unexpected patch setting: {}", val),
-                                        },
-                                    ))
-                                },
-                            )
-                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
-                    );
-                    Ok(())
-                }
-                "file" | "files" => {
-                    let file_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
-
-                    let Some(r) = record_data_from_val(&file_rt) else {
-                        return Err(Error::unexpected_type(
-                            format!("patch `{}`", ident_and_loc.label()),
-                            "a record of patch settings",
-                            &file_rt,
-                            program,
-                        ));
-                    };
-                    if files.is_some() {
-                        todo!("error for both 'file' and 'files' set");
-                    }
-                    files = Some(
-                        r.fields
-                            .iter()
-                            .map(
-                                |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                    let val: String = deserialize_field(
-                                        format!("patch `file.{}`", ident_and_loc.label()),
-                                        "a string",
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?;
-                                    Ok((
-                                        ident_and_loc.label().to_string(),
-                                        match val.as_str() {
-                                            "ReadOnly" | "read-only" | "ro" => {
-                                                PatchSetting::ReadOnly
-                                            }
-                                            "ReadWrite" | "read-write" | "rw" => {
-                                                PatchSetting::ReadWrite
-                                            }
-                                            _ => todo!("unexpected patch setting: {}", val),
-                                        },
-                                    ))
-                                },
-                            )
-                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
-                    );
-                    Ok(())
-                }
-                _ => Ok(()),
-            }
-        })?;
-
-    Ok(EnvPatches {
-        file: files.unwrap_or_default(),
-        dir: dirs.unwrap_or_default(),
-    })
 }
 
 pub(crate) fn env_vars_from_term(
@@ -1116,5 +1031,118 @@ mod tests {
                 ..Default::default()
             }),
         );
+    }
+
+    /// A layer whose `minimal.toml` still names the pre-v0.5.0 `harness` key
+    /// is refused at load; when that layer was fetched from a repository,
+    /// the refusal must say which file, which repo, which rev — not just a
+    /// bare key name that gives nothing to go re-pin.
+    #[test]
+    fn harness_key_in_repo_layer_names_file_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mfile = dir.path().join("minimal.toml");
+        std::fs::write(&mfile, "[harness]\nuse = \"rust\"\n").unwrap();
+
+        let opts = LoadOptions {
+            from: SpecOrigin::Repo(Repo::Git {
+                url: "https://example.com/upstream/layer.git".to_string(),
+                rev: "abcd1234".to_string(),
+                tracking: None,
+            }),
+            ..LoadOptions::for_test()
+        };
+        let err = crate::Layer::new(dir.path(), &opts)
+            .err()
+            .unwrap_or_else(|| panic!("`harness` layer must be refused"));
+
+        let Error::Other(msg) = &err else {
+            panic!("expected Error::Other for a `harness` layer, got {err:?}");
+        };
+        assert!(msg.contains("the `harness` key"), "{msg}");
+        assert!(msg.contains(&mfile.display().to_string()), "{msg}");
+        assert!(
+            msg.contains("https://example.com/upstream/layer.git at rev abcd1234"),
+            "{msg}"
+        );
+        assert!(msg.contains("update or re-pin this layer"), "{msg}");
+    }
+
+    /// A layer URL may carry credentials (`https://user:token@host/…`); the
+    /// refusal names the repository without repeating them.
+    #[test]
+    fn harness_key_in_repo_layer_omits_url_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("minimal.toml"), "harness = \"rust\"\n").unwrap();
+
+        let opts = LoadOptions {
+            from: SpecOrigin::Repo(Repo::Git {
+                url: "https://robot:s3cret@example.com/upstream/layer.git".to_string(),
+                rev: "abcd1234".to_string(),
+                tracking: None,
+            }),
+            ..LoadOptions::for_test()
+        };
+        let err = crate::Layer::new(dir.path(), &opts)
+            .err()
+            .unwrap_or_else(|| panic!("`harness` layer must be refused"));
+
+        let Error::Other(msg) = &err else {
+            panic!("expected Error::Other for a `harness` layer, got {err:?}");
+        };
+        assert!(
+            msg.contains("from https://example.com/upstream/layer.git at rev abcd1234"),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cret"), "{msg}");
+        assert!(!msg.contains("robot:"), "{msg}");
+    }
+
+    /// Userinfo, query string and fragment are all dropped, wherever the
+    /// authority ends; a URL carrying none of them passes through unchanged.
+    #[test]
+    fn without_credentials_drops_userinfo_query_and_fragment() {
+        for (url, want) in [
+            (
+                "https://u:tok@host/org/repo.git",
+                "https://host/org/repo.git",
+            ),
+            (
+                "https://host/org/repo.git?token=tok",
+                "https://host/org/repo.git",
+            ),
+            ("https://host/org/repo.git#tok", "https://host/org/repo.git"),
+            ("https://host?x=a@b", "https://host"),
+            ("https://u:tok@host?x=a@b#c", "https://host"),
+            ("https://host/org/repo.git", "https://host/org/repo.git"),
+            ("git@host:org/repo.git", "git@host:org/repo.git"),
+        ] {
+            assert_eq!(without_credentials(url), want, "{url}");
+        }
+    }
+
+    /// The same refusal for a layer loaded from a local directory stays
+    /// path-only: no repo URL, since there is none to name.
+    #[test]
+    fn harness_key_in_local_layer_names_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mfile = dir.path().join("minimal.toml");
+        std::fs::write(&mfile, "harness = \"rust\"\n").unwrap();
+
+        let opts = LoadOptions {
+            from: SpecOrigin::LocalDir {
+                given: dir.path().to_path_buf(),
+                absolute: dir.path().canonicalize().unwrap(),
+            },
+            ..LoadOptions::for_test()
+        };
+        let err = crate::Layer::new(dir.path(), &opts)
+            .err()
+            .unwrap_or_else(|| panic!("`harness` layer must be refused"));
+
+        let Error::Other(msg) = &err else {
+            panic!("expected Error::Other for a `harness` layer, got {err:?}");
+        };
+        assert!(msg.contains(&mfile.display().to_string()), "{msg}");
+        assert!(!msg.contains("update or re-pin this layer"), "{msg}");
     }
 }

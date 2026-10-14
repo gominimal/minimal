@@ -669,6 +669,22 @@ impl Graph {
             slf.stacks.insert(name, stack);
         }
 
+        // Load containers
+        for (name, container) in loader.from.containers {
+            // Verify all packages exist
+            for pkg in &container.packages {
+                if slf.by_name(pkg).is_none() {
+                    return Err(Error::NoSuchPkg { name: pkg.clone() });
+                }
+            }
+
+            if slf.containers.contains_key(&name) {
+                // Its illegal to shadow a container of the same name from upstream.
+                return Err(Error::ConflictingContainer { name });
+            }
+            slf.containers.insert(name, container);
+        }
+
         Ok(slf)
     }
 }
@@ -824,6 +840,89 @@ mod tests {
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>(),
             vec!["go".to_string(), "python".to_string(), "rust".to_string()],
+        );
+    }
+
+    #[test]
+    fn ingest_container() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {build, layer, container, ..} = import \"minimal.ncl\" in
+
+                layer {
+                  builds = [
+                    build {
+                        name = \"beepboop\",
+                        build_deps = [],
+                        cmd = \"\",
+                    }
+                  ],
+                  containers = [
+                    container {
+                      name = \"container1\",
+                      packages = [\"beepboop\"],
+                    }
+                  ],
+                }
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = Graph::new().ingest(layer).unwrap();
+        assert_eq!(
+            dp.containers.get("container1"),
+            Some(&decode::Container {
+                name: "container1".to_string(),
+                packages: vec!["beepboop".to_string()],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn iter_containers_yields_name_order() {
+        // The wire writers serialise containers in `iter_containers` order, so
+        // hash order would make the bytes for one graph differ between runs.
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {build, layer, container, ..} = import \"minimal.ncl\" in
+
+                layer {
+                  builds = [
+                    build {
+                        name = \"beepboop\",
+                        build_deps = [],
+                        cmd = \"\",
+                    }
+                  ],
+                  containers = [
+                    container { name = \"web\", packages = [\"beepboop\"] },
+                    container { name = \"api\", packages = [\"beepboop\"] },
+                    container { name = \"jobs\", packages = [\"beepboop\"] },
+                  ],
+                }
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = Graph::new().ingest(layer).unwrap();
+        assert_eq!(
+            dp.iter_containers()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+            vec!["api".to_string(), "jobs".to_string(), "web".to_string()],
         );
     }
 

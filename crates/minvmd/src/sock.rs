@@ -127,8 +127,78 @@ pub fn enforce_socket_permissions(socket_path: &std::path::Path) -> io::Result<(
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Verify that `dir` is owned by the calling process's uid and has mode
+/// 0700. Return `PermissionDenied` otherwise, naming the directory and its
+/// actual owner and mode.
+pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let my_uid = unsafe { libc::geteuid() };
+    if meta.uid() != my_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "provider directory {} is owned by uid {}; expected uid {my_uid}",
+                dir.display(),
+                meta.uid(),
+            ),
+        ));
+    }
+
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "provider directory {} has mode {mode:04o}; expected 0700",
+                dir.display(),
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Tighten `dir` to 0700 when it is a directory the calling uid owns with
+/// any other mode, so [`verify_provider_dir_ownership`] then holds.
+///
+/// The provider dir is first created by `StateDir::new`, which creates it
+/// under the process umask (typically 0755), before any socket is bound;
+/// [`prepare_socket_dir`] leaves a pre-existing dir untouched. Refusing
+/// such a dir outright would refuse every existing install. Only the
+/// owner (or root) can change a dir's mode, so tightening our own dir is
+/// safe; a dir owned by another uid is left as is for the verification to
+/// refuse.
+pub fn restrict_owned_dir(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let meta = std::fs::metadata(dir)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let my_uid = unsafe { libc::geteuid() };
+    let mode = meta.permissions().mode() & 0o777;
+    if meta.is_dir() && meta.uid() == my_uid && mode != 0o700 {
+        tracing::info!(
+            dir = %dir.display(),
+            mode = format_args!("{mode:04o}"),
+            "tightening the provider directory to 0700"
+        );
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::DirBuilderExt;
     use std::sync::Mutex;
 
     use super::*;
@@ -229,5 +299,42 @@ mod tests {
         let err = remove_stale_socket(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert!(path.exists(), "non-socket must be left in place");
+    }
+
+    #[test]
+    fn verify_provider_dir_ownership_passes_owned_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("provider");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        verify_provider_dir_ownership(&dir).unwrap();
+    }
+
+    #[test]
+    fn verify_provider_dir_ownership_rejects_wrong_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("provider");
+        std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
+        let err = verify_provider_dir_ownership(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("0755"), "{err}");
+        assert!(err.to_string().contains("expected 0700"), "{err}");
+    }
+
+    #[test]
+    fn verify_provider_dir_ownership_rejects_non_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("regular");
+        std::fs::File::create(&path).unwrap();
+        let err = verify_provider_dir_ownership(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn restrict_owned_dir_tightens_an_owned_0755_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("provider");
+        std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
+        restrict_owned_dir(&dir).unwrap();
+        verify_provider_dir_ownership(&dir).unwrap();
     }
 }

@@ -10,7 +10,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-#[allow(dead_code)]
 mod fs;
 pub use fs::FSError;
 pub use fs::FileSystem;
@@ -25,9 +24,8 @@ use read_tracker::ReadTracker;
 
 /// A directory tree in the cache you can read or write.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct DirCacheEntry<FS: FileSystem> {
-    c: Cache<FS>,
     hash: SpecHash,
     tree: FS::Subtree,
 }
@@ -72,7 +70,6 @@ impl<FS: FileSystem<Subtree = ST>, ST: FileSystem> FileSystem for DirCacheEntry<
 
 /// A writeable directory that will end up in the cache when finalized.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct PendingDir {
     c: Cache<LocalDir>,
     hash: SpecHash,
@@ -154,7 +151,6 @@ impl FileSystem for PendingDir {
 
 /// The implementation of [Cache].
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct CacheInner<FS: FileSystem> {
     fs: FS,
     read_tracker: Option<Arc<Mutex<ReadTracker>>>,
@@ -225,7 +221,6 @@ impl std::error::Error for CacheErr {
 ///
 /// Cache is thread-safe and copyable, implemented using interior mutability.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Cache<FS: FileSystem> {
     inner: Arc<Mutex<CacheInner<FS>>>,
 }
@@ -363,14 +358,9 @@ impl Cache<LocalDir> {
     }
 }
 
-#[allow(dead_code)]
 impl<FS: FileSystem> Cache<FS> {
     fn inner(&'_ self) -> MutexGuard<'_, CacheInner<FS>> {
         self.inner.lock().unwrap()
-    }
-    fn with_inner<T>(&self, f: impl FnOnce(&CacheInner<FS>) -> T) -> T {
-        let guard = self.inner.lock().unwrap();
-        f(&*guard)
     }
 
     /// Releases the read tracker, closing its locked `alog/<n>.v1` file.
@@ -388,7 +378,6 @@ impl<FS: FileSystem> Cache<FS> {
         let i = self.inner();
         i.record_access(hash);
         Ok(DirCacheEntry {
-            c: self.clone(),
             tree: i.dir(hash)?,
             hash: hash.clone(),
         })

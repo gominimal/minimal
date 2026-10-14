@@ -97,11 +97,11 @@ packages = ["mermaid-ascii", "go"]
 DIAGRAM = "arch.mmd"
 
 # Inherit-with-default: reads from the host env when set, falls
-# back to `C.UTF-8` otherwise. On most systems `LANG` is set, so
+# back to `en_US.UTF-8` otherwise. On most systems `LANG` is set, so
 # activation prompts once for approval. Add
 # `[vars] allow = ["LANG"]` (or hit "Allow permanent" at the
 # prompt) to skip the prompt on the next run.
-LANG = { inherit = true, default = "C.UTF-8" }
+LANG = { inherit = true, default = "en_US.UTF-8" }
 
 # Same shape as `LANG`, but `TZ` is typically unset on Linux hosts
 # — so this branch usually takes the fallback path and no prompt

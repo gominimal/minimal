@@ -89,10 +89,16 @@ async fn debugfs_program() -> PathBuf {
 // (proc tables, JSON, logs — all highly compressible text) expands ~15×, so a
 // literal 4× budget rejects every legitimate nested bundle. The ratio still
 // earns its keep for genuinely large blobs, but below `NESTED_MIN_BUDGET` it is
-// meaningless (a few hundred KB decoded to check is free), so the budget is
-// `clamp(4×compressed, MIN_BUDGET, MAX_DECOMPRESSED)`. The two hard caps the
-// bomb guard actually rests on — the 1 GiB ceiling and the 10k-entry cap — are
-// exactly as specified.
+// meaningless (decoding up to that much into a sink is cheap and bounded), so
+// the budget is `clamp(4×compressed, MIN_BUDGET, MAX_DECOMPRESSED)`. The two
+// hard caps the bomb guard actually rests on — the 1 GiB ceiling and the
+// 10k-entry cap — are exactly as specified.
+//
+// Known limit: at ~15× expansion a bundle outgrows the 256 MiB floor at about
+// 17 MiB compressed, and a 4× ratio never catches up with 15× growth, so any
+// legitimate bundle past that size fails the size check and is stored
+// unverified. Lifting the limit means revisiting the ratio against R7.3, not
+// just the floor.
 
 /// Entry-count ceiling for the nested bundle (R7.3). Bounds the header
 /// dimension of a bomb, which the byte budget does not charge for.
@@ -101,8 +107,10 @@ const NESTED_MAX_ENTRIES: usize = 10_000;
 const NESTED_EXPANSION_RATIO: u64 = 4;
 /// Floor under the ratio budget: below this, the ratio is not a meaningful
 /// bomb signal and decoding this much to find out is free. See the deviation
-/// note above.
-const NESTED_MIN_BUDGET: u64 = 64 * 1024 * 1024;
+/// note above. Sized above a healthy guest bundle's expansion: real
+/// diagnostic content is highly compressible, so a ~12 MiB compressed bundle
+/// decompresses well past 64 MiB.
+const NESTED_MIN_BUDGET: u64 = 256 * 1024 * 1024;
 /// Absolute ceiling on decompressed content, whatever the ratio allows (R7.3).
 const NESTED_MAX_DECOMPRESSED: u64 = 1024 * 1024 * 1024;
 /// Headroom over the content budget for the stream-level cap, covering the tar
@@ -234,7 +242,7 @@ pub async fn collect(
 /// content ratio.
 async fn verify_nested_bundle(bytes: &[u8]) -> Result<DaemonLogs, String> {
     // `clamp` cannot panic here: the floor is a compile-time constant below the
-    // ceiling (64 MiB < 1 GiB).
+    // ceiling (256 MiB < 1 GiB).
     let budget = (bytes.len() as u64)
         .saturating_mul(NESTED_EXPANSION_RATIO)
         .clamp(NESTED_MIN_BUDGET, NESTED_MAX_DECOMPRESSED);
@@ -312,6 +320,7 @@ struct VolumeMeta {
     path: String,
     exists: bool,
     bytes: Option<u64>,
+    allocated_bytes: Option<u64>,
     mtime_unix: Option<u64>,
 }
 
@@ -346,6 +355,9 @@ pub async fn volume_fallback(
         path: image.display().to_string(),
         exists: meta.is_some(),
         bytes: meta.as_ref().map(std::fs::Metadata::len),
+        allocated_bytes: meta
+            .as_ref()
+            .map(|m| std::os::unix::fs::MetadataExt::blocks(m) * 512),
         mtime_unix: meta
             .as_ref()
             .and_then(|m| m.modified().ok())
@@ -544,6 +556,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_well_formed_bundle_verifies() {
         let bytes = pack(&[("meta.json", b"{}"), ("manifest.json", b"{}")]).await;
+        verify_nested_bundle(&bytes).await.unwrap();
+    }
+
+    /// A healthy guest bundle decompresses well past 64 MiB: real diagnostic
+    /// content is highly compressible, so a ~12 MiB compressed bundle expands
+    /// far beyond that. The floor must sit above a normal bundle's expansion,
+    /// or every healthy bundle is stored unverified.
+    #[tokio::test]
+    async fn a_bundle_expanding_past_64_mib_verifies() {
+        let body = vec![0u8; 80 * 1024 * 1024];
+        let bytes = pack(&[("manifest.json", b"{}"), ("logs/minimald.log", &body)]).await;
         verify_nested_bundle(&bytes).await.unwrap();
     }
 

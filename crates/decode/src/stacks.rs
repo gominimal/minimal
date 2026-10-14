@@ -299,7 +299,6 @@ impl StackMatcher {
 
 /// A stack, a specific set of norms for building a codebase.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct Stack {
     /// The human-readable name declared on the stack. Unique within a repo/layer.
     pub name: String,

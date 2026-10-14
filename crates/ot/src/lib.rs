@@ -64,6 +64,26 @@ pub struct Progress {
     pub len: Option<u64>,
 }
 
+/// A callback run each time an operation starts anywhere in a tree; see
+/// [`OpTracker::on_op_start`].
+type OpStartFn = Arc<dyn Fn(&Operation) + Send + Sync>;
+
+/// The [`OpStartFn`]s registered on one tree, each under the id its
+/// [`OpStartHook`] removes it by.
+#[derive(Default)]
+struct OpStartHooks {
+    next_id: u64,
+    hooks: Vec<(u64, OpStartFn)>,
+}
+
+impl std::fmt::Debug for OpStartHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpStartHooks")
+            .field("registered", &self.hooks.len())
+            .finish()
+    }
+}
+
 /// State shared by every node of a single operation tree, owned via `Arc`.
 ///
 /// Created once per root (see [`OpTracker::new_root`]) and cloned into each
@@ -79,6 +99,11 @@ struct RootShared {
     version: watch::Sender<u64>,
     /// Allocator for [`OpId`]s within this tree.
     next_id: AtomicU64,
+    /// Callbacks told of every operation as it starts. A snapshot only sees
+    /// what is live when it is taken, and a finished op leaves the tree, so
+    /// an observer that must see every op (not just every one a periodic
+    /// renderer happened to catch) registers here instead.
+    op_start: Mutex<OpStartHooks>,
 }
 
 impl Default for RootShared {
@@ -88,6 +113,7 @@ impl Default for RootShared {
         Self {
             version: watch::channel(0).0,
             next_id: AtomicU64::new(0),
+            op_start: Mutex::default(),
         }
     }
 }
@@ -101,6 +127,40 @@ impl RootShared {
     /// Allocates the next unique [`OpId`] for this tree (root is `0`).
     fn alloc_id(&self) -> OpId {
         OpId(self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// Runs every registered [`OpStartFn`] for `op`. The hooks are cloned
+    /// out first, so none runs under the hook list's lock: a hook may itself
+    /// register or drop a hook on this tree.
+    fn op_started(&self, op: &Operation) {
+        let hooks: Vec<OpStartFn> = {
+            let reg = self.op_start.lock().unwrap();
+            reg.hooks.iter().map(|(_, f)| f.clone()).collect()
+        };
+        for hook in hooks {
+            hook(op);
+        }
+    }
+}
+
+/// A registration made by [`OpTracker::on_op_start`]. Dropping it removes the
+/// callback; it holds the tree only weakly, so it never keeps one alive.
+#[must_use = "dropping the hook unregisters the callback"]
+pub struct OpStartHook {
+    shared: Weak<RootShared>,
+    id: u64,
+}
+
+impl Drop for OpStartHook {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared
+                .op_start
+                .lock()
+                .unwrap()
+                .hooks
+                .retain(|(id, _)| *id != self.id);
+        }
     }
 }
 
@@ -237,7 +297,15 @@ impl OpTracker {
         self
     }
     pub fn set_op(&self, op: Operation) {
-        self.inner.lock().unwrap().set_op(Some(op));
+        // The node lock is released before the hooks run, so a hook never
+        // runs under any lock of this tree's and may read it (a snapshot,
+        // say) without deadlocking.
+        let shared = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.set_op(Some(op.clone()));
+            inner.shared.clone()
+        };
+        shared.op_started(&op);
     }
     pub fn set_done(&self) {
         self.inner.lock().unwrap().set_op(None);
@@ -247,6 +315,28 @@ impl OpTracker {
     }
     pub fn increment(&self, amt: u64) {
         self.inner.lock().unwrap().increment(amt);
+    }
+
+    /// Registers `hook` to run each time an operation starts anywhere in this
+    /// node's tree — on every [`set_op`](Self::set_op) (and so every
+    /// [`with_op`](Self::with_op)), never on [`set_done`](Self::set_done) —
+    /// until the returned [`OpStartHook`] is dropped.
+    ///
+    /// Unlike a [`snapshot`](Self::snapshot), which only shows what is live
+    /// when it is taken, this sees an operation that starts and finishes
+    /// between two snapshots. The hook runs synchronously on the thread that
+    /// started the operation, after the op is stored and with no lock of the
+    /// tree's held, so it should be brief: it delays the operation it reports.
+    pub fn on_op_start(&self, hook: impl Fn(&Operation) + Send + Sync + 'static) -> OpStartHook {
+        let shared = self.inner.lock().unwrap().shared.clone();
+        let mut reg = shared.op_start.lock().unwrap();
+        reg.next_id += 1;
+        let id = reg.next_id;
+        reg.hooks.push((id, Arc::new(hook)));
+        OpStartHook {
+            shared: Arc::downgrade(&shared),
+            id,
+        }
     }
 
     /// Returns how deep in the operation tree the operation is.
@@ -581,6 +671,53 @@ mod tests {
             root.version() > before,
             "dropping a node must bump the version"
         );
+    }
+
+    #[test]
+    fn an_op_start_hook_fires_once_per_set_op_and_never_on_done() {
+        let root = OpTracker::new_root();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook = root.on_op_start({
+            let seen = seen.clone();
+            move |op| seen.lock().unwrap().push(format!("{op:?}"))
+        });
+        // A grandchild reports to the root's hook: the hook is the tree's.
+        let child = root.new_child().new_child();
+        child.set_op(Operation::FetchPkg { name: "a".into() });
+        child.set_length(10);
+        child.increment(10);
+        child.set_done();
+        let _b = root
+            .new_child()
+            .with_op(Operation::ExtractPkg { name: "b".into() });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                format!("{:?}", Operation::FetchPkg { name: "a".into() }),
+                format!("{:?}", Operation::ExtractPkg { name: "b".into() }),
+            ]
+        );
+
+        // Dropped, the hook hears nothing more.
+        drop(hook);
+        child.set_op(Operation::FetchIndex);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_op_start_hook_may_read_the_tree() {
+        // The hook runs with no lock of the tree's held, so reading the tree
+        // from inside it does not deadlock.
+        let root = OpTracker::new_root();
+        let rows = Arc::new(Mutex::new(0));
+        let _hook = root.on_op_start({
+            let (root, rows) = (root.clone(), rows.clone());
+            move |_| *rows.lock().unwrap() = root.snapshot().len()
+        });
+        let _a = root
+            .new_child()
+            .with_op(Operation::FetchPkg { name: "a".into() });
+        assert_eq!(*rows.lock().unwrap(), 2);
     }
 
     #[tokio::test]

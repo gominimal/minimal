@@ -168,10 +168,25 @@ pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
     if let Some(dir) = minimal_dir {
         cmd.arg("--minimal-state-dir").arg(dir);
     }
+    // Forward the VM name too, so the daemon this spawns serves the same
+    // named VM this client resolved its state dir and socket under
+    // (NET-052). The default VM needs no flag — its paths are unchanged
+    // (NET-053) — and a named one must not spawn a second default VM.
+    let vm = crate::client::vm_name();
+    if vm != paths::DEFAULT_VM_NAME {
+        cmd.arg("--vm").arg(vm);
+    }
     cmd.arg("run")
         .arg("--detach")
         .arg("--timeout")
         .arg(timeout_secs.to_string());
+    // The CLI's trace context, so the minvmd it starts (and, through the
+    // supervisor and the guest boot line, the VM it boots) joins this
+    // invocation's trace. minvmd adopts it only with telemetry on.
+    cmd.env(
+        minimald_rpc::trace::TRACEPARENT_ENV,
+        minimal_client::trace_context().traceparent(),
+    );
 
     // `minvmd run --detach` blocks until the VM is serving (or times out): a
     // cold first boot can sit here for up to ~1 min. Run it on a thread (so
@@ -243,9 +258,16 @@ pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            // The hint must name the VM this command was driving: a bare
+            // `minvmd stop` forces the *default* VM down and leaves a named
+            // one wedged (NET-052).
+            let stop_hint = match crate::client::vm_name() {
+                paths::DEFAULT_VM_NAME => "minvmd stop".to_owned(),
+                vm => format!("minvmd --vm {vm} stop"),
+            };
             return Err(io::Error::other(format!(
                 "the VM is still shutting down after {STOPPED_WAIT_SECS}s; \
-                 run `minvmd stop` to force it down"
+                 run `{stop_hint}` to force it down"
             )));
         }
         thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
@@ -463,6 +485,36 @@ mod tests {
             "points at the diagnostic bundle: {msg}"
         );
         assert!(msg.contains("Re-run"), "suggests retrying: {msg}");
+    }
+
+    /// T93: a VM start that failed on the hostname proxy's port reaches the
+    /// user with the port, the holder and why inline — the line `minvmd run
+    /// --detach` lifts from its supervisor's log — not a bare pointer at it.
+    #[test]
+    fn autospawn_error_names_proxy_port_and_holder() {
+        for (stderr, port, holder, why) in [
+            (
+                "Error: hostname proxy port 7654 held by pid 4242 (python3); configured ports \
+                 never redraw (free the port or unset MINVMD_NODE_PROXY_PORT) \
+                 (supervisor log: /s/run.log)\n",
+                "hostname proxy port 7654",
+                "held by pid 4242 (python3)",
+                "configured ports never redraw",
+            ),
+            (
+                "Error: hostname proxy port 41001 held by pid 77 (gvproxy); 3 publish tries \
+                 exhausted, every drawn port taken (supervisor log: /s/run.log)\n",
+                "hostname proxy port 41001",
+                "held by pid 77 (gvproxy)",
+                "3 publish tries exhausted",
+            ),
+        ] {
+            let msg = boot_failure_error(stderr).to_string();
+            for part in [port, holder, why] {
+                assert!(msg.contains(part), "the error names '{part}': {msg}");
+            }
+            assert!(msg.contains("min bug"), "still actionable: {msg}");
+        }
     }
 
     /// The state dir a `--minimal-dir` override resolves to.

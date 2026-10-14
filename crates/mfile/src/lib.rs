@@ -1,10 +1,12 @@
 //! Finding & reading the `minimal.toml` file.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::hash::{Hash, Hasher};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 mod error;
 pub use error::Error;
@@ -316,7 +318,7 @@ impl EnvPatches {
                 mappings.push(common::FsMapping {
                     host_path: Self::expand_home(path, home)?,
                     sandbox_path: None, // use host
-                    create_if_missing: true,
+                    create_if_missing: matches!(settings, PatchSetting::ReadWrite),
                     is_file,
                     read_only: matches!(settings, PatchSetting::ReadOnly),
                 });
@@ -859,8 +861,9 @@ pub struct File {
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
     ///
-    /// TODO: Remove `harness` alias after July 2026.
-    #[serde(default, alias = "harness")]
+    /// `[harness]`, the pre-v0.5.0 name of this table, no longer parses: it
+    /// errors at load, so an old config has to rename the table.
+    #[serde(default)]
     pub stack: Option<Stack>,
 
     /// Task definitions, invoked with `minimal run <task name>`.
@@ -895,9 +898,35 @@ pub struct File {
     /// Where the minimal file is located on disk, if it was loaded from disk.
     #[serde(skip)]
     mfile_path: Option<PathBuf>,
+    /// Hash of the bytes that produced this `File`, when loaded from disk.
+    /// Used to dedup warnings per (path, content) without re-reading the
+    /// file, which could have been replaced between parse and validate.
+    #[serde(skip)]
+    content_hash: Option<u64>,
     /// What layout this repo/layer is using, if loaded from disk.
     #[serde(skip)]
     layout: Option<Layout>,
+}
+
+/// Maps a key that is unknown at the top level of an mfile to the nesting
+/// path where it is actually valid, when there is one. `lifecycle_hooks` is
+/// top-level in a loadout but nests under `[session]` in a project mfile, so a
+/// user who lifts the documented loadout snippet lands it here; the correct
+/// path is more useful than the blanket upgrade advice.
+fn misplaced_top_level_key(key: &str) -> Option<&'static str> {
+    match key {
+        "lifecycle_hooks" => Some("[[session.lifecycle_hooks]]"),
+        _ => None,
+    }
+}
+
+/// Hash the raw bytes of an mfile so warning dedup can key on the content
+/// that actually produced the parsed `File`, rather than re-reading the path
+/// (which may have been replaced between parse and validate).
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl File {
@@ -931,9 +960,15 @@ impl File {
     }
 
     /// Helper to finish initialization of the structure after being deserialized.
-    fn init_toml(mut self, path: &PathBuf, layout: Layout) -> Result<Self, Error> {
+    fn init_toml(
+        mut self,
+        path: &PathBuf,
+        layout: Layout,
+        content_hash: u64,
+    ) -> Result<Self, Error> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
+        self.content_hash = Some(content_hash);
         if let Some(u) = self.upstream.as_mut() {
             u.fixup_relative(path);
             for sideload in u.sideloads.iter_mut() {
@@ -956,13 +991,39 @@ impl File {
     /// # Errors
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
-    /// no `default` field.
+    /// no `default` field, [`Error::HarnessTable`] if the file names the
+    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
                 if s.default.is_none() {
                     return Err(Error::MissingParamDefault(n.clone()));
                 }
+            }
+        }
+        // `[harness]` stopped parsing in v0.5.0 and now lands in `extra`,
+        // setting no stack: the toolchain its name promised is silently
+        // absent, and the gap only surfaces much later, as a bare
+        // `linker 'cc' not found` from a build inside the session. Refuse
+        // the load here, at the config, where the fix is still visible.
+        if self.extra.contains_key("harness") {
+            return Err(Error::HarnessTable(self.mfile_path.clone()));
+        }
+        // serde takes one action key as `task.action` and leaves any other in
+        // `task.extra`. Refuse the task here, before `warn_unknown_fields`
+        // would misreport the extra action key as unknown and suggest an
+        // upgrade.
+        for (task_name, task) in &self.tasks {
+            let extra_actions = TaskAction::KEYS
+                .iter()
+                .filter(|k| task.extra.contains_key(**k))
+                .map(|k| k.to_string());
+            let keys: Vec<String> = std::iter::once(task.action.key().to_string())
+                .chain(extra_actions)
+                .collect();
+            if keys.len() > 1 {
+                return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
         }
         self.warn_unknown_fields();
@@ -987,6 +1048,7 @@ impl File {
                     toml::from_slice(&file_data).map_err(Error::Format)?,
                     &path,
                     Layout::Root,
+                    hash_bytes(&file_data),
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1000,6 +1062,7 @@ impl File {
                 toml::from_slice(&file_data).map_err(Error::Format)?,
                 &path,
                 Layout::DotMinimal,
+                hash_bytes(&file_data),
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
@@ -1020,14 +1083,52 @@ impl File {
     }
 
     fn warn_unknown_fields(&self) {
+        // One command decodes the same file several times; without this a
+        // single load prints each warning once per decode. Surface them only
+        // the first time a given path is validated in this process.
+        //
+        // The dedup key is (path, content) rather than path alone: a
+        // long-lived process (notably `minimald`) re-reads and re-validates
+        // the workspace `minimal.toml` on every session bring-up, and keying
+        // on path alone would permanently silence the warning after the first
+        // decode — even if the user edits the file and breaks it again. The
+        // content hash collapses the repeated decodes of an unchanged file
+        // while still re-warning when the file is edited or re-broken.
+        //
+        // The hash is computed from the bytes that produced `self` (see
+        // `hash_bytes`), not re-read from disk here: re-reading could hash a
+        // replacement file written between parse and validate, and then a
+        // later validation of that replacement would be wrongly suppressed.
+        if let (Some(path), Some(content_hash)) = (&self.mfile_path, self.content_hash) {
+            static WARNED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
+                LazyLock::new(|| Mutex::new(HashSet::new()));
+            if !WARNED_FILES
+                .lock()
+                .unwrap()
+                .insert((path.clone(), content_hash))
+            {
+                return;
+            }
+        }
+
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
-            tracing::warn!(
-                "unknown fields in {}: {}",
-                MFILE_NAME,
-                self.extra.keys().cloned().collect::<Vec<_>>().join(",")
-            );
-            was_unknown_fields = true;
+            // A key that is valid at another nesting level is not really
+            // unknown; point at the correct path instead of the generic
+            // upgrade hint, which cannot fix it.
+            let mut unknown = Vec::new();
+            for key in self.extra.keys() {
+                match misplaced_top_level_key(key) {
+                    Some(correct) => tracing::warn!(
+                        "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
+                    ),
+                    None => unknown.push(key.clone()),
+                }
+            }
+            if !unknown.is_empty() {
+                tracing::warn!("unknown fields in {}: {}", MFILE_NAME, unknown.join(","));
+                was_unknown_fields = true;
+            }
         }
         if !self.defaults.extra.is_empty() {
             tracing::warn!(
@@ -1144,9 +1245,18 @@ impl File {
     ///  - default profile if set (and not set on the task)
     ///  - default state_key if set (and not set on the task)
     ///  - additional build_packages & runtime_packages set on the stack
+    ///  - repo-wide `[params]` as args, unless the task declares an arg of the same name
     ///
     /// The returned task will not have had any string interpolations applied.
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
+        if let Some(params) = &self.params {
+            for (name, spec) in &params.0 {
+                task.args
+                    .0
+                    .entry(name.clone())
+                    .or_insert_with(|| spec.clone());
+            }
+        }
         if let Some(default_profile) = &self.defaults.profile
             && task.profile.is_none()
         {
@@ -1359,6 +1469,7 @@ mod tests {
 
     use super::*;
     use indoc::indoc;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -1457,6 +1568,7 @@ mod tests {
                 session: None,
                 extra: HashMap::new(),
                 mfile_path: None,
+                content_hash: None,
                 layout: None,
             }
         )
@@ -1757,6 +1869,73 @@ mod tests {
         assert_eq!(
             toml::to_string(&forward).unwrap(),
             toml::to_string(&reverse).unwrap()
+        );
+    }
+
+    /// A read-only mapping consumes a source that must already exist, so it is
+    /// never fabricated; only read-write mappings may create a missing path.
+    #[test]
+    fn to_fs_mappings_derives_create_if_missing_from_the_mode() {
+        let patches = EnvPatches {
+            dir: [
+                ("/ro-dir".to_string(), PatchSetting::ReadOnly),
+                ("/rw-dir".to_string(), PatchSetting::ReadWrite),
+            ]
+            .into(),
+            file: [
+                ("/ro-file".to_string(), PatchSetting::ReadOnly),
+                ("/rw-file".to_string(), PatchSetting::ReadWrite),
+            ]
+            .into(),
+        };
+
+        let mappings = patches.to_fs_mappings(None).unwrap();
+        let flags = mappings
+            .iter()
+            .map(|m| (m.host_path.as_str(), m.create_if_missing))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            flags,
+            vec![
+                ("/ro-dir", false),
+                ("/rw-dir", true),
+                ("/ro-file", false),
+                ("/rw-file", true),
+            ]
+        );
+    }
+
+    /// Repo-wide `[params]` reach every task as defaulted args, and a task
+    /// arg of the same name shadows the repo param.
+    #[test]
+    fn task_inherits_repo_params_as_args() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [params]
+            greeting = { type = "string", default = "hi" }
+            name = { type = "string", default = "repo" }
+
+            [tasks.useparam]
+            bash = "echo %{greeting} %{name}"
+            args.name = { type = "string", default = "task" }
+            "#
+        })
+        .unwrap();
+
+        let task = mf.task("useparam").unwrap();
+        assert_eq!(
+            task.args.0.get("greeting"),
+            Some(&args::ArgSpec {
+                spec: args::ArgSchema::Scalar(args::PrimitiveSpec::String),
+                help: None,
+                default: Some("hi".to_string()),
+            })
+        );
+        assert_eq!(
+            task.args.0.get("name").and_then(|a| a.default.as_deref()),
+            Some("task"),
+            "a task arg must not be replaced by a repo param of the same name"
         );
     }
 
@@ -2163,6 +2342,15 @@ mod tests {
     }
 
     #[test]
+    fn top_level_lifecycle_hooks_points_at_the_session_path() {
+        assert_eq!(
+            misplaced_top_level_key("lifecycle_hooks"),
+            Some("[[session.lifecycle_hooks]]")
+        );
+        assert_eq!(misplaced_top_level_key("genuinely_unknown"), None);
+    }
+
+    #[test]
     fn repo_slug_normalizes_common_url_forms() {
         for url in [
             "https://github.com/gominimal/pkgs",
@@ -2334,5 +2522,183 @@ mod tests {
         assert!(hook.on_detach().is_some());
         assert!(hook.on_destroy().is_some());
         assert!(hook.description().is_some());
+    }
+
+    /// The once-per-path warning dedup must key on (path, content), not path
+    /// alone: a long-lived process re-validates the same file repeatedly, and
+    /// an edited file must re-warn. This test drives `warn_unknown_fields`
+    /// through the public `validate` path and counts the emitted warnings.
+    #[test]
+    fn warn_unknown_fields_rewarns_when_file_content_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let write = |contents: &str| {
+            std::fs::write(&path, contents).unwrap();
+            let file = File::from_dir(dir.path()).unwrap();
+            file.validate().unwrap();
+        };
+
+        // First decode of a file with an unknown field warns once.
+        write("[unknown_top_level]\nkey = \"v\"\n");
+        assert_eq!(count_unknown_warnings(&capture), 1);
+
+        // Re-validating the unchanged file does not warn again.
+        write("[unknown_top_level]\nkey = \"v\"\n");
+        assert_eq!(count_unknown_warnings(&capture), 1);
+
+        // Editing the file (new content) re-warns.
+        write("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n");
+        assert_eq!(count_unknown_warnings(&capture), 2);
+
+        drop(guard);
+    }
+
+    /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
+    /// a file that still uses it is refused at load — before any build runs
+    /// and misses its toolchain — and pointed at the rename. The refusal
+    /// names the offending file, so a layer pulled from upstream can be
+    /// located without re-reading every candidate.
+    #[test]
+    fn harness_table_no_longer_parses() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
+
+        let err = File::from_dir(dir.path()).unwrap_err();
+        let path = dir.path().join(MFILE_NAME);
+        assert!(
+            matches!(&err, Error::HarnessTable(Some(p)) if *p == path),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Replace it with a `[stack]` table"), "{msg}");
+        assert!(msg.starts_with(&path.display().to_string()), "{msg}");
+    }
+
+    /// The pre-v0.5.0 `harness` key can also arrive as a bare string, not a
+    /// table; it lands in `extra` all the same and is refused identically.
+    #[test]
+    fn harness_scalar_key_is_refused_like_the_table() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "harness = \"rust\"\n").unwrap();
+
+        let err = File::from_dir(dir.path()).unwrap_err();
+        let path = dir.path().join(MFILE_NAME);
+        assert!(
+            matches!(&err, Error::HarnessTable(Some(p)) if *p == path),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("the `harness` key"), "{msg}");
+        assert!(msg.contains("`name = \"x\"` under `[stack]`"), "{msg}");
+        assert!(msg.starts_with(&path.display().to_string()), "{msg}");
+    }
+
+    /// A file parsed without a path (the wire/fuzz entry point) is still
+    /// refused, with wording that stands on its own without one.
+    #[test]
+    fn harness_key_without_a_path_names_no_file() {
+        let file = File::from_toml_bytes(b"harness = \"rust\"\n").unwrap();
+        let err = file.validate().expect_err("`harness` must be refused");
+
+        assert!(matches!(err, Error::HarnessTable(None)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("the `harness` key"), "{msg}");
+    }
+
+    /// A task with two action keys is refused with an error naming the task
+    /// and both keys, instead of running one and calling the other unknown.
+    #[test]
+    fn task_with_two_actions_is_refused() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.both]\nexec = [\"echo\", \"from-exec\"]\nbash = \"echo from-bash\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let err = File::from_dir(dir.path()).expect_err("two actions must be refused");
+        drop(guard);
+
+        assert!(matches!(err, Error::MultipleTaskActions(..)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("task `both` sets more than one action ("),
+            "{msg}"
+        );
+        assert!(msg.contains("exec") && msg.contains("bash"), "{msg}");
+        assert!(msg.ends_with("); set exactly one"), "{msg}");
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields in task"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    #[test]
+    fn task_with_one_action_passes_validate() {
+        for action in [
+            "exec = [\"echo\", \"hi\"]",
+            "bash = \"echo hi\"",
+            "echo = \"hi\"",
+            "cmdcmd = [\"gen\"]",
+        ] {
+            let file: File = toml::from_str(&format!("[tasks.one]\n{action}\n")).unwrap();
+            file.validate().unwrap_or_else(|e| panic!("{action}: {e}"));
+            assert!(file.tasks["one"].extra.is_empty(), "{action}");
+        }
+    }
+
+    fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
+        capture
+            .contents()
+            .lines()
+            .filter(|line| line.contains("unknown fields in"))
+            .count()
+    }
+
+    /// Minimal `MakeWriter` that records formatted tracing output into a
+    /// shared buffer so tests can assert on emitted warnings.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn default() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
     }
 }

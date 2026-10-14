@@ -1,5 +1,6 @@
 [package]
 name = "ot"
+description = "Operation tracking for progress rendering (render-agnostic core + drivers)."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -23,3 +24,6 @@ tokio = { workspace = true, features = ["sync"] }
 # (see the `indicatif` feature), so this stays out of the production deps.
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

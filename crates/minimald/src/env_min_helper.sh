@@ -1,5 +1,20 @@
 #!/usr/bin/bash
 
+# Columns of the terminal stdout writes to, for clipping a progress line so
+# it does not wrap. A wrapped line breaks the in-place redraw. Measured
+# through fd 3, which the caller points at stdout: inside `$(...)` stdout is
+# the capture pipe. 80 when the size cannot be read.
+__min_term_cols() {
+    local size cols
+    size=$(stty size <&3 2>/dev/null) || size=""
+    cols=${size##* }
+    if [[ "$cols" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s' "$cols"
+    else
+        printf '80'
+    fi
+}
+
 __min_rpc() {
     local method="$1"
     shift
@@ -7,12 +22,48 @@ __min_rpc() {
 
     local error="false"
     local env_pairs=()
+    local bar_open=0
+    # The exec that runs this helper hands the box its TRACEPARENT (the exec
+    # span's W3C context). Forward it ahead of the request so the daemon's
+    # work for it (StartMaterialize, ExposeDynamic, ...) joins that trace
+    # instead of the channel actor's own root (scenarios 717b, 770). Only a
+    # value in the 55-character W3C form crosses: anything in the box can
+    # set TRACEPARENT, and a `%` in it would shift the daemon's split of the
+    # line.
+    local prefix=""
+    if [[ "${TRACEPARENT:-}" =~ ^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$ ]]; then
+        prefix="traceparent%${TRACEPARENT}%"
+    fi
 
     while IFS= read -r line; do
         local tag="${line%%:*}"
         local rest="${line#*:}"
         case "$tag" in
+            bar)
+                # One live meter. The daemon sends a fresh line per paint;
+                # reprint it on the same row, and clear the row on an empty
+                # one. A pipe or a log keeps the one-shot `msg:` lines and
+                # drops the redraws. The width is re-read per paint so a
+                # resize mid-download does not wrap the row.
+                if [[ -t 1 ]]; then
+                    if [[ -n "$rest" ]]; then
+                        local cols
+                        { cols=$(__min_term_cols); } 3>&1
+                        printf '\r\033[K%.*s' "$((cols - 1))" "$rest"
+                        bar_open=1
+                    elif [[ "$bar_open" -eq 1 ]]; then
+                        printf '\r\033[K'
+                        bar_open=0
+                    fi
+                fi
+                ;;
             msg)
+                # Clear the meter rather than leave its last frame behind;
+                # the daemon repaints it below this line.
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
                 echo "$rest"
                 ;;
             set_env)
@@ -25,12 +76,20 @@ __min_rpc() {
                 break
                 ;;
             error)
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
                 echo "error:$rest" >&2
                 error="true"
                 break
                 ;;
         esac
-    done < <(echo "${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    done < <(echo "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+
+    if [[ "$bar_open" -eq 1 ]]; then
+        printf '\r\033[K'
+    fi
 
     if [[ ${#env_pairs[@]} -gt 0 ]]; then
         echo ""
@@ -55,8 +114,12 @@ min_search() {
 
 min_patched_pkg() {
     local pkg="$1"
-    if [[ -z "$pkg" ]]; then
-        echo "Usage: min_patched_pkg <package-name>" >&2
+    if [[ "$pkg" == "-h" || "$pkg" == "--help" ]]; then
+        echo "Usage: min package patched-build <package-name>" >&2
+        return 0
+    fi
+    if [[ -z "$pkg" || "$pkg" == -* ]]; then
+        echo "Usage: min package patched-build <package-name>" >&2
         return 1
     fi
 
@@ -157,6 +220,26 @@ min_materialize() {
     __min_rpc "materialize" "${PWD}%$*"
 }
 
+min_net() {
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        expose)
+            local port="$1"
+            if [[ -z "$port" ]]; then
+                echo "Usage: min net expose <port>" >&2
+                return 1
+            fi
+            __min_rpc "net-expose" "$port"
+            ;;
+        *)
+            echo "error: unknown subcommand '$subcmd'. Expected 'expose'" >&2
+            return 1
+            ;;
+    esac
+}
+
 # If invoked directly as a script (not sourced), handle invocation
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     subcmd="$1"
@@ -183,6 +266,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         materialize)
             min_materialize "$@"
             ;;
+        net)
+            min_net "$@"
+            ;;
         *)
             echo "Usage: min <subcommand>" >&2
             echo "" >&2
@@ -193,6 +279,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>" >&2
             echo "Check minimal configuration (bare, by exception): min check" >&2
             echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>" >&2
+            echo "Publish a port from inside the box: min net expose <port>" >&2
             exit 1
             ;;
     esac

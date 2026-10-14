@@ -3,6 +3,7 @@
 //! The primary type here is [Orchestrator], which is parameterized by a [Backend]. The intention is that
 //! different backends can be used for local builds vs remote builds and other architectural variants, while all
 //! the main/control logic stays the same.
+#![recursion_limit = "256"]
 #![allow(clippy::result_large_err)]
 
 use std::sync::Arc;
@@ -129,6 +130,10 @@ impl<B: Backend> Orchestrator<B> {
         let shared_hnd = SharedHandle::new(shared);
 
         let mut pending: JoinSet<Result<(), (DeliverableRef, Error)>> = JoinSet::new();
+        // A JoinSet task starts with no current span: without this every build,
+        // cache fill and package fetch (`materialize`) began a trace of its own,
+        // cut off from the activation that asked for it.
+        let span = tracing::Span::current();
         while !state_hnd.done().await {
             let mut s = state_hnd.lock().await;
             let mut runnables = s.runnable().map(|(dr, _)| dr).collect::<Vec<_>>();
@@ -153,7 +158,7 @@ impl<B: Backend> Orchestrator<B> {
                         full_build: _,
                         cost: _,
                         dependencies,
-                    } => pending.spawn(
+                    } => pending.spawn(tracing::Instrument::instrument(
                         OrchestratedBuild {
                             shared_hnd: shared_hnd.clone(),
                             state_hnd: state_hnd.clone(),
@@ -164,23 +169,27 @@ impl<B: Backend> Orchestrator<B> {
                             dependencies: dependencies.clone(),
                         }
                         .run(),
-                    ),
-                    state::DeliverableInner::CacheFill { bsr, spec_hash } => pending.spawn(
-                        OrchestratedCacheFill {
-                            shared_hnd: shared_hnd.clone(),
-                            state_hnd: state_hnd.clone(),
-                            deliverable: dr,
+                        span.clone(),
+                    )),
+                    state::DeliverableInner::CacheFill { bsr, spec_hash } => {
+                        pending.spawn(tracing::Instrument::instrument(
+                            OrchestratedCacheFill {
+                                shared_hnd: shared_hnd.clone(),
+                                state_hnd: state_hnd.clone(),
+                                deliverable: dr,
 
-                            bsr: *bsr,
-                            spec_hash: spec_hash.clone(),
-                        }
-                        .run(),
-                    ),
+                                bsr: *bsr,
+                                spec_hash: spec_hash.clone(),
+                            }
+                            .run(),
+                            span.clone(),
+                        ))
+                    }
                     state::DeliverableInner::Subset {
                         subset,
                         spec_hash,
                         build,
-                    } => pending.spawn(
+                    } => pending.spawn(tracing::Instrument::instrument(
                         OrchestratedSubset {
                             shared_hnd: shared_hnd.clone(),
                             state_hnd: state_hnd.clone(),
@@ -191,7 +200,8 @@ impl<B: Backend> Orchestrator<B> {
                             build: *build,
                         }
                         .run(),
-                    ),
+                        span.clone(),
+                    )),
                 };
                 deliverable.state = DeliverableState::InProgress(abort_handle);
             }

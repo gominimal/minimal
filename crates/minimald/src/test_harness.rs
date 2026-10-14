@@ -17,8 +17,9 @@
 
 #![cfg(any(test, feature = "test-support"))]
 
+use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use camino::Utf8PathBuf;
 use paths::DaemonAbsPath;
@@ -26,11 +27,215 @@ use russh::keys::PublicKeyOrCertificate;
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
+use tracing_subscriber::fmt::MakeWriter;
 
 use minimald_rpc::OneshotSshRpc;
 
 use crate::connection::Connection;
 use crate::server::{Config, HostKey, ServerStateHandle};
+
+/// A `MakeWriter` accumulating everything written into a shared buffer, so a
+/// test can assert on the structured fields a `tracing` event emitted.
+#[derive(Clone, Default)]
+pub struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    /// Returns the captured bytes as a UTF-8 string.
+    pub fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+static CAPTURE: OnceLock<CaptureWriter> = OnceLock::new();
+
+/// The process-wide capture buffer. Installs the global `tracing`
+/// subscriber on first call (`set_global_default` accepts one subscriber
+/// per process, so a second install returns `Err`), and every later call
+/// returns the same buffer. Under nextest each test is its own process;
+/// under libtest (`just test-cross`) every test in the binary shares this
+/// one subscriber, so assertions on the buffer must use `contains`.
+pub fn captured_log() -> CaptureWriter {
+    CAPTURE
+        .get_or_init(|| {
+            let capture = CaptureWriter::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+            .expect("first global subscriber install in this process");
+            capture
+        })
+        .clone()
+}
+
+/// One span a [`SpanLog`] saw.
+#[derive(Clone, Debug)]
+pub struct LoggedSpan {
+    pub name: &'static str,
+    /// Every field value, at creation or recorded later (`Span::record`):
+    /// a `&str` as is, anything else in its `Debug` form.
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// The index (in [`SpanLog::spans`]) of the span's `tracing` parent.
+    pub parent: Option<usize>,
+    pub closed: bool,
+}
+
+impl LoggedSpan {
+    /// The value of `field`, if the span has one.
+    pub fn field(&self, field: &str) -> Option<&str> {
+        self.fields.get(field).map(String::as_str)
+    }
+}
+
+/// A `tracing` layer that keeps every span: its name, its fields, its
+/// parent and whether it has closed, so a test can assert how the daemon's
+/// spans nest and which trace ids they carry (`trace_id`, `span_id`,
+/// `parent_span_id`, recorded by `exec::adopt_trace` whether or not export
+/// is on). Install it with `tracing::subscriber::set_default` on a
+/// current-thread runtime: the daemon's tasks then run on the test's thread
+/// and report to it, and no global subscriber is involved. In a test binary
+/// with no global subscriber, a thread-local one can miss callsites another
+/// libtest thread registered first; there, install it process-wide and pick
+/// a test's spans out by trace id (`crates/minimal/tests/otel_cli.rs`).
+#[derive(Clone, Default)]
+pub struct SpanLog(Arc<Mutex<SpanLogInner>>);
+
+#[derive(Default)]
+struct SpanLogInner {
+    spans: Vec<LoggedSpan>,
+    /// The open span each live `tracing` id stands for (ids are reused
+    /// once a span closes).
+    open: std::collections::HashMap<u64, usize>,
+}
+
+impl SpanLog {
+    /// The log, whether or not a panicking test thread poisoned it.
+    fn inner(&self) -> std::sync::MutexGuard<'_, SpanLogInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Every span seen so far, in creation order.
+    pub fn spans(&self) -> Vec<LoggedSpan> {
+        self.inner().spans.clone()
+    }
+
+    /// The spans named `name` whose `field` is `value`.
+    pub fn find(&self, name: &str, field: &str, value: &str) -> Vec<LoggedSpan> {
+        self.spans()
+            .into_iter()
+            .filter(|s| s.name == name && s.field(field) == Some(value))
+            .collect()
+    }
+
+    /// The one span named `name` whose `field` is `value`; panics, listing
+    /// every span, unless there is exactly one.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: the assert above leaves exactly one"
+    )]
+    pub fn one(&self, name: &str, field: &str, value: &str) -> LoggedSpan {
+        let found = self.find(name, field, value);
+        assert_eq!(
+            found.len(),
+            1,
+            "{name}{{{field}={value}}}: {found:?} among {:#?}",
+            self.spans()
+        );
+        found.into_iter().next().unwrap()
+    }
+
+    /// The `tracing` parent of `span`, if it has one.
+    pub fn parent_of(&self, span: &LoggedSpan) -> Option<LoggedSpan> {
+        let spans = self.spans();
+        span.parent.and_then(|i| spans.get(i).cloned())
+    }
+}
+
+/// Collects field values for [`SpanLog`].
+struct FieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanLog
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        cx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let parent_id = cx
+            .span(id)
+            .and_then(|s| s.parent())
+            .map(|p| p.id().into_u64());
+        let mut fields = std::collections::BTreeMap::new();
+        attrs.record(&mut FieldVisitor(&mut fields));
+        let mut log = self.inner();
+        let parent = parent_id.and_then(|p| log.open.get(&p).copied());
+        log.spans.push(LoggedSpan {
+            name: attrs.metadata().name(),
+            fields,
+            parent,
+            closed: false,
+        });
+        let index = log.spans.len() - 1;
+        log.open.insert(id.into_u64(), index);
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut log = self.inner();
+        if let Some(i) = log.open.get(&id.into_u64()).copied()
+            && let Some(span) = log.spans.get_mut(i)
+        {
+            values.record(&mut FieldVisitor(&mut span.fields));
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut log = self.inner();
+        if let Some(i) = log.open.remove(&id.into_u64())
+            && let Some(span) = log.spans.get_mut(i)
+        {
+            span.closed = true;
+        }
+    }
+}
 
 /// A minimald instance running against a tempdir, ready to accept
 /// in-memory ssh connections.
@@ -61,17 +266,22 @@ impl TestServer {
     /// one server's [`Self::into_state_dir`] to a second server to prove
     /// per-session state survives a restart.
     pub async fn new_in(temp: TempDir) -> Self {
-        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let state_dir = DaemonAbsPath::try_new(path.clone()).unwrap();
-        let cache_dir = DaemonAbsPath::try_new(path).unwrap();
-        let config = Config {
-            host_key: HostKey::Ephemeral,
-            minimal_state_dir: state_dir,
-            minimal_cache_dir: cache_dir,
-            gvproxy_bin: None,
-            in_microvm: false,
-            state_volume_mounted: false,
-        };
+        Self::over(config_in(&temp, false), temp).await
+    }
+
+    /// [`Self::new_in`] on a daemon that opted out of the deny-all egress
+    /// default (NET-077): the same server, but one whose boxes with no
+    /// `egress` section keep the earlier allow-all. Every other harness
+    /// server runs the default this build ships — in force (NET-074), so its
+    /// own-address boxes with no `egress` section reach nothing outside
+    /// themselves.
+    pub async fn new_opted_out_in(temp: TempDir) -> Self {
+        Self::over(config_in(&temp, true), temp).await
+    }
+
+    /// Boots a server on `config`, owning `temp` for its lifetime. The two
+    /// public constructors differ only in the config's `deny_all_opt_out`.
+    async fn over(config: Config, temp: TempDir) -> Self {
         let state = ServerStateHandle::new(config, None).await.unwrap();
         // `Server::run` installs the housekeeping actor; a harness server never
         // runs it, so do the same here — otherwise the `CleanCache` RPC has
@@ -118,7 +328,7 @@ impl TestServer {
                 Connection::from_stream(server_side, russh_config, state, true)
                     .await
                     .expect("handshake in test harness");
-            tokio::spawn(session_fut);
+            crate::traced::spawn(session_fut);
         };
 
         let client_config = Arc::new(russh::client::Config::default());
@@ -141,11 +351,11 @@ impl TestServer {
         let listener = UnixListener::bind(sock).unwrap();
         let russh_config = self.russh_config.clone();
         let state = self.state.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let russh_config = russh_config.clone();
                 let state = state.clone();
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let (_conn, session_fut) =
                         match Connection::from_stream(socket, russh_config, state, true).await {
                             Ok(conn) => conn,
@@ -195,6 +405,48 @@ impl TestServer {
     }
 }
 
+/// The harness's `Config` for `temp`: every field where a test server
+/// follows a real daemon's start path — ephemeral host key, the tempdir's
+/// state and cache, a switch /24 derived from the instance id. The one
+/// field a test chooses is `deny_all_opt_out` (NET-077): whether this
+/// server opts out of the deny-all egress default. `false` — what every
+/// harness server but an opted-out one runs — is what a daemon started
+/// without the flag gets.
+fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
+    let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf())
+        .expect("a tempdir path is utf-8 on every host the harness runs on");
+    let state_dir = DaemonAbsPath::try_new(path.clone())
+        .expect("the tempdir lives under the host's tmp root, an absolute path");
+    let cache_dir = DaemonAbsPath::try_new(path).expect("as above: the tempdir path is absolute");
+    Config {
+        host_key: HostKey::Ephemeral,
+        minimal_state_dir: state_dir,
+        minimal_cache_dir: cache_dir,
+        gvproxy_bin: None,
+        in_microvm: false,
+        state_volume_mounted: false,
+        // A harness server never starts the host-side proxies, so there
+        // is no port to pin: `None` (default-then-select) keeps the field
+        // absent from the RPC replies a test inspects unless a test
+        // drives the proxy startup itself.
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        // `None` derives the switch /24 from the instance id, the same
+        // start path a real daemon takes.
+        switch_subnet_octet: None,
+        // No identity dir: the harness persists nothing and takes no
+        // runtime-dir lock, deriving the octet from the per-start id.
+        daemon_identity_dir: None,
+        deny_all_opt_out,
+        // Off, not live: the harness runs unconfined on hosts that are
+        // themselves restricted (CI's Ubuntu runners, the lima guest) and
+        // never starts a sandbox, so a live probe would refuse every create
+        // here for a reason no test is about. A gate test fixes a verdict
+        // through `ServerStateHandle::set_user_namespace_gate`.
+        user_namespace_gate: crate::server::UsernsGate::Off,
+    }
+}
+
 /// Dials an already-listening minimald UDS and returns an authenticated
 /// [`TestClient`].
 ///
@@ -228,7 +480,24 @@ impl TestClient {
     /// Panics on any transport or codec failure — appropriate for unit
     /// tests, which want loud failure rather than recovery.
     pub async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
+        self.call_with_env::<R>(&[], req).await
+    }
+
+    /// [`Self::call`], with `env` set on the channel first (as `min` sets
+    /// `TRACEPARENT`).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: a transport failure must fail the test loudly, as in `call`"
+    )]
+    pub async fn call_with_env<R: OneshotSshRpc>(
+        &mut self,
+        env: &[(&str, &str)],
+        req: &R::Request<'_>,
+    ) -> R::Response {
         let mut channel = self.handle.channel_open_session().await.unwrap();
+        for (name, value) in env {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
         channel.request_subsystem(true, R::NAME).await.unwrap();
 
         let body = serde_json_lenient::to_vec(req).expect("request serializes");
@@ -470,6 +739,9 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             project_path: paths::HostAbsPath::try_new(project).unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
         },
@@ -528,7 +800,10 @@ pub async fn create_configured_session(
     // circuits the marker check in that case (there's nothing to
     // upload), so calling it directly is fine.
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         minimald_rpc::Errorable::Ok(_) => {}

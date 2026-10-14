@@ -41,7 +41,10 @@
 //!   start with `/` after substitution produces
 //!   [`ExpandError::NotAbsolute`]. Use `~/foo` or `$HOME/foo` for
 //!   home-relative paths — they expand to an absolute form during
-//!   substitution.
+//!   substitution. A patch a *project* declared may also use a
+//!   repo-relative source (`source = "config/myrc"`): when a
+//!   [`Anchors::project_root`] is supplied, a still-relative pattern
+//!   is joined onto it before the absoluteness check.
 //!
 //! [`StrictVarName`]: crate::core::primitives::StrictVarName
 
@@ -97,6 +100,10 @@ pub struct Anchors<'a> {
     /// The declaring loadout's directory, for [`LOADOUT_ROOT`]. `None`
     /// for anything a loadout didn't declare.
     pub loadout_root: Option<&'a str>,
+    /// The declaring project's root directory, for resolving
+    /// repo-relative patch sources (e.g. `source = "config/myrc"`).
+    /// `None` for anything a project didn't declare.
+    pub project_root: Option<&'a str>,
 }
 
 impl<'a> Anchors<'a> {
@@ -107,6 +114,7 @@ impl<'a> Anchors<'a> {
         Self {
             home,
             loadout_root: None,
+            project_root: None,
         }
     }
 
@@ -114,6 +122,13 @@ impl<'a> Anchors<'a> {
     #[must_use]
     pub fn with_loadout_root(mut self, loadout_root: Option<&'a str>) -> Self {
         self.loadout_root = loadout_root;
+        self
+    }
+
+    /// Add the declaring project's root directory.
+    #[must_use]
+    pub fn with_project_root(mut self, project_root: Option<&'a str>) -> Self {
+        self.project_root = project_root;
         self
     }
 }
@@ -210,6 +225,24 @@ pub fn expand_source(
     resolved_vars: &(impl VarLookup + ?Sized),
     anchors: Anchors<'_>,
 ) -> Result<FileSet, ExpandError> {
+    expand_source_with_plain_dir(raw, resolved_vars, anchors).map(|(fs, _)| fs)
+}
+
+/// Like [`expand_source`], but also reports whether the source was a
+/// plain directory (no glob metacharacters naming an existing
+/// directory) that was rewritten to `dir/**/*`. Callers that apply
+/// plain-directory-only safeguards (default-directory excludes, the
+/// total-size cap) gate them on this flag so explicit globs and
+/// literal files are copied verbatim.
+///
+/// # Errors
+///
+/// See [`ExpandError`].
+pub fn expand_source_with_plain_dir(
+    raw: &str,
+    resolved_vars: &(impl VarLookup + ?Sized),
+    anchors: Anchors<'_>,
+) -> Result<(FileSet, bool), ExpandError> {
     expand_pattern(raw, resolved_vars, anchors, RequireAbsolute::Yes)
 }
 
@@ -241,6 +274,7 @@ pub fn expand_policy_pattern(
         Anchors::home(home_fallback),
         RequireAbsolute::No,
     )
+    .map(|(fs, _)| fs)
 }
 
 /// Whether the expander enforces "result must be absolute." Kept
@@ -257,8 +291,20 @@ fn expand_pattern(
     resolved_vars: &(impl VarLookup + ?Sized),
     anchors: Anchors<'_>,
     require_absolute: RequireAbsolute,
-) -> Result<FileSet, ExpandError> {
+) -> Result<(FileSet, bool), ExpandError> {
     let mut out = String::with_capacity(raw.len());
+    // The same expansion with substituted values left *unescaped*.
+    // `out` is what `FileSet` receives (glob metacharacters in
+    // substituted values are bracket-escaped so they stay literal);
+    // `unescaped` is the real filesystem path, used only for the
+    // plain-directory detection below.
+    let mut unescaped = String::with_capacity(raw.len());
+    // Whether the *raw* pattern (the user's own text, before any
+    // substitution) contains active glob syntax. Substituted values
+    // are literal path bytes and never count here — their glob
+    // metacharacters are escaped in `out` and must not suppress the
+    // plain-directory rewrite.
+    let mut raw_has_glob_meta = false;
     let bytes = raw.as_bytes();
     let mut i = 0;
 
@@ -272,6 +318,7 @@ fn expand_pattern(
                 name: "HOME".into(),
             })?;
         escape_glob_metas(home, &mut out);
+        unescaped.push_str(home);
         i = 1;
     } else if bytes.first() == Some(&b'~') {
         // `~name/...`: we don't support per-user tilde expansion.
@@ -289,6 +336,7 @@ fn expand_pattern(
             // `$$` → literal `$`.
             if bytes.get(i + 1) == Some(&b'$') {
                 out.push('$');
+                unescaped.push('$');
                 i += 2;
                 continue;
             }
@@ -311,6 +359,7 @@ fn expand_pattern(
                     })?
             };
             escape_glob_metas(value, &mut out);
+            unescaped.push_str(value);
             i += consumed;
             continue;
         }
@@ -319,22 +368,118 @@ fn expand_pattern(
         // mangle non-ASCII content). Byte-indexed scanning above is
         // still safe because every control character we care about
         // (`$`, `{`, `}`, `~`, `/`) is single-byte ASCII.
+        //
+        // A glob metacharacter here is the user's own active glob
+        // syntax (unlike the bracket escapes `escape_glob_metas`
+        // emits for substituted values), so it marks the pattern as
+        // non-plain. The byte test is safe: `*`, `?`, `[`, `{` are
+        // ASCII and can never be a UTF-8 continuation byte.
+        if matches!(b, b'*' | b'?' | b'[' | b'{') {
+            raw_has_glob_meta = true;
+        }
         let ch_len = raw[i..]
             .chars()
             .next()
             .expect("non-empty slice has at least one char")
             .len_utf8();
         out.push_str(&raw[i..i + ch_len]);
+        unescaped.push_str(&raw[i..i + ch_len]);
         i += ch_len;
     }
 
     let normalized = normalize_path(&out)?;
+    let unescaped_normalized = normalize_path(&unescaped)?;
     if require_absolute == RequireAbsolute::Yes && !normalized.starts_with('/') {
+        // A project-declared patch may use a repo-relative source
+        // (e.g. `source = "config/myrc"`). When a project root is
+        // available, join the still-relative pattern onto it so the
+        // absoluteness check passes. `..` is still rejected by
+        // `normalize_path` above, so a relative pattern like
+        // `../escape` is already `PathTraversal` before we get here.
+        if let Some(root) = anchors.project_root {
+            // The root is a substituted value, so its glob
+            // metacharacters must be escaped in the pattern the walker
+            // sees — a project directory literally named `a[b]` would
+            // otherwise truncate the walk root at the `[`. The
+            // unescaped form is kept for the plain-directory check,
+            // which consults the real filesystem path.
+            //
+            // The root must itself be absolute: a relative project
+            // path (possible on the wire) would otherwise let
+            // `finish_expand` emit a relative pattern, defeating the
+            // absoluteness guarantee this branch exists to uphold.
+            if !root.starts_with('/') {
+                return Err(ExpandError::NotAbsolute {
+                    pattern: root.to_owned(),
+                });
+            }
+            let mut escaped_root = String::with_capacity(root.len());
+            escape_glob_metas(root, &mut escaped_root);
+            let joined = if root.ends_with('/') {
+                format!("{escaped_root}{normalized}")
+            } else {
+                format!("{escaped_root}/{normalized}")
+            };
+            let unescaped_joined = if root.ends_with('/') {
+                format!("{root}{unescaped_normalized}")
+            } else {
+                format!("{root}/{unescaped_normalized}")
+            };
+            return finish_expand(
+                joined,
+                &unescaped_joined,
+                raw_has_glob_meta,
+                require_absolute,
+            );
+        }
         return Err(ExpandError::NotAbsolute {
             pattern: normalized,
         });
     }
-    FileSet::try_new(normalized).map_err(ExpandError::from)
+    finish_expand(
+        normalized,
+        &unescaped_normalized,
+        raw_has_glob_meta,
+        require_absolute,
+    )
+}
+
+/// Turn an already-normalized (and, when required, absolute) pattern
+/// into a [`FileSet`], applying the plain-directory rewrite.
+fn finish_expand(
+    normalized: String,
+    unescaped_normalized: &str,
+    raw_has_glob_meta: bool,
+    require_absolute: RequireAbsolute,
+) -> Result<(FileSet, bool), ExpandError> {
+    // When the expanded pattern is a plain directory path with no glob
+    // metacharacters, the walker would match only the directory itself
+    // (not its contents) — a silent no-op. Append `/**/*` so it behaves
+    // identically to the explicit glob form the user would otherwise
+    // have to write.
+    //
+    // The directory check consults the *unescaped* path: a substituted
+    // value like `/tmp/a[b]` is a literal directory name, but `out`
+    // renders it as `/tmp/a[[]b[]]`, which `Path::is_dir` would not
+    // find. Active glob syntax is decided from the raw pattern alone
+    // (`raw_has_glob_meta`), so a raw `[X]` — genuine glob syntax —
+    // suppresses the rewrite while a substituted `[b]` does not.
+    let plain_directory = require_absolute == RequireAbsolute::Yes
+        && !raw_has_glob_meta
+        && std::path::Path::new(unescaped_normalized).is_dir();
+    let pattern = if plain_directory {
+        let mut with_glob = normalized;
+        if with_glob.ends_with('/') {
+            with_glob.push_str("**/*");
+        } else {
+            with_glob.push_str("/**/*");
+        }
+        with_glob
+    } else {
+        normalized
+    };
+    let fs = FileSet::try_new(pattern).map_err(ExpandError::from)?;
+    Ok((fs, plain_directory))
 }
 
 /// Drop `.` and empty components, reject any `..` component.
@@ -374,7 +519,11 @@ fn normalize_path(s: &str) -> Result<String, ExpandError> {
         out.push('/');
     }
     out.push_str(&components.join("/"));
-    if trailing_slash {
+    // Restore the trailing slash only onto a non-empty component list:
+    // `./` normalizes to the empty (current-directory) path, and
+    // pushing `/` onto it would turn a relative source into the
+    // absolute host root.
+    if trailing_slash && !components.is_empty() {
         out.push('/');
     }
     Ok(out)
@@ -543,6 +692,19 @@ mod tests {
             raw,
             vars,
             Anchors::default().with_loadout_root(Some(loadout_root)),
+        )
+        .map(|fs| fs.pattern().to_owned())
+    }
+
+    fn expand_with_project_root(
+        raw: &str,
+        vars: &[ResolvedVar],
+        project_root: &str,
+    ) -> Result<String, ExpandError> {
+        expand_source(
+            raw,
+            vars,
+            Anchors::default().with_project_root(Some(project_root)),
         )
         .map(|fs| fs.pattern().to_owned())
     }
@@ -1106,5 +1268,230 @@ mod tests {
             matches!(err, ExpandError::PathTraversal { .. }),
             "got: {err:?}",
         );
+    }
+
+    // ---- project-root anchor ----
+
+    /// A repo-relative source (e.g. `source = "config/myrc"`) is
+    /// joined onto the project root so the absoluteness check passes.
+    #[test]
+    fn project_root_anchors_relative_source() {
+        let vars: [ResolvedVar; 0] = [];
+        assert_eq!(
+            expand_with_project_root("config/myrc", vars.as_slice(), "/home/u/proj").unwrap(),
+            "/home/u/proj/config/myrc",
+        );
+    }
+
+    /// A project-root anchor with a trailing slash doesn't double the
+    /// separator.
+    #[test]
+    fn project_root_with_trailing_slash() {
+        let vars: [ResolvedVar; 0] = [];
+        assert_eq!(
+            expand_with_project_root("config/myrc", vars.as_slice(), "/home/u/proj/").unwrap(),
+            "/home/u/proj/config/myrc",
+        );
+    }
+
+    /// An already-absolute source is left alone — the project root
+    /// doesn't prepend.
+    #[test]
+    fn project_root_does_not_affect_absolute_source() {
+        let vars: [ResolvedVar; 0] = [];
+        assert_eq!(
+            expand_with_project_root("/etc/foo", vars.as_slice(), "/home/u/proj").unwrap(),
+            "/etc/foo",
+        );
+    }
+
+    /// `..` in a relative source is still rejected before the join —
+    /// the project root is not an escape hatch.
+    #[test]
+    fn project_root_still_rejects_parent_traversal() {
+        let vars: [ResolvedVar; 0] = [];
+        let err =
+            expand_with_project_root("../escape", vars.as_slice(), "/home/u/proj").unwrap_err();
+        assert!(
+            matches!(err, ExpandError::PathTraversal { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    /// A relative source with no project root still fails with
+    /// `NotAbsolute` — the existing behaviour for non-project patches.
+    #[test]
+    fn relative_source_without_project_root_is_not_absolute() {
+        let vars: [ResolvedVar; 0] = [];
+        let err = expand("config/myrc", &vars).unwrap_err();
+        assert!(
+            matches!(err, ExpandError::NotAbsolute { ref pattern } if pattern == "config/myrc"),
+            "got: {err:?}",
+        );
+    }
+
+    /// A project-relative source that names an existing directory still
+    /// gets the plain-directory `/**/*` append.
+    #[test]
+    fn project_root_plain_directory_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-proj-dir");
+        let sub = dir.join("config");
+        std::fs::create_dir_all(&sub).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let pat =
+            expand_with_project_root("config", vars.as_slice(), dir.to_str().unwrap()).unwrap();
+        assert_eq!(pat, format!("{}/config/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `$HOME` substitution composes with the project-root anchor:
+    /// the tilde/home expansion runs first, and if the result is
+    /// absolute the project root is not applied.
+    #[test]
+    fn project_root_with_home_substitution() {
+        let vars = [sv("HOME", "/home/u")];
+        // `~/foo` expands to `/home/u/foo` — already absolute, so
+        // project root is not applied.
+        let pat = expand_source(
+            "~/foo",
+            vars.as_slice(),
+            Anchors::home(None).with_project_root(Some("/proj")),
+        )
+        .map(|fs| fs.pattern().to_owned())
+        .unwrap();
+        assert_eq!(pat, "/home/u/foo");
+    }
+
+    /// Glob metacharacters in the project root are escaped like any
+    /// other substituted value. A project directory literally named
+    /// `proj[1]` would otherwise truncate the walk root at the `[` and
+    /// match a far wider tree than the project asked for.
+    #[test]
+    fn project_root_escapes_glob_metas() {
+        let vars: [ResolvedVar; 0] = [];
+        assert_eq!(
+            expand_with_project_root("config/myrc", vars.as_slice(), "/home/u/proj[1]").unwrap(),
+            "/home/u/proj[[]1[]]/config/myrc",
+        );
+    }
+
+    /// `./` names the project root itself. It must resolve under the
+    /// project, never to the host root `/` (which the plain-directory
+    /// rewrite would widen to the whole host filesystem).
+    #[test]
+    fn project_root_dot_slash_resolves_to_project_root() {
+        let vars: [ResolvedVar; 0] = [];
+        for raw in ["./", ".//", "."] {
+            assert_eq!(
+                expand_with_project_root(raw, vars.as_slice(), "/home/u/proj").unwrap(),
+                "/home/u/proj/",
+                "raw: {raw:?}",
+            );
+        }
+    }
+
+    /// Without a project root, `./` stays relative and is rejected
+    /// rather than becoming the absolute host root.
+    #[test]
+    fn dot_slash_without_project_root_is_not_absolute() {
+        let vars: [ResolvedVar; 0] = [];
+        let err = expand("./", &vars).unwrap_err();
+        assert!(
+            matches!(err, ExpandError::NotAbsolute { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    /// A relative project root is rejected before the join: joining a
+    /// relative source onto it would still be relative, and
+    /// `finish_expand` would emit a pattern that defeats the
+    /// absoluteness guarantee this branch exists to uphold.
+    #[test]
+    fn project_root_relative_is_rejected() {
+        let vars: [ResolvedVar; 0] = [];
+        let err = expand_with_project_root("config/myrc", vars.as_slice(), "proj").unwrap_err();
+        assert!(
+            matches!(err, ExpandError::NotAbsolute { ref pattern } if pattern == "proj"),
+            "got: {err:?}",
+        );
+    }
+
+    // ---- plain-directory source ----
+
+    /// A patch source that names an existing directory with no glob
+    /// metacharacters is treated as `<dir>/**/*`, so it delivers the
+    /// directory tree instead of silently matching nothing.
+    #[test]
+    fn plain_directory_source_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand(dir.to_str().unwrap(), vars.as_slice()).unwrap();
+        assert_eq!(pat, format!("{}/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain directory source with a trailing slash still appends the
+    /// recursive glob without doubling the separator.
+    #[test]
+    fn plain_directory_source_with_trailing_slash_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-plain-dir-slash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let raw = format!("{}/", dir.to_str().unwrap());
+        let pat = expand(&raw, vars.as_slice()).unwrap();
+        assert_eq!(pat, format!("{}/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain path that is *not* an existing directory is left alone —
+    /// it may be a file, or a directory that doesn't exist on this host
+    /// (the walker already warns-and-drops those).
+    #[test]
+    fn plain_non_directory_source_is_left_alone() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand("/definitely/not/a/real/dir", vars.as_slice()).unwrap();
+        assert_eq!(pat, "/definitely/not/a/real/dir");
+    }
+
+    /// A pattern that already carries glob metacharacters is left alone,
+    /// even when it names a directory.
+    #[test]
+    fn globbed_source_is_left_alone() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand("/tmp/**/*.lua", vars.as_slice()).unwrap();
+        assert_eq!(pat, "/tmp/**/*.lua");
+    }
+
+    /// A substituted value that names a directory with a literal
+    /// bracket in its name is still treated as a plain directory: the
+    /// directory check consults the *unescaped* path, so `a[b]` is
+    /// found on disk even though the `FileSet` pattern escapes it to
+    /// `a[[]b[]]`.
+    #[test]
+    fn substituted_directory_with_bracket_name_appends_recursive_glob() {
+        let parent = std::env::temp_dir().join("minimal-expansion-bracket-dir");
+        let dir = parent.join("a[b]");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars = [sv("DIR", dir.to_str().unwrap())];
+        let pat = expand("$DIR", &vars).unwrap();
+        assert_eq!(pat, format!("{}/a[[]b[]]/**/*", parent.to_str().unwrap()));
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    /// A raw `[X]` is active glob syntax (a single-character class),
+    /// not a literal directory name. Even when a directory literally
+    /// named `[X]` exists, the pattern is left alone: appending
+    /// `/**/*` would produce `[X]/**/*`, which globset reads as "the
+    /// `X` directory", not the literal `[X]`.
+    #[test]
+    fn raw_bracket_class_is_not_treated_as_plain_directory() {
+        let parent = std::env::temp_dir().join("minimal-expansion-raw-bracket");
+        let dir = parent.join("[X]");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand(dir.to_str().unwrap(), vars.as_slice()).unwrap();
+        assert_eq!(pat, dir.to_str().unwrap());
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 }
