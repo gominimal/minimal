@@ -215,7 +215,9 @@ inputs.
 
 - **QM-017** WHEN grading a change THE SYSTEM SHALL mutation-test only the
   lines the change added or edited, and WHEN running nightly THE SYSTEM
-  SHALL test one of seven shards of the workspace chosen by the weekday.
+  SHALL mutation-test the lines changed since the newest published snapshot
+  within a declared time budget, reporting a run that reached the budget as
+  partial.
   tier:     T0
   verify:   bash scripts/metrics_test.sh mutants_scope_follows_mode
   - IF the change adds a source file that is not yet tracked THEN THE
@@ -265,6 +267,12 @@ workflow already has. The gate reads its baseline from that ref.
 it can edit is not graded. Reading the thresholds from the merge-base and
 applying the stricter of base and head means a change may tighten the bar
 immediately and may loosen it only after review has merged the loosening.
+
+**The nightly mutation scope is yesterday's change, not a workspace
+shard.** A seventh of the workspace is thousands of mutants, which no
+night can finish; the lines changed since the last snapshot are bounded,
+and a trend over them says whether new code arrives tested. A wall-clock
+budget keeps one large change from taking the run with it.
 
 **Three run tiers, forced by two budgets.** The review runtime gives a
 probe 300 seconds and delivers no arguments; the coding runtime gives the
