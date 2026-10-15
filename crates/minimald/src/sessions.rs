@@ -1091,6 +1091,24 @@ impl Manager {
         Ok(Some(h))
     }
 
+    /// Whether the session that answers to `name` is in the tearing-down
+    /// set. A store error reads as not: the caller then reports the plain
+    /// collision it already had.
+    async fn name_is_being_destroyed(&self, name: &str) -> bool {
+        match self
+            .store
+            .find(RecordPredicate::Name(name.to_string()))
+            .await
+        {
+            Ok(Some(handle)) => self
+                .tearing_down
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(handle.id()),
+            _ => false,
+        }
+    }
+
     /// Starts the actor of every `Active` record whose box owns a name
     /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
     /// registered when its actor starts ([`Session::run`]), and a restarted
@@ -1271,7 +1289,28 @@ impl Manager {
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
         let record = build_record(config, username, boxes::SessionStatus::Pending)?;
-        let handle = self.store.create(record).await?;
+        let name = record.name.clone();
+        let handle = match self.store.create(record).await {
+            Ok(handle) => handle,
+            // The name may be held by a session whose destroy is still
+            // running (its record outlives its actor by the length of the
+            // teardown task, a stalled clone's connect timeout at worst):
+            // say so, rather than report a plain collision the user cannot
+            // see in `min ls`, where that session is no longer listed.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(match name {
+                    Some(name) if self.name_is_being_destroyed(&name).await => SessionsError::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "a session named `{name}` is still being destroyed; \
+                                 try again once it is gone"
+                        ),
+                    ),
+                    _ => e,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let session_id = *handle.id();
 
         let mut seed = self.session_config(handle.clone());
@@ -1620,7 +1659,12 @@ impl Manager {
                     // Teardowns in flight (`DeleteSession` runs them on tasks
                     // of their own) end before the volume is quiesced: a hook
                     // mid-run or a record delete mid-write would otherwise
-                    // race the unmount. Bounded by the hooks' own timeouts.
+                    // race the unmount. The wait is as long as the slowest
+                    // of them: a claimed actor reaches its `Destroy` only
+                    // after the message it is in, so one inside a stalled
+                    // package-graph clone holds shutdown for that clone's
+                    // connect timeout (minutes on a dropped route), as the
+                    // inline destroy used to; its hooks' timeouts come after.
                     while self.teardowns.join_next().await.is_some() {}
                     // Release the cache's held-open alog fd: it lives on the
                     // state volume, and a surviving write-open fd there makes
@@ -2654,6 +2698,49 @@ pub(crate) mod tests {
                 .is_none(),
             "the record should be gone after destroy"
         );
+    }
+
+    /// A create whose name is held by a session still being torn down says
+    /// so, rather than reporting a plain collision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_during_a_teardown_names_the_destroy() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session_contributing(
+            &mngr,
+            sample_config(),
+            WireContribution {
+                lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                    hook: boxes::wire::primitives::WireLifecycleHook {
+                        on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                            body: "sleep 2".to_string(),
+                            timeout_secs: 60,
+                        }),
+                        ..Default::default()
+                    },
+                    source: boxes::wire::primitives::WireSource::UserLoadout {
+                        name: "test".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        let destroying = {
+            let mngr = mngr.clone();
+            crate::traced::spawn(async move { mngr.delete_session(id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let err = mngr
+            .create_session(sample_config(), None)
+            .await
+            .expect_err("the name is still held by the session being destroyed");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("still being destroyed"),
+            "the error should name the destroy: {err}"
+        );
+        destroying.await.unwrap().unwrap();
     }
 
     /// Destroying an unknown ID is a `NotFound` error.
