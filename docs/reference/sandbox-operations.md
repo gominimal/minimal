@@ -68,6 +68,17 @@ Runs the specified task in a new Minimal sandbox. Interactive tasks are not supp
 
 `min task run` is the canonical noun-verb spelling; the bare `min run` is a legacy alias.
 
+### `net expose <PORT>`
+
+Sessions only: publishes `<PORT>` at the box's published address, so the
+host can reach it. The box's session decides the request against the
+[`--dynamic-ingress`](./cli-min.md#session-activate) stance set at activation:
+`allow` publishes it inside `--dynamic-range`, `ask` waits on whoever is
+attached, and an unset or `deny` stance refuses it. A refusal names its way
+forward: re-activating with the flags, or the host-side
+[`min net forward`](./cli-min.md#net-forward). Runtime publishes appear in
+[`min session policy`](./cli-min.md#session-policy).
+
 ### `package build <PACKAGES...>`
 
 Builds the named packages in a clean room, making them available in the local
