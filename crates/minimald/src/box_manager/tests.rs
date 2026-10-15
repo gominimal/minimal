@@ -546,6 +546,17 @@ async fn a_second_destroy_during_a_teardown_runs_no_hook_twice() {
             .is_none(),
         "a session being torn down should resolve to nothing"
     );
+    assert!(
+        mngr.list().await.unwrap().iter().all(|s| s.id != id),
+        "a session being torn down should not be listed"
+    );
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down should have no record to read"
+    );
 
     first.await.unwrap().unwrap();
     let ran = std::fs::read_to_string(&marker).unwrap_or_default();

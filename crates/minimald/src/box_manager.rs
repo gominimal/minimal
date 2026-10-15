@@ -1348,9 +1348,20 @@ impl BoxManager {
             ManagerMessage::List(r) => {
                 let running = &self.running;
                 let store = &self.store;
+                // A session being torn down is gone here as it is to the
+                // resolver: its record outlives its actor only by the length
+                // of the teardown task.
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 r.handle(async move {
                     let mut records = Vec::with_capacity(32);
                     for handle in store.handles().await? {
+                        if tearing_down.contains(handle.id()) {
+                            continue;
+                        }
                         records.push(handle.record().await?);
                     }
                     // The attrs probes run in parallel and each under
@@ -1382,8 +1393,15 @@ impl BoxManager {
             }
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 r.handle(async {
                     Ok::<_, BoxManagerError>(match self.store.find(pred.into()).await? {
+                        // Gone, as to the listing and the resolver.
+                        Some(handle) if tearing_down.contains(handle.id()) => None,
                         Some(handle) => Some(handle.record().await?),
                         None => None,
                     })
@@ -1691,5 +1709,6 @@ impl Drop for TearingDown {
     }
 }
 
+#[cfg(test)]
 #[cfg(test)]
 pub(crate) mod tests;
