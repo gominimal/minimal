@@ -20,14 +20,14 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
     let stream = connect_with_retry(&socket_path).await?;
 
     let bridge = proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout());
-    match args.owner {
-        None => bridge.await,
-        Some(owner) => tokio::select! {
+    match (args.owner, args.owner_lock) {
+        (None, None) => bridge.await,
+        (owner, lock) => tokio::select! {
             res = bridge => res,
-            () = owner_gone(owner) => {
+            () = owner_gone(owner, lock) => {
                 // Dropping the bridge closes the daemon socket: the signal
                 // the daemon acts on for a lost client.
-                tracing::debug!(owner, "the proxy's owner is gone; closing the daemon connection");
+                tracing::debug!(?owner, "the proxy's owner is gone; closing the daemon connection");
                 Ok(())
             }
         },
@@ -45,22 +45,56 @@ const OWNER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// the daemon's socket open, and the daemon, which learns of a lost client
 /// only from its connection closing, keeps the command running — a silent
 /// `sleep` outlived its killed client indefinitely (lab scenario 732).
-/// Polled, since the owner is a grandparent this process cannot wait on;
-/// `kill(pid, 0)` says whether it still exists (`EPERM` is alive). A pid
-/// that does not fit a `pid_t` names no process and reads as gone.
-async fn owner_gone(pid: u32) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    let pid = nix::unistd::Pid::from_raw(pid);
+/// Polled, since the owner is a grandparent this process cannot wait on.
+///
+/// The lock is the watch: the owner holds an exclusive `flock` on `lock`
+/// for its life, and the kernel releases it on any end of that process, so
+/// the moment this process can take it the owner is gone. The pid is the
+/// fallback where no lock was handed (an older `min`): `kill(pid, 0)` says
+/// whether it still exists (`EPERM` is alive), and can be fooled by a
+/// recycled pid or a zombie the owner's parent has not reaped — which is
+/// why the lock exists. A pid that does not fit a `pid_t` names no process
+/// and reads as gone.
+async fn owner_gone(pid: Option<u32>, lock: Option<PathBuf>) {
+    let pid = pid.and_then(|pid| i32::try_from(pid).ok().map(nix::unistd::Pid::from_raw));
     loop {
-        if matches!(
-            nix::sys::signal::kill(pid, None),
-            Err(nix::errno::Errno::ESRCH)
-        ) {
+        if let Some(path) = &lock
+            && owner_lock_is_free(path)
+        {
+            return;
+        }
+        if lock.is_none()
+            && let Some(pid) = pid
+            && matches!(
+                nix::sys::signal::kill(pid, None),
+                Err(nix::errno::Errno::ESRCH)
+            )
+        {
+            return;
+        }
+        if lock.is_none() && pid.is_none() {
+            // A pid that fit no `pid_t` and no lock: nothing to watch.
             return;
         }
         tokio::time::sleep(OWNER_POLL).await;
+    }
+}
+
+/// Whether the owner's lock can be taken: its file gone, or its `flock`
+/// free. A lock taken here is released at once (and its file removed: the
+/// owner that made it is gone), so a second look reads the same.
+fn owner_lock_is_free(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            drop(lock);
+            let removed = std::fs::remove_file(path);
+            tracing::debug!(?removed, path = %path.display(), "the proxy's owner lock was free");
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -69,7 +103,8 @@ mod owner_watch_tests {
     use super::owner_gone;
     use std::time::Duration;
 
-    /// The watch holds while the owner lives and resolves once it is gone.
+    /// The pid fallback holds while the owner lives and resolves once it is
+    /// gone.
     #[tokio::test]
     async fn the_watch_resolves_when_the_owner_dies() {
         let mut child = std::process::Command::new("sleep")
@@ -78,16 +113,47 @@ mod owner_watch_tests {
             .expect("sleep spawns");
         let pid = child.id();
         assert!(
-            tokio::time::timeout(Duration::from_millis(600), owner_gone(pid))
+            tokio::time::timeout(Duration::from_millis(600), owner_gone(Some(pid), None))
                 .await
                 .is_err(),
             "the watch resolved while the owner was alive"
         );
         child.kill().expect("sleep is killable");
         child.wait().expect("sleep is reaped");
-        tokio::time::timeout(Duration::from_secs(2), owner_gone(pid))
+        tokio::time::timeout(Duration::from_secs(2), owner_gone(Some(pid), None))
             .await
             .expect("the watch did not resolve after the owner died");
+    }
+
+    /// The lock watch holds while the owner holds its lock and resolves
+    /// once the lock is released — what the kernel does for a process that
+    /// ends any way at all, SIGKILL included. The pid handed beside it is a
+    /// live one (this process), so only the lock can end the watch.
+    #[tokio::test]
+    async fn the_watch_resolves_when_the_owner_lock_is_released() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("proxy-owner-test.lock");
+        let file = std::fs::File::create(&path).expect("the lock file is created");
+        let held = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let me = std::process::id();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(600),
+                owner_gone(Some(me), Some(path.clone()))
+            )
+            .await
+            .is_err(),
+            "the watch resolved while the lock was held"
+        );
+        drop(held);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            owner_gone(Some(me), Some(path.clone())),
+        )
+        .await
+        .expect("the watch did not resolve after the lock was released");
+        assert!(!path.exists(), "the freed lock file is removed");
     }
 }
 

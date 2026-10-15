@@ -99,6 +99,57 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// matching `SendEnv` option) the daemon reads back alongside
 /// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
 /// for non-interactive exec channels, which have no detach.
+/// The exclusive lock this process holds for the proxies it drives, taken
+/// once and kept for the process's life; see [`hold_owner_lock`].
+static OWNER_LOCK: std::sync::OnceLock<(std::path::PathBuf, nix::fcntl::Flock<std::fs::File>)> =
+    std::sync::OnceLock::new();
+
+/// Takes (once per process) the exclusive `flock` the proxy's owner watch
+/// reads, on a file beside the daemon socket named for this pid, and
+/// returns its path. Held in [`OWNER_LOCK`] until the process ends: that
+/// end — a SIGKILL as much as an exit — is what releases it, and what the
+/// proxy is waiting for. Best-effort: where the file cannot be made or
+/// locked (a socket path with no directory yet, a read-only state dir)
+/// the proxy keeps the pid watch alone, and the attach goes on.
+fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
+    if let Some((path, _)) = OWNER_LOCK.get() {
+        return Some(path.clone());
+    }
+    let path = sock.with_file_name(format!("proxy-owner-{}.lock", std::process::id()));
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "no proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_, errno)) => {
+            tracing::debug!(
+                path = %path.display(),
+                %errno,
+                "could not lock the proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    // A second caller racing this one holds the same lock: either value is
+    // the process's, and the loser's lock drops, released, with its file
+    // still ours through the winner.
+    let (path, _) = OWNER_LOCK.get_or_init(|| (path, lock));
+    Some(path.clone())
+}
+
 pub fn attach_command(
     sock: &Path,
     id: boxes::SessionId,
@@ -106,18 +157,27 @@ pub fn attach_command(
     session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
-    // depend on socat or nc being installed. `--owner` is this process: a
-    // `min` that dies without taking ssh down (SIGKILL, an OOM kill) leaves
-    // ssh and the proxy holding the daemon's socket open, and the daemon
-    // learns of a lost client only from that socket closing — so the proxy
-    // watches its owner and exits when it is gone.
+    // depend on socat or nc being installed. `--owner-lock` is a file this
+    // process holds an exclusive `flock` on for its lifetime, and `--owner`
+    // its pid: a `min` that dies without taking ssh down (SIGKILL, an OOM
+    // kill) leaves ssh and the proxy holding the daemon's socket open, and
+    // the daemon learns of a lost client only from that socket closing — so
+    // the proxy watches its owner and exits when it is gone. The lock is
+    // the watch that cannot be fooled: the kernel releases it on any end of
+    // this process, where a pid can be recycled or linger as a zombie.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
-    let proxy_cmd = format!(
+    let mut proxy_cmd = format!(
         "{} proxy --socket {} --owner {}",
         shell_quote(&exe.display().to_string()),
         shell_quote(&sock.display().to_string()),
         std::process::id(),
     );
+    if let Some(owner_lock) = hold_owner_lock(sock) {
+        proxy_cmd.push_str(&format!(
+            " --owner-lock {}",
+            shell_quote(&owner_lock.display().to_string())
+        ));
+    }
 
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
