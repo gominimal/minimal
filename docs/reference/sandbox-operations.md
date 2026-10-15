@@ -75,9 +75,7 @@ host can reach it. Minimal decides the request against the
 [`--dynamic-ingress`](./cli-min.md#session-activate) stance set at activation.
 `allow` publishes a port inside `--dynamic-range` and refuses any other.
 `ask` prompts the terminal attached to the session. With nobody attached,
-Minimal refuses the request at once. An unset or `deny` stance refuses it. A
-VM-backed host, such as every macOS host, refuses `allow` and `ask` at
-activation.
+Minimal refuses the request at once. An unset or `deny` stance refuses it.
 
 The stances apply only to a `--network own_ip` box. On a `host_ip` box (the
 default), the port does not need exposing: the box shares the host's network
