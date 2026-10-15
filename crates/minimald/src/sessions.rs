@@ -190,7 +190,9 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<Vec<String>>),
+    /// Destroy a session; with `true`, only if it has not finished
+    /// activating (`None` when it was kept).
+    DeleteSession(SessionId, bool, Responder<Option<Vec<String>>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
@@ -1530,7 +1532,7 @@ impl Manager {
             // actor was inside a stalled package-graph clone parked `min ls`
             // for the rest of the clone's connect timeout (70 s in the lab,
             // 710d).
-            ManagerMessage::DeleteSession(id, r) => {
+            ManagerMessage::DeleteSession(id, only_if_unfinalized, r) => {
                 if self.in_shutdown.is_cancelled() {
                     r.handle(async {
                         Err(SessionsError::new(
@@ -1558,6 +1560,51 @@ impl Manager {
                         return;
                     }
                 };
+                // A destroy only for an unfinished session (inbox#690) goes
+                // to a live actor unclaimed: the actor decides, after any
+                // finalize ahead of it in its mailbox, and evicts itself if
+                // it destroys. An idle session has no finalize in flight, so
+                // its record answers: a finished one is kept, an unfinished
+                // one takes the unconditional path below.
+                if only_if_unfinalized {
+                    let busy = self
+                        .tearing_down
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&id);
+                    if busy {
+                        r.handle(async {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ResourceBusy,
+                                format!("session `{}` is already being destroyed", id.as_ref()),
+                            ))
+                        })
+                        .await;
+                        return;
+                    }
+                    if let Some(hnd) = self.running.get(&id).cloned() {
+                        let span = tracing::Span::current();
+                        self.teardowns.spawn(tracing::Instrument::instrument(
+                            async move {
+                                r.handle(async { hnd.destroy_if_unfinalized().await }).await;
+                            },
+                            span,
+                        ));
+                        while self.teardowns.try_join_next().is_some() {}
+                        return;
+                    }
+                    match handle.record().await {
+                        Ok(record) if record.status == boxes::SessionStatus::Active => {
+                            r.handle(async { Ok(None) }).await;
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            r.handle(async { Err(e) }).await;
+                            return;
+                        }
+                    }
+                }
                 // One teardown per session: a second destroy that lands
                 // while the first runs is refused rather than brought up
                 // as a fresh actor whose hooks would run again.
@@ -1665,11 +1712,11 @@ impl Manager {
                                     {
                                         return Err(e);
                                     }
-                                    Ok(hook_failures)
+                                    Ok(Some(hook_failures))
                                 }
                                 None => {
                                     handle.delete().await?;
-                                    Ok(Vec::new())
+                                    Ok(Some(Vec::new()))
                                 }
                             }
                         })
@@ -2158,11 +2205,31 @@ impl ManagerHandle {
     /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
     pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
+        self.delete(id, false).await.map(Option::unwrap_or_default)
+    }
+
+    /// [`Self::delete_session`] for a session that has not finished
+    /// activating: `Ok(None)`, with the session left as it is, when it had —
+    /// decided by the session after any finalize already in flight. The
+    /// cleanup a client or the connection-close reap sends for an activation
+    /// that was given up on (inbox#690).
+    pub async fn delete_session_if_unfinalized(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<Vec<String>>, SessionsError> {
+        self.delete(id, true).await
+    }
+
+    async fn delete(
+        &self,
+        id: SessionId,
+        only_if_unfinalized: bool,
+    ) -> Result<Option<Vec<String>>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .sender
-            .send(ManagerMessage::DeleteSession(id, send))
+            .send(ManagerMessage::DeleteSession(id, only_if_unfinalized, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
@@ -2807,6 +2874,42 @@ pub(crate) mod tests {
         })
         .await
         .expect("the destroy never claimed the session");
+    }
+
+    /// A cleanup destroy (`only_if_unfinalized`) keeps a session that
+    /// finished activating and destroys one that did not (inbox#690).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cleanup_destroy_keeps_a_finished_session() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let kept = mngr.delete_session_if_unfinalized(id).await.unwrap();
+        assert!(kept.is_none(), "an Active session should be kept");
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_some(),
+            "a kept session keeps its record"
+        );
+        assert_eq!(mngr.list().await.unwrap().len(), 1, "and is listed");
+
+        let (_state, _cache, pending_mngr, pending, _response) = create_pending_session().await;
+        let destroyed = pending_mngr
+            .delete_session_if_unfinalized(pending)
+            .await
+            .unwrap();
+        assert!(
+            destroyed.is_some(),
+            "an unfinished session should be destroyed"
+        );
+        assert!(
+            pending_mngr
+                .get_record(SessionKeyPredicate::Id(pending))
+                .await
+                .unwrap()
+                .is_none(),
+            "the destroyed session's record should be gone"
+        );
     }
 
     /// Destroying an unknown ID is a `NotFound` error.

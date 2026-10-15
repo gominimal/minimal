@@ -1415,11 +1415,18 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         ) {
             continue;
         }
-        match mngr.delete_session(id).await {
-            Ok(_) => tracing::info!(
+        // Only if still unfinished when the session gets to it: a finalize
+        // already in flight ends first, and a session it finished is kept
+        // (inbox#690's reap half).
+        match mngr.delete_session_if_unfinalized(id).await {
+            Ok(Some(_)) => tracing::info!(
                 session_id = %id,
                 ?status,
                 "reaped unfinalized session after its connection closed"
+            ),
+            Ok(None) => tracing::info!(
+                session_id = %id,
+                "kept a session whose connection closed: it finished activating first"
             ),
             Err(e) => tracing::warn!(
                 session_id = %id,

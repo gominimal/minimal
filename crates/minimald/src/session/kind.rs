@@ -20,6 +20,7 @@ impl SessionMessage {
             Self::Abort { .. } => "Abort",
             Self::Rename { .. } => "Rename",
             Self::IsBusy { .. } => "IsBusy",
+            Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::Stop { .. } => "Stop",
             Self::Destroy { .. } => "Destroy",
             Self::GetRecord { .. } => "GetRecord",

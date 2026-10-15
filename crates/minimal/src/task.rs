@@ -446,7 +446,10 @@ fn arm_task_run_interrupt(
             {
                 use minimald_rpc::{DestroySession, DestroySessionRequest};
                 let _ = client
-                    .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
+                    .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+                        id: session_id,
+                        only_if_unfinalized: false,
+                    })
                     .await;
             }
             // The run's own return never comes on this path, so the release
@@ -886,7 +889,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     )
     .await
     {
-        crate::best_effort_destroy(&mut client, id).await;
+        // Only if unfinished: a finalize that completed after the client
+        // gave up leaves a live session, which is kept (inbox#690).
+        crate::best_effort_destroy(&mut client, id, true).await;
         return Err(e);
     }
 
@@ -912,7 +917,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // always did. A run that bridged leaves its box to the daemon.
         Err(e) => {
             if !args.keep {
-                crate::best_effort_destroy(&mut client, id).await;
+                // Finished (the exec never started): unconditional.
+                crate::best_effort_destroy(&mut client, id, false).await;
             }
             Err(e)
         }

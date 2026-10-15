@@ -1616,16 +1616,18 @@ pub(crate) async fn activate_session(
         // Materializing on the daemon. Destroy it so the operator's
         // `min ls` doesn't fill with half-finalized sessions, and
         // withdraw the row the registration bought with it (T66).
-        best_effort_destroy(&mut client, id).await;
-        withdraw_box_row(
-            control_sock.clone(),
-            config.name.as_deref(),
-            config.box_addresses,
-            registered
-                .as_ref()
-                .and_then(|registration| registration.box_id),
-        )
-        .await;
+        let kept = best_effort_destroy(&mut client, id, true).await;
+        if !kept {
+            withdraw_box_row(
+                control_sock.clone(),
+                config.name.as_deref(),
+                config.box_addresses,
+                registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
+            )
+            .await;
+        }
         return Err(e);
     }
 
@@ -3911,7 +3913,10 @@ pub(crate) async fn destroy_session(
     use minimald_rpc::{DestroySession, DestroySessionRequest};
 
     let resp = client
-        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id })
+        .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
         .context("DestroySession RPC failed")?;
 
@@ -7116,7 +7121,10 @@ mod tests {
 
         // The Delete choice destroyed it daemon-side: the name is released.
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7201,7 +7209,10 @@ mod tests {
         // the hold is made for a session that is gone, and released again
         // by its id once the second lookup finds no session.
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7247,7 +7258,10 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id: gone })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id: gone,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7327,7 +7341,10 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7381,7 +7398,10 @@ mod tests {
         );
 
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}

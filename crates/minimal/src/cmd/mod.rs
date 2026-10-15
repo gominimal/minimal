@@ -757,16 +757,35 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
 /// back to `cmd_activate`.
-pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id: boxes::SessionId) {
+///
+/// With `only_if_unfinalized` (the cleanup after an activation the client
+/// gave up on) the daemon keeps a session that finished after all
+/// (inbox#690); returns whether it did, so the caller does not undo the
+/// rest of a session that is live.
+pub(crate) async fn best_effort_destroy(
+    client: &mut client::Client,
+    session_id: boxes::SessionId,
+    only_if_unfinalized: bool,
+) -> bool {
     /// Ceiling on how long we let a cleanup RPC run. Chosen well
     /// above a healthy `DestroySession` (single-digit milliseconds
     /// on a UDS) so the timeout only fires against pathologies.
     const DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     use minimald_rpc::DestroySession;
-    let call = client
-        .oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest { id: session_id });
+    let call = client.oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest {
+        id: session_id,
+        only_if_unfinalized,
+    });
     match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
-        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
+        Ok(Ok(minimald_rpc::Errorable::Ok(resp))) => {
+            if resp.kept {
+                eprintln!(
+                    "note: the session {session_id} finished activating after this client gave \
+                     up on it, so it was kept: it is live (`min ls`)"
+                );
+                return true;
+            }
+        }
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
@@ -787,6 +806,7 @@ pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id:
             );
         }
     }
+    false
 }
 
 /// The stderr line activation prints for a declared port the box yields

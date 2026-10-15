@@ -2001,6 +2001,13 @@ pub struct DestroySession;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestroySessionRequest {
     pub id: SessionId,
+    /// Destroy the session only if it has not finished activating (record
+    /// not yet `Active`), decided by the session itself after any finalize
+    /// already in flight: the destroy a client sends to clean up an
+    /// activation it gave up on (inbox#690). Absent, as from a client that
+    /// predates it, the destroy is unconditional, as it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_if_unfinalized: bool,
 }
 
 /// The response for a [`DestroySession`] RPC.
@@ -2022,6 +2029,10 @@ pub struct DestroySessionResponse {
     /// declared and what happened, followed by its captured output tail
     /// on the lines after, when there is any.
     pub hook_failures: Vec<String>,
+    /// The destroy was `only_if_unfinalized` and the session had finished:
+    /// it was kept, and is live. Only ever set in answer to such a request,
+    /// so a client that predates the flag never sees it.
+    pub kept: bool,
 }
 
 /// [`DestroySessionResponse`] on the wire: `null` (the old unit shape)
@@ -2041,6 +2052,8 @@ enum DestroySessionResponseWire {
 struct DestroySessionResponseFields {
     #[serde(default)]
     hook_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    kept: bool,
 }
 
 impl From<DestroySessionResponseWire> for DestroySessionResponse {
@@ -2049,6 +2062,7 @@ impl From<DestroySessionResponseWire> for DestroySessionResponse {
             DestroySessionResponseWire::Unit(()) => Self::default(),
             DestroySessionResponseWire::Fields(f) => Self {
                 hook_failures: f.hook_failures,
+                kept: f.kept,
             },
         }
     }
@@ -2056,11 +2070,12 @@ impl From<DestroySessionResponseWire> for DestroySessionResponse {
 
 impl From<DestroySessionResponse> for DestroySessionResponseWire {
     fn from(resp: DestroySessionResponse) -> Self {
-        if resp.hook_failures.is_empty() {
+        if resp.hook_failures.is_empty() && !resp.kept {
             Self::Unit(())
         } else {
             Self::Fields(DestroySessionResponseFields {
                 hook_failures: resp.hook_failures,
+                kept: resp.kept,
             })
         }
     }
@@ -3019,8 +3034,31 @@ mod tests {
 
         let failed = DestroySessionResponse {
             hook_failures: vec!["user loadout `dev`: exited with status 3".to_string()],
+            kept: false,
         };
         assert_eq!(round_trip(&failed), failed);
+
+        // A kept session (an `only_if_unfinalized` destroy the session
+        // outlived, inbox#690) round-trips, and is never the old `null`.
+        let kept = DestroySessionResponse {
+            hook_failures: Vec::new(),
+            kept: true,
+        };
+        assert_eq!(round_trip(&kept), kept);
+        assert_ne!(
+            serde_json_lenient::to_string(&Errorable::Ok(kept)).unwrap(),
+            "null"
+        );
+        // A request that predates the flag decodes as unconditional, and an
+        // unconditional one encodes exactly as it always did.
+        let old: DestroySessionRequest =
+            serde_json_lenient::from_str(&format!(r#"{{"id":"{}"}}"#, SessionId::nil())).unwrap();
+        assert!(!old.only_if_unfinalized);
+        assert!(
+            !serde_json_lenient::to_string(&old)
+                .unwrap()
+                .contains("only_if_unfinalized")
+        );
 
         let err: Errorable<DestroySessionResponse> =
             serde_json_lenient::from_str(r#"{"error":"no such session"}"#)
