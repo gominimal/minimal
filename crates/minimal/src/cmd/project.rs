@@ -152,6 +152,12 @@ pub enum UploadDecision {
     SkipUndeclared,
     /// Non-VCS, no `minimal.toml`, interactive: confirm before uploading.
     Confirm,
+    /// The user answered that confirm with no: nothing is uploaded and the
+    /// session starts on an empty workspace. Kept apart from
+    /// [`Self::SkipUndeclared`], which is the *headless* skip — the one the
+    /// CLI refuses when the project declares lifecycle hooks that only the
+    /// upload would carry. A deliberate decline is never refused.
+    Declined,
 }
 
 /// The upload decision, resolved from inputs that need no TTY. [`resolve_upload_root`]
@@ -242,6 +248,9 @@ pub(crate) async fn run_workspace_upload(
                 Ok(WorkspaceUpload::Declined)
             }
         }
+        // The confirm was answered before this ran, by a caller that owns
+        // the prompt (the `min dash` TUI); the answer needs no daemon.
+        UploadDecision::Declined => Ok(WorkspaceUpload::Declined),
         UploadDecision::Upload => upload_workspace(client, id, root, progress).await,
     }
 }
@@ -278,6 +287,26 @@ pub(crate) fn resolved_upload_root_notice(
         .then(|| format!("Uploading from project root {root} (resolved from {invoked_from})"))
 }
 
+/// The rule of [`report_upload_outcome`]'s refusal, for a caller that owns
+/// its own screen and so cannot take that function's stderr lines: `min dash`
+/// applies it to the skip it was handed before it creates the box. Every
+/// other outcome passes — a [`WorkspaceUpload::Declined`] is the user's own
+/// answer, never an accident to refuse.
+pub(crate) fn refuse_dropped_hooks(
+    outcome: &WorkspaceUpload,
+    root: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    match outcome {
+        WorkspaceUpload::SkippedUndeclared { dropped_hooks } if *dropped_hooks > 0 => {
+            Err(undeclared_upload_drops_hooks_error(root, *dropped_hooks))
+        }
+        WorkspaceUpload::Uploaded
+        | WorkspaceUpload::SkippedEmptyOrHome
+        | WorkspaceUpload::SkippedUndeclared { .. }
+        | WorkspaceUpload::Declined => Ok(()),
+    }
+}
+
 /// The refusal for a [`WorkspaceUpload::SkippedUndeclared`] whose
 /// `dropped_hooks` is non-zero, for the callers that refuse rather than start
 /// a session silently missing its lifecycle hooks. The wording lives here so
@@ -305,18 +334,17 @@ pub(crate) fn undeclared_upload_drops_hooks_error(
 pub(crate) fn report_upload_outcome(
     outcome: Result<WorkspaceUpload, anyhow::Error>,
     root: &camino::Utf8Path,
-    refuse_dropped_hooks: bool,
+    refuse: bool,
 ) -> Result<(), anyhow::Error> {
-    match outcome? {
+    let outcome = outcome?;
+    if refuse {
+        refuse_dropped_hooks(&outcome, root)?;
+    }
+    match outcome {
         WorkspaceUpload::Uploaded => Ok(()),
         WorkspaceUpload::SkippedEmptyOrHome => {
             eprintln!("Starting with an empty box (nothing here to sync)");
             Ok(())
-        }
-        WorkspaceUpload::SkippedUndeclared { dropped_hooks }
-            if refuse_dropped_hooks && dropped_hooks > 0 =>
-        {
-            Err(undeclared_upload_drops_hooks_error(root, dropped_hooks))
         }
         WorkspaceUpload::SkippedUndeclared { .. } => {
             eprintln!(
