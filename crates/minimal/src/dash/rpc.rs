@@ -432,9 +432,10 @@ pub async fn rename(
 ///
 /// The upload root and its [`crate::UploadDecision`] are resolved by the
 /// caller — the create task — so the TUI could ask its own confirm before
-/// anything reached the daemon. Only [`crate::UploadDecision::Upload`] and the
-/// skip decisions arrive here; `Confirm` is resolved against the create form's
-/// modal first. The loadout composition, staged hook scripts, and hook budget
+/// anything reached the daemon. Only the resolved decisions arrive here;
+/// `Confirm` was answered against the create form's modal first, and a
+/// declined answer arrives as [`crate::UploadDecision::Declined`]. The loadout
+/// composition, staged hook scripts, and hook budget
 /// arrive as [`crate::loadouts::ActivationInputs`], resolved against the same
 /// project path, so an external loadout hook works from the dashboard.
 pub async fn activate(
@@ -506,9 +507,12 @@ pub async fn activate(
     let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
         // The caller resolved the root and the decision (the Confirm answered
         // through the TUI); the upload is the shared CLI path, quiet because
-        // the TUI owns the screen. The outcome is not rendered here — a
-        // skipped upload simply shows as the empty session.
-        crate::run_workspace_upload(
+        // the TUI owns the screen. The notices stay unrendered — an empty
+        // session is the caller's own answer — but the refusal is not
+        // optional: `min session activate` will not create a session missing
+        // the lifecycle hooks a skipped upload would have carried, and a box
+        // created here must not either.
+        let outcome = crate::run_workspace_upload(
             &mut client,
             id,
             &upload_root,
@@ -517,6 +521,7 @@ pub async fn activate(
             crate::UploadProgress::Quiet,
         )
         .await?;
+        crate::refuse_dropped_hooks(&outcome, &upload_root)?;
         // Upload the loadouts' external hook scripts before the configure:
         // the daemon gates `FinalizeSession` on the upload's ready-marker, and
         // a composition naming a script that never arrived cannot finalize.
