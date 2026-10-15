@@ -63,6 +63,11 @@ struct RuntimeIngressState {
     /// switch may already have handed to another box.
     detached: bool,
     forwards: Vec<LiveIngressForward>,
+    /// The declared ports' forwards bound for this spawn after its attach
+    /// (NET-129): a shared-address port the box took over while it ran.
+    /// They deliver to the spawn's lease as its attach's own forwards do,
+    /// and come down with it the same way.
+    handed: Vec<crate::net::policy::PortForwarder>,
 }
 
 /// The ports a box published at runtime with its own `min net expose`
@@ -115,6 +120,50 @@ impl RuntimeIngress {
         }
         state.forwards.push(live);
         Ok(())
+    }
+
+    /// Records a declared port's forward bound after the attach, at a
+    /// shared-address port's hand-over (NET-129). Refused, handing the
+    /// forward back for the caller to release, when the spawn it delivers
+    /// to has ended.
+    pub(crate) fn record_handed(
+        &self,
+        forwarder: crate::net::policy::PortForwarder,
+    ) -> Result<(), crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        if state.detached {
+            return Err(forwarder);
+        }
+        state.handed.push(forwarder);
+        Ok(())
+    }
+
+    /// Whether the forward `mapping` declares at `published` is held as one
+    /// bound at a hand-over.
+    pub(crate) fn holds_handed(
+        &self,
+        published: std::net::Ipv4Addr,
+        mapping: &boxes::PortMapping,
+    ) -> bool {
+        self.state()
+            .handed
+            .iter()
+            .any(|forwarder| forwarder.is_forward_of(published, mapping))
+    }
+
+    /// The box stopped: takes the forwards bound at a hand-over, for the
+    /// session actor to release as declared forwards are.
+    pub(crate) fn take_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
+        std::mem::take(&mut self.state().handed)
+    }
+
+    /// The spawn ended: takes the forwards bound at a hand-over, for the
+    /// guard to release beside the ones its attach bound, and refuses new
+    /// ones until the next attach.
+    pub(crate) fn detach_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        state.detached = true;
+        std::mem::take(&mut state.handed)
     }
 
     /// A spawn attached: its lease is the box's switch address from here on.
@@ -556,8 +605,8 @@ async fn privileged_tap(
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "the PTask's network namespace is gone before its tap was made \
-                 ({netns} does not exist); the sandbox did not survive its spawn"
+                "the box's sandbox exited before its network could be set up \
+                 ({netns} does not exist)"
             ),
         ));
     }
@@ -694,7 +743,7 @@ impl Network for OwnIpNetwork {
                         let userns = sandbox::user_namespaces_restriction()
                             .map_or_else(|| "available".to_string(), |r| r.to_string());
                         return Err(NetworkError::new(std::io::Error::other(format!(
-                            "own-IP sandbox produced no in-namespace tap fd \
+                            "the box's sandbox could not create its network device \
                              (/dev/net/tun present: {tun}; user namespaces: {userns})"
                         ))));
                     };
@@ -1127,7 +1176,7 @@ mod tests {
         let stale = plan(deny_all.clone()).plan().await;
         let refusal = stale.expect_err("a carve-out naming another bind is stale");
         assert!(
-            refusal.to_string().contains("stale carve-out"),
+            refusal.to_string().contains("its name lookups would fail"),
             "the plan refuses the box as a stale carve-out: {refusal}"
         );
 

@@ -821,6 +821,7 @@ mod tests {
             box_id: None,
             host_ip_enforcement: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: Default::default(),
         }
     }

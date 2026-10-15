@@ -171,7 +171,7 @@ fn inherited_session_env_prefix_not_substring() {
 fn spawn_failed_error_without_a_hint_keeps_the_bare_symptom() {
     assert_eq!(
         super::spawn_failed_error(None).to_string(),
-        "session host exited before its channel could attach"
+        "the session's sandbox process exited before the attach could connect to it"
     );
 }
 
@@ -186,7 +186,9 @@ fn spawn_failed_error_with_a_hint_names_the_restriction_and_fix() {
                  profile (one-time, needs root)";
     let msg = super::spawn_failed_error(Some(hint)).to_string();
     assert!(
-        msg.starts_with("session host exited before its channel could attach — "),
+        msg.starts_with(
+            "the session's sandbox process exited before the attach could connect to it — "
+        ),
         "the symptom must stay the error's lead: {msg}"
     );
     assert!(msg.contains(hint), "the diagnosis must travel whole: {msg}");
@@ -1966,7 +1968,8 @@ async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
-        refusal.contains("session host exited before its channel could attach"),
+        refusal
+            .contains("the session's sandbox process exited before the attach could connect to it"),
         "a host that died before its channel attached reads as a spawn failure, got: {refusal:?}"
     );
 }
@@ -1988,7 +1991,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
-        refusal.contains("session host is busy; retry the attach once it drains"),
+        refusal.contains("the session is busy; run the attach again in a moment"),
         "a host that wedged before its channel attached reads as busy, not exited, got: {refusal:?}"
     );
     assert!(
@@ -2003,7 +2006,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
     let mut retry = client.open_shell(id).await;
     let refusal = collect_to_close(&mut retry).await;
     assert!(
-        refusal.contains("session host is busy; retry the attach once it drains"),
+        refusal.contains("the session is busy; run the attach again in a moment"),
         "a retry must reach the kept wedged host, not mint a second one, got: {refusal:?}"
     );
 }
@@ -4011,7 +4014,7 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("host-side network registration"),
+        refusal.contains("the VM host daemon released this session's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
@@ -4019,7 +4022,11 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must name the step that registers a box again; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("run the attach or exec again"),
+        refusal.contains("min session destroy <session>"),
+        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("run the same command again"),
         "the refusal must name the re-run that resumes the row; got: {refusal:?}"
     );
     assert_eq!(
@@ -4036,7 +4043,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Error attaching to session:")
-            && refusal.contains("host-side network registration"),
+            && refusal.contains("the VM host daemon released this session's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }
@@ -6705,6 +6712,430 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
     );
 }
 
+/// NET-129 at daemon start: a shared-address port goes to the box created
+/// earliest among the boxes publishing it, whatever order the store lists
+/// them in. The store lists its records by the last five hex digits of
+/// each id, which are random, so the pair this test restarts with is chosen
+/// to list the newer box first — the order that hands it the port unless
+/// the resume sorts by id.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_holder_same_in_any_resume_order() {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let store_key = |id: SessionId| {
+        let id = id.to_string();
+        id[id.len() - 5..].to_owned()
+    };
+
+    // Keep two boxes on the port, replacing the older one until the newer
+    // box's store key sorts first. Destroying the older box hands the port
+    // to the one left, so the older of the pair always holds it.
+    let mut older = (
+        finalize_handed_own_ip_session(
+            &mut client,
+            "box-0",
+            std::net::Ipv4Addr::new(100, 64, 128, 9),
+            shared,
+        )
+        .await,
+        "box-0".to_owned(),
+    );
+    let mut newer = None;
+    for n in 1..=32u8 {
+        let name = format!("box-{n}");
+        let id = finalize_handed_own_ip_session(
+            &mut client,
+            &name,
+            std::net::Ipv4Addr::new(100, 64, 128, 9 + n),
+            shared,
+        )
+        .await;
+        if store_key(id) < store_key(older.0) {
+            newer = Some(id);
+            break;
+        }
+        destroy_session(&mut client, older.0).await;
+        older = (id, name);
+    }
+    let newer = newer.expect("some newer box's store key sorts before an older box's");
+    let (older, older_name) = older;
+    let held_by_older = vec![crate::net::dns::SharedPortCollision {
+        port: 18080,
+        other: format!("{older_name}.min.internal"),
+    }];
+    {
+        let registry = server.state.sessions_manager().await.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(routes.shared_port_collisions(older).is_empty());
+        assert_eq!(routes.shared_port_collisions(newer), held_by_older);
+    }
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both boxes are resumed"
+    );
+    let registry = manager.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.shared_port_collisions(older).is_empty(),
+        "the box created earliest holds the port after the restart"
+    );
+    assert_eq!(
+        routes.shared_port_collisions(newer),
+        held_by_older,
+        "and the newer box yields to it, though the store lists it first"
+    );
+}
+
+/// NET-129 across a daemon restart, when the boxes did not publish in
+/// creation order: a box's id is minted at create and it publishes at
+/// finalize, so a box created later can finalize first and hold the port.
+/// Once that box has launched — bound the port's forward — it holds the
+/// port after a restart too, though the resume starts the older box first.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart() {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let older = create_handed_own_ip_session(
+        &mut client,
+        "older",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let newer = create_handed_own_ip_session(
+        &mut client,
+        "newer",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    assert!(older < newer, "ids are minted in creation order");
+
+    // The newer box finalizes first and launches; the older one finalizes
+    // after it and yields.
+    finalize_session(&mut client, newer).await;
+    let mut channel = client.open_shell(newer).await;
+    await_echo(&mut channel).await;
+    finalize_session(&mut client, older).await;
+    let held_by_newer = vec![crate::net::dns::SharedPortCollision {
+        port: 18080,
+        other: "newer.min.internal".to_string(),
+    }];
+    {
+        let registry = server.state.sessions_manager().await.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(routes.shared_port_collisions(newer).is_empty());
+        assert_eq!(routes.shared_port_collisions(older), held_by_newer);
+    }
+    drop(channel);
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both boxes are resumed"
+    );
+    let record = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(newer))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .record()
+        .await
+        .expect("the record reads back");
+    assert_eq!(
+        record.bound_ports,
+        std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, 18080)]),
+        "the launch recorded the port it bound on the box's record"
+    );
+    let registry = manager.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.shared_port_collisions(newer).is_empty(),
+        "the box that bound the port before the restart holds it after"
+    );
+    assert_eq!(
+        routes.shared_port_collisions(older),
+        held_by_newer,
+        "and the older box still yields to it, though it is resumed first"
+    );
+}
+
+/// Two boxes handed one loopback address, both declaring port 18080: the
+/// first to finalize holds it and the second yields. Returns the manager,
+/// the two ids, and the shared address the registry publishes them at.
+#[cfg(target_os = "linux")]
+async fn shared_port_pair(
+    server: &TestServer,
+    client: &mut TestClient,
+) -> (
+    crate::sessions::ManagerHandle,
+    SessionId,
+    SessionId,
+    std::net::Ipv4Addr,
+) {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let manager = server.state.sessions_manager().await;
+    let holder = finalize_handed_own_ip_session(
+        client,
+        "holder",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let yielder = finalize_handed_own_ip_session(
+        client,
+        "yielder",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    let published = {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(routes.shared_port_collisions(holder).is_empty());
+        assert_eq!(routes.shared_port_collisions(yielder).len(), 1);
+        routes
+            .published_own_address(yielder)
+            .expect("the yielding box publishes")
+    };
+    (manager, holder, yielder, published)
+}
+
+/// Waits until the stand-in forwarder has served `count` requests.
+#[cfg(target_os = "linux")]
+async fn await_served(served: &std::sync::Mutex<Vec<String>>, count: usize) -> Vec<String> {
+    for _ in 0..1_000 {
+        {
+            let served = served.lock().expect("served lock");
+            if served.len() >= count {
+                return served.clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "the switch was asked fewer than {count} request(s): {:?}",
+        served.lock().expect("served lock")
+    );
+}
+
+/// NET-129, live: when the box holding a shared-address port is destroyed,
+/// the running box that takes the port over has its forward bound at once,
+/// with no new attach. The daemon posts the expose the box's own attach
+/// would have posted, toward its lease at the inside port its declaration
+/// maps, records the port on the box's record as one it bound, and unbinds
+/// the forward when that box stops.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes_it() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (manager, holder, yielder, published) = shared_port_pair(&server, &mut client).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the yielding box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    destroy_session(&mut client, holder).await;
+
+    let requests = await_served(&served, 1).await;
+    let (line, body) = requests[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the hand-over binds the new holder's forward: {requests:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &boxes::PortMapping {
+            external_port: 18080,
+            internal_port: 80,
+            proto: boxes::IpProto::Tcp,
+        },
+        published,
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the expose is the one the box's own attach posts for the port"
+    );
+    {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(
+            routes.shared_port_collisions(yielder).is_empty(),
+            "the box holds the port of record"
+        );
+    }
+    let bound = std::collections::BTreeSet::from([std::net::SocketAddrV4::new(published, 18080)]);
+    let mut recorded = false;
+    for _ in 0..1_000 {
+        if handle
+            .record()
+            .await
+            .expect("the record reads back")
+            .bound_ports
+            == bound
+        {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        recorded,
+        "the box's record names the port it bound at the hand-over"
+    );
+
+    // The box stops for good: the forward bound at the hand-over comes down
+    // with it, as the forwards its own attach bound do.
+    destroy_session(&mut client, yielder).await;
+    let requests = await_served(&served, 2).await;
+    forwarder.abort();
+    let (line, body) = requests[1]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/unexpose "),
+        "the stop unbinds the handed-over forward: {requests:?}"
+    );
+    assert!(
+        body.contains(&format!("\"local\":\"{published}:18080\"")),
+        "the unexpose names the handed-over listener: {body}"
+    );
+    assert_eq!(requests.len(), 2, "nothing else was asked: {requests:?}");
+}
+
+/// NET-129: a box that takes a shared-address port over while it is not
+/// running has nothing bound for it. It holds the port of record, and its
+/// next attach binds the forward, as before.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_destroyed_holders_shared_port_is_not_bound_for_a_box_that_is_not_running() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (manager, holder, yielder, _published) = shared_port_pair(&server, &mut client).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    destroy_session(&mut client, holder).await;
+
+    {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(
+            routes.shared_port_collisions(yielder).is_empty(),
+            "the box holds the port of record"
+        );
+    }
+    // The hand-over reaches the box's actor behind the destroy; an answer
+    // from the actor after it proves the hand-over was handled first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _record = handle.record().await.expect("the record reads back");
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a box with no host running asks the switch nothing"
+    );
+}
+
+/// NET-129: a hand-over's bind the switch refuses loses nothing. The box
+/// still holds the port of record, no forward is tracked for it, and its
+/// record names no port it did not bind, so its next attach binds the port
+/// as it would have without the hand-over.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hand_over_bind_the_switch_refuses_leaves_the_election_standing() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (manager, holder, yielder, _published) = shared_port_pair(&server, &mut client).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the yielding box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 500).await;
+
+    destroy_session(&mut client, holder).await;
+
+    let requests = await_served(&served, 1).await;
+    assert!(
+        requests[0].starts_with("POST /services/forwarder/expose "),
+        "the hand-over asked for the bind: {requests:?}"
+    );
+    // An answer from the actor after the refused bind was served proves the
+    // hand-over's turn has ended.
+    let record = handle.record().await.expect("the record reads back");
+    assert!(
+        record.bound_ports.is_empty(),
+        "a refused bind is not recorded as bound"
+    );
+    {
+        let registry = manager.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(
+            routes.shared_port_collisions(yielder).is_empty(),
+            "the election stands: the box still holds the port of record"
+        );
+    }
+
+    // Nothing is tracked for the refused bind: the box's stop unbinds nothing.
+    destroy_session(&mut client, yielder).await;
+    forwarder.abort();
+    let requests = served.lock().expect("served lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the stop asks the switch for nothing: {requests:?}"
+    );
+}
+
 /// The write-lock promotion `register_hostname` runs after its wait, driven
 /// directly with no timers: a registration that took the `127.0.0.1` interim
 /// moves to its hand once the verdict vouches for it — whether the name is
@@ -7942,6 +8373,12 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
                 source.to_string().contains(refusal),
                 "the refused publish carries the grant's own reason: {source}"
             );
+            assert!(
+                source
+                    .to_string()
+                    .contains("the VM host daemon refused to open the port"),
+                "the refused publish says who refused it: {source}"
+            );
         }
         other => panic!("a report the grant refused must fail the publish: {other:?}"),
     }
@@ -8923,7 +9360,8 @@ async fn expose_on_stopped_box_refused() {
         line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
-            && line.contains("reason=this box is not running; start the box and try again"),
+            && line
+                .contains("reason=this box is not running, so there is nothing to open a port on"),
         "the refusal names the box, the port, the decision and the reason: {line}"
     );
 }
@@ -9011,8 +9449,7 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
         line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
-            && line
-                .contains("reason=this box has no published address on file to expose a port at"),
+            && line.contains("reason=this box was given no address on the host to open a port at"),
         "the line says the decision was allow and the refusal was the missing \
          publish: {line}"
     );

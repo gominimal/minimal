@@ -4238,6 +4238,7 @@ dependencies = [
  "anyhow",
  "clap",
  "minvmd",
+ "switch",
  "tracing-subscriber",
  "version",
 ]

@@ -119,6 +119,7 @@ fn build_record(
         box_id: config.box_id,
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
+        bound_ports: std::collections::BTreeSet::new(),
         attrs: config.attrs,
     };
     record
@@ -591,6 +592,40 @@ impl Manager {
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
         let weak_self = handle.downgrade();
+        // NET-129: each shared-address port the registry hands to a new
+        // holder is passed to that box's session, which binds the port's
+        // forward if the box is running. Off the registry's lock and off
+        // the session that made the hand-over, which may be the destroyed
+        // holder this manager is still waiting on.
+        #[cfg(target_os = "linux")]
+        {
+            let (sender, mut hand_overs) = tokio::sync::mpsc::unbounded_channel();
+            hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .notify_hand_overs(sender);
+            let manager = weak_self.clone();
+            // Serves hand-overs for the manager's life: a root of its own,
+            // like the manager's mainloop below.
+            crate::traced::spawn_detached(
+                tracing::info_span!(parent: None, "sessions.hand_overs"),
+                async move {
+                    while let Some(hand_over) = hand_overs.recv().await {
+                        let Some(manager) = manager.upgrade() else {
+                            return;
+                        };
+                        let holder = manager
+                            .get_session(SessionKeyPredicate::Id(hand_over.holder))
+                            .await;
+                        if let Ok(Some(holder)) = holder {
+                            holder
+                                .bind_handed_port(hand_over.address, hand_over.port)
+                                .await;
+                        }
+                    }
+                },
+            );
+        }
         let mngr = Self {
             in_shutdown,
             receiver,
@@ -1063,7 +1098,16 @@ impl Manager {
             return Ok(0);
         }
         let mut resumed = 0;
-        for handle in self.store.handles().await? {
+        // Oldest session first (the id is a UUIDv7): each resumed box
+        // publishes as its actor starts, and a shared-address port goes to
+        // the first box publishing it, so this order gives the port to the
+        // box created earliest — the box a live hand-over elects (NET-129)
+        // — unless a later box bound it before the restart, which takes it
+        // back at its own publish (`restore_bound_ports`). The store lists
+        // its keys by a random suffix of the id.
+        let mut handles = self.store.handles().await?;
+        handles.sort_by_key(|handle| *handle.id());
+        for handle in handles {
             let session_id = *handle.id();
             if self.running.contains_key(&session_id) {
                 continue;

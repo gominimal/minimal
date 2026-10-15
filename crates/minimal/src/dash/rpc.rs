@@ -588,7 +588,7 @@ pub async fn activate(
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized) => {}
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {
                 anyhow::bail!(
-                    "this project needs interactive policy gating; \
+                    "this project needs approvals the dashboard cannot ask for; \
                      create it with `min session activate` instead"
                 );
             }
@@ -1271,6 +1271,7 @@ mod tests {
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: Default::default(),
         }
     }
@@ -1324,6 +1325,7 @@ mod tests {
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: Default::default(),
         };
         settle_destroyed_box(&ssh_sock, record.id, &record).await;

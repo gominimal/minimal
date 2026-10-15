@@ -35,6 +35,8 @@ impl SessionMessage {
             Self::ExposeDynamic { .. } => "ExposeDynamic",
             Self::LiveIngress { .. } => "LiveIngress",
             Self::AskAnswered { .. } => "AskAnswered",
+            #[cfg(target_os = "linux")]
+            Self::BindHandedPort { .. } => "BindHandedPort",
             Self::SetWorkspaceUploadInFlight(..) => "SetWorkspaceUploadInFlight",
             #[cfg(test)]
             Self::PeekPendingAsks(_) => "PeekPendingAsks",

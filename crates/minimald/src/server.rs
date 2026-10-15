@@ -3838,7 +3838,7 @@ mod tests {
 
         // The answerer never does: no line of its component — not a bind, not
         // a retry, not a serving — and its discovery field, the one `min ls`
-        // prints its ZONE ANSWERER line from, stays empty for a window the
+        // prints its DNS SERVICE line from, stays empty for a window the
         // native startup fills it in within its first bind attempt.
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(

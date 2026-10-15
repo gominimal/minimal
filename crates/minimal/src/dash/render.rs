@@ -490,7 +490,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
         // A none box has no network, so it can carry no egress or ingress
         // declaration at all — nothing here would describe anything real.
         lines.push(Line::styled(
-            "No network policy (NoNet)",
+            "This box has no network (--network none)",
             Style::default().fg(Color::Gray),
         ));
         // A lane the box declared is still shown, marked as not in effect,
@@ -1047,6 +1047,7 @@ mod tests {
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: std::collections::BTreeMap::new(),
         };
         let mut model = Model::new(Utc::now());
@@ -1128,7 +1129,7 @@ mod tests {
         let own = policy_text(boxes::NetworkMode::OwnIp, laned.clone());
         assert!(
             own.contains(
-                "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
+                "egress\n  deny-all\n  credentialed upstream  allowed to reach the Box Egress Proxy\n"
             ),
             "a laned own-address box must show the lane row, got:\n{own}"
         );
@@ -1139,10 +1140,16 @@ mod tests {
             "a box without a lane must show no lane row, got:\n{bare}"
         );
 
+        let none = policy_text(boxes::NetworkMode::NoNet, laned.clone());
+        assert!(
+            none.starts_with("This box has no network (--network none)\n"),
+            "a none box must open with the note `min session policy` prints, got:\n{none}"
+        );
+
         let host = policy_text(boxes::NetworkMode::HostNet, laned);
         assert!(
             host.contains(
-                "  credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+                "  credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)"
             ),
             "a laned host-address box must show the lane, marked, got:\n{host}"
         );

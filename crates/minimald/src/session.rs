@@ -67,7 +67,9 @@ fn userns_spawn_hint() -> Option<String> {
 /// that names neither the restriction nor the fix.
 fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
     with_userns_hint(
-        std::io::Error::other("session host exited before its channel could attach"),
+        std::io::Error::other(
+            "the session's sandbox process exited before the attach could connect to it",
+        ),
         userns_spawn_hint,
     )
 }
@@ -157,8 +159,8 @@ impl fmt::Display for AttachError {
             AttachError::LoadoutFailed(e) => write!(f, "configuring session loadout: {e}"),
             AttachError::LaunchRecordUnwritable(e) => write!(
                 f,
-                "recording the launch's egress enforcement on the session \
-                 record: {e}"
+                "starting the session failed: the session's saved state could \
+                 not be updated: {e}"
             ),
             AttachError::SessionPending => write!(
                 f,
@@ -171,14 +173,14 @@ impl fmt::Display for AttachError {
                  attach once the upload completes"
             ),
             AttachError::SessionBusy => {
-                write!(f, "session host is busy; retry the attach once it drains")
+                write!(f, "the session is busy; run the attach again in a moment")
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "this box's host-side network registration has ended; run the attach or \
-                 exec again to resume it, and if that is refused too (the host no longer \
-                 holds the box's record), destroy the session with `min session destroy` \
-                 and activate it again with `min session activate`"
+                "the VM host daemon released this session's network addresses; run \
+                 the same command again to restore them. If it is refused again, \
+                 destroy the session with `min session destroy <session>` and start \
+                 it again with `min session activate`"
             ),
         }
     }
@@ -668,6 +670,15 @@ enum SessionMessage {
         reply:
             oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     },
+    /// A shared-address port this box took over while another box held it
+    /// (NET-129): bind its forward now if the box is running, so the port
+    /// is served without waiting for the box's next attach. Sent by the
+    /// sessions manager for each hand-over the name registry makes.
+    #[cfg(target_os = "linux")]
+    BindHandedPort {
+        address: std::net::Ipv4Addr,
+        port: u16,
+    },
     /// The live dynamic-ingress mappings this box published at runtime
     /// (NET-044), by the surface that published them — what the
     /// `GetLiveIngress` RPC serves. Empty for a box that published none.
@@ -795,25 +806,31 @@ const HOST_NO_TTY_REASON: &str = "the attached client could not show the prompt;
 fn host_ask_cancel_text(cause: minimald_rpc::AskCancelCause) -> String {
     match cause {
         minimald_rpc::AskCancelCause::LastDetach => {
-            format!("the ask was cancelled: {cause}; nobody is attached any more")
+            format!("the port prompt was cancelled: {cause}; nobody is attached any more")
         }
-        _ => format!("the ask was cancelled: {cause}"),
+        _ => format!("the port prompt was cancelled: {cause}"),
     }
 }
 
 /// A host refusal as the expose's failure names it.
 fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'static str {
     match reason {
-        minimald_rpc::AskRefused::QueueFull => "the box's pending-ask queue is full",
-        minimald_rpc::AskRefused::NoRow => "the VM host daemon holds no row for this box",
-        minimald_rpc::AskRefused::StanceNotAsk => "the box's host-held stance is not ask",
+        minimald_rpc::AskRefused::QueueFull => {
+            "too many port prompts from this box are already waiting for an answer"
+        }
+        minimald_rpc::AskRefused::NoRow => {
+            "this box's network addresses are not registered with the VM host daemon"
+        }
+        minimald_rpc::AskRefused::StanceNotAsk => {
+            "the VM host daemon does not have this box's --dynamic-ingress set to ask"
+        }
         minimald_rpc::AskRefused::OutsideGrant => {
-            "the port is outside the box's host-held dynamic range"
+            "the port is outside the --dynamic-range the VM host daemon holds for this box"
         }
         minimald_rpc::AskRefused::NoClient => "nobody is attached on the host to answer",
-        minimald_rpc::AskRefused::Denied => "the attached human answered no",
-        minimald_rpc::AskRefused::NoTty => "the host client had no terminal for the dialog",
-        minimald_rpc::AskRefused::Cancelled => "the ask was cancelled before an answer",
+        minimald_rpc::AskRefused::Denied => "the person attached answered no",
+        minimald_rpc::AskRefused::NoTty => "the attached terminal could not show the prompt",
+        minimald_rpc::AskRefused::Cancelled => "the port prompt was cancelled before an answer",
     }
 }
 
@@ -1593,6 +1610,7 @@ impl Session {
                     // the finalize reply so the activating client can warn —
                     // the daemon log line is the only other trace, and a user
                     // reading exit 0 never sees it.
+                    reg.restore_bound_ports(record.id, &record.bound_ports);
                     shared_port_collisions =
                         reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
@@ -1888,8 +1906,24 @@ impl Session {
                     .hostnames
                     .write()
                     .expect("hostname registry lock poisoned");
-                reg.unpublish_own_address(record.id);
+                let (_, hand_overs) = reg.unpublish_own_address(record.id);
                 reg.forget_own_address(record.id);
+                // NET-129: each shared-address port this box held has a new
+                // holder of record — a running box before a stopped one. The
+                // registry sends each hand-over to the sessions manager,
+                // which has the new holder bind its forward if its box is
+                // running ([`Self::bind_handed_port`]); a box that is not
+                // binds it at its next attach.
+                for hand_over in hand_overs {
+                    tracing::info!(
+                        session_id = %hand_over.holder,
+                        address = %hand_over.address,
+                        port = hand_over.port,
+                        from = %record.id,
+                        action = "shared-address-port-hand-over",
+                        "a shared-address port passes to the earliest-created box still publishing it"
+                    );
+                }
             }
             self.release_loopback_address(&record, &registry_name(&record));
         }
@@ -2207,6 +2241,10 @@ impl Session {
                 // routed to the attached human (NET-045) — either way this
                 // handler is done with it.
                 self.expose_dynamic(port, reply).await;
+            }
+            #[cfg(target_os = "linux")]
+            SessionMessage::BindHandedPort { address, port } => {
+                self.bind_handed_port(address, port).await;
             }
             SessionMessage::LiveIngress(r) => {
                 #[expect(
@@ -3233,7 +3271,7 @@ impl Session {
             AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
                 port: ask.port,
                 source: std::io::Error::other(format!(
-                    "the VM host daemon refused the ask: {}",
+                    "the VM host daemon refused the port prompt: {}",
                     host_ask_refusal_text(*reason)
                 )),
             }),
@@ -3896,6 +3934,131 @@ impl Session {
         Ok(mapping)
     }
 
+    /// Binds the forward of a shared-address port this box took over while
+    /// it runs (NET-129): the port's holder was destroyed, moved off the
+    /// address or stopped naming the port, and the registry elected this
+    /// box. Its attach skipped the port while it yielded, so nothing is
+    /// bound for it until this, or until its next attach.
+    ///
+    /// Nothing is asked for a box with no host running or whose spawn has
+    /// ended: that box holds the port of record and its next attach binds
+    /// it. Nothing is asked either when the registry no longer names this
+    /// box the port's holder at `address`, since the hand-over is read
+    /// after other changes may have landed.
+    ///
+    /// A bind that fails is logged and changes nothing: the box still holds
+    /// the port of record, no forward is tracked, and the box's next attach
+    /// binds the port as it would have without the hand-over. A bind that
+    /// stands is tracked with the spawn it delivers to, so the box's stop
+    /// or its spawn's end releases it as it releases the forwards the
+    /// attach bound, and the port is recorded as one this box bound.
+    #[cfg(target_os = "linux")]
+    async fn bind_handed_port(&mut self, address: std::net::Ipv4Addr, port: u16) {
+        use crate::net::policy::HandedBind;
+
+        if !self.has_live_host() || self.live_ingress.is_detached() {
+            return;
+        }
+        let Ok(record) = self.record.record().await else {
+            return;
+        };
+        let mappings: Vec<boxes::PortMapping> = record
+            .policy
+            .ingress
+            .iter()
+            .flat_map(|ingress| &ingress.port_mappings)
+            .filter(|mapping| mapping.external_port == port)
+            .cloned()
+            .collect();
+        let switch_address = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            if !registry.holds_shared_port(record.id, address, port) {
+                return;
+            }
+            match record.box_addresses {
+                Some(addresses) => Some(addresses.switch_address),
+                None => registry.own_lease(record.id),
+            }
+        };
+        let Some(switch_address) = switch_address else {
+            return;
+        };
+        let control = self.switch_control().await;
+        let gate = crate::net::switch::live_gate(switch_address);
+        let mut bound_any = false;
+        let mut refused_any = false;
+        for mapping in &mappings {
+            let local = format!("{address}:{port}");
+            if self.live_ingress.holds_handed(address, mapping) {
+                continue;
+            }
+            let bind = crate::net::policy::bind_handed_port(
+                &control,
+                address,
+                switch_address,
+                mapping,
+                gate.as_ref(),
+            )
+            .await;
+            let (forwarder, held_by_host) = match bind {
+                Ok(HandedBind::Bound(forwarder)) => (forwarder, false),
+                Ok(HandedBind::HeldByHost(forwarder)) => (forwarder, true),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %record.id,
+                        name = ?record.name,
+                        %local,
+                        %error,
+                        action = "shared-address-port-hand-over",
+                        "binding the shared-address port this box took over failed; \
+                         the box still holds it, and its next attach binds it"
+                    );
+                    refused_any = true;
+                    continue;
+                }
+            };
+            if let Err(stale) = self.live_ingress.record_handed(forwarder) {
+                // The spawn ended while the bind was in flight: the forward
+                // delivers to a lease that is gone, so it comes down here.
+                crate::net::policy::release_declared_ingress(&control, &[stale]).await;
+                return;
+            }
+            bound_any = true;
+            tracing::info!(
+                session_id = %record.id,
+                name = ?record.name,
+                %local,
+                held_by_host,
+                action = "shared-address-port-hand-over",
+                "bound the shared-address port this box took over while it runs"
+            );
+        }
+        // A port one of whose forwards was refused is not recorded as
+        // bound: the box's next attach binds it whole.
+        if !bound_any || refused_any {
+            return;
+        }
+        // The box bound the port, so a restarted daemon gives it back to
+        // this box ([`Self::record_bound_ports`]). A write that fails costs
+        // only that memory.
+        let bound_ports = self
+            .hostnames
+            .write()
+            .expect("hostname registry lock poisoned")
+            .mark_held_ports_bound(record.id);
+        if let Err(error) = self.record_bound_ports(bound_ports).await {
+            tracing::warn!(
+                session_id = %record.id,
+                %error,
+                "the hand-over could not record the shared-address port it bound; \
+                 a daemon restart may hand it to another box"
+            );
+        }
+    }
+
     /// The switch's control channel, read off the daemon's shared switch under
     /// a lock held only for the two sync reads — never across the publish it
     /// feeds.
@@ -3948,6 +4111,15 @@ impl Session {
         // down with it.
         let forwarders = self.live_ingress.take_all();
         self.publications.revoke_all();
+        // A declared port bound for this box at a shared-address port's
+        // hand-over (NET-129) goes the way the forwards its attach bound
+        // go: unbound here on a native host, left for the host on a
+        // VM-backed one.
+        let handed = self.live_ingress.take_handed();
+        if !handed.is_empty() {
+            let control = self.switch_control().await;
+            crate::net::policy::release_declared_ingress(&control, &handed).await;
+        }
         if !forwarders.is_empty() {
             // The expose's revocation withdraws its admission at the box's
             // gate first (NET-044), so no new connection crosses the gap
@@ -4289,9 +4461,10 @@ impl Session {
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "composition has patches that only `min session activate` can upload; \
-                     the attach shortcut can't drive that sequence — destroy this session \
-                     and re-activate through the CLI",
+                    "this session's configuration includes patches that only \
+                     `min session activate` can apply; destroy it with \
+                     `min session destroy <session>`, then run \
+                     `min session activate` again",
                 )));
             }
             // No patches: finalize inline so the shortcut still
@@ -4497,6 +4670,17 @@ impl Session {
                 delta
             }
         };
+        // NET-129: the shared-address ports this box holds are the ones
+        // this launch binds forwards for. Marked before the spawn binds
+        // them, so no publish takes one from under the bind, and recorded
+        // below so a restarted daemon gives them back to this box.
+        #[cfg(target_os = "linux")]
+        let bound_ports = matches!(record.network, boxes::NetworkMode::OwnIp).then(|| {
+            self.hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .mark_held_ports_bound(record.id)
+        });
         let spawn = Box::pin(session_host::Host::spawn(
             launcher,
             session_host::HostParams {
@@ -4583,7 +4767,36 @@ impl Session {
             let _ = host.kill(false).await;
             return Err(AttachError::LaunchRecordUnwritable(e));
         }
+        // A write that fails costs only the restart's memory of who bound
+        // the port, never this launch: said, and the box is handed back.
+        #[cfg(target_os = "linux")]
+        if let Some(bound_ports) = bound_ports
+            && let Err(error) = self.record_bound_ports(bound_ports).await
+        {
+            tracing::warn!(
+                session_id = %record.id,
+                %error,
+                "the launch could not record the shared-address ports it bound; \
+                 a daemon restart may hand them to another box"
+            );
+        }
         Ok((channel, (host, task)))
+    }
+
+    /// Records on this session's record the published ports this launch
+    /// bound forwards for (NET-129), when they differ from what the last
+    /// launch recorded.
+    #[cfg(target_os = "linux")]
+    async fn record_bound_ports(
+        &self,
+        bound_ports: std::collections::BTreeSet<std::net::SocketAddrV4>,
+    ) -> Result<(), std::io::Error> {
+        let mut record = self.record.record().await?;
+        if record.bound_ports == bound_ports {
+            return Ok(());
+        }
+        record.bound_ports = bound_ports;
+        self.record.write(record).await
     }
 
     /// Records on this session's record that a launch bound the box's
@@ -5834,6 +6047,22 @@ impl SessionHandle {
             Ok(reply) => reply,
             Err(_) => Err(crate::net::policy::ExposeFailure::ActorGone { port }),
         }
+    }
+
+    /// Tells the session's actor it took a shared-address port over
+    /// (NET-129), so it binds the port's forward if its box is running. Not
+    /// answered: a box that is gone, stopped or no longer the holder binds
+    /// nothing, and the port is bound at the holder's next attach.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn bind_handed_port(&self, address: std::net::Ipv4Addr, port: u16) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "an actor that is gone has no box to bind the port for"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::BindHandedPort { address, port })
+            .await;
     }
 
     /// Continues a parked runtime port-publish ask (NET-045) with the attached

@@ -3348,7 +3348,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     );
 
     let capture = crate::test_harness::captured_log();
-    const REFUSAL: &str = "host_ip boxes on this host enforce only deny-all egress";
+    const REFUSAL: &str = "with --network host_ip this machine can only block all network access";
     // The box's declaration: the narrowing a per-box host has no verdict for,
     // in the CLI's own spelling of `--deny-subnets`.
     let narrowing = boxes::SessionPolicy::new(
@@ -3432,7 +3432,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         "the launch's refusal names the rule it refused over: {refusal}"
     );
     assert!(
-        refusal.contains("which enforces them"),
+        refusal.contains("to apply them"),
         "the launch's refusal says own-address boxes enforce these rules, \
          the same words the create's would have said: {refusal}"
     );
@@ -6795,10 +6795,19 @@ async fn vm_ask_cancelled_is_a_publish_failure_with_its_cause() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vm_ask_host_refusals_are_publish_failures() {
     for (reason, says) in [
-        (minimald_rpc::AskRefused::QueueFull, "queue is full"),
-        (minimald_rpc::AskRefused::OutsideGrant, "outside"),
-        (minimald_rpc::AskRefused::StanceNotAsk, "not ask"),
-        (minimald_rpc::AskRefused::NoRow, "no row"),
+        (
+            minimald_rpc::AskRefused::QueueFull,
+            "already waiting for an answer",
+        ),
+        (
+            minimald_rpc::AskRefused::OutsideGrant,
+            "outside the --dynamic-range",
+        ),
+        (minimald_rpc::AskRefused::StanceNotAsk, "set to ask"),
+        (
+            minimald_rpc::AskRefused::NoRow,
+            "not registered with the VM host daemon",
+        ),
     ] {
         let result = vm_ask_ended_by_host(host_refused(reason, None)).await;
         match result {

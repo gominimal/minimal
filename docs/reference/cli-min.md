@@ -100,7 +100,7 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
-| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
+| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it its own IP address so `--ingress` can publish ports. An `own_ip` box with no egress flags reaches no external address by default (see below). The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
 | `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them, `ask` asks the attached person, and `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. A VM-backed host refuses `allow` and `ask` before it creates the box, until the host side can admit a publish the box requests ([gominimal/minimal#1897](https://github.com/gominimal/minimal/issues/1897)). Every macOS host is VM-backed |
 | `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
@@ -109,11 +109,11 @@ the current directory).
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
-| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
+| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. An own-address (`--network own_ip`) or host-address (`--network host_ip`) box accepts the rule flags, and only an own-address box enforces them. A host that decides egress per box refuses to create a host-address box that carries them. Any other host runs that box with the rules unenforced. A `--network none` box rejects the whole egress declaration |
 | `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant |
 | `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
-| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box without egress flags already gets deny-all by default (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
 declaration. Naming one of them stores it on the session, and `min session
@@ -126,18 +126,17 @@ what a declaration with no allow list does. `--allow-dns-hosts github.com`
 alone reaches `github.com` and no address directly. `--deny-subnets` alone
 reaches nothing. Both used to reach every address the deny left, and the
 operator opt-out named below restores that earlier meaning. An
-own-address box (`--network own_ip`) without these flags, and without an
-`egress` section in its `minimal.toml`, gets the deny-all default: it
-reaches no external address. It can still resolve names in the box zone,
+own-address box (`--network own_ip`) gets the deny-all default when it does
+not declare egress by these flags or in the project's `minimal.toml`. It
+then reaches no external address. It can still resolve names in the box zone,
 `host.min.internal` included. Activate prints one line saying so:
 
 ```
-egress: deny-all (default for an own-ip box with no egress section); declare reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags
+This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, activate a new session with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts github.com.
 ```
 
 To give such a box reach, declare it with the allow flags, such as
-`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`, or with an
-`egress` section in `minimal.toml`. To keep the earlier allow-all default for
+`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`. To keep the earlier allow-all default for
 every undeclared box on a host, the operator opts out. A native Linux host
 opts out with `minimald run --egress-deny-all-opt-out`, or with
 `MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
@@ -345,11 +344,11 @@ the egress block:
 ```
 egress
   deny-all (default)
-  credentialed upstream  box egress proxy listener
+  credentialed upstream  allowed to reach the Box Egress Proxy
 ```
 
 The row names the lane the declaration opened. The gate admits the box's
-frames to the box egress proxy's listener, and the proxy checks their
+frames to the Box Egress Proxy's listener, and the proxy checks their
 credential. The rows above never decide that destination. The listener is
 the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
@@ -362,7 +361,7 @@ effect, with the box's mode named:
 ```
 egress
   allow-all (default)
-  credentialed upstream  box egress proxy listener (not in effect: host_ip box)
+  credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)
 ```
 
 The ingress block lists the published port mappings the session's
@@ -400,7 +399,8 @@ box's relay gate when it binds the forward. If nothing in the box listens on
 the port yet, the box itself refuses a connection to it.
 A row from an older daemon whose gate did not admit runtime publishes reads
 `(pending; not yet reachable)`. A row from a daemon older than the `pending`
-field reads `(unknown; daemon predates this field)`. The CLI never shows
+field reads `(reachability unknown: the running daemon is older than this min)`.
+The CLI never shows
 either row as reachable.
 
 The daemon publishes a port the box listens on only after it writes the
@@ -409,7 +409,7 @@ stays unpublished, and the command prints one line per port after the live
 rows:
 
 ```
-warning: port 3000 is permitted but not published: the audit log /path/to/audit/decisions.log cannot be written
+warning: port 3000 is allowed but not reachable yet: Minimal could not write the audit log /path/to/audit/decisions.log. The port is published once that log can be written.
 ```
 
 The line clears once the log takes records again and the port publishes.
@@ -542,12 +542,15 @@ The installer runs without privilege. Anything on this host that needs root
 is left for this command, which runs it in one `sudo` call. Until it runs,
 the hostname proxy serves box names. The host line that
 `min session activate` prints says where the box name resolves:
-`names: <box>.min.internal via 127.0.0.1:<port>` while the proxy serves the
-names, or `names: <box>.min.internal resolves in any browser on this machine`
-once this host resolves the zone natively. While any item is not done, the
+`names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`
+while the proxy serves the names, or
+`names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>`
+once this host resolves the zone natively. Native names resolve to a reserved
+local address. A browser opens the box through the hostname proxy, which
+keeps serving. While any item is not done, the
 line ends with `; finish setup: min finalize-install`. When the proxy failed
 to bind, the cause replaces the resolution and the box stays named:
-`names: <box>.min.internal: the hostname proxy is not serving — <cause>`, with
+`names: <box>.min.internal: the hostname proxy is not serving: <cause>`, with
 the same clause after it when it applies. A session
 start never prints or runs the privileged step.
 
@@ -564,6 +567,15 @@ The script holds only what this host is missing from:
   nothing until an association adds the reserved addresses
 - membership of the `kvm` group, only when the configured provider is the
   Linux VM provider
+
+On macOS the step installs the box-name service's program in an app bundle,
+`/Library/PrivilegedHelperTools/Minimal.app`, that root owns. The service and
+the job that reserves the local range both run that program. A release signs
+the bundle, so System Settings lists the two jobs under the bundle's name,
+Minimal, in General, then Login Items & Extensions. A host that ran the step
+from an earlier release has a bare `minzoned` program in the same directory
+and a script for the local range. The next `min finalize-install` replaces
+both with the bundle.
 
 `min finalize-install` prints the summary of what is missing. It writes the
 script to a temporary file that only you can read (mode `0600`) and runs it
@@ -610,7 +622,8 @@ the install. It removes the user-namespace profile, the classifier tree with
 its units and step copy, and the group membership the step added. A profile
 or a classifier tree installed another way stays, with a note. It also removes the box-name
 service and its program copy, the resolver hook, and on macOS the local range
-unit.
+unit. On macOS the program copy is the app bundle, and `--undo` also removes
+the bare program and the range script that an earlier release installed.
 The local range addresses on macOS stay on the loopback until the next boot.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
