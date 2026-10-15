@@ -73,15 +73,17 @@ Runs the specified task in a new Minimal sandbox. Interactive tasks are not supp
 Sessions only: publishes `<PORT>` at the box's published address, so the
 host can reach it. Minimal decides the request against the
 [`--dynamic-ingress`](./cli-min.md#session-activate) stance set at activation.
-`allow` publishes a port inside `--dynamic-range` and refuses one outside it.
+`allow` publishes a port inside `--dynamic-range` and refuses any other.
 `ask` prompts the terminal attached to the session. With nobody attached,
-Minimal refuses the request at once. An unset or `deny` stance refuses it.
+Minimal refuses the request at once. An unset or `deny` stance refuses it. A
+VM-backed host, such as every macOS host, refuses `allow` and `ask` at
+activation.
 
 The stances apply only to a `--network own_ip` box. On a `host_ip` box (the
 default), the port does not need exposing: the box shares the host's network
 and already answers at `<box>.min.internal:<PORT>`. Minimal refuses the
-request from a `--network none` box. Each refusal names its way forward, such
-as re-activating with the flags or the host-side
+request from a `--network none` box. A deny or an unanswered `ask` names its
+way forward, such as re-activating with the flags or the host-side
 [`min net forward`](./cli-min.md#net-forward). Runtime publishes appear in
 [`min session policy`](./cli-min.md#session-policy).
 
