@@ -1440,7 +1440,12 @@ pub(crate) async fn activate_session(
         SyncMode::Tarball => {
             let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let decision = decide_workspace_upload(&upload_root, sync_explicit, headless);
+            let decision = decide_workspace_upload(
+                &upload_root,
+                sync_explicit,
+                headless,
+                std::env::home_dir().as_deref(),
+            );
             // The resolved-root notice is CLI presentation, and precedes the
             // upload bar it explains.
             if decision != UploadDecision::SkipEmptyOrHome

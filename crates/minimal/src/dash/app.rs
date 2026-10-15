@@ -1184,8 +1184,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                             None,
                                         )?;
                                         let root = crate::resolve_upload_root(&dir)?;
-                                        let decision =
-                                            crate::decide_workspace_upload(&root, false, false);
+                                        let decision = crate::decide_workspace_upload(
+                                            &root,
+                                            false,
+                                            false,
+                                            std::env::home_dir().as_deref(),
+                                        );
                                         Ok::<_, anyhow::Error>((inputs, root, decision))
                                     })
                                     .await
