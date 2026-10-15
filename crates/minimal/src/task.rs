@@ -755,7 +755,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
     let headless = global.no_input || !crate::can_prompt_interactively();
-    let decision = crate::decide_workspace_upload(&upload_root, false, headless);
+    let decision = crate::decide_workspace_upload(
+        &upload_root,
+        false,
+        headless,
+        std::env::home_dir().as_deref(),
+    );
     if decision != crate::UploadDecision::SkipEmptyOrHome
         && let Some(notice) = crate::resolved_upload_root_notice(&utf8_path, &upload_root)
     {

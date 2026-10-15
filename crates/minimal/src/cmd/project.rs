@@ -154,9 +154,8 @@ pub enum UploadDecision {
     Confirm,
     /// The user answered that confirm with no: nothing is uploaded and the
     /// session starts on an empty workspace. Kept apart from
-    /// [`Self::SkipUndeclared`], which is the *headless* skip — the one the
-    /// CLI refuses when the project declares lifecycle hooks that only the
-    /// upload would carry. A deliberate decline is never refused.
+    /// [`Self::SkipUndeclared`], the *headless* skip, which is nobody's
+    /// choice: a deliberate decline is never refused, and never reads as one.
     Declined,
 }
 
@@ -165,18 +164,22 @@ pub enum UploadDecision {
 /// [`file_upload::upload_gate`] into one value the callers can act on: the
 /// interactive `Confirm` case is resolved by the caller (the CLI prompts, the
 /// dashboard asks its own UI), and nothing here touches the daemon.
+///
+/// `home` is the reader for `$HOME`, passed in rather than read here so the
+/// carve-out is testable off this machine's own home directory.
 pub(crate) fn decide_workspace_upload(
     root: &camino::Utf8Path,
     sync_explicit: bool,
     headless: bool,
+    home: Option<&std::path::Path>,
 ) -> UploadDecision {
     // An empty box has nothing to sync, and `$HOME` — even when non-empty or
     // itself a VCS root — is far too much to bulk-upload on a stray keystroke.
     // A deliberate `--sync tarball` (`sync_explicit`) is the escape hatch that
-    // still uploads both.
-    if !sync_explicit
-        && file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
-    {
+    // still uploads both. A `$HOME` that is itself a declared project loses
+    // its hooks here; the callers refuse over that count rather than let the
+    // session come up without them.
+    if !sync_explicit && file_upload::is_empty_or_home(root.as_std_path(), home) {
         return UploadDecision::SkipEmptyOrHome;
     }
     match file_upload::upload_gate(
@@ -209,13 +212,16 @@ pub(crate) enum UploadProgress {
 pub(crate) enum WorkspaceUpload {
     /// The workspace tree was streamed to the daemon.
     Uploaded,
-    /// An empty directory or `$HOME`: nothing to sync.
-    SkippedEmptyOrHome,
-    /// An undeclared non-VCS root was not uploaded. `dropped_hooks` is the
-    /// project's lifecycle-hook count, which the skip also drops — the mfile
-    /// never reaches the daemon — so the caller decides whether that is a
-    /// warning or a refusal.
-    SkippedUndeclared { dropped_hooks: usize },
+    /// An empty directory or `$HOME`: nothing to sync. `dropped_hooks` counts
+    /// the lifecycle hooks declared at the root, because a `$HOME` that is
+    /// itself a declared project has its `minimal.toml` skipped with the tree
+    /// — and that file is the only thing that carries them to the daemon. The
+    /// refusing callers will not create a session without them.
+    SkippedEmptyOrHome { dropped_hooks: usize },
+    /// An undeclared non-VCS root was not uploaded. It has no `minimal.toml`
+    /// (a root that carries one uploads), so it declares no hooks and this
+    /// skip cannot drop any: it warns, and never refuses.
+    SkippedUndeclared,
     /// The interactive confirm was declined.
     Declined,
 }
@@ -237,10 +243,10 @@ pub(crate) async fn run_workspace_upload(
     progress: UploadProgress,
 ) -> Result<WorkspaceUpload, anyhow::Error> {
     match decision {
-        UploadDecision::SkipEmptyOrHome => Ok(WorkspaceUpload::SkippedEmptyOrHome),
-        UploadDecision::SkipUndeclared => Ok(WorkspaceUpload::SkippedUndeclared {
+        UploadDecision::SkipEmptyOrHome => Ok(WorkspaceUpload::SkippedEmptyOrHome {
             dropped_hooks: project_lifecycle_hook_count(root),
         }),
+        UploadDecision::SkipUndeclared => Ok(WorkspaceUpload::SkippedUndeclared),
         UploadDecision::Confirm => {
             if ask()? {
                 upload_workspace(client, id, root, progress).await
@@ -289,7 +295,7 @@ pub(crate) fn resolved_upload_root_notice(
 
 /// The rule of [`report_upload_outcome`]'s refusal, for a caller that owns
 /// its own screen and so cannot take that function's stderr lines: `min dash`
-/// applies it to the skip it was handed before it creates the box. Every
+/// applies it to the outcome it was handed before it creates the box. Every
 /// other outcome passes — a [`WorkspaceUpload::Declined`] is the user's own
 /// answer, never an accident to refuse.
 pub(crate) fn refuse_dropped_hooks(
@@ -297,40 +303,40 @@ pub(crate) fn refuse_dropped_hooks(
     root: &camino::Utf8Path,
 ) -> Result<(), anyhow::Error> {
     match outcome {
-        WorkspaceUpload::SkippedUndeclared { dropped_hooks } if *dropped_hooks > 0 => {
-            Err(undeclared_upload_drops_hooks_error(root, *dropped_hooks))
+        // The one skip that can cost hooks: a `$HOME` that is itself a
+        // declared project, since home is never uploaded implicitly.
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks } if *dropped_hooks > 0 => {
+            Err(dropped_hooks_error(root, *dropped_hooks))
         }
         WorkspaceUpload::Uploaded
-        | WorkspaceUpload::SkippedEmptyOrHome
-        | WorkspaceUpload::SkippedUndeclared { .. }
+        | WorkspaceUpload::SkippedEmptyOrHome { .. }
+        | WorkspaceUpload::SkippedUndeclared
         | WorkspaceUpload::Declined => Ok(()),
     }
 }
 
-/// The refusal for a [`WorkspaceUpload::SkippedUndeclared`] whose
-/// `dropped_hooks` is non-zero, for the callers that refuse rather than start
-/// a session silently missing its lifecycle hooks. The wording lives here so
-/// `min session activate` and `min task run` cannot drift.
-pub(crate) fn undeclared_upload_drops_hooks_error(
-    root: &camino::Utf8Path,
-    dropped_hooks: usize,
-) -> anyhow::Error {
+/// The refusal for the skip that would drop the project's lifecycle hooks,
+/// for the callers that refuse rather than start a session silently missing
+/// them: the `$HOME` that is itself a declared project, whose `minimal.toml`
+/// never reaches the daemon. The wording lives here so `min session
+/// activate`, `min task run`, and the dashboard's own gate cannot drift.
+pub(crate) fn dropped_hooks_error(root: &camino::Utf8Path, dropped_hooks: usize) -> anyhow::Error {
     anyhow::anyhow!(
-        "{root} is not a version control repository root, so its \
-         file upload is being skipped — but its {name} declares \
-         {dropped_hooks} lifecycle hook(s) that reach the session only \
-         through that upload. They would be silently dropped and never \
-         run. Pass `--sync tarball` to upload the project (hooks \
-         included), or `--sync none` to start without them deliberately.",
+        "{root} is your home directory, so its file upload is being skipped \
+         — but its {name} declares {dropped_hooks} lifecycle hook(s) that \
+         reach the session only through that upload. They would be silently \
+         dropped and never run. Pass `--sync tarball` to upload the project \
+         (hooks included), or `--sync none` to start without them \
+         deliberately.",
         name = mfile::MFILE_NAME,
     )
 }
 
 /// Renders a [`WorkspaceUpload`] outcome on the CLI's stderr — the shared
 /// presentation for `min session activate` and `min task run`. `refuse`
-/// turns a skip that would drop lifecycle hooks into the returned error; a
-/// caller that only warns passes `false`. `Ok(())` when the session may
-/// proceed.
+/// turns the skip that would drop the project's lifecycle hooks (a `$HOME`
+/// that is itself a declared project) into the returned error; a caller that
+/// only warns passes `false`. `Ok(())` when the session may proceed.
 pub(crate) fn report_upload_outcome(
     outcome: Result<WorkspaceUpload, anyhow::Error>,
     root: &camino::Utf8Path,
@@ -342,11 +348,11 @@ pub(crate) fn report_upload_outcome(
     }
     match outcome {
         WorkspaceUpload::Uploaded => Ok(()),
-        WorkspaceUpload::SkippedEmptyOrHome => {
+        WorkspaceUpload::SkippedEmptyOrHome { .. } => {
             eprintln!("Starting with an empty box (nothing here to sync)");
             Ok(())
         }
-        WorkspaceUpload::SkippedUndeclared { .. } => {
+        WorkspaceUpload::SkippedUndeclared => {
             eprintln!(
                 "{}",
                 file_upload::skipped_upload_warning(root.as_std_path())
