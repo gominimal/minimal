@@ -115,7 +115,12 @@ fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
     if let Some((path, _)) = OWNER_LOCK.get() {
         return Some(path.clone());
     }
-    let path = sock.with_file_name(format!("proxy-owner-{}.lock", std::process::id()));
+    // Unique to this process, not just its pid: a recycled pid must not
+    // find (or be found by) a proxy still watching the old owner's path.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = sock.with_file_name(format!("proxy-owner-{}-{started}.lock", std::process::id()));
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1125,6 +1130,14 @@ mod tests {
         assert!(
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
+        );
+        // The proxy is told who it serves (lab scenario 732): without the
+        // flag a SIGKILLed `min` leaves the daemon socket open again.
+        let owner = format!("--owner {}", std::process::id());
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("ProxyCommand=") && a.contains(&owner)),
+            "the ProxyCommand should name this process as the proxy's owner: {args:?}"
         );
     }
 
