@@ -115,6 +115,28 @@ fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
     if let Some((path, _)) = OWNER_LOCK.get() {
         return Some(path.clone());
     }
+    // One coordination lock per directory, held across the sweep of stale
+    // owner files and this one's create-and-lock, so a sweep never removes
+    // a file between its creation and its owner's lock. Not taken, the
+    // proxy keeps the pid watch alone.
+    let coord_path = sock.with_file_name(OWNER_COORD_FILE);
+    let coord = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&coord_path)
+        .ok()
+        .and_then(|f| nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive).ok());
+    if coord.is_none() {
+        tracing::debug!(
+            path = %coord_path.display(),
+            "no proxy owner coordination lock; the proxy watches the pid alone"
+        );
+        return None;
+    }
+    if let Some(dir) = sock.parent() {
+        sweep_stale_owner_locks(dir);
+    }
     // Unique to this process, not just its pid: a recycled pid must not
     // find (or be found by) a proxy still watching the old owner's path.
     let started = std::time::SystemTime::now()
@@ -152,7 +174,42 @@ fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
     // the process's, and the loser's lock drops, released, with its file
     // still ours through the winner.
     let (path, _) = OWNER_LOCK.get_or_init(|| (path, lock));
+    drop(coord);
     Some(path.clone())
+}
+
+/// The coordination lock beside the daemon socket; see [`hold_owner_lock`].
+const OWNER_COORD_FILE: &str = "proxy-owners.lock";
+
+/// Removes the `proxy-owner-*.lock` files in `dir` that no live process
+/// holds: an owner that ended (an attach or exec that completed, or one
+/// killed) leaves its file behind, and the proxy unlinks it only when it
+/// was still watching at that moment. A file is removed while this process
+/// holds its lock, then released. Called under the coordination lock, so a
+/// new file is never caught between its creation and its owner's lock.
+fn sweep_stale_owner_locks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("proxy-owner-") && name.ends_with(".lock")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if let Ok(lock) = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        {
+            let removed = std::fs::remove_file(&path);
+            drop(lock);
+            tracing::debug!(?removed, path = %path.display(), "swept a stale proxy owner lock");
+        }
+    }
 }
 
 pub fn attach_command(
@@ -1041,6 +1098,30 @@ pub(crate) fn trace_env() -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale owner file (its owner gone, its lock free) is swept; one a
+    /// live process holds stays, as does anything that is not an owner file.
+    #[test]
+    fn stale_owner_locks_are_swept_and_held_ones_kept() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let stale = dir.path().join("proxy-owner-1-1.lock");
+        std::fs::File::create(&stale).expect("the stale file");
+        let held_path = dir.path().join("proxy-owner-2-2.lock");
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::create(&held_path).expect("the held file"),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let other = dir.path().join(OWNER_COORD_FILE);
+        std::fs::File::create(&other).expect("the coordination file");
+
+        sweep_stale_owner_locks(dir.path());
+
+        assert!(!stale.exists(), "a free owner file is swept");
+        assert!(held_path.exists(), "a held owner file is kept");
+        assert!(other.exists(), "the coordination file is not an owner file");
+        drop(held);
+    }
     use std::path::PathBuf;
 
     /// The dashboard's hold verbs: a release is one release line naming the
