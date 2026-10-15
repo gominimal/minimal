@@ -1208,10 +1208,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     if reply_rx.await.unwrap_or(false) {
                                         crate::UploadDecision::Upload
                                     } else {
-                                        // The user declined: skip the upload the
-                                        // same way the CLI's confirm does,
-                                        // creating the session on an empty box.
-                                        crate::UploadDecision::SkipUndeclared
+                                        // The user declined: the session starts
+                                        // on an empty box, the way the CLI's
+                                        // own "no" does. Declined, not the
+                                        // headless skip — that one is what the
+                                        // CLI refuses over dropped hooks.
+                                        crate::UploadDecision::Declined
                                     }
                                 } else {
                                     decision
