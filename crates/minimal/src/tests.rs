@@ -1776,6 +1776,7 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
                 dropped_hooks: project_lifecycle_hook_count(home),
             },
             home,
+            CLI_DROPPED_HOOKS_REMEDY,
         )
         .is_err(),
         "a skipped home that declares hooks must be refused, not created silently"
@@ -1784,16 +1785,38 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
 
 /// The refusal a hook-dropping skip raises names the root, the count, and the
 /// `--sync` escape hatch. It is shared by both CLI callers and by the
-/// dashboard's own gate, so the wording cannot drift between them.
+/// dashboard's own gate, so the wording cannot drift between them; the remedy
+/// clause is the caller's, and each caller's names what it can do.
 #[test]
 fn dropped_hooks_error_names_root_count_and_escape_hatch() {
-    let err = dropped_hooks_error(camino::Utf8Path::new("/srv/data/run42"), 3);
+    let err = dropped_hooks_error(
+        camino::Utf8Path::new("/srv/data/run42"),
+        3,
+        CLI_DROPPED_HOOKS_REMEDY,
+    );
     let text = err.to_string();
     assert!(text.contains("/srv/data/run42"), "{text}");
     assert!(text.contains("is your home directory"), "{text}");
     assert!(text.contains("3 lifecycle hook(s)"), "{text}");
     assert!(text.contains("--sync tarball"), "{text}");
     assert!(text.contains("--sync none"), "{text}");
+
+    // The dashboard owns neither flag, so its refusal names the command that
+    // does rather than advice no key on the screen can follow.
+    let dashboard = dropped_hooks_error(
+        camino::Utf8Path::new("/home/dev"),
+        2,
+        DASH_DROPPED_HOOKS_REMEDY,
+    )
+    .to_string();
+    assert!(
+        dashboard.contains("min session activate --sync tarball"),
+        "{dashboard}"
+    );
+    assert!(
+        !dashboard.contains("`--sync none`"),
+        "the dashboard cannot pass --sync none, so it must not be told to: {dashboard}"
+    );
 }
 
 /// The resolved-root notice appears only when the upload walked above the
@@ -1852,11 +1875,15 @@ fn refuse_dropped_hooks_gates_only_the_hook_dropping_skip() {
         WorkspaceUpload::SkippedUndeclared,
         WorkspaceUpload::Declined,
     ] {
-        assert!(refuse_dropped_hooks(&allowed, root).is_ok(), "{allowed:?}");
+        assert!(
+            refuse_dropped_hooks(&allowed, root, CLI_DROPPED_HOOKS_REMEDY).is_ok(),
+            "{allowed:?}"
+        );
     }
     let err = refuse_dropped_hooks(
         &WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 },
         root,
+        CLI_DROPPED_HOOKS_REMEDY,
     )
     .expect_err("a home skip that drops lifecycle hooks is refused");
     assert!(err.to_string().contains("2 lifecycle hook(s)"), "{err}");
