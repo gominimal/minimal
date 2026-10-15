@@ -113,7 +113,7 @@ the current directory).
 | `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant |
 | `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
-| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box without egress flags already gets deny-all by default (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box gets deny-all by default when it does not declare egress by flag or in its `minimal.toml` (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
 declaration. Naming one of them stores it on the session, and `min session
@@ -126,8 +126,9 @@ what a declaration with no allow list does. `--allow-dns-hosts github.com`
 alone reaches `github.com` and no address directly. `--deny-subnets` alone
 reaches nothing. Both used to reach every address the deny left, and the
 operator opt-out named below restores that earlier meaning. An
-own-address box (`--network own_ip`) without these flags gets the deny-all
-default: it reaches no external address. It can still resolve names in the box zone,
+own-address box (`--network own_ip`) gets the deny-all default when it does
+not declare egress by these flags or in the project's `minimal.toml`. It
+then reaches no external address. It can still resolve names in the box zone,
 `host.min.internal` included. Activate prints one line saying so:
 
 ```
