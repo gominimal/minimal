@@ -15,7 +15,8 @@ const GIVE_UP: Duration = Duration::from_secs(600);
 
 /// A probe of a host that never answers has to end on its own deadline.
 ///
-/// The session actor forwards `GetHostAttrs`/`GetHostScreen` to a spawned
+/// The session actor forwards `GetHostScreen` (and, through the host slot,
+/// the listing's attrs probe takes the same bounded path) to a spawned
 /// task so the actor stays responsive, but nothing cancels that task:
 /// dropping the caller's receiver does not stop a spawned future. Left
 /// unbounded, every poll of a wedged host stranded one task forever — and

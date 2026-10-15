@@ -2809,6 +2809,39 @@ pub(crate) mod tests {
         .expect("the destroy never claimed the session");
     }
 
+    /// A listing must not wait on a session actor: its attrs come from the
+    /// host the actor last published, not from the actor's mailbox. With an
+    /// actor parked (a clone inside `ConfigureLoadout`, an inline attach),
+    /// `list` answered only after `HOST_PROBE_TIMEOUT` for that session —
+    /// 2 s per `min ls` through the whole of a stalled activation (710d).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_does_not_wait_on_a_parked_actor() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        handle.park_for(std::time::Duration::from_secs(3)).await;
+        // Let the actor take the park before measuring.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+            .await
+            .expect("`list` waited on the parked actor")
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].attrs.is_none(), "no host, so no attrs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the listing took {:?}",
+            started.elapsed()
+        );
+        drop(handle);
+    }
+
     /// Destroying an unknown ID is a `NotFound` error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_unknown_id_errors() {
