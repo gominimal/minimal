@@ -1702,6 +1702,166 @@ fn resolve_upload_root_errors_on_malformed_mfile() {
     assert!(resolve_upload_root(path).is_err());
 }
 
+/// The pure upload decision over its whole domain: the empty/`$HOME`
+/// carve-out, the explicit-sync escape hatch, and the VCS / blueprint /
+/// headless gate, with no TTY and no daemon in sight.
+#[test]
+fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
+    // An empty directory skips silently — unless the caller passed an
+    // explicit `--sync tarball`, which uploads it anyway.
+    let empty = tempfile::tempdir().unwrap();
+    let empty = camino::Utf8Path::from_path(empty.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(empty, false, false, None),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(
+        decide_workspace_upload(empty, true, false, None),
+        UploadDecision::Upload
+    );
+
+    // A non-empty, undeclared, non-VCS root: a headless caller skips with
+    // the shared warning, an interactive one is asked first.
+    let plain = tempfile::tempdir().unwrap();
+    std::fs::write(plain.path().join("notes.txt"), "x").unwrap();
+    let plain = camino::Utf8Path::from_path(plain.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(plain, false, true, None),
+        UploadDecision::SkipUndeclared
+    );
+    assert_eq!(
+        decide_workspace_upload(plain, false, false, None),
+        UploadDecision::Confirm
+    );
+
+    // A VCS root or a declared project uploads unconditionally.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("notes.txt"), "x").unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let repo = camino::Utf8Path::from_path(repo.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(repo, false, true, None),
+        UploadDecision::Upload
+    );
+
+    let declared = tempfile::tempdir().unwrap();
+    std::fs::write(declared.path().join("notes.txt"), "x").unwrap();
+    std::fs::write(declared.path().join(mfile::MFILE_NAME), "[upstream]\n").unwrap();
+    let declared = camino::Utf8Path::from_path(declared.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(declared, false, true, None),
+        UploadDecision::Upload
+    );
+
+    // A declared project that is `$HOME` keeps the carve-out — home is never
+    // bulk-uploaded on a stray activation — so its hooks are the count the
+    // gate below refuses over. This is the one state a skip can drop hooks
+    // from: an undeclared root has no `minimal.toml` to lose (the case above).
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+    )
+    .unwrap();
+    let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(home, false, false, Some(home.as_std_path())),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(project_lifecycle_hook_count(home), 1);
+    assert!(
+        refuse_dropped_hooks(
+            &WorkspaceUpload::SkippedEmptyOrHome {
+                dropped_hooks: project_lifecycle_hook_count(home),
+            },
+            home,
+        )
+        .is_err(),
+        "a skipped home that declares hooks must be refused, not created silently"
+    );
+}
+
+/// The refusal a hook-dropping skip raises names the root, the count, and the
+/// `--sync` escape hatch. It is shared by both CLI callers and by the
+/// dashboard's own gate, so the wording cannot drift between them.
+#[test]
+fn dropped_hooks_error_names_root_count_and_escape_hatch() {
+    let err = dropped_hooks_error(camino::Utf8Path::new("/srv/data/run42"), 3);
+    let text = err.to_string();
+    assert!(text.contains("/srv/data/run42"), "{text}");
+    assert!(text.contains("is your home directory"), "{text}");
+    assert!(text.contains("3 lifecycle hook(s)"), "{text}");
+    assert!(text.contains("--sync tarball"), "{text}");
+    assert!(text.contains("--sync none"), "{text}");
+}
+
+/// The resolved-root notice appears only when the upload walked above the
+/// invocation directory, so `min activate` from inside a project says which
+/// root it used while a root at the invocation directory stays quiet.
+#[test]
+fn resolved_upload_root_notice_only_when_they_differ() {
+    let root = camino::Utf8Path::new("/proj");
+    let subdir = camino::Utf8Path::new("/proj/sub");
+    assert!(resolved_upload_root_notice(root, root).is_none());
+    let notice = resolved_upload_root_notice(subdir, root).expect("a notice when they differ");
+    assert!(
+        notice.contains("/proj (resolved from /proj/sub)"),
+        "{notice}"
+    );
+}
+
+/// A skip that would drop lifecycle hooks is the caller's call: the refusing
+/// caller gets an error, and one with no hooks dropped never does. The skip
+/// that costs them is the `$HOME` that is itself a declared project — an
+/// undeclared root has no `minimal.toml` to lose — and the user's own decline
+/// is never refused, whatever it costs: it is an answer, not an accident.
+#[test]
+fn report_upload_outcome_refuses_dropped_hooks_only() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    assert!(
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+            root,
+            true,
+        )
+        .is_err(),
+        "a skipped home that declares hooks is refused"
+    );
+    for kept in [
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 },
+        WorkspaceUpload::SkippedUndeclared,
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(
+            report_upload_outcome(Ok(kept), root, true).is_ok(),
+            "{kept:?}"
+        );
+    }
+}
+
+/// The rule `min dash` applies in place of the stderr wording refuses exactly
+/// the skip that would drop hooks: the skips that cost nothing, and the user's
+/// own decline, still create their box.
+#[test]
+fn refuse_dropped_hooks_gates_only_the_hook_dropping_skip() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    for allowed in [
+        WorkspaceUpload::Uploaded,
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 },
+        WorkspaceUpload::SkippedUndeclared,
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(refuse_dropped_hooks(&allowed, root).is_ok(), "{allowed:?}");
+    }
+    let err = refuse_dropped_hooks(
+        &WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 },
+        root,
+    )
+    .expect_err("a home skip that drops lifecycle hooks is refused");
+    assert!(err.to_string().contains("2 lifecycle hook(s)"), "{err}");
+}
+
 /// A refused composition is reported in the user's terms — the
 /// directory the activation ran from — with the daemon's own text kept
 /// as subordinate detail rather than as the headline (#581).
