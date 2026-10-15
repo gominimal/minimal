@@ -7297,6 +7297,11 @@ proof_local_range_reserved_by_privileged_step() {
   RANGE_LABEL="dev.minimal.local-range"
   RANGE_PROGRAM_PATH="/Library/PrivilegedHelperTools/$RANGE_LABEL"
   RANGE_PLIST_PATH="/Library/LaunchDaemons/$RANGE_LABEL.plist"
+  # Where the step installs the answerer's app bundle (a `min` with a
+  # bundled minzoned beside it or on PATH, as a release ships it), the
+  # range unit runs the bundle's program with the range verb instead of
+  # the script at RANGE_PROGRAM_PATH, and the script removes that file.
+  RANGE_BUNDLE_PROGRAM="/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
   RANGE_NAME="e2e-local-range"
 
   # A prior run killed past its own EXIT trap (a SIGKILL'd runner) can leave
@@ -7381,6 +7386,22 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,12p'
     fail
   fi
+  # The program the range unit runs, read off the range plist the script
+  # carries (its heredoc alone: the answerer's own plist names the bundle's
+  # program in both shapes): the bundle's program when the script installs
+  # the bundle, else the script it writes to RANGE_PROGRAM_PATH.
+  if printf '%s\n' "$range_cmd" \
+       | awk -v start="cat > $RANGE_PLIST_PATH <<" '
+           index($0, start) == 1 { inside = 1; next }
+           inside && /^MINIMAL_RANGE_PLIST_EOF$/ { inside = 0 }
+           inside { print }' \
+       | grep -qF -- "<string>$RANGE_BUNDLE_PROGRAM</string>"; then
+    RANGE_UNIT_PROGRAM="$RANGE_BUNDLE_PROGRAM"
+    echo "the range unit runs the answerer bundle's program ($RANGE_UNIT_PROGRAM)"
+  else
+    RANGE_UNIT_PROGRAM="$RANGE_PROGRAM_PATH"
+    echo "the range unit runs the script it installs ($RANGE_UNIT_PROGRAM)"
+  fi
   # The script the header promised: one elevation for the resolver and the
   # range together, carrying both files' bytes and the boot step.
   case "$range_cmd" in
@@ -7452,7 +7473,7 @@ proof_local_range_reserved_by_privileged_step() {
   # Custody, the facts the CLI's own detection checks: both files root-owned
   # at their exact modes, the directories the command made root's, and the
   # plist naming the root-owned program.
-  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_PROGRAM_PATH" 2>/dev/null || true)"
+  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_UNIT_PROGRAM" 2>/dev/null || true)"
   range_plist_stat="$(stat -f '%u %Lp' "$RANGE_PLIST_PATH" 2>/dev/null || true)"
   if [ "$range_prog_stat" != "0 755" ] || [ "$range_plist_stat" != "0 644" ]; then
     echo "::error::the range unit's files are not root-owned at their modes (program: '$range_prog_stat', plist: '$range_plist_stat')"
@@ -7468,9 +7489,20 @@ proof_local_range_reserved_by_privileged_step() {
     esac
   done
   range_plist_prog="$(plutil -extract ProgramArguments.0 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
-  if [ "$range_plist_prog" != "$RANGE_PROGRAM_PATH" ]; then
-    echo "::error::the plist does not name the root-owned program (ProgramArguments[0]: '$range_plist_prog')"
+  if [ "$range_plist_prog" != "$RANGE_UNIT_PROGRAM" ]; then
+    echo "::error::the plist does not name the root-owned program $RANGE_UNIT_PROGRAM (ProgramArguments[0]: '$range_plist_prog')"
     fail
+  fi
+  if [ "$RANGE_UNIT_PROGRAM" = "$RANGE_BUNDLE_PROGRAM" ]; then
+    range_plist_verb="$(plutil -extract ProgramArguments.1 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
+    if [ "$range_plist_verb" != reserve-local-range ]; then
+      echo "::error::the plist does not run the bundle's program with the range verb (ProgramArguments[1]: '$range_plist_verb')"
+      fail
+    fi
+    if [ -e "$RANGE_PROGRAM_PATH" ]; then
+      echo "::error::the range script $RANGE_PROGRAM_PATH is still on the host, though the unit runs the bundle's program"
+      fail
+    fi
   fi
   echo "custody holds: both files root-owned at 0755/0644, the plist runs the root-owned program"
 
@@ -7528,7 +7560,7 @@ proof_local_range_reserved_by_privileged_step() {
     launchctl print "system/$RANGE_LABEL" 2>&1 || true
     fail
   fi
-  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_PROGRAM_PATH"; then
+  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_UNIT_PROGRAM"; then
     echo "::error::the loaded job does not name the root-owned program (launchctl print:)"
     printf '%s\n' "$range_print" | head -40
     fail
