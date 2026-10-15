@@ -240,6 +240,16 @@ pub struct BoxManager {
     in_shutdown: CancellationToken,
     receiver: crate::traced::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, BoxHandle>,
+    /// Sessions whose teardown runs on a task of its own (`DeleteSession`):
+    /// out of `running`, their record on disk until the task deletes it. The
+    /// resolver reads such a session as gone, so an attach, a listing's
+    /// bring-up or a second destroy in that window starts no second actor and
+    /// runs no `on_destroy` hook twice. A task removes its id as it ends.
+    tearing_down: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    /// The teardown tasks, joined by `Shutdown` before the state volume is
+    /// quiesced: a hook still running or a record delete still in flight
+    /// would otherwise race the unmount.
+    teardowns: tokio::task::JoinSet<()>,
     store: StoreHandle,
 
     /// A weak handle to this manager, which can be duplicated so
@@ -628,6 +638,8 @@ impl BoxManager {
             in_shutdown,
             receiver,
             running,
+            tearing_down: Arc::default(),
+            teardowns: tokio::task::JoinSet::new(),
             store,
             weak_self,
             daemon_ctx,
@@ -1060,6 +1072,16 @@ impl BoxManager {
         let session_id = *handle.id();
         if let Some(h) = self.running.get(&session_id) {
             return Ok(Some(h.clone()));
+        }
+        // Being torn down: the record outlives the actor by the length of
+        // its teardown task, and a session in that window is gone, not idle.
+        if self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&session_id)
+        {
+            return Ok(None);
         }
         // Not running, start it!
         let h = BoxActor::run(self.session_config(handle)).await?;
@@ -1497,6 +1519,24 @@ impl BoxManager {
                         return;
                     }
                 };
+                // One teardown per session: a second destroy that lands
+                // while the first runs is refused rather than brought up
+                // as a fresh actor whose hooks would run again.
+                let tearing_down = Arc::clone(&self.tearing_down);
+                let first = tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id);
+                if !first {
+                    r.handle(async {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ResourceBusy,
+                            format!("session `{}` is already being destroyed", id.as_ref()),
+                        ))
+                    })
+                    .await;
+                    return;
+                }
                 // Teardown belongs to the actor, so an idle session gets
                 // one brought up rather than having its record deleted
                 // out from under it. That used to be a fair shortcut —
@@ -1505,58 +1545,77 @@ impl BoxManager {
                 // them silently for any session whose actor had been
                 // reaped (every session, after a daemon restart).
                 //
-                // Spawning is cheap: the actor reads its record and
-                // composition, and only mints a sandbox if there are
-                // destroy hooks to run in one.
-                let actor = match self.running.remove(&id) {
-                    Some(hnd) => Some(hnd),
-                    None => match BoxActor::run(self.session_config(handle.clone())).await {
-                        Ok(hnd) => Some(hnd),
-                        // A record the actor refuses to come up on — a
-                        // restart-orphaned `Materializing` one is the
-                        // known case — must still be destroyable, so
-                        // fall through to deleting it directly. A
-                        // session that cannot be torn down is worse
-                        // than one torn down without its hooks.
-                        Err(e) => {
-                            tracing::warn!(
-                                session_id = %id,
-                                error = %e,
-                                "could not start the session to run its destroy hooks; \
-                                 removing its record without them",
-                            );
-                            None
-                        }
-                    },
+                // Claimed here, brought up and torn down on a task of its
+                // own: the mainloop awaits neither the actor's start (a
+                // record and composition read) nor its destroy (hooks), so
+                // a listing served meanwhile neither waits nor probes it.
+                // The caller gets the outcome when the task ends.
+                let claimed = self.running.remove(&id);
+                let seed = match claimed {
+                    Some(_) => None,
+                    None => Some(self.session_config(handle.clone())),
                 };
-                // Claimed: the session is out of `running`, so a `List`
-                // served meanwhile no longer probes an actor that is busy
-                // tearing down. The caller gets the outcome when it ends.
-                crate::traced::spawn(async move {
-                    r.handle(async {
-                        match actor {
-                            Some(hnd) => {
-                                let hook_failures = hnd.destroy().await?;
-                                // Belt-and-braces: a dead actor (self-terminated
-                                // but not yet evicted) reads as `Ok` above, and
-                                // may have died *without* deleting its record
-                                // (its own delete failed). Remove any leftover;
-                                // `NotFound` is the normal already-deleted case.
-                                if let Err(e) = handle.delete().await
-                                    && e.kind() != NotFound
-                                {
-                                    return Err(e);
+                let span = tracing::Span::current();
+                self.teardowns.spawn(tracing::Instrument::instrument(
+                    async move {
+                        // Out of the set as this task ends, whatever its outcome.
+                        let _release = TearingDown {
+                            set: tearing_down,
+                            id,
+                        };
+                        r.handle(async {
+                            let actor = match (claimed, seed) {
+                                (Some(hnd), _) => Some(hnd),
+                                (None, Some(seed)) => match BoxActor::run(seed).await {
+                                    Ok(hnd) => Some(hnd),
+                                    // A record the actor refuses to come up on — a
+                                    // restart-orphaned `Materializing` one is the
+                                    // known case — must still be destroyable, so
+                                    // fall through to deleting it directly. A
+                                    // session that cannot be torn down is worse
+                                    // than one torn down without its hooks.
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id = %id,
+                                            error = %e,
+                                            "could not start the session to run its destroy hooks; \
+                                             removing its record without them",
+                                        );
+                                        None
+                                    }
+                                },
+                                // A claimed actor comes with no seed; the
+                                // match above covers every pair that occurs.
+                                (None, None) => None,
+                            };
+                            match actor {
+                                Some(hnd) => {
+                                    let hook_failures = hnd.destroy().await?;
+                                    // Belt-and-braces: a dead actor (self-terminated
+                                    // but not yet evicted) reads as `Ok` above, and
+                                    // may have died *without* deleting its record
+                                    // (its own delete failed). Remove any leftover;
+                                    // `NotFound` is the normal already-deleted case.
+                                    if let Err(e) = handle.delete().await
+                                        && e.kind() != NotFound
+                                    {
+                                        return Err(e);
+                                    }
+                                    Ok(hook_failures)
                                 }
-                                Ok(hook_failures)
+                                None => {
+                                    handle.delete().await?;
+                                    Ok(Vec::new())
+                                }
                             }
-                            None => {
-                                handle.delete().await?;
-                                Ok(Vec::new())
-                            }
-                        }
-                    })
-                    .await;
-                });
+                        })
+                        .await;
+                    },
+                    span,
+                ));
+                // Finished tasks leave the set on their own; their join
+                // handles leave it here, so the set holds only the live ones.
+                while self.teardowns.try_join_next().is_some() {}
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {
@@ -1584,6 +1643,11 @@ impl BoxManager {
                         hnd.stop().await;
                     }
                     self.running.clear();
+                    // Teardowns in flight (`DeleteSession` runs them on tasks
+                    // of their own) end before the volume is quiesced: a hook
+                    // mid-run or a record delete mid-write would otherwise
+                    // race the unmount. Bounded by the hooks' own timeouts.
+                    while self.teardowns.join_next().await.is_some() {}
                     // Release the cache's held-open alog fd: it lives on the
                     // state volume, and a surviving write-open fd there makes
                     // the post-drain quiesce (R2.1 syncfs + unmount) fail
@@ -1608,6 +1672,22 @@ impl BoxManager {
                 self.running.remove(&id);
             }
         }
+    }
+}
+
+/// Removes a session from the manager's tearing-down set when its teardown
+/// task ends, however it ends.
+struct TearingDown {
+    set: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    id: SessionId,
+}
+
+impl Drop for TearingDown {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 

@@ -495,6 +495,70 @@ async fn a_slow_destroy_does_not_hold_the_mainloop() {
     );
 }
 
+/// A session being torn down is gone to everyone else: a second destroy
+/// in the window is refused, a resolve finds nothing, and the
+/// `on_destroy` hook runs once. With the teardown off the mainloop the
+/// window is real (the first review of #2224 found it): without the
+/// tearing-down set, the second destroy brought up a fresh actor from
+/// the still-present record and ran the hook again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_destroy_during_a_teardown_runs_no_hook_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("sleep 2; echo ran >> {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let first = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.delete_session(id).await })
+    };
+    // Let the first destroy claim the session and reach its hook.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let second = mngr.delete_session(id).await;
+    assert!(
+        matches!(&second, Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy),
+        "a second destroy during the teardown should be refused, got {second:?}"
+    );
+    assert!(
+        mngr.get_session(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down should resolve to nothing"
+    );
+
+    first.await.unwrap().unwrap();
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(ran.lines().count(), 1, "the destroy hook ran {ran:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record should be gone after destroy"
+    );
+}
+
 /// Destroying an unknown ID is a `NotFound` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroy_unknown_id_errors() {
