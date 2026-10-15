@@ -72,7 +72,8 @@ pub enum Action {
     /// `n`: the create form.
     Create(CreateForm),
     /// A dashboard create paused on the undeclared non-VCS upload confirm
-    /// (the CLI's #770 prompt): "y" uploads the root, "n"/Esc skips it.
+    /// (the CLI's #770 prompt): "y" uploads the root, "n" skips it and
+    /// creates the box empty, Esc calls the create off.
     ConfirmCreateUpload { token: u64, root: String },
 }
 
@@ -135,6 +136,8 @@ pub enum Msg {
     Created {
         provider: String,
         id: SessionId,
+        /// What the tree upload did, for the status line.
+        upload: crate::WorkspaceUpload,
         /// The daemon's package check stepped aside at finalize.
         package_check_skipped: bool,
         /// The deny-all egress default binds the new box (NET-074).
@@ -148,8 +151,29 @@ pub enum Msg {
     CreateUploadConfirm {
         token: u64,
         root: String,
-        reply: tokio::sync::oneshot::Sender<bool>,
+        reply: tokio::sync::oneshot::Sender<UploadAnswer>,
     },
+}
+
+/// The user's answer to a create's upload confirm. "n" and Esc are different
+/// answers: the first creates the box without the tree, the second calls the
+/// create off, as Esc does everywhere else in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadAnswer {
+    /// Upload the root and create the box from it.
+    Upload,
+    /// Skip the upload and create the box empty.
+    Decline,
+    /// Create nothing at all.
+    Cancel,
+}
+
+/// What a finished create task got.
+enum CreateOutcome {
+    /// The box was created and activated.
+    Created(rpc::Activated),
+    /// The user called the create off at the upload confirm.
+    Cancelled,
 }
 
 /// Side effects [`update`] asks the driver to run.
@@ -175,7 +199,7 @@ pub enum Effect {
     /// `Effect`).
     AnswerCreateUpload {
         token: u64,
-        confirmed: bool,
+        answer: UploadAnswer,
     },
     /// Persist the last-focused session to `dash-state.json`.
     SaveState,
@@ -545,10 +569,12 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Created {
             provider,
             id,
+            upload,
             package_check_skipped,
             egress_deny_all_default,
         } => {
             model.status = Some(created_status(
+                upload,
                 package_check_skipped,
                 egress_deny_all_default,
             ));
@@ -565,13 +591,36 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
     }
 }
 
-/// The status line a create ends with: the package check's warning when it
-/// stepped aside, and the note `min session activate` prints when the
-/// deny-all egress default binds the new box (NET-074) — the dashboard has
-/// no egress fields, so a bare own-address box it creates reaches nothing
-/// outside itself until it is re-created with declared reach.
-fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) -> String {
+/// The status line a create ends with: what the upload did with the tree,
+/// the package check's warning when it stepped aside, and the note `min
+/// session activate` prints when the deny-all egress default binds the new
+/// box (NET-074) — the dashboard has no egress fields, so a bare own-address
+/// box it creates reaches nothing outside itself until it is re-created with
+/// declared reach.
+fn created_status(
+    upload: crate::WorkspaceUpload,
+    package_check_skipped: bool,
+    egress_deny_all_default: bool,
+) -> String {
     let mut status = "session created".to_string();
+    match upload {
+        crate::WorkspaceUpload::Uploaded => {}
+        crate::WorkspaceUpload::SkippedEmptyOrHome { .. } => {
+            status.push_str("; starting with an empty box (nothing here to sync)");
+        }
+        crate::WorkspaceUpload::SkippedUndeclared => {
+            status.push_str(
+                "; the file upload was skipped: not a repository root and no minimal.toml, \
+                 so the box starts with an empty workspace",
+            );
+        }
+        crate::WorkspaceUpload::Declined => {
+            status.push_str(
+                "; the file upload was skipped as you asked: the box starts with an empty \
+                 workspace",
+            );
+        }
+    }
     if package_check_skipped {
         status.push_str(
             "; warning: package names were not checked, so an unknown package name \
@@ -725,14 +774,23 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 model.action = None;
                 vec![Effect::AnswerCreateUpload {
                     token,
-                    confirmed: true,
+                    answer: UploadAnswer::Upload,
                 }]
             }
-            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
+            (KeyCode::Char('n'), KeyModifiers::NONE) => {
                 model.action = None;
                 vec![Effect::AnswerCreateUpload {
                     token,
-                    confirmed: false,
+                    answer: UploadAnswer::Decline,
+                }]
+            }
+            // Esc backs out the way it does on every other dashboard prompt:
+            // no session is created, rather than an empty one.
+            (KeyCode::Esc, _) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Cancel,
                 }]
             }
             _ => Vec::new(),
@@ -939,11 +997,11 @@ pub struct DashOptions {
 }
 
 /// One create waiting on an upload confirm: the token keys it, `root` is
-/// shown in the footer, and `reply` is answered when the user presses y/n.
+/// shown in the footer, and `reply` is answered when the user answers.
 struct PendingConfirm {
     token: u64,
     root: String,
-    reply: tokio::sync::oneshot::Sender<bool>,
+    reply: tokio::sync::oneshot::Sender<UploadAnswer>,
 }
 
 /// The next upload-confirm token. A create task picks one before it sends
@@ -1064,12 +1122,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 // The upload confirm the user just answered: deliver the
                 // stashed reply and, if another create is waiting, show its
                 // modal now that `update` closed this one.
-                Effect::AnswerCreateUpload { token, confirmed } => {
+                Effect::AnswerCreateUpload { token, answer } => {
                     if let Some(i) = pending_confirms.iter().position(|p| p.token == token) {
                         // `remove` needs the index; the element is known to
                         // exist from the `position` above.
                         if let Some(p) = pending_confirms.remove(i) {
-                            let _ = p.reply.send(confirmed);
+                            let _ = p.reply.send(answer);
                         }
                     }
                     show_pending_confirm(&mut model, &mut pending_confirms);
@@ -1209,15 +1267,20 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                             reply: reply_tx,
                                         })
                                         .await;
-                                    if reply_rx.await.unwrap_or(false) {
-                                        crate::UploadDecision::Upload
-                                    } else {
-                                        // The user declined: the session starts
-                                        // on an empty box, the way the CLI's
-                                        // own "no" does. Declined, not the
-                                        // headless skip — that one is what the
-                                        // CLI refuses over dropped hooks.
-                                        crate::UploadDecision::Declined
+                                    match reply_rx.await.unwrap_or(UploadAnswer::Cancel) {
+                                        UploadAnswer::Upload => crate::UploadDecision::Upload,
+                                        // The user declined: the session
+                                        // starts on an empty box, the way the
+                                        // CLI's own "no" does. Declined, not
+                                        // the headless skip — that one is what
+                                        // the CLI refuses over dropped hooks.
+                                        UploadAnswer::Decline => crate::UploadDecision::Declined,
+                                        // Esc called the create off: nothing
+                                        // reaches the daemon, so there is no
+                                        // empty box to clean up.
+                                        UploadAnswer::Cancel => {
+                                            return Ok(CreateOutcome::Cancelled);
+                                        }
                                     }
                                 } else {
                                     decision
@@ -1232,19 +1295,25 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     inputs,
                                 )
                                 .await
+                                .map(CreateOutcome::Created)
                             }
                             .await;
                             let msg = match result {
-                                Ok(rpc::Activated {
+                                Ok(CreateOutcome::Created(rpc::Activated {
                                     id,
+                                    upload,
                                     package_check_skipped,
                                     egress_deny_all_default,
-                                }) => Msg::Created {
+                                })) => Msg::Created {
                                     provider,
                                     id,
+                                    upload,
                                     package_check_skipped,
                                     egress_deny_all_default,
                                 },
+                                Ok(CreateOutcome::Cancelled) => {
+                                    Msg::ActionDone(Ok("create cancelled".to_string()))
+                                }
                                 Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
                             };
                             let _ = tx.send(msg).await;
@@ -1594,6 +1663,7 @@ mod tests {
             Msg::Created {
                 provider: "host".to_string(),
                 id: id(1),
+                upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
                 egress_deny_all_default: true,
             },
@@ -1613,11 +1683,50 @@ mod tests {
             Msg::Created {
                 provider: "host".to_string(),
                 id: id(2),
+                upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
                 egress_deny_all_default: false,
             },
         );
         assert_eq!(model.status.as_deref(), Some("session created"));
+    }
+
+    /// A create that skipped the tree says so on the status line, the way the
+    /// CLI prints its own line for the same skip: the box looks created either
+    /// way, and only the status tells them apart.
+    #[test]
+    fn created_status_reports_each_upload_outcome() {
+        let status_of = |upload| {
+            let mut model = model_with(Vec::new());
+            update(
+                &mut model,
+                Msg::Created {
+                    provider: "host".to_string(),
+                    id: id(3),
+                    upload,
+                    package_check_skipped: false,
+                    egress_deny_all_default: false,
+                },
+            );
+            model.status.clone().unwrap_or_default()
+        };
+        assert_eq!(
+            status_of(crate::WorkspaceUpload::Uploaded),
+            "session created"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 })
+                .contains("nothing here to sync"),
+            "an empty or home root says the box starts empty"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::Declined).contains("as you asked"),
+            "a declined upload is the user's own answer"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::SkippedUndeclared).contains("was skipped"),
+            "an undeclared root says the upload was skipped"
+        );
     }
 
     fn two_providers() -> Model {
@@ -1876,36 +1985,30 @@ mod tests {
         assert!(model.action.is_none());
     }
 
+    /// "n" and Esc are different answers: "n" creates the box without the
+    /// tree, Esc calls the create off. Everywhere else in the dashboard Esc
+    /// backs out, and a user who mistyped the path must be able to too.
     #[test]
-    fn create_upload_confirm_answers_y_and_n() {
-        let mut model = two_providers();
-        model.action = Some(Action::ConfirmCreateUpload {
-            token: 7,
-            root: "/srv/data".to_string(),
-        });
-        let effects = update(&mut model, key(KeyCode::Char('y')));
-        assert!(model.action.is_none());
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::AnswerCreateUpload {
+    fn create_upload_confirm_answers_y_n_and_esc() {
+        let answer = |code: KeyCode| {
+            let mut model = two_providers();
+            model.action = Some(Action::ConfirmCreateUpload {
                 token: 7,
-                confirmed: true
-            }
-        )));
-
-        model.action = Some(Action::ConfirmCreateUpload {
-            token: 8,
-            root: "/srv/data".to_string(),
-        });
-        let effects = update(&mut model, key(KeyCode::Esc));
-        assert!(model.action.is_none());
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::AnswerCreateUpload {
-                token: 8,
-                confirmed: false
-            }
-        )));
+                root: "/srv/data".to_string(),
+            });
+            let effects = update(&mut model, key(code));
+            assert!(model.action.is_none(), "the modal closes on {code:?}");
+            effects
+                .into_iter()
+                .find_map(|e| match e {
+                    Effect::AnswerCreateUpload { token: 7, answer } => Some(answer),
+                    _ => None,
+                })
+                .expect("the answer reaches the waiting create")
+        };
+        assert_eq!(answer(KeyCode::Char('y')), UploadAnswer::Upload);
+        assert_eq!(answer(KeyCode::Char('n')), UploadAnswer::Decline);
+        assert_eq!(answer(KeyCode::Esc), UploadAnswer::Cancel);
     }
 
     /// Two creates can pause on the upload confirm at once: the second waits

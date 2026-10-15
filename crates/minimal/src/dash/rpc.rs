@@ -546,7 +546,7 @@ pub async fn activate(
             crate::UploadProgress::Quiet,
         )
         .await?;
-        crate::refuse_dropped_hooks(&outcome, &upload_root)?;
+        crate::refuse_dropped_hooks(&outcome, &upload_root, crate::DASH_DROPPED_HOOKS_REMEDY)?;
         // Upload the loadouts' external hook scripts before the configure:
         // the daemon gates `FinalizeSession` on the upload's ready-marker, and
         // a composition naming a script that never arrived cannot finalize.
@@ -600,7 +600,7 @@ pub async fn activate(
             .await
             .context("FinalizeSession RPC failed")?
         {
-            Errorable::Ok(ok) => Ok(ok.package_check_skipped),
+            Errorable::Ok(ok) => Ok((ok.package_check_skipped, outcome)),
             Errorable::Err { error } => anyhow::bail!("{error}"),
         }
     })
@@ -609,7 +609,7 @@ pub async fn activate(
     // A failed flow must not orphan the record: a `Pending` stub would hold
     // its name and be reaped at the next daemon restart anyway.
     match flow {
-        Ok(package_check_skipped) => {
+        Ok((package_check_skipped, upload)) => {
             // The session is active: a `host_ip` box holds its name in the
             // zone (NODATA) the way `min session activate` holds it, read
             // off the record so an autogen name is the one held.
@@ -623,6 +623,7 @@ pub async fn activate(
             }
             Ok(Activated {
                 id,
+                upload,
                 package_check_skipped,
                 egress_deny_all_default,
             })
@@ -775,6 +776,9 @@ async fn create_registering<C: Send>(
 #[derive(Debug)]
 pub struct Activated {
     pub id: SessionId,
+    /// What the tree upload did: the create's status line says which skip
+    /// left the new box without the project, as the CLI's own line does.
+    pub upload: crate::WorkspaceUpload,
     /// The daemon's package check stepped aside at finalize, so unknown
     /// package names surface at first exec; the status line says so.
     pub package_check_skipped: bool,

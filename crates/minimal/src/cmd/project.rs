@@ -209,7 +209,7 @@ pub(crate) enum UploadProgress {
 /// the CLI renders it on stderr, the `min dash` TUI on its own screen. The
 /// shared step prints nothing itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceUpload {
+pub enum WorkspaceUpload {
     /// The workspace tree was streamed to the daemon.
     Uploaded,
     /// An empty directory or `$HOME`: nothing to sync. `dropped_hooks` counts
@@ -297,16 +297,18 @@ pub(crate) fn resolved_upload_root_notice(
 /// its own screen and so cannot take that function's stderr lines: `min dash`
 /// applies it to the outcome it was handed before it creates the box. Every
 /// other outcome passes — a [`WorkspaceUpload::Declined`] is the user's own
-/// answer, never an accident to refuse.
+/// answer, never an accident to refuse. `remedy` is the one part of the
+/// refusal each caller words for itself; see [`CLI_DROPPED_HOOKS_REMEDY`].
 pub(crate) fn refuse_dropped_hooks(
     outcome: &WorkspaceUpload,
     root: &camino::Utf8Path,
+    remedy: &str,
 ) -> Result<(), anyhow::Error> {
     match outcome {
         // The one skip that can cost hooks: a `$HOME` that is itself a
         // declared project, since home is never uploaded implicitly.
         WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks } if *dropped_hooks > 0 => {
-            Err(dropped_hooks_error(root, *dropped_hooks))
+            Err(dropped_hooks_error(root, *dropped_hooks, remedy))
         }
         WorkspaceUpload::Uploaded
         | WorkspaceUpload::SkippedEmptyOrHome { .. }
@@ -315,19 +317,32 @@ pub(crate) fn refuse_dropped_hooks(
     }
 }
 
+/// What a refusing CLI caller tells the user of a `$HOME` create: which of
+/// the two upload flags they meant.
+pub(crate) const CLI_DROPPED_HOOKS_REMEDY: &str = "Pass `--sync tarball` to upload the project (hooks included), or `--sync none` to start \
+     without them deliberately";
+
+/// What `min dash`, which owns neither flag, tells the user of the same
+/// create: the command that does.
+pub(crate) const DASH_DROPPED_HOOKS_REMEDY: &str =
+    "Create the box from a terminal with `min session activate --sync tarball` instead";
+
 /// The refusal for the skip that would drop the project's lifecycle hooks,
 /// for the callers that refuse rather than start a session silently missing
 /// them: the `$HOME` that is itself a declared project, whose `minimal.toml`
-/// never reaches the daemon. The wording lives here so `min session
-/// activate`, `min task run`, and the dashboard's own gate cannot drift.
-pub(crate) fn dropped_hooks_error(root: &camino::Utf8Path, dropped_hooks: usize) -> anyhow::Error {
+/// never reaches the daemon. The facts are worded here so `min session
+/// activate`, `min task run`, and the dashboard cannot drift; `remedy` is the
+/// caller's own, because what can be done about it differs by caller.
+pub(crate) fn dropped_hooks_error(
+    root: &camino::Utf8Path,
+    dropped_hooks: usize,
+    remedy: &str,
+) -> anyhow::Error {
     anyhow::anyhow!(
         "{root} is your home directory, so its file upload is being skipped \
          — but its {name} declares {dropped_hooks} lifecycle hook(s) that \
          reach the session only through that upload. They would be silently \
-         dropped and never run. Pass `--sync tarball` to upload the project \
-         (hooks included), or `--sync none` to start without them \
-         deliberately.",
+         dropped and never run. {remedy}.",
         name = mfile::MFILE_NAME,
     )
 }
@@ -344,7 +359,7 @@ pub(crate) fn report_upload_outcome(
 ) -> Result<(), anyhow::Error> {
     let outcome = outcome?;
     if refuse {
-        refuse_dropped_hooks(&outcome, root)?;
+        refuse_dropped_hooks(&outcome, root, CLI_DROPPED_HOOKS_REMEDY)?;
     }
     match outcome {
         WorkspaceUpload::Uploaded => Ok(()),
