@@ -1195,9 +1195,19 @@ const EXEC_INPUT_HELD_MAX: usize = 256 * 1024 * 1024;
 /// nothing from the channel, so the connection is parked for at most this
 /// long per bound hit. A command that reads at least a byte within each
 /// such window releases it and is never ended; one that reads nothing for
-/// a whole window is. At the daemon bound only an exec holding input of its
-/// own can be the one ended: one that holds nothing waits for the others.
+/// a whole window is. The window counts this exec's own reads only: another
+/// exec's release never restarts it. At the daemon bound an exec holding
+/// input of its own is the one ended; one that holds nothing waits for the
+/// others, up to [`EXEC_INPUT_STARVED`].
 const EXEC_INPUT_STALL: Duration = Duration::from_secs(10);
+
+/// How long an exec that holds no input of its own waits at the daemon bound
+/// for the execs that do. Each of those is ended within its own stall unless
+/// it reads, so the wait is normally short; but execs that each read a byte
+/// per window keep the budget full forever, and the waiting exec's channel —
+/// with the connection behind it — would be parked as long. Past this the
+/// waiting exec ends with the daemon-bound notice instead.
+const EXEC_INPUT_STARVED: Duration = Duration::from_secs(60);
 
 /// The most unread exec input this daemon holds across all its execs. The
 /// per-exec cap alone would let N stalled execs hold N times it in a guest
@@ -1253,6 +1263,8 @@ struct HeldInputLimits {
     daemon_progress: &'static tokio::sync::Notify,
     /// The stall a running command is allowed at a bound.
     stall: Duration,
+    /// The wait an exec holding nothing is allowed at the daemon bound.
+    starved: Duration,
 }
 
 impl HeldInputLimits {
@@ -1263,6 +1275,7 @@ impl HeldInputLimits {
             daemon_held: &EXEC_INPUT_HELD_DAEMON,
             daemon_progress: &EXEC_INPUT_PROGRESS,
             stall: EXEC_INPUT_STALL,
+            starved: EXEC_INPUT_STARVED,
         }
     }
 }
@@ -1550,50 +1563,58 @@ async fn pump_channel_input<M>(
                 // parks the connection behind russh's buffer, for a bounded
                 // time: until the command starts (a fast client puts the cap
                 // in flight before a command spawns), and once it runs, for
-                // at most `stall` without a byte read. A release by this
-                // exec or, at the daemon bound, by any other wakes the wait.
+                // at most `stall` without this exec reading a byte, or, for
+                // an exec that holds nothing at the daemon bound, `starved`.
+                // The window restarts only on this exec's own reads; another
+                // exec's release wakes the pump to retry, at the daemon bound
+                // only, and leaves the window where it was.
+                let mut since = tokio::time::Instant::now();
                 let mut starved_warned = false;
                 loop {
                     let bound = match held.push(&data) {
                         Ok(()) => break,
                         Err(bound) => bound,
                     };
-                    let progress = async {
+                    if !held.started() {
                         tokio::select! {
                             _ = held.progress.notified() => {}
                             _ = held.limits.daemon_progress.notified() => {}
                         }
-                    };
-                    if !held.started() {
-                        progress.await;
+                        since = tokio::time::Instant::now();
                         continue;
                     }
-                    if tokio::time::timeout(held.limits.stall, progress)
-                        .await
-                        .is_ok()
-                    {
-                        continue;
-                    }
+                    let daemon_bound = matches!(bound, HeldBound::Daemon);
                     // The daemon's budget is full of other execs' input and
                     // this one holds nothing: it is not the one not reading,
-                    // and it waits for them (each of those ends within its
-                    // own stall, or its command reads).
-                    if matches!(bound, HeldBound::Daemon) && held.held_bytes() == 0 {
-                        if !starved_warned {
-                            starved_warned = true;
-                            tracing::warn!(
-                                daemon = held.limits.daemon,
-                                "exec: the daemon's input budget is held by other execs; this one waits for it",
-                            );
+                    // and it waits for them, up to `starved`.
+                    let starved = daemon_bound && held.held_bytes() == 0;
+                    if starved && !starved_warned {
+                        starved_warned = true;
+                        tracing::warn!(
+                            daemon = held.limits.daemon,
+                            "exec: the daemon's input budget is held by other execs; this one waits for it",
+                        );
+                    }
+                    let allowed = if starved {
+                        held.limits.starved
+                    } else {
+                        held.limits.stall
+                    };
+                    tokio::select! {
+                        _ = held.progress.notified() => {
+                            since = tokio::time::Instant::now();
+                            continue;
                         }
-                        continue;
+                        _ = held.limits.daemon_progress.notified(), if daemon_bound => continue,
+                        () = tokio::time::sleep_until(since + allowed) => {}
                     }
                     tracing::warn!(
                         ?bound,
+                        starved,
                         per_exec = held.limits.per_exec,
                         daemon = held.limits.daemon,
-                        stall_ms = u64::try_from(held.limits.stall.as_millis()).unwrap_or(u64::MAX),
-                        "exec: the command is not reading its input and the daemon holds the most it will; ending the exec",
+                        waited_ms = u64::try_from(allowed.as_millis()).unwrap_or(u64::MAX),
+                        "exec: the command's input stayed at a bound for the whole window; ending the exec",
                     );
                     held.clear();
                     end.send_replace(Some(ExecEnd::InputHeldOver(bound)));
@@ -4609,6 +4630,7 @@ mod tests {
             daemon_held: fresh_daemon(),
             daemon_progress: fresh_progress(),
             stall: std::time::Duration::from_millis(300),
+            starved: std::time::Duration::from_millis(900),
         }
     }
     fn held_with(
@@ -4782,6 +4804,171 @@ mod tests {
         );
     }
 
+    /// Before the command starts a bound is a wait, not an end: the pump
+    /// holds what fits and takes nothing more until the command is up and
+    /// reads (on the lab a 300 MB push reached the cap before the box had
+    /// spawned the command, 789z). Once it runs, the next bound with nothing
+    /// read for the stall ends the exec.
+    #[tokio::test]
+    async fn before_the_command_starts_a_bound_waits_and_a_stalled_command_ends() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msgs) = msg_stream();
+        let limits = super::HeldInputLimits {
+            per_exec: 200,
+            ..unlimited()
+        };
+        let (held, mut stdin_r) = held_with(limits);
+        let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+        let _pump = tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+
+        // The third chunk would cross the cap: the pump waits, holding two.
+        for _ in 0..3 {
+            msg_tx.send(data(100, 7)).unwrap();
+        }
+        tokio::time::sleep(limits.stall * 3).await;
+        assert!(
+            end_rx.borrow().is_none(),
+            "nothing ends before the command starts"
+        );
+        assert_eq!(held.held_bytes(), 200);
+
+        // The command starts and reads one chunk: the waiting chunk is taken.
+        held.command_started();
+        let mut first = [0u8; 100];
+        timeout(Duration::from_secs(10), stdin_r.read_exact(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            until(5, || held.held_bytes() == 200).await,
+            "the chunk the pump held back is charged once there is room"
+        );
+        assert!(end_rx.borrow().is_none());
+
+        // One more with nothing read: the stall ends the exec.
+        msg_tx.send(data(100, 7)).unwrap();
+        timeout(Duration::from_secs(10), end_rx.changed())
+            .await
+            .expect("a running command that reads nothing at the bound is ended")
+            .unwrap();
+        assert_eq!(
+            *end_rx.borrow(),
+            Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+        );
+        assert_eq!(held.held_bytes(), 0, "cleared and released on the end");
+    }
+
+    /// An exec holding nothing at the daemon bound waits for the others, but
+    /// not past `starved`: when the budget stays full (its holders read just
+    /// enough never to stall, or, here, never at all while not at a bound
+    /// themselves), the waiting exec ends with the daemon-bound reason
+    /// instead of parking its connection for good. The holder is untouched.
+    #[tokio::test]
+    async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let daemon_held = fresh_daemon();
+        let limits = super::HeldInputLimits {
+            per_exec: usize::MAX,
+            daemon: 300,
+            daemon_held,
+            daemon_progress: fresh_progress(),
+            stall: Duration::from_millis(300),
+            starved: Duration::from_millis(1500),
+        };
+        let mut pumps = Vec::new();
+        for _ in 0..2 {
+            let (msg_tx, msgs) = msg_stream();
+            let (held, stdin_r) = held_with(limits);
+            let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+            tokio::spawn(super::pump_channel_input(
+                msgs,
+                std::sync::Arc::clone(&held),
+                end_tx,
+            ));
+            pumps.push((msg_tx, stdin_r, end_rx, held));
+        }
+        for p in &pumps {
+            p.3.command_started();
+        }
+        pumps[0].0.send(data(200, 1)).unwrap();
+        assert!(
+            until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+                == 200)
+            .await
+        );
+        pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
+        tokio::time::sleep(limits.stall * 3).await;
+        assert!(
+            pumps[1].2.borrow().is_none(),
+            "past the stall, but inside the ceiling: still waiting"
+        );
+        timeout(Duration::from_secs(10), pumps[1].2.changed())
+            .await
+            .expect("a starved exec is ended at the ceiling")
+            .unwrap();
+        assert_eq!(
+            *pumps[1].2.borrow(),
+            Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+        );
+        assert!(pumps[0].2.borrow().is_none(), "the holder is untouched");
+        assert_eq!(pumps[0].3.held_bytes(), 200);
+    }
+
+    /// The per-exec stall counts this exec's own reads only. Another exec
+    /// releasing input all the while (which wakes every pump waiting at the
+    /// daemon bound) must not restart it: a command that reads nothing at
+    /// its own cap is ended within the stall regardless.
+    #[tokio::test]
+    async fn another_execs_releases_do_not_extend_a_stall() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let limits = super::HeldInputLimits {
+            per_exec: 200,
+            stall: Duration::from_millis(500),
+            ..unlimited()
+        };
+        let (msg_tx, msgs) = msg_stream();
+        let (stalled, _never_read) = held_with(limits);
+        let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&stalled),
+            end_tx,
+        ));
+        stalled.command_started();
+        for _ in 0..3 {
+            msg_tx.send(data(100, 7)).unwrap(); // the third waits at the cap
+        }
+        // Another exec on the same daemon releases every 50 ms.
+        let (busy, _busy_reader) = held_with(limits);
+        let churn = tokio::spawn(async move {
+            loop {
+                busy.push(&[0u8; 10])
+                    .expect("the churning exec has no bound");
+                busy.clear();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+        churn.abort();
+        ended
+            .expect("the stall ends the exec though other execs keep releasing")
+            .unwrap();
+        assert_eq!(
+            *end_rx.borrow(),
+            Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+        );
+    }
+
     /// Two execs share the daemon's budget. The one that would cross it
     /// while holding nothing of its own is not the one hoarding: it waits,
     /// and goes on the moment the other releases (ended, here), while the
@@ -4798,6 +4985,8 @@ mod tests {
             daemon_held,
             daemon_progress: fresh_progress(),
             stall: Duration::from_millis(300),
+            // longer than this test's waits: it is about the wait, not its end
+            starved: Duration::from_secs(60),
         };
         let mut pumps = Vec::new();
         for _ in 0..2 {
