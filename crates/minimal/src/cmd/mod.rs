@@ -629,7 +629,7 @@ pub(crate) async fn submit_verdict_and_wait(
     session_id: boxes::SessionId,
     verdict: boxes::wire::request::ContributionVerdict,
 ) -> Result<boxes::SessionId, anyhow::Error> {
-    use boxes::wire::request::SessionStep;
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::SubmitVerdict;
 
     let resp = match client.oneshot_rpc::<SubmitVerdict>(verdict).await {
@@ -647,8 +647,8 @@ pub(crate) async fn submit_verdict_and_wait(
         }
     };
     match step {
-        SessionStep::Materialized { id } => Ok(id),
-        SessionStep::Fault { error } => {
+        BoxStep::Materialized { id } => Ok(id),
+        BoxStep::Fault { error } => {
             send_abort(client, session_id).await;
             bail!("{error}");
         }

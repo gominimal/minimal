@@ -11,7 +11,7 @@
 //! here — unless `--keep` retains it as an attachable session.
 //!
 //! Deliberately composed from the same client/RPC primitives `cmd_activate`
-//! uses (`SessionConfig`, `CreateSession`, the upload gates,
+//! uses (`BoxConfig`, `CreateSession`, the upload gates,
 //! `ConfigureLoadout`, the gating hooks, `FinalizeSession`) rather than
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
@@ -649,11 +649,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     crate::ensure_daemon(global)?;
 
-    let config = minimald_rpc::SessionConfig {
+    let config = minimald_rpc::BoxConfig {
         name: Some(task_session_name(&args.task, &crate::random_hex4())),
         project_path: abs_path.clone(),
         network: boxes::NetworkMode::HostNet,
-        policy: boxes::SessionPolicy::default(),
+        policy: boxes::BoxPolicy::default(),
         task_addresses: Vec::new(),
         box_id: None,
         box_addresses: None,

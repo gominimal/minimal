@@ -9,13 +9,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use boxes::{EffectiveSessionPolicy, NetworkMode, SessionId, SessionPolicy};
+use boxes::{BoxPolicy, EffectiveBoxPolicy, NetworkMode, SessionId};
 use minimal_client::Client;
 use minimald_rpc::{
-    CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest, Errorable,
-    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetSessionRecord,
+    BoxConfig, CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest,
+    Errorable, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetVersion, ListSessions, OneshotSshRpc, RenameSession,
-    RenameSessionRequest, SessionConfig,
+    RenameSessionRequest,
 };
 
 /// Deadline for the UI-loop RPCs. The draw loop awaits these inline, so a
@@ -243,13 +243,7 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
 pub async fn fetch_detail(
     provider: &mut Provider,
     id: SessionId,
-) -> Result<
-    (
-        Option<boxes::Record>,
-        Result<EffectiveSessionPolicy, String>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<(Option<boxes::Record>, Result<EffectiveBoxPolicy, String>), anyhow::Error> {
     let record = timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .context("GetSessionRecord RPC failed")?
@@ -492,11 +486,11 @@ pub async fn activate(
     // the reply echoes back — not a `GetVersion` ahead of them. Activation is
     // the one path where an extra round trip is felt, and the create can carry
     // the check for free.
-    let config = SessionConfig {
+    let config = BoxConfig {
         name,
         project_path: project_path.clone(),
         network,
-        policy: SessionPolicy::default(),
+        policy: BoxPolicy::default(),
         // An own-address box on a VM-backed host is handed its addresses by
         // the registration [`create_registering`] makes first.
         task_addresses: Vec::new(),
@@ -713,9 +707,9 @@ type CreateFuture<'c> = std::pin::Pin<
 /// `client`.
 async fn create_registering<C: Send>(
     sock: &Path,
-    mut config: SessionConfig,
+    mut config: BoxConfig,
     client: &mut C,
-    mut create: impl for<'c> FnMut(&'c mut C, SessionConfig) -> CreateFuture<'c>,
+    mut create: impl for<'c> FnMut(&'c mut C, BoxConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
     use minimal_client::box_name::{autogen_session_name, random_hex4, should_retry_autogen};
     use minimal_client::box_registration::{
@@ -930,15 +924,15 @@ mod tests {
     }
 
     /// The dashboard's create config for an own-address box in `dir`.
-    fn own_ip_config(dir: &Path, name: Option<&str>) -> SessionConfig {
-        SessionConfig {
+    fn own_ip_config(dir: &Path, name: Option<&str>) -> BoxConfig {
+        BoxConfig {
             name: name.map(str::to_string),
             project_path: paths::HostAbsPath::try_new(
                 camino::Utf8PathBuf::from_path_buf(dir.join("web-app")).unwrap(),
             )
             .unwrap(),
             network: NetworkMode::OwnIp,
-            policy: SessionPolicy::default(),
+            policy: BoxPolicy::default(),
             task_addresses: Vec::new(),
             box_id: None,
             box_addresses: None,
@@ -1259,12 +1253,12 @@ mod tests {
             username: None,
             project_path: paths::HostAbsPath::try_new("/p").unwrap(),
             network: NetworkMode::OwnIp,
-            policy: SessionPolicy {
+            policy: BoxPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
             },
-            status: boxes::SessionStatus::default(),
+            status: boxes::BoxState::default(),
             hooks_enabled: true,
             box_addresses,
             task_addresses: Vec::new(),
@@ -1313,12 +1307,12 @@ mod tests {
             username: None,
             project_path: paths::HostAbsPath::try_new("/p").unwrap(),
             network: NetworkMode::OwnIp,
-            policy: SessionPolicy {
+            policy: BoxPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
             },
-            status: boxes::SessionStatus::default(),
+            status: boxes::BoxState::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(handed),

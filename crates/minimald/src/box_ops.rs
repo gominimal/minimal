@@ -15,7 +15,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::box_actor::WeakSessionHandle;
+use crate::box_actor::WeakBoxHandle;
 
 /// The terminal result of a build side-op, delivered as the final
 /// [`BuildUpdate`] before the build's channel closes.
@@ -397,7 +397,7 @@ enum Op {
 #[allow(dead_code)]
 pub struct SideOp {
     id: uuid::Uuid,
-    session: WeakSessionHandle,
+    session: WeakBoxHandle,
 
     op: Op,
 
@@ -444,7 +444,7 @@ impl SideOp {
     ///
     /// Should only be called from the session actor.
     pub(crate) async fn spawn_build(
-        session: WeakSessionHandle,
+        session: WeakBoxHandle,
         rebuild: bool,
         pkgs: Vec<String>,
         ctx: Context,
@@ -458,7 +458,7 @@ impl SideOp {
 
     /// Called to kick off a new build with the specified parameters.
     async fn new_build(
-        session: WeakSessionHandle,
+        session: WeakBoxHandle,
         rebuild: bool,
         pkgs: Vec<String>,
         ctx: Context,
@@ -552,7 +552,7 @@ impl SideOp {
     ///
     /// Should only be called from the session actor.
     pub(crate) async fn spawn_check(
-        session: WeakSessionHandle,
+        session: WeakBoxHandle,
         opts: CheckOpts,
         ctx: Context,
         buffer: usize,
@@ -564,7 +564,7 @@ impl SideOp {
 
     /// Called to kick off a new check run with the specified parameters.
     async fn new_check(
-        session: WeakSessionHandle,
+        session: WeakBoxHandle,
         opts: CheckOpts,
         ctx: Context,
         sinks: Vec<CheckSink>,
@@ -697,7 +697,7 @@ impl SideOp {
     ///
     /// Should only be called from the session actor.
     pub(crate) async fn spawn_materialize(
-        session: WeakSessionHandle,
+        session: WeakBoxHandle,
         opts: MaterializeOpts,
         ctx: Context,
         buffer: usize,
@@ -714,7 +714,7 @@ impl SideOp {
     /// handed. The cancel token stops the package build only: assembly is not
     /// interruptible.
     async fn new_materialize(
-        session: WeakSessionHandle,
+        session: WeakBoxHandle,
         opts: MaterializeOpts,
         ctx: Context,
         sinks: Vec<MaterializeSink>,

@@ -16,8 +16,8 @@ use crate::{
 };
 
 /// Describes the session object yielded by [`Loader`].
-pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
-    type Key: SessionKey;
+pub trait BoxObject: Sized + Send + Clone + 'static + std::fmt::Debug {
+    type Key: BoxKey;
 
     fn record(&self) -> &Record;
     fn refresh_from_record(&mut self, r: Record);
@@ -46,15 +46,15 @@ pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
 
 /// Describes the primary key a [`Loader`] uses to reference
 /// sessions.
-pub trait SessionKey: Sized + Send + 'static + std::fmt::Debug + Clone + Eq + Ord {
+pub trait BoxKey: Sized + Send + 'static + std::fmt::Debug + Clone + Eq + Ord {
     /// Returns the ID of the session.
     fn id(&self) -> &SessionId;
 }
 
 /// A type which can load sessions.
 pub trait Loader {
-    type Key: SessionKey;
-    type Object: SessionObject<Key = Self::Key>;
+    type Key: BoxKey;
+    type Object: BoxObject<Key = Self::Key>;
 
     /// Lists all sessions known to this loader, by key.
     fn keys(&self) -> impl Iterator<Item = Self::Key>;
@@ -217,12 +217,12 @@ pub trait Loader {
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DiskSessionKey {
+pub struct DiskBoxKey {
     session_id: SessionId,
     dir_key: DaemonRelPath,
 }
 
-impl SessionKey for DiskSessionKey {
+impl BoxKey for DiskBoxKey {
     fn id(&self) -> &SessionId {
         &self.session_id
     }
@@ -230,21 +230,21 @@ impl SessionKey for DiskSessionKey {
 
 /// The concrete session object from [`DiskLoader`].
 #[derive(Debug, Clone)]
-pub struct DiskSession {
-    key: DiskSessionKey,
+pub struct DiskBox {
+    key: DiskBoxKey,
     minimal_state_dir: DaemonAbsPath,
     record: Record,
 }
 
-impl DiskSession {
+impl DiskBox {
     fn root_path(&self) -> DaemonAbsPath {
         sub_path!(self.minimal_state_dir, "sessions")
             .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
     }
 }
 
-impl SessionObject for DiskSession {
-    type Key = DiskSessionKey;
+impl BoxObject for DiskBox {
+    type Key = DiskBoxKey;
 
     fn record(&self) -> &Record {
         &self.record
@@ -255,7 +255,7 @@ impl SessionObject for DiskSession {
         self.record.id = id; // ID must never change
     }
 
-    fn key(&self) -> &DiskSessionKey {
+    fn key(&self) -> &DiskBoxKey {
         &self.key
     }
     fn workspace_path(&self) -> DaemonAbsPath {
@@ -758,8 +758,8 @@ impl DiskLoader {
     /// Resolve `key` to its live short directory name, or `NotFound` if the
     /// key is stale.
     ///
-    /// A [`DiskSessionKey`] can outlive the session it names — a caller may
-    /// hold a key (or a `SessionRecordHandle`) across a concurrent delete. A
+    /// A [`DiskBoxKey`] can outlive the session it names — a caller may
+    /// hold a key (or a `BoxRecordHandle`) across a concurrent delete. A
     /// stale key is refused two ways:
     ///
     /// - its short is no longer in the index (the session was deleted), or
@@ -773,7 +773,7 @@ impl DiskLoader {
     ///
     /// [`get`]: Loader::get
     /// [`delete`]: Loader::delete
-    fn live_short(&self, key: &DiskSessionKey) -> Result<String, std::io::Error> {
+    fn live_short(&self, key: &DiskBoxKey) -> Result<String, std::io::Error> {
         let short = key.dir_key.to_string();
         match self.index.short_to_id.get(&short) {
             Some(stored_id) if stored_id == key.id() => Ok(short),
@@ -853,8 +853,8 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
 }
 
 impl Loader for DiskLoader {
-    type Key = DiskSessionKey;
-    type Object = DiskSession;
+    type Key = DiskBoxKey;
+    type Object = DiskBox;
 
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
         if let Some(name) = &record.name {
@@ -894,7 +894,7 @@ impl Loader for DiskLoader {
             .insert(short.clone(), SessionId(uuid), record.name);
         self.flush_index()?;
 
-        Ok(DiskSessionKey {
+        Ok(DiskBoxKey {
             session_id: SessionId(uuid),
             dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
@@ -938,7 +938,7 @@ impl Loader for DiskLoader {
             .join(&short)
             .join("record.json");
         let record: Record = serde_json_lenient::from_reader(std::fs::File::open(record_file)?)?;
-        Ok(DiskSession {
+        Ok(DiskBox {
             minimal_state_dir: self.minimal_dir.clone(),
             key: key.clone(),
             record,
@@ -1173,7 +1173,7 @@ impl Loader for DiskLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SessionStatus;
+    use crate::BoxState;
     use paths::HostAbsPath;
     use std::{collections::BTreeSet, io::ErrorKind};
     use tempfile::TempDir;
@@ -1194,7 +1194,7 @@ mod tests {
             // all-`None` default. Every egress field is set, deny_subnets
             // included, so a field dropped on write shows up as a diff.
             network: crate::NetworkMode::OwnIp,
-            policy: crate::SessionPolicy::new(
+            policy: crate::BoxPolicy::new(
                 Some(crate::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
@@ -1203,7 +1203,7 @@ mod tests {
                 }),
                 None,
             ),
-            status: SessionStatus::default(),
+            status: BoxState::default(),
             // Deliberately the non-default shapes: `hooks_enabled: false`
             // and a present `box_addresses` are both serde defaults to
             // `None`/`true`, so a fixture using those would round-trip
@@ -1522,13 +1522,10 @@ mod tests {
         // Re-saving the unchanged record (e.g. a status promotion) must not
         // re-validate the reserved name.
         let mut promoted = loader.get(&key).unwrap().record().clone();
-        promoted.status = SessionStatus::Active;
+        promoted.status = BoxState::Active;
         loader.save(&key, &promoted).unwrap();
 
-        assert_eq!(
-            loader.get(&key).unwrap().record().status,
-            SessionStatus::Active,
-        );
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
     }
 
     #[test]
@@ -1661,12 +1658,9 @@ mod tests {
         // Re-saving the record with its legacy name unchanged (e.g. a status
         // promotion) must not re-validate the name.
         let mut promoted = loader.get(&key).unwrap().record().clone();
-        promoted.status = SessionStatus::Active;
+        promoted.status = BoxState::Active;
         loader.save(&key, &promoted).unwrap();
-        assert_eq!(
-            loader.get(&key).unwrap().record().status,
-            SessionStatus::Active,
-        );
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
     }
 
     #[test]
@@ -1962,18 +1956,15 @@ mod tests {
         let key = loader
             .create({
                 let mut r = sample_record();
-                r.status = SessionStatus::Pending;
+                r.status = BoxState::Pending;
                 r
             })
             .unwrap();
         let mut promoted = loader.get(&key).unwrap().record().clone();
-        promoted.status = SessionStatus::Active;
+        promoted.status = BoxState::Active;
         loader.save(&key, &promoted).unwrap();
 
-        assert_eq!(
-            loader.get(&key).unwrap().record().status,
-            SessionStatus::Active,
-        );
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
     }
 
     #[test]
@@ -2166,7 +2157,7 @@ mod tests {
     /// "squatter") straight onto disk at the freed short and re-open the loader
     /// so self-heal indexes it as an orphan. Returns the reopened loader, the
     /// now-stale key of the deleted session, and the new session's id + short.
-    fn reused_short_scenario(tmp: &TempDir) -> (DiskLoader, DiskSessionKey, SessionId, String) {
+    fn reused_short_scenario(tmp: &TempDir) -> (DiskLoader, DiskBoxKey, SessionId, String) {
         let mut loader = DiskLoader::new(loader_dir(tmp)).unwrap();
         let stale_key = loader.create(sample_record()).unwrap();
         let stale_short = stale_key.dir_key.to_string();
@@ -2249,7 +2240,7 @@ mod tests {
     // state, because the API guarantees consistency. We're testing
     // the on-disk recovery.
 
-    fn short_of(key: &DiskSessionKey) -> String {
+    fn short_of(key: &DiskBoxKey) -> String {
         key.dir_key.to_string()
     }
 

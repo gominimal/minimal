@@ -183,7 +183,7 @@ impl ExposedMapping {
 pub struct PortForwarder {
     mapping: ExposedMapping,
     internal_port: u16,
-    gate: Option<Arc<super::switch::SessionGate>>,
+    gate: Option<Arc<super::switch::BoxGate>>,
     /// Whether this forwarder's ingress was revoked already — set by
     /// [`Self::revoke`] once its unbind has *succeeded*, so a revocation that
     /// failed at the switch stays unrevoked and both a retry and the
@@ -348,7 +348,7 @@ pub async fn apply_ingress(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::SessionGate>>,
+    gate: Option<&Arc<super::switch::BoxGate>>,
     yielded: &[super::dns::SharedPortCollision],
 ) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
@@ -443,7 +443,7 @@ pub async fn bind_handed_port(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     mapping: &PortMapping,
-    gate: Option<&Arc<super::switch::SessionGate>>,
+    gate: Option<&Arc<super::switch::BoxGate>>,
 ) -> io::Result<HandedBind> {
     let req = expose_request(mapping, published, ptask_ip);
     let answer = post_json(control, "/services/forwarder/expose", &req).await;
@@ -893,7 +893,7 @@ pub async fn expose_dynamic(
     ptask_ip: Ipv4Addr,
     port: u16,
     proto: IpProto,
-    gate: Option<&Arc<super::switch::SessionGate>>,
+    gate: Option<&Arc<super::switch::BoxGate>>,
 ) -> io::Result<PortForwarder> {
     let req = ExposeRequest {
         local: format!("{published}:{port}"),

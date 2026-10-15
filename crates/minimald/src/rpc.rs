@@ -26,7 +26,7 @@ use crate::traced::spawn;
 
 use crate::{
     ChannelConfig,
-    box_manager::SessionKeyPredicate,
+    box_manager::BoxKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
     net::classifier,
     server::ServerStateHandle,
@@ -152,7 +152,7 @@ async fn serve_list_sessions(
             let fact = crate::box_runtime::host_ip_enforcement_fact();
             let enforcement = futures::future::join_all(infos.iter().map(|i| async {
                 let record = mngr
-                    .get_record(SessionKeyPredicate::Id(i.id))
+                    .get_record(BoxKeyPredicate::Id(i.id))
                     .await
                     .ok()
                     .flatten();
@@ -221,7 +221,7 @@ async fn serve_list_sessions(
 /// Empty for every mode but a shared-address own-ip box; a plain map lookup
 /// behind the registry's lock, so it never holds up a reply.
 fn shared_port_collisions_of(
-    mngr: &crate::box_manager::ManagerHandle,
+    mngr: &crate::box_manager::BoxManagerHandle,
     id: SessionId,
 ) -> Vec<minimald_rpc::SharedPortCollision> {
     let registry = mngr.hostnames();
@@ -256,7 +256,7 @@ async fn serve_get_session_record(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
-    use crate::box_manager::SessionKeyPredicate;
+    use crate::box_manager::BoxKeyPredicate;
     GetSessionRecord
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
@@ -264,8 +264,8 @@ async fn serve_get_session_record(
                 daemon_version: Some(OWN_VERSION.to_string()),
                 record: mngr
                     .get_record(match req {
-                        GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
-                        GetSessionRecordRequest::Name(name) => SessionKeyPredicate::Name(name),
+                        GetSessionRecordRequest::Id(id) => BoxKeyPredicate::Id(id),
+                        GetSessionRecordRequest::Name(name) => BoxKeyPredicate::Name(name),
                     })
                     .await
                     .map_err(|e| ConnectionError::Internal(e.to_string()))?,
@@ -275,7 +275,7 @@ async fn serve_get_session_record(
 }
 
 /// Stand-in for `session_name` on the lifecycle records when the session
-/// carries no user-assigned name. `SessionConfig::name` is `None` for an
+/// carries no user-assigned name. `BoxConfig::name` is `None` for an
 /// anonymous session, and an absent field reads like a logging bug.
 const ANONYMOUS_SESSION: &str = "<anonymous>";
 
@@ -292,7 +292,7 @@ struct EgressRuleCounts {
 }
 
 impl EgressRuleCounts {
-    fn of(policy: &minimald_rpc::SessionPolicy) -> Self {
+    fn of(policy: &minimald_rpc::BoxPolicy) -> Self {
         let egress = policy.egress.as_ref();
         Self {
             allow_subnets: egress
@@ -1043,7 +1043,7 @@ async fn serve_configure_loadout(
         .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
             let mngr = s.sessions_manager().await;
             let handle = mngr
-                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .get_session(BoxKeyPredicate::Id(req.session_id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
@@ -1067,8 +1067,8 @@ async fn serve_configure_loadout(
 /// `SubmitVerdict`: the client's per-item decisions for a `Pending`
 /// session. Resolves the session's live actor and routes the verdict
 /// to it; the actor runs `resume_from_verdict` and promotes its
-/// record `Pending → Active`. Replies with `Errorable::Ok(SessionStep)`
-/// where the `SessionStep` is `Active { id }` on success or
+/// record `Pending → Active`. Replies with `Errorable::Ok(BoxStep)`
+/// where the `BoxStep` is `Active { id }` on success or
 /// `Fault { error }` for a structured failure. A verdict for an id
 /// with no live session — including an actor that died between
 /// resolve and delivery — maps to `Fault { UnknownSessionId }` here;
@@ -1081,12 +1081,12 @@ async fn serve_submit_verdict(
         .handle_channel(c, async |req: boxes::wire::request::ContributionVerdict| {
             let mngr = s.sessions_manager().await;
             let unknown = || {
-                Errorable::Ok(boxes::wire::request::SessionStep::Fault {
+                Errorable::Ok(boxes::wire::request::BoxStep::Fault {
                     error: boxes::wire::errors::WireError::UnknownSessionId,
                 })
             };
             let handle = mngr
-                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .get_session(BoxKeyPredicate::Id(req.session_id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             match handle {
@@ -1114,7 +1114,7 @@ async fn serve_finalize_session(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let handle = mngr
-                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .get_session(BoxKeyPredicate::Id(req.session_id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
@@ -1155,7 +1155,7 @@ async fn serve_rename_session(
                 match s
                     .sessions_manager()
                     .await
-                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .get_session(BoxKeyPredicate::Id(req.id))
                     .await?
                 {
                     None => Err(std::io::Error::new(
@@ -1189,7 +1189,7 @@ async fn serve_destroy_session(
             // lookup degrades to the anonymous stand-in rather than failing
             // a destroy that would otherwise succeed.
             let session_name = mngr
-                .get_record(SessionKeyPredicate::Id(req.id))
+                .get_record(BoxKeyPredicate::Id(req.id))
                 .await
                 .ok()
                 .flatten()
@@ -1368,7 +1368,7 @@ async fn serve_abort_session(
                 match s
                     .sessions_manager()
                     .await
-                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .get_session(BoxKeyPredicate::Id(req.id))
                     .await?
                 {
                     None => Err(std::io::Error::new(
@@ -1397,8 +1397,8 @@ async fn serve_get_session_policy(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                GetSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
-                GetSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+                GetSessionPolicyRequest::Id(id) => BoxKeyPredicate::Id(id),
+                GetSessionPolicyRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let record = mngr
                 .get_record(predicate)
@@ -1434,12 +1434,12 @@ async fn serve_get_session_policy(
 /// tests name [`boxes::EgressDefaultPhase::InForce`] so the deny-all
 /// posture they prove does not hang on that constant.
 pub(crate) fn effective_policy_reply(
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     network: boxes::NetworkMode,
     phase: boxes::EgressDefaultPhase,
     opt_out: bool,
-) -> minimald_rpc::EffectiveSessionPolicy {
-    minimald_rpc::EffectiveSessionPolicy {
+) -> minimald_rpc::EffectiveBoxPolicy {
+    minimald_rpc::EffectiveBoxPolicy {
         egress: boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
@@ -1470,8 +1470,8 @@ async fn serve_get_effective_session_policy(
             let opt_out = s.deny_all_opt_out().await;
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                GetEffectiveSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
-                GetEffectiveSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+                GetEffectiveSessionPolicyRequest::Id(id) => BoxKeyPredicate::Id(id),
+                GetEffectiveSessionPolicyRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let record = mngr
                 .get_record(predicate)
@@ -1507,7 +1507,7 @@ async fn serve_get_effective_session_policy(
 /// permitted.
 ///
 /// The live actor's own state, so this resolves the session where the policy
-/// RPCs read the record: [`Manager::get_session`] brings a known session's
+/// RPCs read the record: [`BoxManager::get_session`] brings a known session's
 /// actor up if it has none running, and an actor holding no host answers an
 /// empty list — the honest answer for a box that is not running, since a
 /// publish lives only while its box does.
@@ -1527,8 +1527,8 @@ async fn serve_get_live_ingress(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                minimald_rpc::GetLiveIngressRequest::Id(id) => SessionKeyPredicate::Id(id),
-                minimald_rpc::GetLiveIngressRequest::Name(name) => SessionKeyPredicate::Name(name),
+                minimald_rpc::GetLiveIngressRequest::Id(id) => BoxKeyPredicate::Id(id),
+                minimald_rpc::GetLiveIngressRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let session = mngr
                 .get_session(predicate)
@@ -1579,8 +1579,8 @@ async fn serve_get_session_runtime_facts(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                GetSessionRuntimeFactsRequest::Id(id) => SessionKeyPredicate::Id(id),
-                GetSessionRuntimeFactsRequest::Name(name) => SessionKeyPredicate::Name(name),
+                GetSessionRuntimeFactsRequest::Id(id) => BoxKeyPredicate::Id(id),
+                GetSessionRuntimeFactsRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let record = mngr
                 .get_record(predicate)
@@ -1605,7 +1605,7 @@ async fn serve_get_session_runtime_facts(
                     // answer has no watcher running, and nothing to warn
                     // about.
                     let unaudited_listen_ports =
-                        match mngr.get_session(SessionKeyPredicate::Id(record.id)).await {
+                        match mngr.get_session(BoxKeyPredicate::Id(record.id)).await {
                             Ok(Some(session)) => session
                                 .live_ingress()
                                 .await
@@ -1632,7 +1632,7 @@ async fn serve_get_session_runtime_facts(
                     // the registry's lock, a plain map lookup, so it never
                     // holds up the reply.
                     let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
-                    Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
+                    Ok(Errorable::Ok(minimald_rpc::BoxRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
                         unaudited_listen_ports,
@@ -1661,8 +1661,8 @@ async fn serve_get_session_hooks(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                minimald_rpc::GetSessionHooksRequest::Id(id) => SessionKeyPredicate::Id(id),
-                minimald_rpc::GetSessionHooksRequest::Name(name) => SessionKeyPredicate::Name(name),
+                minimald_rpc::GetSessionHooksRequest::Id(id) => BoxKeyPredicate::Id(id),
+                minimald_rpc::GetSessionHooksRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             // The record first, only to tell "no such session" from "a
             // session with nothing recorded" — both of which the
@@ -1710,7 +1710,7 @@ async fn serve_session_delta(
 ) -> Result<(), ConnectionError> {
     SessionDelta
         .handle_channel(c, async |req: SessionDeltaRequest| {
-            let predicate = SessionKeyPredicate::Id(req.id);
+            let predicate = BoxKeyPredicate::Id(req.id);
             Ok(
                 match s.sessions_manager().await.get_session(predicate).await {
                     Ok(Some(h)) => h.workspace_at_risk().await,
@@ -1733,7 +1733,7 @@ async fn serve_get_session_screen(
         .handle_channel(c, async |id| {
             let mngr = s.sessions_manager().await;
             let snapshot = mngr
-                .get_screen(SessionKeyPredicate::Id(id))
+                .get_screen(BoxKeyPredicate::Id(id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             Ok(match snapshot {
@@ -2061,13 +2061,7 @@ async fn serve_stream_workspace_patches(
 async fn upload_session_handle(
     s: &ServerStateHandle,
     config: &ChannelConfig,
-) -> Result<
-    (
-        crate::box_actor::SessionHandle,
-        crate::box_actor::SessionPaths,
-    ),
-    String,
-> {
+) -> Result<(crate::box_actor::BoxHandle, crate::box_actor::BoxPaths), String> {
     let session_id_str = config
         .env_vars
         .get(crate::MINIMAL_SESSION_ID_ENV)
@@ -2077,7 +2071,7 @@ async fn upload_session_handle(
 
     let mngr = s.sessions_manager().await;
     let session_handle = mngr
-        .get_session(SessionKeyPredicate::Id(session_id))
+        .get_session(BoxKeyPredicate::Id(session_id))
         .await
         .map_err(|e| format!("session UUID lookup failed: {e}"))?
         .ok_or("unknown session UUID")?;
@@ -2094,14 +2088,14 @@ async fn upload_session_handle(
 /// panic, or the upload task torn down mid-stream) enqueues the clear
 /// without awaiting it instead, so no exit path leaves the session refusing
 /// attaches forever.
-pub(crate) struct WorkspaceUploadInFlight(Option<crate::box_actor::SessionHandle>);
+pub(crate) struct WorkspaceUploadInFlight(Option<crate::box_actor::BoxHandle>);
 
 impl WorkspaceUploadInFlight {
     /// Marks the upload in flight. Refused, marking nothing, when the
     /// session is no longer unconfigured: an upload belongs to the create
     /// flow, ahead of the configure, and one into a composed or configured
     /// session's tree is not part of it.
-    pub(crate) async fn begin(handle: crate::box_actor::SessionHandle) -> Result<Self, String> {
+    pub(crate) async fn begin(handle: crate::box_actor::BoxHandle) -> Result<Self, String> {
         handle
             .set_workspace_upload_in_flight(true)
             .await
@@ -2824,18 +2818,17 @@ pub async fn handle_ssh_rpc(
 mod tests {
     use boxes::{NetworkMode, SessionId};
     use minimald_rpc::{
-        CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
-        EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
-        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest, IngressPolicy,
-        IpProto, PortMapping, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
-        ShutdownResponse,
+        BoxPolicy, CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveBoxPolicy,
+        EffectiveEgress, EgressPolicy, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest,
+        GetSessionPolicy, GetSessionPolicyRequest, IngressPolicy, IpProto, PortMapping,
+        RenameSessionRequest, Shutdown, ShutdownRequest, ShutdownResponse,
     };
     use paths::HostAbsPath;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::MINIMAL_SESSION_ID_ENV;
-    use crate::box_manager::SessionKeyPredicate;
+    use crate::box_manager::BoxKeyPredicate;
     use crate::box_runtime::PROBE_TEST_MUTEX;
     use crate::test_harness::{TestClient, TestServer};
 
@@ -2901,7 +2894,7 @@ mod tests {
 
         let mngr = server.state.sessions_manager().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("freshly-created session should be retrievable");
@@ -3069,7 +3062,7 @@ mod tests {
             .state
             .sessions_manager()
             .await
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("the session should resolve")
@@ -3129,7 +3122,7 @@ mod tests {
             .state
             .sessions_manager()
             .await
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("the session should resolve")
@@ -3221,7 +3214,7 @@ mod tests {
 
         let mngr = server.state.sessions_manager().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("session should be retrievable");
@@ -3305,7 +3298,7 @@ mod tests {
 
         let mngr = server.state.sessions_manager().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("session should be retrievable");
@@ -3424,7 +3417,7 @@ mod tests {
     ) -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
         let mngr = server.state.sessions_manager().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("session should be retrievable");
@@ -3878,7 +3871,7 @@ mod tests {
                 project_path: Some(HostAbsPath::try_new("/uwu").unwrap()),
                 // A freshly-created session that hasn't been configured yet
                 // sits in `Pending` until `ConfigureLoadout` promotes it.
-                status: boxes::SessionStatus::Pending,
+                status: boxes::BoxState::Pending,
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
                 // The same state the create response above carried
@@ -4127,7 +4120,7 @@ mod tests {
             classifier::Cause::StepNotInstalled,
         ));
         let mut deny_all = req("deny-all", "/uwu");
-        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        deny_all.config.policy = BoxPolicy::new(Some(EgressPolicy::deny_all()), None);
         let created = client.call::<CreateSession>(&deny_all).await.unwrap();
 
         assert_eq!(
@@ -4206,7 +4199,7 @@ mod tests {
         let own_address = own_ip_session(
             &mut client,
             "own-address",
-            SessionPolicy::new(Some(EgressPolicy::deny_all()), None),
+            BoxPolicy::new(Some(EgressPolicy::deny_all()), None),
         )
         .await;
         assert!(own_address != SessionId::nil());
@@ -4251,7 +4244,7 @@ mod tests {
         // the one carrying an egress section still runs unenforced and
         // still says so, at its create and after.
         let mut sectioned = req("sectioned", "/uwu");
-        sectioned.config.policy = SessionPolicy::new(
+        sectioned.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 ..EgressPolicy::deny_all()
@@ -4263,7 +4256,7 @@ mod tests {
             classifier::Cause::TableNotEffective,
         ));
         let mut refused_create = req("refused-create", "/uwu");
-        refused_create.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        refused_create.config.policy = BoxPolicy::new(Some(EgressPolicy::deny_all()), None);
         let refused_create = client.call::<CreateSession>(&refused_create).await.unwrap();
         assert!(
             refused_create.host_ip_enforcement.is_none(),
@@ -4273,7 +4266,7 @@ mod tests {
             refused_create.host_ip_enforcement
         );
         let mut unrefused_create = req("unrefused-create", "/uwu");
-        unrefused_create.config.policy = SessionPolicy::new(
+        unrefused_create.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 ..EgressPolicy::deny_all()
@@ -4526,7 +4519,7 @@ mod tests {
         // read, nothing decided — so the create gate refuses nothing here; the
         // section it declares is what keeps the listing entry the fact's.
         let mut session = req("reread-proof", "/uwu");
-        session.config.policy = SessionPolicy::new(
+        session.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 ..EgressPolicy::deny_all()
@@ -4666,7 +4659,7 @@ mod tests {
         // `--allow-subnets` narrows what the box may reach — a narrowing the
         // allow subtree refuses nothing to enforce.
         let mut deny_a_range = req("refused-deny-range", "/uwu");
-        deny_a_range.config.policy = SessionPolicy::new(
+        deny_a_range.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
                 ..Default::default()
@@ -4707,7 +4700,7 @@ mod tests {
         );
 
         let mut allow_a_subnet = req("refused-allow-list", "/uwu");
-        allow_a_subnet.config.policy = SessionPolicy::new(
+        allow_a_subnet.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 ..Default::default()
@@ -4765,7 +4758,7 @@ mod tests {
         let own_address = own_ip_session(
             &mut client,
             "own-address-narrowed",
-            SessionPolicy::new(
+            BoxPolicy::new(
                 Some(EgressPolicy {
                     deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
                     ..Default::default()
@@ -4820,7 +4813,7 @@ mod tests {
         );
 
         let mut deny_all = req("deny-all-host-address", "/uwu");
-        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        deny_all.config.policy = BoxPolicy::new(Some(EgressPolicy::deny_all()), None);
         let deny_all = client.call::<CreateSession>(&deny_all).await.unwrap();
         assert_eq!(
             deny_all.host_ip_enforcement.as_deref(),
@@ -4886,7 +4879,7 @@ mod tests {
 
         // Every declaration shape, created: the two narrowings a per-box
         // host refuses, the deny-all shape, and no section at all.
-        let narrowing = SessionPolicy::new(
+        let narrowing = BoxPolicy::new(
             Some(EgressPolicy {
                 deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
                 ..Default::default()
@@ -4897,7 +4890,7 @@ mod tests {
         denied_range.config.policy = narrowing.clone();
         let denied_range = client.call::<CreateSession>(&denied_range).await.unwrap();
         let mut narrowed = req("unenforcing-allow-list", "/uwu");
-        narrowed.config.policy = SessionPolicy::new(
+        narrowed.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 ..Default::default()
@@ -4906,7 +4899,7 @@ mod tests {
         );
         let narrowed = client.call::<CreateSession>(&narrowed).await.unwrap();
         let mut deny_all = req("unenforcing-deny-all", "/uwu");
-        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        deny_all.config.policy = BoxPolicy::new(Some(EgressPolicy::deny_all()), None);
         let deny_all = client.call::<CreateSession>(&deny_all).await.unwrap();
         let plain = client
             .call::<CreateSession>(&req("unenforcing-plain", "/uwu"))
@@ -4943,7 +4936,7 @@ mod tests {
             classifier::Cause::TableNotEffective,
         ));
         let mut nearly_decided = req("unenforcing-nearly-decided", "/uwu");
-        nearly_decided.config.policy = SessionPolicy::new(
+        nearly_decided.config.policy = BoxPolicy::new(
             Some(EgressPolicy {
                 deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
                 ..Default::default()
@@ -5427,7 +5420,7 @@ mod tests {
         // The contrast: the same fact over a declaring host-address box
         // carries it.
         let mut host_address = req("host-address", "/uwu");
-        host_address.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        host_address.config.policy = BoxPolicy::new(Some(EgressPolicy::deny_all()), None);
         let host_address = client.call::<CreateSession>(&host_address).await.unwrap();
         assert!(
             host_address.classifier_advisory.is_some(),
@@ -5438,7 +5431,7 @@ mod tests {
         let own_address = own_ip_create_reply(
             &mut client,
             "own-address",
-            SessionPolicy::new(Some(EgressPolicy::deny_all()), None),
+            BoxPolicy::new(Some(EgressPolicy::deny_all()), None),
         )
         .await;
         assert_eq!(
@@ -6187,11 +6180,11 @@ mod tests {
         };
         let created_id = client
             .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
+                config: minimald_rpc::BoxConfig {
                     name: Some("policy-session".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
-                    policy: SessionPolicy::new(Some(egress.clone()), None),
+                    policy: BoxPolicy::new(Some(egress.clone()), None),
                     task_addresses: Vec::new(),
                     box_id: None,
                     box_addresses: None,
@@ -6221,11 +6214,11 @@ mod tests {
     async fn own_ip_create_reply(
         client: &mut TestClient,
         name: &str,
-        policy: SessionPolicy,
+        policy: BoxPolicy,
     ) -> minimald_rpc::CreateSessionResponse {
         client
             .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
+                config: minimald_rpc::BoxConfig {
                     name: Some(name.to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
@@ -6244,11 +6237,7 @@ mod tests {
 
     /// Creates an own-address session carrying `policy` and returns its id —
     /// [`own_ip_create_reply`] for a caller that needs only the box.
-    async fn own_ip_session(
-        client: &mut TestClient,
-        name: &str,
-        policy: SessionPolicy,
-    ) -> SessionId {
+    async fn own_ip_session(client: &mut TestClient, name: &str, policy: BoxPolicy) -> SessionId {
         own_ip_create_reply(client, name, policy).await.id
     }
 
@@ -6281,11 +6270,11 @@ mod tests {
         let declared_id = own_ip_session(
             &mut client,
             "declared-egress",
-            SessionPolicy::new(Some(egress.clone()), None),
+            BoxPolicy::new(Some(egress.clone()), None),
         )
         .await;
-        let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
-        let laned_policy = SessionPolicy {
+        let bare_id = own_ip_session(&mut client, "bare-egress", BoxPolicy::default()).await;
+        let laned_policy = BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
@@ -6297,12 +6286,12 @@ mod tests {
         // once the default is in force.
         assert_eq!(
             super::effective_policy_reply(
-                &SessionPolicy::default(),
+                &BoxPolicy::default(),
                 NetworkMode::OwnIp,
                 boxes::EgressDefaultPhase::InForce,
                 false,
             ),
-            EffectiveSessionPolicy {
+            EffectiveBoxPolicy {
                 egress: EffectiveEgress::DenyAll,
                 ingress: None,
                 credentialed_upstream: None,
@@ -6315,7 +6304,7 @@ mod tests {
         // reply spells the default, `deny_all`, and decodes back to the
         // same value. A lane-less reply serializes without the lane's key:
         // the shape an older client reads.
-        let deny_all = EffectiveSessionPolicy {
+        let deny_all = EffectiveBoxPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
             credentialed_upstream: None,
@@ -6331,7 +6320,7 @@ mod tests {
             "a reply without a lane must serialize without the lane's key, got: {wire}",
         );
         assert_eq!(
-            serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveSessionPolicy>>(&wire)
+            serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveBoxPolicy>>(&wire)
                 .expect("the deny-all reply must decode back"),
             minimald_rpc::Errorable::Ok(deny_all),
         );
@@ -6346,7 +6335,7 @@ mod tests {
         assert_eq!(
             bare,
             super::effective_policy_reply(
-                &SessionPolicy::default(),
+                &BoxPolicy::default(),
                 NetworkMode::OwnIp,
                 boxes::EGRESS_DEFAULT_PHASE,
                 false,
@@ -6367,7 +6356,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             strict,
-            SessionPolicy::default(),
+            BoxPolicy::default(),
             "the strict policy reply must keep the declaration as launched",
         );
 
@@ -6443,10 +6432,10 @@ mod tests {
         let declared_id = own_ip_session(
             &mut client,
             "opt-out-declared",
-            SessionPolicy::new(Some(egress.clone()), None),
+            BoxPolicy::new(Some(egress.clone()), None),
         )
         .await;
-        let bare_id = own_ip_session(&mut client, "opt-out-bare", SessionPolicy::default()).await;
+        let bare_id = own_ip_session(&mut client, "opt-out-bare", BoxPolicy::default()).await;
 
         let bare = client
             .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
@@ -6454,7 +6443,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             bare,
-            EffectiveSessionPolicy {
+            EffectiveBoxPolicy {
                 egress: EffectiveEgress::AllowAll,
                 ingress: None,
                 credentialed_upstream: None,
@@ -6468,7 +6457,7 @@ mod tests {
         // posture it exists to defer whatever the shipped constant says.
         assert_eq!(
             crate::box_actor::effective_egress_section(
-                &boxes::SessionPolicy::default(),
+                &boxes::BoxPolicy::default(),
                 NetworkMode::OwnIp,
                 boxes::EgressDefaultPhase::InForce,
                 true,
@@ -6501,13 +6490,9 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         assert_eq!(
-            own_ip_create_reply(
-                &mut client,
-                "opt-out-reply-default",
-                SessionPolicy::default()
-            )
-            .await
-            .deny_all_opt_out,
+            own_ip_create_reply(&mut client, "opt-out-reply-default", BoxPolicy::default())
+                .await
+                .deny_all_opt_out,
             Some(false),
             "a daemon without the flag must say it did not opt out",
         );
@@ -6515,7 +6500,7 @@ mod tests {
         let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
         let mut client = server.connect().await;
         assert_eq!(
-            own_ip_create_reply(&mut client, "opt-out-reply-set", SessionPolicy::default())
+            own_ip_create_reply(&mut client, "opt-out-reply-set", BoxPolicy::default())
                 .await
                 .deny_all_opt_out,
             Some(true),
@@ -6655,11 +6640,11 @@ mod tests {
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
+                config: minimald_rpc::BoxConfig {
                     name: Some("bad-policy".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::NoNet,
-                    policy: SessionPolicy::new(Some(egress), None),
+                    policy: BoxPolicy::new(Some(egress), None),
                     task_addresses: Vec::new(),
                     box_id: None,
                     box_addresses: None,
@@ -6705,11 +6690,11 @@ mod tests {
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
+                config: minimald_rpc::BoxConfig {
                     name: Some("bad-ingress".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::HostNet,
-                    policy: SessionPolicy::new(None, Some(ingress)),
+                    policy: BoxPolicy::new(None, Some(ingress)),
                     task_addresses: Vec::new(),
                     box_id: None,
                     box_addresses: None,
@@ -6743,7 +6728,7 @@ mod tests {
         // live actor's in-memory record rather than only touching disk.
         let mngr = server.state.sessions_manager().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("freshly-created session should be retrievable");
@@ -6795,7 +6780,7 @@ mod tests {
         // The failed rename left the name intact.
         let mngr = server.state.sessions_manager().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("freshly-created session should be retrievable");
@@ -6839,7 +6824,7 @@ mod tests {
             })
             .await;
         match resp {
-            Errorable::Ok(boxes::wire::request::SessionStep::Fault {
+            Errorable::Ok(boxes::wire::request::BoxStep::Fault {
                 error: boxes::wire::errors::WireError::UnknownSessionId,
             }) => {}
             other => panic!("expected Fault::UnknownSessionId, got {other:?}"),
@@ -6933,7 +6918,7 @@ mod tests {
         // lookup for a well-formed id is rejected rather than answered.
         let mngr = server.state.sessions_manager().await;
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(SessionId::nil()))
+            mngr.get_session(BoxKeyPredicate::Id(SessionId::nil()))
                 .await
                 .is_err(),
             "manager should reject session work while shutting down",
@@ -6974,7 +6959,7 @@ mod tests {
         // still reachable and no shutdown flag was latched.
         let mngr = server.state.sessions_manager().await;
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(session_id))
+            mngr.get_session(BoxKeyPredicate::Id(session_id))
                 .await
                 .unwrap()
                 .is_some(),
@@ -7043,7 +7028,7 @@ mod tests {
 
         let mngr = server.state.sessions_manager().await;
         let session = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("keep leaves the session in place");
@@ -7070,7 +7055,7 @@ mod tests {
         let session_id = fresh_session(&mut client).await;
 
         let mngr = server.state.sessions_manager().await;
-        mngr.get_session(SessionKeyPredicate::Id(session_id))
+        mngr.get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("freshly-created session should be retrievable");
@@ -7083,7 +7068,7 @@ mod tests {
 
         // ...and, being in shutdown, refuses to hand out sessions afterwards.
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(session_id))
+            mngr.get_session(BoxKeyPredicate::Id(session_id))
                 .await
                 .is_err(),
             "a forced shutdown should leave the manager rejecting session work",

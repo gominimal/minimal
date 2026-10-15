@@ -225,7 +225,7 @@ pub(crate) fn duplicate_session_warning(
     let existing = entries
         .iter()
         .filter(|e| e.project_path.as_ref() == Some(target))
-        .find(|e| e.status == boxes::SessionStatus::Active)
+        .find(|e| e.status == boxes::BoxState::Active)
         .or_else(|| {
             entries
                 .iter()
@@ -238,7 +238,7 @@ pub(crate) fn duplicate_session_warning(
     );
     // Only point at `attach` as the step to take now for a session it will
     // actually accept. Attach refuses anything not yet `Active` (see
-    // `boxes::SessionStatus`), so for a `Pending`/`Materializing`
+    // `boxes::BoxState`), so for a `Pending`/`Materializing`
     // duplicate the reuse command would fail immediately — say to wait
     // first, and show the later attach with a `<session>` placeholder so no
     // printed command names a session attach would refuse right now. When
@@ -247,7 +247,7 @@ pub(crate) fn duplicate_session_warning(
     // unnamed handle would parse as a nonexistent name and the attach lookup
     // would miss.
     match existing.status {
-        boxes::SessionStatus::Active => {
+        boxes::BoxState::Active => {
             let key = existing
                 .name
                 .clone()
@@ -1288,11 +1288,11 @@ pub fn format_ls_across_vms_on(
 
 /// Human-readable lifecycle status for the `ls` table, using the same
 /// snake_case tokens the `--json` surface emits so the two agree.
-pub(crate) fn status_label(status: boxes::SessionStatus) -> &'static str {
+pub(crate) fn status_label(status: boxes::BoxState) -> &'static str {
     match status {
-        boxes::SessionStatus::Pending => "pending",
-        boxes::SessionStatus::Materializing => "materializing",
-        boxes::SessionStatus::Active => "active",
+        boxes::BoxState::Pending => "pending",
+        boxes::BoxState::Materializing => "materializing",
+        boxes::BoxState::Active => "active",
     }
 }
 

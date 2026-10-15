@@ -400,7 +400,7 @@ impl std::fmt::Debug for DaemonLogRelease {
 #[derive(Debug)]
 pub struct ServerState {
     config: Config,
-    sessions: box_manager::ManagerHandle,
+    sessions: box_manager::BoxManagerHandle,
     daemon_id: String,
 
     /// The daemon-scoped gvproxy switch, cloned beside the copy the sessions
@@ -605,7 +605,7 @@ impl ServerState {
         );
 
         Ok(Self {
-            sessions: box_manager::Manager::init(
+            sessions: box_manager::BoxManager::init(
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
@@ -779,7 +779,7 @@ impl ServerStateHandle {
     }
 
     /// Returns a handle to the sessions manager.
-    pub async fn sessions_manager(&self) -> box_manager::ManagerHandle {
+    pub async fn sessions_manager(&self) -> box_manager::BoxManagerHandle {
         self.0.lock().await.sessions.clone()
     }
 
@@ -1397,10 +1397,7 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         // Re-read the status at teardown: a clean client abort already
         // deleted the record (`get_record` → `None`), and a finalized
         // session is `Active` — neither should be reaped here.
-        let status = match mngr
-            .get_record(box_manager::SessionKeyPredicate::Id(id))
-            .await
-        {
+        let status = match mngr.get_record(box_manager::BoxKeyPredicate::Id(id)).await {
             Ok(Some(record)) => record.status,
             Ok(None) => continue,
             Err(e) => {
@@ -1414,7 +1411,7 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         };
         if !matches!(
             status,
-            ::boxes::SessionStatus::Pending | ::boxes::SessionStatus::Materializing
+            ::boxes::BoxState::Pending | ::boxes::BoxState::Materializing
         ) {
             continue;
         }
@@ -3309,7 +3306,7 @@ mod tests {
         let working = state
             .sessions_manager()
             .await
-            .get_session(box_manager::SessionKeyPredicate::Id(id))
+            .get_session(box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session should resolve")
@@ -3399,7 +3396,7 @@ mod tests {
                 .await
                 .record
                 .map(|record| record.status),
-            Some(::boxes::SessionStatus::Pending),
+            Some(::boxes::BoxState::Pending),
             "the refused attach must leave the session unfinalized for the reap"
         );
 

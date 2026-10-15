@@ -163,9 +163,7 @@ fn only_eio_promises_the_shell_is_already_gone() {
 /// Wires a channel into a host's binding slot and hands back the receiving
 /// end, so a test can see exactly what the host tells an attached binding.
 /// The join handle is a stand-in — nothing under test awaits it.
-fn watch_binding<P: SessionProcess, G: SessionGuard>(
-    host: &mut Host<P, G>,
-) -> mpsc::Receiver<BindingMsg> {
+fn watch_binding<P: BoxProcess, G: BoxGuard>(host: &mut Host<P, G>) -> mpsc::Receiver<BindingMsg> {
     let (tx, rx) = mpsc::channel(16);
     host.remote = Some((tx, crate::traced::spawn(async {}), CancellationToken::new()));
     rx
@@ -1287,7 +1285,7 @@ async fn get_attrs_tracks_title_and_io_times() {
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
-            paths: SessionPaths {
+            paths: BoxPaths {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
@@ -1365,7 +1363,7 @@ async fn kill_tears_down_host_and_reaps_process() {
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
-            paths: SessionPaths {
+            paths: BoxPaths {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
@@ -1454,8 +1452,8 @@ impl sandbox::NetGuard for RecordingNetGuard {
     }
 }
 
-fn test_paths() -> SessionPaths {
-    SessionPaths {
+fn test_paths() -> BoxPaths {
+    BoxPaths {
         working: DaemonAbsPath::root(),
         cache: DaemonAbsPath::root(),
         home: DaemonAbsPath::root(),
@@ -1709,7 +1707,7 @@ struct SealingMockLauncher {
     seal_injection: bool,
 }
 
-impl SessionLauncher for SealingMockLauncher {
+impl BoxLauncher for SealingMockLauncher {
     type Process = MockProcess;
     type Guard = ();
 
@@ -1719,7 +1717,7 @@ impl SessionLauncher for SealingMockLauncher {
         _session_id: boxes::SessionId,
         _name: String,
         _username: String,
-        _paths: SessionPaths,
+        _paths: BoxPaths,
         sz: WinSize,
     ) -> io::Result<Launched<MockProcess, ()>> {
         let pty = Pty::open(sz)?;
@@ -2658,7 +2656,7 @@ fn sandbox_launcher(network_mode: boxes::NetworkMode) -> (SandboxLauncher, tempf
 /// daemon builds one launcher per launch, so the per-launch construction is
 /// production's shape; only the state dir is shared.
 fn launcher_in(network_mode: boxes::NetworkMode, state_path: &std::path::Path) -> SandboxLauncher {
-    launcher_with(network_mode, state_path, boxes::SessionPolicy::default())
+    launcher_with(network_mode, state_path, boxes::BoxPolicy::default())
 }
 
 /// The same launcher carrying the session's policy, so a test can launch a
@@ -2668,7 +2666,7 @@ fn launcher_in(network_mode: boxes::NetworkMode, state_path: &std::path::Path) -
 fn launcher_with(
     network_mode: boxes::NetworkMode,
     state_path: &std::path::Path,
-    policy: boxes::SessionPolicy,
+    policy: boxes::BoxPolicy,
 ) -> SandboxLauncher {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let config = mctx::ConfigBuilder::new()
@@ -2690,7 +2688,7 @@ fn launcher_with(
         own_address: None,
         box_addresses: None,
         composition: None,
-        session: crate::box_actor::WeakSessionHandle::dangling(),
+        session: crate::box_actor::WeakBoxHandle::dangling(),
         // The tests here drive the session's own launches unless one sets
         // the purpose itself (`a_hook_launch_does_not_advise_unenforced_placement`).
         for_hooks: false,
@@ -3043,7 +3041,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
         let mut launcher = launcher_with(
             NetworkMode::HostNet,
             state.path(),
-            boxes::SessionPolicy::new(Some(egress), None),
+            boxes::BoxPolicy::new(Some(egress), None),
         );
         // The stand-in tree, not the host's: the launch's leaf, its probe
         // and its reclaim all read this one root, and its decision and its
@@ -3234,7 +3232,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
         let mut launcher = launcher_with(
             NetworkMode::HostNet,
             state.path(),
-            boxes::SessionPolicy::new(Some(egress), None),
+            boxes::BoxPolicy::new(Some(egress), None),
         );
         launcher.classifier_root = root.clone();
         launcher.classifier_mountinfo = Some(mountinfo.clone());
@@ -3351,7 +3349,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     const REFUSAL: &str = "with --network host_ip this machine can only block all network access";
     // The box's declaration: the narrowing a per-box host has no verdict for,
     // in the CLI's own spelling of `--deny-subnets`.
-    let narrowing = boxes::SessionPolicy::new(
+    let narrowing = boxes::BoxPolicy::new(
         Some(boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
@@ -3483,7 +3481,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     let mut launcher = launcher_with(
         NetworkMode::HostNet,
         state.path(),
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     );
     launcher.classifier_root = root.clone();
     launcher.classifier_mountinfo = Some(mountinfo.clone());
@@ -3940,7 +3938,7 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
         let launcher = launcher_with(
             NetworkMode::HostNet,
             state.path(),
-            boxes::SessionPolicy::new(Some(egress), None),
+            boxes::BoxPolicy::new(Some(egress), None),
         );
         let outcome = tokio::time::timeout(
             Duration::from_secs(30),
@@ -4151,7 +4149,7 @@ async fn dynamic_ingress_box(
     name: &str,
     mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
-) -> (boxes::SessionId, crate::box_actor::SessionHandle) {
+) -> (boxes::SessionId, crate::box_actor::BoxHandle) {
     // The loopback verdict vouches for the handed address, so the registry
     // publishes the box at it — the address a runtime publish binds at.
     let manager = server.state.sessions_manager().await;
@@ -4159,7 +4157,7 @@ async fn dynamic_ingress_box(
     let id =
         finalize_dynamic_ingress_session(client, name, ASK_SWITCH, ASK_LOOPBACK, mode, range).await;
     let handle = manager
-        .get_session(crate::box_manager::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("the {name} box should resolve"));
@@ -5542,14 +5540,14 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
     )
     .await;
     let handle = manager
-        .get_session(crate::box_manager::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the asking box resolves");
-    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
         "askgate".to_string(),
         switch,
-        &boxes::SessionPolicy::default(),
+        &boxes::BoxPolicy::default(),
         crate::net::SwitchSubnet::default(),
         None,
     ));
@@ -5780,15 +5778,15 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     )
     .await;
     let web_handle = manager
-        .get_session(crate::box_manager::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
     let (_db, db_handle) = dynamic_ingress_box(&server, &mut client, "db", None, None).await;
-    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
         "web".to_string(),
         switch,
-        &boxes::SessionPolicy::default(),
+        &boxes::BoxPolicy::default(),
         crate::net::SwitchSubnet::default(),
         None,
     ));
@@ -6416,7 +6414,7 @@ async fn attach_live_shell(
 /// Seed `handle`'s switch as VM-backed, its report door the test's
 /// stand-in, and stand up a forwarder for the publish.
 async fn vm_backed_ask_box(
-    handle: &crate::box_actor::SessionHandle,
+    handle: &crate::box_actor::BoxHandle,
 ) -> (
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,

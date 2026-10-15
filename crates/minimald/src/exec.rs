@@ -39,8 +39,8 @@ use diagnostics::redact::scrub_secrets;
 
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
-    box_actor::SessionHandle,
-    box_manager::SessionKeyPredicate,
+    box_actor::BoxHandle,
+    box_manager::BoxKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
     server::ServerStateHandle,
 };
@@ -60,7 +60,7 @@ use crate::{
 pub trait Exec: Send + 'static {
     type Process: Process;
 
-    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>>;
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>>;
 }
 
 /// A handle to one spawned process: stdio plus lifecycle controls.
@@ -154,7 +154,7 @@ fn task_start_dir(
 impl Exec for TaskExec {
     type Process = TaskProcess;
 
-    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
         // the next child once the consumer pulls. Dropping a
         // `HakoniwaProcess` orphans the child, so we don't want to
@@ -188,7 +188,7 @@ impl Exec for TaskExec {
 /// the deny-all default in force, allow-all behind the opt-out — and none of
 /// its ingress. Shared by the two ways a
 /// task starts — over an exec channel here, and from inside the session
-/// (`env::SessionChannel::run_task`).
+/// (`env::BoxChannel::run_task`).
 ///
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
@@ -230,7 +230,7 @@ pub(crate) fn task_network(
         record.network,
         switch,
         &format!("{session}-task"),
-        egress.map(|section| boxes::SessionPolicy::new(Some(section), None)),
+        egress.map(|section| boxes::BoxPolicy::new(Some(section), None)),
         // Never the record's handed box addresses (T66): the task's sandbox
         // is not the box the registration named — attaching it at the
         // session box's address would key its frames to the session's row.
@@ -348,7 +348,7 @@ fn parse_task_args(
 /// governed by the consumer's stream.
 async fn task_producer(
     exec: TaskExec,
-    session: SessionHandle,
+    session: BoxHandle,
     mut req_rx: mpsc::Receiver<()>,
     proc_tx: mpsc::Sender<io::Result<TaskProcess>>,
 ) {
@@ -806,7 +806,7 @@ pub struct TokioExec {
 impl Exec for TokioExec {
     type Process = TokioProcess;
 
-    fn exec(self, _session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+    fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
             cmd.arg("-c")
@@ -852,7 +852,7 @@ fn git_repo_location_env() -> BTreeSet<String> {
 /// What to run inside the session, and whether a shell stands between the
 /// client's words and the process.
 #[derive(Debug, Clone)]
-pub enum SessionProgram {
+pub enum BoxProgram {
     /// A command line for the session's shell. The client wrote a shell
     /// command, so quoting, globs, pipes and redirections are part of what it
     /// means — matching what `ssh host '...'` does everywhere else.
@@ -864,7 +864,7 @@ pub enum SessionProgram {
     Argv(Vec<String>),
 }
 
-impl SessionProgram {
+impl BoxProgram {
     /// The program and arguments to hand the session, resolving a shell
     /// command into an explicit `bash -c` argv.
     fn argv(self) -> (String, Vec<String>) {
@@ -882,8 +882,8 @@ impl SessionProgram {
 /// An [`Exec`] that runs a command *inside* the session's sandbox, joining the
 /// namespaces of the running session process.
 #[derive(Debug, Clone)]
-pub struct SessionExec {
-    pub program: SessionProgram,
+pub struct BoxExec {
+    pub program: BoxProgram,
     /// Variables layered over the session's own for this one process: the
     /// exec's `TRACEPARENT` on telemetry opt-in ([`minimald_rpc::taskenv::trace_env`]).
     pub extra_env: BTreeMap<String, String>,
@@ -897,10 +897,10 @@ pub struct SessionExec {
 /// has no `/bin/bash`.
 const SESSION_SHELL: &str = "/usr/bin/bash";
 
-impl Exec for SessionExec {
+impl Exec for BoxExec {
     type Process = TokioProcess;
 
-    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             // Launching the sandbox is part of servicing the request: an exec
             // against an idle session should work, not fail because nobody
@@ -1041,7 +1041,7 @@ struct ExecTask<S: Exec> {
 
     serv: ServerStateHandle,
     conn: ConnectionHandle,
-    session: SessionHandle,
+    session: BoxHandle,
 }
 
 impl<S: Exec> ExecTask<S> {
@@ -1775,7 +1775,7 @@ pub(crate) async fn handle_exec(
     );
     let mngr = serv.sessions_manager().await;
     let session_handle = match mngr
-        .get_session(SessionKeyPredicate::Id(session_id))
+        .get_session(BoxKeyPredicate::Id(session_id))
         .instrument(span.clone())
         .await
     {
@@ -1829,8 +1829,8 @@ pub(crate) async fn handle_exec(
     match request {
         ExecRequest::Shell(_) | ExecRequest::Argv(_) => {
             let program = match request {
-                ExecRequest::Shell(cmd) => SessionProgram::Shell(cmd),
-                ExecRequest::Argv(words) => SessionProgram::Argv(words),
+                ExecRequest::Shell(cmd) => BoxProgram::Shell(cmd),
+                ExecRequest::Argv(words) => BoxProgram::Argv(words),
                 _ => unreachable!("the match arm admits only Shell and Argv"),
             };
             let span = span.clone();
@@ -2154,7 +2154,7 @@ mod box_traceparent_tests {
 /// Runs `argv` inside the session's sandbox, streamed over the SSH channel.
 ///
 /// The fallback for every exec request the daemon does not service itself. It
-/// needs the session's sandbox up, which [`SessionExec`] arranges — launching a
+/// needs the session's sandbox up, which [`BoxExec`] arranges — launching a
 /// host for an idle session if there isn't one.
 // Left positional: a single call site that immediately packs the arguments into
 // an `ExecTask`, so a struct would be single-use ceremony.
@@ -2162,10 +2162,10 @@ mod box_traceparent_tests {
 async fn run_in_session(
     serv: ServerStateHandle,
     conn: ConnectionHandle,
-    session: SessionHandle,
+    session: BoxHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
-    program: SessionProgram,
+    program: BoxProgram,
     conn_username: String,
     extra_env: BTreeMap<String, String>,
 ) {
@@ -2174,7 +2174,7 @@ async fn run_in_session(
         serv,
         session,
         channel_id,
-        exec: SessionExec {
+        exec: BoxExec {
             program,
             conn_username,
             extra_env,
@@ -2204,7 +2204,7 @@ async fn end_run_box(
     // reason `serve_destroy_session` resolves it there: once the record is
     // gone there is nothing left to resolve it against.
     let session_name = mngr
-        .get_record(SessionKeyPredicate::Id(session_id))
+        .get_record(BoxKeyPredicate::Id(session_id))
         .await
         .ok()
         .flatten()
@@ -2232,7 +2232,7 @@ async fn end_run_box(
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
 /// channel. Kicks off a session side-op build based on an existing session.
 async fn run_build_exec(
-    session: SessionHandle,
+    session: BoxHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
     args: String,
@@ -2325,7 +2325,7 @@ async fn run_build_exec(
 /// exec over the SSH channel. Kicks off a session side-op check run based on an
 /// existing session.
 async fn run_check_exec(
-    session: SessionHandle,
+    session: BoxHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
     args: String,
@@ -2410,7 +2410,7 @@ async fn handle_git_receive(
     let session_pred = {
         match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
             Some(id_str) => match SessionId::parse_str(id_str) {
-                Ok(id) => SessionKeyPredicate::Id(id),
+                Ok(id) => BoxKeyPredicate::Id(id),
                 Err(_e) => {
                     tracing::warn!(
                         value = %id_str,
@@ -2421,8 +2421,8 @@ async fn handle_git_receive(
                 }
             },
             None => match SessionId::parse_str(ident) {
-                Ok(id) => SessionKeyPredicate::Id(id),
-                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+                Ok(id) => BoxKeyPredicate::Id(id),
+                Err(_e) => BoxKeyPredicate::Name(ident.to_string()),
             },
         }
     };
@@ -2592,7 +2592,7 @@ async fn handle_git_upload(
     let session_pred = {
         match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
             Some(id_str) => match SessionId::parse_str(id_str) {
-                Ok(id) => SessionKeyPredicate::Id(id),
+                Ok(id) => BoxKeyPredicate::Id(id),
                 Err(_e) => {
                     tracing::warn!(
                         value = %id_str,
@@ -2603,8 +2603,8 @@ async fn handle_git_upload(
                 }
             },
             None => match SessionId::parse_str(ident) {
-                Ok(id) => SessionKeyPredicate::Id(id),
-                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+                Ok(id) => BoxKeyPredicate::Id(id),
+                Err(_e) => BoxKeyPredicate::Name(ident.to_string()),
             },
         }
     };
@@ -2956,10 +2956,10 @@ mod tests {
             username: None,
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
-            policy: boxes::SessionPolicy::default(),
+            policy: boxes::BoxPolicy::default(),
             task_addresses: Vec::new(),
             box_addresses: None,
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             hooks_enabled: true,
             // No launch ever minted these records, so none has recorded its
             // outcome on one.

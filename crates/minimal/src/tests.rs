@@ -679,7 +679,7 @@ fn twin_entry(
     id: &str,
     name: Option<&str>,
     path: Option<&str>,
-    status: boxes::SessionStatus,
+    status: boxes::BoxState,
 ) -> minimald_rpc::ListSessionsEntry {
     minimald_rpc::ListSessionsEntry {
         id: boxes::SessionId::parse_str(id).unwrap(),
@@ -701,7 +701,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        boxes::SessionStatus::Active,
+        boxes::BoxState::Active,
     )];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     assert_eq!(
@@ -724,7 +724,7 @@ fn duplicate_session_warning_flags_only_a_matching_path() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        boxes::SessionStatus::Active,
+        boxes::BoxState::Active,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -750,12 +750,7 @@ fn duplicate_session_warning_flags_only_a_matching_path() {
 #[test]
 fn duplicate_session_warning_reuses_unnamed_session_by_id() {
     let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
-    let entries = vec![twin_entry(
-        id,
-        None,
-        Some("/w"),
-        boxes::SessionStatus::Active,
-    )];
+    let entries = vec![twin_entry(id, None, Some("/w"), boxes::BoxState::Active)];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
     let warning = duplicate_session_warning(&entries, &taken)
@@ -782,7 +777,7 @@ fn duplicate_session_warning_waits_before_attach_for_materializing() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        boxes::SessionStatus::Materializing,
+        boxes::BoxState::Materializing,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -818,14 +813,9 @@ fn duplicate_session_warning_prefers_active_over_pending_match() {
             pending_id,
             Some("mzing"),
             Some("/w"),
-            boxes::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         ),
-        twin_entry(
-            active_id,
-            Some("live"),
-            Some("/w"),
-            boxes::SessionStatus::Active,
-        ),
+        twin_entry(active_id, Some("live"), Some("/w"), boxes::BoxState::Active),
     ];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -867,13 +857,13 @@ fn bare_status_counts_elsewhere_sessions() {
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             Some("api"),
             Some("/other"),
-            boxes::SessionStatus::Active,
+            boxes::BoxState::Active,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0066",
             None,
             Some("/third"),
-            boxes::SessionStatus::Pending,
+            boxes::BoxState::Pending,
         ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
@@ -903,25 +893,25 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             None,
             Some("/w"),
-            boxes::SessionStatus::Pending,
+            boxes::BoxState::Pending,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0066",
             Some("web"),
             Some("/w"),
-            boxes::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0077",
             Some("spare"),
             Some("/w"),
-            boxes::SessionStatus::Active,
+            boxes::BoxState::Active,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0088",
             Some("api"),
             Some("/other"),
-            boxes::SessionStatus::Active,
+            boxes::BoxState::Active,
         ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
@@ -2658,8 +2648,8 @@ async fn create_box_on(
     name: &str,
 ) -> boxes::SessionId {
     use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest, Errorable,
-        FinalizeSession, FinalizeSessionRequest, SessionConfig,
+        BoxConfig, ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+        Errorable, FinalizeSession, FinalizeSessionRequest,
     };
 
     let mut client = server.connect().await;
@@ -2668,12 +2658,12 @@ async fn create_box_on(
             .expect("UTF-8");
     let id = match client
         .call::<CreateSession>(&CreateSessionRequest {
-            config: SessionConfig {
+            config: BoxConfig {
                 name: Some(name.to_string()),
                 project_path: paths::HostAbsPath::try_new(project_path)
                     .expect("the test cwd as a host path"),
                 network: boxes::NetworkMode::NoNet,
-                policy: boxes::SessionPolicy::default(),
+                policy: boxes::BoxPolicy::default(),
                 task_addresses: Vec::new(),
                 box_id: None,
                 box_addresses: None,
@@ -3505,7 +3495,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
 /// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
 /// `a1b2c3d4…` named `web`.
 fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
-    use boxes::SessionStatus::Active;
+    use boxes::BoxState::Active;
     vec![
         twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
         twin_entry(
@@ -3538,7 +3528,7 @@ fn a_unique_id_prefix_resolves_to_its_session() {
 /// resolves.
 #[test]
 fn an_ambiguous_id_prefix_names_the_candidates() {
-    use boxes::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry(
             "a1b2c3d4-0a99-78b1-9165-0809440f0052",
@@ -3570,7 +3560,7 @@ fn an_ambiguous_id_prefix_names_the_candidates() {
 /// as the first differing digit.
 #[test]
 fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
-    use boxes::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
         twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
@@ -3615,7 +3605,7 @@ fn a_non_hex_or_short_input_is_not_an_id_prefix() {
 /// resolves by its name: an exact name wins over a prefix.
 #[test]
 fn an_exact_name_wins_over_an_id_prefix() {
-    use boxes::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let mut entries = prefix_entries();
     entries.push(twin_entry(
         "ffffffff-0a99-78b1-9165-0809440f0052",
@@ -3635,7 +3625,7 @@ fn an_exact_name_wins_over_an_id_prefix() {
 /// and a folded name wins over a session whose id starts with the same hex.
 #[test]
 fn a_name_resolves_case_insensitively() {
-    use boxes::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry(
             "ffffffff-0a99-78b1-9165-0809440f0052",
@@ -3661,7 +3651,7 @@ fn a_name_resolves_case_insensitively() {
 /// falls through to a session whose id starts with that prefix.
 #[test]
 fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
-    use boxes::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry(
             "ffffffff-0a99-78b1-9165-0809440f0052",

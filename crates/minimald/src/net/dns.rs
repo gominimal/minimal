@@ -62,7 +62,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use boxes::core::egress::EgressRules;
 #[cfg(target_os = "linux")]
 use boxes::core::loopback::LoopbackAllocator;
-use boxes::{SessionId, SessionPolicy};
+use boxes::{BoxPolicy, SessionId};
 use hickory_proto::rr::Name;
 use serde::Serialize;
 #[cfg(target_os = "linux")]
@@ -478,7 +478,7 @@ struct CallerFacts {
     name: String,
     /// The caller's policy as launch recorded it — the egress half is what a
     /// request from it is put to; the ingress half is not read here.
-    policy: SessionPolicy,
+    policy: BoxPolicy,
     /// The switch the box's relay is attached to, whose resolver its egress
     /// carve-out is keyed to (NET-079).
     subnet: SwitchSubnet,
@@ -826,7 +826,7 @@ impl HostnameRegistry {
         &mut self,
         session_id: SessionId,
         session_name: &str,
-        policy: &SessionPolicy,
+        policy: &BoxPolicy,
         subnet: SwitchSubnet,
         hostname_proxy_port: Option<u16>,
     ) {
@@ -1769,7 +1769,7 @@ pub enum LoopbackGrant {
     PoolSpent,
     /// The verdict over the reserved local range has not landed yet: the
     /// probe that produces it — on a microVM daemon, the forwarder-conducted
-    /// walk [`crate::box_manager::Manager::init`] defers so the accept loop is
+    /// walk [`crate::box_manager::BoxManager::init`] defers so the accept loop is
     /// never held for it — is still running, so nothing has yet vouched for
     /// an address of the range. Every ask is answered this way, one for a
     /// namespace the record already names too: the box publishes on the
@@ -1827,7 +1827,7 @@ impl LoopbackGrant {
 /// answer before the book opens; a daemon inside a microVM does not, because
 /// the surface its publishes bind on is the *host's* loopback, a machine the
 /// guest can only measure through the forwarder-conducted walk
-/// [`crate::box_manager::Manager::init`] defers rather than holding its accept
+/// [`crate::box_manager::BoxManager::init`] defers rather than holding its accept
 /// loop for. The book opens holding whichever state the opening daemon is in
 /// and the walk applies its own when it lands.
 ///
@@ -2061,7 +2061,7 @@ impl LoopbackLeaseBook {
     /// known when the book opens: a daemon inside a microVM can only measure
     /// its publish surface through the host's forwarder, and that walk takes
     /// long enough that the daemon must not hold its accept loop for it (see
-    /// [`crate::box_manager::Manager::init`]), so the book opens on the pending
+    /// [`crate::box_manager::BoxManager::init`]), so the book opens on the pending
     /// verdict and the walk applies its own when it lands.
     fn verdict(&self) -> RangeVerdict {
         RangeVerdict::from_key(self.verdict.load(std::sync::atomic::Ordering::Acquire))

@@ -416,7 +416,7 @@ fn pidfd_open(pid: u32) -> Result<OwnedFd, NsenterError> {
 ///   launcher does — descriptors cross namespaces untouched.
 ///
 /// `minimald` gets both of the first two from the session's
-/// [`SessionEnvironment`](crate::box_runtime::SessionEnvironment), which is
+/// [`BoxEnvironment`](crate::box_runtime::BoxEnvironment), which is
 /// what the session's own shell was launched with.
 #[derive(Debug)]
 #[must_use = "an Injection does nothing until `command` is called"]

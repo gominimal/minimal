@@ -1,8 +1,8 @@
-//! The per-message span name of a [`SessionMessage`]: the variant's name.
+//! The per-message span name of a [`BoxMessage`]: the variant's name.
 
-use super::SessionMessage;
+use super::BoxMessage;
 
-impl SessionMessage {
+impl BoxMessage {
     /// The variant's name, for the actor's per-message span.
     pub(super) fn kind(&self) -> &'static str {
         match self {

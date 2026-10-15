@@ -24,8 +24,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::RequestedPty;
-use crate::box_actor::SessionPaths;
-use crate::box_manager::SessionControl;
+use crate::box_actor::BoxPaths;
+use crate::box_manager::BoxControl;
 use crate::workspace_delta::DeltaSource;
 use boxes::NetworkMode;
 use boxes::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
@@ -518,7 +518,7 @@ struct Binding {
     /// Capability to destroy the owning session, exercised when the user picks
     /// "delete" on the shell-exit prompt. `None` for hosts spawned without a
     /// manager (the test harness), where "delete" degrades to a detach.
-    control: Option<SessionControl>,
+    control: Option<BoxControl>,
     /// Workspace-change detection, shared from the owning [`Host`], so the
     /// shell-exit prompt can lead with the files changed since activation.
     /// `None` when the baseline snapshot could not be taken.
@@ -602,7 +602,7 @@ impl Binding {
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
         generation: u64,
-        control: Option<SessionControl>,
+        control: Option<BoxControl>,
         delta: Option<Arc<DeltaSource>>,
         name: String,
         archives_dir: std::path::PathBuf,
@@ -1216,7 +1216,7 @@ impl Binding {
     /// out of `self` by this point.
     async fn shell_exit_prompt<R, W>(
         delta: Option<&Arc<DeltaSource>>,
-        control: Option<&SessionControl>,
+        control: Option<&BoxControl>,
         archives_dir: &std::path::Path,
         name: &str,
         holds_host_row: bool,
@@ -1424,7 +1424,7 @@ impl ExitReason {
 /// driven against a real sandboxed process or a test double. `try_wait` and
 /// `wait` reduce the `hakoniwa::ExitStatus` payload to a portable exit code;
 /// [`Self::exit_reason`] carries the part of it that has to reach the user.
-pub(crate) trait SessionProcess: Send + 'static {
+pub(crate) trait BoxProcess: Send + 'static {
     /// Returns the PID of hakoniwa's container supervisor — **not** the PID of
     /// the shell it exec'd.
     ///
@@ -1448,9 +1448,9 @@ pub(crate) trait SessionProcess: Send + 'static {
     fn exit_reason(&self) -> Option<ExitReason>;
 }
 
-/// A backend's answer to a reap: the portable code a [`SessionProcess`] reduces
+/// A backend's answer to a reap: the portable code a [`BoxProcess`] reduces
 /// the child's status to, plus the account to cache for
-/// [`SessionProcess::exit_reason`].
+/// [`BoxProcess::exit_reason`].
 pub(crate) struct ExitReport {
     /// The code `wait`/`try_wait` returns.
     code: i32,
@@ -1459,17 +1459,17 @@ pub(crate) struct ExitReport {
 }
 
 /// The process-creation backend behind [`HostProcess`]: the one part of a
-/// [`SessionProcess`] that differs between the real sandboxed child and the
+/// [`BoxProcess`] that differs between the real sandboxed child and the
 /// test double. Everything else — the exit-reason cache and its record-once
 /// policy — lives in [`HostProcess`] and is shared.
 pub(crate) trait ProcessBackend: Send + 'static {
-    /// See [`SessionProcess::container_pid`].
+    /// See [`BoxProcess::container_pid`].
     fn container_pid(&self) -> u32;
-    /// See [`SessionProcess::try_wait`]; `Ok(None)` while the process runs.
+    /// See [`BoxProcess::try_wait`]; `Ok(None)` while the process runs.
     fn try_wait(&mut self) -> io::Result<Option<ExitReport>>;
-    /// See [`SessionProcess::wait`].
+    /// See [`BoxProcess::wait`].
     fn wait(&mut self) -> io::Result<ExitReport>;
-    /// See [`SessionProcess::kill`].
+    /// See [`BoxProcess::kill`].
     fn kill(&mut self) -> io::Result<()>;
     /// Logs the backend's account of an observed exit. Called exactly once per
     /// session by [`HostProcess::record_exit`]; the default is silent, so a
@@ -1477,9 +1477,9 @@ pub(crate) trait ProcessBackend: Send + 'static {
     fn log_exit(_reason: &ExitReason) {}
 }
 
-/// The single [`SessionProcess`] implementation, generic over the backend that
+/// The single [`BoxProcess`] implementation, generic over the backend that
 /// owns the actual child. Holds the exit reason cached at the first reap, so
-/// [`SessionProcess::exit_reason`] can answer after the fact for both the real
+/// [`BoxProcess::exit_reason`] can answer after the fact for both the real
 /// sandboxed child and the test double.
 pub(crate) struct HostProcess<B: ProcessBackend> {
     backend: B,
@@ -1496,7 +1496,7 @@ impl<B: ProcessBackend> HostProcess<B> {
     }
 
     /// Logs the backend's account of an observed exit and caches it for
-    /// [`SessionProcess::exit_reason`], returning the portable code.
+    /// [`BoxProcess::exit_reason`], returning the portable code.
     ///
     /// Caches and logs on the first reap only, not on every subsequent one: the
     /// child caches its own status, so a `wait` following a `try_wait` that
@@ -1510,7 +1510,7 @@ impl<B: ProcessBackend> HostProcess<B> {
     }
 }
 
-impl<B: ProcessBackend> SessionProcess for HostProcess<B> {
+impl<B: ProcessBackend> BoxProcess for HostProcess<B> {
     fn container_pid(&self) -> u32 {
         self.backend.container_pid()
     }
@@ -1538,13 +1538,13 @@ impl<B: ProcessBackend> SessionProcess for HostProcess<B> {
 /// wired to the slave side, and yields the master side plus a
 /// handle to the process. The seam between the generic [`Host`]
 /// runtime and the process-creation backend.
-pub(crate) trait SessionLauncher {
+pub(crate) trait BoxLauncher {
     /// The running-process handle this launcher produces.
-    type Process: SessionProcess;
+    type Process: BoxProcess;
     /// A value held for the session's lifetime, for its `Drop` (it owns the
     /// sandbox files backing the running process's rootfs) and as the live view
     /// of the session's environment. Dropped after [`Self::Process`].
-    type Guard: SessionGuard;
+    type Guard: BoxGuard;
 
     /// Launches the session's shell, placing its host-address box in a
     /// classifier leaf named by `session_id` when this host has one.
@@ -1560,14 +1560,14 @@ pub(crate) trait SessionLauncher {
         session_id: boxes::SessionId,
         name: String,
         username: String,
-        paths: SessionPaths,
+        paths: BoxPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
 }
 
 /// Where a command should start in a session, and with what environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SessionEnvironment {
+pub(crate) struct BoxEnvironment {
     /// Absolute path inside the sandbox: `/workbench` for a session.
     pub(crate) cwd: String,
     /// The composed session variables, layout defaults included, plus anything
@@ -1580,34 +1580,34 @@ pub(crate) struct SessionEnvironment {
 /// Primarily a `Drop` guard — it owns the sandbox files backing the running
 /// process's rootfs — but it is also the live handle to the session's
 /// environment.
-pub(crate) trait SessionGuard: Send + 'static {
+pub(crate) trait BoxGuard: Send + 'static {
     /// The working directory and environment a command should run with in this
     /// session, as of now.
-    fn command_environment(&self) -> SessionEnvironment;
+    fn command_environment(&self) -> BoxEnvironment;
 }
 
 /// The mock launcher has no sandbox, so there is nothing to describe.
 #[cfg(test)]
-impl SessionGuard for () {
-    fn command_environment(&self) -> SessionEnvironment {
-        SessionEnvironment::default()
+impl BoxGuard for () {
+    fn command_environment(&self) -> BoxEnvironment {
+        BoxEnvironment::default()
     }
 }
 
-impl SessionGuard for crate::env::Env {
-    fn command_environment(&self) -> SessionEnvironment {
+impl BoxGuard for crate::env::Env {
+    fn command_environment(&self) -> BoxEnvironment {
         crate::env::Env::command_environment(self)
     }
 }
 
-/// The product of [`SessionLauncher::launch`].
+/// The product of [`BoxLauncher::launch`].
 pub(crate) struct Launched<P, G> {
     /// Master side of the launched process's PTY; the slave is wired to the
     /// process. The [`Host`] reads its stdout and writes its stdin here.
     master: OwnedFd,
     /// Handle used to wait on / signal the launched process.
     process: P,
-    /// Kept alive for the session; see [`SessionLauncher::Guard`].
+    /// Kept alive for the session; see [`BoxLauncher::Guard`].
     guard: G,
     /// The per-sandbox network attachment (own-IP switch wiring), if any. Torn
     /// down explicitly via [`sandbox::NetGuard::teardown`] at session end.
@@ -2213,10 +2213,10 @@ fn host_ip_enforcement(
 
 /// The state of the session process.
 ///
-/// Generic over the [`SessionProcess`] it supervises and the [`SessionLauncher`]
+/// Generic over the [`BoxProcess`] it supervises and the [`BoxLauncher`]
 /// guard kept alive for the session, so the runtime loop can be driven against a
 /// real sandboxed process or a test double.
-pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
+pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// Channel for actor messages via [`HostHandle`].
     receiver: mpsc::Receiver<Message>,
 
@@ -2312,7 +2312,7 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // Destroy capability handed to each binding this host spawns, so a
     // shell-exit "delete" can tear the whole session down. `None` for hosts
     // built without a manager (the test harness).
-    control: Option<SessionControl>,
+    control: Option<BoxControl>,
 
     // Workspace baseline taken before the process launched, handed to each
     // binding so the shell-exit prompt can list the files changed during the
@@ -2389,7 +2389,7 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // and graph) alive for as long as this host (and thus the session process)
     // lives. Declared last so it is dropped after `process`: the process is torn
     // down before the sandbox files backing its rootfs are removed. Also read,
-    // via `SessionGuard`, for the session's current environment.
+    // via `BoxGuard`, for the session's current environment.
     guard: G,
 }
 
@@ -2927,7 +2927,7 @@ fn layer_session_env(
     env
 }
 
-/// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
+/// The real [`BoxLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
@@ -2943,7 +2943,7 @@ pub(crate) struct SandboxLauncher {
     /// mappings applied on the switch once this `OwnIp` PTask attaches and
     /// inbound ports gated on its other leg, removed on exit. Unused by other
     /// network modes.
-    pub(crate) policy: boxes::SessionPolicy,
+    pub(crate) policy: boxes::BoxPolicy,
     /// The proxy-routing-table handle the `OwnIp` lease is reported through
     /// on attach, so the box's `<name>.min.internal` route exists exactly
     /// while the box does (NET-001). Ignored by every other network mode.
@@ -2961,7 +2961,7 @@ pub(crate) struct SandboxLauncher {
     pub(crate) composition: Option<std::sync::Arc<boxes::core::compose::Composition>>,
     /// Weak handle back to the owning session actor, for  `min` commands
     /// (e.g. `min build`) to drive session side-ops.
-    pub(crate) session: crate::box_actor::WeakSessionHandle,
+    pub(crate) session: crate::box_actor::WeakBoxHandle,
     /// Whether this launch exists to run lifecycle hooks rather than to serve
     /// a person: minted by the session's hook path — activation at finalize,
     /// teardown at detach or destroy — headless, its pty read by nobody.
@@ -4066,7 +4066,7 @@ fn place_box_processes(
     sandbox::classifier::place_pid(&leaf.procs(), supervisor)
 }
 
-impl SessionLauncher for SandboxLauncher {
+impl BoxLauncher for SandboxLauncher {
     type Process = SandboxProcess;
     // The session env, kept alive for the session's lifetime (it owns the
     // sandbox files backing the running process's rootfs). The own-IP switch
@@ -4080,7 +4080,7 @@ impl SessionLauncher for SandboxLauncher {
         session_id: boxes::SessionId,
         name: String,
         username: String,
-        paths: SessionPaths,
+        paths: BoxPaths,
         sz: WinSize,
     ) -> io::Result<Launched<SandboxProcess, Self::Guard>> {
         let ctx = self.ctx;
@@ -4903,7 +4903,7 @@ pub(crate) type MockProcess = HostProcess<MockBackend>;
 #[cfg(test)]
 pub(crate) const MOCK_EXIT_LINE: &str = "quit";
 
-/// A test [`SessionLauncher`] that wires a plain, un-sandboxed host process to a
+/// A test [`BoxLauncher`] that wires a plain, un-sandboxed host process to a
 /// freshly opened PTY — so the [`Host`] runtime can be exercised end-to-end
 /// without building a real sandbox (which needs packages unavailable in the
 /// unit-test environment).
@@ -4984,7 +4984,7 @@ impl MockLauncher {
 }
 
 #[cfg(test)]
-impl SessionLauncher for MockLauncher {
+impl BoxLauncher for MockLauncher {
     type Process = MockProcess;
     type Guard = ();
 
@@ -4994,7 +4994,7 @@ impl SessionLauncher for MockLauncher {
         _session_id: boxes::SessionId,
         _name: String,
         _username: String,
-        _paths: SessionPaths,
+        _paths: BoxPaths,
         sz: WinSize,
     ) -> io::Result<Launched<MockProcess, ()>> {
         let pty = Pty::open(sz)?;
@@ -5051,10 +5051,10 @@ impl SessionLauncher for MockLauncher {
 pub(crate) struct HostParams {
     pub name: String,
     pub username: String,
-    pub paths: SessionPaths,
+    pub paths: BoxPaths,
     pub sz: WinSize,
     pub channel: Option<Channel<Msg>>,
-    pub control: Option<SessionControl>,
+    pub control: Option<BoxControl>,
     pub delta: Option<Arc<DeltaSource>>,
     pub archives_dir: std::path::PathBuf,
     /// Whether the session's record carries host-handed addresses (T66): the
@@ -5124,7 +5124,7 @@ impl NameMarker {
     }
 }
 
-impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
+impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     /// The PID of hakoniwa's container supervisor for this session.
     ///
     /// Correct as a handle for every namespace the sandbox unshared *except*
@@ -5305,7 +5305,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         std::io::Error,
     >
     where
-        L: SessionLauncher<Process = P, Guard = G>,
+        L: BoxLauncher<Process = P, Guard = G>,
     {
         let (host, handle) = Self::build(launcher, params).await?;
         // Read out before `mainloop` takes the host: the value is the
@@ -5330,7 +5330,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// directly and observe the host's state.
     async fn build<L>(launcher: L, params: HostParams) -> Result<(Self, HostHandle), std::io::Error>
     where
-        L: SessionLauncher<Process = P, Guard = G>,
+        L: BoxLauncher<Process = P, Guard = G>,
     {
         let HostParams {
             name,

@@ -95,7 +95,7 @@ impl HookEvent {
 /// leaves only the `setns` step untested here — everything else (script
 /// delivery, stdio, timeouts, ordering, metadata) runs against the same
 /// code path either way.
-pub(crate) trait SessionCommands {
+pub(crate) trait BoxCommands {
     /// A command that will run `program` with `args` inside the
     /// session, with `extra_env` layered over the session's own
     /// variables.
@@ -107,7 +107,7 @@ pub(crate) trait SessionCommands {
     ) -> impl std::future::Future<Output = std::io::Result<std::process::Command>> + Send;
 }
 
-/// A [`SessionCommands`] owning everything needed to build an
+/// A [`BoxCommands`] owning everything needed to build an
 /// injection, so it can outlive a borrow of the host.
 ///
 /// The host uses this rather than its own handle: a hook run happens
@@ -128,7 +128,7 @@ pub(crate) struct InjectedCommands {
     pub(crate) seal_none_box: bool,
 }
 
-impl SessionCommands for InjectedCommands {
+impl BoxCommands for InjectedCommands {
     async fn command(
         &self,
         program: &str,
@@ -149,7 +149,7 @@ impl SessionCommands for InjectedCommands {
     }
 }
 
-impl SessionCommands for crate::box_runtime::HostHandle {
+impl BoxCommands for crate::box_runtime::HostHandle {
     fn command(
         &self,
         program: &str,
@@ -282,7 +282,7 @@ const OUTPUT_TAIL_BYTES: usize = 4096;
 /// failing it.
 ///
 /// [`MAX_HOOK_TIMEOUT`]: boxes::core::lifecyclehook::MAX_HOOK_TIMEOUT
-pub(crate) async fn run_hooks<C: SessionCommands>(
+pub(crate) async fn run_hooks<C: BoxCommands>(
     commands: &C,
     ctx: &HookContext<'_>,
     event: HookEvent,
@@ -450,7 +450,7 @@ impl Interpreter {
         &self.program
     }
 
-    /// Its arguments, in the shape [`SessionCommands::command`] takes.
+    /// Its arguments, in the shape [`BoxCommands::command`] takes.
     fn args(&self) -> Vec<&str> {
         self.args.iter().map(String::as_str).collect()
     }
@@ -471,7 +471,7 @@ pub(crate) struct HookContext<'a> {
 // Left positional: a private helper with a single call site, so a struct would
 // be single-use ceremony.
 #[allow(clippy::too_many_arguments)]
-async fn run_one<C: SessionCommands>(
+async fn run_one<C: BoxCommands>(
     commands: &C,
     ctx: &HookContext<'_>,
     event: HookEvent,
@@ -760,12 +760,12 @@ mod tests {
     use super::*;
     use boxes::core::lifecyclehook::LifecycleHook;
 
-    /// A [`SessionCommands`] that runs the command on the host instead
+    /// A [`BoxCommands`] that runs the command on the host instead
     /// of inside a sandbox. Exercises everything but the namespace
     /// join.
     struct HostCommands;
 
-    impl SessionCommands for HostCommands {
+    impl BoxCommands for HostCommands {
         fn command(
             &self,
             program: &str,
@@ -781,11 +781,11 @@ mod tests {
         }
     }
 
-    /// A [`SessionCommands`] that always refuses, standing in for a
+    /// A [`BoxCommands`] that always refuses, standing in for a
     /// session whose shell has exited.
-    struct DeadSession;
+    struct DeadBox;
 
-    impl SessionCommands for DeadSession {
+    impl BoxCommands for DeadBox {
         async fn command(
             &self,
             _program: &str,
@@ -1370,7 +1370,7 @@ mod tests {
             loadout("dev"),
         )]);
         let outcomes = run_hooks(
-            &DeadSession,
+            &DeadBox,
             &ctx(&comp, dir),
             HookEvent::Destroy,
             HookOutput::Capture,
@@ -1488,7 +1488,7 @@ mod tests {
         let comp = composition_of(Vec::new());
         assert!(
             run_hooks(
-                &DeadSession,
+                &DeadBox,
                 &ctx(&comp, dir),
                 HookEvent::Activate,
                 HookOutput::Capture,

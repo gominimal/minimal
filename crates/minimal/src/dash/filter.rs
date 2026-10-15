@@ -37,7 +37,7 @@ mod tests {
             id: boxes::SessionId::nil(),
             name: name.map(str::to_owned),
             project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),

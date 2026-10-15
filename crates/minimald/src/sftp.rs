@@ -37,7 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 // clippy `disallowed-methods` for the crate names tokio's own spawn.
 use crate::traced::spawn;
 
-use crate::box_manager::SessionKeyPredicate;
+use crate::box_manager::BoxKeyPredicate;
 use crate::connection::{ConnectionError, ConnectionHandle};
 use crate::server::ServerStateHandle;
 use crate::{MINIMAL_SESSION_ID_ENV, env};
@@ -696,7 +696,7 @@ pub(crate) async fn handle_sftp_subsystem(
     };
 
     let mngr = s.sessions_manager().await;
-    let session_handle = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+    let session_handle = match mngr.get_session(BoxKeyPredicate::Id(session_id)).await {
         Ok(Some(h)) => h,
         Ok(None) => {
             tracing::warn!(%session_id, "sftp subsystem rejected: unknown session");
@@ -748,8 +748,8 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use crate::box_actor::SessionPaths;
-    use crate::box_manager::SessionKeyPredicate;
+    use crate::box_actor::BoxPaths;
+    use crate::box_manager::BoxKeyPredicate;
     use crate::env;
     use crate::test_harness::TestServer;
 
@@ -762,9 +762,9 @@ mod tests {
 
     /// The daemon-side directories behind a session, so a test can check
     /// *where* a client's write landed rather than only that it round-trips.
-    async fn session_paths(server: &TestServer, id: SessionId) -> SessionPaths {
+    async fn session_paths(server: &TestServer, id: SessionId) -> BoxPaths {
         let mngr = server.state.sessions_manager().await;
-        mngr.get_session(SessionKeyPredicate::Id(id))
+        mngr.get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session was just created")
