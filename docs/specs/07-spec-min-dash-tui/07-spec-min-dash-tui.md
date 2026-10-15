@@ -405,8 +405,8 @@ VCS checkout or a root carrying `minimal.toml` uploads; an empty directory or
 confirmation ("<root> is not a repository root; upload it? y/n") before
 anything reaches the daemon. A declined confirmation uploads nothing and
 creates the session on an empty workspace, the same answer the CLI's own prompt
-gives. Any skip that drops the project's lifecycle hooks fails the create, as
-it does on the CLI. The create composes its activation inputs
+gives. A `$HOME` that declares lifecycle hooks fails the create, as it does on
+the CLI. The create composes its activation inputs
 through the CLI's own helper against the session's project path, so
 `default_loadouts`, the user policy, loadout hook scripts, and the
 composition's patches apply to dashboard-created sessions too.
