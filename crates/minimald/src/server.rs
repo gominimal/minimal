@@ -5801,18 +5801,18 @@ mod tests {
         // sibling can release it before the answerer below binds, which
         // hands the answerer the default and fails the assertion (CI,
         // 2026-10-15). So a busy port is waited for, not taken on trust.
+        // If a sibling holds it past the wait, go on as the test used to:
+        // the sibling's hold relocates the answerer just as this one's would,
+        // so the wait narrows the race without adding a failure of its own.
         let held = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, ANSWERER_PORT)) {
-                    Ok(socket) => break socket,
-                    Err(e) if std::time::Instant::now() < deadline => {
-                        tracing::debug!(error = %e, "the answerer's default is held by a sibling test; waiting");
+                    Ok(socket) => break Some(socket),
+                    Err(_) if std::time::Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    Err(e) => {
-                        panic!("the answerer's default port stayed held elsewhere for 10 s: {e}")
-                    }
+                    Err(_) => break None,
                 }
             }
         };
