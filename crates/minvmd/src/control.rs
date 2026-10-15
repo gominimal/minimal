@@ -2147,12 +2147,18 @@ fn refuse_past_cap(
         );
     }
     // The kind in the words a person reads; the log lines keep the daemon's.
+    // A cap of one reads in the singular.
+    let noun = if cap == 1 {
+        "connection"
+    } else {
+        "connections"
+    };
     let connections = match kind {
-        "guest ask" => "port prompt connections".to_owned(),
-        "ask subscription" => "connections waiting for port prompts".to_owned(),
-        "registration lease" => "box registration connections".to_owned(),
+        "guest ask" => format!("port prompt {noun}"),
+        "ask subscription" => format!("{noun} waiting for port prompts"),
+        "registration lease" => format!("box registration {noun}"),
         // A kind with no phrase of its own reads under the daemon's word.
-        other => format!("{other} connections"),
+        other => format!("{other} {noun}"),
     };
     write_reply(
         stream,
@@ -5603,7 +5609,7 @@ mod tests {
         );
         let refused_sub = second.next();
         assert!(
-            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("limit of 1 connections waiting for port prompts")),
+            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("limit of 1 connection waiting for port prompts;")),
             "the second subscription is refused at the cap: {refused_sub:?}"
         );
         held.clear();
@@ -5699,7 +5705,7 @@ mod tests {
         let refused =
             control_past_cap(&BoxControlRequest::AnswererStatus).expect("the refusal is answered");
         assert!(
-            matches!(&refused, BoxControlReply::Error { error } if error.contains("limit of 1 control connections")),
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("limit of 1 control connection;")),
             "a connection past the cap is refused: {refused:?}"
         );
 
@@ -6384,7 +6390,7 @@ mod tests {
         let (_second, refused) = register_holding(&host.sock_path, "db");
         match &refused {
             BoxControlReply::Error { error } => assert!(
-                error.contains("limit of 1 box registration connections"),
+                error.contains("limit of 1 box registration connection;"),
                 "the refusal names the cap, got {error}"
             ),
             other => panic!("a lease past the cap is refused, got {other:?}"),
