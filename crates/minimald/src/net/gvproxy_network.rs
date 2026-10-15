@@ -2197,11 +2197,7 @@ mod tests {
                 SHARED,
                 BTreeSet::from([8080, 9090]),
             );
-            reg.register_own_ip(
-                boxes::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
         // The session actor's cell, shared with every spawn's guard through
         // the reporter, as the launcher wires it.
