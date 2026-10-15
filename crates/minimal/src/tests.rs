@@ -1898,7 +1898,9 @@ fn resolved_upload_root_notice_only_when_they_differ() {
 }
 
 /// A skip that would drop lifecycle hooks is the caller's call: the refusing
-/// caller gets an error, and one with no hooks dropped never does.
+/// caller gets an error, and one with no hooks dropped never does. The user's
+/// own decline is never refused, whatever it costs — it is an answer, not an
+/// accident.
 #[test]
 fn report_upload_outcome_refuses_dropped_hooks_only() {
     let root = camino::Utf8Path::new("/srv/data/run42");
@@ -1918,6 +1920,32 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
         )
         .is_ok()
     );
+    assert!(
+        report_upload_outcome(Ok(WorkspaceUpload::Declined), root, true).is_ok(),
+        "a deliberate decline is never refused"
+    );
+}
+
+/// The rule `min dash` applies in place of the stderr wording refuses exactly
+/// the hook-dropping undeclared skip: the skips that cost nothing, and the
+/// user's own decline, still create their box.
+#[test]
+fn refuse_dropped_hooks_gates_only_the_hook_dropping_skip() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    for allowed in [
+        WorkspaceUpload::Uploaded,
+        WorkspaceUpload::SkippedEmptyOrHome,
+        WorkspaceUpload::SkippedUndeclared { dropped_hooks: 0 },
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(refuse_dropped_hooks(&allowed, root).is_ok(), "{allowed:?}");
+    }
+    let err = refuse_dropped_hooks(
+        &WorkspaceUpload::SkippedUndeclared { dropped_hooks: 2 },
+        root,
+    )
+    .expect_err("a skip that drops lifecycle hooks is refused");
+    assert!(err.to_string().contains("2 lifecycle hook(s)"), "{err}");
 }
 
 /// A refused composition is reported in the user's terms — the
