@@ -2457,7 +2457,7 @@ mod tests {
             body: &'static str,
         ) -> tokio::task::JoinHandle<String> {
             let listener = UnixListener::bind(&path).unwrap();
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 let (mut sock, _) = listener.accept().await.expect("the bind is asked");
                 let request = String::from_utf8_lossy(&read_request(&mut sock).await).into_owned();
                 sock.write_all(

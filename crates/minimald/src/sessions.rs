@@ -605,21 +605,26 @@ impl Manager {
                 .expect("hostname registry lock poisoned")
                 .notify_hand_overs(sender);
             let manager = weak_self.clone();
-            tokio::spawn(async move {
-                while let Some(hand_over) = hand_overs.recv().await {
-                    let Some(manager) = manager.upgrade() else {
-                        return;
-                    };
-                    let holder = manager
-                        .get_session(SessionKeyPredicate::Id(hand_over.holder))
-                        .await;
-                    if let Ok(Some(holder)) = holder {
-                        holder
-                            .bind_handed_port(hand_over.address, hand_over.port)
+            // Serves hand-overs for the manager's life: a root of its own,
+            // like the manager's mainloop below.
+            crate::traced::spawn_detached(
+                tracing::info_span!(parent: None, "sessions.hand_overs"),
+                async move {
+                    while let Some(hand_over) = hand_overs.recv().await {
+                        let Some(manager) = manager.upgrade() else {
+                            return;
+                        };
+                        let holder = manager
+                            .get_session(SessionKeyPredicate::Id(hand_over.holder))
                             .await;
+                        if let Ok(Some(holder)) = holder {
+                            holder
+                                .bind_handed_port(hand_over.address, hand_over.port)
+                                .await;
+                        }
                     }
-                }
-            });
+                },
+            );
         }
         let mngr = Self {
             in_shutdown,
