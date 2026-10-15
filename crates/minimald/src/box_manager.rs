@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    session::{Session, SessionConfig, SessionHandle},
-    session_host::HostAttrs,
+    box_actor::{Session, SessionConfig, SessionHandle},
+    box_runtime::HostAttrs,
     store::{RecordPredicate, SessionRecordHandle, Store, StoreHandle},
 };
 use boxes::SessionId;
@@ -678,7 +678,7 @@ pub(crate) struct InterimUpgrade {
 }
 
 /// Lands a range verdict the way the deferred walk lands it
-/// ([`crate::sessions::Manager::init`]'s spawned probe): the state moves
+/// ([`crate::box_manager::Manager::init`]'s spawned probe): the state moves
 /// first, then the arm that follows it runs over the publishes the old
 /// verdict left standing — the one moment a verdict's landing has effects
 /// beside the atomic it sets, and the reason the walk cannot simply store
@@ -854,7 +854,7 @@ pub(crate) fn draw_interim_upgrades(
 ///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
-/// ([`crate::sessions::Manager::init`]), never through the manager's
+/// ([`crate::box_manager::Manager::init`]), never through the manager's
 /// mailbox or a session actor's, so a destroy can land anywhere between
 /// the draw's enumeration, its grant, and this apply.
 #[cfg(target_os = "linux")]
@@ -1009,7 +1009,7 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
 ///
 /// Aliases the session actor's bound on the same probes rather than picking
 /// its own number, so the two hops cannot drift apart.
-const HOST_PROBE_TIMEOUT: std::time::Duration = crate::session::HOST_PROBE_TIMEOUT;
+const HOST_PROBE_TIMEOUT: std::time::Duration = crate::box_actor::HOST_PROBE_TIMEOUT;
 
 impl Manager {
     /// The async task which handles interactions with the
@@ -1132,7 +1132,7 @@ impl Manager {
             {
                 continue;
             }
-            let name = crate::session::registry_name(&record);
+            let name = crate::box_actor::registry_name(&record);
             if let Some(owner) = self
                 .hostnames
                 .read()
@@ -1230,7 +1230,7 @@ impl Manager {
         // gate is the host-address mode's alone.
         if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
             config.network,
-            crate::session_host::host_ip_enforcement_fact().can_decide_per_box(),
+            crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box(),
             config.policy.egress.as_ref(),
         ) {
             let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
@@ -1565,7 +1565,7 @@ pub struct ManagerHandle {
 /// A non-owning handle to the [`Manager`] actor.
 ///
 /// Held by per-session machinery that must be able to reach the manager
-/// (notably a session's [`Binding`](crate::session_host), to request its own
+/// (notably a session's [`Binding`](crate::box_runtime), to request its own
 /// destruction) without keeping the actor alive. See [`Manager::weak_self`] for
 /// why the path back to the manager must be weak.
 #[derive(Debug, Clone)]
@@ -1602,7 +1602,7 @@ impl WeakManagerHandle {
 
 /// A non-owning handle to manipulate a specific session on a sessions actor.
 ///
-/// Used by downstream actors (i.e. [`Binding`](crate::session_host)) to
+/// Used by downstream actors (i.e. [`Binding`](crate::box_runtime)) to
 /// manipulate the session itself, such as deletion.
 #[derive(Debug, Clone)]
 pub struct SessionControl {
@@ -1846,7 +1846,7 @@ impl ManagerHandle {
     /// pass `None` for non-SSH callers (e.g. in-process daemon callers and
     /// tests).
     ///
-    /// [`configure_loadout`]: crate::session::SessionHandle::configure_loadout
+    /// [`configure_loadout`]: crate::box_actor::SessionHandle::configure_loadout
     pub async fn create_session(
         &self,
         config: minimald_rpc::SessionConfig,
@@ -1976,7 +1976,7 @@ impl ManagerHandle {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::session::PACKAGE_CHECK_DEADLINE;
+    use crate::box_actor::PACKAGE_CHECK_DEADLINE;
     use boxes::daemon::composer::ComposeOutcome;
     use boxes::wire::request::{ContributionVerdict, SessionStep, WireContribution};
     use paths::HostAbsPath;
@@ -3345,7 +3345,7 @@ pub(crate) mod tests {
     /// clean — the terminal update is the whole point here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_check_closes_with_exactly_one_terminal_outcome() {
-        use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+        use crate::box_ops::{CheckOpts, CheckOutcome, CheckUpdate};
 
         let (_state, _cache, mngr) = manager().await;
         let id = create_active_session(&mngr).await;
@@ -3389,7 +3389,7 @@ pub(crate) mod tests {
     /// would first have to be handed and drain.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_materialize_rejects_an_unknown_output_by_name() {
-        use crate::session_sop::MaterializeOpts;
+        use crate::box_ops::MaterializeOpts;
 
         let (_state, _cache, mngr) = manager().await;
         let id = create_active_session(&mngr).await;

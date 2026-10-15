@@ -855,7 +855,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // In the guest this is pid 1, which mounts cgroup2 itself
     // (`guest::enter_rootfs`) and so builds the tree here; a tree it could
     // not build is a broken image, not a deployment state, and
-    // `session_host` refuses a host-address box on it (design §7.1).
+    // `box_runtime` refuses a host-address box on it (design §7.1).
     // Natively the installer installs the tree and delegates it to this
     // account, and entering it is a migration whose common ancestor this
     // daemon can write only from *inside* the tree: the installer's `--pid`
@@ -986,7 +986,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // own re-read — the state the create reply carries, the cause every
     // surface's refusal gate answers over, and what lowers a box's own
     // launch record to `none` when the host can no longer decide per box.
-    minimald::session_host::set_host_ip_enforcement_fact(&classifier_decision);
+    minimald::box_runtime::set_host_ip_enforcement_fact(&classifier_decision);
     if let Some(cause) = classifier_decision.cause() {
         tracing::info!(
             tree = sandbox::classifier::TREE_ROOT,

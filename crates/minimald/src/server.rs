@@ -175,8 +175,8 @@ fn resolve_switch_octet(lock_dir: Option<&std::path::Path>, identity: &str) -> u
     octet
 }
 
+use crate::box_manager;
 use crate::connection::{Connection, ConnectionHandle};
-use crate::sessions;
 
 /// The ed25519 host private key for the SSH server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,7 +400,7 @@ impl std::fmt::Debug for DaemonLogRelease {
 #[derive(Debug)]
 pub struct ServerState {
     config: Config,
-    sessions: sessions::ManagerHandle,
+    sessions: box_manager::ManagerHandle,
     daemon_id: String,
 
     /// The daemon-scoped gvproxy switch, cloned beside the copy the sessions
@@ -605,7 +605,7 @@ impl ServerState {
         );
 
         Ok(Self {
-            sessions: sessions::Manager::init(
+            sessions: box_manager::Manager::init(
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
@@ -779,7 +779,7 @@ impl ServerStateHandle {
     }
 
     /// Returns a handle to the sessions manager.
-    pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
+    pub async fn sessions_manager(&self) -> box_manager::ManagerHandle {
         self.0.lock().await.sessions.clone()
     }
 
@@ -1397,7 +1397,10 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         // Re-read the status at teardown: a clean client abort already
         // deleted the record (`get_record` → `None`), and a finalized
         // session is `Active` — neither should be reaped here.
-        let status = match mngr.get_record(sessions::SessionKeyPredicate::Id(id)).await {
+        let status = match mngr
+            .get_record(box_manager::SessionKeyPredicate::Id(id))
+            .await
+        {
             Ok(Some(record)) => record.status,
             Ok(None) => continue,
             Err(e) => {
@@ -3306,7 +3309,7 @@ mod tests {
         let working = state
             .sessions_manager()
             .await
-            .get_session(sessions::SessionKeyPredicate::Id(id))
+            .get_session(box_manager::SessionKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session should resolve")

@@ -776,7 +776,7 @@ mod tests {
     /// the shape a VM-backed host's daemon carries. Carries the same
     /// instance host id the NET-121 proofs build their registry with
     /// (`aaaa1`), the pairing the daemon itself makes
-    /// (`sessions.rs` builds its registry from this switch's `host_id`),
+    /// (`box_manager.rs` builds its registry from this switch's `host_id`),
     /// so the attach's per-id `/services/dns/add` publishes — its own id
     /// beside the deprecated `local` one — are the two the proofs count.
     fn vm_host_switch() -> Arc<Mutex<SwitchClient>> {
@@ -3410,7 +3410,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let scenario = attach_scenario(&dir, "gvproxy.sock");
         // The host-side registration's row: the box's own address, published
-        // by the same stable id the reporter reads back — what `session`'s
+        // by the same stable id the reporter reads back — what `box_actor`'s
         // finalize does for a handed box, standing in for the host-side
         // creator that owns the row.
         scenario

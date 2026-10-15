@@ -275,8 +275,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 // The autogen session name and its collision retry are the client
 // library's, shared with `min dash`.
 #[cfg(test)]
-pub(crate) use minimal_client::session_name::AUTOGEN_NAME_RETRIES;
-pub(crate) use minimal_client::session_name::{
+pub(crate) use minimal_client::box_name::AUTOGEN_NAME_RETRIES;
+pub(crate) use minimal_client::box_name::{
     autogen_session_name, random_hex4, sanitize_name_component, should_retry_autogen,
 };
 

@@ -649,7 +649,7 @@ async fn register_box_at(
 /// to one a live row already holds; for an autogen `name` that refusal is a
 /// name collision like the create's, so the name is re-minted with `remint`
 /// and registered again, within the bounded budget
-/// ([`crate::session_name::should_retry_autogen`]) the `CreateSession`
+/// ([`crate::box_name::should_retry_autogen`]) the `CreateSession`
 /// collision retry spends — `attempts` is shared with
 /// it. A refused registration publishes no row, so nothing is withdrawn
 /// between attempts. A user-supplied name, any other failure, and a spent
@@ -720,7 +720,7 @@ async fn reminting_autogen(
         };
         match registered {
             Err(error)
-                if crate::session_name::should_retry_autogen(
+                if crate::box_name::should_retry_autogen(
                     autogen,
                     *attempts,
                     &format!("{error:#}"),

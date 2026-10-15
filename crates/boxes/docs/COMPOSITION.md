@@ -396,7 +396,7 @@ the launcher's rootfs setup picks up; lifecycle hooks are held on
 `SessionInner::Active { composition, ... }` and logged at `info!`
 with `deferred = true` — the in-sandbox exec plumbing for hooks
 is still to land. Operator visibility is intact:
-`log_session_contents` in `crates/minimald/src/session_host.rs`
+`log_session_contents` in `crates/minimald/src/box_runtime.rs`
 enumerates every composition item with its provenance.
 
 **Response shape.** `CreateSession` returns

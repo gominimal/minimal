@@ -372,7 +372,7 @@ impl TestServer {
     /// `get_session` is called, which starts the session actor.
     pub async fn bring_session_up(&self, session_id: boxes::SessionId) {
         let mngr = self.state.sessions_manager().await;
-        mngr.get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        mngr.get_session(crate::box_manager::SessionKeyPredicate::Id(session_id))
             .await
             .expect("get_session RPC should succeed")
             .expect("session should be retrievable");
@@ -389,7 +389,7 @@ impl TestServer {
     pub async fn seed_workspace_mfile(&self, session_id: boxes::SessionId, contents: &str) {
         let mngr = self.state.sessions_manager().await;
         let paths = mngr
-            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .get_session(crate::box_manager::SessionKeyPredicate::Id(session_id))
             .await
             .expect("get_session RPC should succeed")
             .expect("session should be retrievable")

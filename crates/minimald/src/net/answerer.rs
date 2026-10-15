@@ -1388,7 +1388,7 @@ fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &
 /// re-check logged, so the same stale state is named once, not once per
 /// pass, and the return to a matching bind is the one info line it owes.
 async fn recheck_live_carve_outs(
-    manager: &crate::sessions::ManagerHandle,
+    manager: &crate::box_manager::ManagerHandle,
     live: Option<SocketAddr>,
     facts: &HolderFacts,
     said: &mut Option<String>,
@@ -1396,7 +1396,7 @@ async fn recheck_live_carve_outs(
     // Only a host that decides a host-address box's verdict per box has
     // boxes whose carve-out is a fact the table enforces; on any other host
     // there is nothing to re-check and nothing a bind change could break.
-    if !crate::session_host::host_ip_enforcement_fact().can_decide_per_box() {
+    if !crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box() {
         return;
     }
     // The recorded half of the comparison, read the same way a launch
@@ -1424,7 +1424,7 @@ async fn recheck_live_carve_outs(
 /// every arm of the comparison, the matching one included, is reachable
 /// from a test.
 async fn recheck_live_carve_outs_against(
-    manager: &crate::sessions::ManagerHandle,
+    manager: &crate::box_manager::ManagerHandle,
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
     facts: &HolderFacts,
@@ -1463,7 +1463,7 @@ async fn recheck_live_carve_outs_against(
             };
             for info in infos {
                 let Some(record) = manager
-                    .get_record(crate::sessions::SessionKeyPredicate::Id(info.id))
+                    .get_record(crate::box_manager::SessionKeyPredicate::Id(info.id))
                     .await
                     .ok()
                     .flatten()
@@ -1895,7 +1895,7 @@ enum WindowEnd {
 #[expect(clippy::too_many_arguments, reason = "the loop's own state, threaded")]
 async fn host_the_interim(
     state: &crate::server::ServerStateHandle,
-    manager: &crate::sessions::ManagerHandle,
+    manager: &crate::box_manager::ManagerHandle,
     registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
     commands: &mut mpsc::Receiver<HandoverCommand>,
     socket: tokio::net::UdpSocket,
@@ -3618,11 +3618,11 @@ mod tests {
 
         // The fact is process-global: hold the window every fact-writing
         // test holds, and put it back before the test ends.
-        let _fact_window = crate::session_host::PROBE_TEST_MUTEX
+        let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let capture = crate::test_harness::captured_log();
-        crate::session_host::set_host_ip_enforcement_fact(
+        crate::box_runtime::set_host_ip_enforcement_fact(
             &crate::net::classifier::Decision::decided(),
         );
 
@@ -3803,7 +3803,7 @@ mod tests {
         drop(foreign);
 
         drop(channel);
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// NET-122's host arm and its bound: with no install marker and no

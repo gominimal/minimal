@@ -24,9 +24,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::RequestedPty;
-use crate::session::SessionPaths;
-use crate::session_delta::DeltaSource;
-use crate::sessions::SessionControl;
+use crate::box_actor::SessionPaths;
+use crate::box_manager::SessionControl;
+use crate::workspace_delta::DeltaSource;
 use boxes::NetworkMode;
 use boxes::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 // The one per-box egress enforcement type (NET-079): shared with the session
@@ -575,14 +575,14 @@ const HOST_GONE_NOTICE: &[u8] = b"\r\nDisconnecting - the session is gone\r\n";
 ///
 /// The wait is bounded because this runs inside the host loop. A binding
 /// whose client stopped draining can neither take the message nor finish,
-/// and past [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT) it is
+/// and past [`HOST_PROBE_TIMEOUT`](crate::box_actor::HOST_PROBE_TIMEOUT) it is
 /// shed instead, which still closes its channel.
 async fn retire_binding((tx, mut task, shed): BindingSlot, msg: BindingMsg) {
     let orderly = async {
         let _ = tx.send(msg).await;
         let _ = (&mut task).await;
     };
-    if tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, orderly)
+    if tokio::time::timeout(crate::box_actor::HOST_PROBE_TIMEOUT, orderly)
         .await
         .is_err()
     {
@@ -1030,8 +1030,8 @@ impl Binding {
             // because russh's channel writer otherwise answers this short
             // buffer with the interrupted write's byte count and tokio's
             // `write_all` panics past its end.
-            let _ =
-                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(notice)).await;
+            let _ = tokio::time::timeout(crate::box_actor::HOST_PROBE_TIMEOUT, w.write_all(notice))
+                .await;
         }
 
         let _ = ws.eof().await;
@@ -1841,7 +1841,7 @@ impl WeakHostHandle {
 /// to callers only when the loop is *not* draining: a wedged host fills this
 /// in a handful of polls, after which a probe blocks in `send` rather than
 /// `recv`. Both need a deadline; see
-/// [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT).
+/// [`HOST_PROBE_TIMEOUT`](crate::box_actor::HOST_PROBE_TIMEOUT).
 pub(crate) const HOST_MAILBOX_CAPACITY: usize = 8;
 
 /// How long an attached binding may take no session output at all before
@@ -1850,7 +1850,7 @@ pub(crate) const HOST_MAILBOX_CAPACITY: usize = 8;
 /// Until then a binding that falls behind gets backpressure: the host stops
 /// reading the pty while the binding's mailbox is full, so the shell waits on
 /// the terminal, and the loop keeps serving its own mailbox. The bound is far
-/// longer than [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT)
+/// longer than [`HOST_PROBE_TIMEOUT`](crate::box_actor::HOST_PROBE_TIMEOUT)
 /// because it catches something else. The probe deadline asks whether the
 /// host is alive. This one asks whether the client has stopped reading
 /// altogether. A slow terminal drains a mailbox slot in milliseconds, so it
@@ -1910,7 +1910,7 @@ impl HostHandle {
             .sender
             .send_timeout(
                 Message::Kill(for_shutdown),
-                crate::session::HOST_PROBE_TIMEOUT,
+                crate::box_actor::HOST_PROBE_TIMEOUT,
             )
             .await
         {
@@ -1934,7 +1934,7 @@ impl HostHandle {
             .sender
             .send_timeout(
                 Message::Rename(new_name),
-                crate::session::HOST_PROBE_TIMEOUT,
+                crate::box_actor::HOST_PROBE_TIMEOUT,
             )
             .await;
     }
@@ -1959,7 +1959,7 @@ impl HostHandle {
             .sender
             .send_timeout(
                 Message::Attach(c, sz, connection, keys),
-                crate::session::HOST_PROBE_TIMEOUT,
+                crate::box_actor::HOST_PROBE_TIMEOUT,
             )
             .await
         {
@@ -2077,7 +2077,7 @@ impl HostHandle {
     /// neither can be computed or the host is gone (a dead host reads as
     /// `Unavailable`, not a panic, because callers race teardown). The
     /// computation runs off the host's runtime loop, bounded per
-    /// [`crate::session_delta::assess`].
+    /// [`crate::workspace_delta::assess`].
     pub async fn at_risk(&self) -> minimald_rpc::SessionDeltaResponse {
         let (send, recv) = oneshot::channel();
         if self.sender.send(Message::GetAtRisk(send)).await.is_err() {
@@ -2097,7 +2097,7 @@ impl HostHandle {
     ///
     /// Unbounded by design: the human's answer is the only bound an ask has,
     /// so callers that must not park on it await this off the actor the
-    /// request belongs to (see how [`crate::session`] routes the ask).
+    /// request belongs to (see how [`crate::box_actor`] routes the ask).
     pub(crate) async fn ask_expose(&self, port: u16) -> Option<AskAnswer> {
         let (send, recv) = oneshot::channel();
         if self
@@ -2700,7 +2700,7 @@ const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
 
 /// Environment folded into a session shell at the launching attach, over and
 /// above the composition. Both halves are captured from the SSH channel the
-/// attach arrives on (see [`crate::session::Session::attach`]).
+/// attach arrives on (see [`crate::box_actor::Session::attach`]).
 ///
 /// The two halves sit on opposite sides of the composition in precedence:
 /// `inherited` are defaults the composition may override, `connection` are
@@ -2961,7 +2961,7 @@ pub(crate) struct SandboxLauncher {
     pub(crate) composition: Option<std::sync::Arc<boxes::core::compose::Composition>>,
     /// Weak handle back to the owning session actor, for  `min` commands
     /// (e.g. `min build`) to drive session side-ops.
-    pub(crate) session: crate::session::WeakSessionHandle,
+    pub(crate) session: crate::box_actor::WeakSessionHandle,
     /// Whether this launch exists to run lifecycle hooks rather than to serve
     /// a person: minted by the session's hook path — activation at finalize,
     /// teardown at detach or destroy — headless, its pty read by nobody.
@@ -3017,7 +3017,7 @@ pub(crate) struct SandboxLauncher {
 /// is gone. The `Err` arms between the spawn and the handoff reap
 /// explicitly; this is what catches the third way out, a **cancelled**
 /// launch future. There is a real caller: a teardown transition bounds
-/// its launch with a timeout (`session::HOOK_LAUNCH_TIMEOUT`) and drops
+/// its launch with a timeout (`box_actor::HOOK_LAUNCH_TIMEOUT`) and drops
 /// this future when it expires, which without the guard would strand a
 /// sandbox the destroy then tries to delete out from under.
 ///
@@ -3079,7 +3079,7 @@ impl Drop for SpawnedProcessGuard {
 /// return
 /// for a build that failed, and — the one no `return` covers — the future's
 /// own `Drop`, which is what a teardown transition bounding its launch with
-/// a timeout (`session::HOOK_LAUNCH_TIMEOUT`) takes. This guard owns the
+/// a timeout (`box_actor::HOOK_LAUNCH_TIMEOUT`) takes. This guard owns the
 /// leaf until `release` hands it to the [`SandboxBackend`] that keeps it for
 /// the session's lifetime.
 ///
@@ -4458,7 +4458,7 @@ impl SessionLauncher for SandboxLauncher {
             attach_env.connection,
         );
         // Which shell this attach starts is decided from the composed
-        // `SHELL` (see `crate::session_shell`). Read before `env_vars`
+        // `SHELL` (see `crate::attach_shell`). Read before `env_vars`
         // moves into the env build; the rootfs it has to be checked
         // against doesn't exist until that build has run.
         let requested_shell = env_vars.get("SHELL").cloned();
@@ -4569,7 +4569,7 @@ impl SessionLauncher for SandboxLauncher {
             // absolute (`/usr/bin/<shell>`): packages install with
             // `--prefix=/usr` and the generic rootfs has no `/bin`, so a
             // bare name or a `/bin/…` path would fail with ENOENT.
-            let shell = crate::session_shell::resolve(requested_shell.as_deref(), &env.rootfs());
+            let shell = crate::attach_shell::resolve(requested_shell.as_deref(), &env.rootfs());
             if let Some(notice) = &shell.fallback {
                 tracing::warn!(
                     session = %session_label,
@@ -5889,7 +5889,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                         port,
                                         reply: binding_reply,
                                     },
-                                    crate::session::HOST_PROBE_TIMEOUT,
+                                    crate::box_actor::HOST_PROBE_TIMEOUT,
                                 )
                                 .await
                             {
@@ -5949,7 +5949,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         let root = self.workspace_root.clone();
                         let delta = self.delta.clone();
                         crate::traced::spawn(async move {
-                            let _ = s.send(crate::session_delta::assess(root, delta).await);
+                            let _ = s.send(crate::workspace_delta::assess(root, delta).await);
                         });
                     }
                     #[cfg(test)]
@@ -6095,7 +6095,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                         match tx
                                             .send_timeout(
                                                 BindingMsg::TeardownDueToDetach(uc),
-                                                crate::session::HOST_PROBE_TIMEOUT,
+                                                crate::box_actor::HOST_PROBE_TIMEOUT,
                                             )
                                             .await
                                         {

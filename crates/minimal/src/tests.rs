@@ -1832,7 +1832,7 @@ fn daemon_refusals_print_without_rpc_names() {
     // in type paths and comments, which the scan does not read. A literal
     // is tracked across lines — the refusals are wrapped with `\` — so a
     // continuation line with no quote of its own is still read.
-    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
+    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/box_actor.rs"))
         .expect("readable daemon source");
     let mut in_literal = false;
     for (number, line) in daemon.lines().enumerate() {
@@ -1865,7 +1865,7 @@ fn daemon_refusals_print_without_rpc_names() {
         ] {
             assert!(
                 !line.contains(rpc),
-                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
+                "minimald/src/box_actor.rs:{}: a string names the {rpc} RPC: {line}",
                 number + 1
             );
         }

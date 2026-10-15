@@ -717,10 +717,10 @@ async fn create_registering<C: Send>(
     client: &mut C,
     mut create: impl for<'c> FnMut(&'c mut C, SessionConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
+    use minimal_client::box_name::{autogen_session_name, random_hex4, should_retry_autogen};
     use minimal_client::box_registration::{
         control_sock_beside, register_box_beside_reminting_autogen, vm_host_control_sock,
     };
-    use minimal_client::session_name::{autogen_session_name, random_hex4, should_retry_autogen};
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
     let project_dir = config.project_path.as_utf8_path().to_path_buf();

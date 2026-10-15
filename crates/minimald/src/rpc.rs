@@ -26,10 +26,10 @@ use crate::traced::spawn;
 
 use crate::{
     ChannelConfig,
+    box_manager::SessionKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
     net::classifier,
     server::ServerStateHandle,
-    sessions::SessionKeyPredicate,
 };
 
 /// This daemon's build, reported on every reply a version-gated client path
@@ -149,7 +149,7 @@ async fn serve_list_sessions(
             // host-address session", so one unreadable record fails no
             // listing.
             let in_microvm = s.in_microvm().await;
-            let fact = crate::session_host::host_ip_enforcement_fact();
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
             let enforcement = futures::future::join_all(infos.iter().map(|i| async {
                 let record = mngr
                     .get_record(SessionKeyPredicate::Id(i.id))
@@ -157,7 +157,7 @@ async fn serve_list_sessions(
                     .ok()
                     .flatten();
                 record.map(|record| {
-                    crate::session_host::displayed_host_ip_enforcement(
+                    crate::box_runtime::displayed_host_ip_enforcement(
                         in_microvm,
                         record.network,
                         classifier::verdict_of(record.policy.egress.as_ref()),
@@ -221,7 +221,7 @@ async fn serve_list_sessions(
 /// Empty for every mode but a shared-address own-ip box; a plain map lookup
 /// behind the registry's lock, so it never holds up a reply.
 fn shared_port_collisions_of(
-    mngr: &crate::sessions::ManagerHandle,
+    mngr: &crate::box_manager::ManagerHandle,
     id: SessionId,
 ) -> Vec<minimald_rpc::SharedPortCollision> {
     let registry = mngr.hostnames();
@@ -256,7 +256,7 @@ async fn serve_get_session_record(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
-    use crate::sessions::SessionKeyPredicate;
+    use crate::box_manager::SessionKeyPredicate;
     GetSessionRecord
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
@@ -405,7 +405,7 @@ async fn serve_create_session(
                     error: refused.to_string(),
                 });
             }
-            let fact = crate::session_host::host_ip_enforcement_fact();
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
             let classifier_cause = fact.cause;
             let classifier_advisory = create_classifier_advisory(
                 in_microvm,
@@ -413,7 +413,7 @@ async fn serve_create_session(
                 classifier_cause,
                 req.config.policy.egress.as_ref(),
             );
-            let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+            let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
                 in_microvm,
                 req.config.network,
                 classifier::verdict_of(req.config.policy.egress.as_ref()),
@@ -1591,11 +1591,11 @@ async fn serve_get_session_runtime_facts(
                     error: "no session found".to_string(),
                 }),
                 Some(record) => {
-                    let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+                    let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
                         s.in_microvm().await,
                         record.network,
                         classifier::verdict_of(record.policy.egress.as_ref()),
-                        &crate::session_host::host_ip_enforcement_fact(),
+                        &crate::box_runtime::host_ip_enforcement_fact(),
                         record.host_ip_enforcement,
                     );
                     // The listen publishes the audit log refused (NET-046):
@@ -2061,7 +2061,13 @@ async fn serve_stream_workspace_patches(
 async fn upload_session_handle(
     s: &ServerStateHandle,
     config: &ChannelConfig,
-) -> Result<(crate::session::SessionHandle, crate::session::SessionPaths), String> {
+) -> Result<
+    (
+        crate::box_actor::SessionHandle,
+        crate::box_actor::SessionPaths,
+    ),
+    String,
+> {
     let session_id_str = config
         .env_vars
         .get(crate::MINIMAL_SESSION_ID_ENV)
@@ -2088,14 +2094,14 @@ async fn upload_session_handle(
 /// panic, or the upload task torn down mid-stream) enqueues the clear
 /// without awaiting it instead, so no exit path leaves the session refusing
 /// attaches forever.
-pub(crate) struct WorkspaceUploadInFlight(Option<crate::session::SessionHandle>);
+pub(crate) struct WorkspaceUploadInFlight(Option<crate::box_actor::SessionHandle>);
 
 impl WorkspaceUploadInFlight {
     /// Marks the upload in flight. Refused, marking nothing, when the
     /// session is no longer unconfigured: an upload belongs to the create
     /// flow, ahead of the configure, and one into a composed or configured
     /// session's tree is not part of it.
-    pub(crate) async fn begin(handle: crate::session::SessionHandle) -> Result<Self, String> {
+    pub(crate) async fn begin(handle: crate::box_actor::SessionHandle) -> Result<Self, String> {
         handle
             .set_workspace_upload_in_flight(true)
             .await
@@ -2829,8 +2835,8 @@ mod tests {
 
     use super::*;
     use crate::MINIMAL_SESSION_ID_ENV;
-    use crate::session_host::PROBE_TEST_MUTEX;
-    use crate::sessions::SessionKeyPredicate;
+    use crate::box_manager::SessionKeyPredicate;
+    use crate::box_runtime::PROBE_TEST_MUTEX;
     use crate::test_harness::{TestClient, TestServer};
 
     /// Serializes `(path, contents)` entries into a tar archive and
@@ -3854,7 +3860,7 @@ mod tests {
         // reads it from, pinned here so the listing below is proven to
         // answer over the same fact the create did, whatever this host
         // actually decides.
-        let fact = crate::session_host::host_ip_enforcement_fact();
+        let fact = crate::box_runtime::host_ip_enforcement_fact();
         assert_eq!(
             created.host_ip_enforcement.as_deref(),
             Some(fact.enforcement.machine_str()),
@@ -3896,7 +3902,7 @@ mod tests {
     /// mount table the test spells beside the tree stands in for the daemon's
     /// own. Returns the tree guard, which the caller keeps alive for as long
     /// as the stand-in answers, and the root and mount table to hand a
-    /// launch's re-read ([`crate::session_host::re_read_classifier_fact`]).
+    /// launch's re-read ([`crate::box_runtime::re_read_classifier_fact`]).
     fn installed_cohort_tree() -> (tempfile::TempDir, std::path::PathBuf, String) {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
         let root = tree.path().to_path_buf();
@@ -3973,7 +3979,7 @@ mod tests {
         // The fact a start-up read over a step-missing host leaves: state
         // `none`, cause the step's — the state the daemon's own start-up
         // line would spell with the same words the advisory below carries.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
         let step_missing = client
@@ -4008,14 +4014,14 @@ mod tests {
         // The cannot-confine fact over the same box: the cause is the
         // mount's, so the advisory names the own-address start alone and
         // says why the install cannot help.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::CannotConfine,
         ));
         let cannot_confine = client
             .call::<CreateSession>(&deny_all("cannot-confine"))
             .await
             .unwrap();
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
         let advisory = cannot_confine
             .classifier_advisory
             .expect("a host that cannot confine still gets the advisory");
@@ -4117,7 +4123,7 @@ mod tests {
         let mut client = server.connect().await;
 
         // The fact a start-up read over a step-missing host leaves.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
         let mut deny_all = req("deny-all", "/uwu");
@@ -4253,7 +4259,7 @@ mod tests {
             None,
         );
         let sectioned_id = client.call::<CreateSession>(&sectioned).await.unwrap().id;
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::TableNotEffective,
         ));
         let mut refused_create = req("refused-create", "/uwu");
@@ -4330,7 +4336,7 @@ mod tests {
             classifier::Cause::StepNotInstalled,
         ));
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Deny,
@@ -4342,7 +4348,7 @@ mod tests {
              enforced"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Allow,
@@ -4354,7 +4360,7 @@ mod tests {
              section too"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::OwnIp,
                 sandbox::config::Verdict::Deny,
@@ -4366,7 +4372,7 @@ mod tests {
              address leases, not on the cgroup tree"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Deny,
@@ -4378,7 +4384,7 @@ mod tests {
              refuses shows nothing, exactly as its launch refuses it"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Allow,
@@ -4390,7 +4396,7 @@ mod tests {
              unenforced and show that state"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Deny,
@@ -4408,7 +4414,7 @@ mod tests {
         // record is the launch's outcome and never the host's current
         // state's to raise.
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Allow,
@@ -4420,7 +4426,7 @@ mod tests {
              gave it, while this host can still decide per box"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Allow,
@@ -4432,7 +4438,7 @@ mod tests {
              the undecidable state, never the per-box one its record holds"
         );
         assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
+            crate::box_runtime::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
                 sandbox::config::Verdict::Allow,
@@ -4444,15 +4450,15 @@ mod tests {
              is never raised to the per-box state a later launch reached"
         );
 
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// The fact a decision leaves, as the reads see it — set and copied back
     /// through the daemon's own accessors, so a pure pin answers over the
     /// pairing a real read produced, never a pairing a test invented.
-    fn fact_of(decision: &classifier::Decision) -> crate::session_host::HostIpEnforcementFact {
-        crate::session_host::set_host_ip_enforcement_fact(decision);
-        crate::session_host::host_ip_enforcement_fact()
+    fn fact_of(decision: &classifier::Decision) -> crate::box_runtime::HostIpEnforcementFact {
+        crate::box_runtime::set_host_ip_enforcement_fact(decision);
+        crate::box_runtime::host_ip_enforcement_fact()
     }
 
     /// The listing entry's enforcement for one session: the read surface the
@@ -4539,10 +4545,10 @@ mod tests {
         // table whose refusal the probe reads — the kernel behind it is not
         // there — so the reading is injected, the one classifier fact a
         // stand-in tree cannot vouch for.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
+        crate::box_runtime::install_classifier_reading_standin(classifier::Reading::Refused(
             Vec::new(),
         ));
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
+        let (_, decision) = crate::box_runtime::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
             false,
@@ -4563,13 +4569,13 @@ mod tests {
         // The table read as removed: the marker still stands over a refusal
         // that is gone, so the same launch re-reads `none` — and the
         // listing shows it, not the state the earlier read reached.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+        crate::box_runtime::install_classifier_reading_standin(classifier::Reading::NotRefused {
             because: "the injected reading stands in for a probe whose \
                           every leg completed"
                 .to_string(),
             families: Vec::new(),
         });
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
+        let (_, decision) = crate::box_runtime::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
             false,
@@ -4591,10 +4597,10 @@ mod tests {
 
         // The table read as reinstalled: the next launch re-reads `per_box`,
         // and the listing shows the fact the re-read refreshed.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
+        crate::box_runtime::install_classifier_reading_standin(classifier::Reading::Refused(
             Vec::new(),
         ));
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
+        let (_, decision) = crate::box_runtime::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
             false,
@@ -4613,8 +4619,8 @@ mod tests {
              as reinstalled shows `per_box` again"
         );
 
-        crate::session_host::clear_classifier_reading_standin();
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_classifier_reading_standin();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
         drop(tree);
     }
 
@@ -4647,12 +4653,12 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let capture = crate::test_harness::captured_log();
-        let refused_before = crate::sessions::refused_unenforceable_creates();
+        let refused_before = crate::box_manager::refused_unenforceable_creates();
 
         // The host decides per box: the state a loaded, refusing table reads,
         // and the one the create gate answers over — the same bit the launch
         // that follows re-reads for its own gate.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::decided());
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::decided());
 
         // The CLI's own spellings of a narrowing, each refused with the rule
         // it names: `--deny-subnets` subtracts a range from an allow-all —
@@ -4728,7 +4734,7 @@ mod tests {
 
         // The counter counted each refusal, and each refusal logged one info
         // line: the box, the host's per-box value, and each unenforced rule.
-        let refused_after = crate::sessions::refused_unenforceable_creates();
+        let refused_after = crate::box_manager::refused_unenforceable_creates();
         assert_eq!(
             refused_after,
             refused_before + 2,
@@ -4773,7 +4779,7 @@ mod tests {
             "an own-address box's narrowing is enforced, not refused"
         );
 
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// NET-079: a host that decides per box refuses only the declarations
@@ -4796,9 +4802,9 @@ mod tests {
         let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        let refused_before = crate::sessions::refused_unenforceable_creates();
+        let refused_before = crate::box_manager::refused_unenforceable_creates();
 
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::decided());
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::decided());
 
         let plain = client
             .call::<CreateSession>(&req("plain-host-address", "/uwu"))
@@ -4840,12 +4846,12 @@ mod tests {
             );
         }
         assert_eq!(
-            crate::sessions::refused_unenforceable_creates(),
+            crate::box_manager::refused_unenforceable_creates(),
             refused_before,
             "an enforceable declaration is never counted as refused"
         );
 
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// NET-079's exception, at the create: a host that cannot decide per
@@ -4870,11 +4876,11 @@ mod tests {
         let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        let refused_before = crate::sessions::refused_unenforceable_creates();
+        let refused_before = crate::box_manager::refused_unenforceable_creates();
 
         // A host that cannot decide per box: the step never having run, the
         // plainest cause — its boxes run unenforced and say so.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
 
@@ -4933,7 +4939,7 @@ mod tests {
         // create answers over the host's `can_decide_per_box` alone, and the
         // launch's own refusal for the promised verdict is never a reason to
         // hold the name or the record hostage here.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::TableNotEffective,
         ));
         let mut nearly_decided = req("unenforcing-nearly-decided", "/uwu");
@@ -4961,12 +4967,12 @@ mod tests {
              created: {listed:?}"
         );
         assert_eq!(
-            crate::sessions::refused_unenforceable_creates(),
+            crate::box_manager::refused_unenforceable_creates(),
             refused_before,
             "a host that cannot decide per box refuses no create on this ground"
         );
 
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// Waits for the mock host's echo of `line`, which proves this session's
@@ -5047,13 +5053,13 @@ mod tests {
         // tree is still there for a launch to place a box in, and the
         // placement is the outcome A's launch records; the table's state is
         // the reads' to lower it by, never the launch's to record.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+        crate::box_runtime::install_classifier_reading_standin(classifier::Reading::NotRefused {
             because: "the injected reading stands in for a probe whose \
                           every leg completed"
                 .to_string(),
             families: Vec::new(),
         });
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
+        let (_, decision) = crate::box_runtime::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
             false,
@@ -5105,10 +5111,10 @@ mod tests {
 
         // Box B's host reads per_box: the table's refusal is in force, so
         // this host can decide a box's verdict on a leaf of its own.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
+        crate::box_runtime::install_classifier_reading_standin(classifier::Reading::Refused(
             Vec::new(),
         ));
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
+        let (_, decision) = crate::box_runtime::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
             false,
@@ -5179,7 +5185,7 @@ mod tests {
         // test launcher's placement consults. Nothing places a leaf for C:
         // its launch records the outcome of a placement that did not
         // happen.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
 
@@ -5254,13 +5260,13 @@ mod tests {
         // box, so every box on it shows the state its own record is lowered
         // to — B falls from `per_box` to `none`, and A stays where its
         // launch left it.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+        crate::box_runtime::install_classifier_reading_standin(classifier::Reading::NotRefused {
             because: "the injected reading stands in for a probe whose \
                           every leg completed"
                 .to_string(),
             families: Vec::new(),
         });
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
+        let (_, decision) = crate::box_runtime::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
             false,
@@ -5293,8 +5299,8 @@ mod tests {
 
         drop(channel_a);
         drop(channel_b);
-        crate::session_host::clear_classifier_reading_standin();
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_classifier_reading_standin();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
         drop(tree);
     }
 
@@ -5322,7 +5328,7 @@ mod tests {
         let mut client = server.connect().await;
 
         // The fact the reads answer from: a host that cannot decide.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
 
@@ -5392,7 +5398,7 @@ mod tests {
              client's assertion: a host that cannot decide shows `none`"
         );
 
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// NET-079's advisory is built only where it applies: a create over a
@@ -5415,7 +5421,7 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+        crate::box_runtime::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
         // The contrast: the same fact over a declaring host-address box
@@ -5442,7 +5448,7 @@ mod tests {
             own_address.classifier_advisory
         );
 
-        crate::session_host::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_host_ip_enforcement_fact();
     }
 
     /// NET-079's advisory, the other half of where it applies: a daemon
@@ -6461,7 +6467,7 @@ mod tests {
         // is passed explicitly so the opt-out stays proven against the
         // posture it exists to defer whatever the shipped constant says.
         assert_eq!(
-            crate::session::effective_egress_section(
+            crate::box_actor::effective_egress_section(
                 &boxes::SessionPolicy::default(),
                 NetworkMode::OwnIp,
                 boxes::EgressDefaultPhase::InForce,
@@ -7006,7 +7012,7 @@ mod tests {
         // Exit the shell and take the prompt's default (keep): the session
         // survives, its host gone.
         channel
-            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
             .await
             .unwrap();
         let mut answered = false;
@@ -7019,7 +7025,7 @@ mod tests {
                     prompt_out.extend_from_slice(&data);
                     if !answered
                         && String::from_utf8_lossy(&prompt_out)
-                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                            .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                     {
                         channel.data_bytes(b"\r".to_vec()).await.unwrap();
                         answered = true;

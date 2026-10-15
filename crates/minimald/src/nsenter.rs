@@ -1,6 +1,6 @@
 //! Injecting additional processes into a running session's namespaces.
 //!
-//! A session shell is launched into a sandbox by [`crate::session_host`], which
+//! A session shell is launched into a sandbox by [`crate::box_runtime`], which
 //! hands hakoniwa a container and gets back a [`hakoniwa::Child`]. Running a
 //! *second* program in that same sandbox means joining the namespaces via
 //! `setns(2)`.
@@ -416,7 +416,7 @@ fn pidfd_open(pid: u32) -> Result<OwnedFd, NsenterError> {
 ///   launcher does — descriptors cross namespaces untouched.
 ///
 /// `minimald` gets both of the first two from the session's
-/// [`SessionEnvironment`](crate::session_host::SessionEnvironment), which is
+/// [`SessionEnvironment`](crate::box_runtime::SessionEnvironment), which is
 /// what the session's own shell was launched with.
 #[derive(Debug)]
 #[must_use = "an Injection does nothing until `command` is called"]

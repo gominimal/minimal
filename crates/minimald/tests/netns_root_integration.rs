@@ -619,8 +619,8 @@ async fn network_none_attach_works() {
         return;
     }
     announce_to_the_runner("network_none_attach_works");
+    use minimald::box_runtime::{Pty, WinSize};
     use minimald::nsenter::{Injection, session_leader_pid};
-    use minimald::session_host::{Pty, WinSize};
     use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
@@ -645,7 +645,7 @@ async fn network_none_attach_works() {
     let mut container = sandbox
         .new_container(&plan)
         .expect("building none-box container");
-    // The session host's own sequence (session_host.rs:2207): the box becomes
+    // The session host's own sequence (box_runtime.rs:2207): the box becomes
     // its own session leader *before* `Sandbox::command` builds the command
     // whose program the seccomp closure swap replaces, so the swap is what has
     // to carry the runctl to the child hakoniwa forks.
@@ -670,7 +670,7 @@ async fn network_none_attach_works() {
     // The terminal the launch hands the box, on stdin — the fd hakoniwa's
     // `TIOCSCTTY` acts on, so `Runctl::NewSession` can make it the box's
     // controlling terminal.  A real session wires stdout and stderr to the
-    // same slave (session_host.rs:2256-2260); stdout stays a pipe here so the
+    // same slave (box_runtime.rs:2256-2260); stdout stays a pipe here so the
     // report below arrives byte-exact, and the box's stdin — the one the
     // terminal dance needs — is the part this proof exercises.  The pair
     // outlives the box: closing the master while the box runs would SIGHUP it.

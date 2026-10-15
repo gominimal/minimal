@@ -37,9 +37,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 // clippy `disallowed-methods` for the crate names tokio's own spawn.
 use crate::traced::spawn;
 
+use crate::box_manager::SessionKeyPredicate;
 use crate::connection::{ConnectionError, ConnectionHandle};
 use crate::server::ServerStateHandle;
-use crate::sessions::SessionKeyPredicate;
 use crate::{MINIMAL_SESSION_ID_ENV, env};
 
 /// The SSH subsystem name used to negotiate an SFTP channel.
@@ -748,9 +748,9 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
 
+    use crate::box_actor::SessionPaths;
+    use crate::box_manager::SessionKeyPredicate;
     use crate::env;
-    use crate::session::SessionPaths;
-    use crate::sessions::SessionKeyPredicate;
     use crate::test_harness::TestServer;
 
     /// Creates a fresh session through the public CreateSession RPC and

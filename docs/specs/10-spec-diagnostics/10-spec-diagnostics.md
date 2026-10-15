@@ -462,7 +462,7 @@ records carry correlation ids on spans.
 **Affected areas:**
 - `crates/minvmd/src/{main.rs,lib.rs,cmd/run.rs,cmd/vmm_child.rs}`, `Cargo.toml`
 - `justfile`, `scripts/session-e2e.sh` — boot.log default fallout
-- `crates/minimald/src/{main.rs,server.rs,rpc.rs,session_host.rs,test_harness.rs}`
+- `crates/minimald/src/{main.rs,server.rs,rpc.rs,box_runtime.rs,test_harness.rs}`
 - `crates/minimal/src/dirs.rs` — daemon-log note (deferred from Unit 2)
   (`tracing-appender` daily rotation; already a workspace dep, no new one added)
 
@@ -484,7 +484,7 @@ records carry correlation ids on spans.
   `server.rs:103-118` owns a `VolumeLogRelease` invoked from the
   **pre-existing** Shutdown→quiesce path (`rpc.rs:346` on `origin/main`) so
   the appender (and its `WorkerGuard`) drop before the ext4 unmount.
-- ref: `session_host.rs:368-372` and `server.rs:398-401` stamp channel/conn
+- ref: `box_runtime.rs:368-372` and `server.rs:398-401` stamp channel/conn
   ids as **manual per-line fields** — superseded here by spans per the
   design-review boundary above.
 - `tracing-appender` rotation is time-based only; nothing caps intra-day

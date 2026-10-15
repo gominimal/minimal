@@ -73,7 +73,7 @@
 //! publishes stand exactly as they always did, admitted by the switch
 //! alone.
 //!
-//! The plan a launch gathers rides [`crate::session_host::Launched`] to the
+//! The plan a launch gathers rides [`crate::box_runtime::Launched`] to the
 //! host that runs its box — no process-global table between them — so a
 //! plan is the launch's own from the moment it is built, and a launch that
 //! built none starts no watcher at all.
@@ -691,7 +691,7 @@ pub struct ListenPlan {
     /// The box's session gate: the permit decision and the admission.
     gate: Arc<SessionGate>,
     /// The box's publications, shared with the runtime expose surface
-    /// ([`crate::session::Session`]): the one set both read before they
+    /// ([`crate::box_actor::Session`]): the one set both read before they
     /// bind, and the one place a publication's owner is written down.
     publications: BoxPublications,
     /// The daemon's state directory: the audit log the publication's
@@ -804,7 +804,7 @@ struct PublicationEntry {
 /// refused everywhere it does not belong.
 ///
 /// The set belongs to one *launch*, not to the session for good: the
-/// session's launcher ([`crate::session::Session::session_launcher`])
+/// session's launcher ([`crate::box_actor::Session::session_launcher`])
 /// builds a fresh one for the spawn it is about to run, hands it to the
 /// launcher beside the plan, and the session actor reads the same one — so
 /// a respawn starts with an empty set by construction, never with the

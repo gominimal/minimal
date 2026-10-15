@@ -15,7 +15,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::session::WeakSessionHandle;
+use crate::box_actor::WeakSessionHandle;
 
 /// The terminal result of a build side-op, delivered as the final
 /// [`BuildUpdate`] before the build's channel closes.

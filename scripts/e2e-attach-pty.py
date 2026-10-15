@@ -33,7 +33,7 @@ to fire `on_detach`):
   E2E_PTY_ASK       answer a runtime port-publish ask the attached human is
                     shown: `allow` selects Allow (Down then Enter — Deny
                     stands highlighted), `deny` takes the highlighted Deny
-                    (Enter). The ask's dialog (session_host.rs `ask_prompt`,
+                    (Enter). The ask's dialog (box_runtime.rs `ask_prompt`,
                     NET-045) renders on the attached terminal exactly the way
                     the session-exit prompt does, so it too can only be
                     answered through a real pty: bytes typed ahead of the
@@ -119,10 +119,10 @@ if answer not in ANSWER_LABEL_PREFIX:
     sys.stderr.write(f"e2e-attach-pty: unknown E2E_PTY_ANSWER {answer!r}\n")
     sys.exit(2)
 
-# The runtime port-publish ask's own prompt (session_host.rs `ASK_PROMPT`), the
+# The runtime port-publish ask's own prompt (box_runtime.rs `ASK_PROMPT`), the
 # frame the answer below keys on: the lead-in ("... asks to publish port N/tcp.")
 # then the Select with Deny highlighted. The two answers are the keystrokes
-# the daemon's own test driver sends (`session_host/tests.rs` `answer_ask_on`):
+# the daemon's own test driver sends (`box_runtime/tests.rs` `answer_ask_on`):
 # Down lands on Allow, Enter takes the row; a bare Enter takes the highlighted
 # Deny. One ask per attach — a second dialog would park unanswered.
 ASK_PROMPT = b"Allow the publish to the host?"

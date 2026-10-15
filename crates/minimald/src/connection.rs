@@ -17,10 +17,11 @@ use tokio::{
 };
 
 use crate::{
-    ChannelConfig, RequestedPty, exec,
+    ChannelConfig, RequestedPty,
+    box_manager::SessionKeyPredicate,
+    exec,
     rpc::{self},
     server::ServerStateHandle,
-    sessions::SessionKeyPredicate,
     sftp,
 };
 
@@ -826,7 +827,7 @@ const IN_BOX_DIAL_LINGER_SECS: u32 = 5;
 /// is its SSH username (the session's UUID), passed to `ensure_host` the way
 /// the exec path does.
 async fn dial_in_box(
-    session: &crate::session::SessionHandle,
+    session: &crate::box_actor::SessionHandle,
     conn_username: &str,
     host: &str,
     port: u16,
@@ -896,7 +897,7 @@ async fn dial_in_box(
 /// environment and nothing else. This exists for the other build: under
 /// test the harness's "in-session" command runs host-side with the mock
 /// session's *empty* environment (see the `cfg(test)` swap in
-/// [`crate::session_host`]), so `socat` would resolve through the libc
+/// [`crate::box_runtime`]), so `socat` would resolve through the libc
 /// default path (`/bin:/usr/bin`) — which has it on hosts that happen to
 /// install it, but not on a bare CI runner. The in-box-dial test instead
 /// points the dial at its own `socat` stand-in through the `PATH` it

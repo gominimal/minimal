@@ -37,8 +37,8 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::box_manager::Responder;
 use crate::server::ServerStateHandle;
-use crate::sessions::Responder;
 
 /// How long after startup the first clean runs. Late enough to stay out of the
 /// way of a daemon that is still coming up (and of the session a user is
@@ -81,7 +81,7 @@ enum MaintenanceMessage {
 
 /// The daemon's housekeeping actor.
 ///
-/// Follows the actor pattern, like [`crate::sessions::Manager`]. Here the
+/// Follows the actor pattern, like [`crate::box_manager::Manager`]. Here the
 /// pattern is load-bearing rather than incidental: being the single owner of
 /// cache cleaning is what keeps a requested clean from colliding with the
 /// periodic one.
@@ -443,7 +443,7 @@ mod tests {
 
         // A session that needs exactly one package, and the hash it resolves.
         let mngr = state.sessions_manager().await;
-        let _id = crate::sessions::tests::active_session_needing(&mngr, "sess", "pkg-a").await;
+        let _id = crate::box_manager::tests::active_session_needing(&mngr, "sess", "pkg-a").await;
         let needed: Vec<SpecHash> = mngr.needed_packages().await.unwrap().into_iter().collect();
         assert_eq!(needed.len(), 1, "the session needs its one package");
 

@@ -1,14 +1,14 @@
-use crate::channel_progress::ChannelProgress;
-use crate::session_sop::{
+use crate::box_ops::{
     BuildUpdate, CheckOpts, CheckUpdate, MaterializeOpts, MaterializeUpdate, SideOp,
 };
+use crate::channel_progress::ChannelProgress;
 
-use crate::sessions::{SessionControl, WeakManagerHandle, composables};
+use crate::box_manager::{SessionControl, WeakManagerHandle, composables};
 use crate::store::SessionRecordHandle;
 use crate::{
     ChannelConfig,
-    session_delta::{self, DeltaSource},
-    session_host::{self, HostAttrs, WinSize},
+    box_runtime::{self, HostAttrs, WinSize},
+    workspace_delta::{self, DeltaSource},
 };
 use boxes::keys::SessionKeys;
 use boxes::wire::request::ContributionResponse;
@@ -367,7 +367,7 @@ enum Teardown {
 /// A launched host: its handle, paired with the `JoinHandle` of its runtime
 /// loop so teardown can be awaited on destroy.
 type LaunchedHost = (
-    session_host::HostHandle,
+    box_runtime::HostHandle,
     JoinHandle<Result<i32, std::io::Error>>,
 );
 
@@ -473,7 +473,7 @@ impl fmt::Debug for WorkspaceBaseline {
 /// nothing about the spawned task: against a host that never answers, an
 /// unbounded probe outlives every caller that gave up on it. Nor does it
 /// stay parked in the same place:
-/// [`HOST_MAILBOX_CAPACITY`](crate::session_host::HOST_MAILBOX_CAPACITY)
+/// [`HOST_MAILBOX_CAPACITY`](crate::box_runtime::HOST_MAILBOX_CAPACITY)
 /// messages in, a wedged host's mailbox is full and the probe blocks in
 /// `send` rather than `recv` — still forever, and still one stranded task
 /// per poll. `min dash` polls the focused session's screen on every refresh
@@ -484,7 +484,7 @@ impl fmt::Debug for WorkspaceBaseline {
 /// cannot answer within the deadline ends, and the caller reads the same
 /// `None` a session with no running host already reports.
 ///
-/// [`crate::sessions::Manager`] bounds these probes again on its own
+/// [`crate::box_manager::Manager`] bounds these probes again on its own
 /// mainloop. That is not redundant — this deadline covers a wedged *host*,
 /// and the manager's covers a wedged *session actor*, which can be parked in
 /// an inline `EnsureHost`, `Attach`, or `ConfigureLoadout` and never reach
@@ -549,7 +549,7 @@ enum SessionMessage {
     /// a command inside the session's sandbox and so needs the sandbox up, but
     /// has no terminal to attach and nothing to render progress to.
     EnsureHost(
-        oneshot::Sender<Result<session_host::HostHandle, AttachError>>,
+        oneshot::Sender<Result<box_runtime::HostHandle, AttachError>>,
         SessionHandle,
         String,
     ),
@@ -745,7 +745,7 @@ pub(crate) struct AskId(u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AskEnd {
     /// The attached human answered.
-    Answered(session_host::AskAnswer),
+    Answered(box_runtime::AskAnswer),
     /// Nobody answered: on a native host no binding, or a dialog that ended
     /// without a pick; on a VM-backed host no client attached when the ask
     /// arrived. The typed nobody-is-attached refusal.
@@ -764,8 +764,8 @@ pub(crate) enum AskEnd {
 }
 
 /// The binding's answer, or its absence: the native dialog's own ends.
-impl From<Option<session_host::AskAnswer>> for AskEnd {
-    fn from(answer: Option<session_host::AskAnswer>) -> Self {
+impl From<Option<box_runtime::AskAnswer>> for AskEnd {
+    fn from(answer: Option<box_runtime::AskAnswer>) -> Self {
         answer.map_or(Self::Unanswered, Self::Answered)
     }
 }
@@ -778,10 +778,10 @@ impl AskEnd {
         use minimald_rpc::AskRefused;
         match outcome {
             minimald_rpc::AskAdmitOutcome::Admitted { .. } => {
-                Self::Answered(session_host::AskAnswer::Allowed)
+                Self::Answered(box_runtime::AskAnswer::Allowed)
             }
             minimald_rpc::AskAdmitOutcome::Refused { reason, cause, .. } => match reason {
-                AskRefused::Denied => Self::Answered(session_host::AskAnswer::Refused),
+                AskRefused::Denied => Self::Answered(box_runtime::AskAnswer::Refused),
                 AskRefused::NoClient => Self::Unanswered,
                 AskRefused::NoTty => Self::HostNoTty,
                 // A cancellation always names its cause; one that does not
@@ -997,12 +997,12 @@ pub struct Session {
     /// in-process (`None`).
     creator: Option<std::sync::Weak<()>>,
 
-    /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
+    /// A non-owning handle to the [`Manager`](crate::box_manager::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
     /// all), and to self-evict from the manager's running map on
     /// actor-initiated termination. Weak by design — see
-    /// [`crate::sessions::Manager::weak_self`].
+    /// [`crate::box_manager::Manager::weak_self`].
     manager: WeakManagerHandle,
 
     /// A non-owning handle to this session, handed to the runtime objects
@@ -1071,7 +1071,7 @@ enum HostOrigin {
     /// Minted by [`Session::launch_host_for_hooks`] to run lifecycle hooks.
     /// Nothing of the user's runs in it: its shell waits at the launch's
     /// start gate, before it execs, until an attach releases it (see
-    /// `session_host::Launched::start_gate`), so neither the shell nor its
+    /// `box_runtime::Launched::start_gate`), so neither the shell nor its
     /// startup files have run when an attach arrives, and it is safe to
     /// replace. A host kept instead ([`replaces_host_for_terminal`]) starts
     /// its shell at that attach, after the activate hooks.
@@ -1666,7 +1666,7 @@ impl Session {
     /// (`stood_on_interim`). The present landing's sweep upgrades a handed
     /// box standing at the interim back to its own hand when the verdict
     /// finally vouches for it
-    /// ([`crate::sessions::land_range_verdict`]'s present arm).
+    /// ([`crate::box_manager::land_range_verdict`]'s present arm).
     ///
     /// Called outside every registry lock, since the wait is async.
     #[cfg(target_os = "linux")]
@@ -2871,7 +2871,7 @@ impl Session {
     /// task is detached rather than aborted so the `NetGuard` teardown at the
     /// end of `Host::mainloop` can still run once the loop drains.
     async fn kill_and_stop_loop(
-        host: &session_host::HostHandle,
+        host: &box_runtime::HostHandle,
         task: &mut JoinHandle<Result<i32, std::io::Error>>,
         for_shutdown: bool,
     ) {
@@ -3197,7 +3197,7 @@ impl Session {
             // address pair, a switch that would not bind — so even an
             // allowed ask can end refused, with the switch asked only now
             // (NET-047).
-            AskEnd::Answered(session_host::AskAnswer::Allowed) => {
+            AskEnd::Answered(box_runtime::AskAnswer::Allowed) => {
                 let published = self
                     .publish_exposed_port(
                         &ask.record,
@@ -3233,7 +3233,7 @@ impl Session {
             // which means the same thing: the box's own deny answer, now in
             // the human's hand. An input EOF is not this — a client that
             // went away did not answer — so it lands on the `None` below.
-            AskEnd::Answered(session_host::AskAnswer::Refused) => {
+            AskEnd::Answered(box_runtime::AskAnswer::Refused) => {
                 Err(crate::net::policy::ExposeFailure::Refused(
                     crate::net::policy::ExposeRefusal::DeniedByHuman,
                 ))
@@ -4381,7 +4381,7 @@ impl Session {
                     session_keys.detach_key.as_config_str(),
                 ),
             ));
-            session_host::AttachEnv {
+            box_runtime::AttachEnv {
                 inherited,
                 connection,
             }
@@ -4567,7 +4567,7 @@ impl Session {
                     .await
                 {
                     Ok(()) => Ok(()),
-                    Err(session_host::HostAttachError::Closed(channel, sz)) => {
+                    Err(box_runtime::HostAttachError::Closed(channel, sz)) => {
                         // A registered box's row ended with this loop
                         // (NET-138); re-minting would re-attach it rowless.
                         // The check at the top of this attach normally
@@ -4588,7 +4588,7 @@ impl Session {
                         )
                         .await
                     }
-                    Err(session_host::HostAttachError::Timeout) => {
+                    Err(box_runtime::HostAttachError::Timeout) => {
                         // The host is alive but its mailbox stayed full past
                         // the attach deadline. Re-minting here would abort a
                         // busy-but-healthy shell, orphaning its processes and
@@ -4631,7 +4631,7 @@ impl Session {
         session_hnd: SessionHandle,
         conn_username: String,
         sz: WinSize,
-        attach_env: session_host::AttachEnv,
+        attach_env: box_runtime::AttachEnv,
         progress: Option<ChannelProgress>,
         phase: LaunchPhase,
         for_hooks: bool,
@@ -4681,9 +4681,9 @@ impl Session {
                 .expect("hostname registry lock poisoned")
                 .mark_held_ports_bound(record.id)
         });
-        let spawn = Box::pin(session_host::Host::spawn(
+        let spawn = Box::pin(box_runtime::Host::spawn(
             launcher,
-            session_host::HostParams {
+            box_runtime::HostParams {
                 name: registry_name(&record),
                 username: conn_username,
                 paths,
@@ -4707,7 +4707,7 @@ impl Session {
                 // on the way out, so a shared-address name answers NODATA while
                 // no host is alive to answer it.
                 #[cfg(target_os = "linux")]
-                name_marker: Some(session_host::NameMarker::new(
+                name_marker: Some(box_runtime::NameMarker::new(
                     Arc::clone(&self.hostnames),
                     record.id,
                 )),
@@ -4923,7 +4923,7 @@ impl Session {
     ) -> Option<Arc<DeltaSource>> {
         match self.record.load_delta_baseline().await {
             Ok(Some(bytes)) => {
-                match session_delta::from_sidecar_bytes(&bytes, workspace_root.clone()) {
+                match workspace_delta::from_sidecar_bytes(&bytes, workspace_root.clone()) {
                     Ok(delta) => return delta,
                     Err(e) => {
                         tracing::warn!(
@@ -4947,7 +4947,7 @@ impl Session {
         // Persist the arm result — a failed arm included, so a restart
         // honors "change detection disabled" instead of re-snapshotting a
         // tree the session may already have modified.
-        match session_delta::to_sidecar_bytes(delta.as_ref()) {
+        match workspace_delta::to_sidecar_bytes(delta.as_ref()) {
             Ok(bytes) => {
                 if let Err(e) = self.record.store_delta_baseline(bytes).await {
                     tracing::warn!(
@@ -4983,7 +4983,7 @@ impl Session {
         &mut self,
         session_hnd: SessionHandle,
         conn_username: String,
-    ) -> Result<session_host::HostHandle, AttachError> {
+    ) -> Result<box_runtime::HostHandle, AttachError> {
         {
             let record = self
                 .record
@@ -5024,7 +5024,7 @@ impl Session {
                 session_hnd,
                 conn_username,
                 UNATTACHED_WIN_SIZE,
-                session_host::AttachEnv::default(),
+                box_runtime::AttachEnv::default(),
                 None,
                 LaunchPhase::Attached,
                 false,
@@ -5048,7 +5048,7 @@ impl Session {
         conn_username: String,
         channel: Channel<Msg>,
         sz: WinSize,
-        attach_env: session_host::AttachEnv,
+        attach_env: box_runtime::AttachEnv,
         session_keys: SessionKeys,
     ) -> Result<(), AttachError> {
         let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
@@ -5085,17 +5085,12 @@ impl Session {
         // them, and an empty map means "no revision", not "no terminal".
         let outcome = match launched
             .0
-            .attach(
-                channel,
-                sz,
-                session_host::ConnectionEnv::new(),
-                session_keys,
-            )
+            .attach(channel, sz, box_runtime::ConnectionEnv::new(), session_keys)
             .await
         {
             Ok(()) => Ok(()),
             // The host's loop ended before the attach could be delivered.
-            Err(session_host::HostAttachError::Closed(..)) => {
+            Err(box_runtime::HostAttachError::Closed(..)) => {
                 return Err(AttachError::SpawnFailed(spawn_failed_error(
                     userns_spawn_hint().as_deref(),
                 )));
@@ -5104,13 +5099,13 @@ impl Session {
             // deadline: the same wedged case the re-attach path refuses with
             // `SessionBusy`, and for the same reason — re-minting would abort
             // a busy-but-healthy shell. The host is still stored below.
-            Err(session_host::HostAttachError::Timeout) => Err(AttachError::SessionBusy),
+            Err(box_runtime::HostAttachError::Timeout) => Err(AttachError::SessionBusy),
         };
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
         // A wedged-but-alive host can reach here via attach's re-mint branch
-        // (`session_host.rs` `SendTimeoutError::Timeout`): its loop task is
+        // (`box_runtime.rs` `SendTimeoutError::Timeout`): its loop task is
         // still running. Dropping the replaced `(HostHandle, JoinHandle)`
         // would detach that task, leaking the old sandbox process, pty master,
         // and `NetGuard` for the daemon's lifetime — one leak per attach to the
@@ -5253,7 +5248,7 @@ impl Session {
                     xpixel: 0,
                     ypixel: 0,
                 },
-                session_host::AttachEnv::default(),
+                box_runtime::AttachEnv::default(),
                 None,
                 phase,
                 // This launch exists only so the hooks have namespaces to
@@ -5294,10 +5289,10 @@ impl Session {
         &mut self,
         session: SessionHandle,
         record: &Record,
-        attach_env: session_host::AttachEnv,
+        attach_env: box_runtime::AttachEnv,
         phase: LaunchPhase,
         for_hooks: bool,
-    ) -> Result<session_host::SandboxLauncher, AttachError> {
+    ) -> Result<box_runtime::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
         // (e.g. ingress forwards on a non-`OwnIp` PTask) before launching the
         // host.
@@ -5331,7 +5326,7 @@ impl Session {
         // Built here, per launch, so a respawn starts from an empty set and
         // nothing a dead spawn published can answer for its successor.
         self.publications = Default::default();
-        Ok(session_host::SandboxLauncher {
+        Ok(box_runtime::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
                 // The activation launch runs inside `finalize`, before the
@@ -5406,10 +5401,10 @@ impl Session {
         &mut self,
         _session: SessionHandle,
         record: &Record,
-        _attach_env: session_host::AttachEnv,
+        _attach_env: box_runtime::AttachEnv,
         _phase: LaunchPhase,
         _for_hooks: bool,
-    ) -> Result<session_host::MockLauncher, AttachError> {
+    ) -> Result<box_runtime::MockLauncher, AttachError> {
         // Mirror the production R2.1 gate so test launches reject a
         // policy/network-mode mismatch the same way production does.
         record
@@ -5436,15 +5431,15 @@ impl Session {
         // decided on address leases, never on the host's cgroup tree, so
         // there is no per-box outcome for its launches to record.
         let mut launcher = if record.network == boxes::NetworkMode::HostNet {
-            let fact = crate::session_host::host_ip_enforcement_fact();
-            let placement = if crate::session_host::fact_places_a_leaf(fact.cause) {
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
+            let placement = if crate::box_runtime::fact_places_a_leaf(fact.cause) {
                 minimald_rpc::HostIpEnforcement::PerBox
             } else {
                 minimald_rpc::HostIpEnforcement::None
             };
-            session_host::MockLauncher::with_host_ip_enforcement(placement)
+            box_runtime::MockLauncher::with_host_ip_enforcement(placement)
         } else {
-            session_host::MockLauncher::default()
+            box_runtime::MockLauncher::default()
         };
         // A listen plan a test seeded ([`listen_plan_seam`]) rides the
         // mock's `Launched` the way the launch's own gathered plan rides a
@@ -6336,7 +6331,7 @@ impl SessionHandle {
     pub async fn ensure_host(
         &self,
         conn_username: String,
-    ) -> Result<session_host::HostHandle, AttachError> {
+    ) -> Result<box_runtime::HostHandle, AttachError> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -6613,7 +6608,7 @@ pub(crate) mod mint_attach_seam {
 
     use boxes::SessionId;
 
-    use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle, WedgedMailbox};
+    use crate::box_runtime::{HOST_MAILBOX_CAPACITY, HostHandle, WedgedMailbox};
 
     /// The failure a seeded mint must hit: the host's loop ending before the
     /// attach could be delivered, or a wedged loop whose mailbox stays full.

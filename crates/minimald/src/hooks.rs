@@ -149,7 +149,7 @@ impl SessionCommands for InjectedCommands {
     }
 }
 
-impl SessionCommands for crate::session_host::HostHandle {
+impl SessionCommands for crate::box_runtime::HostHandle {
     fn command(
         &self,
         program: &str,

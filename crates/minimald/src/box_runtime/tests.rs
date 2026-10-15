@@ -3,7 +3,7 @@ use paths::DaemonAbsPath;
 use super::*;
 use std::time::Duration;
 
-use crate::session::tests::{fake_forwarder, fake_report_door, finalize_dynamic_ingress_session};
+use crate::box_actor::tests::{fake_forwarder, fake_report_door, finalize_dynamic_ingress_session};
 use crate::test_harness::{TestServer, captured_log};
 
 const DEFAULT_SIZE: WinSize = WinSize {
@@ -591,10 +591,10 @@ async fn a_slow_reader_is_held_back_not_shed() {
     let mut attach = FloodedAttach::start(OUTPUT_STALL_TIMEOUT).await;
 
     // Stall well past the probe deadline, probing the host throughout.
-    let stall = tokio::time::Instant::now() + 2 * crate::session::HOST_PROBE_TIMEOUT;
+    let stall = tokio::time::Instant::now() + 2 * crate::box_actor::HOST_PROBE_TIMEOUT;
     while tokio::time::Instant::now() < stall {
         tokio::time::timeout(
-            crate::session::HOST_PROBE_TIMEOUT,
+            crate::box_actor::HOST_PROBE_TIMEOUT,
             attach.handle.get_attrs(),
         )
         .await
@@ -961,7 +961,7 @@ fn layer_session_env_precedence() {
 }
 
 /// A composed `SHELL` reaches the layered map, which is the input
-/// the launcher hands [`crate::session_shell::resolve`] to pick the
+/// the launcher hands [`crate::attach_shell::resolve`] to pick the
 /// shell it spawns. Nothing else sets the key — the sandbox's
 /// `/usr/bin/bash` default lives a layer below this, inside
 /// `sandbox`'s `command_env` — so its absence here is exactly the
@@ -2690,7 +2690,7 @@ fn launcher_with(
         own_address: None,
         box_addresses: None,
         composition: None,
-        session: crate::session::WeakSessionHandle::dangling(),
+        session: crate::box_actor::WeakSessionHandle::dangling(),
         // The tests here drive the session's own launches unless one sets
         // the purpose itself (`a_hook_launch_does_not_advise_unenforced_placement`).
         for_hooks: false,
@@ -4151,7 +4151,7 @@ async fn dynamic_ingress_box(
     name: &str,
     mode: Option<boxes::DynamicIngress>,
     range: Option<(u16, u16)>,
-) -> (boxes::SessionId, crate::session::SessionHandle) {
+) -> (boxes::SessionId, crate::box_actor::SessionHandle) {
     // The loopback verdict vouches for the handed address, so the registry
     // publishes the box at it — the address a runtime publish binds at.
     let manager = server.state.sessions_manager().await;
@@ -4159,7 +4159,7 @@ async fn dynamic_ingress_box(
     let id =
         finalize_dynamic_ingress_session(client, name, ASK_SWITCH, ASK_LOOPBACK, mode, range).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::SessionKeyPredicate::Id(id))
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("the {name} box should resolve"));
@@ -5542,7 +5542,7 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::SessionKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the asking box resolves");
@@ -5780,7 +5780,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     )
     .await;
     let web_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::SessionKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -6058,7 +6058,7 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
     // The switch accepts the publish's bind and then refuses the
     // withdrawal's unexpose — the failure the retention is for.
     let (forwarder, served) =
-        crate::session::tests::scripted_forwarder(sock.clone(), vec![200, 500]).await;
+        crate::box_actor::tests::scripted_forwarder(sock.clone(), vec![200, 500]).await;
 
     // Every append is refused: the audit directory is a planted link.
     let state_dir = server.state.minimal_state_dir().await;
@@ -6195,7 +6195,8 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let Some(request) = crate::session::tests::read_control_request(&mut stream).await
+                let Some(request) =
+                    crate::box_actor::tests::read_control_request(&mut stream).await
                 else {
                     continue;
                 };
@@ -6415,7 +6416,7 @@ async fn attach_live_shell(
 /// Seed `handle`'s switch as VM-backed, its report door the test's
 /// stand-in, and stand up a forwarder for the publish.
 async fn vm_backed_ask_box(
-    handle: &crate::session::SessionHandle,
+    handle: &crate::box_actor::SessionHandle,
 ) -> (
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -6635,7 +6636,7 @@ async fn ask_no_or_no_tty_records_nothing() {
     );
     assert_eq!(
         handle.live_ingress().await.expect("the session answers"),
-        crate::session::LiveIngressRows::default(),
+        crate::box_actor::LiveIngressRows::default(),
         "no mapping stands"
     );
     let records = audit_records(&server.state.minimal_state_dir().await).await;

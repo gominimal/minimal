@@ -39,10 +39,10 @@ use diagnostics::redact::scrub_secrets;
 
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
+    box_actor::SessionHandle,
+    box_manager::SessionKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
     server::ServerStateHandle,
-    session::SessionHandle,
-    sessions::SessionKeyPredicate,
 };
 
 /// "What to run." Turns into a [`Stream`] of one or more process
@@ -220,7 +220,7 @@ pub(crate) fn task_network(
 ) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    let egress = crate::session::effective_egress_section(
+    let egress = crate::box_actor::effective_egress_section(
         &record.policy,
         record.network,
         phase,
@@ -265,7 +265,7 @@ async fn ensure_task_rows_stand(
     };
     let standing = match record.box_id {
         Some(box_id) => {
-            let control = crate::session::switch_control_of(switch).await;
+            let control = crate::box_actor::switch_control_of(switch).await;
             crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
                 .await
                 == Some(true)
@@ -2258,7 +2258,7 @@ async fn run_build_exec(
 
     let exit_status = match session.start_build(rebuild, pkgs).await {
         Ok(mut events) => {
-            use crate::session_sop::{BuildOutcome, BuildUpdate};
+            use crate::box_ops::{BuildOutcome, BuildUpdate};
             let mut renderer = BuildRenderer::new(verbose);
             let mut outcome = None;
             while let Some(update) = events.recv().await {
@@ -2330,7 +2330,7 @@ async fn run_check_exec(
     channel: Channel<Msg>,
     args: String,
 ) {
-    use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+    use crate::box_ops::{CheckOpts, CheckOutcome, CheckUpdate};
 
     let (_rs, ws) = channel.split();
     let mut w = ws.make_writer();
@@ -3066,7 +3066,7 @@ mod tests {
         // session's PTask is attached at the same time. The gate exists only
         // where that egress has rules, so the answer follows the shipped
         // phase rather than a literal a cutover would invalidate.
-        let gated = crate::session::effective_egress_section(
+        let gated = crate::box_actor::effective_egress_section(
             &record.policy,
             record.network,
             boxes::EGRESS_DEFAULT_PHASE,
@@ -3205,7 +3205,7 @@ mod tests {
         // task gets no gate at all — its inbound stays as open as it was
         // before the default was announced.
         assert_eq!(
-            crate::session::effective_egress_section(
+            crate::box_actor::effective_egress_section(
                 &record.policy,
                 record.network,
                 boxes::EgressDefaultPhase::Announced,
@@ -3228,7 +3228,7 @@ mod tests {
         // In force, no opt-out: the same absent section is the deny-all one,
         // and the task carries the gate built from it.
         assert_eq!(
-            crate::session::effective_egress_section(
+            crate::box_actor::effective_egress_section(
                 &record.policy,
                 record.network,
                 boxes::EgressDefaultPhase::InForce,
@@ -3270,7 +3270,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                crate::session::effective_egress_section(
+                crate::box_actor::effective_egress_section(
                     &declared_record.policy,
                     declared_record.network,
                     phase,
@@ -3808,7 +3808,7 @@ mod tests {
     /// driving, reports the kill as exit 1, and stops the sequence without
     /// ever pulling the next process, so nothing beyond the exec's own
     /// command was touched. The box the exec ran against is the session
-    /// plane's concern (`session::tests` proves it survives the same loss).
+    /// plane's concern (`box_actor::tests` proves it survives the same loss).
     #[tokio::test]
     async fn lost_exec_client_kills_only_its_own_process() {
         use std::time::Duration;
