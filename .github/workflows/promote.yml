@@ -321,9 +321,17 @@ jobs:
                   # draft with the notes and every artifact attached. A missing
                   # release is a pipeline invariant broken upstream, not
                   # something to paper over here.
-                  state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish --jq '"\(.isDraft) \(.targetCommitish)"' 2>/dev/null)" \
+                  # Found by listing, never by tag: a draft has no tag yet, so
+                  # `gh release view <tag>` and releases/tags/<tag> both answer
+                  # 404 for exactly the release this job exists to publish.
+                  matches="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$tag\") | \"\(.id) \(.draft) \(.target_commitish)\"")"
+                  count="$(printf '%s' "$matches" | grep -c . || true)"
+                  [ "$count" -ge 1 ] \
                     || { echo "::error::no GitHub Release $tag — was $semver cut by a versioned release build (release.yml versioned: true)?"; exit 1; }
-                  read -r is_draft target <<<"$state"
+                  [ "$count" -eq 1 ] \
+                    || { echo "::error::$count GitHub Releases carry $tag; delete the stale ones and re-run"; printf '%s\n' "$matches"; exit 1; }
+                  read -r release_id is_draft target <<<"$matches"
                   if [ "$is_draft" != "true" ]; then
                     # Already public: a re-run, or a rollback. Leave the release
                     # as it is (no --latest, which would take the badge from a
@@ -350,12 +358,17 @@ jobs:
                   fi
                   # A prerelease (a `-` tail, judged before any `+build`
                   # metadata) is published but never becomes "Latest".
-                  extra=()
+                  make_latest=true
                   case "${semver%%+*}" in
-                    *-*) echo "::notice::$tag is a prerelease — published without the Latest badge" ;;
-                    *)   extra+=(--latest) ;;
+                    *-*) make_latest=false
+                         echo "::notice::$tag is a prerelease — published without the Latest badge" ;;
                   esac
-                  gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
+                  # Published by id, with the tag named: publishing a draft
+                  # without tag_name tags it with the draft's placeholder
+                  # (untagged-<hex>) instead of $tag.
+                  gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+                    -f tag_name="$tag" -f target_commitish="$target" \
+                    -F draft=false -f make_latest="$make_latest" --jq .tag_name >/dev/null
                   # The tag now exists at the draft's target; say where.
                   tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
                   echo "published $tag at $tagged (draft targeted $target)"
