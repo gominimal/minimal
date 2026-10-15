@@ -204,36 +204,8 @@ minimald-build:
 dist-build target:
     scripts/dist-build.sh {{quote(target)}}
 
-# Build the .deb/.rpm/.apk packages for a staged semver release from the
-# installer bucket via the pinned nfpm (fetched + sha256-verified by the
-# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
-# infra repo, not here. (The release workflow builds them from its own
-# artifacts instead — ARTIFACTS_DIR mode — before the row is staged.)
-#
-# The semver row must exist: every versioned release build stages one;
-# releases up to and including 0.5.3 need scripts/backfill-version-row.sh
-# first. Linux-only for the same host-check reason as dist-build: the script
-# downloads static musl ELFs and runs the downloaded `min` to generate
-# completions.
-[linux]
-pkg-nfpm pkgver:
-    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
-
-# Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
-# throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
-# accepts and records the exact version, every shipped path exists, the
-# binaries run on the box's libc, and an uninstall round-trip cleans up. This
-# is the pre-publish ritual from the review feedback — run it before staging a
-# tag; the CI-native container smoke is a separate, follow-up lane. Distrobox
-# drives everything (no apx, no raw podman — see the script header); boxes are
-# removed even on failure unless --keep-boxes is passed through.
-# Linux-only: needs distrobox and a container engine on the host.
-[linux]
-pkg-smoke pkgdir="dist" *args:
-    scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
-
-# Restage an already-shipped release under its semver so the command above can
-# see it (the one-time fix for releases staged before the semver-row
+# Restage an already-shipped release under its semver so `install.sh --version`
+# can find it (the one-time fix for releases staged before the semver-row
 # convention, e.g. `just backfill-version-row abc12345 0.5.3`).
 [linux]
 backfill-version-row sha version:
@@ -634,13 +606,11 @@ test-promote-gate:
 check-version:
     scripts/next-version.sh --check
 
-# Run every scripts/*_test.sh harness in one go (the release/publishing logic:
-# semver resolution, version assertion, staged-version lookup, the packaging
-# renderer, and the AUR/brew publishers against fixture remotes). No network,
-# no credentials, no gcloud — the harnesses stub or fixture everything. CI runs
-# the same set through crates/common/tests/shell_harnesses.rs (part of
-# `just test`), which discovers them by convention so a new harness is never
-# forgotten.
+# Run every scripts/*_test.sh harness in one go (the release and installer
+# logic). No network, no credentials, no gcloud — the harnesses stub or
+# fixture everything. CI runs the same set through
+# crates/common/tests/shell_harnesses.rs (part of `just test`), which
+# discovers them by convention so a new harness is never forgotten.
 test-shell:
     #!/usr/bin/env bash
     set -euo pipefail

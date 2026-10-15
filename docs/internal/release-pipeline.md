@@ -1,6 +1,6 @@
 ---
 title: Release pipeline
-description: "How to cut a stable release, and how the pipeline builds, stages, smoke-tests, promotes, and installs releases: release.yml, nightly.yml, promote.yml, publish-packages.yml, prune-releases.yml, and the curl|sh installer."
+description: "How to cut a stable release, and how the pipeline builds, stages, smoke-tests, promotes, and installs releases: release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer."
 ---
 
 > This is internal documentation. It is not published to the docs site.
@@ -20,13 +20,9 @@ Follow these steps in order. The examples use version `X.Y.Z` and commit
 
 ### Before you start
 
-- You start each promotion run in steps 6 and 7, and a second person on the
+- You start the promotion run in step 6, and a second person on the
   approver list in `promote.yml` approves it. The workflow does not let you
   approve your own run.
-- Make sure that the repository secrets `AUR_SSH_PRIVATE_KEY` and
-  `BREW_TAP_TOKEN` exist, and that the `gominimal/homebrew-minimal` repository
-  exists, before you promote with `publish_packages=true`. No check reads
-  them before that. If one is missing, its publish job fails.
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
   a PR and cut the next version.
@@ -69,7 +65,7 @@ point at the commit.
 gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=true
 ```
 
-A dry run builds, signs, packages, and smoke-tests everything. It uploads
+A dry run builds, signs, and smoke-tests everything. It uploads
 nothing and does not use up the version number. Wait for it to pass.
 
 ### 4. Stage the release
@@ -137,44 +133,10 @@ on it. Then the workflow does these things, in this order:
 4. It publishes the draft GitHub Release, which creates the `vX.Y.Z` tag and
    marks the release Latest.
 
-The AUR and Homebrew packages do not change by default. The
-`publish_packages` input is off. You publish them in step 7.
-
 If the release publish job fails, fix the cause and use **Re-run failed jobs**
 on the same run.
 
-### 7. Publish the AUR and Homebrew packages
-
-Run the promotion again for the same version, with `publish_packages` on:
-
-```sh
-gh workflow run promote.yml -f target=stable -f version=X.Y.Z -f publish_packages=true
-```
-
-The run goes through approval and the smoke check again. It writes the
-`stable` pointer again, which changes nothing while `stable` points at
-`X.Y.Z`. The release is already public, so the release publish job checks
-that the `vX.Y.Z` tag is on the release commit and changes nothing. Then the
-run publishes the AUR package and the Homebrew formula. If a package job
-fails, fix the cause and use **Re-run failed jobs** on the same run.
-
-When both publishers work for a real release, publish the packages in step 6
-instead: add `-f publish_packages=true` to the promotion.
-
-If the workflow cannot publish the packages, run the two publishers by hand.
-You need the AUR key and the tap token. Run them from the tagged commit:
-
-```sh
-PKGVER=X.Y.Z AUR_SSH_PRIVATE_KEY="$(cat aur-key)" scripts/publish-aur.sh
-PKGVER=X.Y.Z BREW_TAP_REPO=https://github.com/gominimal/homebrew-minimal.git \
-  GITHUB_TOKEN=<tap token> scripts/publish-brew.sh
-```
-
-The AUR publisher needs `makepkg`, so run it on an Arch host or in an
-`archlinux:base-devel` container. Run each publisher with `--dry-run` first to
-read the diff that it pushes.
-
-### 8. Clean up
+### 7. Clean up
 
 Delete the branch from step 2:
 
@@ -190,10 +152,6 @@ Run the promotion again with `target=stable` and an earlier version that has a
 smoke record. The promotion refuses a version without a smoke record. Choose
 your rollback version before you promote. Use `override_provenance=true` only
 in an emergency. The approval issue shows that you used it.
-
-Keep `publish_packages` off for a rollback. If it is on, the run publishes the
-earlier version to the AUR and Homebrew, which downgrades the users of those
-packages.
 
 ## We test every artifact we release
 
@@ -215,10 +173,7 @@ meet the policy yet.
 | macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
 | Linux arm64 `min`, `minimald`, `minvmd`, `gvproxy-min` on a Linux host | **Gap.** No smoke job runs on a Linux arm64 host. |
 | Linux `mip`, amd64 and arm64 | **Gap.** `smoke-linux-kvm` downloads `mip`, but no job runs it. |
-| amd64 `.deb` | `smoke-linux-amd64` installs it and checks that `min -V` shows the release version. Versioned runs only. |
-| arm64 `.deb`, every `.rpm`, every `.apk` | **Gap.** No job installs them. |
 | `install.sh` and the AppArmor profile installer | The `ci-shell-installer` lane tests both scripts on each PR that changes them. **Gap:** no release job installs the staged folder through `install.sh`. |
-| Homebrew formula and AUR package | `just test-shell` tests the publish scripts against fixture remotes, and CI runs it. **Gap:** no job installs the published package. |
 | `completions.tar.gz` and the legacy `minimalone-<sha>.tar.zst` bundle | **Gap.** No job tests them. |
 
 ## Pipeline reference
@@ -227,8 +182,7 @@ meet the policy yet.
 
 Each release run uploads one folder, `gs://minimal-one/versions/<version>/`.
 It holds the artifacts, a `components` manifest, a copy of `install.sh`, and
-the release notes as `notes.md`. A versioned release also has the packages in
-`pkg/`. Each manifest row gives one component, its OS and architecture, its
+the release notes as `notes.md`. Each manifest row gives one component, its OS and architecture, its
 SHA-256, and where it installs. The folder never changes after upload.
 
 A channel is a small file at the bucket root, such as
@@ -247,8 +201,7 @@ A release run makes a nightly build or a versioned release:
 | Version the binaries report | `0.6.0-dev.70.g9b763dd5` | `0.6.0` |
 | GitHub Release | `release-<sha>`, deleted later by `prune-releases` | Draft `vX.Y.Z`, published in step 6 |
 | Git tag | None | `vX.Y.Z`, created in step 6 |
-| Packages (`.deb`, `.rpm`, `.apk`) | None | In `pkg/` and on the GitHub Release |
-| Stable promotion publishes | Nothing | GitHub Release, plus AUR and Homebrew with `publish_packages=true` |
+| Stable promotion publishes | Nothing | GitHub Release |
 
 ### release.yml: build, test, stage
 
@@ -330,23 +283,18 @@ half of the work:
   beside `bin/min`. The staged copy is only the source that the advisory
   copies. No unit file and no `launchd` property list refers to it at its
   user-writable path.
-- [`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) and
-  [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) put
-  `/usr/bin/minzoned` in every `.deb`, `.rpm`, and `.apk`. The packages
-  do not install a service. The advisory's privileged command is the only
-  privileged step.
 - [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
   and replaces it on upgrade, like every other `bin` row. On macOS an
   upgrade from a release that installed `bin/minzoned` removes that file,
   because the program is now in the bundle.
 
 *Still optional in the scripts.* The release workflow uploads `minzoned`
-on every platform, but `stage-release.sh` and `package-nfpm.sh` still accept
-a missing `minzoned` artifact with a warning that names the omitted row.
-They stage or package all other artifacts. A release staged without it gives
+on every platform, but `stage-release.sh` still accepts a missing
+`minzoned` artifact with a warning that names the omitted row. It stages
+all other artifacts. A release staged without it gives
 no `minzoned` to the host. The advisory then shows the state `this release
 ships no minzoned; the DNS service install is unavailable` and does not
-offer the step. Both optional lists go after a release publishes the
+offer the step. The optional list goes after a release publishes the
 artifact on every platform.
 
 *Identity model.* Each check runs where it has meaning:
@@ -416,7 +364,7 @@ handles `minzoned` with the same steps that the other binaries have:
   **Notarization** paragraphs below.
 - The release job and the stage-installer job stay the same. They collect
   artifacts by the platform-suffixed names, so the new names go into the
-  GitHub Release, the `components` manifest, and the packages. The SHA-256
+  GitHub Release and the `components` manifest. The SHA-256
   columns of the manifest are the checksums.
 
 This section does not close these residuals:
@@ -424,8 +372,6 @@ This section does not close these residuals:
 - A shell-installer install on Linux, into the user's prefix, has no
   signature. The privileged step accepts the copy only up to the hash pin.
   That limit is inside the single-operator premise of design §7.1.
-- A `.deb` or `.rpm` install copies from the root-owned `/usr/bin`. That
-  closes the residual on packaged hosts.
 - `answerer_survives_session_stop` is the e2e proof that the installed
   answerer service continues after a session stops. It installs a root-run
   unit, and no macOS lane can run `sudo` without a password.
@@ -514,15 +460,12 @@ signs, are not notarized.
 
 **release job.** This job downloads all build outputs. It writes the release
 notes with `scripts/next-version.sh --notes` and generates shell completions
-for `mip`, `min`, and `minimald`. On a versioned run it builds the `.deb`,
-`.rpm`, and `.apk` for both Linux architectures from the same binaries
-([`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh)). Then it does
-two things:
+for `mip`, `min`, and `minimald`. Then it does two things:
 
 - It uploads the legacy `minimalone-<sha>.tar.zst` bundle to
   `gs://minimal-shim/archives/` for the old `minimal-shim` install path.
 - It creates the GitHub Release with the notes, the binaries, the guest
-  artifacts, `completions.tar.gz`, and the packages. A nightly build gets
+  artifacts, and `completions.tar.gz`. A nightly build gets
   `release-<sha>`. A versioned run gets a draft `vX.Y.Z` that points at the
   commit. A version with a `-` suffix is a prerelease.
 
@@ -538,8 +481,7 @@ can promote it.
 ([`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)) against the release
 artifacts. `smoke-linux-amd64` uses the host daemon, `smoke-linux-kvm` uses a
 KVM microVM, and `smoke-macos` uses the signed macOS files in the installer
-layout. On a versioned run, `smoke-linux-amd64` also installs the amd64
-`.deb`. The smokes also run on a dry run. The section on artifact tests above
+layout. The smokes also run on a dry run. The section on artifact tests above
 lists what they do not cover.
 
 **record-smoked job.** After the smokes and the staging pass,
@@ -568,7 +510,7 @@ See [docs/ci-strategy.md](../ci-strategy.md).
 
 [`.github/workflows/promote.yml`](../../.github/workflows/promote.yml), named
 `promote-cli` in the Actions list, moves `stable` or `unstable`. Its inputs are
-`version`, `target`, `dry_run`, `override_provenance`, and `publish_packages`. `version` is a
+`version`, `target`, `dry_run`, and `override_provenance`. `version` is a
 version number or a nightly commit hash. When you leave it empty, the
 workflow uses the newest staged nightly build.
 
@@ -588,25 +530,14 @@ approval issue shows that choice.
 sends a `reference-docs-promoted` event to `gominimal/webapp` with the release
 commit, and the docs site at docs.minimal.dev rebuilds from that commit.
 
-### publish-packages.yml: publish a stable release
-
-A `stable` promotion that is not a dry run calls
-[`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml).
-The AUR and Homebrew jobs run only with `publish_packages=true`.
-
-- `publish-release` publishes the draft `vX.Y.Z`. Publication creates the tag
-  on the release commit. It does not start a build. The job fails if the
-  release does not exist. If the release is already public, the job changes
-  nothing, but it fails if the `vX.Y.Z` tag is missing or is not on the
-  release commit. For a nightly commit hash, it prints a notice and does
-  nothing.
-- `publish-aur` publishes `minimal-bin` to the AUR from the staged folder.
-- `publish-brew` updates the formula in `gominimal/homebrew-minimal` from the
-  GitHub Release.
-
-A prerelease, such as `0.6.0-rc1`, gets a public GitHub Release but no AUR
-or Homebrew update. Neither can hold a prerelease. The `apt`, `dnf`, and `apk`
-repositories come from the `pkg/` folder, and the infra repository builds them.
+**Release publish.** A `stable` promotion that is not a dry run then runs
+the `publish` job. It publishes the draft `vX.Y.Z`. Publication creates the
+tag on the release commit. It does not start a build. The job fails if the
+release does not exist. If the release is already public, the job changes
+nothing, but it fails if the `vX.Y.Z` tag is missing or is not on the
+release commit. For a nightly commit hash, it prints a notice and does
+nothing. A prerelease, such as `0.6.0-rc1`, gets a public GitHub Release
+that is not marked Latest.
 
 ### prune-releases.yml: delete old nightly releases
 

@@ -44,13 +44,12 @@ if ! command -v sha256sum >/dev/null 2>&1; then
 fi
 export PATH="$root/bin:$PATH"
 export GCLOUD_STUB_ARGS="$root/gcloud-args"
-unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED GCLOUD_STUB_RM_ERROR RESTAGE VERSION BUCKET ARTIFACTS_DIR PKG_DIR PKG_ONLY
+unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED GCLOUD_STUB_RM_ERROR RESTAGE VERSION BUCKET ARTIFACTS_DIR
 
-mkdir -p "$root/artifacts" "$root/pkg"
+mkdir -p "$root/artifacts"
 printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
 printf 'fake mip\n' >"$root/artifacts/mip-linux-amd64"
 printf 'fake answerer\n' >"$root/artifacts/minzoned-linux-amd64"
-printf 'fake deb\n' >"$root/pkg/minimal_0.6.0_amd64.deb"
 
 pass=0 fail=0
 # ok / bad <description> — count and print one passing / failing case.
@@ -170,60 +169,8 @@ for rm_err in \
         with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 GCLOUD_STUB_RM_ERROR="$rm_err" -- stage --version 0.6.0 --restage
     expect_calls 0 "^storage cp " "nothing is uploaded after a failed marker deletion (${rm_err:26:20}...)"
 done
-expect 1 "could not remove" "--pkg-only --restage dies the same way" -- \
-    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 GCLOUD_STUB_RM_ERROR="ERROR: (gcloud.storage.rm) HTTPError 403: forbidden" -- \
-    stage --version 0.6.0 --restage --pkg-only --pkg-dir "$root/pkg"
-expect_calls 0 "^storage cp " "--pkg-only uploads nothing after a failed marker deletion"
 with GCLOUD_STUB_EXISTS=0 GCLOUD_STUB_SMOKED=1 -- stage --version 0.6.0 >/dev/null 2>&1
 expect_calls 0 "^storage rm " "a fresh (non-restage) stage never touches a marker"
-expect 0 "removed versions/0.6.0/smoked" "--pkg-only --restage also invalidates the marker before its upload" -- \
-    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=1 -- stage --version 0.6.0 --restage --pkg-only --pkg-dir "$root/pkg"
-if [ "$(sed -n '1p' "$GCLOUD_STUB_ARGS")" = "storage rm gs://test-bucket/versions/0.6.0/smoked" ]; then
-    ok "--pkg-only --restage deletes the marker before the packages upload"
-else
-    bad "--pkg-only --restage did not delete the marker first: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
-fi
-
-# The row path and --pkg-dir each carry an invalidation site; a restage that
-# stages both must still delete the marker once, and must not follow the real
-# deletion with a "was not present" for the marker it just removed.
-restage_pkg_out="$(with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=1 -- \
-    stage --version 0.6.0 --restage --pkg-dir "$root/pkg" 2>&1)" && rc=0 || rc=$?
-if [ "$rc" -eq 0 ] && [[ "$restage_pkg_out" == *"removed versions/0.6.0/smoked"* ]] \
-    && [[ "$restage_pkg_out" != *"was not present"* ]]; then
-    ok "--restage --pkg-dir removes the marker once and never reports it absent"
-else
-    bad "--restage --pkg-dir double-invalidated or failed (rc=$rc): $restage_pkg_out"
-fi
-expect_calls 1 "^storage rm gs://test-bucket/versions/0.6.0/smoked$" \
-    "--restage --pkg-dir deletes the marker exactly once across both upload sites"
-if [ "$(sed -n '1p' "$GCLOUD_STUB_ARGS")" = "storage rm gs://test-bucket/versions/0.6.0/smoked" ]; then
-    ok "--restage --pkg-dir deletes the marker before any upload"
-else
-    bad "--restage --pkg-dir did not delete the marker first: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
-fi
-
-# --- the packages upload is guarded the same way ------------------------------
-
-expect 0 "staged 0.6.0" "--pkg-dir on a fresh version stages the row and the packages" -- \
-    with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --pkg-dir "$root/pkg"
-expect_calls 3 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 " \
-    "all three uploads carry the precondition"
-expect_calls 1 "minimal_0.6.0_amd64.deb gs://test-bucket/versions/0.6.0/pkg/$" \
-    "the packages land under versions/<V>/pkg/"
-if [ "$(grep '^storage cp ' "$GCLOUD_STUB_ARGS" | tail -n 1 | grep -c '/components$')" -eq 1 ]; then
-    ok "with --pkg-dir the manifest is still the last object written, after the packages"
-else
-    bad "the manifest was not the last upload with --pkg-dir: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
-fi
-
-# --pkg-only adds packages to a row that is already staged BY DESIGN: the
-# manifest probe must not fire, but each package object is still write-once.
-expect 0 "staged packages for 0.6.0" "--pkg-only stages into an existing row" -- \
-    with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0 --pkg-only --pkg-dir "$root/pkg"
-expect_calls 0 "^storage objects describe " "--pkg-only does not probe the manifest"
-expect_calls 1 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 .*/pkg/$" \
-    "--pkg-only's single upload carries the precondition"
 
 # --- --extra files join the row under the same guard ---------------------------
 

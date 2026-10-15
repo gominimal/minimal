@@ -6,10 +6,10 @@ name: Release
 #     `release-<sha>` GitHub Release (auto-pruned);
 #   * a VERSIONED build (`versioned: true`) builds with
 #     MINIMAL_RELEASE_VERSION = Cargo.toml package.version so every binary
-#     reports the release version on an UNTAGGED commit, packages the
-#     .deb/.rpm/.apk from the same bytes, generates the release notes, stages
-#     versions/<semver>/ (binaries, manifest, pkg/, notes.md, install.sh),
-#     and parks a DRAFT GitHub Release `v<semver>` with everything attached.
+#     reports the release version on an UNTAGGED commit, generates the
+#     release notes, stages versions/<semver>/ (binaries, manifest, notes.md,
+#     install.sh), and parks a DRAFT GitHub Release `v<semver>` with
+#     everything attached.
 #
 # Both then smoke the shipped artifacts in this same run and, on success,
 # record versions/<version>/smoked — the provenance the promote workflow
@@ -20,7 +20,7 @@ on:
     workflow_dispatch:
         inputs:
             versioned:
-                description: "Cut a versioned release: build with MINIMAL_RELEASE_VERSION = Cargo.toml package.version, package .deb/.rpm/.apk, stage versions/<semver>/ with release notes, park a draft GitHub Release v<semver>. The tag is created by promote, last."
+                description: "Cut a versioned release: build with MINIMAL_RELEASE_VERSION = Cargo.toml package.version, stage versions/<semver>/ with release notes, park a draft GitHub Release v<semver>. The tag is created by promote, last."
                 type: boolean
                 default: false
             dry_run:
@@ -1030,9 +1030,9 @@ jobs:
                   echo "resolved release version: $ver"
 
     release:
-        # Assemble everything: completions, the legacy archive, the release
-        # notes, and (versioned) the distro packages; then cut the GitHub
-        # Release — `release-<sha>` for a nightly/plain build, or a DRAFT
+        # Assemble everything: completions, the legacy archive, and the
+        # release notes; then cut the GitHub Release — `release-<sha>` for a
+        # nightly/plain build, or a DRAFT
         # `v<semver>` for a versioned one, which promote publishes later
         # (publishing the draft is what creates the tag).
         runs-on: ubuntu-latest
@@ -1102,26 +1102,6 @@ jobs:
               run: rm -f artifacts/temp-*
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
-            - name: Build the distro packages (versioned release only)
-              # .deb/.rpm/.apk for both Linux arches from THIS run's binaries
-              # (ARTIFACTS_DIR mode, no bucket round-trip), via the pinned
-              # nfpm. They are attached to the draft release below, staged as
-              # versions/<semver>/pkg/ by stage-installer, and the .deb is
-              # install-smoked by smoke-linux-amd64 — all the same bytes.
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              env:
-                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
-                  ARTIFACTS_DIR: artifacts
-                  OUT_DIR: ${{ runner.temp }}/dist
-              run: scripts/package-nfpm.sh
-            - name: Upload distro packages
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-              with:
-                  name: packages
-                  path: ${{ runner.temp }}/dist/
-                  if-no-files-found: error
-                  retention-days: 7
             - name: Generate completions
               # `min` splits printing from installing (`completions print
               # <shell>`); `mip` and `minimald` keep the flat verb. The `min`
@@ -1166,13 +1146,9 @@ jobs:
                   REL_SHA: ${{ steps.release_info.outputs.sha }}
                   RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   NOTES: ${{ runner.temp }}/notes.md
-                  DIST: ${{ runner.temp }}/dist
               run: |
                   set -euo pipefail
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
-                  if [ -n "$RELEASE_VERSION" ]; then
-                    cp "$DIST"/* artifacts/
-                  fi
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
                     exit 0
@@ -1180,7 +1156,7 @@ jobs:
                   extra=()
                   if [ -n "$RELEASE_VERSION" ]; then
                     # Versioned: a DRAFT parked on this commit. Drafts create no
-                    # tag; promote publishes it (publish-packages.yml), and THAT
+                    # tag; promote publishes it (promote.yml), and THAT
                     # creates v<semver> — last, on a smoked and promoted commit.
                     # A pre-release version (one with a `-` suffix) is marked a
                     # GitHub prerelease so it never shows as "Latest". A
@@ -1215,9 +1191,9 @@ jobs:
         # installer reads (docs/specs/07-spec-installer): ONE write-once row,
         # versions/<version>/ — the short sha for a nightly/plain build, the
         # semver for a versioned one — holding the binaries, the `components`
-        # manifest, the version-pinned install.sh, the release notes, and
-        # (versioned) pkg/ with the .deb/.rpm/.apk. It re-fetches the same
-        # build artifacts and touches only gs://minimal-one. Wholly a publish
+        # manifest, the version-pinned install.sh, and the release notes. It
+        # re-fetches the same build artifacts and touches only
+        # gs://minimal-one. Wholly a publish
         # step, so it is skipped entirely on a dry run.
         runs-on: ubuntu-latest
         timeout-minutes: 20
@@ -1241,12 +1217,6 @@ jobs:
               with:
                   name: release-notes
                   path: ${{ runner.temp }}/notes
-            - name: Download distro packages (versioned release only)
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-              with:
-                  name: packages
-                  path: ${{ runner.temp }}/dist
             - name: Authenticate to Google Cloud (installer bucket)
               # Distinct project + workload-identity pool from the release job's
               # minimal-shim auth; this one grants write to gs://minimal-one.
@@ -1256,22 +1226,19 @@ jobs:
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Stage release into installer bucket
               # Upload versions/<version>/{components,<artifacts>,install.sh,
-              # notes.md[,pkg/]}. Inert on its own: changes nothing users
-              # receive until a channel points at it. Staged rows are
-              # write-once — a row that already exists fails here before any
-              # object is touched — unless `restage` was set to re-run a
-              # versioned build that failed after staging.
+              # notes.md}. Inert on its own: changes nothing users receive
+              # until a channel points at it. Staged rows are write-once — a
+              # row that already exists fails here before any object is
+              # touched — unless `restage` was set to re-run a versioned build
+              # that failed after staging.
               env:
                   VERSION: ${{ needs.assert-version.outputs.version }}
-                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   RESTAGE: ${{ inputs.restage }}
                   NOTES: ${{ runner.temp }}/notes/notes.md
-                  DIST: ${{ runner.temp }}/dist
               run: |
                   set -euo pipefail
                   args=(--artifacts-dir artifacts --version "$VERSION" --bucket gs://minimal-one)
                   args+=(--extra scripts/install.sh --extra "$NOTES")
-                  [ -z "$RELEASE_VERSION" ] || args+=(--pkg-dir "$DIST")
                   [ "$RESTAGE" != "true" ] || args+=(--restage)
                   scripts/stage-release.sh "${args[@]}"
 
@@ -1290,9 +1257,7 @@ jobs:
         # `min`/`minimald` — downloaded back by name — must auto-spawn a daemon
         # and pass the session e2e. Mirrors ci-linux-native's `native-daemon-e2e`
         # job, but against the release artifacts instead of a target/debug build.
-        # A versioned build additionally installs the .deb it packaged and
-        # checks the installed `min` reports the release version.
-        needs: [assert-version, release]
+        needs: [release]
         runs-on: ubuntu-latest
         timeout-minutes: 30
         permissions:
@@ -1340,31 +1305,6 @@ jobs:
               # No E2E_* knobs: native target, host daemon, and the e2e seeds its
               # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
               run: ./scripts/session-e2e.sh
-            - name: Download the distro packages (versioned release only)
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-              with:
-                  name: packages
-                  path: ${{ runner.temp }}/pkg
-            - name: Install the .deb and check the version it reports
-              # The package is installed from the file (no repo), so this
-              # proves the .deb built from this run's bytes installs on a
-              # stock Ubuntu and its `min` reports the release version. Runs
-              # AFTER the e2e so the PATH-first shipped binaries above are what
-              # the e2e exercised; /usr/bin/min is addressed explicitly.
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              env:
-                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
-                  PKG: ${{ runner.temp }}/pkg
-              run: |
-                  set -euo pipefail
-                  deb="$(find "$PKG" -maxdepth 1 -name '*amd64*.deb' | head -n 1)"
-                  [ -n "$deb" ] || { echo "::error::no amd64 .deb among the packages"; ls -l "$PKG"; exit 1; }
-                  sudo apt-get install -y "$deb"
-                  got="$(/usr/bin/min -V | awk '{print $2}')"
-                  [ "$got" = "$RELEASE_VERSION" ] \
-                    || { echo "::error::installed min reports '$got', expected '$RELEASE_VERSION'"; exit 1; }
-                  echo "installed $(basename "$deb"): min -V reports $got"
 
     smoke-linux-kvm:
         # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from

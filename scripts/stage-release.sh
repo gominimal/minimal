@@ -29,11 +29,6 @@
 #   --version VER         Release version / folder name   (VERSION, default: git short sha)
 #   --bucket URL          gs:// bucket URL                 (BUCKET, default: gs://minimal-one)
 #   --allow-missing       Warn and omit rows whose artifact is absent (default: hard error)
-#   --pkg-dir DIR         Also upload DIR's .deb/.rpm/.apk into versions/<V>/pkg/
-#                         (PKG_DIR). With --pkg-only, THAT is all this run does:
-#                         no artifacts dir, no manifest — just the packages,
-#                         for a row that is already staged.
-#   --pkg-only            Only upload --pkg-dir (PKG_ONLY)
 #   --extra FILE          Also upload FILE into versions/<V>/ under its basename
 #                         (repeatable): the version-pinned install.sh, the
 #                         release notes. Not manifest rows; same guard and
@@ -67,8 +62,6 @@ ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts}"
 BUCKET="${BUCKET:-gs://minimal-one}"
 VERSION="${VERSION:-}"
 ALLOW_MISSING=0
-PKG_DIR="${PKG_DIR:-}"
-PKG_ONLY="${PKG_ONLY:-0}"
 RESTAGE="${RESTAGE:-0}"
 EXTRA_FILES=()
 DRY_RUN=0
@@ -79,8 +72,7 @@ DRY_RUN=0
 FORMAT_VERSION=1
 
 # Immutable version artifacts: cache aggressively. Content is addressed by the
-# version segment, so a given URL never changes payload. Shared by both upload
-# paths (the versions/<V>/ row and the --pkg-dir packages).
+# version segment, so a given URL never changes payload.
 IMMUTABLE_CACHE="public, max-age=31536000, immutable"
 
 while [ $# -gt 0 ]; do
@@ -89,8 +81,6 @@ while [ $# -gt 0 ]; do
         --version)       VERSION="$2"; shift 2 ;;
         --bucket)        BUCKET="$2"; shift 2 ;;
         --allow-missing) ALLOW_MISSING=1; shift ;;
-        --pkg-dir)       PKG_DIR="$2"; shift 2 ;;
-        --pkg-only)      PKG_ONLY=1; shift ;;
         --restage)       RESTAGE=1; shift ;;
         --extra)         [ -f "${2:-}" ] || die "--extra needs an existing file (got '${2:-}')"; EXTRA_FILES+=("$2"); shift 2 ;;
         --dry-run)       DRY_RUN=1; shift ;;
@@ -129,14 +119,10 @@ fi
 
 # A restage invalidates the row's smoke provenance BEFORE it touches anything:
 # versions/<V>/smoked (scripts/record-smoked.sh) digests only the components
-# manifest, and a restage can replace the packages, install.sh, or notes
-# without moving that digest. Deleting the marker first means a restage whose
-# smoke then fails leaves an unpromotable row, not a stale blessing; the
-# restage's own run re-records once its smoke passes. Called at the first
-# upload site of whichever path runs (the row, or --pkg-only); a run that
-# stages the row AND --pkg-dir reaches both sites, so the second call is a
-# no-op (one deletion per run, one log line, no misleading "was not present"
-# for a marker this run just removed).
+# manifest, and a restage can replace install.sh or the notes without moving
+# that digest. Deleting the marker first means a restage whose smoke then
+# fails leaves an unpromotable row, not a stale blessing; the restage's own
+# run re-records once its smoke passes. Called once, before the first upload.
 # Only a confirmed not-found is tolerated: any other failure (auth, permission,
 # a transient storage error) would leave the stale marker in place under the
 # new bytes, so it stops the restage before the first upload.
@@ -158,38 +144,6 @@ invalidate_smoked() {
     esac
 }
 
-# --- The distro-package upload (--pkg-dir / --pkg-only) ---------------------
-#
-# One definition of the versions/<VERSION>/pkg/ write — same immutable cache
-# header as every other staging write — so a workflow does not grow its own
-# gcloud invocation. --pkg-only stages ONLY the packages (no artifacts dir, no
-# manifest): the semver row itself is already staged at that point.
-if [ "$PKG_ONLY" -eq 1 ] && [ -z "$PKG_DIR" ]; then
-    die "--pkg-only needs --pkg-dir"
-fi
-
-# upload_pkg_dir — upload every file in PKG_DIR into versions/<V>/pkg/ (or list them on a dry run).
-upload_pkg_dir() {
-    [ -d "$PKG_DIR" ] || die "pkg dir not found: $PKG_DIR"
-    pkg_files=()
-    for f in "$PKG_DIR"/*; do
-        [ -f "$f" ] && pkg_files+=("$f")
-    done
-    [ "${#pkg_files[@]}" -gt 0 ] || die "no package files in $PKG_DIR (package-nfpm.sh did not run?)"
-    printf '=== %d package(s) -> %s/versions/%s/pkg/ ===\n' "${#pkg_files[@]}" "$BUCKET" "$VERSION" >&2
-    printf '  %s\n' "${pkg_files[@]}" >&2
-    [ "$DRY_RUN" -eq 1 ] && return 0
-    invalidate_smoked
-    gcloud storage cp \
-        "${cp_flags[@]}" \
-        "${pkg_files[@]}" "$BUCKET/versions/$VERSION/pkg/"
-}
-
-if [ "$PKG_ONLY" -eq 1 ]; then
-    upload_pkg_dir
-    printf 'stage-release: staged packages for %s (no row changes; see set-channel.sh)\n' "$VERSION" >&2
-    exit 0
-fi
 [ -d "$ARTIFACTS_DIR" ] || die "artifacts dir not found: $ARTIFACTS_DIR"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -466,12 +420,8 @@ if [ "${#EXTRA_FILES[@]}" -gt 0 ]; then
         "${EXTRA_FILES[@]}" "$version_prefix/"
 fi
 
-if [ -n "$PKG_DIR" ]; then
-    upload_pkg_dir
-fi
-
 # LAST: its presence means a complete row (see Write-once above), so nothing
-# — not the extras, not the packages — may be uploaded after it.
+# — not the extras — may be uploaded after it.
 gcloud storage cp \
     "${cp_flags[@]}" \
     "$manifest" "$version_prefix/components"
