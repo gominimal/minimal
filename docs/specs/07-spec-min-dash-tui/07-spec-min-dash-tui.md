@@ -397,13 +397,14 @@ and move cursor to the next session.
 cwd), network mode (HostNet/OwnIp/NoNet, default: HostNet). The create
 targets the provider the cursor points at (the focused session's provider,
 or the provider whose group header is selected). On confirm, call
-`CreateSession` with a `sessions::Record`. On success, refresh the list and
+`CreateSession` with a `boxes::Record`. On success, refresh the list and
 focus the new session. The upload root resolves like the CLI's (walk up to
 the nearest `minimal.toml` repo root) and follows the CLI's upload gate: a
 VCS checkout or a root carrying `minimal.toml` uploads; an empty directory or
 `$HOME` is skipped; an undeclared non-VCS root prompts through a footer
-confirmation ("<root> is not a repository root; upload it? y/n") before
-anything reaches the daemon. A declined confirmation uploads nothing and
+confirmation ("<root> is not a repository root; upload it? y/n", with `Esc`
+cancelling the create) before anything reaches the daemon. A declined
+confirmation uploads nothing and
 creates the session on an empty workspace, the same answer the CLI's own prompt
 gives. A `$HOME` that declares lifecycle hooks fails the create, as it does on
 the CLI. The create composes its activation inputs

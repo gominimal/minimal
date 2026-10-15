@@ -574,7 +574,7 @@ pub(crate) fn prepare_activation_inputs(
     project: &paths::HostAbsPath,
     selection: LoadoutSelection,
     hooks_enabled: bool,
-    user_policy_override: Option<sessions::core::policy::UserPolicy>,
+    user_policy_override: Option<boxes::core::policy::UserPolicy>,
 ) -> Result<ActivationInputs, anyhow::Error> {
     let cfg = read_client_config(global)?;
     let user_policy = match user_policy_override {
