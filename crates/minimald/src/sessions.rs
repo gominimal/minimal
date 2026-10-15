@@ -2603,8 +2603,9 @@ pub(crate) mod tests {
 
         let destroying = mngr.clone();
         let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
-        // Let the destroy reach its hook before measuring.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Measure once the destroy holds the session (its hook then runs
+        // on the teardown task).
+        until_claimed(&mngr, id).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), mngr.list())
             .await
             .expect("`list` queued behind a destroy that was waiting on its actor")
@@ -2661,8 +2662,8 @@ pub(crate) mod tests {
             let mngr = mngr.clone();
             crate::traced::spawn(async move { mngr.delete_session(id).await })
         };
-        // Let the first destroy claim the session and reach its hook.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Once the first destroy holds the session.
+        until_claimed(&mngr, id).await;
 
         let second = mngr.delete_session(id).await;
         assert!(
@@ -2729,7 +2730,7 @@ pub(crate) mod tests {
             let mngr = mngr.clone();
             crate::traced::spawn(async move { mngr.delete_session(id).await })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        until_claimed(&mngr, id).await;
 
         let err = mngr
             .create_session(sample_config(), None)
@@ -2741,6 +2742,20 @@ pub(crate) mod tests {
             "the error should name the destroy: {err}"
         );
         destroying.await.unwrap().unwrap();
+    }
+
+    /// Waits until a destroy has claimed `id`: from that moment the
+    /// listing no longer shows it (a session in the tearing-down set is
+    /// gone to it), so a test can act on the teardown window itself rather
+    /// than on a guess at how long reaching it takes.
+    async fn until_claimed(mngr: &ManagerHandle, id: SessionId) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while mngr.list().await.unwrap().iter().any(|s| s.id == id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the destroy never claimed the session");
     }
 
     /// Destroying an unknown ID is a `NotFound` error.
