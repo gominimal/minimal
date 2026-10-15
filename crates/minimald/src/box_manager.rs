@@ -1089,6 +1089,24 @@ impl BoxManager {
         Ok(Some(h))
     }
 
+    /// Whether the session that answers to `name` is in the tearing-down
+    /// set. A store error reads as not: the caller then reports the plain
+    /// collision it already had.
+    async fn name_is_being_destroyed(&self, name: &str) -> bool {
+        match self
+            .store
+            .find(RecordPredicate::Name(name.to_string()))
+            .await
+        {
+            Ok(Some(handle)) => self
+                .tearing_down
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(handle.id()),
+            _ => false,
+        }
+    }
+
     /// Starts the actor of every `Active` record whose box owns a name
     /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
     /// registered when its actor starts ([`BoxActor::run`]), and a restarted
@@ -1311,7 +1329,30 @@ impl BoxManager {
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
         let record = build_record(config, username, boxes::BoxState::Pending)?;
-        let handle = self.store.create(record).await?;
+        let name = record.name.clone();
+        let handle = match self.store.create(record).await {
+            Ok(handle) => handle,
+            // The name may be held by a session whose destroy is still
+            // running (its record outlives its actor by the length of the
+            // teardown task, a stalled clone's connect timeout at worst):
+            // say so, rather than report a plain collision the user cannot
+            // see in `min ls`, where that session is no longer listed.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(match name {
+                    Some(name) if self.name_is_being_destroyed(&name).await => {
+                        BoxManagerError::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "a session named `{name}` is still being destroyed; \
+                                 try again once it is gone"
+                            ),
+                        )
+                    }
+                    _ => e,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let session_id = *handle.id();
 
         let mut seed = self.session_config(handle.clone());
@@ -1664,7 +1705,12 @@ impl BoxManager {
                     // Teardowns in flight (`DeleteSession` runs them on tasks
                     // of their own) end before the volume is quiesced: a hook
                     // mid-run or a record delete mid-write would otherwise
-                    // race the unmount. Bounded by the hooks' own timeouts.
+                    // race the unmount. The wait is as long as the slowest
+                    // of them: a claimed actor reaches its `Destroy` only
+                    // after the message it is in, so one inside a stalled
+                    // package-graph clone holds shutdown for that clone's
+                    // connect timeout (minutes on a dropped route), as the
+                    // inline destroy used to; its hooks' timeouts come after.
                     while self.teardowns.join_next().await.is_some() {}
                     // Release the cache's held-open alog fd: it lives on the
                     // state volume, and a surviving write-open fd there makes

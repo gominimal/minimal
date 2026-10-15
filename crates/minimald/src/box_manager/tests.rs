@@ -570,6 +570,49 @@ async fn a_second_destroy_during_a_teardown_runs_no_hook_twice() {
     );
 }
 
+/// A create whose name is held by a session still being torn down says
+/// so, rather than reporting a plain collision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_during_a_teardown_names_the_destroy() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let destroying = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.delete_session(id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let err = mngr
+        .create_session(sample_config(), None)
+        .await
+        .expect_err("the name is still held by the session being destroyed");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        err.to_string().contains("still being destroyed"),
+        "the error should name the destroy: {err}"
+    );
+    destroying.await.unwrap().unwrap();
+}
+
 /// Destroying an unknown ID is a `NotFound` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroy_unknown_id_errors() {
