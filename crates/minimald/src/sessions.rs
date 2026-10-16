@@ -242,6 +242,16 @@ pub struct Manager {
     in_shutdown: CancellationToken,
     receiver: crate::traced::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, SessionHandle>,
+    /// Sessions whose teardown runs on a task of its own (`DeleteSession`):
+    /// out of `running`, their record on disk until the task deletes it. The
+    /// resolver reads such a session as gone, so an attach, a listing's
+    /// bring-up or a second destroy in that window starts no second actor and
+    /// runs no `on_destroy` hook twice. A task removes its id as it ends.
+    tearing_down: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    /// The teardown tasks, joined by `Shutdown` before the state volume is
+    /// quiesced: a hook still running or a record delete still in flight
+    /// would otherwise race the unmount.
+    teardowns: tokio::task::JoinSet<()>,
     store: StoreHandle,
 
     /// A weak handle to this manager, which can be duplicated so
@@ -630,6 +640,8 @@ impl Manager {
             in_shutdown,
             receiver,
             running,
+            tearing_down: Arc::default(),
+            teardowns: tokio::task::JoinSet::new(),
             store,
             weak_self,
             daemon_ctx,
@@ -1063,10 +1075,38 @@ impl Manager {
         if let Some(h) = self.running.get(&session_id) {
             return Ok(Some(h.clone()));
         }
+        // Being torn down: the record outlives the actor by the length of
+        // its teardown task, and a session in that window is gone, not idle.
+        if self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&session_id)
+        {
+            return Ok(None);
+        }
         // Not running, start it!
         let h = Session::run(self.session_config(handle)).await?;
         self.running.insert(session_id, h.clone());
         Ok(Some(h))
+    }
+
+    /// Whether the session that answers to `name` is in the tearing-down
+    /// set. A store error reads as not: the caller then reports the plain
+    /// collision it already had.
+    async fn name_is_being_destroyed(&self, name: &str) -> bool {
+        match self
+            .store
+            .find(RecordPredicate::Name(name.to_string()))
+            .await
+        {
+            Ok(Some(handle)) => self
+                .tearing_down
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(handle.id()),
+            _ => false,
+        }
     }
 
     /// Starts the actor of every `Active` record whose box owns a name
@@ -1109,7 +1149,15 @@ impl Manager {
         handles.sort_by_key(|handle| *handle.id());
         for handle in handles {
             let session_id = *handle.id();
-            if self.running.contains_key(&session_id) {
+            // Running, or being torn down (its record outlives its actor by
+            // the teardown task's length): either way not one to bring up.
+            if self.running.contains_key(&session_id)
+                || self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&session_id)
+            {
                 continue;
             }
             let record = match handle.record().await {
@@ -1249,7 +1297,28 @@ impl Manager {
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
         let record = build_record(config, username, boxes::SessionStatus::Pending)?;
-        let handle = self.store.create(record).await?;
+        let name = record.name.clone();
+        let handle = match self.store.create(record).await {
+            Ok(handle) => handle,
+            // The name may be held by a session whose destroy is still
+            // running (its record outlives its actor by the length of the
+            // teardown task, a stalled clone's connect timeout at worst):
+            // say so, rather than report a plain collision the user cannot
+            // see in `min ls`, where that session is no longer listed.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(match name {
+                    Some(name) if self.name_is_being_destroyed(&name).await => SessionsError::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "a session named `{name}` is still being destroyed; \
+                                 try again once it is gone"
+                        ),
+                    ),
+                    _ => e,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let session_id = *handle.id();
 
         let mut seed = self.session_config(handle.clone());
@@ -1286,9 +1355,20 @@ impl Manager {
             ManagerMessage::List(r) => {
                 let running = &self.running;
                 let store = &self.store;
+                // A session being torn down is gone here as it is to the
+                // resolver: its record outlives its actor only by the length
+                // of the teardown task.
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 r.handle(async move {
                     let mut records = Vec::with_capacity(32);
                     for handle in store.handles().await? {
+                        if tearing_down.contains(handle.id()) {
+                            continue;
+                        }
                         records.push(handle.record().await?);
                     }
                     // The attrs probes run in parallel and each under
@@ -1320,8 +1400,15 @@ impl Manager {
             }
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 r.handle(async {
                     Ok::<_, SessionsError>(match self.store.find(pred.into()).await? {
+                        // Gone, as to the listing and the resolver.
+                        Some(handle) if tearing_down.contains(handle.id()) => None,
                         Some(handle) => Some(handle.record().await?),
                         None => None,
                     })
@@ -1417,78 +1504,139 @@ impl Manager {
             }
             // Deletes a session: tears down its running host and actor (if
             // any), then removes its on-disk record.
+            //
+            // The mainloop resolves the record and claims the actor; the
+            // teardown itself runs on a task of its own. Awaiting the actor
+            // here held every queued caller behind it: the reap of a session
+            // whose client gave up on `min session activate` while the
+            // actor was inside a stalled package-graph clone parked `min ls`
+            // for the rest of the clone's connect timeout (70 s in the lab,
+            // 710d).
             ManagerMessage::DeleteSession(id, r) => {
-                r.handle(async {
-                    if self.in_shutdown.is_cancelled() {
-                        return Err(SessionsError::new(
+                if self.in_shutdown.is_cancelled() {
+                    r.handle(async {
+                        Err(SessionsError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "in shutdown",
-                        ));
+                        ))
+                    })
+                    .await;
+                    return;
+                }
+                let handle = match self.store.find(RecordPredicate::Id(id)).await {
+                    Ok(Some(handle)) => handle,
+                    Ok(None) => {
+                        r.handle(async {
+                            Err(std::io::Error::new(
+                                NotFound,
+                                format!("no session with ID `{}`", id.as_ref()),
+                            ))
+                        })
+                        .await;
+                        return;
                     }
-                    let handle =
-                        self.store
-                            .find(RecordPredicate::Id(id))
-                            .await?
-                            .ok_or_else(|| {
-                                std::io::Error::new(
-                                    NotFound,
-                                    format!("no session with ID `{}`", id.as_ref()),
-                                )
-                            })?;
-                    // Teardown belongs to the actor, so an idle session gets
-                    // one brought up rather than having its record deleted
-                    // out from under it. That used to be a fair shortcut —
-                    // "nothing to undo" — but a session's `on_destroy` hooks
-                    // now run on this path, and skipping the actor skipped
-                    // them silently for any session whose actor had been
-                    // reaped (every session, after a daemon restart).
-                    //
-                    // Spawning is cheap: the actor reads its record and
-                    // composition, and only mints a sandbox if there are
-                    // destroy hooks to run in one.
-                    let actor = match self.running.remove(&id) {
-                        Some(hnd) => Some(hnd),
-                        None => match Session::run(self.session_config(handle.clone())).await {
-                            Ok(hnd) => Some(hnd),
-                            // A record the actor refuses to come up on — a
-                            // restart-orphaned `Materializing` one is the
-                            // known case — must still be destroyable, so
-                            // fall through to deleting it directly. A
-                            // session that cannot be torn down is worse
-                            // than one torn down without its hooks.
-                            Err(e) => {
-                                tracing::warn!(
-                                    session_id = %id,
-                                    error = %e,
-                                    "could not start the session to run its destroy hooks; \
-                                     removing its record without them",
-                                );
-                                None
-                            }
-                        },
-                    };
-                    match actor {
-                        Some(hnd) => {
-                            let hook_failures = hnd.destroy().await?;
-                            // Belt-and-braces: a dead actor (self-terminated
-                            // but not yet evicted) reads as `Ok` above, and
-                            // may have died *without* deleting its record
-                            // (its own delete failed). Remove any leftover;
-                            // `NotFound` is the normal already-deleted case.
-                            if let Err(e) = handle.delete().await
-                                && e.kind() != NotFound
-                            {
-                                return Err(e);
-                            }
-                            Ok(hook_failures)
-                        }
-                        None => {
-                            handle.delete().await?;
-                            Ok(Vec::new())
-                        }
+                    Err(e) => {
+                        r.handle(async { Err(e) }).await;
+                        return;
                     }
-                })
-                .await
+                };
+                // One teardown per session: a second destroy that lands
+                // while the first runs is refused rather than brought up
+                // as a fresh actor whose hooks would run again.
+                let tearing_down = Arc::clone(&self.tearing_down);
+                let first = tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id);
+                if !first {
+                    r.handle(async {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ResourceBusy,
+                            format!("session `{}` is already being destroyed", id.as_ref()),
+                        ))
+                    })
+                    .await;
+                    return;
+                }
+                // Teardown belongs to the actor, so an idle session gets
+                // one brought up rather than having its record deleted
+                // out from under it. That used to be a fair shortcut —
+                // "nothing to undo" — but a session's `on_destroy` hooks
+                // now run on this path, and skipping the actor skipped
+                // them silently for any session whose actor had been
+                // reaped (every session, after a daemon restart).
+                //
+                // Claimed here, brought up and torn down on a task of its
+                // own: the mainloop awaits neither the actor's start (a
+                // record and composition read) nor its destroy (hooks), so
+                // a listing served meanwhile neither waits nor probes it.
+                // The caller gets the outcome when the task ends.
+                let claimed = self.running.remove(&id);
+                let seed = match claimed {
+                    Some(_) => None,
+                    None => Some(self.session_config(handle.clone())),
+                };
+                let span = tracing::Span::current();
+                self.teardowns.spawn(tracing::Instrument::instrument(
+                    async move {
+                        // Out of the set as this task ends, whatever its outcome.
+                        let _release = TearingDown {
+                            set: tearing_down,
+                            id,
+                        };
+                        r.handle(async {
+                            let actor = match (claimed, seed) {
+                                (Some(hnd), _) => Some(hnd),
+                                (None, Some(seed)) => match Session::run(seed).await {
+                                    Ok(hnd) => Some(hnd),
+                                    // A record the actor refuses to come up on — a
+                                    // restart-orphaned `Materializing` one is the
+                                    // known case — must still be destroyable, so
+                                    // fall through to deleting it directly. A
+                                    // session that cannot be torn down is worse
+                                    // than one torn down without its hooks.
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id = %id,
+                                            error = %e,
+                                            "could not start the session to run its destroy hooks; \
+                                             removing its record without them",
+                                        );
+                                        None
+                                    }
+                                },
+                                // A claimed actor comes with no seed; the
+                                // match above covers every pair that occurs.
+                                (None, None) => None,
+                            };
+                            match actor {
+                                Some(hnd) => {
+                                    let hook_failures = hnd.destroy().await?;
+                                    // Belt-and-braces: a dead actor (self-terminated
+                                    // but not yet evicted) reads as `Ok` above, and
+                                    // may have died *without* deleting its record
+                                    // (its own delete failed). Remove any leftover;
+                                    // `NotFound` is the normal already-deleted case.
+                                    if let Err(e) = handle.delete().await
+                                        && e.kind() != NotFound
+                                    {
+                                        return Err(e);
+                                    }
+                                    Ok(hook_failures)
+                                }
+                                None => {
+                                    handle.delete().await?;
+                                    Ok(Vec::new())
+                                }
+                            }
+                        })
+                        .await;
+                    },
+                    span,
+                ));
+                // Finished tasks leave the set on their own; their join
+                // handles leave it here, so the set holds only the live ones.
+                while self.teardowns.try_join_next().is_some() {}
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {
@@ -1516,6 +1664,16 @@ impl Manager {
                         hnd.stop().await;
                     }
                     self.running.clear();
+                    // Teardowns in flight (`DeleteSession` runs them on tasks
+                    // of their own) end before the volume is quiesced: a hook
+                    // mid-run or a record delete mid-write would otherwise
+                    // race the unmount. The wait is as long as the slowest
+                    // of them: a claimed actor reaches its `Destroy` only
+                    // after the message it is in, so one inside a stalled
+                    // package-graph clone holds shutdown for that clone's
+                    // connect timeout (minutes on a dropped route), as the
+                    // inline destroy used to; its hooks' timeouts come after.
+                    while self.teardowns.join_next().await.is_some() {}
                     // Release the cache's held-open alog fd: it lives on the
                     // state volume, and a surviving write-open fd there makes
                     // the post-drain quiesce (R2.1 syncfs + unmount) fail
@@ -1540,6 +1698,22 @@ impl Manager {
                 self.running.remove(&id);
             }
         }
+    }
+}
+
+/// Removes a session from the manager's tearing-down set when its teardown
+/// task ends, however it ends.
+struct TearingDown {
+    set: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    id: SessionId,
+}
+
+impl Drop for TearingDown {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -2404,6 +2578,192 @@ pub(crate) mod tests {
             "the session should no longer resolve after destroy"
         );
         drop(handle);
+    }
+
+    /// A destroy that waits on its actor must not hold the mainloop. Here
+    /// the wait is an `on_destroy` hook that sleeps; in the lab (710d) it
+    /// was the reap of a session whose actor sat inside a stalled
+    /// package-graph clone after its client gave up, and `min ls` queued
+    /// behind it for 70 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_destroy_does_not_hold_the_mainloop() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session_contributing(
+            &mngr,
+            sample_config(),
+            WireContribution {
+                lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                    hook: boxes::wire::primitives::WireLifecycleHook {
+                        on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                            body: "sleep 5".to_string(),
+                            timeout_secs: 60,
+                        }),
+                        ..Default::default()
+                    },
+                    source: boxes::wire::primitives::WireSource::UserLoadout {
+                        name: "test".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let destroying = mngr.clone();
+        let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+        // Measure once the destroy holds the session (its hook then runs
+        // on the teardown task).
+        until_claimed(&mngr, id).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), mngr.list())
+            .await
+            .expect("`list` queued behind a destroy that was waiting on its actor")
+            .unwrap();
+        assert!(
+            !destroy.is_finished(),
+            "the destroy hook should still be running"
+        );
+
+        let hook_failures = destroy.await.unwrap().unwrap();
+        assert!(hook_failures.is_empty(), "{hook_failures:?}");
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the record should be gone after destroy"
+        );
+    }
+
+    /// A session being torn down is gone to everyone else: a second destroy
+    /// in the window is refused, a resolve finds nothing, and the
+    /// `on_destroy` hook runs once. With the teardown off the mainloop the
+    /// window is real (the first review of #2224 found it): without the
+    /// tearing-down set, the second destroy brought up a fresh actor from
+    /// the still-present record and ran the hook again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_destroy_during_a_teardown_runs_no_hook_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session_contributing(
+            &mngr,
+            sample_config(),
+            WireContribution {
+                lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                    hook: boxes::wire::primitives::WireLifecycleHook {
+                        on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                            body: format!("sleep 2; echo ran >> {}", marker.display()),
+                            timeout_secs: 60,
+                        }),
+                        ..Default::default()
+                    },
+                    source: boxes::wire::primitives::WireSource::UserLoadout {
+                        name: "test".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let first = {
+            let mngr = mngr.clone();
+            crate::traced::spawn(async move { mngr.delete_session(id).await })
+        };
+        // Once the first destroy holds the session.
+        until_claimed(&mngr, id).await;
+
+        let second = mngr.delete_session(id).await;
+        assert!(
+            matches!(&second, Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy),
+            "a second destroy during the teardown should be refused, got {second:?}"
+        );
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "a session being torn down should resolve to nothing"
+        );
+        assert!(
+            mngr.list().await.unwrap().iter().all(|s| s.id != id),
+            "a session being torn down should not be listed"
+        );
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "a session being torn down should have no record to read"
+        );
+
+        first.await.unwrap().unwrap();
+        let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(ran.lines().count(), 1, "the destroy hook ran {ran:?}");
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the record should be gone after destroy"
+        );
+    }
+
+    /// A create whose name is held by a session still being torn down says
+    /// so, rather than reporting a plain collision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_during_a_teardown_names_the_destroy() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session_contributing(
+            &mngr,
+            sample_config(),
+            WireContribution {
+                lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                    hook: boxes::wire::primitives::WireLifecycleHook {
+                        on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                            body: "sleep 2".to_string(),
+                            timeout_secs: 60,
+                        }),
+                        ..Default::default()
+                    },
+                    source: boxes::wire::primitives::WireSource::UserLoadout {
+                        name: "test".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        let destroying = {
+            let mngr = mngr.clone();
+            crate::traced::spawn(async move { mngr.delete_session(id).await })
+        };
+        until_claimed(&mngr, id).await;
+
+        let err = mngr
+            .create_session(sample_config(), None)
+            .await
+            .expect_err("the name is still held by the session being destroyed");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("still being destroyed"),
+            "the error should name the destroy: {err}"
+        );
+        destroying.await.unwrap().unwrap();
+    }
+
+    /// Waits until a destroy has claimed `id`: from that moment the
+    /// listing no longer shows it (a session in the tearing-down set is
+    /// gone to it), so a test can act on the teardown window itself rather
+    /// than on a guess at how long reaching it takes.
+    async fn until_claimed(mngr: &ManagerHandle, id: SessionId) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while mngr.list().await.unwrap().iter().any(|s| s.id == id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the destroy never claimed the session");
     }
 
     /// Destroying an unknown ID is a `NotFound` error.
