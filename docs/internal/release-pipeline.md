@@ -26,6 +26,10 @@ Follow these steps in order. The examples use version `X.Y.Z` and commit
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
   a PR and cut the next version.
+- A release runs on a branch that outlives one build. Fixes land on
+  `release/X.Y.Z` while `main` keeps moving, and each release candidate burns
+  its own version number, because a staged number is permanent. 0.7.0 went
+  out as `0.7.0-rc1`, then `0.7.0-rc2`, then `0.7.0`.
 
 ### 1. Choose the commit and check the version
 
@@ -58,6 +62,10 @@ git push origin <commit>:refs/heads/release/X.Y.Z
 
 Nothing in the pipeline reads the branch name. The draft release and the tag
 point at the commit.
+
+Keep the branch. It carries the fixes that go into the release while `main`
+moves on, and a hotfix cuts the next version from it. Step 9 deletes the
+private pointer from step 5 and nothing else.
 
 ### 3. Rehearse the release run
 
@@ -136,15 +144,28 @@ on it. Then the workflow does these things, in this order:
 If the release publish job fails, fix the cause and use **Re-run failed jobs**
 on the same run.
 
-### 7. Clean up
+### 7. Update minimal-skills
 
-Delete the branch from step 2:
+[`gominimal/minimal-skills`](https://github.com/gominimal/minimal-skills)
+describes the behaviour of the released build, so it follows the release.
+Check its claims against the version you just released, run its evals, and
+file each place where the published docs and the running build disagree in
+[`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
+its own `release/vX.Y.Z` branch. The 0.7.0 pass ran on 2026-10-14 against
+`0.7.0-rc2`.
 
-```sh
-git push origin --delete release/X.Y.Z
-```
+### 8. Forward port the release branch
 
-Also delete any private pointer that you wrote in step 5.
+The fixes that landed on `release/X.Y.Z` are not on `main`. Open a pull
+request that brings them back and land it. `main` moves while a release is
+out, so a port that waits costs more than one that does not.
+
+### 9. Clean up
+
+Delete the private pointer that you wrote in step 5.
+
+Keep the branch from step 2. A hotfix lands on it, bumps `package.version`,
+and goes out through steps 3 to 6 as the next version.
 
 ### Roll back
 
