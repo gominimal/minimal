@@ -5794,13 +5794,28 @@ mod tests {
 
         use crate::net::answerer::{ANSWERER_PORT, AnswerScope, ZoneAnswerer};
 
-        // Hold the answerer's documented default (UDP) for the whole test.
-        // `.ok()`, not `unwrap`: the `Server::run` tests beside this one bind
+        // Hold the answerer's documented default (UDP) for the whole test,
+        // and hold it *here*: the `Server::run` tests beside this one bind
         // the real defaults too, and nextest runs each test in its own
-        // process, so another process may already hold it. Either holder
-        // produces the same relocation; nothing here needs *this* process to
-        // be the one holding it.
-        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, ANSWERER_PORT)).ok();
+        // process, so a first bind can find the port held by a sibling. That
+        // sibling can release it before the answerer below binds, which
+        // hands the answerer the default and fails the assertion (CI,
+        // 2026-10-15). So a busy port is waited for, not taken on trust.
+        // If a sibling holds it past the wait, go on as the test used to:
+        // the sibling's hold relocates the answerer just as this one's would,
+        // so the wait narrows the race without adding a failure of its own.
+        let held = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, ANSWERER_PORT)) {
+                    Ok(socket) => break Some(socket),
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(_) => break None,
+                }
+            }
+        };
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
