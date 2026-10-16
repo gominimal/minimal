@@ -2872,6 +2872,34 @@ pub(crate) mod tests {
         drop(handle);
     }
 
+    /// The slot is emptied when the actor ends, so a handle that outlives
+    /// it reads no host, and holds no sender to one. The destroy's message
+    /// ends the actor with a `break`, after which nothing is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ended_actors_slot_is_emptied() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+        handle.put_host_for_test(crate::session_host::HostHandle::answering_attrs());
+        assert!(
+            handle.get_attrs().await.is_some(),
+            "the slot serves the host it holds"
+        );
+        mngr.delete_session(id).await.unwrap();
+        // The destroy replies just before the actor's loop ends.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.get_attrs().await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ended actor's slot still served a host");
+    }
+
     /// Destroying an unknown ID is a `NotFound` error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_unknown_id_errors() {

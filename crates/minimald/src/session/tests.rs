@@ -1867,7 +1867,7 @@ async fn missing_sidecar_falls_back_to_baseline() {
 /// session sitting idle with nobody attached must still be able to launch
 /// a host, and a second request must reuse it rather than starting a
 /// second shell in the same session.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -1892,7 +1892,8 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     assert!(host.is_alive());
     assert!(
         handle.get_attrs().await.is_some(),
-        "the session should now be holding the host it launched"
+        "the session should now be holding the host it launched: the slot is \
+         published before `ensure_host` replies, on a multi-thread runtime too"
     );
 
     let again = handle

@@ -1960,6 +1960,10 @@ impl Session {
     /// ([`HostSlot`]). Called after every message, so between messages —
     /// and for as long as one parks the actor — the slot holds the host the
     /// actor last had, and a listing's probe never waits on this mailbox.
+    /// Also called where a host is installed ([`Self::mint_session_host`],
+    /// [`Self::launch_host_for_hooks`]), which is before the message that
+    /// launched it replies: a caller that awaits an attach or `ensure_host`
+    /// and then reads attrs sees the new host.
     fn publish_host(&self) {
         let host = match &self.inner {
             SessionInner::Active {
@@ -1981,6 +1985,7 @@ impl Session {
     /// instead of deadlocking against a full manager mailbox.
     async fn mainloop(mut self) {
         let mut teardown = Teardown::ManagerInitiated;
+        let _clear_slot = ClearSlotOnExit(Arc::clone(&self.host_slot));
         self.publish_host();
         while let Some((msg, caller)) = self.receiver.recv().await {
             // Opened now, a child of the sender's ids (see
@@ -5150,6 +5155,7 @@ impl Session {
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
+        self.publish_host();
         outcome
     }
 
@@ -5302,6 +5308,7 @@ impl Session {
         // attach may replace this shell rather than inherit its blank `TERM`.
         // See [`HostOrigin::Hooks`].
         self.host_origin = HostOrigin::Hooks;
+        self.publish_host();
         Ok(())
     }
 
@@ -5784,6 +5791,22 @@ impl Session {
 /// [`HOST_PROBE_TIMEOUT`]. The actor refreshes it after every message it
 /// handles ([`Session::publish_host`]).
 pub(crate) type HostSlot = Arc<std::sync::Mutex<Option<AttrsProbe>>>;
+
+/// Empties a [`HostSlot`] when the actor that publishes it ends, however it
+/// ends: a teardown's `break` (which publishes nothing after it), or a panic
+/// unwinding the actor's task. A listing then reads no host for an actor
+/// that is gone, and the slot holds no sender that would keep the host's
+/// mailbox open.
+struct ClearSlotOnExit(HostSlot);
+
+impl Drop for ClearSlotOnExit {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
 
 /// What the [`HostSlot`] hands out: a host's attrs, and nothing else. The
 /// slot is read by every holder of a [`SessionHandle`], so it carries no
