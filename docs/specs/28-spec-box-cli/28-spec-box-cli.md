@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/4d554e41e6e13ec55d3dc64d9282b883601f5818/architecture.md
 arch_sha: "4d554e41e6e13ec55d3dc64d9282b883601f5818"
-updated: 2026-10-07
+updated: 2026-10-16
 ---
 
 # BCLI — The box grammar — `min box`, the type nouns, and the migration from the session verbs
@@ -41,7 +41,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
 
 - **BCLI-002** THE SYSTEM SHALL accept a box address as an id, a name, or `provider/host/name`.
-  <!-- was BOX-007, without its `self` sub-bullet, which stays in BOX -->
+  <!-- was BOX-007, without its `self` sub-bullet; BOX-007 only reserves the name, and BCLI-075 resolves `self` -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_address_accepts_id_name_and_qualified
   - IF an unqualified name matches running boxes on more than one host THEN THE SYSTEM SHALL report BOX-005's refusal with exit 2, listing each candidate with its host.
@@ -50,6 +50,14 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF a host cannot be reached while an unqualified name is resolved across hosts THEN THE SYSTEM SHALL fail with exit 7, naming each unreachable host, and resolve nothing from the hosts that answered.
     tier:   T0
     verify: cargo nextest run -p minimal unqualified_name_with_unreachable_host_exit7_names_host
+
+- **BCLI-075** WHEN `self` is given as the box address to `min box spec`, `min box show` or `min box events` from inside a box THE SYSTEM SHALL resolve it to the containing box from the calling connection's per-box identity as the parent minimald holds it, never from the box's environment.
+  <!-- event-driven; the architecture's Addressing (L385) defines `self` and its resolution; BOX-007 reserves the name; `--parent self` waits with nesting (Non-goals) -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal self_resolves_from_connection_identity
+  - IF `self` is given outside a box THEN THE SYSTEM SHALL fail with exit 2 and a hint that `self` addresses the containing box only from inside one.
+    tier:   T0
+    verify: cargo nextest run -p minimal self_outside_box_exit2_hints_inside_only
 
 - **BCLI-003** WHEN `min box show <box>` runs THE SYSTEM SHALL render the record BOX-159 returns, with the box's state as BOX-011 defines it and its identity as BOX-140 reports it.
   <!-- split from BOX-011: the rendering half; the state model stays in BOX. The identity clause is BOX-140's rendering half, moved here in cycle 4 -->
@@ -79,18 +87,26 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal resume_name_conflict_exit2_names_holder
 
-- **BCLI-009** IF `min box attach`, `min session attach` or `min box resume` would restart the processes of a stopped or exited box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL report BOX-030's refusal with exit 2 naming `min task run`, in the order BOX-025 states, so a non-PTY resume whose name a running box holds reports this refusal and not BCLI-007's name hint.
-  <!-- was the sub-bullet of BOX-030; the refusal itself returned to BOX-030 in cycle 4. Identity re-establishment under enrollment is Gatehouse §6.3.3's and composes with this (see Design reasoning) -->
+- **BCLI-009** IF `min box attach`, `min session attach` or `min box resume` would restart the processes of a stopped or exited box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL report BOX-030's refusal with exit 2, its hint chosen by `lifetime`: `min box restart <box>` for a box whose spec sets `lifetime = "until_stopped"`, and `min task run` for a box that runs to completion, in the order BOX-025 states, so a non-PTY resume whose name a running box holds reports this refusal and not BCLI-007's name hint.
+  <!-- was the sub-bullet of BOX-030; the refusal itself returned to BOX-030 in cycle 4. The hint follows `lifetime`, not type: design principle 8 (L334). Identity re-establishment under enrollment is Gatehouse §6.3.3's and composes with this (see Design reasoning) -->
   tier:     T0
-  verify:   cargo nextest run -p minimal resume_non_pty_box_exit2_names_run
+  verify:   cargo nextest run -p minimal resume_non_pty_box_exit2_hint_by_lifetime
+
+- **BCLI-074** WHEN `min box restart <box>` runs against a box whose spec sets `lifetime = "until_stopped"` THE SYSTEM SHALL stop its processes if they are running and start them again from the spec stored at its creation (BOX-068) and its retained filesystem, under the same `box_id` and name.
+  <!-- event-driven; the architecture's `min box restart` (L466), and design principle 8 (L334): `restart` follows `lifetime = "until_stopped"`, not type. BOX owes the matching operation (Rollout) -->
+  tier:     T0
+  verify:   cargo nextest run -p minimal box_restart_until_stopped_restarts_same_id_and_name
+  - IF `min box restart` targets a box whose spec does not set `lifetime = "until_stopped"` THEN THE SYSTEM SHALL fail with exit 2, naming `min task run <task>` for a box of type `task` and `min box run <entry>` for any other.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_restart_not_until_stopped_exit2_names_run
 
 - **BCLI-010** WHEN `min task run <task> [-- <args>…]` or `min box run <entry> [-- <args>…]` runs without `--detach` THE SYSTEM SHALL create a box from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
   <!-- was BOX-032; widened to `min box run`, type-neutral; the `pty_enabled` case waits on gominimal/arch#127 (Open questions) -->
   tier:     T0
   verify:   cargo nextest run -p minimal run_entry_wires_stdio_and_exit_code
-  - WHERE `--detach` is given to `min task run` THE SYSTEM SHALL print only the `box_id` to stdout, close the task's stdin at creation, leave its output to be captured as BOX-155 defines, and return.
+  - WHERE `--detach` is given to `min task run` or `min box run` THE SYSTEM SHALL print only the `box_id` to stdout, close the task's stdin at creation, leave its output to be captured as BOX-155 defines, and return.
     tier:   T0
-    verify: cargo nextest run -p minimal task_run_detach_prints_id_closes_stdin
+    verify: cargo nextest run -p minimal run_detach_prints_id_closes_stdin
 
 - **BCLI-011** THE SYSTEM SHALL provide `min task run` as the task noun's run verb and remove the previous hidden `min run` that only errored.
   <!-- was BOX-033 -->
@@ -110,10 +126,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal box_wait_orphaned_stopped_record_returns_137
 
-- **BCLI-014** IF a box ends with `exited.reason = "timeout"` THEN THE SYSTEM SHALL emit a machine-mode error with `code = "timeout"` and return 124 from `min task run` and from `min box wait`.
-  <!-- split from BOX-037: the CLI half; the timeout reason stays in BOX. `min box wait` added in cycle 4 -->
+- **BCLI-014** IF a box ends with `exited.reason = "timeout"` THEN THE SYSTEM SHALL emit a machine-mode error with `code = "timeout"` and return 124 from `min task run`, `min box run` and `min box wait`.
+  <!-- split from BOX-037: the CLI half; the timeout reason stays in BOX. `min box wait` added in cycle 4, and `min box run` for the architecture's exit-code table (L366, L372) -->
   tier:     T0
-  verify:   cargo nextest run -p minimal task_run_and_wait_timeout_return_124_with_code_timeout
+  verify:   cargo nextest run -p minimal run_verbs_and_wait_timeout_return_124_with_code_timeout
 
 - **BCLI-015** THE SYSTEM SHALL list exited tasks in `min task list` until they are pruned.
   <!-- was BOX-039 -->
@@ -197,8 +213,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 ### The command tree, aliases and hosts
 
-- **BCLI-026** THE SYSTEM SHALL provide `min box start`, `run`, `list`, `show`, `spec`, `stop`, `rm`, `prune`, `resume`, `rename`, `logs`, `wait`, `events`, `cp`, `exec` and `attach` with the flags the architecture's command reference lists, BCLI-053's `--timeout` for `exec`, BCLI-068's `--exec` for `attach`, BCLI-069's `--name` for `start` and `run`, and BCLI-070's `--new` for `start`.
-  <!-- was BOX-086 -->
+- **BCLI-026** THE SYSTEM SHALL provide `min box start`, `run`, `list`, `show`, `spec`, `stop`, `rm`, `prune`, `resume`, `rename`, `restart`, `logs`, `wait`, `events`, `cp`, `exec` and `attach` with the flags the architecture's command reference lists, except `--provider` and `--all-providers`, `--using <pkg>[@<ver>]`, `min box wait --parent <box|self> [--any]` and `self` as the value of `--parent` (Non-goals), with BCLI-053's `--timeout` for `exec`, BCLI-068's `--exec` for `attach`, BCLI-069's `--name` for `start` and `run`, and BCLI-070's `--new` for `start`.
+  <!-- was BOX-086; limited to the flags this spec delivers, the rest in Non-goals -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_verbs_exist_with_arch_flags
 
@@ -278,10 +294,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_without_address_unreachable_host_exit7
 
-- **BCLI-033** THE SYSTEM SHALL emit `-o json` and `-o jsonl` output under the versioned schemas `min/v1/box`, `min/v1/event` and `min/v1/error`.
-  <!-- was BOX-095 -->
+- **BCLI-033** THE SYSTEM SHALL emit every object in `-o json` and `-o jsonl` output with a `schema` field `min/v1/<type>`, the types being `box`, `event`, `error`, `type`, `host`, `provider`, `spec` and `exec` (the exec listing in `box show`).
+  <!-- was BOX-095; bound to every object, as the architecture's Output conventions (L376) and design principle 4 (L330) state -->
   tier:     T0
-  verify:   cargo nextest run -p minimal json_output_carries_versioned_schemas
+  verify:   cargo nextest run -p minimal json_output_schema_per_object
   - IF a command fails in a machine output mode THEN THE SYSTEM SHALL write one JSON object to stderr carrying `code`, `message` and `hint`.
     tier:   T0
     verify: cargo nextest run -p minimal machine_mode_error_object_on_stderr
@@ -291,9 +307,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   verify:   cargo nextest run -p minimal secrets_rendered_as_refs_in_every_output_mode
   property: For every output mode and every secret-bearing field of a spec, a record, an event or an error object, the rendered output contains the secret's reference and never its value.
 
-- **BCLI-064** IF a box address given to any `min box`, `min session` or `min task` verb resolves to no box under BOX-005 THEN THE SYSTEM SHALL fail with exit 4, naming the address, before any other check runs.
+- **BCLI-064** IF a box address given to any `min box`, `min session` or `min task` verb resolves to no box under BOX-005 THEN THE SYSTEM SHALL fail with exit 4, naming the address, before any other check runs, except that BCLI-002's unreachable-host refusal (exit 7) wins over it: a name that no reachable host holds is not proof that no box has it.
   tier:     T0
   verify:   cargo nextest run -p minimal unknown_box_address_exit4_names_address
+
 - **BCLI-034** THE SYSTEM SHALL end each command with the exit code the architecture's exit-code table assigns to its outcome, for every row the table does not mark [proposed].
   <!-- was BOX-097; ubiquitous; bound to the table as a whole so the spec restates no partial list; the [proposed] rows, exit 8 and exit 5's provider-quota case, belong to the resources spec (gominimal/inbox#698; BRES) -->
   tier:     T0
@@ -332,7 +349,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     <!-- unwanted; the architecture's `min box attach` paragraph and design principle 3 -->
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_without_tty_exit2
-  - IF `min box attach <box>` runs without `--exec` against a running box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box>`; against a stopped or exited box without `pty_enabled`, BCLI-009's restart refusal naming `min task run` applies instead, and `min session attach` (BCLI-032) inherits the same split.
+  - IF `min box attach <box>` runs without `--exec` against a running box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box>`; against a stopped or exited box without `pty_enabled`, BCLI-009's restart refusal applies instead, with its hint chosen by `lifetime` (`min box restart <box>` for a box whose spec sets `lifetime = "until_stopped"`, `min task run` for a box that runs to completion), and `min session attach` (BCLI-032) inherits the same split.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_running_non_pty_box_exit2_names_logs
   - WHEN `min box attach <box> --exec <exec-id>` names a live PTY exec in the box THE SYSTEM SHALL re-attach the caller's terminal to that exec as BOX-149 defines, resolving the exec id against the live exec ids BOX-159 returns.
@@ -446,7 +463,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - Volume verbs (`min volume list|show|rm|prune`): `docs/specs/27-spec-box-volumes` (BVOL), which carries them as BVOL-006, BVOL-007 and BVOL-012. BRES and BVOL keep their own verbs because they are small and move with the behaviour they render.
 - The dash (epic story S14): an amendment to `docs/specs/07-spec-min-dash-tui`.
 - The local providers serving the Box Provider API (epic story S16): they wait on gominimal/arch#45, and `min host` and `min provider` read the daemon directly until then.
-- `min box sync`, `min box port`, `min box add` and `min box restart`: the architecture's `min box` reference; not scheduled by this epic. `min box restart` sits beside `min service restart` (gominimal/inbox#678).
+- `min box sync`, `min box port` and `min box add`: the architecture's `min box` reference. This epic does not schedule them.
+- `--provider` and `--all-providers` on the `min box` verbs: they select remote providers, which wait on the Box Provider API (gominimal/arch#45).
+- `min box list --using <pkg>[@<ver>]`: it reads a box's SBOM, which the SBOM epic owns (gominimal/inbox#582).
+- `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent` on any verb: they manage a box's children, which needs nesting. Nesting has no owner yet (Open questions).
 - `min host create|snapshot|pause|resume|rm` and `min provider show|add|rm|login|use`: they wait on the Box Provider API (gominimal/arch#45), as the local providers do.
 - The `min agent` and `min service` nouns, including `min service restart`: the Agent Box epic gominimal/inbox#678.
 - `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP).
@@ -470,7 +490,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **The exec id never enters the exec's stdout.** The owner decided on 2026-09-28 that `min box exec -t` prints the exec id to stderr, so stdout carries only the exec's output, while `--detach`, which has no other output, prints only the id on stdout; `min box show <box>` lists the live execs (BCLI-053, BCLI-067). The rejected alternative printed the id on stdout under `-t`, where it lands in the attached PTY stream and any transcript wrapping it, against the architecture's payload-only stdout (design principle 4).
 
-**Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box, whose restart is a new `min task run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states. A resume refused because a running box holds the name exits 2 by this spec's choice, as a usage-shaped refusal like the ambiguous-name error, rather than the policy exit 5. A resume refused because another box holds a volume the box declares exits 5 (BVOL-013); the name check runs before the spec and volume checks, so a resume that meets both refusals exits 2.
+**Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box. Its hint follows `lifetime`, not type (design principle 8). A box whose spec sets `lifetime = "until_stopped"` comes back with `min box restart` (BCLI-074). A box that runs to completion comes back with a new `min task run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states. A resume refused because a running box holds the name exits 2 by this spec's choice, as a usage-shaped refusal like the ambiguous-name error, rather than the policy exit 5. A resume refused because another box holds a volume the box declares exits 5 (BVOL-013); the name check runs before the spec and volume checks, so a resume that meets both refusals exits 2.
 
 **`run` and `--new` make a fresh instance; a plain `start` refuses a held name.** The architecture's Addressing rule (gominimal/arch#117) has `start` create under the box's name and refuse one a running box on the host holds, while `run` and `start --new` create a fresh instance named `<name>-<n>`. BCLI-069 reports the refusal with a hint naming `--new` and `--name`, and BCLI-070 maps `run` and `--new` onto BOX-163's fresh instance. A second concurrent `min task run build` on one host therefore succeeds as `build-1`, which is the CI case. This spec's earlier text, which refused a held name for `min task run` too, was rejected in review because it refused that second run.
 
@@ -496,7 +516,24 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   enforced by: every rendering of a spec or record carries a secret as a reference only (architecture Output conventions: secrets never appear in any output mode)
   covered by: BCLI-021, BCLI-063
 
+## Rollout
+
+**BOX owes a restart operation.** BCLI-074 drives the restart of a box whose spec sets `lifetime = "until_stopped"`, but BOX resumes only boxes whose spec sets `pty_enabled` (BOX-025, BOX-030). BOX owes an amendment to `docs/specs/29-spec-box-local-first` alongside this spec: a matching requirement for restarting an `until_stopped` box.
+
+**Merged requirements cite spellings BCLI-042 and BCLI-046 remove.** These requirements on main cite an old spelling:
+
+- `min session activate`: NET-018, NET-020, NET-035, NET-040, NET-049, NET-051 and NET-122, the last in a sub-bullet's comment. A BOX-001 sub-bullet cites it too.
+- `min session policy`: NET-044, NET-061, NET-075, NET-130 (in a sub-bullet's comment) and NET-140. The draft GWI-003 cites it too.
+- `min session destroy`: BEP-043.
+- `min session exec`: a NET-015 sub-bullet.
+- Bare `min stop`: TEL-011.
+- `--provider local-minvmd`, which BCLI-046 expires: NET-049, NET-051 and TEL-034.
+
+BCLI-042's sub-bullet expires each BCLI-042 or BCLI-046 alias after the release that accepted it. That expiry takes effect only once every requirement listed for the alias cites the new spelling.
+
+The same NET-015 sub-bullet also cites `min session run`, which BCLI-066 refuses at once, with no alias window. Plan task T43 supersedes that citation: a task runs as its own box, not inside a session. NET-015 gets its new citation when T43 merges.
+
 ## Open questions
 
-- [NEEDS CLARIFICATION (MEDIUM): NET-035 binds `--help` to `min session activate`, and NET-061 and the draft GWI-003 cite `min session policy`; both are BCLI-042 aliases for one release, and NET-035, NET-061 and GWI-003 should re-cite `min session start` and `min box show --network` (BCLI-025) before the aliases are removed.]
+- [NEEDS CLARIFICATION (MEDIUM): nesting has no owner. The BOX Non-goals name gominimal/inbox#568, which closed as a duplicate, and gominimal/inbox#572 closed as not planned. `min box wait --parent` and `--parent self` wait on whichever spec or epic takes nesting up.]
 - [NEEDS CLARIFICATION (LOW): the architecture's `min box run` wires stdio for any entry. It does not say whether it allocates a PTY for a `pty_enabled` entry, or what such a run does off a TTY. This spec specifies neither until gominimal/arch#127 rules.]
