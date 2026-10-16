@@ -4145,14 +4145,16 @@ mod tests {
     async fn proxy_auto_selects_free_port() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        // Hold the documented default so the fallback is observable: the
-        // daemon's first bind must fail, its second must land elsewhere.
-        let held = TcpListener::bind((
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-        ))
-        .await
-        .ok();
+        // Hold the "default" so the fallback is observable: the daemon's
+        // first bind must fail, its second must land elsewhere. An OS-picked
+        // port this process owns, not the documented one: the `Server::run`
+        // tests beside this one bind the real default in their own
+        // processes, and one could release it between a failed hold here and
+        // the proxy's bind, which would then take the default.
+        let held = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let default = held.local_addr().unwrap().port();
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -4165,13 +4167,23 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        start_host_proxies(&state, false, None, None).await;
+        // The native startup shape `start_host_proxies` spawns, with the
+        // held port as the default.
+        crate::traced::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: ProxyPort::DefaultThenSelect { default },
+            },
+            false,
+            HostExpose::Shuttle,
+            RetryBackoff::production(),
+        ));
 
         let bound = wait_for_proxy_port(&state).await;
         assert_ne!(bound, 0, "port 0 is a request for a port, not an answer");
         assert_ne!(
-            bound,
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+            bound, default,
             "a busy default must not be waited on or taken"
         );
         assert!(
