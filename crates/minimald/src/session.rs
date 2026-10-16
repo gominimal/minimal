@@ -1960,8 +1960,9 @@ impl Session {
     /// ([`HostSlot`]). Called after every message, so between messages —
     /// and for as long as one parks the actor — the slot holds the host the
     /// actor last had, and a listing's probe never waits on this mailbox.
-    /// Also called where a host is installed ([`Self::mint_session_host`],
-    /// [`Self::launch_host_for_hooks`]), which is before the message that
+    /// Also called where a host is installed ([`Self::ensure_host`],
+    /// [`Self::mint_session_host`], [`Self::launch_host_for_hooks`]),
+    /// which is before the message that
     /// launched it replies: a caller that awaits an attach or `ensure_host`
     /// and then reads attrs sees the new host.
     fn publish_host(&self) {
@@ -5072,6 +5073,7 @@ impl Session {
         // Minted for an exec: a command is about to run in this sandbox, so a
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
+        self.publish_host();
         Ok(host)
     }
 
