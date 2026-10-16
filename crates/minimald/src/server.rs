@@ -4268,14 +4268,16 @@ mod tests {
     async fn proxy_auto_selects_free_port() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        // Hold the documented default so the fallback is observable: the
-        // daemon's first bind must fail, its second must land elsewhere.
-        let held = TcpListener::bind((
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-        ))
-        .await
-        .ok();
+        // Hold the "default" so the fallback is observable: the daemon's
+        // first bind must fail, its second must land elsewhere. An OS-picked
+        // port this process owns, not the documented one: the `Server::run`
+        // tests beside this one bind the real default in their own
+        // processes, and one could release it between a failed hold here and
+        // the proxy's bind, which would then take the default.
+        let held = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let default = held.local_addr().unwrap().port();
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -4288,13 +4290,23 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        start_host_proxies(&state, false, None, None).await;
+        // The native startup shape `start_host_proxies` spawns, with the
+        // held port as the default.
+        crate::traced::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: ProxyPort::DefaultThenSelect { default },
+            },
+            false,
+            HostExpose::Shuttle,
+            RetryBackoff::production(),
+        ));
 
         let bound = wait_for_proxy_port(&state).await;
         assert_ne!(bound, 0, "port 0 is a request for a port, not an answer");
         assert_ne!(
-            bound,
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+            bound, default,
             "a busy default must not be waited on or taken"
         );
         assert!(
@@ -5908,15 +5920,16 @@ mod tests {
     async fn answerer_relocates_when_its_default_port_is_busy() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use crate::net::answerer::{ANSWERER_PORT, AnswerScope, ZoneAnswerer};
+        use crate::net::answerer::{AnswerScope, ZoneAnswerer};
 
-        // Hold the answerer's documented default (UDP) for the whole test.
-        // `.ok()`, not `unwrap`: the `Server::run` tests beside this one bind
-        // the real defaults too, and nextest runs each test in its own
-        // process, so another process may already hold it. Either holder
-        // produces the same relocation; nothing here needs *this* process to
-        // be the one holding it.
-        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, ANSWERER_PORT)).ok();
+        // Hold the "default" for the whole test: an OS-picked port this
+        // process owns, not the documented one. The `Server::run` tests
+        // beside this one bind the real defaults in their own processes, so
+        // a hold on the documented port could fail while another process
+        // held it, and that process could release it before the answerer's
+        // bind, which would then take the default.
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let default = held.local_addr().unwrap().port();
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -5935,9 +5948,7 @@ mod tests {
             state.clone(),
             answerer,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ProxyPort::DefaultThenSelect {
-                default: ANSWERER_PORT,
-            },
+            ProxyPort::DefaultThenSelect { default },
             false,
             HostExpose::Shuttle,
             RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
@@ -5954,7 +5965,7 @@ mod tests {
         .await
         .expect("the answerer must relocate and report its port");
         assert_ne!(
-            reported, ANSWERER_PORT,
+            reported, default,
             "a busy default must not be waited on or taken"
         );
 
