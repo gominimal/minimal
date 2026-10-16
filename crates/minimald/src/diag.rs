@@ -1072,14 +1072,14 @@ mod tests {
             .join("spool");
         std::fs::create_dir_all(&spool).unwrap();
         std::fs::write(
-            spool.join("minimald-1-1.jsonl"),
+            spool.join("minimald-1-1700000000000.jsonl"),
             b"{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"name\":\"rpc\"}]}]}]}\n",
         )
         .unwrap();
         std::fs::write(spool.join("notes.txt"), b"not a spool file").unwrap();
 
         let files = fetch_bundle(&server).await;
-        let entry = "telemetry/spool/minimald-1-1.jsonl";
+        let entry = "telemetry/spool/minimald-1-1700000000000.jsonl";
         let body = files
             .get(entry)
             .unwrap_or_else(|| panic!("missing {entry}: {:?}", files.keys()));
@@ -1109,7 +1109,7 @@ mod tests {
         let pinned = tmp.path().join("pinned-spool");
         std::fs::create_dir_all(&pinned).unwrap();
         std::fs::write(
-            pinned.join("minimald-1-1.jsonl"),
+            pinned.join("minimald-1-1700000000000.jsonl"),
             concat!(
                 r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"rpc","attributes":["#,
                 r#"{"key":"http.request.header.x-honeycomb-team","value":{"stringValue":"daemonONLYkey1"}},"#,
@@ -1135,7 +1135,7 @@ mod tests {
         collect_files(&unpacked, &unpacked, &mut files);
         let body = files
             .iter()
-            .find(|(k, _)| k.ends_with("telemetry/spool/minimald-1-1.jsonl"))
+            .find(|(k, _)| k.ends_with("telemetry/spool/minimald-1-1700000000000.jsonl"))
             .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
             .unwrap_or_else(|| panic!("the pinned spool is not bundled: {:?}", files.keys()));
         assert!(body.contains("\"exec\""), "the record travels: {body}");
@@ -1155,7 +1155,7 @@ mod tests {
         let spool_dir = tmp.path().join("telemetry").join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
         std::fs::write(
-            spool_dir.join("minimald-1-1.jsonl"),
+            spool_dir.join("minimald-1-1700000000000.jsonl"),
             concat!(
                 r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"rpc","attributes":["#,
                 r#"{"key":"note","value":{"stringValue":"Bearer%20s3cr3tTOKEN99"}},"#,
@@ -1186,7 +1186,7 @@ mod tests {
         collect_files(&unpacked, &unpacked, &mut files);
         let body = files
             .iter()
-            .find(|(k, _)| k.ends_with("telemetry/spool/minimald-1-1.jsonl"))
+            .find(|(k, _)| k.ends_with("telemetry/spool/minimald-1-1700000000000.jsonl"))
             .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
             .unwrap_or_else(|| panic!("no spool file: {:?}", files.keys()));
         assert!(body.contains("\"exec\""), "the record travels: {body}");

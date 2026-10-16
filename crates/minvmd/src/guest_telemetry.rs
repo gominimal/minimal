@@ -76,18 +76,17 @@ pub const MAX_FRAME_BYTES: usize = mlog::otel::FORWARD_MAX_FRAME_BYTES;
 /// cost per second, sustained, where a line costs the larger of its frame
 /// and the stamped line the host spools for it ([`read_frames`]). The
 /// frames past it are refused and counted (they stay in the guest's own
-/// spool). Foreign lines have no spool of their own: they share the host
-/// spool's 50 MiB bound and its pruning order with the host's records
-/// (`mlog::otel::spool_guest_line`), so this rate is what keeps a guest
-/// that floods from pushing the CLI's and this daemon's own records out of
-/// the spool. The arithmetic: a VM writes at most its 4 MiB burst plus
-/// 64 KiB a second into the spool, so one VM at the limit takes
-/// (50 - 4) MiB / 64 KiB/s = 736 s, about 12 minutes, to write a spool's
-/// worth. The budget is per VM and the spool is shared by every VM on the
-/// host, so N VMs flooding at once take (50 - 4N) x 16 / N seconds: 336 s
-/// for two, 136 s for four, and thirteen bursts alone exceed the bound. A
-/// guest at full tilt records a few hundred spans a second of a few hundred
-/// bytes each; this bounds a guest that floods, not one that works.
+/// spool). Each VM's lines go to a spool of its own under the host's spool
+/// directory, bounded at `mlog::otel::GUEST_SPOOL_MAX_BYTES` (8 MiB) and
+/// pruned on its own (`mlog::otel::spool_guest_line`), so a flooding guest
+/// can only cycle its own earlier lines; this rate is what keeps that guest
+/// from costing the host's endpoint and disk more than a bounded trickle.
+/// The arithmetic: a VM writes at most its 4 MiB burst plus 64 KiB a second
+/// into its spool, so one VM at the limit fills it in
+/// (8 - 4) MiB / 64 KiB/s = 64 s and then stays there; N VMs cost N such
+/// spools, never one another's. A guest at full tilt records a few hundred
+/// spans a second of a few hundred bytes each; this bounds a guest that
+/// floods, not one that works.
 pub const GUEST_BYTES_PER_SEC: u64 = 64 * 1024;
 /// The burst [`GUEST_BYTES_PER_SEC`] allows: the guest sender's own queue
 /// bound in bytes, so a guest that comes back with a full queue (TEL-046)
@@ -1193,15 +1192,15 @@ mod tests {
     /// writes. A stamped line is longer than its frame (two stamp
     /// attributes, serialized again), so the door charges an accepted line
     /// the larger of the two: a budget of exactly three spooled lines admits
-    /// three, where charging frames alone admitted more. So the spool gains
-    /// at most the budget's bytes, and the arithmetic in
+    /// three, where charging frames alone admitted more. So a guest's spool
+    /// gains at most the budget's bytes, and the arithmetic in
     /// [`GUEST_BYTES_PER_SEC`]'s doc (and `mlog::otel::spool_guest_line`'s)
-    /// holds: past the burst, one VM at the limit takes 736 s to write a
-    /// spool's worth, and N VMs, each with its own budget, share one spool.
+    /// holds: past the burst, one VM at the limit fills its own 8 MiB spool
+    /// in about a minute, and N VMs fill N spools, never one another's.
     #[test]
-    fn the_guest_budget_is_a_small_share_of_the_host_spool() {
-        // The host spool's bound (`mlog`'s `spool::MAX_BYTES`).
-        const SPOOL_BYTES: u64 = 50 * 1024 * 1024;
+    fn the_guest_budget_fills_only_the_guests_own_spool() {
+        // One VM's spool bound.
+        const SPOOL_BYTES: u64 = mlog::otel::GUEST_SPOOL_MAX_BYTES;
         const RECORD: &str = "{\"resourceSpans\":[{\"resource\":{\"attributes\":[\
             {\"key\":\"service.name\",\"value\":{\"stringValue\":\"minimald\"}}]},\
             \"scopeSpans\":[{\"scope\":{\"name\":\"minimald\"},\"spans\":[{\
@@ -1241,14 +1240,16 @@ mod tests {
         let short = spooled_bytes(&request_body(Signal::Traces, stamped(SPAN)).unwrap());
         assert!(short * 10 > frame(SPAN).len() * 18, "{short}");
 
-        let fill_secs =
-            |vms: u64| (SPOOL_BYTES - vms * GUEST_BURST_BYTES) / (vms * GUEST_BYTES_PER_SEC);
-        assert_eq!(fill_secs(1), 736, "one VM: more than ten minutes");
-        assert_eq!(fill_secs(2), 336, "the budget is per VM, the spool shared");
-        assert_eq!(fill_secs(4), 136);
+        // The budget and the spool are both per VM: the fill time does not
+        // depend on how many VMs flood at once.
+        let fill_secs = (SPOOL_BYTES - GUEST_BURST_BYTES) / GUEST_BYTES_PER_SEC;
+        assert_eq!(
+            fill_secs, 64,
+            "one VM fills its own spool in about a minute"
+        );
         const {
-            // Thirteen VMs' bursts alone exceed the spool.
-            assert!(13 * GUEST_BURST_BYTES > SPOOL_BYTES);
+            // A burst does not fill a spool by itself.
+            assert!(GUEST_BURST_BYTES < SPOOL_BYTES);
             // A frame at the bound fits a full budget.
             assert!(GUEST_BURST_BYTES >= MAX_FRAME_BYTES as u64 + 4);
         }

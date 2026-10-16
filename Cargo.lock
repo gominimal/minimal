@@ -768,6 +768,7 @@ dependencies = [
  "futures",
  "graph",
  "lcache",
+ "mlog",
  "moka",
  "nickel-lang-core",
  "object 0.40.0",

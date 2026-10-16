@@ -141,10 +141,18 @@ pub fn minimal_cache_dir() -> DaemonAbsPath {
 /// Panics if neither a state directory nor a home directory can be resolved,
 /// or if the resulting path is not valid UTF-8.
 pub fn minimal_state_dir() -> DaemonAbsPath {
+    try_minimal_state_dir().expect("could not determine home directory")
+}
+
+/// [`minimal_state_dir`] without the panics: `None` when neither a state
+/// directory nor a home directory can be resolved, or the path is not valid
+/// UTF-8 or not absolute. For a caller that can do without the directory
+/// (a spool that then writes nothing) rather than one that cannot start.
+pub fn try_minimal_state_dir() -> Option<DaemonAbsPath> {
     let explicit = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute());
-    default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
+    try_default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
 }
 
 /// File name of the daemon SSH socket in a provider instance dir. Served by
@@ -523,6 +531,19 @@ fn xdg_data_home() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
+}
+
+/// [`default_dir`] without the panics: `None` where it would panic.
+fn try_default_dir(
+    base_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+    home_fallback: &str,
+) -> Option<DaemonAbsPath> {
+    let base = match base_dir() {
+        Some(b) => b,
+        None => dirs::home_dir()?.join(home_fallback),
+    };
+    let path = Utf8PathBuf::from_path_buf(base.join("minimal")).ok()?;
+    DaemonAbsPath::try_new(path).ok()
 }
 
 /// Computes `<base>/minimal`, where `base` comes from `base_dir` or, failing

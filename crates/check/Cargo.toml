@@ -19,6 +19,7 @@ tokio-util.workspace = true
 url.workspace = true
 moka.workspace = true
 tracing.workspace = true
+mlog.workspace = true
 
 common.workspace = true
 decode.workspace = true

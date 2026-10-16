@@ -542,10 +542,12 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
 - **TEL-034** WHILE telemetry is on THE SYSTEM SHALL send the guest daemon's
   finished spans and log records to `minvmd` over the VM's vsock port 7353,
   and `minvmd` SHALL stamp them with `minimal.forwarded_by` and
-  `minimal.vm`, append them to the host spool and forward them to the
-  host's endpoints under the host's switches, so that `guest.ready` is a
-  child of `vm.boot` in the supervisor's trace and the guest does not use
-  the network for telemetry (design: [guest-vsock.md](guest-vsock.md)).
+  `minimal.vm`, append them to that VM's own spool under the host's spool
+  directory while the host spools (`MINIMAL_OTEL_SPOOL=0` on the host
+  writes nothing), and forward them to the host's endpoints under the host's
+  switches, so that `guest.ready` is a child of `vm.boot` in the
+  supervisor's trace and the guest does not use the network for telemetry
+  (design: [guest-vsock.md](guest-vsock.md)).
   tier:     T0
   verify:   cargo nextest run -p mlog -p minvmd -E 'test(a_forward_destination_queues_every_record_and_builds_no_exporter) | test(only_one_otlp_request_per_line_is_accepted) | test(a_forwarded_line_is_stamped_with_the_hosts_provenance) | test(a_guests_minimal_attributes_are_dropped_at_every_level)'
   test:     crates/mlog/src/otel.rs::a_forward_destination_queues_every_record_and_builds_no_exporter;
@@ -694,8 +696,8 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   the daemon's spool files inside the daemon's bundle, which on a VM host
   are the guest daemon's spool, SHALL include the CLI's and `minvmd`'s spools
   on a host where they spool locally, and SHALL scrub every spool file so
-  that no bundle contains an exporter header value or the value of a
-  secret-shaped attribute.
+  that no bundle contains a configured exporter header value of 8 bytes or
+  more, or the value of a secret-shaped attribute.
   tier:     T0
   verify:   cargo nextest run -p minimal a_host_bundle_never_carries_a_header_value_or_a_secret_attribute
   test:     crates/minimal/src/diag/collect.rs::a_host_bundle_never_carries_a_header_value_or_a_secret_attribute;
@@ -717,8 +719,11 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
     guest's records also reach the host spool through the vsock forward
     (TEL-034), so the host bundle carries them too.
   - The scrub replaces each configured exporter header value of 8 bytes or
-    more wherever it appears. It masks the value of an OTLP attribute whose
-    name looks secret, by the rule the bundle's key redaction uses. It
+    more wherever it appears; a shorter value is not replaced, because a
+    value that short matches ordinary text and the scrub would eat the
+    bundle (a token under 8 bytes is not a credential a collector accepts).
+    It masks the value of an OTLP attribute whose name looks secret, by the
+    rule the bundle's key redaction uses. It
     withholds a line that is not JSON, such as the torn first line of a
     tail. The log scrub then runs over every line.
   - Known gap: the tests above cover each collector's scrub, and

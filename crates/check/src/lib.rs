@@ -1028,7 +1028,15 @@ impl GraphBasedChecker for StandaloneTestCheck {
             let cancel = ctx.cancel.clone();
             let daemon_id = ctx.daemon_id.clone();
             drop(graph);
-            let span = tracing::Span::current();
+            // The task outlives the check stream it was spawned from, so it
+            // gets a root of its own, linked to the request's span
+            // (`follows_from`) rather than parented under it: it must never
+            // record children under a span that has already closed.
+            let span = tracing::info_span!(parent: None, "check.standalone_tests", pkg = %pkg);
+            span.follows_from(tracing::Span::current().id());
+            // A root takes its own sampling decision: under an opted-out
+            // request it must record nothing, as the request does (TEL-045).
+            mlog::otel::inherit_opt_out(&span);
             result = tokio::task::spawn(tracing::Instrument::instrument(
                 async move {
                     let mut result = result;

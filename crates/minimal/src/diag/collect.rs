@@ -695,7 +695,9 @@ fn newest_cmd_trace_id_in(text: &str) -> Option<String> {
                 continue;
             };
             let t = end(span);
-            if best.as_ref().is_none_or(|(b, _)| t >= *b) {
+            // Files are visited newest first, so an equal end time keeps
+            // the span already recorded: strictly greater, not `>=`.
+            if best.as_ref().is_none_or(|(b, _)| t > *b) {
                 best = Some((t, id.to_owned()));
             }
         }
@@ -1517,12 +1519,12 @@ mod tests {
         let spool_dir = state.join("telemetry").join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
         std::fs::write(
-            spool_dir.join("minimal-cli-1-1.jsonl"),
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
             b"{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"name\":\"cmd\"}]}]}]}\n",
         )
         .unwrap();
         std::fs::write(
-            spool_dir.join("minvmd-2-1.jsonl"),
+            spool_dir.join("minvmd-2-1700000000000.jsonl"),
             b"{\"resourceLogs\":[]}\n",
         )
         .unwrap();
@@ -1542,10 +1544,10 @@ mod tests {
             .unwrap();
         let files = unpack(&out, "root").await;
         let cli = files
-            .get("telemetry/spool/minimal-cli-1-1.jsonl")
+            .get("telemetry/spool/minimal-cli-1-1700000000000.jsonl")
             .unwrap_or_else(|| panic!("missing the CLI spool: {:?}", files.keys()));
         assert!(std::str::from_utf8(cli).unwrap().contains("resourceSpans"));
-        assert!(files.contains_key("telemetry/spool/minvmd-2-1.jsonl"));
+        assert!(files.contains_key("telemetry/spool/minvmd-2-1700000000000.jsonl"));
         assert!(
             !files.contains_key("telemetry/spool/notes.txt"),
             "only *.jsonl spool files travel"
@@ -1631,7 +1633,7 @@ mod tests {
         let spool_dir = tmp.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
         std::fs::write(
-            spool_dir.join("minimal-cli-1-1.jsonl"),
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
             concat!(
                 r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"cmd","attributes":["#,
                 r#"{"key":"note","value":{"stringValue":"hcaik_s3cr3tINGEST"}},"#,
@@ -1654,7 +1656,8 @@ mod tests {
             .await
             .unwrap();
         let files = unpack(&out, "root").await;
-        let body = std::str::from_utf8(&files["telemetry/spool/minimal-cli-1-1.jsonl"]).unwrap();
+        let body = std::str::from_utf8(&files["telemetry/spool/minimal-cli-1-1700000000000.jsonl"])
+            .unwrap();
         assert!(body.contains("\"build\""), "the record travels: {body}");
         for (path, bytes) in &files {
             let text = String::from_utf8_lossy(bytes);
@@ -1729,7 +1732,7 @@ mod tests {
         let spool_dir = tmp.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
         std::fs::write(
-            spool_dir.join("minimal-cli-1-1.jsonl"),
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
             concat!(
                 r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"cmd","endTimeUnixNano":"200"}]}]}]}"#,
                 "\n",
@@ -2013,8 +2016,8 @@ mod tests {
         for d in [&ours, &theirs] {
             std::fs::create_dir_all(d).unwrap();
         }
-        std::fs::write(ours.join("minimal-cli-1-1.jsonl"), line).unwrap();
-        std::fs::write(theirs.join("minvmd-2-1.jsonl"), line).unwrap();
+        std::fs::write(ours.join("minimal-cli-1-1700000000000.jsonl"), line).unwrap();
+        std::fs::write(theirs.join("minvmd-2-1700000000000.jsonl"), line).unwrap();
 
         let paths = paths(tmp.path());
         let vars = [("MINIMAL_OTEL_SPOOL_DIR", ours.to_str().unwrap())];
@@ -2033,7 +2036,7 @@ mod tests {
             .await
             .unwrap();
         let files = unpack(&out, "root").await;
-        assert!(files.contains_key("telemetry/spool/minimal-cli-1-1.jsonl"));
+        assert!(files.contains_key("telemetry/spool/minimal-cli-1-1700000000000.jsonl"));
         assert!(
             !files.keys().any(|k| k.contains("minvmd-2-1")),
             "only the directory min bug resolves is read: {:?}",

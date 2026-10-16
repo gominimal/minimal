@@ -122,15 +122,14 @@ pub(crate) fn dir() -> Option<PathBuf> {
 /// `MINIMAL_OTEL_SPOOL_DIR` says: where a refused directory falls back to
 /// ([`SpoolFile::open`]).
 pub(crate) fn state_dir_spool() -> Option<PathBuf> {
-    // minimal_state_dir panics when no home can be resolved: no spool then.
-    std::panic::catch_unwind(paths::minimal_state_dir)
-        .ok()
-        .map(|d| {
-            d.as_utf8_path()
-                .as_std_path()
-                .join("telemetry")
-                .join("spool")
-        })
+    // No state or home directory: no spool then, and no panic to catch (a
+    // caught one still ran the panic hook, and `panic = "abort"` has none).
+    paths::try_minimal_state_dir().map(|d| {
+        d.as_utf8_path()
+            .as_std_path()
+            .join("telemetry")
+            .join("spool")
+    })
 }
 
 /// Why a spool directory is not written to.
@@ -295,9 +294,10 @@ impl SpoolDir {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    /// Open `name` for appending, creating it.
+    /// Open `name` for appending, creating it. Readable too: a reused file's
+    /// last byte is read through this descriptor ([`ends_with_newline`]).
     fn open_append(&self, name: &str) -> std::io::Result<File> {
-        self.open_at(name, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND)
+        self.open_at(name, libc::O_RDWR | libc::O_CREAT | libc::O_APPEND)
     }
 
     /// Create `name` empty, or truncate it (which updates its mtime).
@@ -420,6 +420,7 @@ impl SpoolDir {
     fn open_append(&self, name: &str) -> std::io::Result<File> {
         OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(self.path.join(name))
     }
@@ -624,6 +625,15 @@ impl fmt::Display for SpoolName {
         }
         f.write_str(".jsonl")
     }
+}
+
+/// Whether the file's last byte, read through its descriptor, is a newline.
+fn ends_with_newline(f: &File, len: u64) -> bool {
+    use std::os::unix::fs::FileExt as _;
+    let mut b = [0u8; 1];
+    len > 0
+        && f.read_at(&mut b, len - 1)
+            .is_ok_and(|n| n == 1 && b[0] == b'\n')
 }
 
 /// Whether `name` is a spool file's name ([`SpoolName`]), this process's or
@@ -880,6 +890,18 @@ impl SpoolFile {
             if let Err(e) = self.next_file(&mut st) {
                 return Some(e);
             }
+            // A reused file comes back with its real length: when that leaves
+            // no room for this record, rotate before writing it, so the bound
+            // holds for the first record after a reopen as for every other.
+            // Every rotation takes a fresh name, so a directory of full files
+            // is walked past, never written into, however many there are.
+            while st.written > 0 && st.written + n + u64::from(st.torn) > self.limits.segment_bytes
+            {
+                st.file = None;
+                if let Err(e) = self.next_file(&mut st) {
+                    return Some(e);
+                }
+            }
         }
         let mut buf = Vec::with_capacity(line.len() + 2);
         if st.torn {
@@ -952,11 +974,17 @@ impl SpoolFile {
         let path = dir.join(&name);
         match handle.open_append(&name) {
             Ok(f) => {
+                // The name is reused after `release`, or a `relocate` back to
+                // a directory this process wrote in: the file is appended to,
+                // so its bound counts from its real size, and a torn last
+                // line is closed before the next record.
+                let len = f.metadata().map_or(0, |m| m.len());
+                let torn = len > 0 && !ends_with_newline(&f, len);
                 st.file = Some(f);
                 st.path = Some(path);
                 st.opened += 1;
-                st.written = 0;
-                st.torn = false;
+                st.written = len;
+                st.torn = torn;
                 st.checked = Some(Instant::now());
                 st.failures = 0;
                 st.retry_at = None;
@@ -1955,6 +1983,109 @@ mod tests {
         }
         // The first file of the process (the oldest) was pruned away.
         assert!(!files.iter().any(|f| f.0 == file.name.to_string()));
+    }
+
+    /// After `release` (or a relocate back to a directory this process wrote
+    /// in) the first file's name is reused: the file is appended to, so its
+    /// bound counts from its real size and the writer rotates on time instead
+    /// of doubling the segment, and a torn last line is closed first.
+    #[test]
+    fn a_reused_file_counts_from_its_real_size() {
+        let dir = private_tempdir();
+        let d = dir.path();
+        let file = SpoolFile::with_limits(d.to_path_buf(), "svc", small(10_000, 2_000));
+        for i in 0..15 {
+            file.append(&format!("{i:099}")); // 1500 bytes in the first file
+        }
+        let first = file.path().unwrap();
+        // A torn last line, as a crash mid-write leaves one.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&first).unwrap();
+            f.write_all(b"partial").unwrap();
+        }
+        file.release();
+        file.relocate(d.to_path_buf());
+        for i in 15..30 {
+            file.append(&format!("{i:099}")); // 3000 bytes in one file without the fix
+        }
+        let files = jsonl(d);
+        assert!(files.len() >= 2, "rotated on the real size: {files:?}");
+        assert!(files.iter().all(|f| f.1 <= 2_000), "{files:?}");
+        let t = std::fs::read_to_string(&first).unwrap();
+        assert!(t.contains("partial\n"), "the torn line was closed: {t:?}");
+        assert!(t.ends_with('\n') && t.lines().all(|l| l.len() == 99 || l == "partial"));
+    }
+
+    /// A reused file already at its bound is not written to: the first
+    /// record after the reopen rotates, as any record past the bound does.
+    #[test]
+    fn a_reused_file_at_its_bound_rotates_before_the_first_record() {
+        let dir = private_tempdir();
+        let d = dir.path();
+        let file = SpoolFile::with_limits(d.to_path_buf(), "svc", small(10_000, 2_000));
+        for i in 0..20 {
+            file.append(&format!("{i:099}")); // exactly 2000 bytes: at the bound
+        }
+        let first = file.path().unwrap();
+        assert_eq!(std::fs::metadata(&first).unwrap().len(), 2_000);
+        file.release();
+        file.relocate(d.to_path_buf());
+        file.append(&format!("{:099}", 20));
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().len(),
+            2_000,
+            "the full file was not written to"
+        );
+        let files = jsonl(d);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.iter().all(|f| f.1 <= 2_000), "{files:?}");
+    }
+
+    /// A directory full of this writer's own full files is walked past on a
+    /// reopen, however many there are: ten reopen cycles leave ten files at
+    /// the bound and the record in an eleventh, none of them written past it.
+    #[test]
+    fn a_reopen_walks_past_every_full_file() {
+        let dir = private_tempdir();
+        let d = dir.path();
+        let file = SpoolFile::with_limits(d.to_path_buf(), "svc", small(100_000, 2_000));
+        for cycle in 0..10 {
+            for i in 0..20 {
+                file.append(&format!("{:099}", cycle * 100 + i)); // fills the current file exactly
+            }
+            file.release();
+            file.relocate(d.to_path_buf());
+        }
+        file.append(&format!("{:099}", 999));
+        let files = jsonl(d);
+        assert_eq!(files.len(), 11, "{files:?}");
+        assert!(
+            files.iter().all(|f| f.1 <= 2_000),
+            "a file was written past the bound: {files:?}"
+        );
+        let newest = std::fs::read_to_string(file.path().unwrap()).unwrap();
+        assert_eq!(newest.lines().count(), 1, "{newest:?}");
+    }
+
+    /// A reused file that ended cleanly gets no blank line: the last byte
+    /// is read through the append descriptor, which must be readable.
+    #[test]
+    fn a_reused_file_that_ended_cleanly_gets_no_blank_line() {
+        let dir = private_tempdir();
+        let d = dir.path();
+        let file = SpoolFile::with_limits(d.to_path_buf(), "svc", small(10_000, 2_000));
+        file.append(&format!("{:099}", 1));
+        let first = file.path().unwrap();
+        file.release();
+        file.relocate(d.to_path_buf());
+        file.append(&format!("{:099}", 2));
+        let t = std::fs::read_to_string(&first).unwrap();
+        assert_eq!(t.lines().count(), 2, "{t:?}");
+        assert!(
+            t.lines().all(|l| l.len() == 99),
+            "a blank line was inserted: {t:?}"
+        );
     }
 
     /// A file another process pruned away under a live writer (a quiet

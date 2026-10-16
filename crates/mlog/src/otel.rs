@@ -513,7 +513,9 @@ pub struct GuestSignal {
     /// `MINIMAL_` endpoint refused for ambient plain headers. `Some(Err(w))`
     /// when the configured value was refused ([`export_url_from`]): the
     /// supervisor logs `w` (it names the variable and the rule, never the
-    /// value) and the signal stays off in the guest.
+    /// value) and hands no endpoint down. The guest keeps the signal on: its
+    /// lines still reach the per-VM spool through the door, which exports
+    /// nothing for that signal, as the host keeps spooling its own.
     pub url: Option<Result<String, String>>,
 }
 
@@ -528,8 +530,9 @@ pub fn guest_exports(var: impl Fn(&str) -> Option<String>) -> GuestExports {
     };
     let switches = switches::Switches::read(var);
     let d = switches.decide();
-    // A refused endpoint (`Some(Err(_))`) leaves the signal off in the guest:
-    // the host never hands down a value its own exporter would not send to.
+    // A refused endpoint is reported (`Some(Err(_))`) and nothing is handed
+    // down for it; the guest's signal stays on, so its lines are spooled on
+    // the host even while nothing exports them.
     let signal = |sw: switches::SignalSwitches, sd: switches::SignalDecision, name| GuestSignal {
         off: sw.off,
         url: export_url_from(sd.export, name, var).map(|r| r.map(|u| u.to_string())),
@@ -1325,6 +1328,23 @@ pub fn align(
     })
 }
 
+/// Carry an opt-out into a detached root span. A root (`parent: None`,
+/// linked to the caller's span with `follows_from`) takes a fresh sampling
+/// decision, so under an opted-out request it would record where the request
+/// does not (TEL-045). When the current span's context is valid and not
+/// sampled, `root` is opted out the same way ([`opt_out`]); returns whether
+/// it was. Under a sampled request, or none, `root` keeps its own decision.
+pub fn inherit_opt_out(root: &tracing::Span) -> bool {
+    let cx = tracing::Span::current().context();
+    let sc = cx.span().span_context().clone();
+    if sc.is_valid() && !sc.is_sampled() {
+        opt_out(root);
+        true
+    } else {
+        false
+    }
+}
+
 /// Make `span` non-recording, and with it every span opened under it: the
 /// request of a client that opted out of telemetry (`MINIMAL_OTEL=off`
 /// beside no `TRACEPARENT`). The span is given a fresh, unsampled remote
@@ -1466,7 +1486,7 @@ pub fn shutdown(timeout: Duration) {
             clippy::let_underscore_must_use,
             reason = "best effort: a telemetry failure is a silent no-op (spec 25 principle 8)"
         )]
-        let _ = rx.recv_timeout(timeout + Duration::from_millis(250));
+        let _ = rx.recv_timeout(timeout.saturating_add(Duration::from_millis(250)));
     }
 }
 
@@ -1727,6 +1747,63 @@ mod tests {
             reported.1,
             s.span_context.span_id().to_bytes(),
             "ids reported before close are the exported ids"
+        );
+    }
+
+    /// A detached root opened while an opted-out request is current carries
+    /// the opt-out (TEL-045 for a task that outlives the request); one opened
+    /// under a recorded request, or none, records as itself.
+    #[test]
+    fn a_detached_root_inherits_its_callers_opt_out() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("t")));
+        tracing::subscriber::with_default(subscriber, || {
+            let off = tracing::info_span!("rpc", rpc = "off");
+            super::opt_out(&off);
+            off.in_scope(|| {
+                let root = tracing::info_span!(parent: None, "task", rpc = "under-off");
+                root.follows_from(tracing::Span::current().id());
+                assert!(super::inherit_opt_out(&root), "the opt-out is carried");
+                root.in_scope(|| tracing::info_span!("child").in_scope(|| {}));
+            });
+            drop(off);
+            let on = tracing::info_span!("rpc", rpc = "on");
+            on.in_scope(|| {
+                let root = tracing::info_span!(parent: None, "task", rpc = "under-on");
+                assert!(
+                    !super::inherit_opt_out(&root),
+                    "a recorded request carries nothing"
+                );
+                root.in_scope(|| {});
+            });
+            drop(on);
+            let root = tracing::info_span!(parent: None, "task", rpc = "no-request");
+            assert!(!super::inherit_opt_out(&root));
+            root.in_scope(|| {});
+        });
+        let mut names: Vec<_> = exporter
+            .get_finished_spans()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let rpc = s
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "rpc")
+                    .map(|kv| kv.value.as_str().into_owned())
+                    .unwrap_or_default();
+                format!("{}:{rpc}", s.name)
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["rpc:on", "task:no-request", "task:under-on"],
+            "nothing under the opted-out request, root or child"
         );
     }
 

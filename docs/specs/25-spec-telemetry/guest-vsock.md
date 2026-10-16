@@ -76,7 +76,7 @@ three reasons, each with a test:
    `a_batch_is_one_strict_json_request_serialized_from_the_parsed_lines`,
    `a_guests_minimal_attributes_are_dropped_at_every_level`,
    `a_reconnect_does_not_reset_the_byte_budget`,
-   `the_guest_budget_is_a_small_share_of_the_host_spool`,
+   `the_guest_budget_fills_only_the_guests_own_spool`,
    `an_oversized_or_empty_frame_ends_the_connection_after_a_flush`,
    `a_stream_cut_mid_frame_keeps_what_came_before`.
 
@@ -102,18 +102,20 @@ TEL-015 hold. Nothing on the daemon's request paths waits on the host.
 
 ## Forwarding on the host
 
-The door appends every accepted, stamped line to the host spool
-(`mlog::otel::spool_foreign_line`). A line is a self-describing OTLP request
-with the guest's own resource plus the stamp, so `min bug` and the lab see
-guest records in `minvmd-<pid>-*.jsonl`. Guest lines have no spool of their
-own: they share the host spool's 50 MiB bound and its pruning order with
-the host's records. The byte budget is their share, and it is charged on
-the larger of the frame and the spooled line, so it bounds what the spool
-gains. Past its 4 MiB burst, one VM at 64 KiB a second needs
-(50 - 4) MiB / 64 KiB/s = 736 s, about 12 minutes, to write a spool's worth
-and push the host's own files out. The budget is per VM and the spool is
-shared, so N VMs flooding at once take (50 - 4N) x 16 / N seconds: 336 s
-for two, 136 s for four. Batches go to a second thread over
+The door appends every accepted, stamped line to that VM's own spool,
+`<spool>/guest/<vm>/`, bounded on its own at 8 MiB
+(`mlog::otel::spool_guest_line`, `GUEST_SPOOL_MAX_BYTES`) and pruned on its
+own, while the host spools at all: with `MINIMAL_OTEL_SPOOL=0` on the host
+nothing is written. A line is a self-describing OTLP request with the
+guest's own resource plus the stamp, so `min bug` and the lab see guest
+records in `guest/<vm>/guest-<vm>-<pid>-*.jsonl` beside the host's. A
+flooding guest can push out only its own earlier lines, never the host's
+records; the host spool's pruning never enters the subdirectory. The byte
+budget is charged on the larger of the frame and the spooled line, so it
+bounds what a guest spool gains: past its 4 MiB burst, one VM at 64 KiB a
+second fills its 8 MiB in (8 - 4) MiB / 64 KiB/s = 64 s and then cycles its
+own lines; N VMs cost N spools, never one another's. Batches go to a second
+thread over
 a queue of 16; with the queue full, a batch is dropped and counted, so a
 hanging collector never stops the door reading. That thread forwards under
 the host's switches, per signal:
@@ -143,9 +145,11 @@ the host spool is off, `MINIMAL_OTEL_FILTER` when set,
 `TRACEPARENT`. No endpoint token of any kind crosses, so the endpoint
 recognizer and the secret-shape rules leave `minvmd`. The guest ignores any
 `MINIMAL_OTEL_EXPORTER_*` in its environment. In the guest, `init` with
-`MINIMAL_OTEL_FORWARD` set installs the tracer and log providers with the
-spool and forward processors and no OTLP exporter. So `exporting()` is true,
-and `guest.ready` adopts the boot line's parent.
+`MINIMAL_OTEL_FORWARD` set installs a provider for each signal that is on
+(TEL-005: with `MINIMAL_OTEL_TRACES_EXPORTER=none` on the boot line there is
+no tracer, and `guest.ready` is not recorded), with the spool and forward
+processors and no OTLP exporter. So `exporting()` is true for a signal that
+is on, and `guest.ready` adopts the boot line's parent.
 
 ## Trace shape
 

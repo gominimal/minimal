@@ -91,6 +91,9 @@ pub fn detach(root: tracing::Span) -> tracing::Span {
         "a detached task's span must be a root (`parent: None`)"
     );
     root.follows_from(tracing::Span::current());
+    // A root takes its own sampling decision: under an opted-out request it
+    // records nothing, as the request does (TEL-045).
+    mlog::otel::inherit_opt_out(&root);
     root
 }
 
