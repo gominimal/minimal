@@ -1159,7 +1159,15 @@ impl BoxManager {
         handles.sort_by_key(|handle| *handle.id());
         for handle in handles {
             let session_id = *handle.id();
-            if self.running.contains_key(&session_id) {
+            // Running, or being torn down (its record outlives its actor by
+            // the teardown task's length): either way not one to bring up.
+            if self.running.contains_key(&session_id)
+                || self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&session_id)
+            {
                 continue;
             }
             let record = match handle.record().await {
