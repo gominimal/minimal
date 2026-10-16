@@ -59,7 +59,7 @@ impl crate::GraphBasedChecker for OutputTypesValid {
                 .match_files_for_glob(cached_build.path(), glob)?
                 .iter()
             {
-                let data = std::fs::read(path)
+                let data = crate::map_output(path)
                     .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                 match (object::File::parse(&*data), output) {
                     (Ok(f), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
@@ -208,7 +208,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                     // Every output file gets read and ELF-parsed below, so this
                     // is where a large package spends its time.
                     crate::bail_if_cancelled(&cancel)?;
-                    let data = std::fs::read(path)
+                    let data = crate::map_output(path)
                         .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                     if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
                         (object::File::parse(&*data), output)

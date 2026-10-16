@@ -185,6 +185,7 @@ tracing-opentelemetry = "0.34"
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
 nutype = { version = "0.8", features = ["serde"] }
+memmap2 = "0.9"
 object = { version = "0.40", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "4.0"
