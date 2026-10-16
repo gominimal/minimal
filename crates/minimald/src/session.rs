@@ -1964,7 +1964,7 @@ impl Session {
         let host = match &self.inner {
             SessionInner::Active {
                 host: Some((h, _)), ..
-            } => Some(h.clone()),
+            } => Some(AttrsProbe(h.clone())),
             _ => None,
         };
         *self
@@ -5783,7 +5783,20 @@ impl Session {
 /// a session with no host reads as `None` at once instead of after
 /// [`HOST_PROBE_TIMEOUT`]. The actor refreshes it after every message it
 /// handles ([`Session::publish_host`]).
-pub(crate) type HostSlot = Arc<std::sync::Mutex<Option<crate::session_host::HostHandle>>>;
+pub(crate) type HostSlot = Arc<std::sync::Mutex<Option<AttrsProbe>>>;
+
+/// What the [`HostSlot`] hands out: a host's attrs, and nothing else. The
+/// slot is read by every holder of a [`SessionHandle`], so it carries no
+/// way to kill, attach to or rename the host: those stay with the actor,
+/// which serializes them and checks an attach before binding a channel.
+#[derive(Debug, Clone)]
+pub(crate) struct AttrsProbe(crate::session_host::HostHandle);
+
+impl AttrsProbe {
+    async fn get_attrs(&self) -> Result<HostAttrs, ()> {
+        self.0.get_attrs().await
+    }
+}
 
 /// The handle to the session.
 #[derive(Debug, Clone)]
@@ -5977,6 +5990,16 @@ impl SessionHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         probe_host(host?.get_attrs()).await
+    }
+
+    /// Test-only: puts `host` in the slot a listing reads, as the actor does
+    /// after a message; the actor's next message overwrites it.
+    #[cfg(test)]
+    pub(crate) fn put_host_for_test(&self, host: crate::session_host::HostHandle) {
+        *self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AttrsProbe(host));
     }
 
     /// Test-only: parks the actor for `d`, the shape of a message that holds

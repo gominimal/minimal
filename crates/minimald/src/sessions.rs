@@ -2842,6 +2842,36 @@ pub(crate) mod tests {
         drop(handle);
     }
 
+    /// The slot path with a live host, the 710d case itself: an actor parked
+    /// in a long message still has its host's attrs listed, at once, read
+    /// through the slot and not the actor's mailbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_actors_live_host_is_still_listed() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        handle.park_for(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Published while the actor is parked, as a host it had before
+        // would be.
+        handle.put_host_for_test(crate::session_host::HostHandle::answering_attrs());
+        let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+            .await
+            .expect("`list` waited on the parked actor")
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].attrs.is_some(),
+            "the live host's attrs come through the slot while the actor is parked"
+        );
+        drop(handle);
+    }
+
     /// Destroying an unknown ID is a `NotFound` error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_unknown_id_errors() {
