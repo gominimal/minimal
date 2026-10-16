@@ -608,6 +608,10 @@ fn created_status(
         crate::WorkspaceUpload::SkippedEmptyOrHome { .. } => {
             status.push_str("; starting with an empty box (nothing here to sync)");
         }
+        // Defensive: the dashboard's create task always passes
+        // `headless: false` and resolves its own confirm, so it can only
+        // produce `Uploaded`, `SkippedEmptyOrHome` or `Declined`. The arm is
+        // kept so the match stays exhaustive over the shared `WorkspaceUpload`.
         crate::WorkspaceUpload::SkippedUndeclared => {
             status.push_str(
                 "; the file upload was skipped: not a repository root and no minimal.toml, \
@@ -1723,6 +1727,8 @@ mod tests {
             status_of(crate::WorkspaceUpload::Declined).contains("as you asked"),
             "a declined upload is the user's own answer"
         );
+        // The defensive arm: the dashboard cannot reach this today (its
+        // create never runs headless), but the renderer still maps it.
         assert!(
             status_of(crate::WorkspaceUpload::SkippedUndeclared).contains("was skipped"),
             "an undeclared root says the upload was skipped"
