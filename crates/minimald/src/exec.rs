@@ -817,6 +817,13 @@ pub struct TokioExec {
 impl Exec for TokioExec {
     type Process = TokioProcess;
 
+    /// One program (`git receive-pack`, `git upload-pack`): input it leaves
+    /// unread after closing its stdin has no other reader, as for a
+    /// session exec.
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
+
     fn exec(self, _session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
@@ -1292,8 +1299,8 @@ fn held_input_notice(bound: HeldBound) -> String {
             mib(EXEC_INPUT_HELD_MAX)
         ),
         HeldBound::Daemon => format!(
-            "minimald: unread exec input across this daemon's execs reached {} MiB; this exec was \
-             ended rather than holding more\n",
+            "minimald: unread exec input across this daemon's execs reached {} MiB and stayed \
+             there, so this exec could take no more of its input and was ended\n",
             mib(EXEC_INPUT_HELD_DAEMON_MAX)
         ),
     }
