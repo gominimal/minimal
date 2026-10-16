@@ -1638,6 +1638,7 @@ impl BoxManager {
                     Some(_) => None,
                     None => Some(self.session_config(handle.clone())),
                 };
+                let in_shutdown = self.in_shutdown.clone();
                 let span = tracing::Span::current();
                 self.teardowns.spawn(tracing::Instrument::instrument(
                     async move {
@@ -1647,6 +1648,18 @@ impl BoxManager {
                             id,
                         };
                         r.handle(async {
+                            // A shutdown that began after this destroy was
+                            // accepted: an idle session is not brought up
+                            // now (a fresh actor and sandbox while shutdown
+                            // waits on this task). The destroy is refused, as
+                            // one that arrived during shutdown is above, and
+                            // the record stays for the next start.
+                            if seed.is_some() && in_shutdown.is_cancelled() {
+                                return Err(BoxManagerError::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    "in shutdown",
+                                ));
+                            }
                             let actor = match (claimed, seed) {
                                 (Some(hnd), _) => Some(hnd),
                                 (None, Some(seed)) => match BoxActor::run(seed).await {
