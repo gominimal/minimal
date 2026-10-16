@@ -698,7 +698,10 @@ where
     // takes exclusive ownership and closes it on drop.
     let tap_file = unsafe { std::fs::File::from_raw_fd(tap_fd.into_raw_fd()) };
     set_nonblocking(tap_file.as_raw_fd())?;
-    let tap = Arc::new(AsyncFd::new(tap_file)?);
+    // SAFETY: the `AsyncFd` owns `tap_file` for its whole life, and nothing
+    // reaches the `File` through it to close or replace its fd, so the fd stays
+    // open and names the same tap device until the last `Arc` is dropped.
+    let tap = Arc::new(unsafe { AsyncFd::register(tap_file) }?);
 
     // One gate serves both legs: the egress leg applies its verdict, the
     // ingress leg its default-block posture, both sharing the conntrack (a
