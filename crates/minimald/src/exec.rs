@@ -1101,7 +1101,7 @@ impl<S: Exec> ExecTask<S> {
 
         let stream = self.exec.exec(self.session.clone());
         let mngr = self.serv.sessions_manager().await;
-        let exit_status = bridge_noting_shutdown(
+        let (exit_status, late_start) = bridge_noting_shutdown(
             self.channel_id,
             stream,
             &mut stdin_r,
@@ -1142,7 +1142,30 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        // An exec that ended while its command was still starting has
+        // answered its client already; the command that start yields, if it
+        // ever does, is ended here rather than left running unbridged.
+        if let Some(mut late) = late_start {
+            reap_late_start(&mut late).await;
+        }
         exit_status
+    }
+}
+
+/// Ends the command a start already in flight yields, once it does: the exec
+/// it was for ended while it was starting ([`bridge_until_end`]). Takes one
+/// item only, the start that was pending, so no further command of a
+/// sequence is started. A start that never returns keeps this waiting, with
+/// the client already answered and its channel closed.
+async fn reap_late_start<S, P>(stream: &mut S)
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+{
+    if let Some(Ok(mut process)) = stream.next().await {
+        tracing::info!("exec: a command started after its exec had ended; ending it");
+        let _ = process.start_kill();
+        let _ = process.wait().await;
     }
 }
 
@@ -1170,7 +1193,7 @@ async fn bridge_noting_shutdown<S, P, R, W, E>(
     client_lost: watch::Receiver<Option<ExecEnd>>,
     unread: UnreadStdin,
     shutting_down: impl FnOnce() -> bool,
-) -> u32
+) -> (u32, Option<S>)
 where
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
@@ -1178,11 +1201,12 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let exit_status = bridge(channel_id, stream, r, w, e, client_lost, unread).await;
+    let (exit_status, late_start) =
+        bridge_until_end(channel_id, stream, r, w, e, client_lost, unread).await;
     if shutting_down() {
         let _ = e.write_all(SHUTDOWN_NOTICE).await;
     }
-    exit_status
+    (exit_status, late_start)
 }
 
 /// How much of an exec's input the daemon holds for a command that is not
@@ -1224,8 +1248,9 @@ const EXEC_INPUT_STARVED: Duration = Duration::from_secs(60);
 /// command, and that wait normally ends with the start; this bounds it for
 /// a spawn that never returns. Past it the held input is released, the pump
 /// lets go of the channel (so the connection is no longer parked), and the
-/// exec is ended with [`ExecEnd::InputHeldUnstarted`] — once the spawn
-/// returns, since the bridge is inside it until then.
+/// exec is ended with [`ExecEnd::InputHeldUnstarted`] at once: the bridge
+/// races each start against the exec's end ([`bridge_until_end`]), and the
+/// command a late start yields is ended when it comes ([`reap_late_start`]).
 const EXEC_INPUT_UNSTARTED: Duration = Duration::from_secs(300);
 
 /// The most unread exec input this daemon holds across all its execs. The
@@ -1715,7 +1740,53 @@ async fn pump_channel_input<M>(
 ///
 /// Returns the SSH-encoded exit code of the last process run (or 0 if
 /// the stream was empty).
+#[cfg(test)]
 async fn bridge<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: ExecInput,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    bridge_until_end(channel_id, stream, r, w, e, client_lost, unread)
+        .await
+        .0
+}
+
+/// Resolves once the exec's end is set; never, if its sender is gone with
+/// none set. Reads with `borrow`, not `borrow_and_update`, so the end stays
+/// unseen for the `changed()` of [`bridge_one`] in the race where a command
+/// starts in the same instant.
+async fn until_ended(end: &mut watch::Receiver<Option<ExecEnd>>) {
+    loop {
+        if end.borrow().is_some() {
+            return;
+        }
+        if end.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// [`bridge`], and the stream back when the exec's end came while a command
+/// was still starting. The wait for each command's start is raced against
+/// the end ([`ExecEnd`]), so an exec whose client goes, or whose input's
+/// wait at a bound runs out ([`ExecEnd::InputHeldUnstarted`]), ends at once
+/// rather than once a spawn that may never return does. It reports exit 1,
+/// as a spawn that fails does. The start in flight lives in the stream, not
+/// in the abandoned `next()`, so the caller can finish it later and end
+/// what it yields ([`reap_late_start`]): dropping it instead could orphan a
+/// task's sandboxed child.
+async fn bridge_until_end<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     mut stream: S,
     r: &mut R,
@@ -1723,7 +1794,7 @@ async fn bridge<S, P, R, W, E>(
     e: &mut E,
     mut client_lost: watch::Receiver<Option<ExecEnd>>,
     unread: UnreadStdin,
-) -> u32
+) -> (u32, Option<S>)
 where
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
@@ -1734,7 +1805,21 @@ where
     let mut stdin_open = true;
     let mut last_exit: u32 = 0;
     loop {
-        let process = match stream.next().await {
+        let next = tokio::select! {
+            // A command that starts in the same instant as the end is
+            // bridged, and `bridge_one` ends it at once.
+            biased;
+            next = stream.next() => next,
+            () = until_ended(&mut client_lost) => {
+                tracing::warn!(
+                    %channel_id,
+                    end = ?*client_lost.borrow(),
+                    "exec: ended while its command was starting; the start is ended when it returns",
+                );
+                return (1, Some(stream));
+            }
+        };
+        let process = match next {
             Some(Ok(p)) => p,
             None => break,
             Some(Err(err)) => {
@@ -1768,7 +1853,7 @@ where
             break;
         }
     }
-    last_exit
+    (last_exit, None)
 }
 
 /// Drives one [`Process`] to completion: pumps `r → child stdin` and
@@ -4272,7 +4357,7 @@ mod tests {
             let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
             let bridge_task = crate::traced::spawn(async move {
-                let exit = bridge_noting_shutdown(
+                let (exit, _late) = bridge_noting_shutdown(
                     "test",
                     process,
                     &mut bridge_stdin,
@@ -4966,6 +5051,66 @@ mod tests {
             .await
             .expect("the pump returns, letting go of the channel")
             .unwrap();
+    }
+
+    /// An exec whose end comes while its command is still starting ends at
+    /// once, not when the start does, and hands the stream back; the command
+    /// the start yields later is ended and reaped, never left running.
+    #[tokio::test]
+    async fn an_end_while_the_command_is_starting_ends_the_exec_at_once() {
+        use futures::StreamExt as _;
+        use std::time::Duration;
+        use tokio::io::duplex;
+
+        let (process, endpoints) = super::testing::build_mock();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        // The start returns only once released: one still pending.
+        let starting = futures::stream::once(async move {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a dropped release starts the command as a sent one does"
+            )]
+            let _ = release_rx.await;
+        })
+        .zip(process)
+        .map(|((), p)| p)
+        .boxed();
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        let (_stdin_w, mut stdin_r) = duplex(64);
+        let (mut w, _client_w) = duplex(1024);
+        let (mut e, _client_e) = duplex(1024);
+        let bridged = tokio::spawn(async move {
+            super::bridge_until_end(
+                "test",
+                starting,
+                &mut stdin_r,
+                &mut w,
+                &mut e,
+                end_rx,
+                super::UnreadStdin::Keep,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        end_tx.send_replace(Some(super::ExecEnd::InputHeldUnstarted(
+            super::HeldBound::Exec,
+        )));
+        let (exit, late) = tokio::time::timeout(Duration::from_secs(5), bridged)
+            .await
+            .expect("the exec ends while its command is still starting")
+            .unwrap();
+        assert_eq!(exit, 1);
+        let mut late = late.expect("the pending start is handed back");
+        assert!(!endpoints.ctrl.was_killed());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), super::reap_late_start(&mut late))
+            .await
+            .expect("the late start is reaped");
+        assert!(
+            endpoints.ctrl.was_killed(),
+            "the command that started after its exec ended is killed"
+        );
     }
 
     /// An exec holding nothing at the daemon bound waits for the others, but
