@@ -47,6 +47,8 @@ impl SessionMessage {
             Self::PeekIngressCells(_) => "PeekIngressCells",
             #[cfg(test)]
             Self::CheckPackagesAtFinalize(..) => "CheckPackagesAtFinalize",
+            #[cfg(test)]
+            Self::HoldUntil(..) => "HoldUntil",
         }
     }
 }

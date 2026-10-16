@@ -889,9 +889,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     )
     .await
     {
-        // Only if unfinished: a finalize that completed after the client
-        // gave up leaves a live session, which is kept (inbox#690).
-        crate::best_effort_destroy(&mut client, id, true).await;
+        // Unconditional: a task box is its run's own, and one whose finalize
+        // completed after the client gave up has no exec whose end would
+        // destroy it, so a kept box would be stranded. Only an activation's
+        // cleanup keeps a finished session (inbox#690).
+        crate::best_effort_destroy(&mut client, id, false).await;
         return Err(e);
     }
 

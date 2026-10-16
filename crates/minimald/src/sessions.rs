@@ -1576,16 +1576,37 @@ impl Manager {
                         r.handle(async {
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::ResourceBusy,
-                                format!("session `{}` is already being destroyed", id.as_ref()),
+                                format!(
+                                    "a destroy of session `{}` is already in flight; if the \
+                                     session is still listed once it ends, destroy it again",
+                                    id.as_ref()
+                                ),
                             ))
                         })
                         .await;
                         return;
                     }
                     if let Some(hnd) = self.running.get(&id).cloned() {
+                        // In the tearing-down set until the actor answers, as
+                        // an unconditional destroy is for its whole teardown:
+                        // a second destroy is refused rather than queued
+                        // behind this one (where it would destroy a session
+                        // this one reports kept), and a listing skips the
+                        // session rather than reading a record the actor may
+                        // be deleting. A kept session leaves the set with
+                        // the answer, and is listed again.
+                        let tearing_down = Arc::clone(&self.tearing_down);
+                        tearing_down
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(id);
                         let span = tracing::Span::current();
                         self.teardowns.spawn(tracing::Instrument::instrument(
                             async move {
+                                let _release = TearingDown {
+                                    set: tearing_down,
+                                    id,
+                                };
                                 r.handle(async { hnd.destroy_if_unfinalized().await }).await;
                             },
                             span,
@@ -1617,7 +1638,11 @@ impl Manager {
                     r.handle(async {
                         Err(std::io::Error::new(
                             std::io::ErrorKind::ResourceBusy,
-                            format!("session `{}` is already being destroyed", id.as_ref()),
+                            format!(
+                                "a destroy of session `{}` is already in flight; if the \
+                                     session is still listed once it ends, destroy it again",
+                                id.as_ref()
+                            ),
                         ))
                     })
                     .await;
@@ -2909,6 +2934,90 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none(),
             "the destroyed session's record should be gone"
+        );
+    }
+
+    /// The race inbox#690 is about, pinned: a cleanup destroy queued in the
+    /// session's mailbox behind a finalize that is still running waits for
+    /// it, and keeps the session it finished. While the cleanup is in
+    /// flight the session is in the tearing-down set: a second destroy is
+    /// refused, and a listing skips it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cleanup_destroy_queued_behind_a_running_finalize_keeps_the_session() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        let handle = session(&mngr, id).await;
+        assert!(
+            handle
+                .configure_loadout(WireContribution::default())
+                .await
+                .expect("an empty loadout configures")
+                .is_none(),
+            "an empty loadout needs no verdict"
+        );
+
+        // The actor is held, so the finalize and then the cleanup queue in
+        // its mailbox in that order: the finalize is the one "still running".
+        let release = handle.hold_for_test().await;
+        let finalize = crate::traced::spawn({
+            let handle = handle.clone();
+            async move { handle.finalize().await }
+        });
+        handle.until_queued(1).await;
+        let cleanup = crate::traced::spawn({
+            let mngr = mngr.clone();
+            async move { mngr.delete_session_if_unfinalized(id).await }
+        });
+        handle.until_queued(2).await;
+
+        let second = mngr
+            .delete_session(id)
+            .await
+            .expect_err("a second destroy while the cleanup is in flight is refused");
+        assert_eq!(second.kind(), ErrorKind::ResourceBusy);
+        assert!(
+            mngr.list().await.unwrap().is_empty(),
+            "a session a cleanup is in flight for is not listed"
+        );
+
+        release.send(()).expect("the actor is held");
+        finalize
+            .await
+            .unwrap()
+            .expect("the finalize ahead of the cleanup succeeds");
+        let kept = cleanup.await.unwrap().unwrap();
+        assert!(
+            kept.is_none(),
+            "the cleanup keeps the session the finalize finished"
+        );
+        let listed = mngr.list().await.unwrap();
+        assert_eq!(listed.len(), 1, "the kept session is listed again");
+        assert_eq!(listed[0].status, boxes::SessionStatus::Active);
+    }
+
+    /// A cleanup destroy that does destroy — the session never finished —
+    /// leaves a listing whole: the session is skipped while its actor
+    /// deletes the record, and gone after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_survives_a_cleanup_destroy_of_an_unfinished_session() {
+        let (_state, _cache, mngr, id, _response) = create_pending_session().await;
+        let handle = session(&mngr, id).await;
+        let release = handle.hold_for_test().await;
+        let cleanup = crate::traced::spawn({
+            let mngr = mngr.clone();
+            async move { mngr.delete_session_if_unfinalized(id).await }
+        });
+        handle.until_queued(1).await;
+        assert!(mngr.list().await.unwrap().is_empty());
+        release.send(()).expect("the actor is held");
+        let destroyed = cleanup.await.unwrap().unwrap();
+        assert!(destroyed.is_some(), "an unfinished session is destroyed");
+        assert!(mngr.list().await.unwrap().is_empty());
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

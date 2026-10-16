@@ -744,6 +744,11 @@ enum SessionMessage {
     /// so a finalize sent after the ack sees it.
     #[cfg(test)]
     CheckPackagesAtFinalize(std::time::Duration, oneshot::Sender<()>),
+    /// Test-only: acknowledge on the first sender, then hold the actor in
+    /// this message until the receiver fires or its sender drops, so a test
+    /// can queue messages behind it in a known order.
+    #[cfg(test)]
+    HoldUntil(oneshot::Sender<()>, oneshot::Receiver<()>),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -2349,6 +2354,19 @@ impl Session {
                     reason = "the asker may already be gone; there is nothing to answer then"
                 )]
                 let _ = r.send((self.live_ingress.clone(), self.publications.clone()));
+            }
+            #[cfg(test)]
+            SessionMessage::HoldUntil(entered, release) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the holder may already be gone; the hold still ends on its release"
+                )]
+                let _ = entered.send(());
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "a dropped release ends the hold as a sent one does"
+                )]
+                let _ = release.await;
             }
             #[cfg(test)]
             SessionMessage::CheckPackagesAtFinalize(deadline, r) => {
@@ -6306,6 +6324,40 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::IsBusy(send)).await;
         recv.await.unwrap_or(false)
+    }
+
+    /// Test-only: holds the actor in a message until the returned sender
+    /// fires or drops (see [`SessionMessage::HoldUntil`]). Returns once the
+    /// actor is in the hold.
+    #[cfg(test)]
+    pub(crate) async fn hold_for_test(&self) -> oneshot::Sender<()> {
+        let (entered, entered_recv) = oneshot::channel();
+        let (release, release_recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::HoldUntil(entered, release_recv))
+            .await;
+        entered_recv
+            .await
+            .expect("the session actor should enter the hold");
+        release
+    }
+
+    /// Test-only: waits until `n` messages are queued in this session's
+    /// mailbox, behind the one being handled.
+    #[cfg(test)]
+    pub(crate) async fn until_queued(&self, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while self.0.queued() < n {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{n} messages never queued in the session's mailbox"));
     }
 
     /// Test-only: turn on the finalize package check for this session,
