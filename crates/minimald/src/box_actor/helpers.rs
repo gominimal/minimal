@@ -6,7 +6,7 @@ use super::*;
 
 /// Copy every `composition.patches()` entry from the staged
 /// `<workspace>/patches/<dest>` into the session's home dir at
-/// the same relative path. Called once by [`Session::finalize`]
+/// the same relative path. Called once by [`BoxActor::finalize`]
 /// when the session goes `Active`; subsequent attaches see the
 /// populated home without re-copying.
 ///
@@ -59,13 +59,13 @@ pub(crate) async fn materialize_patches_into_home(
 /// disk after a daemon restart genuinely has no sandbox for a hook to
 /// enter, and teardown must proceed regardless.
 pub(super) async fn run_session_hooks(
-    inner: &SessionInner,
-    record: &SessionRecordHandle,
+    inner: &BoxInner,
+    record: &BoxRecordHandle,
     event: crate::hooks::HookEvent,
 ) -> Vec<crate::hooks::HookOutcome> {
-    use boxes::store::SessionObject as _;
+    use boxes::store::BoxObject as _;
 
-    let SessionInner::Active {
+    let BoxInner::Active {
         composition: Some(composition),
         host: Some((handle, _)),
         ..
@@ -181,7 +181,7 @@ pub(crate) fn composition_needs_staged_scripts(composition: &Composition) -> boo
 /// "attach still works" property at the cost of the lost loadout
 /// contributions. This is the loud-fallback path: the operator sees
 /// the warning instead of a silent drop.
-pub(crate) async fn load_composition(record: &SessionRecordHandle) -> Option<Arc<Composition>> {
+pub(crate) async fn load_composition(record: &BoxRecordHandle) -> Option<Arc<Composition>> {
     match record.load_composition().await {
         Ok(Some(comp)) => Some(Arc::new(comp)),
         Ok(None) => {

@@ -342,7 +342,7 @@ struct FlowKey {
 }
 
 /// One box's DNS-pinned admission state, built at attach and shared between
-/// the relay's two legs through the [`super::switch::SessionGate`]: the
+/// the relay's two legs through the [`super::switch::BoxGate`]: the
 /// egress leg asks it what an undeclared-destination drop may be lifted for
 /// and hands it the box's queries, the ingress leg hands it the resolver's
 /// replies.
@@ -945,8 +945,8 @@ pub(crate) mod tests {
 
     /// The box that allows `github.com` and, by address, nothing else: TCP
     /// declared, no subnets, the one name — the proof sentence's box.
-    fn github_only_egress() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn github_only_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
@@ -966,8 +966,8 @@ pub(crate) mod tests {
     /// verdict carves out UDP/53 to the resolver before it checks protocol
     /// rules (NET-079), so `allow_protocols: Some([Tcp])` still lets the box
     /// resolve every allowed name.
-    fn toolchain_hosts_egress() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn toolchain_hosts_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
@@ -989,8 +989,8 @@ pub(crate) mod tests {
     /// — the idle-bound proofs' box, since a UDP flow is the one that carries
     /// no close signal for the gate to read and so can only ever be released
     /// by idleness.
-    fn github_udp_egress() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn github_udp_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_protocols: Some(vec![boxes::IpProto::Udp]),
                 allow_subnets: Some(Vec::new()),
@@ -1006,8 +1006,8 @@ pub(crate) mod tests {
     /// denied-range refusal's box (NET-067). Two names, because the refusal
     /// log's requirement is the *name* and the answer — the log proof
     /// refuses each of them inside the limiter's interval and must hear both.
-    fn denied_range_egress() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn denied_range_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
@@ -1112,7 +1112,7 @@ pub(crate) mod tests {
     /// A fresh gate over `policy`, on the default switch's resolver and
     /// infrastructure set and host alias, for the unit tests that drive the
     /// gate directly.
-    fn gate_for(policy: &boxes::SessionPolicy) -> DnsGate {
+    fn gate_for(policy: &boxes::BoxPolicy) -> DnsGate {
         let label = LEASE.to_string();
         DnsGate::new(
             &label,
@@ -1143,7 +1143,7 @@ pub(crate) mod tests {
     /// the cap.
     #[test]
     fn admitted_addresses_are_capped_per_name() {
-        let two_names = boxes::SessionPolicy {
+        let two_names = boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
@@ -2648,8 +2648,8 @@ pub(crate) mod tests {
     /// The deny-all box: every `allow_*` dimension present and empty, the
     /// section `boxes::EgressPolicy::deny_all` materializes for
     /// `EffectiveEgress::DenyAll` (NET-141's deny-all case).
-    fn deny_all_egress() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn deny_all_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
@@ -2997,7 +2997,7 @@ pub(crate) mod tests {
     /// but NET-136's, which they keep answering NODATA.
     #[test]
     fn allow_list_and_allow_all_boxes_keep_forwarding() {
-        let allow_all = boxes::SessionPolicy {
+        let allow_all = boxes::BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -3116,7 +3116,7 @@ pub(crate) mod tests {
     fn forwarding_gates() -> [DnsGate; 2] {
         [
             test_gate(),
-            gate_for(&boxes::SessionPolicy {
+            gate_for(&boxes::BoxPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
@@ -3308,7 +3308,7 @@ pub(crate) mod tests {
     async fn undeclared_names_and_hosts_pin_nothing() {
         // The address-deny-all declaration of the existing egress proofs,
         // with no name list: resolving must not open it.
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: Some(Vec::new()),

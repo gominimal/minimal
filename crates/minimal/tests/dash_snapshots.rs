@@ -18,7 +18,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         id: id(n),
         name: name.map(str::to_owned),
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
-        status: boxes::SessionStatus::Active,
+        status: boxes::BoxState::Active,
         git: None,
         host_ip_enforcement: None,
         shared_port_collisions: Vec::new(),
@@ -73,10 +73,10 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         username: Some("chroma".to_string()),
         project_path: paths::HostAbsPath::try_new("/src/api").unwrap(),
         network,
-        policy: boxes::SessionPolicy::default(),
+        policy: boxes::BoxPolicy::default(),
         task_addresses: Vec::new(),
         box_addresses: None,
-        status: boxes::SessionStatus::Active,
+        status: boxes::BoxState::Active,
         hooks_enabled: true,
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
@@ -217,7 +217,7 @@ fn detail_pane_with_policy() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(boxes::EffectiveSessionPolicy {
+            policy: Some(boxes::EffectiveBoxPolicy {
                 egress: boxes::EffectiveEgress::Declared(boxes::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
@@ -260,7 +260,7 @@ fn detail_pane_names_a_declared_deny_all() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(boxes::EffectiveSessionPolicy {
+            policy: Some(boxes::EffectiveBoxPolicy {
                 egress: boxes::EffectiveEgress::Declared(boxes::EgressPolicy {
                     allow_subnets: Some(vec![]),
                     allow_dns_hosts: Some(vec![]),
@@ -300,7 +300,7 @@ fn detail_pane_marks_the_allow_all_default() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(boxes::EffectiveSessionPolicy {
+            policy: Some(boxes::EffectiveBoxPolicy {
                 egress: boxes::EffectiveEgress::AllowAll,
                 ingress: None,
                 credentialed_upstream: None,
@@ -329,7 +329,7 @@ fn detail_pane_marks_a_credentialed_upstream_lane_not_in_effect() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::HostNet)),
-            policy: Some(boxes::EffectiveSessionPolicy {
+            policy: Some(boxes::EffectiveBoxPolicy {
                 egress: boxes::EffectiveEgress::AllowAll,
                 ingress: None,
                 credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
@@ -386,7 +386,7 @@ fn detail_pane_marks_the_deny_all_default() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(boxes::EffectiveSessionPolicy {
+            policy: Some(boxes::EffectiveBoxPolicy {
                 egress: boxes::EffectiveEgress::DenyAll,
                 ingress: None,
                 credentialed_upstream: None,
@@ -413,7 +413,7 @@ fn detail_pane_shows_dynamic_ingress() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(boxes::EffectiveSessionPolicy {
+            policy: Some(boxes::EffectiveBoxPolicy {
                 egress: boxes::EffectiveEgress::Declared(boxes::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,

@@ -3,8 +3,8 @@ use crate::box_ops::{
 };
 use crate::channel_progress::ChannelProgress;
 
-use crate::box_manager::{SessionControl, WeakManagerHandle, composables};
-use crate::store::SessionRecordHandle;
+use crate::box_manager::{BoxControl, WeakBoxManagerHandle, composables};
+use crate::store::BoxRecordHandle;
 use crate::{
     ChannelConfig,
     box_runtime::{self, HostAttrs, WinSize},
@@ -13,11 +13,11 @@ use crate::{
 use boxes::keys::SessionKeys;
 use boxes::wire::request::ContributionResponse;
 use boxes::{
-    Record, SessionStatus,
+    BoxState, Record,
     core::compose::Composition,
     daemon::composer::{ComposeOutcome, PendingComposeState, resume_from_verdict},
-    store::{DiskSession, SessionObject},
-    wire::request::{ContributionVerdict, SessionStep, WireContribution},
+    store::{BoxObject, DiskBox},
+    wire::request::{BoxStep, ContributionVerdict, WireContribution},
 };
 use common::SpecHash;
 use mctx::ConfigBuilder;
@@ -188,7 +188,7 @@ impl fmt::Display for AttachError {
 
 /// The paths on the daemon relevant to a session's internals.
 #[derive(Debug)]
-pub struct SessionPaths {
+pub struct BoxPaths {
     pub working: DaemonAbsPath,
     pub cache: DaemonAbsPath,
     pub home: DaemonAbsPath,
@@ -223,20 +223,20 @@ pub(crate) async fn switch_control_of(
     }
 }
 
-/// Everything a [`Session`] actor needs at spawn time. Every session actor
-/// is spawned through [`Session::run`] with one of these, whether it is
+/// Everything a [`BoxActor`] actor needs at spawn time. Every session actor
+/// is spawned through [`BoxActor::run`] with one of these, whether it is
 /// backed by a freshly allocated record (the `CreateSession` path) or an
 /// existing one being brought up from disk (the `GetSession` path); what the
 /// session *is* comes from its record, not from the spawn site.
-pub(crate) struct SessionConfig {
+pub(crate) struct BoxActorConfig {
     pub minimal_state_dir: DaemonAbsPath,
     pub minimal_cache_dir: DaemonAbsPath,
     pub daemon_ctx: Arc<mctx::DaemonContext>,
 
     /// Handle to this session's record.
-    pub record: SessionRecordHandle,
+    pub record: BoxRecordHandle,
     /// Handle to the session manager, powers operations initiated within the session.
-    pub manager: WeakManagerHandle,
+    pub manager: WeakBoxManagerHandle,
 
     pub net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     /// The daemon's shared PTask hostname registry; the actor registers its
@@ -260,7 +260,7 @@ pub(crate) struct SessionConfig {
     pub deny_all_opt_out: bool,
     /// The liveness of the connection that created this session over
     /// `CreateSession`, or `None` for a session brought up any other way
-    /// (from disk, or by an in-process caller). See `Session::creator`.
+    /// (from disk, or by an in-process caller). See `BoxActor::creator`.
     pub creator: Option<std::sync::Weak<()>>,
 }
 
@@ -279,7 +279,7 @@ pub(crate) struct SessionConfig {
 /// ([`crate::exec::task_network`]), so a task runs under the same egress
 /// its session does.
 pub(crate) fn effective_egress_section(
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     network: boxes::NetworkMode,
     phase: boxes::EgressDefaultPhase,
     opt_out: bool,
@@ -298,15 +298,15 @@ pub(crate) fn effective_egress_section(
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
 /// with the destination lists it left absent resolved. `phase` resolves
 /// under, exactly as [`effective_egress_section`] documents. The
-/// declaration on the record is left untouched: the strict `SessionPolicy`
+/// declaration on the record is left untouched: the strict `BoxPolicy`
 /// a client reads back stays exactly what the box was launched with.
 pub(crate) fn effective_session_policy(
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     network: boxes::NetworkMode,
     phase: boxes::EgressDefaultPhase,
     opt_out: bool,
-) -> boxes::SessionPolicy {
-    boxes::SessionPolicy {
+) -> boxes::BoxPolicy {
+    boxes::BoxPolicy {
         egress: effective_egress_section(policy, network, phase, opt_out),
         ingress: policy.ingress.clone(),
         // The credentialed-upstream declaration (NET-134) resolves nothing —
@@ -320,9 +320,9 @@ pub(crate) fn effective_session_policy(
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
 /// as a state machine. Session-lifetime state (record snapshot, dirs,
-/// tracker, handles) lives on [`Session`] itself.
+/// tracker, handles) lives on [`BoxActor`] itself.
 #[derive(Debug)]
-enum SessionInner {
+enum BoxInner {
     /// Session allocated but is accumulating configuration / not yet started.
     Draft {
         /// Daemon-side resume state for [`resume_from_verdict`], stashed by a
@@ -374,16 +374,16 @@ type LaunchedHost = (
 /// Where in the session lifecycle a host launch is happening, which decides
 /// whether the launch has to wait for an `Active` record.
 ///
-/// Only [`Session::finalize`]'s launch is `Activating`. Every other
+/// Only [`BoxActor::finalize`]'s launch is `Activating`. Every other
 /// launch happens after the session is attachable and keeps the status gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchPhase {
     /// A launch against a session that is already `Active`: an attach, or an
-    /// exec's [`Session::ensure_host`]. Both check the record's status
-    /// themselves before getting here; the gate in [`Session::context`] is
+    /// exec's [`BoxActor::ensure_host`]. Both check the record's status
+    /// themselves before getting here; the gate in [`BoxActor::context`] is
     /// their backstop.
     Attached,
-    /// The pre-activation launch inside [`Session::finalize`]. It runs while
+    /// The pre-activation launch inside [`BoxActor::finalize`]. It runs while
     /// the record is still `Materializing` by construction — promoting to
     /// `Active` is what finalize does *after* the activation hooks this host
     /// exists to run — so it cannot take the `Active` gate without
@@ -413,7 +413,7 @@ const TEARDOWN_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// against a wedge, not a performance budget.
 const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long [`Session::check_composed_packages`] waits for the session
+/// How long [`BoxActor::check_composed_packages`] waits for the session
 /// graph to resolve before stepping aside.
 ///
 /// Evaluating the graph can clone the upstream repo when the daemon's
@@ -454,7 +454,7 @@ enum WorkspaceBaseline {
     Armed(Option<Arc<DeltaSource>>),
 }
 
-// Opaque so `Session`'s derived `Debug` need not dump the whole baseline
+// Opaque so `BoxActor`'s derived `Debug` need not dump the whole baseline
 // snapshot: only whether the baseline is armed and present is informative.
 impl fmt::Debug for WorkspaceBaseline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -469,7 +469,7 @@ impl fmt::Debug for WorkspaceBaseline {
 /// attributes and the screen snapshot.
 ///
 /// Spawning those probes off the session actor (see
-/// [`Session::handle_message`]) keeps the *actor* responsive, but says
+/// [`BoxActor::handle_message`]) keeps the *actor* responsive, but says
 /// nothing about the spawned task: against a host that never answers, an
 /// unbounded probe outlives every caller that gave up on it. Nor does it
 /// stay parked in the same place:
@@ -484,7 +484,7 @@ impl fmt::Debug for WorkspaceBaseline {
 /// cannot answer within the deadline ends, and the caller reads the same
 /// `None` a session with no running host already reports.
 ///
-/// [`crate::box_manager::Manager`] bounds these probes again on its own
+/// [`crate::box_manager::BoxManager`] bounds these probes again on its own
 /// mainloop. That is not redundant — this deadline covers a wedged *host*,
 /// and the manager's covers a wedged *session actor*, which can be parked in
 /// an inline `EnsureHost`, `Attach`, or `ConfigureLoadout` and never reach
@@ -531,16 +531,16 @@ pub(crate) struct LiveIngressRows {
     pub(crate) unaudited_listen_ports: Vec<u16>,
 }
 
-enum SessionMessage {
-    GetPaths(oneshot::Sender<SessionPaths>),
+enum BoxMessage {
+    GetPaths(oneshot::Sender<BoxPaths>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
     Attach(
         oneshot::Sender<Result<(), AttachError>>,
-        SessionHandle,
+        BoxHandle,
         String,
         Channel<Msg>,
         ChannelConfig,
-        /// The attaching connection's liveness, see [`Session::creator`].
+        /// The attaching connection's liveness, see [`BoxActor::creator`].
         Option<std::sync::Weak<()>>,
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
@@ -550,7 +550,7 @@ enum SessionMessage {
     /// has no terminal to attach and nothing to render progress to.
     EnsureHost(
         oneshot::Sender<Result<box_runtime::HostHandle, AttachError>>,
-        SessionHandle,
+        BoxHandle,
         String,
     ),
     /// The workspace's at-risk report (what a destroy would lose), served
@@ -577,7 +577,7 @@ enum SessionMessage {
     SubmitVerdict(
         Box<(
             ContributionVerdict,
-            oneshot::Sender<Result<SessionStep, std::io::Error>>,
+            oneshot::Sender<Result<BoxStep, std::io::Error>>,
         )>,
     ),
     /// Promote a `Materializing` session to `Active`, gating on the
@@ -615,18 +615,18 @@ enum SessionMessage {
     /// effective egress (NET-074) the same way the launcher does.
     GetDenyAllOptOut(oneshot::Sender<bool>),
     /// Hand back the session's composition, if it has one. Sourced from
-    /// the persisted snapshot: `Session::run` loads it at spawn, so this
+    /// the persisted snapshot: `BoxActor::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
     GetComposition(oneshot::Sender<Option<Arc<Composition>>>),
     /// Hand back an `Arc` clone of this session's patches-upload lock, see
-    /// [`Session::patches_upload_lock`].
+    /// [`BoxActor::patches_upload_lock`].
     GetPatchesUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
-    /// see [`Session::hook_scripts_upload_lock`].
+    /// see [`BoxActor::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
     /// Mark one `WorkspaceFilesTarZst` upload into this session as
     /// started (true) or finished (false), see
-    /// [`Session::workspace_uploads_in_flight`]. The ack fires once the
+    /// [`BoxActor::workspace_uploads_in_flight`]. The ack fires once the
     /// actor has applied the change, so a Begin is visible to an attach
     /// before the upload pulls its first byte. It carries whether the
     /// change was applied: a Begin is refused unless the session is still
@@ -684,7 +684,7 @@ enum SessionMessage {
     /// `GetLiveIngress` RPC serves. Empty for a box that published none.
     LiveIngress(oneshot::Sender<LiveIngressRows>),
     /// The attached human's answer to a runtime port-publish ask routed to
-    /// them (NET-045), sent by the task [`Session::route_ask`] spawned —
+    /// them (NET-045), sent by the task [`BoxActor::route_ask`] spawned —
     /// never by the actor itself, which must not park on a human.
     /// [`AskEnd::Unanswered`] means nobody was attached to answer, which is
     /// the ask's own fail-closed case rather than an error to report.
@@ -722,7 +722,7 @@ enum SessionMessage {
         )>,
     ),
     /// Test-only: turn on the finalize package check that test builds leave
-    /// off (see [`Session::check_packages_at_finalize`]), bounded by the
+    /// off (see [`BoxActor::check_packages_at_finalize`]), bounded by the
     /// carried deadline — [`PACKAGE_CHECK_DEADLINE`] for the production
     /// bound, shorter to exercise the expiry path. Acknowledged once set,
     /// so a finalize sent after the ack sees it.
@@ -732,7 +732,7 @@ enum SessionMessage {
 
 /// The key an ask parks under (NET-045): minted per request the session
 /// routes, never derived from the port — two concurrent requests can share a
-/// port. The ask's continuation ([`SessionMessage::AskAnswered`]) carries it
+/// port. The ask's continuation ([`BoxMessage::AskAnswered`]) carries it
 /// back, so an answer reaches the ask it answers even when another ask on the
 /// same port is parked ahead of it, and a late fail-closed answer for an ask
 /// that already ended does not pop its neighbour instead.
@@ -838,8 +838,8 @@ fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'static str {
 /// attached human answers the dialog it was routed to (NET-045).
 ///
 /// The caller's reply travels with it because the actor never answers the
-/// request itself: it answers from [`Session::resume_ask`] once the human
-/// has, or fail-closed from [`Session::stop_running`] when the session is
+/// request itself: it answers from [`BoxActor::resume_ask`] once the human
+/// has, or fail-closed from [`BoxActor::stop_running`] when the session is
 /// going away and nobody can. Keyed by [`AskId`] — the id the continuation
 /// message carries back — so two asks for the same port each reach their own
 /// asker however their answers arrive.
@@ -867,19 +867,19 @@ struct PendingAsk {
 
 /// Manages one session, from the moment its record is allocated: the create
 /// flow (compose → `Draft` → verdict → `Active`) runs as the
-/// [`SessionInner`] state machine, and the actor owns its record's writes
+/// [`BoxInner`] state machine, and the actor owns its record's writes
 /// and deletion, its PTask hostname, its held composition, and its host.
 ///
 /// Follows the actor pattern.
 #[derive(Debug)]
-pub struct Session {
-    receiver: crate::traced::Receiver<SessionMessage>,
+pub struct BoxActor {
+    receiver: crate::traced::Receiver<BoxMessage>,
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
     daemon_ctx: Arc<mctx::DaemonContext>,
 
     /// Store-backed handle to this session's record.
-    record: SessionRecordHandle,
+    record: BoxRecordHandle,
 
     /// The daemon's shared PTask hostname registry (see
     /// [`SessionSeed::hostnames`]). The lock is only ever held for a
@@ -887,7 +887,7 @@ pub struct Session {
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 
-    /// The answerer's lease book for this host ([`SessionConfig::loopback`]):
+    /// The answerer's lease book for this host ([`BoxActorConfig::loopback`]):
     /// where the box's own host loopback address comes from at finalize and
     /// where it goes back at destroy. Every ask is a synchronous
     /// read-modify-write under the record's own lock file — never held across
@@ -909,7 +909,7 @@ pub struct Session {
     /// The ports this box published at runtime with its own `min net expose`
     /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
     /// the switch accepted, held from the publish until the box stops, where
-    /// [`Session::stop_running`] unbinds them — or until the spawn they
+    /// [`BoxActor::stop_running`] unbinds them — or until the spawn they
     /// deliver to ends, whose guard unbinds them beside its declared forwards
     /// (the cell is shared with it through the launch's
     /// [`crate::net::provider::OwnAddressReporter`]). A box that published
@@ -935,7 +935,7 @@ pub struct Session {
     /// The runtime port-publish requests this box decided `ask`, parked until
     /// the attached human answers them (NET-045). Empty for a box with
     /// nothing waiting on a human; drained fail-closed by
-    /// [`Session::stop_running`].
+    /// [`BoxActor::stop_running`].
     pending_asks: Vec<PendingAsk>,
 
     /// The counter behind [`AskId`]: the actor mints one id per ask it parks,
@@ -948,7 +948,7 @@ pub struct Session {
     tracker: OpTracker,
 
     /// Session state machine.
-    inner: SessionInner,
+    inner: BoxInner,
 
     /// Workspace baseline for the shell-exit prompt, armed once and reused
     /// across host rebuilds so a reattach after a "keep filesystem" exit still
@@ -997,18 +997,18 @@ pub struct Session {
     /// in-process (`None`).
     creator: Option<std::sync::Weak<()>>,
 
-    /// A non-owning handle to the [`Manager`](crate::box_manager::Manager), used to
-    /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
+    /// A non-owning handle to the [`BoxManager`](crate::box_manager::BoxManager), used to
+    /// build the [`BoxControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
     /// all), and to self-evict from the manager's running map on
     /// actor-initiated termination. Weak by design — see
-    /// [`crate::box_manager::Manager::weak_self`].
-    manager: WeakManagerHandle,
+    /// [`crate::box_manager::BoxManager::weak_self`].
+    manager: WeakBoxManagerHandle,
 
     /// A non-owning handle to this session, handed to the runtime objects
     /// we spawns (e.g. build [`SideOp`]s) so they can reach back into
     /// the session.
-    weak_self: WeakSessionHandle,
+    weak_self: WeakBoxHandle,
 
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
@@ -1036,7 +1036,7 @@ pub struct Session {
 
     /// The live direct-tcpip forwards opened for this session: one abort
     /// handle per relay the connection layer spawned. Pruned as relays
-    /// finish; every live one is aborted by [`Session::stop_running`], so a
+    /// finish; every live one is aborted by [`BoxActor::stop_running`], so a
     /// session that goes away takes its forwards down with it (NET-105).
     forwards: Vec<tokio::task::AbortHandle>,
 
@@ -1046,7 +1046,7 @@ pub struct Session {
     /// `test`/`test-support`, whose sessions run offline and compose names
     /// (the scaffolded `base`/`vim`, for one) that only an upstream declares;
     /// a test that wants the check turns it on through
-    /// [`SessionHandle::check_packages_at_finalize`].
+    /// [`BoxHandle::check_packages_at_finalize`].
     check_packages_at_finalize: bool,
 
     /// The bound on [`Self::check_composed_packages`] —
@@ -1068,7 +1068,7 @@ enum HostOrigin {
     /// Minted by an attach, from a client with a PTY. Its environment already
     /// describes a terminal.
     Interactive,
-    /// Minted by [`Session::launch_host_for_hooks`] to run lifecycle hooks.
+    /// Minted by [`BoxActor::launch_host_for_hooks`] to run lifecycle hooks.
     /// Nothing of the user's runs in it: its shell waits at the launch's
     /// start gate, before it execs, until an attach releases it (see
     /// `box_runtime::Launched::start_gate`), so neither the shell nor its
@@ -1076,7 +1076,7 @@ enum HostOrigin {
     /// replace. A host kept instead ([`replaces_host_for_terminal`]) starts
     /// its shell at that attach, after the activate hooks.
     Hooks,
-    /// Minted by [`Session::ensure_host`] to serve an exec. The command is
+    /// Minted by [`BoxActor::ensure_host`] to serve an exec. The command is
     /// live inside that sandbox, so replacing the shell would kill it — this
     /// one is never respawned, and the attaching terminal's facts reach it
     /// through the per-attach environment instead.
@@ -1101,16 +1101,16 @@ fn replaces_host_for_terminal(
     origin == HostOrigin::Hooks && declares_terminal && !holds_host_row
 }
 
-impl Session {
+impl BoxActor {
     /// Assembles the actor from its seed, mailbox, and initial state. The
     /// caller decides when to enter [`Self::mainloop`].
     fn assemble(
-        seed: SessionConfig,
-        receiver: crate::traced::Receiver<SessionMessage>,
-        inner: SessionInner,
-        weak_self: WeakSessionHandle,
+        seed: BoxActorConfig,
+        receiver: crate::traced::Receiver<BoxMessage>,
+        inner: BoxInner,
+        weak_self: WeakBoxHandle,
     ) -> Self {
-        let SessionConfig {
+        let BoxActorConfig {
             minimal_state_dir,
             minimal_cache_dir,
             daemon_ctx,
@@ -1175,7 +1175,7 @@ impl Session {
     }
 
     /// Create the session's backing directories (workspace, home, cache).
-    fn create_dirs(object: &DiskSession) -> Result<(), std::io::Error> {
+    fn create_dirs(object: &DiskBox) -> Result<(), std::io::Error> {
         std::fs::create_dir_all(object.workspace_path())?;
         std::fs::create_dir_all(object.home_path())?;
         std::fs::create_dir_all(object.cache_path())?;
@@ -1189,23 +1189,23 @@ impl Session {
     /// sidecar is missing or corrupt, with a logged warning and no
     /// composition so the launcher falls back to its baseline set), a
     /// `Pending` one as an unconfigured `Draft` awaiting `ConfigureLoadout`.
-    pub(crate) async fn run(conf: SessionConfig) -> Result<SessionHandle, std::io::Error> {
+    pub(crate) async fn run(conf: BoxActorConfig) -> Result<BoxHandle, std::io::Error> {
         let obj = conf.record.object().await?;
         Self::create_dirs(&obj)?;
 
         let inner = match obj.record().status {
-            SessionStatus::Active => {
+            BoxState::Active => {
                 let composition = load_composition(&conf.record).await;
-                SessionInner::Active {
+                BoxInner::Active {
                     composition,
                     host: None,
                     sops: vec![],
                 }
             }
-            SessionStatus::Pending => SessionInner::Draft { pending: None },
+            BoxState::Pending => BoxInner::Draft { pending: None },
             // `Materializing` records are only meaningful across a
             // matching in-memory composition, which is lost on
-            // daemon restart. `Manager::init` runs
+            // daemon restart. `BoxManager::init` runs
             // `reap_unresumable_records` at startup to delete these
             // before any actor spawns.
             //
@@ -1216,7 +1216,7 @@ impl Session {
             // actor up. Every alternative gets a session into a
             // bad shape:
             //
-            //   * `SessionInner::Draft { pending: None }` would let
+            //   * `BoxInner::Draft { pending: None }` would let
             //     `configure_loadout` accept a fresh contribution
             //     while the on-disk status stays `Materializing`,
             //     drifting the two into inconsistency.
@@ -1224,13 +1224,13 @@ impl Session {
             //     could then satisfy the *new* composition's
             //     finalize marker check, materializing the wrong
             //     patches into the sandbox home.
-            //   * `SessionInner::Active { composition: None }`
+            //   * `BoxInner::Active { composition: None }`
             //     would let attach reach a shell against a session
             //     that never actually finished materializing.
             //
             // Fail the spawn instead; the caller sees an error and
             // the operator can destroy the stuck record explicitly.
-            SessionStatus::Materializing => {
+            BoxState::Materializing => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "session record is Materializing but has no in-memory composition \
@@ -1282,7 +1282,7 @@ impl Session {
         }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
-        let weak_self = WeakSessionHandle(sender.downgrade());
+        let weak_self = WeakBoxHandle(sender.downgrade());
         let actor = Self::assemble(conf, receiver, inner, weak_self);
 
         // Register the PTask hostname before the actor goes live, so the
@@ -1309,7 +1309,7 @@ impl Session {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(SessionHandle(sender))
+        Ok(BoxHandle(sender))
     }
 
     /// Register this session's PTask hostname (R3.1/R3.6). A HostNet PTask's
@@ -1845,7 +1845,7 @@ impl Session {
     /// [`Self::register_hostname`] registered one.
     #[cfg(target_os = "linux")]
     fn owns_hostname_route(&self, record: &Record) -> bool {
-        matches!(self.inner, SessionInner::Active { .. })
+        matches!(self.inner, BoxInner::Active { .. })
             && matches!(
                 record.network,
                 boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
@@ -1980,25 +1980,25 @@ impl Session {
     ///
     /// Returns [`ControlFlow::Break`] when the session has terminated and
     /// the actor loop should exit.
-    async fn handle_message(&mut self, msg: SessionMessage) -> ControlFlow<Teardown> {
+    async fn handle_message(&mut self, msg: BoxMessage) -> ControlFlow<Teardown> {
         match msg {
-            SessionMessage::GetPaths(r) => {
+            BoxMessage::GetPaths(r) => {
                 let _ = r.send(self.paths().await);
             }
-            SessionMessage::MakeContext(r) => {
+            BoxMessage::MakeContext(r) => {
                 let _ = r.send(self.context(false).await);
             }
-            SessionMessage::Attach(r, session_hnd, conn_username, channel, config, attacher) => {
+            BoxMessage::Attach(r, session_hnd, conn_username, channel, config, attacher) => {
                 let _ = r.send(
                     self.attach(session_hnd, conn_username, channel, config, attacher)
                         .await,
                 );
             }
-            SessionMessage::EnsureHost(r, session_hnd, conn_username) => {
+            BoxMessage::EnsureHost(r, session_hnd, conn_username) => {
                 let _ = r.send(self.ensure_host(session_hnd, conn_username).await);
             }
-            SessionMessage::GetHostAttrs(r) => match &self.inner {
-                SessionInner::Active {
+            BoxMessage::GetHostAttrs(r) => match &self.inner {
+                BoxInner::Active {
                     host: Some((h, _)), ..
                 } => {
                     // Forwarded off-actor for the same reason as
@@ -2020,8 +2020,8 @@ impl Session {
                     let _ = r.send(None);
                 }
             },
-            SessionMessage::GetWorkspaceDelta(r) => match &self.inner {
-                SessionInner::Active {
+            BoxMessage::GetWorkspaceDelta(r) => match &self.inner {
+                BoxInner::Active {
                     host: Some((h, _)), ..
                 } => {
                     // Forwarded off-actor: the host answers via bounded git
@@ -2036,8 +2036,8 @@ impl Session {
                     let _ = r.send(minimald_rpc::SessionDeltaResponse::Unavailable);
                 }
             },
-            SessionMessage::GetHostScreen(r) => match &self.inner {
-                SessionInner::Active {
+            BoxMessage::GetHostScreen(r) => match &self.inner {
+                BoxInner::Active {
                     host: Some((h, _)), ..
                 } => {
                     // Off-actor and bounded for the same reasons as
@@ -2051,7 +2051,7 @@ impl Session {
                     let _ = r.send(None);
                 }
             },
-            SessionMessage::ConfigureLoadout(contribution, r) => {
+            BoxMessage::ConfigureLoadout(contribution, r) => {
                 // Honour what the user chose at `min session activate`.
                 let hooks_enabled = match self.record.record().await {
                     Ok(rec) => rec.hooks_enabled,
@@ -2068,22 +2068,22 @@ impl Session {
                 };
                 let _ = r.send(self.configure_loadout(contribution, hooks_enabled).await);
             }
-            SessionMessage::SubmitVerdict(msg) => {
+            BoxMessage::SubmitVerdict(msg) => {
                 let (verdict, r) = *msg;
                 let _ = r.send(self.handle_verdict(verdict).await);
             }
-            SessionMessage::Finalize(r) => {
+            BoxMessage::Finalize(r) => {
                 let _ = r.send(self.finalize().await);
             }
-            SessionMessage::Abort(r) => match &self.inner {
+            BoxMessage::Abort(r) => match &self.inner {
                 // Abort is Draft-only: delete the record, then stop. The
                 // record delete happens before the reply so a post-reply
                 // store read never sees the aborted session.
-                SessionInner::Draft { .. } => {
+                BoxInner::Draft { .. } => {
                     let _ = r.send(self.record.clone().delete().await);
                     return ControlFlow::Break(Teardown::SelfInitiated);
                 }
-                SessionInner::Active { .. } => {
+                BoxInner::Active { .. } => {
                     let _ = r.send(Err({
                         match self.record.record().await {
                             Ok(record) => std::io::Error::new(
@@ -2099,24 +2099,24 @@ impl Session {
                     }));
                 }
             },
-            SessionMessage::Rename(new_name, r) => {
+            BoxMessage::Rename(new_name, r) => {
                 let _ = r.send(self.rename(new_name).await);
             }
-            SessionMessage::IsBusy(r) => {
+            BoxMessage::IsBusy(r) => {
                 let _ = r.send(match &self.inner {
                     // Awaiting a verdict: a client is mid create flow.
-                    SessionInner::Draft { pending } => pending.is_some(),
+                    BoxInner::Draft { pending } => pending.is_some(),
                     // A *live* host, not merely a held one: the slot outlives
                     // the process (see `launch_host_for_hooks`), so a session
                     // whose shell has exited still holds a handle to a host
                     // that runs nothing — and nothing is what an unforced
                     // shutdown would interrupt there.
-                    SessionInner::Active { host, .. } => {
+                    BoxInner::Active { host, .. } => {
                         host.as_ref().is_some_and(|(h, _)| h.is_alive())
                     }
                 });
             }
-            SessionMessage::Stop(r) => {
+            BoxMessage::Stop(r) => {
                 self.stop_running(true).await;
                 // NET-013: a stop keeps the grant and the registry's publish
                 // row — the session still exists, a resume brings the same
@@ -2144,7 +2144,7 @@ impl Session {
                                 "reading the session record failed while stopping; \
                                  marking the box's name stopped by its id",
                             );
-                            matches!(self.inner, SessionInner::Active { .. })
+                            matches!(self.inner, BoxInner::Active { .. })
                         }
                     };
                     if owns_route {
@@ -2157,12 +2157,12 @@ impl Session {
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
-            SessionMessage::RunDetachHooks(r) => {
+            BoxMessage::RunDetachHooks(r) => {
                 self.run_hooks_headless(crate::hooks::HookEvent::Detach)
                     .await;
                 let _ = r.send(());
             }
-            SessionMessage::Destroy(r) => {
+            BoxMessage::Destroy(r) => {
                 // Before `stop_running`: a destroy hook runs *inside* the
                 // session, so the sandbox it joins has to still exist — or
                 // be minted, which is what this does when the session's
@@ -2195,18 +2195,18 @@ impl Session {
                 let _ = r.send(deleted.map(|()| hook_failures));
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
-            SessionMessage::GetPatchesUploadLock(r) => {
+            BoxMessage::GetPatchesUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.patches_upload_lock));
             }
-            SessionMessage::GetHookScriptsUploadLock(r) => {
+            BoxMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
             }
-            SessionMessage::SetWorkspaceUploadInFlight(in_flight, r) => {
+            BoxMessage::SetWorkspaceUploadInFlight(in_flight, r) => {
                 let applied = if !in_flight {
                     self.workspace_uploads_in_flight =
                         self.workspace_uploads_in_flight.saturating_sub(1);
                     true
-                } else if matches!(self.inner, SessionInner::Draft { pending: None }) {
+                } else if matches!(self.inner, BoxInner::Draft { pending: None }) {
                     self.workspace_uploads_in_flight += 1;
                     true
                 } else {
@@ -2214,55 +2214,55 @@ impl Session {
                 };
                 let _ = r.send(applied);
             }
-            SessionMessage::TrackForward(forward) => {
+            BoxMessage::TrackForward(forward) => {
                 // Prune the ones that have finished on their own, so the
                 // list holds the live forwards and nothing else.
                 self.forwards.retain(|h| !h.is_finished());
                 self.forwards.push(forward);
             }
-            SessionMessage::StartBuild {
+            BoxMessage::StartBuild {
                 rebuild,
                 pkgs,
                 reply,
             } => {
                 let _ = reply.send(self.start_build(rebuild, pkgs).await);
             }
-            SessionMessage::StartCheck { opts, reply } => {
+            BoxMessage::StartCheck { opts, reply } => {
                 let _ = reply.send(self.start_check(opts).await);
             }
-            SessionMessage::StartMaterialize { opts, reply } => {
+            BoxMessage::StartMaterialize { opts, reply } => {
                 let _ = reply.send(self.start_materialize(opts).await);
             }
-            SessionMessage::GetComposition(r) => {
+            BoxMessage::GetComposition(r) => {
                 let _ = r.send(self.composition());
             }
-            SessionMessage::ExposeDynamic { port, reply } => {
+            BoxMessage::ExposeDynamic { port, reply } => {
                 // Answers the reply itself, or parks it with the ask it
                 // routed to the attached human (NET-045) — either way this
                 // handler is done with it.
                 self.expose_dynamic(port, reply).await;
             }
             #[cfg(target_os = "linux")]
-            SessionMessage::BindHandedPort { address, port } => {
+            BoxMessage::BindHandedPort { address, port } => {
                 self.bind_handed_port(address, port).await;
             }
-            SessionMessage::LiveIngress(r) => {
+            BoxMessage::LiveIngress(r) => {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
                 )]
                 let _ = r.send(self.live_ingress_snapshot());
             }
-            SessionMessage::AskAnswered { id, port, answer } => {
+            BoxMessage::AskAnswered { id, port, answer } => {
                 self.resume_ask(id, port, answer).await;
             }
-            SessionMessage::GetRecord(r) => {
+            BoxMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
             }
-            SessionMessage::GetNetSwitch(r) => {
+            BoxMessage::GetNetSwitch(r) => {
                 let _ = r.send(Arc::clone(&self.net_switch));
             }
-            SessionMessage::GetDenyAllOptOut(r) => {
+            BoxMessage::GetDenyAllOptOut(r) => {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
@@ -2270,14 +2270,14 @@ impl Session {
                 let _ = r.send(self.deny_all_opt_out);
             }
             #[cfg(test)]
-            SessionMessage::PeekComposition(r) => {
+            BoxMessage::PeekComposition(r) => {
                 let _ = r.send(match &self.inner {
-                    SessionInner::Active { composition, .. } => composition.clone(),
-                    SessionInner::Draft { .. } => None,
+                    BoxInner::Active { composition, .. } => composition.clone(),
+                    BoxInner::Draft { .. } => None,
                 });
             }
             #[cfg(test)]
-            SessionMessage::PeekPendingAsks(r) => {
+            BoxMessage::PeekPendingAsks(r) => {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
@@ -2290,7 +2290,7 @@ impl Session {
                 );
             }
             #[cfg(test)]
-            SessionMessage::PeekIngressCells(r) => {
+            BoxMessage::PeekIngressCells(r) => {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
@@ -2298,7 +2298,7 @@ impl Session {
                 let _ = r.send((self.live_ingress.clone(), self.publications.clone()));
             }
             #[cfg(test)]
-            SessionMessage::CheckPackagesAtFinalize(deadline, r) => {
+            BoxMessage::CheckPackagesAtFinalize(deadline, r) => {
                 self.check_packages_at_finalize = true;
                 self.package_check_deadline = deadline;
                 #[expect(
@@ -2337,20 +2337,20 @@ impl Session {
         hooks_enabled: bool,
     ) -> Result<Option<ContributionResponse>, std::io::Error> {
         match &self.inner {
-            SessionInner::Active { .. } => {
+            BoxInner::Active { .. } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "session loadout is already configured",
                 ));
             }
-            SessionInner::Draft { pending: Some(_) } => {
+            BoxInner::Draft { pending: Some(_) } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
                     "session already has a pending contribution awaiting its verdict; \
                      abort it and create a new session to retry",
                 ));
             }
-            SessionInner::Draft { pending: None } => {}
+            BoxInner::Draft { pending: None } => {}
         }
         // Composing mid-upload would scaffold and resolve against a
         // half-populated tree, and the session could then go `Active` with
@@ -2367,7 +2367,7 @@ impl Session {
 
         // Scaffold before composing, not after: the launcher's package set is
         // its baseline unioned with the composition's packages (see the note
-        // on `SessionInner::Active::composition`), so a default written any
+        // on `BoxInner::Active::composition`), so a default written any
         // later never reaches the sandbox. Propagated, not logged — an
         // activation that hands back a session id must hand back a usable
         // session, and a box with no blueprint can't run anything.
@@ -2427,9 +2427,9 @@ impl Session {
                 // sidecar intact.
                 self.record.store_composition(&composition).await?;
                 let mut record = object.record().clone();
-                record.status = SessionStatus::Materializing;
+                record.status = BoxState::Materializing;
                 self.record.write(record.clone()).await?;
-                self.inner = SessionInner::Active {
+                self.inner = BoxInner::Active {
                     composition: Some(Arc::new(composition)),
                     host: None,
                     sops: vec![],
@@ -2445,7 +2445,7 @@ impl Session {
             } => {
                 // The composer ran before the allocated id was known to it.
                 response.session_id = *self.record.id();
-                self.inner = SessionInner::Draft {
+                self.inner = BoxInner::Draft {
                     pending: Some(Box::new(state)),
                 };
                 Ok(Some(response))
@@ -2458,28 +2458,28 @@ impl Session {
     ///
     /// Structured refusals — a session that is already `Active` or was never
     /// configured, and a verdict the composer can't apply — come back as a
-    /// [`SessionStep::Fault`] and leave the session `Draft` and resumable, so
+    /// [`BoxStep::Fault`] and leave the session `Draft` and resumable, so
     /// a client that mis-gated an item can correct it and re-submit rather
     /// than lose the session.
     async fn handle_verdict(
         &mut self,
         verdict: ContributionVerdict,
-    ) -> Result<SessionStep, std::io::Error> {
+    ) -> Result<BoxStep, std::io::Error> {
         let wrong_state = |what: &str| {
-            Ok(SessionStep::Fault {
+            Ok(BoxStep::Fault {
                 error: boxes::wire::errors::WireError::WrongState {
                     what: what.to_string(),
                 },
             })
         };
         let pending = match &self.inner {
-            SessionInner::Active { .. } => return wrong_state("expected Pending, found Active"),
-            SessionInner::Draft { pending: None } => {
+            BoxInner::Active { .. } => return wrong_state("expected Pending, found Active"),
+            BoxInner::Draft { pending: None } => {
                 return wrong_state(
                     "expected Pending, found a session with no composition to resume",
                 );
             }
-            SessionInner::Draft {
+            BoxInner::Draft {
                 pending: Some(state),
             } => state,
         };
@@ -2488,7 +2488,7 @@ impl Session {
         // and a rejected verdict has to leave the session resumable.
         let composition = match resume_from_verdict((**pending).clone(), verdict) {
             Ok(c) => c,
-            Err(e) => return Ok(SessionStep::Fault { error: e.into() }),
+            Err(e) => return Ok(BoxStep::Fault { error: e.into() }),
         };
 
         // Promote the on-disk record `Pending → Materializing`. A
@@ -2504,14 +2504,14 @@ impl Session {
         // path above).
         self.record.store_composition(&composition).await?;
         let mut record = self.record.record().await?;
-        record.status = SessionStatus::Materializing;
+        record.status = BoxState::Materializing;
         self.record.write(record.clone()).await?;
-        self.inner = SessionInner::Active {
+        self.inner = BoxInner::Active {
             composition: Some(Arc::new(composition)),
             host: None,
             sops: vec![],
         };
-        Ok(SessionStep::Materialized { id: record.id })
+        Ok(BoxStep::Materialized { id: record.id })
     }
 
     /// Finalize a `Materializing` session: verify that the client
@@ -2529,19 +2529,19 @@ impl Session {
     async fn finalize(&mut self) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
         let record = self.record.record().await?;
         match record.status {
-            SessionStatus::Active => {
+            BoxState::Active => {
                 // Already finalized — retry is a no-op, and its hooks ran
                 // on the finalize that did the work. Like the hooks, a
                 // skipped package check is reported only by that first
                 // finalize; a retry does not re-report it.
                 Ok(minimald_rpc::FinalizeSessionResponse::default())
             }
-            SessionStatus::Materializing => {
+            BoxState::Materializing => {
                 // Guard against a `Materializing` record whose
                 // actor didn't carry compose state through — the
-                // only path there is `Session::run` spawning from
+                // only path there is `BoxActor::run` spawning from
                 // an on-disk `Materializing` record after a
-                // restart survived the reap in `Manager::init`
+                // restart survived the reap in `BoxManager::init`
                 // (delete failed, log-and-skip). Without the
                 // in-memory composition we can't tell whether the
                 // patches were uploaded; `has_patches` below would
@@ -2554,7 +2554,7 @@ impl Session {
                 // to a broken shell.
                 if !matches!(
                     &self.inner,
-                    SessionInner::Active {
+                    BoxInner::Active {
                         composition: Some(_),
                         ..
                     }
@@ -2584,7 +2584,7 @@ impl Session {
                 let patches_dir = paths_obj.patches_path();
                 let has_patches = matches!(
                     &self.inner,
-                    SessionInner::Active {
+                    BoxInner::Active {
                         composition: Some(c),
                         ..
                     } if !c.patches().is_empty()
@@ -2625,7 +2625,7 @@ impl Session {
                 // [`composition_needs_staged_scripts`].
                 let needs_staged_scripts = matches!(
                     &self.inner,
-                    SessionInner::Active {
+                    BoxInner::Active {
                         composition: Some(c),
                         ..
                     } if composition_needs_staged_scripts(c)
@@ -2657,7 +2657,7 @@ impl Session {
                 // and the client's activate cleanup removes it.
                 let mut package_check_skipped = false;
                 if self.check_packages_at_finalize
-                    && let SessionInner::Active {
+                    && let BoxInner::Active {
                         composition: Some(comp),
                         ..
                     } = &self.inner
@@ -2674,7 +2674,7 @@ impl Session {
                 // clobber any in-sandbox modifications the user
                 // made in prior attaches). If the composition has
                 // no patches, this is a no-op.
-                if let SessionInner::Active {
+                if let BoxInner::Active {
                     composition: Some(comp),
                     ..
                 } = &self.inner
@@ -2777,7 +2777,7 @@ impl Session {
                 // placement outcome, the host-row binding), and promoting a
                 // stale copy would erase them.
                 let mut record = self.record.record().await?;
-                record.status = SessionStatus::Active;
+                record.status = BoxState::Active;
                 self.record.write(record.clone()).await?;
                 Ok(minimald_rpc::FinalizeSessionResponse {
                     activate_hooks: ran,
@@ -2785,7 +2785,7 @@ impl Session {
                     shared_port_collisions,
                 })
             }
-            SessionStatus::Pending => Err(std::io::Error::new(
+            BoxState::Pending => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "session is Pending; configure the loadout first",
             )),
@@ -2806,8 +2806,8 @@ impl Session {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
         let (sop, rx) = SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, 64).await?;
         match &mut self.inner {
-            SessionInner::Active { sops, .. } => sops.push(sop),
-            SessionInner::Draft { .. } => {
+            BoxInner::Active { sops, .. } => sops.push(sop),
+            BoxInner::Draft { .. } => {
                 sop.shutdown().await;
                 unreachable!("`context()` already rejected a `Draft`");
             }
@@ -2829,8 +2829,8 @@ impl Session {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
         let (sop, rx) = SideOp::spawn_check(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
-            SessionInner::Active { sops, .. } => sops.push(sop),
-            SessionInner::Draft { .. } => {
+            BoxInner::Active { sops, .. } => sops.push(sop),
+            BoxInner::Draft { .. } => {
                 sop.shutdown().await;
                 unreachable!("`context()` already rejected a `Draft`");
             }
@@ -2850,8 +2850,8 @@ impl Session {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
         let (sop, rx) = SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
-            SessionInner::Active { sops, .. } => sops.push(sop),
-            SessionInner::Draft { .. } => {
+            BoxInner::Active { sops, .. } => sops.push(sop),
+            BoxInner::Draft { .. } => {
                 sop.shutdown().await;
                 unreachable!("`context()` already rejected a `Draft`");
             }
@@ -2898,7 +2898,7 @@ impl Session {
             // coordinate sandbox/NetGuard teardown before Destroy deletes the
             // session or terminal-triggered replacement mints a second host —
             // is a heavy architectural lift, not a behavior-preserving patch.
-            // It would restructure `SessionInner` to hold and later await the
+            // It would restructure `BoxInner` to hold and later await the
             // detached task and thread teardown coordination through both the
             // Destroy and replacement paths, a change that cannot be validated
             // here (the wedged-host scenario is not reproducible in this
@@ -2920,7 +2920,7 @@ impl Session {
     /// (NET-045) and parked — with the reply — until they have answered, and
     /// the actor must not park with it, or every probe, read, and shutdown
     /// behind this one would wait on a human. The parked request comes back
-    /// through [`SessionMessage::AskAnswered`]. Everything else is finished
+    /// through [`BoxMessage::AskAnswered`]. Everything else is finished
     /// here, through [`Self::answer_expose`], which writes the one info line
     /// every request logs and the decision's own audit record (NET-046)
     /// beside it.
@@ -3038,7 +3038,7 @@ impl Session {
     /// answer is the only bound it has, and parking the actor on it would
     /// hang `min session policy` reads, manager probes, and a daemon shutdown
     /// behind a dialog nobody may be looking at. It comes back as
-    /// [`SessionMessage::AskAnswered`], which answers the parked reply.
+    /// [`BoxMessage::AskAnswered`], which answers the parked reply.
     ///
     /// Nobody attached is not an error to route — it is the ask's own
     /// fail-closed answer, decided by the daemon, and it goes through the
@@ -3066,7 +3066,7 @@ impl Session {
         // routed to a continuation that would only come back with the same
         // answer.
         let host = match &self.inner {
-            SessionInner::Active {
+            BoxInner::Active {
                 host: Some((host, _)),
                 ..
             } => host.clone(),
@@ -3652,7 +3652,7 @@ impl Session {
     fn has_live_host(&self) -> bool {
         matches!(
             &self.inner,
-            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
         )
     }
 
@@ -4236,8 +4236,8 @@ impl Session {
         }
 
         let inner = match &mut self.inner {
-            SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
-            SessionInner::Draft { .. } => None,
+            BoxInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
+            BoxInner::Draft { .. } => None,
         };
         if let Some((host, mut sops)) = inner {
             for s in sops.drain(..) {
@@ -4248,7 +4248,7 @@ impl Session {
                 // sandbox files backing its rootfs are released before the
                 // caller removes the session's directory tree. The wait is
                 // bounded and aborts a wedged loop rather than parking shutdown
-                // behind it — see [`Session::kill_and_stop_loop`].
+                // behind it — see [`BoxActor::kill_and_stop_loop`].
                 Self::kill_and_stop_loop(&host, &mut task, for_shutdown).await;
             }
         }
@@ -4302,7 +4302,7 @@ impl Session {
         // environment channel. Best-effort: the record-side rename has
         // already succeeded, and a dead host drops the message silently.
         if written.is_ok()
-            && let SessionInner::Active {
+            && let BoxInner::Active {
                 host: Some((host, _)),
                 ..
             } = &self.inner
@@ -4315,7 +4315,7 @@ impl Session {
 
     async fn attach(
         &mut self,
-        session_hnd: SessionHandle,
+        session_hnd: BoxHandle,
         conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
@@ -4408,7 +4408,7 @@ impl Session {
         // record's on-disk `Materializing` status still leaves it
         // reachable for `DestroySession`) and refuse the attach with
         // an actionable error naming the required explicit flow.
-        if let SessionInner::Draft { pending: None } = &self.inner {
+        if let BoxInner::Draft { pending: None } = &self.inner {
             // Refuse the shortcut while the workspace upload is still
             // streaming: it configures against whatever the tree holds
             // right now, and mid-upload that is a half-populated workspace
@@ -4446,7 +4446,7 @@ impl Session {
                 .map_err(AttachError::LoadoutFailed)?;
             let has_patches = matches!(
                 &self.inner,
-                SessionInner::Active {
+                BoxInner::Active {
                     composition: Some(c),
                     ..
                 } if !c.patches().is_empty()
@@ -4480,14 +4480,14 @@ impl Session {
         // Attach is gated on `Active` — a Materializing session has
         // a composition but its patches may not be on disk yet,
         // and materializing without them would produce a broken
-        // sandbox rootfs. See [`Session::finalize`] for the
+        // sandbox rootfs. See [`BoxActor::finalize`] for the
         // transition.
         let record = self
             .record
             .record()
             .await
             .map_err(AttachError::LoadoutFailed)?;
-        if record.status != SessionStatus::Active {
+        if record.status != BoxState::Active {
             return Err(AttachError::SessionPending);
         }
         // Before any respawn or re-mint below: a registered box whose row is
@@ -4520,7 +4520,7 @@ impl Session {
         let kept_for_host_row = !respawn_for_terminal
             && replaces_host_for_terminal(self.host_origin, declares_terminal, false);
         if respawn_for_terminal
-            && let SessionInner::Active {
+            && let BoxInner::Active {
                 host: slot @ Some(_),
                 ..
             } = &mut self.inner
@@ -4531,7 +4531,7 @@ impl Session {
             let (handle, mut join) = slot.take().expect("matched on Some");
             // Bound the wait for the hook host to wind down, aborting a wedged
             // loop rather than parking the attach behind it. Same bounded
-            // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
+            // kill-and-stop as shutdown; see [`BoxActor::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
         } else if kept_for_host_row {
             tracing::info!(
@@ -4543,8 +4543,8 @@ impl Session {
         let host = match &mut self.inner {
             // Awaiting a verdict: a client is mid create flow, and composing
             // over it here would discard the items it is still gating.
-            SessionInner::Draft { .. } => return Err(AttachError::SessionPending),
-            SessionInner::Active { host, .. } => host,
+            BoxInner::Draft { .. } => return Err(AttachError::SessionPending),
+            BoxInner::Active { host, .. } => host,
         };
         match host {
             None => {
@@ -4628,7 +4628,7 @@ impl Session {
     )]
     async fn launch_host(
         &mut self,
-        session_hnd: SessionHandle,
+        session_hnd: BoxHandle,
         conn_username: String,
         sz: WinSize,
         attach_env: box_runtime::AttachEnv,
@@ -4690,7 +4690,7 @@ impl Session {
                 sz,
                 channel: None,
                 // Mint a handle to this session ID in the sessions actor/manager.
-                control: Some(SessionControl::new(self.manager.clone(), record.id)),
+                control: Some(BoxControl::new(self.manager.clone(), record.id)),
                 delta,
                 archives_dir,
                 // A registered box: its shell-exit prompt says a kept session's
@@ -4835,7 +4835,7 @@ impl Session {
         self.relaunch_row_confirmed = false;
         let slot_alive = matches!(
             &self.inner,
-            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
         );
         if record.box_addresses.is_none()
             || !record.host_row_bound
@@ -4981,7 +4981,7 @@ impl Session {
     /// an exec request is not the place to start one.
     async fn ensure_host(
         &mut self,
-        session_hnd: SessionHandle,
+        session_hnd: BoxHandle,
         conn_username: String,
     ) -> Result<box_runtime::HostHandle, AttachError> {
         {
@@ -4990,7 +4990,7 @@ impl Session {
                 .record()
                 .await
                 .map_err(AttachError::LoadoutFailed)?;
-            if record.status != SessionStatus::Active {
+            if record.status != BoxState::Active {
                 return Err(AttachError::SessionPending);
             }
             // Attach's refusal, for the same reason: neither the host a
@@ -5002,11 +5002,11 @@ impl Session {
         }
 
         let running = match &self.inner {
-            SessionInner::Draft { .. } => return Err(AttachError::SessionPending),
-            SessionInner::Active {
+            BoxInner::Draft { .. } => return Err(AttachError::SessionPending),
+            BoxInner::Active {
                 host: Some((h, _)), ..
             } if h.is_alive() => Some(h.clone()),
-            SessionInner::Active { .. } => None,
+            BoxInner::Active { .. } => None,
         };
         if let Some(host) = running {
             // Same claim as the launch below, for a host this call did not
@@ -5032,7 +5032,7 @@ impl Session {
             .await?;
 
         let host = launched.0.clone();
-        let SessionInner::Active { host: slot, .. } = &mut self.inner else {
+        let BoxInner::Active { host: slot, .. } = &mut self.inner else {
             unreachable!("ensure_host returns early on a Draft session");
         };
         *slot = Some(launched);
@@ -5044,7 +5044,7 @@ impl Session {
 
     async fn mint_session_host(
         &mut self,
-        session_hnd: SessionHandle,
+        session_hnd: BoxHandle,
         conn_username: String,
         channel: Channel<Msg>,
         sz: WinSize,
@@ -5101,7 +5101,7 @@ impl Session {
             // a busy-but-healthy shell. The host is still stored below.
             Err(box_runtime::HostAttachError::Timeout) => Err(AttachError::SessionBusy),
         };
-        let SessionInner::Active { host, .. } = &mut self.inner else {
+        let BoxInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
         // A wedged-but-alive host can reach here via attach's re-mint branch
@@ -5125,7 +5125,7 @@ impl Session {
     /// [`Self::run_detach_hooks`]'s): without it, a transition would pay for
     /// a sandbox no hook is going to use.
     fn has_hooks_for(&self, event: crate::hooks::HookEvent) -> bool {
-        let SessionInner::Active {
+        let BoxInner::Active {
             composition: Some(c),
             ..
         } = &self.inner
@@ -5222,7 +5222,7 @@ impl Session {
     async fn launch_host_for_hooks(&mut self, phase: LaunchPhase) -> Result<(), std::io::Error> {
         if matches!(
             &self.inner,
-            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+            BoxInner::Active { host: Some((h, _)), .. } if h.is_alive()
         ) {
             return Ok(());
         }
@@ -5253,7 +5253,7 @@ impl Session {
                 phase,
                 // This launch exists only so the hooks have namespaces to
                 // join — a hook run, not a session start. See
-                // [`Session::launch_host`].
+                // [`BoxActor::launch_host`].
                 true,
             )
             .await
@@ -5261,7 +5261,7 @@ impl Session {
                 std::io::Error::other(format!("launching the session to run its hooks: {e}"))
             })?
             .1;
-        let SessionInner::Active { host, .. } = &mut self.inner else {
+        let BoxInner::Active { host, .. } = &mut self.inner else {
             unreachable!("a headless hook launch only reaches here from the Active state");
         };
         *host = Some(launched);
@@ -5277,8 +5277,8 @@ impl Session {
     #[cfg_attr(test, allow(dead_code))]
     fn composition(&self) -> Option<Arc<Composition>> {
         match &self.inner {
-            SessionInner::Active { composition, .. } => composition.clone(),
-            SessionInner::Draft { .. } => None,
+            BoxInner::Active { composition, .. } => composition.clone(),
+            BoxInner::Draft { .. } => None,
         }
     }
 
@@ -5287,7 +5287,7 @@ impl Session {
     #[cfg(not(test))]
     async fn session_launcher(
         &mut self,
-        session: SessionHandle,
+        session: BoxHandle,
         record: &Record,
         attach_env: box_runtime::AttachEnv,
         phase: LaunchPhase,
@@ -5365,7 +5365,7 @@ impl Session {
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.
             session: session.downgrade(),
-            // What this launch is for; see [`Session::launch_host`].
+            // What this launch is for; see [`BoxActor::launch_host`].
             for_hooks,
             // The classifier tree the privileged step installs natively and
             // the guest's own boot mounts; see the field's doc.
@@ -5393,13 +5393,13 @@ impl Session {
     ///
     /// Kept separate from the production launcher: the two return *different*
     /// launcher types (`SandboxLauncher` vs `MockLauncher`), each with its own
-    /// `SessionProcess`/`SessionGuard` associated types, and `SessionLauncher`
+    /// `BoxProcess`/`BoxGuard` associated types, and `BoxLauncher`
     /// is not object-safe — merging them would force a boxed/dyn launcher
     /// through the production spawn path.
     #[cfg(test)]
     async fn session_launcher(
         &mut self,
-        _session: SessionHandle,
+        _session: BoxHandle,
         record: &Record,
         _attach_env: box_runtime::AttachEnv,
         _phase: LaunchPhase,
@@ -5494,8 +5494,8 @@ impl Session {
     /// This is NOT cached to enable session execution to change as the
     /// `minimal.toml` file changes.
     ///
-    /// Gated on the same lifecycle status as [`Session::attach`]:
-    /// the on-disk record must be `Active`. `SessionInner::Active`
+    /// Gated on the same lifecycle status as [`BoxActor::attach`]:
+    /// the on-disk record must be `Active`. `BoxInner::Active`
     /// alone doesn't distinguish `Materializing` (composition done,
     /// patches not yet uploaded and not yet materialized into the
     /// sandbox home) from `Active` (fully ready). Building a
@@ -5505,13 +5505,13 @@ impl Session {
     /// added to prevent.
     ///
     /// The one caller that legitimately runs before the promotion —
-    /// [`Session::finalize`]'s activation-hook launch — reaches
+    /// [`BoxActor::finalize`]'s activation-hook launch — reaches
     /// [`Self::build_context`] directly instead, via
     /// [`LaunchPhase::Activating`]. It materializes the home dir first, so
     /// it satisfies the invariant this gate protects without being able to
     /// satisfy the gate itself.
     async fn context(&mut self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
-        if matches!(&self.inner, SessionInner::Draft { .. }) {
+        if matches!(&self.inner, BoxInner::Draft { .. }) {
             return Err("session is pending composition".to_string());
         }
         let record = self
@@ -5519,7 +5519,7 @@ impl Session {
             .record()
             .await
             .map_err(|e| format!("reading session record: {e}"))?;
-        if record.status != SessionStatus::Active {
+        if record.status != BoxState::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
              finish the activation first)",
@@ -5730,10 +5730,10 @@ impl Session {
         }
     }
 
-    async fn paths(&self) -> SessionPaths {
+    async fn paths(&self) -> BoxPaths {
         let obj = self.record.object().await.unwrap();
 
-        SessionPaths {
+        BoxPaths {
             working: obj.workspace_path(),
             cache: obj.cache_path(),
             home: obj.home_path(),
@@ -5745,20 +5745,20 @@ impl Session {
 
 /// The handle to the session.
 #[derive(Debug, Clone)]
-pub struct SessionHandle(crate::traced::Sender<SessionMessage>);
+pub struct BoxHandle(crate::traced::Sender<BoxMessage>);
 
-impl SessionHandle {
+impl BoxHandle {
     /// Returns a non-owning handle to this session.
     #[must_use]
-    pub fn downgrade(&self) -> WeakSessionHandle {
-        WeakSessionHandle(self.0.downgrade())
+    pub fn downgrade(&self) -> WeakBoxHandle {
+        WeakBoxHandle(self.0.downgrade())
     }
 
     /// The session's composition, if it has one. See
-    /// [`SessionMessage::GetComposition`].
+    /// [`BoxMessage::GetComposition`].
     pub async fn composition(&self) -> Result<Option<Arc<Composition>>, std::io::Error> {
         let (send, recv) = oneshot::channel();
-        let _ = self.0.send(SessionMessage::GetComposition(send)).await;
+        let _ = self.0.send(BoxMessage::GetComposition(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -5773,10 +5773,7 @@ impl SessionHandle {
     pub async fn patches_upload_lock(&self) -> Result<Arc<Mutex<()>>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self
-            .0
-            .send(SessionMessage::GetPatchesUploadLock(send))
-            .await;
+        let _ = self.0.send(BoxMessage::GetPatchesUploadLock(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -5790,7 +5787,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::GetHookScriptsUploadLock(send))
+            .send(BoxMessage::GetHookScriptsUploadLock(send))
             .await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
@@ -5812,7 +5809,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::SetWorkspaceUploadInFlight(in_flight, send))
+            .send(BoxMessage::SetWorkspaceUploadInFlight(in_flight, send))
             .await;
         match recv.await {
             Ok(true) => Ok(()),
@@ -5835,7 +5832,7 @@ impl SessionHandle {
     /// detached task instead. A dead actor needs no clear and is ignored.
     pub fn end_workspace_upload_detached(&self) {
         let (send, _) = oneshot::channel();
-        let msg = SessionMessage::SetWorkspaceUploadInFlight(false, send);
+        let msg = BoxMessage::SetWorkspaceUploadInFlight(false, send);
         if let Err(mpsc::error::TrySendError::Full(msg)) = self.0.try_send(msg)
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
@@ -5860,7 +5857,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::StartBuild {
+            .send(BoxMessage::StartBuild {
                 rebuild,
                 pkgs,
                 reply,
@@ -5882,10 +5879,7 @@ impl SessionHandle {
     ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
         let (reply, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self
-            .0
-            .send(SessionMessage::StartCheck { opts, reply })
-            .await;
+        let _ = self.0.send(BoxMessage::StartCheck { opts, reply }).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })?
@@ -5903,7 +5897,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::StartMaterialize { opts, reply })
+            .send(BoxMessage::StartMaterialize { opts, reply })
             .await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
@@ -5913,10 +5907,10 @@ impl SessionHandle {
     /// Returns paths on the daemon backing various internals of the session.
     /// A dead actor (self-terminated abort/failed-verdict/create-failure, or
     /// mid-teardown) maps to `NotConnected` — callers race actor death.
-    pub async fn paths(&self) -> Result<SessionPaths, std::io::Error> {
+    pub async fn paths(&self) -> Result<BoxPaths, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetPaths(send)).await;
+        let _ = self.0.send(BoxMessage::GetPaths(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -5927,7 +5921,7 @@ impl SessionHandle {
     pub async fn get_attrs(&self) -> Option<HostAttrs> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetHostAttrs(send)).await;
+        let _ = self.0.send(BoxMessage::GetHostAttrs(send)).await;
         recv.await.ok().flatten()
     }
 
@@ -5938,7 +5932,7 @@ impl SessionHandle {
     pub async fn workspace_at_risk(&self) -> minimald_rpc::SessionDeltaResponse {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetWorkspaceDelta(send)).await;
+        let _ = self.0.send(BoxMessage::GetWorkspaceDelta(send)).await;
         recv.await
             .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
     }
@@ -5947,7 +5941,7 @@ impl SessionHandle {
     pub async fn get_screen(&self) -> Option<minimald_rpc::ScreenSnapshot> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetHostScreen(send)).await;
+        let _ = self.0.send(BoxMessage::GetHostScreen(send)).await;
         recv.await.ok().flatten()
     }
 
@@ -5958,7 +5952,7 @@ impl SessionHandle {
     pub async fn run_detach_hooks(&self) {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::RunDetachHooks(send)).await;
+        let _ = self.0.send(BoxMessage::RunDetachHooks(send)).await;
         let _ = recv.await;
     }
 
@@ -5966,7 +5960,7 @@ impl SessionHandle {
     pub async fn context(&self) -> Result<mctx::Context, String> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::MakeContext(send)).await;
+        let _ = self.0.send(BoxMessage::MakeContext(send)).await;
         recv.await
             .unwrap_or_else(|_| Err("session actor is gone".to_string()))
     }
@@ -5998,7 +5992,7 @@ impl SessionHandle {
     pub(crate) async fn record(&self) -> Result<Record, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetRecord(send)).await;
+        let _ = self.0.send(BoxMessage::GetRecord(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -6011,7 +6005,7 @@ impl SessionHandle {
     ) -> Result<Arc<Mutex<crate::net::SwitchClient>>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetNetSwitch(send)).await;
+        let _ = self.0.send(BoxMessage::GetNetSwitch(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -6036,7 +6030,7 @@ impl SessionHandle {
         )]
         let _ = self
             .0
-            .send(SessionMessage::ExposeDynamic { port, reply: send })
+            .send(BoxMessage::ExposeDynamic { port, reply: send })
             .await;
         match recv.await {
             Ok(reply) => reply,
@@ -6056,13 +6050,13 @@ impl SessionHandle {
         )]
         let _ = self
             .0
-            .send(SessionMessage::BindHandedPort { address, port })
+            .send(BoxMessage::BindHandedPort { address, port })
             .await;
     }
 
     /// Continues a parked runtime port-publish ask (NET-045) with the attached
     /// human's answer, or its absence — sent by the task
-    /// [`Session::route_ask`] spawned, never by the actor itself. Keyed by the
+    /// [`BoxActor::route_ask`] spawned, never by the actor itself. Keyed by the
     /// ask's [`AskId`] so the answer reaches the ask it answers. Best-effort
     /// by shape: a session that has already stopped has answered its asks
     /// fail-closed, so a message that does not land is the normal end of a
@@ -6075,7 +6069,7 @@ impl SessionHandle {
         )]
         let _ = self
             .0
-            .send(SessionMessage::AskAnswered { id, port, answer })
+            .send(BoxMessage::AskAnswered { id, port, answer })
             .await;
     }
 
@@ -6091,7 +6085,7 @@ impl SessionHandle {
             clippy::let_underscore_must_use,
             reason = "the actor may already be gone; an empty peek is the honest answer then"
         )]
-        let _ = self.0.send(SessionMessage::PeekPendingAsks(send)).await;
+        let _ = self.0.send(BoxMessage::PeekPendingAsks(send)).await;
         // A dead actor has no asks parked, and `Vec`'s default says exactly
         // that — which is also the truth about a session that stopped, since
         // `stop_running` answered them all fail-closed first.
@@ -6099,7 +6093,7 @@ impl SessionHandle {
     }
 
     /// Test-only: clones of the box's shared runtime ingress cell and
-    /// publication set (see [`SessionMessage::PeekIngressCells`]). `None` once
+    /// publication set (see [`BoxMessage::PeekIngressCells`]). `None` once
     /// the actor is gone.
     #[cfg(test)]
     pub(crate) async fn ingress_cells(
@@ -6113,7 +6107,7 @@ impl SessionHandle {
             clippy::let_underscore_must_use,
             reason = "the actor may already be gone; the recv below reports that"
         )]
-        let _ = self.0.send(SessionMessage::PeekIngressCells(send)).await;
+        let _ = self.0.send(BoxMessage::PeekIngressCells(send)).await;
         recv.await.ok()
     }
 
@@ -6127,7 +6121,7 @@ impl SessionHandle {
             clippy::let_underscore_must_use,
             reason = "the actor may already be gone; the recv below reports that"
         )]
-        let _ = self.0.send(SessionMessage::LiveIngress(send)).await;
+        let _ = self.0.send(BoxMessage::LiveIngress(send)).await;
         #[expect(
             clippy::map_err_ignore,
             reason = "a closed oneshot carries no cause beyond the actor being gone"
@@ -6147,7 +6141,7 @@ impl SessionHandle {
             clippy::let_underscore_must_use,
             reason = "the actor may already be gone; the recv below reports that"
         )]
-        let _ = self.0.send(SessionMessage::GetDenyAllOptOut(send)).await;
+        let _ = self.0.send(BoxMessage::GetDenyAllOptOut(send)).await;
         #[expect(
             clippy::map_err_ignore,
             reason = "a closed oneshot carries no cause beyond the actor being gone"
@@ -6170,7 +6164,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::ConfigureLoadout(contribution, send))
+            .send(BoxMessage::ConfigureLoadout(contribution, send))
             .await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
@@ -6182,21 +6176,21 @@ impl SessionHandle {
 
     /// Submit the client's contribution verdict against a `Draft` session.
     /// On success the actor promotes its record from `Pending` to
-    /// `Materializing` and replies with [`SessionStep::Materialized`]; the
+    /// `Materializing` and replies with [`BoxStep::Materialized`]; the
     /// client still has to upload patches and call `FinalizeSession`
     /// before the session becomes attachable. Structured failures
     /// (wrong state, an unresumable verdict) come back as
-    /// [`SessionStep::Fault`]. A dead actor maps to `NotConnected`
+    /// [`BoxStep::Fault`]. A dead actor maps to `NotConnected`
     /// (the caller reads it as unknown-session).
     pub(crate) async fn submit_verdict(
         &self,
         verdict: ContributionVerdict,
-    ) -> Result<SessionStep, std::io::Error> {
+    ) -> Result<BoxStep, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::SubmitVerdict(Box::new((verdict, send))))
+            .send(BoxMessage::SubmitVerdict(Box::new((verdict, send))))
             .await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
@@ -6209,14 +6203,14 @@ impl SessionHandle {
     /// Promote a `Materializing` session to `Active`, gating on the
     /// patches-ready marker having been written by a completed
     /// `WorkspacePatchesTarZst` upload. Idempotent on already-Active
-    /// sessions. See [`Session::finalize`] for the state-machine
+    /// sessions. See [`BoxActor::finalize`] for the state-machine
     /// contract.
     pub(crate) async fn finalize(
         &self,
     ) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::Finalize(send)).await;
+        let _ = self.0.send(BoxMessage::Finalize(send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -6231,7 +6225,7 @@ impl SessionHandle {
     pub(crate) async fn abort(&self) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::Abort(send)).await;
+        let _ = self.0.send(BoxMessage::Abort(send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -6246,12 +6240,12 @@ impl SessionHandle {
     pub(crate) async fn is_busy(&self) -> bool {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::IsBusy(send)).await;
+        let _ = self.0.send(BoxMessage::IsBusy(send)).await;
         recv.await.unwrap_or(false)
     }
 
     /// Test-only: turn on the finalize package check for this session,
-    /// bounded by `deadline` (see [`SessionMessage::CheckPackagesAtFinalize`]
+    /// bounded by `deadline` (see [`BoxMessage::CheckPackagesAtFinalize`]
     /// and [`PACKAGE_CHECK_DEADLINE`]).
     #[cfg(test)]
     pub(crate) async fn check_packages_at_finalize(&self, deadline: std::time::Duration) {
@@ -6262,7 +6256,7 @@ impl SessionHandle {
         )]
         let _ = self
             .0
-            .send(SessionMessage::CheckPackagesAtFinalize(deadline, send))
+            .send(BoxMessage::CheckPackagesAtFinalize(deadline, send))
             .await;
         recv.await.expect("the session actor should ack the switch");
     }
@@ -6273,7 +6267,7 @@ impl SessionHandle {
     #[cfg(test)]
     pub(crate) async fn peek_composition(&self) -> Option<Arc<Composition>> {
         let (send, recv) = oneshot::channel();
-        let _ = self.0.send(SessionMessage::PeekComposition(send)).await;
+        let _ = self.0.send(BoxMessage::PeekComposition(send)).await;
         recv.await.ok().flatten()
     }
 
@@ -6283,7 +6277,7 @@ impl SessionHandle {
     pub(crate) async fn rename(&self, new_name: String) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::Rename(new_name, send)).await;
+        let _ = self.0.send(BoxMessage::Rename(new_name, send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -6298,7 +6292,7 @@ impl SessionHandle {
     pub(crate) async fn stop(&self) {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::Stop(send)).await;
+        let _ = self.0.send(BoxMessage::Stop(send)).await;
         // If the actor died before acking, it is stopped all the same.
         let _ = recv.await;
     }
@@ -6312,7 +6306,7 @@ impl SessionHandle {
     pub(crate) async fn destroy(&self) -> Result<Vec<String>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::Destroy(send)).await;
+        let _ = self.0.send(BoxMessage::Destroy(send)).await;
         recv.await.unwrap_or(Ok(Vec::new()))
     }
 
@@ -6336,11 +6330,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::EnsureHost(
-                send,
-                self.clone(),
-                conn_username,
-            ))
+            .send(BoxMessage::EnsureHost(send, self.clone(), conn_username))
             .await;
         match recv.await {
             Ok(result) => result,
@@ -6360,7 +6350,7 @@ impl SessionHandle {
     pub async fn track_forward(&self, forward: tokio::task::AbortHandle) {
         // Ignore send errors - a session that is gone has nothing left to
         // track, and the forward ends with it.
-        let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
+        let _ = self.0.send(BoxMessage::TrackForward(forward)).await;
     }
 
     /// `attacher` is the attaching connection's liveness: while the session
@@ -6376,7 +6366,7 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::Attach(
+            .send(BoxMessage::Attach(
                 send,
                 self.clone(),
                 conn_username,
@@ -6397,25 +6387,25 @@ impl SessionHandle {
     }
 }
 
-/// A non-owning handle to the [`Session`] actor.
+/// A non-owning handle to the [`BoxActor`] actor.
 #[derive(Debug, Clone)]
-pub struct WeakSessionHandle(crate::traced::WeakSender<SessionMessage>);
+pub struct WeakBoxHandle(crate::traced::WeakSender<BoxMessage>);
 
-impl WeakSessionHandle {
-    /// Promotes to a strong [`SessionHandle`], or `None` if the session actor
+impl WeakBoxHandle {
+    /// Promotes to a strong [`BoxHandle`], or `None` if the session actor
     /// has already shut down (all strong senders dropped).
     #[must_use]
-    pub fn upgrade(&self) -> Option<SessionHandle> {
-        Some(SessionHandle(self.0.upgrade()?))
+    pub fn upgrade(&self) -> Option<BoxHandle> {
+        Some(BoxHandle(self.0.upgrade()?))
     }
 
     /// A dangling handle whose actor is already gone (`upgrade` always yields
     /// `None`). Test-only: lets fixtures that never exercise the session
-    /// round-trip satisfy an `EnvArgs`/`SessionChannel` that now requires a
+    /// round-trip satisfy an `EnvArgs`/`BoxChannel` that now requires a
     /// handle, without standing up a live actor.
     #[cfg(test)]
     pub(crate) fn dangling() -> Self {
-        let (tx, _rx) = crate::traced::channel::<SessionMessage>(1);
+        let (tx, _rx) = crate::traced::channel::<BoxMessage>(1);
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
@@ -6426,7 +6416,7 @@ impl WeakSessionHandle {
     /// the next of `answers`, and drops the reply channel for any request
     /// past them — the dead-actor path no live actor can be made to take on
     /// demand. Test-only: lets the env channel's tests drive the typed
-    /// failures [`SessionHandle::expose_dynamic`] hands back, without
+    /// failures [`BoxHandle::expose_dynamic`] hands back, without
     /// standing up a session whose publish genuinely fails. The stand-in
     /// keeps its strong sender alive for the test's runtime, so `upgrade()`
     /// holds; only messages it answers reach a reply.
@@ -6434,7 +6424,7 @@ impl WeakSessionHandle {
     pub(crate) fn answering(
         answers: Vec<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     ) -> Self {
-        let (tx, mut rx) = crate::traced::channel::<SessionMessage>(1);
+        let (tx, mut rx) = crate::traced::channel::<BoxMessage>(1);
         let weak = tx.downgrade();
         crate::traced::spawn(async move {
             // Hold the strong sender for the runtime the test lives in:
@@ -6445,7 +6435,7 @@ impl WeakSessionHandle {
             while let Some((message, _span)) = rx.recv().await {
                 // Past the script, no answer is sent: `reply` drops
                 // unanswered, which the asker types as the actor being gone.
-                if let SessionMessage::ExposeDynamic { reply, .. } = message
+                if let BoxMessage::ExposeDynamic { reply, .. } = message
                     && let Some(answer) = answers.next()
                 {
                     #[expect(
@@ -6704,7 +6694,7 @@ pub(crate) mod listen_plan_seam {
 
     use crate::net::listeners::BoxPublications;
     use crate::net::policy::ControlChannel;
-    use crate::net::switch::SessionGate;
+    use crate::net::switch::BoxGate;
 
     /// The facts a test hands the mock launch it seeds.
     pub(crate) struct Seeded {
@@ -6717,7 +6707,7 @@ pub(crate) mod listen_plan_seam {
         /// The gvproxy control channel the watcher's forwarder verbs ride.
         pub(crate) control: ControlChannel,
         /// The box's session gate: the permit decision and the admission.
-        pub(crate) gate: Arc<SessionGate>,
+        pub(crate) gate: Arc<BoxGate>,
     }
 
     static SEEDED: Mutex<Option<HashMap<SessionId, Seeded>>> = Mutex::new(None);

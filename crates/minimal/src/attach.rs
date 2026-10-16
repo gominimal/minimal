@@ -402,10 +402,10 @@ impl fmt::Display for SessionCandidate {
 /// the client's verdict, `Materializing` has finalized its composition but
 /// is still ingesting patches. Both render with the hollow glyph so the
 /// picker communicates "not-yet-ready" uniformly.
-fn state_glyph(status: boxes::SessionStatus) -> &'static str {
+fn state_glyph(status: boxes::BoxState) -> &'static str {
     match status {
-        boxes::SessionStatus::Active => "●",
-        boxes::SessionStatus::Pending | boxes::SessionStatus::Materializing => "◯",
+        boxes::BoxState::Active => "●",
+        boxes::BoxState::Pending | boxes::BoxState::Materializing => "◯",
     }
 }
 
@@ -582,11 +582,11 @@ pub(crate) fn ambiguous_no_input_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxes::SessionStatus;
+    use boxes::BoxState;
     use minimald_rpc::{ListSessionsEntry, RunningSessionAttrs};
     use paths::HostAbsPath;
 
-    fn entry(id: &str, path: &str, status: SessionStatus) -> ListSessionsEntry {
+    fn entry(id: &str, path: &str, status: BoxState) -> ListSessionsEntry {
         ListSessionsEntry {
             id: boxes::SessionId::parse_str(id).unwrap(),
             name: None,
@@ -601,7 +601,7 @@ mod tests {
 
     /// Like [`entry`] but builds a session with no project_path, simulating an
     /// entry from an older daemon that predates the field.
-    fn entry_no_path(id: &str, status: SessionStatus) -> ListSessionsEntry {
+    fn entry_no_path(id: &str, status: BoxState) -> ListSessionsEntry {
         ListSessionsEntry {
             id: boxes::SessionId::parse_str(id).unwrap(),
             name: None,
@@ -728,7 +728,7 @@ mod tests {
         let entries = vec![entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/elsewhere",
-            SessionStatus::Active,
+            BoxState::Active,
         )];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => {
@@ -747,12 +747,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
@@ -772,17 +772,17 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0077",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
@@ -800,12 +800,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/c")) {
@@ -819,7 +819,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(label.starts_with("● "), "active glyph prefix: {label}");
@@ -852,7 +852,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Pending,
+            BoxState::Pending,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(label.starts_with("◯ "), "pending glyph prefix: {label}");
@@ -864,12 +864,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         let msg = ambiguous_no_input_message(&entries, &cwd("/a"));
@@ -887,7 +887,7 @@ mod tests {
     fn entry_without_project_path_never_matches_cwd_but_still_attaches() {
         let entries = vec![entry_no_path(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
-            SessionStatus::Active,
+            BoxState::Active,
         )];
         // Single session, no cwd match → attach directly.
         match resolve_for_attach(&entries, &cwd("/a")) {
@@ -900,14 +900,8 @@ mod tests {
 
         // Two pathless sessions → pick over all, none tagged as cwd.
         let entries = vec![
-            entry_no_path(
-                "019f5d0f-0a99-78b1-9165-0809440f0052",
-                SessionStatus::Active,
-            ),
-            entry_no_path(
-                "019f5d0f-0a99-78b1-9165-0809440f0066",
-                SessionStatus::Active,
-            ),
+            entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0052", BoxState::Active),
+            entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0066", BoxState::Active),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Pick(cands) => {
@@ -928,7 +922,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(
@@ -946,7 +940,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/elsewhere",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         assert_eq!(
             created_from_suffix(&e, &cwd("/a")),
@@ -959,17 +953,14 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 
     #[test]
     fn created_from_suffix_empty_when_project_path_absent() {
-        let e = entry_no_path(
-            "019f5d0f-0a99-78b1-9165-0809440f0052",
-            SessionStatus::Active,
-        );
+        let e = entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0052", BoxState::Active);
         assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 
@@ -992,7 +983,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let row = PickerRow::Session(SessionCandidate {
             entry: Box::new(e.clone()),

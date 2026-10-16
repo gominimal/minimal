@@ -925,7 +925,7 @@ mod tests {
             id: sid(n),
             name: Some(name.to_string()),
             project_path: Some(paths::HostAbsPath::try_new("/src/x").unwrap()),
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     /// The Policy pane's text for one session with this mode and policy.
-    fn policy_text(network: boxes::NetworkMode, policy: boxes::SessionPolicy) -> String {
+    fn policy_text(network: boxes::NetworkMode, policy: boxes::BoxPolicy) -> String {
         let key = SessionKey {
             provider: "host".to_string(),
             id: sid(1),
@@ -1040,7 +1040,7 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/src/x").unwrap(),
             network,
             policy: policy.clone(),
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1055,7 +1055,7 @@ mod tests {
             key.clone(),
             crate::dash::app::Detail {
                 record: Some(record),
-                policy: Some(boxes::EffectiveSessionPolicy {
+                policy: Some(boxes::EffectiveBoxPolicy {
                     egress: policy
                         .egress
                         .clone()
@@ -1085,7 +1085,7 @@ mod tests {
             let list = |entries: Vec<&str>| Some(entries.into_iter().map(String::from).collect());
             policy_text(
                 boxes::NetworkMode::OwnIp,
-                boxes::SessionPolicy {
+                boxes::BoxPolicy {
                     egress: Some(boxes::EgressPolicy {
                         allow_subnets: list(allow_subnets),
                         allow_dns_hosts: list(allow_dns_hosts),
@@ -1116,12 +1116,12 @@ mod tests {
     /// and prints no row for a box that declared no lane.
     #[test]
     fn policy_pane_shows_the_credentialed_upstream_lane_when_declared() {
-        let laned = boxes::SessionPolicy {
+        let laned = boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
         };
-        let unlaned = boxes::SessionPolicy {
+        let unlaned = boxes::BoxPolicy {
             credentialed_upstream: None,
             ..laned.clone()
         };

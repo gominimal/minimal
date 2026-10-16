@@ -81,7 +81,7 @@ enum MaintenanceMessage {
 
 /// The daemon's housekeeping actor.
 ///
-/// Follows the actor pattern, like [`crate::box_manager::Manager`]. Here the
+/// Follows the actor pattern, like [`crate::box_manager::BoxManager`]. Here the
 /// pattern is load-bearing rather than incidental: being the single owner of
 /// cache cleaning is what keeps a requested clean from colliding with the
 /// periodic one.

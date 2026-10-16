@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::net::dns;
 use crate::net::policy::{ControlChannel, PortForwarder};
-use crate::net::switch::{SessionGate, SwitchRelay};
+use crate::net::switch::{BoxGate, SwitchRelay};
 use crate::net::{PtaskLease, SwitchClient};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
@@ -239,7 +239,7 @@ impl NetGuard for OwnIpGuard {
 /// a task's ungated relay is bound by its lease too. The gate also carries
 /// the session's DNS dimension — its `egress.allow_dns_hosts` and
 /// `egress.deny_subnets` ride the same
-/// [`SessionGate`](crate::net::switch::SessionGate) into the relay, where
+/// [`BoxGate`](crate::net::switch::BoxGate) into the relay, where
 /// the DNS gate pins the addresses those names resolve to for their
 /// admission window (NET-066), refuses the ones that land in denied ranges
 /// (NET-067), and answers AAAA/HTTPS/SVCB lookups NODATA (NET-136).
@@ -267,7 +267,7 @@ pub(crate) async fn complete_own_ip_attach(
     control: ControlChannel,
     lease: PtaskLease,
     session_name: &str,
-    policy: Option<&boxes::SessionPolicy>,
+    policy: Option<&boxes::BoxPolicy>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
     handed_from_host: bool,
 ) -> io::Result<OwnIpGuard> {
@@ -304,7 +304,7 @@ pub(crate) async fn complete_own_ip_attach(
     // forwarder's revocation sets.
     let gate = policy
         .map(|policy| {
-            SessionGate::for_session(
+            BoxGate::for_session(
                 lease_ip.to_string(),
                 lease_ip,
                 policy,
@@ -381,7 +381,7 @@ async fn finish_own_ip_attach(
     lease: PtaskLease,
     session_name: &str,
     ingress: Option<&boxes::IngressPolicy>,
-    gate: Option<&Arc<SessionGate>>,
+    gate: Option<&Arc<BoxGate>>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
     let lease_ip = lease.ip;
@@ -1259,8 +1259,8 @@ mod tests {
 
     /// The two declared ports the NET-121 proofs publish: host `:8080` and
     /// `:9090`, each forwarding to its own number on the box.
-    fn declared_two_ports() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn declared_two_ports() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
                     boxes::PortMapping {
@@ -1285,8 +1285,8 @@ mod tests {
     /// Three declared ports — one more than any one attach can bind before a
     /// refusal — so a proof can show the rollback of a half-bound box: two
     /// bound, the third refused, and the two unbound with it.
-    fn declared_three_ports() -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn declared_three_ports() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
                     boxes::PortMapping {
@@ -2791,7 +2791,7 @@ mod tests {
             boxes::SessionId::nil(),
         );
         // One declared port: host :48080 forwards to the box's :80.
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![boxes::PortMapping {
                     external_port: HOST_PORT,
@@ -3057,7 +3057,7 @@ mod tests {
         );
         // Two declared ports, one in-box port: the shape that makes a
         // revocation's scoping observable.
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
                     boxes::PortMapping {

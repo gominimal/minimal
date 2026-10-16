@@ -146,20 +146,20 @@ pub struct ContributionVerdict {
 
 /// Daemon's reply to a `SubmitVerdict`: composition finalized (the
 /// record has moved from `Pending` to
-/// [`Materializing`](crate::SessionStatus::Materializing), not yet
+/// [`Materializing`](crate::BoxState::Materializing), not yet
 /// `Active`) or a protocol-level fault the transport layer didn't
 /// catch.
 ///
 /// The client follows up with a patches upload
 /// (`WorkspacePatchesTarZst`) and then `FinalizeSession` to
 /// actually promote the record to
-/// [`Active`](crate::SessionStatus::Active). Only after that step
+/// [`Active`](crate::BoxState::Active). Only after that step
 /// is the session attachable.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionStep {
+pub enum BoxStep {
     /// Composition complete; the session record has been promoted to
-    /// [`Materializing`](crate::SessionStatus::Materializing). The
+    /// [`Materializing`](crate::BoxState::Materializing). The
     /// client must upload the composition's patches and call
     /// `FinalizeSession` before the session is attachable.
     Materialized {
@@ -259,8 +259,8 @@ mod tests {
 
     #[test]
     fn session_step_round_trips_all_variants() {
-        let materialized = SessionStep::Materialized { id: session_id() };
-        let fault = SessionStep::Fault {
+        let materialized = BoxStep::Materialized { id: session_id() };
+        let fault = BoxStep::Fault {
             error: WireError::UnknownSessionId,
         };
         assert_eq!(round_trip(&materialized), materialized);
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn session_step_uses_explicit_kind_tag() {
-        let s = SessionStep::Fault {
+        let s = BoxStep::Fault {
             error: WireError::UnknownSessionId,
         };
         let json = serde_json_lenient::to_string(&s).unwrap();

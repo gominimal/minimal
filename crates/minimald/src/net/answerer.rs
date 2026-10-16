@@ -1388,7 +1388,7 @@ fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &
 /// re-check logged, so the same stale state is named once, not once per
 /// pass, and the return to a matching bind is the one info line it owes.
 async fn recheck_live_carve_outs(
-    manager: &crate::box_manager::ManagerHandle,
+    manager: &crate::box_manager::BoxManagerHandle,
     live: Option<SocketAddr>,
     facts: &HolderFacts,
     said: &mut Option<String>,
@@ -1424,7 +1424,7 @@ async fn recheck_live_carve_outs(
 /// every arm of the comparison, the matching one included, is reachable
 /// from a test.
 async fn recheck_live_carve_outs_against(
-    manager: &crate::box_manager::ManagerHandle,
+    manager: &crate::box_manager::BoxManagerHandle,
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
     facts: &HolderFacts,
@@ -1463,7 +1463,7 @@ async fn recheck_live_carve_outs_against(
             };
             for info in infos {
                 let Some(record) = manager
-                    .get_record(crate::box_manager::SessionKeyPredicate::Id(info.id))
+                    .get_record(crate::box_manager::BoxKeyPredicate::Id(info.id))
                     .await
                     .ok()
                     .flatten()
@@ -1895,7 +1895,7 @@ enum WindowEnd {
 #[expect(clippy::too_many_arguments, reason = "the loop's own state, threaded")]
 async fn host_the_interim(
     state: &crate::server::ServerStateHandle,
-    manager: &crate::box_manager::ManagerHandle,
+    manager: &crate::box_manager::BoxManagerHandle,
     registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
     commands: &mut mpsc::Receiver<HandoverCommand>,
     socket: tokio::net::UdpSocket,
@@ -3634,7 +3634,7 @@ mod tests {
         // box a person attaches is.
         let mut deny_all = crate::test_harness::create_session_req("carve-out-box", "/uwu");
         deny_all.config.policy =
-            minimald_rpc::SessionPolicy::new(Some(minimald_rpc::EgressPolicy::deny_all()), None);
+            minimald_rpc::BoxPolicy::new(Some(minimald_rpc::EgressPolicy::deny_all()), None);
         let id = client.call::<CreateSession>(&deny_all).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client

@@ -844,7 +844,7 @@ impl EgressRules {
     ///
     /// The caller is the compile of a whole session policy, the only place
     /// that holds both halves — the declaration ([`crate::CredentialedUpstream`],
-    /// carried on the [`crate::SessionPolicy`]) and the switch subnet its
+    /// carried on the [`crate::BoxPolicy`]) and the switch subnet its
     /// address is drawn from — so the address arrives already resolved and
     /// the verdict reads one field.
     #[must_use]

@@ -18,7 +18,7 @@ use tokio::{
 
 use crate::{
     ChannelConfig, RequestedPty,
-    box_manager::SessionKeyPredicate,
+    box_manager::BoxKeyPredicate,
     exec,
     rpc::{self},
     server::ServerStateHandle,
@@ -427,7 +427,7 @@ impl russh::server::Handler for ConnectionHandler {
         // task of its own, outside the connection's span.
         let span = attach_span(&config, session_id);
         let mngr = serv.sessions_manager().await;
-        let lookup = mngr.get_session(SessionKeyPredicate::Id(session_id));
+        let lookup = mngr.get_session(BoxKeyPredicate::Id(session_id));
         let session_handle = match tracing::Instrument::instrument(lookup, span.clone()).await {
             Ok(Some(h)) => h,
             Ok(None) => {
@@ -596,7 +596,7 @@ impl ConnectionHandler {
             return Ok(());
         };
         let mngr = serv.sessions_manager().await;
-        let session = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+        let session = match mngr.get_session(BoxKeyPredicate::Id(session_id)).await {
             Ok(Some(session)) => session,
             Ok(None) => {
                 tracing::warn!(
@@ -827,7 +827,7 @@ const IN_BOX_DIAL_LINGER_SECS: u32 = 5;
 /// is its SSH username (the session's UUID), passed to `ensure_host` the way
 /// the exec path does.
 async fn dial_in_box(
-    session: &crate::box_actor::SessionHandle,
+    session: &crate::box_actor::BoxHandle,
     conn_username: &str,
     host: &str,
     port: u16,
@@ -1590,7 +1590,7 @@ kill "$peer" 2>/dev/null
         // the channel the forward was relaying ends with the session.
         let mngr = server.state.sessions_manager().await;
         let session = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
+            .get_session(BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("the session exists until destroyed");

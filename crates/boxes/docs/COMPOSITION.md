@@ -45,7 +45,7 @@ sequenceDiagram
     Note over C: Phase 3 — policy gate pending items, produce verdicts
     C->>D: SubmitVerdict carrying ContributionVerdict
     Note over D: Phase 4a — apply verdicts, assemble Composition, promote record Pending → Materializing
-    D-->>C: SessionStep::Materialized { id }
+    D-->>C: BoxStep::Materialized { id }
     Note over C: Phase 4b — collect approved patch (host_path, dest) pairs from contribution + verdict
     C->>D: WorkspacePatchesTarZst upload (into <workspace>/patches/ atomically, marker written last)
     C->>D: FinalizeSession { session_id }
@@ -83,7 +83,7 @@ The daemon can't reach those paths itself, so the client is
 authoritative for streaming them up before the sandbox home can be
 populated. Splitting the finalize step means an attach against a
 session whose patches never arrived is refused (see
-`SessionStatus::Materializing` below) rather than silently
+`BoxState::Materializing` below) rather than silently
 succeeding into an empty home. The client's `cmd_activate`
 unconditionally follows this order, even for `--sync none` (which
 just skips the *first* upload — Phase 2 then composes against a
@@ -260,18 +260,18 @@ already holds a finalized `Composition` (built directly inside
 `SessionComposer::compose`). The record is written as
 `Materializing` (not `Active`) in one store write, the
 `Composition` is retained on the live session actor
-(`SessionInner::Active { composition, ... }`) for the launcher,
+(`BoxInner::Active { composition, ... }`) for the launcher,
 and `ConfigureLoadoutResponse::Materialized` ships.
 
 **Pending path.** On `ComposeOutcome::Pending`, the daemon
 stashes the matching `PendingComposeState` on the session actor
-(`SessionInner::Draft { pending: Some(state) }`), overwrites the
+(`BoxInner::Draft { pending: Some(state) }`), overwrites the
 placeholder `session_id` on the `ContributionResponse`, and ships
 `ConfigureLoadoutResponse::Pending { response }`. The client then
 runs Phase 3 and sends a `ContributionVerdict` over the
 `SubmitVerdict` RPC. The daemon's `SubmitVerdict` handler:
 
-1. Reads the matching stash entry. Missing → `SessionStep::Fault`
+1. Reads the matching stash entry. Missing → `BoxStep::Fault`
    carrying `WireError::WrongState` (compose state is memory-only;
    see the "resume stash" invariant below). The stash is
    **cloned**, not taken — a verdict that fails to resume has to
@@ -287,7 +287,7 @@ runs Phase 3 and sends a `ContributionVerdict` over the
    that ships two entries for the same id gets an actionable
    "duplicate" error instead of an "unknown" one from the second
    lookup. On any error here the handler returns
-   `SessionStep::Fault` and the actor stays `Draft { pending:
+   `BoxStep::Fault` and the actor stays `Draft { pending:
    Some(_) }`.
 3. Merges the stashed `client_contribution` via
    `Composition::extend_from_wire` — same cross-process conflict
@@ -295,13 +295,13 @@ runs Phase 3 and sends a `ContributionVerdict` over the
 4. Promotes the record `Pending → Materializing` via `store.save`
    (not `Active` — that comes in Phase 4c after the client has
    uploaded patches).
-5. Replaces the actor's `SessionInner::Draft { pending: Some(_) }`
-   with `SessionInner::Active { composition, ... }`. Note the
-   asymmetry: the actor is `Active` (has a composition in memory)
-   while the on-disk record is `Materializing` — the record's
-   status tracks *external* attachability, the actor's `inner`
-   tracks *whether compose has produced a Composition*.
-6. Replies with `SessionStep::Materialized { id }`.
+5. Replaces the actor's `BoxInner::Draft { pending: Some(_) }`
+   with `BoxInner::Active { composition, ... }`.
+   The actor is `Active` (it holds a composition in memory) while
+   the on-disk record is `Materializing`. The record's status
+   tracks *external* attachability. The actor's `inner` tracks
+   *whether compose produced a Composition*.
+6. Replies with `BoxStep::Materialized { id }`.
 
 **Resume stash is in-memory only.** A `Draft` actor spawned from
 an on-disk `Pending` record (daemon restart, or the session was
@@ -364,7 +364,7 @@ The client calls `FinalizeSession` once the patches upload has
 returned cleanly. The daemon:
 
 1. Refuses if the actor is `Materializing` on-disk but the
-   in-memory `SessionInner` has no `composition` — this catches
+   in-memory `BoxInner` has no `composition`. This catches
    a `Materializing` record whose actor was respawned from disk
    after a daemon restart (the composition lives in memory
    only). See the "restart-orphaned records are reaped or
@@ -393,7 +393,7 @@ consumes it when the session's shell is minted: packages and vars
 are fed into the sandbox `Env`; patches (already materialized into
 the sandbox home during Phase 4c) contribute file mappings that
 the launcher's rootfs setup picks up; lifecycle hooks are held on
-`SessionInner::Active { composition, ... }` and logged at `info!`
+`BoxInner::Active { composition, ... }` and logged at `info!`
 with `deferred = true` — the in-sandbox exec plumbing for hooks
 is still to land. Operator visibility is intact:
 `log_session_contents` in `crates/minimald/src/box_runtime.rs`
@@ -404,7 +404,7 @@ enumerates every composition item with its provenance.
 `ConfigureLoadoutResponse::Materialized` (composition finalized in
 one shot) or `ConfigureLoadoutResponse::Pending { response }`
 (client must gate before the composition assembles). `SubmitVerdict`
-returns `SessionStep::Materialized { id }` on success.
+returns `BoxStep::Materialized { id }` on success.
 `WorkspacePatchesTarZst` is a channel subsystem, not a JSON RPC —
 it carries a zstd-compressed tar stream and closes on completion;
 errors return via the channel's stderr. `FinalizeSession` returns
@@ -412,8 +412,8 @@ errors return via the channel's stderr. `FinalizeSession` returns
 `CreateSession` time, so every follow-up RPC and upload targets
 the same session.
 
-**State guards.** A session in `SessionStatus::Pending` or
-`SessionStatus::Materializing` is not attachable via a shell:
+**State guards.** A session in `BoxState::Pending` or
+`BoxState::Materializing` is not attachable via a shell:
 the attach path routes through `configure_loadout` if the
 session is still `Draft`, and rejects `Materializing` records
 with `AttachError::SessionPending`. Metadata-only RPCs
@@ -690,12 +690,12 @@ overload:
   `best_effort_destroy`s the session so operators don't accumulate
   stuck `Materializing` records.
 - **`Materializing` records don't survive daemon restart.** The
-  `SessionInner::Active { composition, .. }` state that Phase 4a
+  `BoxInner::Active { composition, .. }` state that Phase 4a
   produces is persisted to a `composition.json` sidecar alongside
   `record.json` so a restart can restore it for `Active` sessions.
   But a `Materializing` record means the patches upload hasn't
   completed — the sidecar exists but the patches marker doesn't,
-  so `Manager::init` runs `reap_unresumable_records` at startup and
+  so `BoxManager::init` runs `reap_unresumable_records` at startup and
   deletes any `Pending` or `Materializing` record it finds (with an
   `info!` log). If a race lets one through, `finalize` refuses with
   an `InvalidInput` fault ("session is Materializing but has no
@@ -725,7 +725,7 @@ overload:
   each other. Each upload writes to a per-upload unique staging
   directory (`patches.upload.<nanos>.tmp`), so the unpack phases
   never share disk state. The install-and-marker step then takes
-  a per-session mutex (`SessionHandle::patches_upload_lock`), so
+  a per-session mutex (`BoxHandle::patches_upload_lock`), so
   only one upload at a time is running the `RENAME_EXCHANGE +
   marker write` critical section — the second upload's swap
   observes the first's finished tree as its "old contents" and

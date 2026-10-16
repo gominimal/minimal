@@ -10,7 +10,7 @@
 //! whichever of its processes holds it — polls and diffs them, and:
 //!
 //! * **publishes** each new listening port the shared verdict permits
-//!   ([`SessionGate::listen_verdict`], the pure decision in
+//!   ([`BoxGate::listen_verdict`], the pure decision in
 //!   `boxes::core::egress` the Kani harness exhausts): a forward bound at
 //!   the box's own address, at the port the process listens on — no
 //!   translation, the same number on both sides, exactly as a declaration's
@@ -135,7 +135,7 @@ use boxes::IpProto;
 use boxes::core::egress::ListenVerdict;
 
 use super::policy::{ControlChannel, ExposedMapping, expose_mapping, unexpose_mapping};
-use super::switch::SessionGate;
+use super::switch::BoxGate;
 
 /// How often the watcher reads the box's socket table: often enough that a
 /// listener a person starts is published before they look for it, rare
@@ -672,7 +672,7 @@ async fn withdraw_report(
 /// wherever it was granted, read back the same way the attach path reads
 /// it — the gvproxy control channel the forwarder verbs ride, the box's
 /// session gate, which holds the shared permit decision
-/// ([`SessionGate::listen_verdict`]) and the admission a published port is
+/// ([`BoxGate::listen_verdict`]) and the admission a published port is
 /// given through, the box's publication set, shared with the runtime
 /// expose surface so neither binds a port the other already holds, and the
 /// daemon's state directory, under which each publication's decision record
@@ -689,7 +689,7 @@ pub struct ListenPlan {
     /// withdraw.
     control: ControlChannel,
     /// The box's session gate: the permit decision and the admission.
-    gate: Arc<SessionGate>,
+    gate: Arc<BoxGate>,
     /// The box's publications, shared with the runtime expose surface
     /// ([`crate::box_actor::Session`]): the one set both read before they
     /// bind, and the one place a publication's owner is written down.
@@ -714,7 +714,7 @@ impl ListenPlan {
         lease: Ipv4Addr,
         published: Ipv4Addr,
         control: ControlChannel,
-        gate: Arc<SessionGate>,
+        gate: Arc<BoxGate>,
         publications: BoxPublications,
         state_dir: PathBuf,
     ) -> Self {
@@ -2726,15 +2726,15 @@ mod tests {
     /// The box's ingress declaration: nothing statically mapped, a permit
     /// range covering exactly `port`, and the stance that lets listening
     /// publish (NET-016).
-    fn permit_policy(port: u16) -> boxes::SessionPolicy {
+    fn permit_policy(port: u16) -> boxes::BoxPolicy {
         permit_range_policy(port, port)
     }
 
     /// [`permit_policy`] over `low..=high`, for a proof that holds every
     /// port in the range itself — so the range admits nothing it does not
     /// hold (see [`adjacent_any_listeners`]).
-    fn permit_range_policy(low: u16, high: u16) -> boxes::SessionPolicy {
-        boxes::SessionPolicy {
+    fn permit_range_policy(low: u16, high: u16) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: Vec::new(),
                 dynamic_allowed_range: Some((low, high)),
@@ -2754,10 +2754,10 @@ mod tests {
     /// the set the launch would share.
     fn watcher_with(
         sock: PathBuf,
-        policy: &boxes::SessionPolicy,
+        policy: &boxes::BoxPolicy,
         leader: Leader,
-    ) -> (ListenWatcher, Arc<SessionGate>) {
-        let gate = Arc::new(SessionGate::for_session(
+    ) -> (ListenWatcher, Arc<BoxGate>) {
+        let gate = Arc::new(BoxGate::for_session(
             "listen-box".into(),
             LEASE,
             policy,
@@ -2789,10 +2789,7 @@ mod tests {
     /// The box's watcher, this process its leader: the watcher's own `/proc`
     /// entry is the table it reads, and the sockets the test binds are in
     /// it — the shape a box whose host resolved its leader starts with.
-    fn watcher_at(
-        sock: PathBuf,
-        policy: &boxes::SessionPolicy,
-    ) -> (ListenWatcher, Arc<SessionGate>) {
+    fn watcher_at(sock: PathBuf, policy: &boxes::BoxPolicy) -> (ListenWatcher, Arc<BoxGate>) {
         watcher_with(sock, policy, Leader::Resolved(std::process::id()))
     }
 
@@ -2802,10 +2799,10 @@ mod tests {
     /// receiver.
     fn started_watcher(
         dir: &tempfile::TempDir,
-        policy: &boxes::SessionPolicy,
+        policy: &boxes::BoxPolicy,
     ) -> (
         ListenWatcher,
-        Arc<SessionGate>,
+        Arc<BoxGate>,
         tokio::task::JoinHandle<()>,
         mpsc::Receiver<Served>,
     ) {
@@ -2820,11 +2817,11 @@ mod tests {
     /// already holding what the expose surface published.
     fn started_watcher_with_publications(
         dir: &tempfile::TempDir,
-        policy: &boxes::SessionPolicy,
+        policy: &boxes::BoxPolicy,
         seed: impl FnOnce(&BoxPublications),
     ) -> (
         ListenWatcher,
-        Arc<SessionGate>,
+        Arc<BoxGate>,
         tokio::task::JoinHandle<()>,
         mpsc::Receiver<Served>,
     ) {
@@ -2832,7 +2829,7 @@ mod tests {
         let (server, served) = spawn_forwarder(sock.clone());
         let publications = BoxPublications::default();
         seed(&publications);
-        let gate = Arc::new(SessionGate::for_session(
+        let gate = Arc::new(BoxGate::for_session(
             "listen-box".into(),
             LEASE,
             policy,
@@ -2945,7 +2942,7 @@ mod tests {
         // the stance permit it: the TCP listener must fall to the rules and
         // be published by them, not answered "published already" under a
         // forward that would never answer its protocol.
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![boxes::PortMapping {
                     external_port: port,
@@ -3042,7 +3039,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("gvproxy.sock");
         let (server, _served) = spawn_forwarder(sock.clone());
-        let gate = Arc::new(SessionGate::for_session(
+        let gate = Arc::new(BoxGate::for_session(
             "listen-box".into(),
             LEASE,
             &permit_policy(1),
@@ -3301,7 +3298,7 @@ mod tests {
             }
         });
         let publications = BoxPublications::default();
-        let gate = Arc::new(SessionGate::for_session(
+        let gate = Arc::new(BoxGate::for_session(
             "listen-box".into(),
             LEASE,
             &permit_policy(port),
@@ -3597,7 +3594,7 @@ mod tests {
         let listener = listening_socket();
         let port = port_of(&listener);
         let dir = tempfile::tempdir().unwrap();
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![boxes::PortMapping {
                     external_port: port,
@@ -3855,7 +3852,7 @@ mod tests {
         let any_port = port_of(&any);
         let dir = tempfile::tempdir().unwrap();
         // The rules permit both ports: only the binds differ.
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             ingress: Some(boxes::IngressPolicy {
                 port_mappings: Vec::new(),
                 dynamic_allowed_range: Some((loop_port.min(any_port), loop_port.max(any_port))),
@@ -4933,7 +4930,7 @@ mod tests {
         // waits: the socket's file appears before its listen does.
         soon(|| std::os::unix::net::UnixStream::connect(&sock).is_ok()).await;
 
-        let gate = Arc::new(SessionGate::for_session(
+        let gate = Arc::new(BoxGate::for_session(
             "listen-box".into(),
             STANDIN_LEASE,
             &permit_policy(port),

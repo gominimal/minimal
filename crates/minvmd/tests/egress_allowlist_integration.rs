@@ -514,12 +514,12 @@ async fn create_toolchain_session(
     let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress.clone()))?;
 
     let req = CreateSessionRequest {
-        config: minimald_rpc::SessionConfig {
+        config: minimald_rpc::BoxConfig {
             name: Some(name),
             project_path: paths::HostAbsPath::try_new("/tmp")
                 .map_err(|e| format!("project_path: {e}"))?,
             network: boxes::NetworkMode::OwnIp,
-            policy: boxes::SessionPolicy::new(Some(egress), None),
+            policy: boxes::BoxPolicy::new(Some(egress), None),
             // The addresses the registration handed back, so the in-VM
             // daemon attaches the box at its row's lease.
             task_addresses: Vec::new(),
@@ -727,7 +727,7 @@ async fn submit_gated_verdict(
     response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
     use boxes::wire::policy::WirePatchVerdict;
-    use boxes::wire::request::SessionStep;
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -785,8 +785,8 @@ async fn submit_gated_verdict(
     let resp: <SubmitVerdict as OneshotSshRpc>::Response = serde_json_lenient::from_slice(&buf)
         .map_err(|e| format!("decode SubmitVerdict response: {e}"))?;
     match resp.ok() {
-        Some(SessionStep::Materialized { .. }) => Ok(()),
-        Some(SessionStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
+        Some(BoxStep::Materialized { .. }) => Ok(()),
+        Some(BoxStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
         None => Err("SubmitVerdict returned an error".into()),
     }
 }

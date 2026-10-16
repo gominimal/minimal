@@ -4,9 +4,9 @@ use std::{
 };
 
 use crate::{
-    box_actor::{Session, SessionConfig, SessionHandle},
+    box_actor::{BoxActor, BoxActorConfig, BoxHandle},
     box_runtime::HostAttrs,
-    store::{RecordPredicate, SessionRecordHandle, Store, StoreHandle},
+    store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
 use boxes::SessionId;
 use common::SpecHash;
@@ -29,7 +29,7 @@ use composables::{
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionInfo {
+pub struct BoxInfo {
     pub id: SessionId,
     pub name: Option<String>,
     /// The absolute host path the session was built from. Surfaced through
@@ -38,28 +38,28 @@ pub struct SessionInfo {
     pub project_path: paths::HostAbsPath,
     /// The session's lifecycle status, surfaced so a client picker can
     /// render a state glyph.
-    pub status: boxes::SessionStatus,
+    pub status: boxes::BoxState,
     pub attrs: Option<HostAttrs>,
 }
 
 /// A key you can use to identify a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionKeyPredicate {
+pub enum BoxKeyPredicate {
     Id(SessionId),
     Name(String),
 }
 
-impl From<SessionKeyPredicate> for RecordPredicate {
-    fn from(pred: SessionKeyPredicate) -> Self {
+impl From<BoxKeyPredicate> for RecordPredicate {
+    fn from(pred: BoxKeyPredicate) -> Self {
         match pred {
-            SessionKeyPredicate::Id(id) => RecordPredicate::Id(id),
-            SessionKeyPredicate::Name(name) => RecordPredicate::Name(name),
+            BoxKeyPredicate::Id(id) => RecordPredicate::Id(id),
+            BoxKeyPredicate::Name(name) => RecordPredicate::Name(name),
         }
     }
 }
 
 /// Transport / internal error when communicating with the sessions actor.
-type SessionsError = std::io::Error;
+type BoxManagerError = std::io::Error;
 
 /// NET-079's observability, for the create path's half of the refusal: how
 /// many creates this daemon has refused because a host-address box's
@@ -90,9 +90,9 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 /// `Pending`; the session actor's create flow promotes it to
 /// `Active` once composition finalizes.
 fn build_record(
-    config: minimald_rpc::SessionConfig,
+    config: minimald_rpc::BoxConfig,
     username: Option<String>,
-    status: boxes::SessionStatus,
+    status: boxes::BoxState,
 ) -> Result<boxes::Record, std::io::Error> {
     let record = boxes::Record {
         id: SessionId::nil(),
@@ -130,11 +130,11 @@ fn build_record(
 
 /// Encapsulates the return channel for messages back from the actor.
 #[derive(Debug)]
-pub(crate) struct Responder<T>(oneshot::Sender<Result<T, SessionsError>>);
+pub(crate) struct Responder<T>(oneshot::Sender<Result<T, BoxManagerError>>);
 
 impl<T> Responder<T> {
     /// Constructs both ends of the return channel.
-    pub(crate) fn channel() -> (Self, oneshot::Receiver<Result<T, SessionsError>>) {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<Result<T, BoxManagerError>>) {
         let (send, recv) = oneshot::channel();
         (Self(send), recv)
     }
@@ -142,7 +142,7 @@ impl<T> Responder<T> {
     /// Awaits the provided future, transmitting its result to the caller.
     pub(crate) async fn handle<F>(self, fut: F)
     where
-        F: Future<Output = Result<T, SessionsError>>,
+        F: Future<Output = Result<T, BoxManagerError>>,
     {
         let _ = self.0.send(fut.await);
     }
@@ -153,26 +153,26 @@ impl<T> Responder<T> {
 /// config; other variants are just a few words).
 #[derive(Debug)]
 struct CreateSessionMsg {
-    config: minimald_rpc::SessionConfig,
+    config: minimald_rpc::BoxConfig,
     /// Authenticated SSH username, supplied by the RPC handler from
     /// the SSH connection context (never the client).
     username: Option<String>,
     /// The creating connection's liveness, see
-    /// [`ManagerHandle::create_session_by`].
+    /// [`BoxManagerHandle::create_session_by`].
     creator: Option<std::sync::Weak<()>>,
     responder: Responder<SessionId>,
 }
 
 enum ManagerMessage {
-    List(Responder<Vec<SessionInfo>>),
-    GetRecord(SessionKeyPredicate, Responder<Option<boxes::Record>>),
-    GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
+    List(Responder<Vec<BoxInfo>>),
+    GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
+    GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
     /// [`GetSession`](Self::GetSession) it never starts an actor, and a
     /// session with no live host answers `None`.
     GetScreen(
-        SessionKeyPredicate,
+        BoxKeyPredicate,
         Responder<Option<minimald_rpc::ScreenSnapshot>>,
     ),
     /// Read a session's persisted composition snapshot. Read-only
@@ -180,7 +180,7 @@ enum ManagerMessage {
     /// unlike [`GetSession`](Self::GetSession), it never starts an
     /// actor, so inspecting a stopped session leaves it stopped.
     GetComposition(
-        SessionKeyPredicate,
+        BoxKeyPredicate,
         Responder<Option<boxes::core::compose::Composition>>,
     ),
     /// How many session actors are live. Test-only, and the only way
@@ -194,7 +194,7 @@ enum ManagerMessage {
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
-    /// (see [`ManagerHandle::resume_active_sessions`]). Answers with how many
+    /// (see [`BoxManagerHandle::resume_active_sessions`]). Answers with how many
     /// actors it started.
     #[cfg(target_os = "linux")]
     ResumeActive(Responder<usize>),
@@ -226,28 +226,28 @@ impl ManagerMessage {
     }
 }
 
-/// Routes session operations to per-session [`Session`] actors, spawning
+/// Routes session operations to per-session [`BoxActor`] actors, spawning
 /// them as needed: `CreateSession` allocates a record and spawns the actor
 /// that owns the create flow, `GetSession` brings a known session's actor up
 /// from disk, and `DeleteSession` tears one down. Everything session-
 /// specific (compose state, verdicts, rename, attach) lives on the session
-/// actor behind its [`SessionHandle`].
+/// actor behind its [`BoxHandle`].
 ///
 /// Follows the actor pattern.
 #[derive(Debug)]
-pub struct Manager {
+pub struct BoxManager {
     /// Cancelled once a shutdown proceeds, before any session is stopped.
-    /// Shared with every [`ManagerHandle`], so a command the shutdown ends
-    /// can tell (see [`ManagerHandle::is_shutting_down`]).
+    /// Shared with every [`BoxManagerHandle`], so a command the shutdown ends
+    /// can tell (see [`BoxManagerHandle::is_shutting_down`]).
     in_shutdown: CancellationToken,
     receiver: crate::traced::Receiver<ManagerMessage>,
-    running: BTreeMap<SessionId, SessionHandle>,
+    running: BTreeMap<SessionId, BoxHandle>,
     store: StoreHandle,
 
     /// A weak handle to this manager, which can be duplicated so
     /// that downstream actors (session, session host) have a handle
     /// to do operations on us.
-    weak_self: WeakManagerHandle,
+    weak_self: WeakBoxManagerHandle,
 
     /// Daemon-scoped mctx state (config, stdlib_dir, vcs, cache) cloned
     /// into each session actor, which composes its loadout and builds its
@@ -277,7 +277,7 @@ pub struct Manager {
     /// through by every daemon on it. It is the address half of a publish, as
     /// the registry beside it is the name half: a session's own-address box
     /// asks it at finalize and returns its address at destroy, holding it
-    /// through its `SessionConfig`. Every ask is a synchronous
+    /// through its `BoxActorConfig`. Every ask is a synchronous
     /// read-modify-write under the record's own lock file, so two daemons on
     /// one host are serialized by the file system rather than by each other —
     /// no daemon asks another for an address, and none self-assigns (design
@@ -292,7 +292,7 @@ pub struct Manager {
     deny_all_opt_out: bool,
 }
 
-impl Manager {
+impl BoxManager {
     /// Launches a sessions manager managing sessions in
     /// the given minimal state dir.
     pub async fn init(
@@ -301,7 +301,7 @@ impl Manager {
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
         deny_all_opt_out: bool,
-    ) -> Result<ManagerHandle, std::io::Error> {
+    ) -> Result<BoxManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
         // Reap unresumable on-disk records left over from a prior
@@ -387,7 +387,7 @@ impl Manager {
             // walk is two request/response rounds per address of the range on
             // one control channel, and a channel that does not answer takes
             // seconds to say so — long enough that awaiting it here would put
-            // it on `Manager::init`'s critical path, which is the one path
+            // it on `BoxManager::init`'s critical path, which is the one path
             // `Server::run` waits on before it starts *accepting*: a guest
             // daemon that held its own SSH accept for the host's loopback
             // verdict would make every `minvmd stop` race the probe instead
@@ -468,7 +468,7 @@ impl Manager {
             // the host-side arbiter that closes the gap. This is the
             // daemon-start half — over whatever was live before this daemon
             // came up; the session-start half
-            // (`Session::report_unrecorded_publishes`) catches the grants a
+            // (`BoxActor::report_unrecorded_publishes`) catches the grants a
             // second root makes after it.
             for address in book.unrecorded_publishes() {
                 crate::net::dns::warn_publish_collision(address);
@@ -581,7 +581,7 @@ impl Manager {
             (hostnames, loopback)
         };
         let in_shutdown = CancellationToken::new();
-        let handle = ManagerHandle {
+        let handle = BoxManagerHandle {
             sender,
             in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
@@ -615,7 +615,7 @@ impl Manager {
                             return;
                         };
                         let holder = manager
-                            .get_session(SessionKeyPredicate::Id(hand_over.holder))
+                            .get_session(BoxKeyPredicate::Id(hand_over.holder))
                             .await;
                         if let Ok(Some(holder)) = holder {
                             holder
@@ -678,7 +678,7 @@ pub(crate) struct InterimUpgrade {
 }
 
 /// Lands a range verdict the way the deferred walk lands it
-/// ([`crate::box_manager::Manager::init`]'s spawned probe): the state moves
+/// ([`crate::box_manager::BoxManager::init`]'s spawned probe): the state moves
 /// first, then the arm that follows it runs over the publishes the old
 /// verdict left standing — the one moment a verdict's landing has effects
 /// beside the atomic it sets, and the reason the walk cannot simply store
@@ -854,7 +854,7 @@ pub(crate) fn draw_interim_upgrades(
 ///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
-/// ([`crate::box_manager::Manager::init`]), never through the manager's
+/// ([`crate::box_manager::BoxManager::init`]), never through the manager's
 /// mailbox or a session actor's, so a destroy can land anywhere between
 /// the draw's enumeration, its grant, and this apply.
 #[cfg(target_os = "linux")]
@@ -950,7 +950,7 @@ async fn live_session_ids(
 }
 
 /// Delete on-disk records whose status is unresumable after a
-/// daemon restart. See [`Manager::init`] for why `Pending` and
+/// daemon restart. See [`BoxManager::init`] for why `Pending` and
 /// `Materializing` records fall into this category. A delete
 /// failure is logged and skipped — a leftover record wastes a
 /// name until it's cleaned up manually but shouldn't block
@@ -970,7 +970,7 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
             }
         };
         match record.status {
-            boxes::SessionStatus::Pending | boxes::SessionStatus::Materializing => {
+            boxes::BoxState::Pending | boxes::BoxState::Materializing => {
                 let id = *handle.id();
                 let status = record.status;
                 if let Err(e) = handle.delete().await {
@@ -988,7 +988,7 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
                     );
                 }
             }
-            boxes::SessionStatus::Active => {}
+            boxes::BoxState::Active => {}
         }
     }
     Ok(())
@@ -1011,7 +1011,7 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
 /// its own number, so the two hops cannot drift apart.
 const HOST_PROBE_TIMEOUT: std::time::Duration = crate::box_actor::HOST_PROBE_TIMEOUT;
 
-impl Manager {
+impl BoxManager {
     /// The async task which handles interactions with the
     /// manager.
     async fn mainloop(mut self) {
@@ -1048,10 +1048,10 @@ impl Manager {
     /// or aborted, rather than to an unreachable record.
     async fn resolve_session(
         &mut self,
-        pred: SessionKeyPredicate,
-    ) -> Result<Option<SessionHandle>, SessionsError> {
+        pred: BoxKeyPredicate,
+    ) -> Result<Option<BoxHandle>, BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
-            return Err(SessionsError::new(
+            return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
             ));
@@ -1064,19 +1064,19 @@ impl Manager {
             return Ok(Some(h.clone()));
         }
         // Not running, start it!
-        let h = Session::run(self.session_config(handle)).await?;
+        let h = BoxActor::run(self.session_config(handle)).await?;
         self.running.insert(session_id, h.clone());
         Ok(Some(h))
     }
 
     /// Starts the actor of every `Active` record whose box owns a name
     /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
-    /// registered when its actor starts ([`Session::run`]), and a restarted
+    /// registered when its actor starts ([`BoxActor::run`]), and a restarted
     /// daemon otherwise starts an actor only when an RPC first names the
     /// session, so until then the name of a session `min ls` lists as active
     /// answers NXDOMAIN and the proxy has no route for it.
     ///
-    /// Resuming through [`Session::run`] keeps one registration path, with
+    /// Resuming through [`BoxActor::run`] keeps one registration path, with
     /// its collision rules and its rule never to wait on the range verdict.
     /// It is idempotent: a session already in `running` is skipped, and a
     /// later RPC that names a resumed session finds its actor there rather
@@ -1093,7 +1093,7 @@ impl Manager {
     /// A record that cannot be read, or whose actor fails to start, is
     /// logged and skipped, so one bad record costs only its own name.
     #[cfg(target_os = "linux")]
-    async fn resume_active_sessions(&mut self) -> Result<usize, SessionsError> {
+    async fn resume_active_sessions(&mut self) -> Result<usize, BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
             return Ok(0);
         }
@@ -1124,7 +1124,7 @@ impl Manager {
                     continue;
                 }
             };
-            if !matches!(record.status, boxes::SessionStatus::Active)
+            if !matches!(record.status, boxes::BoxState::Active)
                 || !matches!(
                     record.network,
                     boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
@@ -1149,7 +1149,7 @@ impl Manager {
                 );
                 continue;
             }
-            match Session::run(self.session_config(handle)).await {
+            match BoxActor::run(self.session_config(handle)).await {
                 Ok(session) => {
                     self.running.insert(session_id, session);
                     resumed += 1;
@@ -1172,8 +1172,8 @@ impl Manager {
     /// The spawn-time config for a session actor backing `record`. The one
     /// place the daemon-scoped dependencies are gathered, so the create and
     /// bring-up-from-disk paths can't hand their actors different worlds.
-    fn session_config(&self, record: SessionRecordHandle) -> SessionConfig {
-        SessionConfig {
+    fn session_config(&self, record: BoxRecordHandle) -> BoxActorConfig {
+        BoxActorConfig {
             minimal_state_dir: self.minimal_state_dir.clone(),
             minimal_cache_dir: self.minimal_cache_dir.clone(),
             daemon_ctx: Arc::clone(&self.daemon_ctx),
@@ -1204,12 +1204,12 @@ impl Manager {
     /// hostage.
     async fn create_session(
         &mut self,
-        config: minimald_rpc::SessionConfig,
+        config: minimald_rpc::BoxConfig,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<SessionId, SessionsError> {
+    ) -> Result<SessionId, BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
-            return Err(SessionsError::new(
+            return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
             ));
@@ -1248,13 +1248,13 @@ impl Manager {
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
-        let record = build_record(config, username, boxes::SessionStatus::Pending)?;
+        let record = build_record(config, username, boxes::BoxState::Pending)?;
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
 
         let mut seed = self.session_config(handle.clone());
         seed.creator = creator;
-        match Session::run(seed).await {
+        match BoxActor::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
                 Ok(session_id)
@@ -1305,7 +1305,7 @@ impl Manager {
                                     .unwrap_or(None),
                                 None => None,
                             };
-                            SessionInfo {
+                            BoxInfo {
                                 id: record.id,
                                 name: record.name.clone(),
                                 project_path: record.project_path.clone(),
@@ -1321,7 +1321,7 @@ impl Manager {
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 r.handle(async {
-                    Ok::<_, SessionsError>(match self.store.find(pred.into()).await? {
+                    Ok::<_, BoxManagerError>(match self.store.find(pred.into()).await? {
                         Some(handle) => Some(handle.record().await?),
                         None => None,
                     })
@@ -1335,11 +1335,11 @@ impl Manager {
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {
                 let n = self.running.len();
-                r.handle(async move { Ok::<_, SessionsError>(n) }).await;
+                r.handle(async move { Ok::<_, BoxManagerError>(n) }).await;
             }
             ManagerMessage::GetComposition(pred, r) => {
                 r.handle(async {
-                    Ok::<_, SessionsError>(match self.store.find(pred.into()).await? {
+                    Ok::<_, BoxManagerError>(match self.store.find(pred.into()).await? {
                         Some(handle) => handle.load_composition().await?,
                         None => None,
                     })
@@ -1369,15 +1369,15 @@ impl Manager {
                 // reached through `GetSessionScreen` instead.
                 let resolved = async {
                     let id = match pred {
-                        SessionKeyPredicate::Id(id) => id,
-                        SessionKeyPredicate::Name(name) => {
+                        BoxKeyPredicate::Id(id) => id,
+                        BoxKeyPredicate::Name(name) => {
                             match self.store.find(RecordPredicate::Name(name)).await? {
                                 Some(handle) => handle.record().await?.id,
                                 None => return Ok(None),
                             }
                         }
                     };
-                    Ok::<_, SessionsError>(self.running.get(&id).cloned())
+                    Ok::<_, BoxManagerError>(self.running.get(&id).cloned())
                 }
                 .await;
                 match resolved {
@@ -1420,7 +1420,7 @@ impl Manager {
             ManagerMessage::DeleteSession(id, r) => {
                 r.handle(async {
                     if self.in_shutdown.is_cancelled() {
-                        return Err(SessionsError::new(
+                        return Err(BoxManagerError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "in shutdown",
                         ));
@@ -1448,7 +1448,7 @@ impl Manager {
                     // destroy hooks to run in one.
                     let actor = match self.running.remove(&id) {
                         Some(hnd) => Some(hnd),
-                        None => match Session::run(self.session_config(handle.clone())).await {
+                        None => match BoxActor::run(self.session_config(handle.clone())).await {
                             Ok(hnd) => Some(hnd),
                             // A record the actor refuses to come up on — a
                             // restart-orphaned `Materializing` one is the
@@ -1545,9 +1545,9 @@ impl Manager {
 
 /// The handle to the session manager.
 #[derive(Debug, Clone)]
-pub struct ManagerHandle {
+pub struct BoxManagerHandle {
     sender: crate::traced::Sender<ManagerMessage>,
-    /// The actor's [`Manager::in_shutdown`].
+    /// The actor's [`BoxManager::in_shutdown`].
     in_shutdown: CancellationToken,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
@@ -1562,34 +1562,34 @@ pub struct ManagerHandle {
     loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
-/// A non-owning handle to the [`Manager`] actor.
+/// A non-owning handle to the [`BoxManager`] actor.
 ///
 /// Held by per-session machinery that must be able to reach the manager
 /// (notably a session's [`Binding`](crate::box_runtime), to request its own
-/// destruction) without keeping the actor alive. See [`Manager::weak_self`] for
+/// destruction) without keeping the actor alive. See [`BoxManager::weak_self`] for
 /// why the path back to the manager must be weak.
 #[derive(Debug, Clone)]
-pub struct WeakManagerHandle {
+pub struct WeakBoxManagerHandle {
     sender: crate::traced::WeakSender<ManagerMessage>,
-    /// Mirrors [`ManagerHandle::in_shutdown`].
+    /// Mirrors [`BoxManagerHandle::in_shutdown`].
     in_shutdown: CancellationToken,
-    /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an
+    /// Mirrors [`BoxManagerHandle::hostnames`]; the registry `Arc` is held so an
     /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
-    /// Mirrors [`ManagerHandle::loopback`], for the same reason: the test seam
+    /// Mirrors [`BoxManagerHandle::loopback`], for the same reason: the test seam
     /// must survive an upgrade.
     #[cfg(all(test, target_os = "linux"))]
     loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
-impl WeakManagerHandle {
-    /// Promotes to a strong [`ManagerHandle`], or `None` if the manager actor
+impl WeakBoxManagerHandle {
+    /// Promotes to a strong [`BoxManagerHandle`], or `None` if the manager actor
     /// has already shut down (all strong senders dropped).
     #[must_use]
-    pub fn upgrade(&self) -> Option<ManagerHandle> {
-        Some(ManagerHandle {
+    pub fn upgrade(&self) -> Option<BoxManagerHandle> {
+        Some(BoxManagerHandle {
             sender: self.sender.upgrade()?,
             in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
@@ -1605,25 +1605,25 @@ impl WeakManagerHandle {
 /// Used by downstream actors (i.e. [`Binding`](crate::box_runtime)) to
 /// manipulate the session itself, such as deletion.
 #[derive(Debug, Clone)]
-pub struct SessionControl {
-    manager: WeakManagerHandle,
+pub struct BoxControl {
+    manager: WeakBoxManagerHandle,
     id: SessionId,
 }
 
-impl SessionControl {
+impl BoxControl {
     /// Binds the destroy capability to a specific session.
     #[must_use]
-    pub fn new(manager: WeakManagerHandle, id: SessionId) -> Self {
+    pub fn new(manager: WeakBoxManagerHandle, id: SessionId) -> Self {
         Self { manager, id }
     }
 
     /// Requests the manager delete this session: kills the host and removes the
     /// on-disk record. Errors if the manager has already shut down, or if the
     /// delete itself fails (e.g. the manager is mid-shutdown).
-    pub async fn destroy(&self) -> Result<(), SessionsError> {
+    pub async fn destroy(&self) -> Result<(), BoxManagerError> {
         match self.manager.upgrade() {
             Some(mngr) => mngr.delete_session(self.id).await.map(drop),
-            None => Err(SessionsError::new(
+            None => Err(BoxManagerError::new(
                 std::io::ErrorKind::NotConnected,
                 "sessions manager is gone",
             )),
@@ -1642,7 +1642,7 @@ impl SessionControl {
         let Some(mngr) = self.manager.upgrade() else {
             return;
         };
-        match mngr.get_session(SessionKeyPredicate::Id(self.id)).await {
+        match mngr.get_session(BoxKeyPredicate::Id(self.id)).await {
             Ok(Some(session)) => session.run_detach_hooks().await,
             Ok(None) => {}
             Err(e) => tracing::warn!(
@@ -1654,7 +1654,7 @@ impl SessionControl {
     }
 }
 
-impl ManagerHandle {
+impl BoxManagerHandle {
     /// Whether a shutdown is under way: set before the shutdown stops any
     /// session, so a command it ends can still see why when it returns.
     #[must_use]
@@ -1664,8 +1664,8 @@ impl ManagerHandle {
 
     /// Returns a non-owning handle to this manager.
     #[must_use]
-    pub fn downgrade(&self) -> WeakManagerHandle {
-        WeakManagerHandle {
+    pub fn downgrade(&self) -> WeakBoxManagerHandle {
+        WeakBoxManagerHandle {
             sender: self.sender.downgrade(),
             in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
@@ -1751,7 +1751,7 @@ impl ManagerHandle {
     }
 
     /// Enqueues the resume of every active session restored from the store
-    /// (see [`Manager::resume_active_sessions`]) and returns the future that
+    /// (see [`BoxManager::resume_active_sessions`]) and returns the future that
     /// answers with how many actors it started. The message is in the
     /// manager's mailbox when this returns, so any message sent after it —
     /// an RPC's lookup of a restored session, say — is served once the
@@ -1760,13 +1760,13 @@ impl ManagerHandle {
     ///
     /// [`crate::server::Server::run`] enqueues this once, before its accept
     /// loop opens, and awaits the answer off that path. It is a message
-    /// rather than part of [`Manager::init`] so the test harness, which
+    /// rather than part of [`BoxManager::init`] so the test harness, which
     /// builds the manager without `Server::run`, can open a window (a
     /// pending range verdict, say) before the resume.
     #[cfg(target_os = "linux")]
     pub async fn enqueue_resume_active_sessions(
         &self,
-    ) -> impl Future<Output = Result<usize, SessionsError>> + Send + 'static {
+    ) -> impl Future<Output = Result<usize, BoxManagerError>> + Send + 'static {
         let (send, recv) = Responder::channel();
         #[expect(
             clippy::let_underscore_must_use,
@@ -1781,12 +1781,12 @@ impl ManagerHandle {
     /// of every active session restored from the store and returns how many
     /// it started.
     #[cfg(target_os = "linux")]
-    pub async fn resume_active_sessions(&self) -> Result<usize, SessionsError> {
+    pub async fn resume_active_sessions(&self) -> Result<usize, BoxManagerError> {
         self.enqueue_resume_active_sessions().await.await
     }
 
     /// Lists the sessions known to this (minimald) instance.
-    pub async fn list(&self) -> Result<Vec<SessionInfo>, SessionsError> {
+    pub async fn list(&self) -> Result<Vec<BoxInfo>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.sender.send(ManagerMessage::List(send)).await;
@@ -1813,8 +1813,8 @@ impl ManagerHandle {
     /// both mean "nothing recorded to report".
     pub async fn get_composition(
         &self,
-        pred: SessionKeyPredicate,
-    ) -> Result<Option<boxes::core::compose::Composition>, SessionsError> {
+        pred: BoxKeyPredicate,
+    ) -> Result<Option<boxes::core::compose::Composition>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1827,8 +1827,8 @@ impl ManagerHandle {
     /// Gets the session record which corresponds to the given predicate.
     pub async fn get_record(
         &self,
-        pred: SessionKeyPredicate,
-    ) -> Result<Option<boxes::Record>, SessionsError> {
+        pred: BoxKeyPredicate,
+    ) -> Result<Option<boxes::Record>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1846,12 +1846,12 @@ impl ManagerHandle {
     /// pass `None` for non-SSH callers (e.g. in-process daemon callers and
     /// tests).
     ///
-    /// [`configure_loadout`]: crate::box_actor::SessionHandle::configure_loadout
+    /// [`configure_loadout`]: crate::box_actor::BoxHandle::configure_loadout
     pub async fn create_session(
         &self,
-        config: minimald_rpc::SessionConfig,
+        config: minimald_rpc::BoxConfig,
         username: Option<String>,
-    ) -> Result<SessionId, SessionsError> {
+    ) -> Result<SessionId, BoxManagerError> {
         self.create_session_by(config, username, None).await
     }
 
@@ -1859,14 +1859,14 @@ impl ManagerHandle {
     /// `creator` is that connection's liveness. While it still upgrades the
     /// session's activation belongs to its creator, so an attach to the
     /// still-unconfigured session is refused instead of configuring it (see
-    /// the `Draft` shortcut in `Session::attach`). Passed at creation, not
+    /// the `Draft` shortcut in `BoxActor::attach`). Passed at creation, not
     /// afterwards, so there is no window in which the actor exists without it.
     pub async fn create_session_by(
         &self,
-        config: minimald_rpc::SessionConfig,
+        config: minimald_rpc::BoxConfig,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<SessionId, SessionsError> {
+    ) -> Result<SessionId, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1886,20 +1886,20 @@ impl ManagerHandle {
     ///
     /// Resolving a session brings its actor up if it isn't running, exactly as
     /// [`get_session`](Self::get_session) does.
-    pub async fn needed_packages(&self) -> Result<HashSet<SpecHash>, SessionsError> {
+    pub async fn needed_packages(&self) -> Result<HashSet<SpecHash>, BoxManagerError> {
         let mut out = HashSet::new();
         for info in self.list().await? {
-            if info.status != boxes::SessionStatus::Active {
+            if info.status != boxes::BoxState::Active {
                 continue;
             }
             // Deleted between the list and the lookup: gone, so needs nothing.
-            let Some(session) = self.get_session(SessionKeyPredicate::Id(info.id)).await? else {
+            let Some(session) = self.get_session(BoxKeyPredicate::Id(info.id)).await? else {
                 continue;
             };
             let pkgs = session
                 .needed_packages()
                 .await
-                .map_err(|e| SessionsError::other(format!("session {}: {e}", info.id)))?;
+                .map_err(|e| BoxManagerError::other(format!("session {}: {e}", info.id)))?;
             out.extend(pkgs);
         }
 
@@ -1909,8 +1909,8 @@ impl ManagerHandle {
     /// Gets a handle to the session corresponding with the given predicate.
     pub async fn get_session(
         &self,
-        pred: SessionKeyPredicate,
-    ) -> Result<Option<SessionHandle>, SessionsError> {
+        pred: BoxKeyPredicate,
+    ) -> Result<Option<BoxHandle>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1924,8 +1924,8 @@ impl ManagerHandle {
     /// the session is unknown or has no live host — never starts an actor.
     pub async fn get_screen(
         &self,
-        pred: SessionKeyPredicate,
-    ) -> Result<Option<minimald_rpc::ScreenSnapshot>, SessionsError> {
+        pred: BoxKeyPredicate,
+    ) -> Result<Option<minimald_rpc::ScreenSnapshot>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1940,7 +1940,7 @@ impl ManagerHandle {
     ///
     /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
-    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
+    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1978,7 +1978,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::box_actor::PACKAGE_CHECK_DEADLINE;
     use boxes::daemon::composer::ComposeOutcome;
-    use boxes::wire::request::{ContributionVerdict, SessionStep, WireContribution};
+    use boxes::wire::request::{BoxStep, ContributionVerdict, WireContribution};
     use paths::HostAbsPath;
     use std::io::ErrorKind;
     use tempfile::TempDir;
@@ -1993,10 +1993,10 @@ pub(crate) mod tests {
     /// Resolves the session's live actor and peeks its held
     /// [`Composition`](boxes::core::compose::Composition).
     async fn peek_composition(
-        mngr: &ManagerHandle,
+        mngr: &BoxManagerHandle,
         id: SessionId,
     ) -> Arc<boxes::core::compose::Composition> {
-        mngr.get_session(SessionKeyPredicate::Id(id))
+        mngr.get_session(BoxKeyPredicate::Id(id))
             .await
             .expect("get_session succeeds")
             .expect("session resolves")
@@ -2006,8 +2006,8 @@ pub(crate) mod tests {
     }
 
     /// Resolves the session's live actor.
-    async fn session(mngr: &ManagerHandle, id: SessionId) -> SessionHandle {
-        mngr.get_session(SessionKeyPredicate::Id(id))
+    async fn session(mngr: &BoxManagerHandle, id: SessionId) -> BoxHandle {
+        mngr.get_session(BoxKeyPredicate::Id(id))
             .await
             .expect("get_session succeeds")
             .expect("session resolves")
@@ -2019,7 +2019,7 @@ pub(crate) mod tests {
     /// tests that want `configure_loadout` to see a project seed it here
     /// between `create_session` and `configure_loadout` — exactly the
     /// spot a real client's upload lands in.
-    async fn seed_workspace_mfile(mngr: &ManagerHandle, id: SessionId, contents: &str) {
+    async fn seed_workspace_mfile(mngr: &BoxManagerHandle, id: SessionId, contents: &str) {
         let paths = session(mngr, id).await.paths().await.unwrap();
         tokio::fs::write(
             paths.working.as_utf8_path().join(mfile::MFILE_NAME),
@@ -2038,7 +2038,7 @@ pub(crate) mod tests {
     ) -> (
         TempDir,
         TempDir,
-        ManagerHandle,
+        BoxManagerHandle,
         SessionId,
         Option<boxes::wire::request::ContributionResponse>,
     ) {
@@ -2064,7 +2064,7 @@ pub(crate) mod tests {
     async fn create_pending_session() -> (
         TempDir,
         TempDir,
-        ManagerHandle,
+        BoxManagerHandle,
         SessionId,
         boxes::wire::request::ContributionResponse,
     ) {
@@ -2097,8 +2097,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn sample_config() -> minimald_rpc::SessionConfig {
-        minimald_rpc::SessionConfig {
+    fn sample_config() -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
             name: Some("doomed".to_string()),
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: boxes::NetworkMode::default(),
@@ -2115,7 +2115,7 @@ pub(crate) mod tests {
     /// RPC) and configure its loadout against an empty workspace, so it
     /// lands `Active` with an empty composition — the shape most lifecycle
     /// tests want.
-    async fn create_active_session(mngr: &ManagerHandle) -> SessionId {
+    async fn create_active_session(mngr: &BoxManagerHandle) -> SessionId {
         create_active_session_with(mngr, sample_config()).await
     }
 
@@ -2127,8 +2127,8 @@ pub(crate) mod tests {
     /// composition-empty short-circuit in `finalize` covers the
     /// marker precondition.
     async fn create_active_session_with(
-        mngr: &ManagerHandle,
-        config: minimald_rpc::SessionConfig,
+        mngr: &BoxManagerHandle,
+        config: minimald_rpc::BoxConfig,
     ) -> SessionId {
         create_active_session_contributing(mngr, config, WireContribution::default()).await
     }
@@ -2136,8 +2136,8 @@ pub(crate) mod tests {
     /// [`create_active_session_with`] carrying a client contribution —
     /// the way a test gets lifecycle hooks into a session's composition.
     async fn create_active_session_contributing(
-        mngr: &ManagerHandle,
-        config: minimald_rpc::SessionConfig,
+        mngr: &BoxManagerHandle,
+        config: minimald_rpc::BoxConfig,
         contribution: WireContribution,
     ) -> SessionId {
         let id = mngr.create_session(config, None).await.unwrap();
@@ -2154,7 +2154,7 @@ pub(crate) mod tests {
         id
     }
 
-    async fn manager() -> (TempDir, TempDir, ManagerHandle) {
+    async fn manager() -> (TempDir, TempDir, BoxManagerHandle) {
         let state = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
         let mngr = manager_over(state.path(), cache.path()).await;
@@ -2164,7 +2164,7 @@ pub(crate) mod tests {
     /// A manager rooted at existing state and cache directories, so a
     /// test can stand a second one up over the first's store — the way
     /// a daemon restart sees a session it never started.
-    async fn manager_over(state: &std::path::Path, cache: &std::path::Path) -> ManagerHandle {
+    async fn manager_over(state: &std::path::Path, cache: &std::path::Path) -> BoxManagerHandle {
         let state = state.to_path_buf();
         let cache = cache.to_path_buf();
         // These tests never start an `OwnIp` launch (they use the mock
@@ -2185,7 +2185,7 @@ pub(crate) mod tests {
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
         // `false`: these tests run the default the build ships, not the
         // opt-out.
-        Manager::init(
+        BoxManager::init(
             daemon_abs(&state),
             daemon_abs(&cache),
             daemon_ctx,
@@ -2214,14 +2214,14 @@ pub(crate) mod tests {
 
         // Nothing created yet: neither predicate resolves.
         assert!(
-            mngr.get_screen(SessionKeyPredicate::Id(SessionId::nil()))
+            mngr.get_screen(BoxKeyPredicate::Id(SessionId::nil()))
                 .await
                 .unwrap()
                 .is_none(),
             "an unknown id should answer None, not hang or error"
         );
         assert!(
-            mngr.get_screen(SessionKeyPredicate::Name("nonesuch".to_string()))
+            mngr.get_screen(BoxKeyPredicate::Name("nonesuch".to_string()))
                 .await
                 .unwrap()
                 .is_none(),
@@ -2232,14 +2232,14 @@ pub(crate) mod tests {
         // is spawned, and the session reports no screen.
         let id = create_active_session(&mngr).await;
         assert!(
-            mngr.get_screen(SessionKeyPredicate::Id(id))
+            mngr.get_screen(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none(),
             "a session with no running host should answer None"
         );
         assert!(
-            mngr.get_screen(SessionKeyPredicate::Name("doomed".to_string()))
+            mngr.get_screen(BoxKeyPredicate::Name("doomed".to_string()))
                 .await
                 .unwrap()
                 .is_none(),
@@ -2260,7 +2260,7 @@ pub(crate) mod tests {
         mngr.delete_session(id).await.unwrap();
 
         assert!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none(),
@@ -2324,7 +2324,7 @@ pub(crate) mod tests {
         );
         assert!(
             restarted
-                .get_record(SessionKeyPredicate::Id(id))
+                .get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none(),
@@ -2357,7 +2357,7 @@ pub(crate) mod tests {
 
         // The read answers for the session...
         let composition = restarted
-            .get_composition(SessionKeyPredicate::Id(id))
+            .get_composition(BoxKeyPredicate::Id(id))
             .await
             .expect("reading the snapshot should succeed");
         assert!(
@@ -2381,7 +2381,7 @@ pub(crate) mod tests {
         // Bring the session actor up (populating the running map) without
         // attaching a host.
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session should resolve");
@@ -2391,13 +2391,13 @@ pub(crate) mod tests {
         // The destroy cascade completed: the record is gone, and a fresh
         // get_session no longer resolves the (now removed) session.
         assert!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(id))
+            mngr.get_session(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none(),
@@ -2420,7 +2420,7 @@ pub(crate) mod tests {
     /// A non-empty `WireContribution` from the client is accepted:
     /// the composer produces a non-empty
     /// [`Composition`](boxes::core::compose::Composition), the
-    /// create flow holds it on the live [`Session`] actor, and the
+    /// create flow holds it on the live [`BoxActor`] actor, and the
     /// record persists as `Active`.
     ///
     /// Replaces an earlier test that asserted the opposite while
@@ -2461,12 +2461,12 @@ pub(crate) mod tests {
         // explicit `FinalizeSession` after any patches have
         // uploaded; this fixture doesn't drive that step.
         assert_eq!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            boxes::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         );
     }
 
@@ -2477,7 +2477,7 @@ pub(crate) mod tests {
     async fn get_session_unknown_id_resolves_to_none() {
         let (_state, _cache, mngr) = manager().await;
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(SessionId::nil()))
+            mngr.get_session(BoxKeyPredicate::Id(SessionId::nil()))
                 .await
                 .expect("get_session succeeds")
                 .is_none(),
@@ -2493,7 +2493,7 @@ pub(crate) mod tests {
         let (_state, _cache, mngr) = manager().await;
         let id = create_active_session(&mngr).await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session resolves");
@@ -2504,7 +2504,7 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         // Record is untouched.
         assert!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_some(),
@@ -2528,16 +2528,16 @@ pub(crate) mod tests {
              placeholder",
         );
         assert_eq!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the Pending record should exist")
                 .status,
-            boxes::SessionStatus::Pending,
+            boxes::BoxState::Pending,
         );
 
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .expect("get_session succeeds")
             .expect("a Pending session's live actor should resolve");
@@ -2545,19 +2545,19 @@ pub(crate) mod tests {
             .submit_verdict(approve_all(id, &response))
             .await
             .expect("the verdict should be accepted");
-        assert_eq!(step, SessionStep::Materialized { id });
+        assert_eq!(step, BoxStep::Materialized { id });
 
         // SubmitVerdict promotes Pending → Materializing, not
         // Pending → Active. The client still has to upload
         // patches (there are none for this fixture) and call
         // FinalizeSession before the record advances to Active.
         assert_eq!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive promotion")
                 .status,
-            boxes::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         );
         let comp = handle
             .peek_composition()
@@ -2577,7 +2577,7 @@ pub(crate) mod tests {
         let (_state, _cache, mngr) = manager().await;
         let id = create_active_session(&mngr).await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session resolves");
@@ -2591,7 +2591,7 @@ pub(crate) mod tests {
             .await
             .expect("actor reply should succeed");
         match step {
-            SessionStep::Fault {
+            BoxStep::Fault {
                 error: boxes::wire::errors::WireError::WrongState { what },
             } => assert!(what.contains("expected Pending"), "got: {what}"),
             other => panic!("expected Fault::WrongState, got {other:?}"),
@@ -2606,21 +2606,21 @@ pub(crate) mod tests {
     async fn abort_via_handle_deletes_pending_session() {
         let (_state, _cache, mngr, id, _response) = create_pending_session().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the Draft actor should resolve");
         handle.abort().await.expect("abort should succeed");
 
         assert!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none(),
             "the record should be deleted by the abort",
         );
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(id))
+            mngr.get_session(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .is_none(),
@@ -2654,16 +2654,16 @@ pub(crate) mod tests {
             .await
             .expect("actor reply should succeed");
         assert!(
-            matches!(step, SessionStep::Fault { .. }),
+            matches!(step, BoxStep::Fault { .. }),
             "a denied item should fault the resume, got {step:?}",
         );
         assert_eq!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive a faulted resume")
                 .status,
-            boxes::SessionStatus::Pending,
+            boxes::BoxState::Pending,
         );
 
         // The compose state survived the fault: a corrected verdict still
@@ -2672,7 +2672,7 @@ pub(crate) mod tests {
             .submit_verdict(approve_all(id, &response))
             .await
             .expect("the corrected verdict should be accepted");
-        assert_eq!(step, SessionStep::Materialized { id });
+        assert_eq!(step, BoxStep::Materialized { id });
     }
 
     /// Renaming a session that owns no PTask hostname route (NoNet here)
@@ -2733,7 +2733,7 @@ pub(crate) mod tests {
     async fn dead_actor_handle_reads_error_instead_of_panicking() {
         let (_state, _cache, mngr, id, _response) = create_pending_session().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the Draft actor should resolve");
@@ -2765,7 +2765,7 @@ pub(crate) mod tests {
     async fn draft_session_refuses_context_creation() {
         let (_state, _cache, mngr, id, _response) = create_pending_session().await;
         let handle = mngr
-            .get_session(SessionKeyPredicate::Id(id))
+            .get_session(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the Draft actor should resolve");
@@ -2856,7 +2856,7 @@ pub(crate) mod tests {
     /// by [`ProjectComposable`] and lands in the composition. With
     /// the non-empty-composition guard gone, the record now
     /// persists as `Active` and the composition stays on the live
-    /// [`Session`] actor.
+    /// [`BoxActor`] actor.
     ///
     /// Uses a package contribution rather than a var so no
     /// env-resolution (or graph presence) is needed — the test
@@ -2875,12 +2875,12 @@ pub(crate) mod tests {
         // `Active` — see the note on
         // `create_session_accepts_non_empty_client_contribution`.
         assert_eq!(
-            mngr.get_record(SessionKeyPredicate::Id(id))
+            mngr.get_record(BoxKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            boxes::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         );
     }
 
@@ -2899,7 +2899,7 @@ pub(crate) mod tests {
 
     /// Writes `pkg` as a package of the session's own workspace layer, so its
     /// graph resolves the name with no upstream layer (and no network) in play.
-    async fn seed_workspace_package(mngr: &ManagerHandle, id: SessionId, pkg: &str) {
+    async fn seed_workspace_package(mngr: &BoxManagerHandle, id: SessionId, pkg: &str) {
         let paths = session(mngr, id).await.paths().await.unwrap();
         let dir = paths.working.as_utf8_path().join("packages").join(pkg);
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -2924,11 +2924,11 @@ pub(crate) mod tests {
     /// local package `pkg` in its `[session]` block — a session that needs
     /// exactly one package, and a different one per call.
     pub(crate) async fn active_session_needing(
-        mngr: &ManagerHandle,
+        mngr: &BoxManagerHandle,
         name: &str,
         pkg: &str,
     ) -> SessionId {
-        let config = minimald_rpc::SessionConfig {
+        let config = minimald_rpc::BoxConfig {
             name: Some(name.to_string()),
             ..sample_config()
         };
@@ -2988,7 +2988,7 @@ pub(crate) mod tests {
     ) -> (
         TempDir,
         TempDir,
-        ManagerHandle,
+        BoxManagerHandle,
         SessionId,
         Result<minimald_rpc::FinalizeSessionResponse, std::io::Error>,
     ) {
@@ -3016,8 +3016,8 @@ pub(crate) mod tests {
         (state, cache, mngr, id, outcome)
     }
 
-    async fn status_of(mngr: &ManagerHandle, id: SessionId) -> boxes::SessionStatus {
-        mngr.get_record(SessionKeyPredicate::Id(id))
+    async fn status_of(mngr: &BoxManagerHandle, id: SessionId) -> boxes::BoxState {
+        mngr.get_record(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the record should survive the finalize")
@@ -3046,7 +3046,7 @@ pub(crate) mod tests {
             !msg.contains("pkg-ok"),
             "a package that resolves is not reported, got {msg:?}"
         );
-        assert_ne!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
+        assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
     }
 
     /// The same refusal for a package that arrives through a loadout: the
@@ -3071,7 +3071,7 @@ pub(crate) mod tests {
             msg.contains("no such package: no-such-pkg-qq") && msg.contains("loadout `editor`"),
             "the error should name the package and its loadout, got {msg:?}"
         );
-        assert_ne!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
+        assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
     }
 
     /// A composition whose every package resolves still finalizes to
@@ -3086,7 +3086,7 @@ pub(crate) mod tests {
             !response.package_check_skipped,
             "a check that ran to a verdict is not skipped"
         );
-        assert_eq!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
+        assert_eq!(status_of(&mngr, id).await, boxes::BoxState::Active);
     }
 
     /// A check that cannot resolve the graph within its deadline steps
@@ -3118,7 +3118,7 @@ pub(crate) mod tests {
             response.package_check_skipped,
             "an expired check reports the skip so the client can warn"
         );
-        assert_eq!(status_of(&mngr, id).await, boxes::SessionStatus::Active);
+        assert_eq!(status_of(&mngr, id).await, boxes::BoxState::Active);
     }
 
     /// The held [`Composition`] actually carries the project
