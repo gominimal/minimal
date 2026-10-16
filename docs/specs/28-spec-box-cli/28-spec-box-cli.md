@@ -41,7 +41,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
 
 - **BCLI-002** THE SYSTEM SHALL accept a box address as an id, a name, or `provider/host/name`.
-  <!-- was BOX-007, without its `self` sub-bullet; BOX-007 only reserves the name, and BCLI-075 resolves `self` -->
+  <!-- was BOX-007, without its `self` sub-bullet; BOX-007 only reserves the name, and resolving `self` waits with running `min` inside a box (Non-goals); BCLI-075 is retired -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_address_accepts_id_name_and_qualified
   - IF an unqualified name matches running boxes on more than one host THEN THE SYSTEM SHALL report BOX-005's refusal with exit 2, listing each candidate with its host.
@@ -50,14 +50,6 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF a host cannot be reached while an unqualified name is resolved across hosts THEN THE SYSTEM SHALL fail with exit 7, naming each unreachable host, and resolve nothing from the hosts that answered.
     tier:   T0
     verify: cargo nextest run -p minimal unqualified_name_with_unreachable_host_exit7_names_host
-
-- **BCLI-075** WHEN `self` is given as the box address to `min box spec`, `min box show` or `min box events` from inside a box THE SYSTEM SHALL resolve it to the containing box from the calling connection's per-box identity as the parent minimald holds it, never from the box's environment.
-  <!-- event-driven; the architecture's Addressing (L385) defines `self` and its resolution; BOX-007 reserves the name; `--parent self` waits with nesting (Non-goals) -->
-  tier:     T0
-  verify:   cargo nextest run -p minimal self_resolves_from_connection_identity
-  - IF `self` is given outside a box THEN THE SYSTEM SHALL fail with exit 2 and a hint that `self` addresses the containing box only from inside one.
-    tier:   T0
-    verify: cargo nextest run -p minimal self_outside_box_exit2_hints_inside_only
 
 - **BCLI-003** WHEN `min box show <box>` runs THE SYSTEM SHALL render the record BOX-159 returns, with the box's state as BOX-011 defines it and its identity as BOX-140 reports it.
   <!-- split from BOX-011: the rendering half; the state model stays in BOX. The identity clause is BOX-140's rendering half, moved here in cycle 4 -->
@@ -467,6 +459,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - `--provider` and `--all-providers` on the `min box` verbs: they select remote providers, which wait on the Box Provider API (gominimal/arch#45).
 - `min box list --using <pkg>[@<ver>]`: it reads a box's SBOM, which the SBOM epic owns (gominimal/inbox#582).
 - `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent` on any verb: they manage a box's children, which needs nesting. Nesting has no owner yet (Open questions).
+- Resolving `self` (`min box spec|show|events self`): only a `min` running inside a box can use it. The BOX spec leaves that out of scope, and `self` arrives with nesting.
 - `min host create|snapshot|pause|resume|rm` and `min provider show|add|rm|login|use`: they wait on the Box Provider API (gominimal/arch#45), as the local providers do.
 - The `min agent` and `min service` nouns, including `min service restart`: the Agent Box epic gominimal/inbox#678.
 - `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP).
