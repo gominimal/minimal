@@ -1125,11 +1125,13 @@ impl<S: Exec> ExecTask<S> {
         // The notice names the bound; a command that happened to finish on
         // its own in the same instant still gets it, which is the rarer
         // wrong of the two (the other being no notice for an ended exec).
-        let ended = *end_rx.borrow();
-        if let Some(ExecEnd::InputHeldOver(bound)) = ended
-            && e.write_all(held_input_notice(bound).as_bytes())
-                .await
-                .is_err()
+        let notice = match *end_rx.borrow() {
+            Some(ExecEnd::InputHeldOver(bound)) => Some(held_input_notice(bound)),
+            Some(ExecEnd::InputHeldUnstarted(bound)) => Some(unstarted_input_notice(bound)),
+            Some(ExecEnd::ClientLost) | None => None,
+        };
+        if let Some(notice) = notice
+            && e.write_all(notice.as_bytes()).await.is_err()
         {
             tracing::debug!("exec: the held-input notice was not written; the client is gone");
         }
@@ -1191,7 +1193,8 @@ where
 /// no way to hold it back, so the client is never slowed down from here:
 /// what the command has not read is held in the daemon or the connection
 /// hangs. At this much the pump stops taking from the channel, which parks
-/// the connection for a bounded time: until the command starts, and then
+/// the connection for a bounded time: until the command starts (at most
+/// [`EXEC_INPUT_UNSTARTED`]), and then
 /// for at most [`EXEC_INPUT_STALL`] without it reading a byte, after which
 /// the exec ends with a notice on its stderr ([`held_input_notice`]), an
 /// active reject rather than a hang.
@@ -1215,6 +1218,15 @@ const EXEC_INPUT_STALL: Duration = Duration::from_secs(10);
 /// with the connection behind it — would be parked as long. Past this the
 /// waiting exec ends with the daemon-bound notice instead.
 const EXEC_INPUT_STARVED: Duration = Duration::from_secs(60);
+
+/// How long the pump waits at a bound for a command that has not started.
+/// A fast client puts the cap in flight before a cold box has spawned the
+/// command, and that wait normally ends with the start; this bounds it for
+/// a spawn that never returns. Past it the held input is released, the pump
+/// lets go of the channel (so the connection is no longer parked), and the
+/// exec is ended with [`ExecEnd::InputHeldUnstarted`] — once the spawn
+/// returns, since the bridge is inside it until then.
+const EXEC_INPUT_UNSTARTED: Duration = Duration::from_secs(300);
 
 /// The most unread exec input this daemon holds across all its execs. The
 /// per-exec cap alone would let N stalled execs hold N times it in a guest
@@ -1246,6 +1258,9 @@ pub(crate) enum ExecEnd {
     ClientLost,
     /// Input held for a command that was not reading it crossed a bound.
     InputHeldOver(HeldBound),
+    /// Input reached a bound before the command started, and the command
+    /// had still not started when [`EXEC_INPUT_UNSTARTED`] ran out.
+    InputHeldUnstarted(HeldBound),
 }
 
 /// What the bridge does with input that arrives while the current command
@@ -1272,6 +1287,8 @@ struct HeldInputLimits {
     stall: Duration,
     /// The wait an exec holding nothing is allowed at the daemon bound.
     starved: Duration,
+    /// The wait at a bound for a command that has not started.
+    unstarted: Duration,
 }
 
 impl HeldInputLimits {
@@ -1283,7 +1300,27 @@ impl HeldInputLimits {
             daemon_progress: &EXEC_INPUT_PROGRESS,
             stall: EXEC_INPUT_STALL,
             starved: EXEC_INPUT_STARVED,
+            unstarted: EXEC_INPUT_UNSTARTED,
         }
+    }
+}
+
+/// The line an exec gets on its stderr when its command had not started by
+/// the end of the wait at a bound ([`ExecEnd::InputHeldUnstarted`]).
+fn unstarted_input_notice(bound: HeldBound) -> String {
+    let mib = |n: usize| n / (1024 * 1024);
+    let waited = EXEC_INPUT_UNSTARTED.as_secs();
+    match bound {
+        HeldBound::Exec => format!(
+            "minimald: this command had not started {waited} s after its input reached the {} MiB \
+             minimald holds for one exec, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_MAX)
+        ),
+        HeldBound::Daemon => format!(
+            "minimald: this command had not started {waited} s after unread exec input across \
+             this daemon's execs reached {} MiB, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_DAEMON_MAX)
+        ),
     }
 }
 
@@ -1569,13 +1606,14 @@ async fn pump_channel_input<M>(
                 // At a bound the pump stops taking from the channel, which
                 // parks the connection behind russh's buffer, for a bounded
                 // time: until the command starts (a fast client puts the cap
-                // in flight before a command spawns), and once it runs, for
+                // in flight before a command spawns), up to `unstarted`, and once it runs, for
                 // at most `stall` without this exec reading a byte, or, for
                 // an exec that holds nothing at the daemon bound, `starved`.
                 // The window restarts only on this exec's own reads; another
                 // exec's release wakes the pump to retry, at the daemon bound
                 // only, and leaves the window where it was.
                 let mut since = tokio::time::Instant::now();
+                let unstarted_from = since;
                 let mut starved_warned = false;
                 loop {
                     let bound = match held.push(&data) {
@@ -1586,6 +1624,17 @@ async fn pump_channel_input<M>(
                         tokio::select! {
                             _ = held.progress.notified() => {}
                             _ = held.limits.daemon_progress.notified() => {}
+                            () = tokio::time::sleep_until(unstarted_from + held.limits.unstarted) => {
+                                tracing::warn!(
+                                    ?bound,
+                                    waited_ms = u64::try_from(held.limits.unstarted.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "exec: the command had not started when the wait at an input bound ran out; ending the exec",
+                                );
+                                held.clear();
+                                end.send_replace(Some(ExecEnd::InputHeldUnstarted(bound)));
+                                return;
+                            }
                         }
                         since = tokio::time::Instant::now();
                         continue;
@@ -1971,6 +2020,10 @@ where
                         ExecEnd::InputHeldOver(bound) => tracing::warn!(
                             %channel_id, ?bound,
                             "exec: the command's unread input crossed a bound; ending the exec",
+                        ),
+                        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
+                            %channel_id, ?bound,
+                            "exec: the command started after its wait at an input bound ran out; ending the exec",
                         ),
                     }
                     ssh_write_failed = true;
@@ -4638,6 +4691,7 @@ mod tests {
             daemon_progress: fresh_progress(),
             stall: std::time::Duration::from_millis(300),
             starved: std::time::Duration::from_millis(900),
+            unstarted: std::time::Duration::from_secs(5),
         }
     }
     fn held_with(
@@ -4871,6 +4925,49 @@ mod tests {
         assert_eq!(held.held_bytes(), 0, "cleared and released on the end");
     }
 
+    /// Before the command starts a bound is a wait, but not one without an
+    /// end: a command whose spawn never returns would otherwise keep the
+    /// connection parked, and its input held, for good. Past `unstarted` the
+    /// held input is released, the pump returns (letting go of the
+    /// channel), and the exec's end names the unstarted command.
+    #[tokio::test]
+    async fn a_command_that_never_starts_ends_the_wait_at_a_bound() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msgs) = msg_stream();
+        let limits = super::HeldInputLimits {
+            per_exec: 200,
+            unstarted: Duration::from_millis(400),
+            ..unlimited()
+        };
+        let (held, _stdin_r) = held_with(limits);
+        let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+        let pump = tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+
+        // The third chunk would cross the cap, and the command never starts.
+        for _ in 0..3 {
+            msg_tx.send(data(100, 7)).unwrap();
+        }
+        timeout(Duration::from_secs(10), end_rx.changed())
+            .await
+            .expect("a wait at a bound for a command that never starts ends")
+            .unwrap();
+        assert_eq!(
+            *end_rx.borrow(),
+            Some(super::ExecEnd::InputHeldUnstarted(super::HeldBound::Exec))
+        );
+        assert_eq!(held.held_bytes(), 0, "cleared and released on the end");
+        timeout(Duration::from_secs(10), pump)
+            .await
+            .expect("the pump returns, letting go of the channel")
+            .unwrap();
+    }
+
     /// An exec holding nothing at the daemon bound waits for the others, but
     /// not past `starved`: when the budget stays full (its holders read just
     /// enough never to stall, or, here, never at all while not at a bound
@@ -4889,6 +4986,7 @@ mod tests {
             daemon_progress: fresh_progress(),
             stall: Duration::from_millis(300),
             starved: Duration::from_millis(1500),
+            unstarted: Duration::from_secs(5),
         };
         let mut pumps = Vec::new();
         for _ in 0..2 {
@@ -4994,6 +5092,7 @@ mod tests {
             stall: Duration::from_millis(300),
             // longer than this test's waits: it is about the wait, not its end
             starved: Duration::from_secs(60),
+            unstarted: Duration::from_secs(5),
         };
         let mut pumps = Vec::new();
         for _ in 0..2 {
