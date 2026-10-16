@@ -517,7 +517,7 @@ impl BoxSession {
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
-            let policy = boxes::SessionPolicy {
+            let policy = boxes::BoxPolicy {
                 egress: Some(egress.clone()),
                 ..Default::default()
             };
@@ -539,7 +539,7 @@ impl BoxSession {
             // whose own declared traffic is a positive control must hold one.
             let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress))?;
             let req = CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
+                config: minimald_rpc::BoxConfig {
                     name: Some(name),
                     project_path: paths::HostAbsPath::try_new("/tmp")
                         .map_err(|e| format!("project_path: {e}"))?,
@@ -791,7 +791,7 @@ async fn submit_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
     response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
-    use boxes::wire::request::SessionStep;
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -835,8 +835,8 @@ async fn submit_verdict(
     let resp: <SubmitVerdict as OneshotSshRpc>::Response = serde_json_lenient::from_slice(&buf)
         .map_err(|e| format!("decode SubmitVerdict response: {e}"))?;
     match resp.ok() {
-        Some(SessionStep::Materialized { .. }) => Ok(()),
-        Some(SessionStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
+        Some(BoxStep::Materialized { .. }) => Ok(()),
+        Some(BoxStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
         None => Err("SubmitVerdict returned an error".into()),
     }
 }

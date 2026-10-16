@@ -1477,14 +1477,14 @@ mod tests {
     use std::sync::{Mutex, RwLock};
 
     use boxes::core::egress::{self, FrameVerdict};
-    use boxes::{EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId, SessionPolicy};
+    use boxes::{BoxPolicy, EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId};
     use tokio::net::TcpSocket;
 
     use crate::net::SwitchSubnet;
     use crate::net::dns::DEFAULT_HOST_ID;
     use crate::net::policy::Direction;
     use crate::net::switch::{
-        NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, SessionGate, declared_request_ports,
+        BoxGate, NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, declared_request_ports,
         proxied_request_verdict,
     };
     use crate::test_harness::CaptureWriter;
@@ -3478,7 +3478,7 @@ mod tests {
 
         // The target's declaration, as launch records it: one published TCP
         // port forwarding to the box's own port (the real listener here).
-        let policy = SessionPolicy {
+        let policy = BoxPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -3512,7 +3512,7 @@ mod tests {
         // The direct half: the relay's own gate for the same declaration —
         // the shared `declared_ingress_ports` derivation — admits the port
         // the declaration's connections terminate on, and refuses any other.
-        let gate = SessionGate::for_session(
+        let gate = BoxGate::for_session(
             "web".to_string(),
             Ipv4Addr::LOCALHOST,
             &policy,
@@ -3820,7 +3820,7 @@ mod tests {
             // The target's declaration. A host-address box cannot carry one
             // (launch validation rejects it); an own-address box carries
             // exactly its mappings, or no section at all.
-            let target_policy = SessionPolicy {
+            let target_policy = BoxPolicy {
                 egress: None,
                 ingress: (mode != TargetMode::HostAddress && declares_ingress).then(|| {
                     IngressPolicy {
@@ -3853,7 +3853,7 @@ mod tests {
                 }
                 TargetMode::OwnAddressNative => {
                     // The creator's hand has published the box's address, as
-                    // `Session::register_hostname` records it; the attach
+                    // `BoxActor::register_hostname` records it; the attach
                     // path's report and the session's own registration both
                     // follow it, and neither is a source of the address.
                     reg.publish_own_address(
@@ -3864,7 +3864,7 @@ mod tests {
                     );
                     reg.report_own_address(target, "web", target_lease, applied);
                     // The session's own registration carries the declared
-                    // set, as `Session::register_hostname` passes it.
+                    // set, as `BoxActor::register_hostname` passes it.
                     reg.register_own_ip(
                         target,
                         "web",
@@ -3880,7 +3880,7 @@ mod tests {
                 reg.register_caller(
                     client,
                     "client",
-                    &SessionPolicy {
+                    &BoxPolicy {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
                         credentialed_upstream: None,
@@ -3960,7 +3960,7 @@ mod tests {
                     ),
                 };
                 if let Some(internal) = terminated_on {
-                    let gate = SessionGate::for_session(
+                    let gate = BoxGate::for_session(
                         "web".to_string(),
                         target_lease,
                         &target_policy,
@@ -3992,14 +3992,14 @@ mod tests {
     #[test]
     fn own_ip_target_with_no_ingress_is_deny_all_on_every_host_form() {
         // The target's declaration: none, which launch accepts on `own_ip`.
-        let policy = SessionPolicy {
+        let policy = BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
-        let gate = SessionGate::for_session(
+        let gate = BoxGate::for_session(
             "web".to_string(),
             Ipv4Addr::LOCALHOST,
             &policy,
@@ -4920,8 +4920,8 @@ mod tests {
 
     /// A caller's egress declaration that denies exactly the target's address
     /// (the loopback stand-in the test's boxes live at).
-    fn egress_denying_the_target() -> SessionPolicy {
-        SessionPolicy {
+    fn egress_denying_the_target() -> BoxPolicy {
+        BoxPolicy {
             egress: Some(EgressPolicy {
                 deny_subnets: Some(vec!["127.0.0.1/32".to_string()]),
                 ..EgressPolicy::default()
@@ -4933,8 +4933,8 @@ mod tests {
 
     /// A caller's egress declaration that allows the target's address: an
     /// allow list naming it.
-    fn egress_allowing_the_target() -> SessionPolicy {
-        SessionPolicy {
+    fn egress_allowing_the_target() -> BoxPolicy {
+        BoxPolicy {
             egress: Some(EgressPolicy {
                 allow_subnets: Some(vec!["127.0.0.1/32".to_string()]),
                 ..EgressPolicy::default()

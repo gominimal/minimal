@@ -776,7 +776,7 @@ pub enum PatchHome {
     ///
     /// [`Daemon`]-realm because that is the filesystem the daemon assembles
     /// the sandbox on, and because it is the realm the session already tracks
-    /// its home in (`SessionPaths::home`, `minimald::env::EnvArgs::home`) —
+    /// its home in (`BoxPaths::home`, `minimald::env::EnvArgs::home`) —
     /// so it arrives here without a conversion that could launder the realm.
     ///
     /// [`Daemon`]: paths::Daemon

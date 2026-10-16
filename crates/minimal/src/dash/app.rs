@@ -55,7 +55,7 @@ pub struct ProviderView {
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
     pub record: Option<boxes::Record>,
-    pub policy: Option<boxes::EffectiveSessionPolicy>,
+    pub policy: Option<boxes::EffectiveBoxPolicy>,
     /// Why the policy could not be fetched, when it could not: a daemon that
     /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
     /// says so instead of sitting on "loading policy…".
@@ -349,7 +349,7 @@ impl Model {
         const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
         const RECENT: chrono::Duration = chrono::Duration::seconds(5);
         if let Some(entry) = self.entry(key)
-            && !matches!(entry.status, boxes::SessionStatus::Active)
+            && !matches!(entry.status, boxes::BoxState::Active)
         {
             return "◌".to_string();
         }
@@ -1353,7 +1353,7 @@ mod tests {
             id: id(n),
             name: name.map(str::to_owned),
             project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),

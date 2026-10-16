@@ -433,7 +433,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // ran unenforced here would speak with the VM's address and no verdict at
     // all (design §7.1). Boot still continues — the daemon keeps serving the
     // modes that need no classification — but the failure is logged at error
-    // level with the consequence named, and `session_host` refuses a
+    // level with the consequence named, and `box_runtime` refuses a
     // host-address session on it.
     let cgroup2 = format!("{NEWROOT}/sys/fs/cgroup");
     if let Err(e) = std::fs::create_dir_all(&cgroup2) {

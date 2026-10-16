@@ -474,7 +474,7 @@ pub async fn register_box_for_activation(
     minimal_dir: Option<&Path>,
     network: boxes::NetworkMode,
     name: &str,
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
     if kind != paths::ProviderKind::Minvmd || network != boxes::NetworkMode::OwnIp {
         return Ok(None);
@@ -506,7 +506,7 @@ pub async fn register_box_beside(
     ssh_sock: &Path,
     network: boxes::NetworkMode,
     name: &str,
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
     if network != boxes::NetworkMode::OwnIp {
         return Ok(None);
@@ -556,7 +556,7 @@ pub fn control_sock_beside(ssh_sock: &Path) -> Option<PathBuf> {
 async fn register_box_at(
     sock_path: &Path,
     name: &str,
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<RegisteredWithVmHost> {
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
@@ -649,7 +649,7 @@ async fn register_box_at(
 /// to one a live row already holds; for an autogen `name` that refusal is a
 /// name collision like the create's, so the name is re-minted with `remint`
 /// and registered again, within the bounded budget
-/// ([`crate::session_name::should_retry_autogen`]) the `CreateSession`
+/// ([`crate::box_name::should_retry_autogen`]) the `CreateSession`
 /// collision retry spends — `attempts` is shared with
 /// it. A refused registration publishes no row, so nothing is withdrawn
 /// between attempts. A user-supplied name, any other failure, and a spent
@@ -661,7 +661,7 @@ pub async fn register_box_reminting_autogen(
     minimal_dir: Option<&Path>,
     network: boxes::NetworkMode,
     name: &mut String,
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     autogen: bool,
     attempts: &mut u32,
     remint: impl FnMut() -> String,
@@ -677,7 +677,7 @@ pub async fn register_box_beside_reminting_autogen(
     ssh_sock: &Path,
     network: boxes::NetworkMode,
     name: &mut String,
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     autogen: bool,
     attempts: &mut u32,
     remint: impl FnMut() -> String,
@@ -706,7 +706,7 @@ async fn reminting_autogen(
     target: VmHost<'_>,
     network: boxes::NetworkMode,
     name: &mut String,
-    policy: &boxes::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     autogen: bool,
     attempts: &mut u32,
     mut remint: impl FnMut() -> String,
@@ -720,7 +720,7 @@ async fn reminting_autogen(
         };
         match registered {
             Err(error)
-                if crate::session_name::should_retry_autogen(
+                if crate::box_name::should_retry_autogen(
                     autogen,
                     *attempts,
                     &format!("{error:#}"),
@@ -792,7 +792,7 @@ mod tests {
             &provider.join(paths::SSH_SOCK_FILE),
             boxes::NetworkMode::OwnIp,
             "web",
-            &boxes::SessionPolicy::default(),
+            &boxes::BoxPolicy::default(),
         )
         .await
         .expect("a native host registers nothing");
@@ -813,8 +813,8 @@ mod tests {
             username: None,
             project_path: paths::HostAbsPath::try_new("/p").unwrap(),
             network: boxes::NetworkMode::OwnIp,
-            policy: boxes::SessionPolicy::default(),
-            status: boxes::SessionStatus::default(),
+            policy: boxes::BoxPolicy::default(),
+            status: boxes::BoxState::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),

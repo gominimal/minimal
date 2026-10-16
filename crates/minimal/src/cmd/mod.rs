@@ -275,8 +275,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 // The autogen session name and its collision retry are the client
 // library's, shared with `min dash`.
 #[cfg(test)]
-pub(crate) use minimal_client::session_name::AUTOGEN_NAME_RETRIES;
-pub(crate) use minimal_client::session_name::{
+pub(crate) use minimal_client::box_name::AUTOGEN_NAME_RETRIES;
+pub(crate) use minimal_client::box_name::{
     autogen_session_name, random_hex4, sanitize_name_component, should_retry_autogen,
 };
 
@@ -629,7 +629,7 @@ pub(crate) async fn submit_verdict_and_wait(
     session_id: boxes::SessionId,
     verdict: boxes::wire::request::ContributionVerdict,
 ) -> Result<boxes::SessionId, anyhow::Error> {
-    use boxes::wire::request::SessionStep;
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::SubmitVerdict;
 
     let resp = match client.oneshot_rpc::<SubmitVerdict>(verdict).await {
@@ -647,8 +647,8 @@ pub(crate) async fn submit_verdict_and_wait(
         }
     };
     match step {
-        SessionStep::Materialized { id } => Ok(id),
-        SessionStep::Fault { error } => {
+        BoxStep::Materialized { id } => Ok(id),
+        BoxStep::Fault { error } => {
             send_abort(client, session_id).await;
             bail!("{error}");
         }

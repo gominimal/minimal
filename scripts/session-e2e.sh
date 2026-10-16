@@ -639,7 +639,7 @@ export RUST_LOG="${RUST_LOG:-warn,minimald::exec=info}"
 # (plan, watcher start, sockets seen, verdicts, admissions) must ride this
 # default to reach the guest at all. Widened only when nothing was set by hand.
 if [ -n "${E2E_VM:-}" ] && [ "$RUST_LOG" = "warn,minimald::exec=info" ]; then
-  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::session_host=debug"
+  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::box_runtime=debug"
 fi
 
 # Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
@@ -2375,11 +2375,11 @@ proof_host_ip_deny_all() {
 
   # The record filter both halves warm their own daemon under: the launch
   # and node-plane records this case reads are INFO from
-  # minimald::session_host and minimald::net::classifier, the
+  # minimald::box_runtime and minimald::net::classifier, the
   # advisory-bearing create record is INFO from minimald::rpc, and the
   # lane's default filter would drop all of them before they reached the
   # file this case reads them from.
-  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info,minimald::rpc=info"
+  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::box_runtime=info,minimald::rpc=info"
 
   # ---- the decided half's gates: one fact each, printed when it is missing.
   # Where one misses the decided half does not run and the unenforced half
@@ -3437,7 +3437,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # pattern). Nothing after the warm-up can spawn a daemon.
   #
   # The filter: the two records this proof reads are INFO records from
-  # minimald::net::classifier and minimald::session_host, a daemon's filter
+  # minimald::net::classifier and minimald::box_runtime, a daemon's filter
   # comes from RUST_LOG at autospawn, and the lane's default filter would
   # drop both before they reached the file this proof reads them from.
   #
@@ -3447,7 +3447,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # cache into an empty dir of its own, under $WORK so it shares the state
   # dir's device (the daemon hardlinks built packages from its cache into
   # the session rootfs, and a hardlink cannot cross filesystems).
-  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info"
+  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::box_runtime=info"
   net080_cache="$WORK/net080-cache"
   if ! RUST_LOG="$net080_rust_log" XDG_CACHE_HOME="$net080_cache" \
       mnl ls >/dev/null 2>"$WORK/net080-warm.err"; then
@@ -8680,12 +8680,12 @@ proof_box_name_resolves_natively_without_proxy() {
   fi
 
   # The daemon's log filter for the restart below — INFO for the records
-  # this case reads (the loopback lease and release, minimald::session; the
+  # this case reads (the loopback lease and release, minimald::box_actor; the
   # name registrations, minimald::net::dns; the publish exposes,
   # minimald::net::gvproxy_network) and DEBUG for the zone answerer, so
   # every lookup this case makes leaves its own line. The exec records the
   # harness's default keeps, for the `min bug` tail.
-  bn_rust_log="warn,minimald::exec=info,minimald::session=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
+  bn_rust_log="warn,minimald::exec=info,minimald::box_actor=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
   # Restart with it — a standalone run has no daemon yet; `min ls` below
   # autospawns it. No restart and no new filter when this run cannot read
   # the daemon's log: the daemon already up keeps the one it came with.
@@ -15822,7 +15822,7 @@ proof_min_internal_names_through_proxy() {
   proxy_start_host_listener
 
   # socat carries the in-box responder below. It is a launcher baseline
-  # package (crates/minimald/src/session_host.rs BASELINE_PACKAGES), so every
+  # package (crates/minimald/src/box_runtime.rs BASELINE_PACKAGES), so every
   # box ships it — at /usr/bin: packages install with --prefix=/usr, and the
   # generic rootfs has no /bin, so the case says the absolute path, the
   # daemon's own convention for in-box argv, rather than lean on PATH.
@@ -19541,7 +19541,7 @@ exit" E2E_PTY_ANSWER=keep \
   # prefix mnl hands an autospawn (native_switch_daemon).
   mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
   eib_saved_rust_log="${RUST_LOG:-}"
-  export RUST_LOG="warn,minimald::session=info"
+  export RUST_LOG="warn,minimald::box_actor=info"
   eib_restore_log() {
     if [ -n "$eib_saved_rust_log" ]; then export RUST_LOG="$eib_saved_rust_log"; else unset RUST_LOG; fi
   }
@@ -20270,7 +20270,7 @@ proof_proxy_refuses_like_direct() {
   fi
 
   # socat carries the responders below and base64 carries the echo script in;
-  # both are launcher-baseline packages (crates/minimald/src/session_host.rs
+  # both are launcher-baseline packages (crates/minimald/src/box_runtime.rs
   # BASELINE_PACKAGES), at /usr/bin — packages install with --prefix=/usr and
   # the generic rootfs has no /bin, so the absolute paths are the daemon's own
   # convention for in-box argv.
@@ -20809,7 +20809,7 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   fi
 
   # socat carries the in-box responder. It is a launcher baseline package
-  # (crates/minimald/src/session_host.rs BASELINE_PACKAGES), so every box
+  # (crates/minimald/src/box_runtime.rs BASELINE_PACKAGES), so every box
   # ships it — at /usr/bin: packages install with --prefix=/usr, and the
   # generic rootfs has no /bin, so the case says the absolute path, the
   # daemon's own convention for in-box argv, rather than lean on PATH.

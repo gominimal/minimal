@@ -610,7 +610,7 @@ pub(crate) async fn activate_session(
     // same as an explicit deny.
     let has_ingress =
         !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
-    let policy = boxes::SessionPolicy {
+    let policy = boxes::BoxPolicy {
         egress,
         ingress: has_ingress.then_some(boxes::IngressPolicy {
             port_mappings,
@@ -644,7 +644,7 @@ pub(crate) async fn activate_session(
     // lands just before the create (T66): the registration is the last
     // fallible client-side step, so a loadout, policy, or hook failure
     // between here and there never strands a row on the host.
-    let mut config = minimald_rpc::SessionConfig {
+    let mut config = minimald_rpc::BoxConfig {
         name: Some(session_name),
         project_path: abs_path.clone(),
         network,
@@ -2532,7 +2532,7 @@ pub fn print_classifier_advisory(
 /// tests that pin the rendering (NET-061, NET-075).
 pub fn format_policy(
     out: &mut impl std::io::Write,
-    effective: &boxes::EffectiveSessionPolicy,
+    effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
     host_ip_enforcement: Option<boxes::HostIpEnforcement>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
@@ -3014,7 +3014,7 @@ struct PolicyCredentialedUpstreamJson<'a> {
 
 impl<'a> PolicyCredentialedUpstreamJson<'a> {
     fn from_effective(
-        effective: &'a boxes::EffectiveSessionPolicy,
+        effective: &'a boxes::EffectiveBoxPolicy,
         network: boxes::NetworkMode,
     ) -> Option<Self> {
         effective.credentialed_upstream.as_ref().map(|lane| Self {
@@ -3052,7 +3052,7 @@ enum LiveIngressJson {
 /// the tests that pin the document, the way [`format_policy`] is.
 pub fn write_policy_json(
     out: &mut impl std::io::Write,
-    effective: &boxes::EffectiveSessionPolicy,
+    effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
@@ -3076,7 +3076,7 @@ pub fn write_policy_json(
 /// rendering's warning lines.
 pub fn write_policy_json_noting(
     out: &mut impl std::io::Write,
-    effective: &boxes::EffectiveSessionPolicy,
+    effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
@@ -3288,7 +3288,7 @@ async fn session_policy_json_inputs(
 ) -> Result<
     (
         boxes::Record,
-        boxes::EffectiveSessionPolicy,
+        boxes::EffectiveBoxPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
         Vec<u16>,
         Vec<minimald_rpc::SharedPortCollision>,
@@ -4375,8 +4375,8 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 mod tests {
     use super::*;
     use boxes::{
-        CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
-        IngressPolicy, IpProto, NetworkMode, PortMapping,
+        CredentialedUpstream, DynamicIngress, EffectiveBoxPolicy, EffectiveEgress, IngressPolicy,
+        IpProto, NetworkMode, PortMapping,
     };
 
     /// A box whose record was read and carries no address pair registered no
@@ -4536,7 +4536,7 @@ mod tests {
         /// Register `name` the way the activation does, with `stance` over
         /// 3000-3999.
         async fn register(&self, name: &str, stance: DynamicIngress) -> RegisteredWithVmHost {
-            let policy = boxes::SessionPolicy {
+            let policy = boxes::BoxPolicy {
                 egress: None,
                 ingress: Some(IngressPolicy {
                     port_mappings: vec![],
@@ -4919,7 +4919,7 @@ mod tests {
 
     #[test]
     fn format_policy_dynamic_ingress_allow_prints_row_not_deny_all() {
-        let policy = EffectiveSessionPolicy {
+        let policy = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![],
@@ -4943,7 +4943,7 @@ mod tests {
 
     #[test]
     fn format_policy_dynamic_ingress_prints_beside_static_mapping() {
-        let policy = EffectiveSessionPolicy {
+        let policy = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -4975,7 +4975,7 @@ mod tests {
         // down before NET-074, which still arrives as `Declared` when the
         // session or the box opted out of the default — and so keeps
         // printing the per-dimension defaults, not `deny-all`.
-        let policy = EffectiveSessionPolicy {
+        let policy = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy::default()),
             ingress: None,
             credentialed_upstream: None,
@@ -5005,7 +5005,7 @@ mod tests {
     /// state it runs in.
     #[test]
     fn policy_shows_declared_deny_all() {
-        let declared = EffectiveSessionPolicy {
+        let declared = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
@@ -5036,7 +5036,7 @@ mod tests {
         // what the box chose, the marked row what the rollout chose for a
         // box that declared nothing (NET-075's "marked as a default and not
         // as a declaration" is the mark's own half of the pair).
-        let defaulted = EffectiveSessionPolicy {
+        let defaulted = EffectiveBoxPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
             credentialed_upstream: None,
@@ -5062,7 +5062,7 @@ mod tests {
         // section rides with its name, empty lists and all, the shape the
         // strict record holds; the default's carries no `rules`, because
         // the box declared nothing to carry.
-        let egress_of = |policy: &EffectiveSessionPolicy| {
+        let egress_of = |policy: &EffectiveBoxPolicy| {
             let mut out = Vec::new();
             write_policy_json(
                 &mut out,
@@ -5130,7 +5130,7 @@ mod tests {
         // A section that allows something is not deny-all and keeps its
         // rows: one allowed subnet makes the verdict "10.0.0.0/8 and
         // nothing else", not deny-all, so it must not collapse to the name.
-        let not_deny_all = EffectiveSessionPolicy {
+        let not_deny_all = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 allow_dns_hosts: Some(vec![]),
@@ -5169,7 +5169,7 @@ mod tests {
         // absent `allow_subnets` to present and empty (NET-074): the row is
         // spelled out as `(none)`, never printed blank, and the section is
         // not deny-all, since its names grant reach.
-        let names_only = EffectiveSessionPolicy {
+        let names_only = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy {
                 allow_subnets: Some(vec![]),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
@@ -5198,7 +5198,7 @@ mod tests {
         // NET-075: once the deny-all default is in force, a box that
         // declared no egress prints the posture the gate enforces, not the
         // absent section — by name, marked as the default it is.
-        let deny_all = EffectiveSessionPolicy {
+        let deny_all = EffectiveBoxPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
             credentialed_upstream: None,
@@ -5217,7 +5217,7 @@ mod tests {
         );
         // The opt-out keeps the shipped default, so that box still reads
         // allow-all (NET-077), under the same mark.
-        let allow_all = EffectiveSessionPolicy {
+        let allow_all = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
             credentialed_upstream: None,
@@ -5242,7 +5242,7 @@ mod tests {
     /// is not.
     #[test]
     fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
-        let unenforced = EffectiveSessionPolicy {
+        let unenforced = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
@@ -5265,7 +5265,7 @@ mod tests {
         );
 
         // The decided host's own spelling rides the same row.
-        let enforced = EffectiveSessionPolicy {
+        let enforced = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
             credentialed_upstream: None,
@@ -5290,7 +5290,7 @@ mod tests {
         // No state reported, no row — the same silence an own-address box
         // reads (its own render never carries the state at all), and the one
         // a daemon too old to answer the facts reply leaves the caller with.
-        let silent = EffectiveSessionPolicy {
+        let silent = EffectiveBoxPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
             credentialed_upstream: None,
@@ -5314,7 +5314,7 @@ mod tests {
     /// the lane has no effect in still shows the declaration, marked.
     #[test]
     fn policy_render_carries_the_credentialed_upstream_row_when_declared() {
-        let laned = EffectiveSessionPolicy {
+        let laned = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: Some(CredentialedUpstream::default()),
@@ -5331,7 +5331,7 @@ mod tests {
 
         // The same policy without the lane prints no row: silence is the
         // no-lane claim, not a lane that reads as undeclared.
-        let unlaned = EffectiveSessionPolicy {
+        let unlaned = EffectiveBoxPolicy {
             egress: EffectiveEgress::Declared(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
@@ -5347,7 +5347,7 @@ mod tests {
         // The document carries the lane the same way: a key only when
         // declared, absent otherwise — never `null`, which a client could
         // not tell from a lane it failed to read.
-        let json_of = |policy: &EffectiveSessionPolicy| {
+        let json_of = |policy: &EffectiveBoxPolicy| {
             let mut out = Vec::new();
             write_policy_json(
                 &mut out,
@@ -5630,7 +5630,7 @@ mod tests {
 
         // Beside the declaration: the declared dynamic surface first, then
         // the publish that used it.
-        let policy = EffectiveSessionPolicy {
+        let policy = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![],
@@ -5720,7 +5720,7 @@ mod tests {
 
         // The `-o json` document carries the same ports for a machine, and
         // leaves the key out when there are none.
-        let policy = EffectiveSessionPolicy {
+        let policy = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
             credentialed_upstream: None,
@@ -5756,7 +5756,7 @@ mod tests {
     /// an empty list marks nothing.
     #[test]
     fn policy_marks_a_yielded_shared_address_port() {
-        let policy = EffectiveSessionPolicy {
+        let policy = EffectiveBoxPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![
@@ -6037,7 +6037,7 @@ mod tests {
     /// ends with rather than creating the box unregistered.
     #[tokio::test]
     async fn activate_registers_box_with_vm_host() {
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             egress: Some(boxes::EgressPolicy {
                 allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                 allow_dns_hosts: None,
@@ -6205,7 +6205,7 @@ mod tests {
             Some(dir.path()),
             NetworkMode::OwnIp,
             "web",
-            &boxes::SessionPolicy::default(),
+            &boxes::BoxPolicy::default(),
         )
         .await
         .expect("the registration is answered")
@@ -6238,7 +6238,7 @@ mod tests {
     /// cannot drift in what they declare or hold.
     #[tokio::test]
     async fn cli_and_dash_register_through_one_exchange() {
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -6312,12 +6312,12 @@ mod tests {
             username: None,
             project_path: paths::HostAbsPath::try_new("/p").unwrap(),
             network: NetworkMode::OwnIp,
-            policy: boxes::SessionPolicy {
+            policy: boxes::BoxPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
             },
-            status: boxes::SessionStatus::default(),
+            status: boxes::BoxState::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
@@ -6364,7 +6364,7 @@ mod tests {
     /// row fills the deny default in: nothing is permitted.
     #[tokio::test]
     async fn registration_carries_dynamic_ingress_grant() {
-        let granted = boxes::SessionPolicy {
+        let granted = boxes::BoxPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -6377,7 +6377,7 @@ mod tests {
             }),
             credentialed_upstream: None,
         };
-        let ungranted = boxes::SessionPolicy {
+        let ungranted = boxes::BoxPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: Vec::new(),
@@ -6443,7 +6443,7 @@ mod tests {
     /// row and the new attachment all agree on it.
     #[tokio::test]
     async fn attachment_carries_the_registered_box_id() {
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -6583,7 +6583,7 @@ mod tests {
     /// silently break the retry.
     #[tokio::test]
     async fn autogen_registration_reminted_on_a_held_name() {
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -6678,7 +6678,7 @@ mod tests {
     /// went active keeps its row past the lease's close.
     #[tokio::test]
     async fn activation_lease_withdraws_uncommitted_and_keeps_committed() {
-        let policy = boxes::SessionPolicy {
+        let policy = boxes::BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
@@ -7466,7 +7466,7 @@ mod tests {
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
         )
         .await;
-        let policy = boxes::SessionPolicy::default();
+        let policy = boxes::BoxPolicy::default();
         let handed = register_box_for_activation(
             paths::ProviderKind::Minvmd,
             Some(dir.path()),

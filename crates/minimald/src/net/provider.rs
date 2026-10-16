@@ -352,7 +352,7 @@ pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<boxes::SessionPolicy>,
+    policy: Option<boxes::BoxPolicy>,
     own_address: Option<OwnAddressReporter>,
     box_addresses: Option<boxes::BoxAddresses>,
     decision: Option<crate::net::classifier::Decision>,
@@ -397,7 +397,7 @@ pub(crate) fn task_network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<boxes::SessionPolicy>,
+    policy: Option<boxes::BoxPolicy>,
     task_addresses: Vec<std::net::Ipv4Addr>,
 ) -> Arc<dyn Network> {
     match mode {
@@ -642,7 +642,7 @@ struct OwnIpNetwork {
     /// Registered as the PTask's `*.min.internal` hostname on attach (R3.1).
     identity: String,
     /// The launch's whole session policy, carried into the relay gate.
-    policy: Option<boxes::SessionPolicy>,
+    policy: Option<boxes::BoxPolicy>,
     /// The registry handle the lease is reported through on attach, so the
     /// box's proxy route exists exactly while the lease does (NET-001). `None`
     /// for a task launch, which owns no proxy route.
@@ -1136,7 +1136,7 @@ mod tests {
     async fn carve_out_targets_live_answerer_bind_in_the_box_plan() {
         use crate::net::classifier::{Decision, clear_live_answerer, set_live_answerer};
 
-        let deny_all = Some(boxes::SessionPolicy::new(
+        let deny_all = Some(boxes::BoxPolicy::new(
             Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
@@ -1201,7 +1201,7 @@ mod tests {
     /// a box in the guest's namespace has no reach into.
     #[tokio::test]
     async fn host_ip_box_resolves_through_answerer() {
-        let deny_all = Some(boxes::SessionPolicy::new(
+        let deny_all = Some(boxes::BoxPolicy::new(
             Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
@@ -1300,7 +1300,7 @@ mod tests {
     async fn guest_deny_all_box_resolves_through_answerer_once_decided() {
         use crate::net::classifier::{Cause, Decision};
 
-        let deny_all = Some(boxes::SessionPolicy::new(
+        let deny_all = Some(boxes::BoxPolicy::new(
             Some(boxes::EgressPolicy::deny_all()),
             None,
         ));

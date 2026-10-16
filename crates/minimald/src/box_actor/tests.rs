@@ -5,7 +5,7 @@ use russh::ChannelMsg;
 
 use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
 
-use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle};
+use crate::box_runtime::{HOST_MAILBOX_CAPACITY, HostHandle};
 use crate::test_harness::{TestClient, TestServer, create_configured_session};
 
 /// Far longer than [`super::HOST_PROBE_TIMEOUT`], so under a paused
@@ -90,7 +90,7 @@ async fn stopping_a_wedged_host_detaches_its_loop_instead_of_parking() {
     // wait was unbounded.
     tokio::time::timeout(
         GIVE_UP,
-        super::Session::kill_and_stop_loop(&host, &mut task, true),
+        super::BoxActor::kill_and_stop_loop(&host, &mut task, true),
     )
     .await
     .expect("the bounded stop path must return, not park on a wedged loop");
@@ -274,12 +274,12 @@ async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
             .state
             .sessions_manager()
             .await
-            .get_record(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
             .await
             .unwrap()
             .expect("the record should exist")
             .status,
-        boxes::SessionStatus::Active,
+        boxes::BoxState::Active,
     );
 }
 
@@ -313,7 +313,7 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
     // once the unpack ends on either arm.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -470,7 +470,7 @@ async fn attach_from_elsewhere_during_activation_is_refused_until_the_creator_fi
         .state
         .sessions_manager()
         .await
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve")
@@ -579,7 +579,7 @@ async fn attach_while_a_real_workspace_upload_is_half_sent_is_refused_then_lands
         .state
         .sessions_manager()
         .await
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve")
@@ -661,7 +661,7 @@ async fn configure_while_a_workspace_upload_streams_is_refused() {
         .state
         .sessions_manager()
         .await
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -727,11 +727,11 @@ async fn shell_round_trips_stdin_to_stdout_then_tears_down() {
     }
 
     // Now ask the mock to exit. The shell exiting raises the session-exit
-    // prompt (see `session_host`), rendered over the channel; answer it by
+    // prompt (see `box_runtime`), rendered over the channel; answer it by
     // confirming the first option (Enter -> detach) so teardown proceeds and
     // the channel closes.
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut saw_exit_status = false;
@@ -748,7 +748,7 @@ async fn shell_round_trips_stdin_to_stdout_then_tears_down() {
                 prompt_out.extend_from_slice(&data);
                 if !answered_prompt
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\r".to_vec()).await.unwrap();
                     answered_prompt = true;
@@ -809,7 +809,7 @@ async fn shell_exit_prompt_lists_files_changed_since_activation() {
     // Change the workspace daemon-side, as an in-session shell would.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -823,7 +823,7 @@ async fn shell_exit_prompt_lists_files_changed_since_activation() {
 
     // Exit the shell; the prompt must lead with the delta.
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut answered_prompt = false;
@@ -834,7 +834,7 @@ async fn shell_exit_prompt_lists_files_changed_since_activation() {
                 prompt_out.extend_from_slice(&data);
                 if !answered_prompt
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\r".to_vec()).await.unwrap();
                     answered_prompt = true;
@@ -866,12 +866,12 @@ async fn shell_exit_prompt_lists_files_changed_since_activation() {
 }
 
 /// Resolves a live session's handle and workspace paths.
-async fn session_paths(server: &TestServer, session_id: SessionId) -> crate::session::SessionPaths {
+async fn session_paths(server: &TestServer, session_id: SessionId) -> crate::box_actor::BoxPaths {
     server
         .state
         .sessions_manager()
         .await
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve")
@@ -1006,7 +1006,7 @@ async fn workspace_baseline_survives_keep_exit_and_reattach() {
 /// channel closes, with the host torn down and the session's files kept.
 async fn keep_exit(channel: &mut russh::Channel<russh::client::Msg>) {
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut answered_prompt = false;
@@ -1017,7 +1017,7 @@ async fn keep_exit(channel: &mut russh::Channel<russh::client::Msg>) {
                 prompt_out.extend_from_slice(&data);
                 if !answered_prompt
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\r".to_vec()).await.unwrap();
                     answered_prompt = true;
@@ -1088,7 +1088,7 @@ async fn workspace_baseline_survives_a_daemon_restart() {
 /// reports VCS-exact state through the whole stack: committed-and-pushed
 /// is proven clean (even though the tree differs from an empty
 /// activation baseline), and new work lists as uncommitted rows. The
-/// unpushed-commit arm is covered by `session_delta`'s unit tests.
+/// unpushed-commit arm is covered by `workspace_delta`'s unit tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_delta_rpc_reports_vcs_state_for_a_git_workspace() {
     use minimald_rpc::{SessionDelta, SessionDeltaRequest, SessionDeltaResponse};
@@ -1228,7 +1228,7 @@ async fn terminate_option_deletes_session_and_closes_channel() {
     // Exit the shell to raise the prompt, then pick the second option
     // (delete): a down-arrow to move off the default, then Enter.
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut closed = false;
@@ -1240,7 +1240,7 @@ async fn terminate_option_deletes_session_and_closes_channel() {
                 prompt_out.extend_from_slice(&data);
                 if !answered_prompt
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\x1b[B\r".to_vec()).await.unwrap();
                     answered_prompt = true;
@@ -1304,7 +1304,7 @@ async fn save_option_archives_changed_files_then_deletes_session() {
     // Change the workspace daemon-side, as an in-session shell would.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -1318,7 +1318,7 @@ async fn save_option_archives_changed_files_then_deletes_session() {
 
     // Exit the shell, then pick the middle option (save-then-delete).
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut closed = false;
@@ -1330,7 +1330,7 @@ async fn save_option_archives_changed_files_then_deletes_session() {
                 prompt_out.extend_from_slice(&data);
                 if !answered_prompt
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\x1b[B\r".to_vec()).await.unwrap();
                     answered_prompt = true;
@@ -1785,7 +1785,7 @@ async fn composition_survives_actor_restart() {
     // and holds the composition in memory. Verify it's present.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve while actor is running");
@@ -1803,7 +1803,7 @@ async fn composition_survives_actor_restart() {
     // Re-resolve: spawns a new actor from disk. The composition
     // should be restored from the sidecar, not None.
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve after eviction");
@@ -1826,7 +1826,7 @@ async fn missing_sidecar_falls_back_to_baseline() {
 
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -1851,7 +1851,7 @@ async fn missing_sidecar_falls_back_to_baseline() {
     // Re-resolve: spawns from disk with no sidecar. The
     // composition should be None — loud fallback to baseline.
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve after eviction");
@@ -1874,7 +1874,7 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
 
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -1915,17 +1915,17 @@ async fn a_launch_whose_record_cannot_be_written_kills_its_box() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let session_id = create_configured_session(&mut client, "unrecorded-launch", "/tmp").await;
-    let torn_down = crate::session::launch_record_seam::fail_writes_for(session_id);
+    let torn_down = crate::box_actor::launch_record_seam::fail_writes_for(session_id);
 
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
 
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::LaunchRecordUnwritable(_)) => {}
+        Err(crate::box_actor::AttachError::LaunchRecordUnwritable(_)) => {}
         Err(other) => panic!("the launch failed for another reason: {other}"),
         Ok(_) => panic!("a launch whose outcome could not be recorded handed its box back"),
     }
@@ -2014,7 +2014,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
 // ---- lifecycle hooks -------------------------------------------------
 //
 // Hooks run inside the session, which under test means the host-side
-// command `session_host::Host::command_in_session` builds for the mock
+// command `box_runtime::Host::command_in_session` builds for the mock
 // launcher. What these cover is the wiring above that: which transitions
 // run hooks, when they run relative to teardown, and whether a session
 // with no live host gets one minted first.
@@ -2059,7 +2059,7 @@ fn contribution_with_hook(
 }
 
 /// The session's on-disk status, or `None` once it is gone.
-async fn record_status(client: &mut TestClient, id: SessionId) -> Option<boxes::SessionStatus> {
+async fn record_status(client: &mut TestClient, id: SessionId) -> Option<boxes::BoxState> {
     client
         .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
         .await
@@ -2221,7 +2221,7 @@ async fn activation_runs_its_activate_hooks() {
     assert!(marker.exists(), "on_activate did not run");
     assert_eq!(
         record_status(&mut client, session_id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
         "a session whose activate hook succeeded should be attachable",
     );
 }
@@ -2344,7 +2344,7 @@ async fn reattaching_from_another_terminal_republishes_term() {
 /// not an assertion that there is no terminal, and a session that had a
 /// good `TERM` must not lose it to a client that could not describe one.
 ///
-/// This is the case `Session::attach` logs, because on the wire it looks
+/// This is the case `BoxActor::attach` logs, because on the wire it looks
 /// exactly like "nothing changed".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_attach_with_no_terminal_keeps_the_last_published_one() {
@@ -2548,7 +2548,7 @@ async fn a_failing_activate_hook_blocks_the_session() {
     // The gate that matters: not attachable.
     assert_ne!(
         record_status(&mut client, id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
         "a session whose activate hook failed must not be attachable",
     );
 }
@@ -2589,7 +2589,7 @@ async fn destroy_runs_its_destroy_hooks_against_a_live_host() {
     // it has always handled: a session with somewhere to run.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("the session should be retrievable");
@@ -2638,7 +2638,7 @@ async fn destroy_runs_its_hooks_after_the_session_shell_has_exited() {
     // way the reported repro does. This is what leaves the stale handle.
     let mut channel = client.open_shell(session_id).await;
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut prompt_out = Vec::new();
@@ -2649,7 +2649,7 @@ async fn destroy_runs_its_hooks_after_the_session_shell_has_exited() {
                 prompt_out.extend_from_slice(&data);
                 if !answered
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\r".to_vec()).await.unwrap();
                     answered = true;
@@ -2769,7 +2769,7 @@ async fn detach_runs_its_detach_hooks_after_the_shell_exits() {
 
     let mut channel = client.open_shell(session_id).await;
     channel
-        .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut prompt_out = Vec::new();
@@ -2780,7 +2780,7 @@ async fn detach_runs_its_detach_hooks_after_the_shell_exits() {
                 prompt_out.extend_from_slice(&data);
                 if !answered
                     && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
                 {
                     channel.data_bytes(b"\r".to_vec()).await.unwrap();
                     answered = true;
@@ -2956,7 +2956,7 @@ async fn box_survives_without_client() {
     // Launch the entrypoint with no client attached.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -2983,7 +2983,7 @@ async fn box_survives_without_client() {
 
     assert_eq!(
         record_status(&mut fresh, session_id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
         "a box that outlived its client is still an Active record",
     );
 }
@@ -3053,7 +3053,7 @@ async fn abrupt_client_loss_keeps_task() {
 
     assert_eq!(
         record_status(&mut fresh, session_id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
     );
 
     use minimald_rpc::{Shutdown, ShutdownRequest};
@@ -3128,7 +3128,7 @@ async fn box_has_no_idle_stop() {
     // The box is exactly where the client left it.
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
@@ -3138,7 +3138,7 @@ async fn box_has_no_idle_stop() {
     );
     assert_eq!(
         record_status(&mut server.connect().await, session_id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
     );
 
     // And none of the stop paths' lines is in the log for this session.
@@ -3226,7 +3226,7 @@ async fn own_ip_default_deny_all() {
     // The launcher's resolution for an own-address box that declared
     // nothing, once the default is in force: the deny-all section, egress
     // only touched, ingress kept.
-    let declared = boxes::SessionPolicy::default();
+    let declared = boxes::BoxPolicy::default();
     let effective = super::effective_session_policy(
         &declared,
         boxes::NetworkMode::OwnIp,
@@ -3283,11 +3283,11 @@ async fn own_ip_default_deny_all() {
     let mut client = server.connect().await;
     client
         .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::SessionConfig {
+            config: minimald_rpc::BoxConfig {
                 name: Some("own-ip-bare".to_string()),
                 project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
                 network: boxes::NetworkMode::OwnIp,
-                policy: boxes::SessionPolicy::default(),
+                policy: boxes::BoxPolicy::default(),
                 task_addresses: Vec::new(),
                 box_id: None,
                 box_addresses: None,
@@ -3332,11 +3332,11 @@ async fn own_ip_default_deny_all() {
 /// the ingress a publish is made of (NET-010) — under the session `name`.
 fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
     minimald_rpc::CreateSessionRequest {
-        config: minimald_rpc::SessionConfig {
+        config: minimald_rpc::BoxConfig {
             name: Some(name.to_string()),
             project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
             network: boxes::NetworkMode::OwnIp,
-            policy: boxes::SessionPolicy {
+            policy: boxes::BoxPolicy {
                 egress: None,
                 ingress: Some(boxes::IngressPolicy {
                     port_mappings: vec![boxes::PortMapping {
@@ -3492,7 +3492,7 @@ async fn create_handed_own_ip_session(
 /// landing a test makes next provably answers a waiter rather than a
 /// registration that has not yet begun to wait (NET-123 §7.1).
 #[cfg(target_os = "linux")]
-async fn await_verdict_waiter(manager: &crate::sessions::ManagerHandle) {
+async fn await_verdict_waiter(manager: &crate::box_manager::BoxManagerHandle) {
     for _ in 0..12_000 {
         if manager.verdict_waiters() >= 1 {
             return;
@@ -3957,7 +3957,7 @@ async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
     );
     assert_eq!(
         record_status(&mut client, id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
         "a box with ingress and an activate hook activates"
     );
     let (owner, address) = zone_answer_for(&server, "hooked-web.min.internal")
@@ -4105,7 +4105,7 @@ async fn ensure_host_refuses_a_registered_box_whose_host_ended() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4122,7 +4122,7 @@ async fn ensure_host_refuses_a_registered_box_whose_host_ended() {
     host.kill(false).await.expect("the box's host ends");
     soon(|| !host.is_alive()).await;
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(crate::box_actor::AttachError::BoxHostRowEnded) => {}
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a registered box was relaunched rowless"),
     }
@@ -4147,7 +4147,7 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4210,7 +4210,7 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
         })
         .expect("the report door stand-in lives");
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(crate::box_actor::AttachError::BoxHostRowEnded) => {}
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a box the host holds no row for was relaunched rowless"),
     }
@@ -4237,7 +4237,7 @@ async fn ensure_host_refuses_a_relaunch_whose_row_ended_while_it_launched() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4269,7 +4269,7 @@ async fn ensure_host_refuses_a_relaunch_whose_row_ended_while_it_launched() {
             .expect("the report door stand-in lives");
     }
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(crate::box_actor::AttachError::BoxHostRowEnded) => {}
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a relaunch whose row ended while it launched was kept rowless"),
     }
@@ -4288,7 +4288,7 @@ async fn ensure_host_refuses_a_relaunch_whose_row_ended_while_it_launched() {
         })
         .expect("the report door stand-in lives");
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(crate::box_actor::AttachError::BoxHostRowEnded) => {}
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("the refused relaunch's host was reused as holding a row"),
     }
@@ -4329,7 +4329,7 @@ async fn ensure_host_refuses_a_registered_box_whose_record_names_no_box_id() {
     finalize_session(&mut client, id).await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4357,7 +4357,7 @@ async fn ensure_host_refuses_a_registered_box_whose_record_names_no_box_id() {
         })
         .expect("the report door stand-in lives");
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(crate::box_actor::AttachError::BoxHostRowEnded) => {}
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a box with no id was relaunched on an address-only read"),
     }
@@ -4387,7 +4387,7 @@ async fn ensure_host_reuses_a_relaunched_host_without_the_report_door() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4451,7 +4451,7 @@ async fn a_restarted_registered_box_whose_row_was_bound_refuses_the_attach() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4465,17 +4465,17 @@ async fn a_restarted_registered_box_whose_row_was_bound_refuses_the_attach() {
     handle.stop().await;
     manager.evict(id).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves after the restart");
     let record = handle.record().await.expect("the record reads back");
-    assert_eq!(record.status, boxes::SessionStatus::Active);
+    assert_eq!(record.status, boxes::BoxState::Active);
     assert!(record.host_row_bound, "the binding survives the restart");
 
     assert_attach_refused_rowless(&mut client, id).await;
     match handle.ensure_host("tester".to_string()).await {
-        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(crate::box_actor::AttachError::BoxHostRowEnded) => {}
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a restarted registered box was launched rowless"),
     }
@@ -4497,7 +4497,7 @@ async fn a_registered_box_never_launched_mints_and_binds_its_row() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -4521,7 +4521,7 @@ async fn a_registered_box_never_launched_mints_and_binds_its_row() {
     handle.stop().await;
     manager.evict(id).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves after the restart");
@@ -4571,7 +4571,7 @@ async fn a_failed_activate_hook_s_publish_is_withdrawn_by_the_destroy() {
     }
     assert_ne!(
         record_status(&mut client, id).await,
-        Some(boxes::SessionStatus::Active),
+        Some(boxes::BoxState::Active),
         "a box whose activate hook failed is not promoted"
     );
 
@@ -4633,7 +4633,7 @@ async fn stopped_shared_address_box_is_nodata_through_actor() {
 
     // Stop the box through the actor — the path the issue reports.
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves while it runs");
@@ -4707,7 +4707,7 @@ async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
     // Stop the box through the actor — the path the issue reports. The Stop
     // arm must not panic; it marks the name stopped and returns.
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves while it runs");
@@ -4740,7 +4740,7 @@ async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
     // stopped marker, and the name answers again at the same address.
     manager.evict(id).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves after eviction");
@@ -4817,7 +4817,7 @@ async fn stop_with_unreadable_record_still_marks_name_stopped() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves while it runs");
@@ -5091,7 +5091,7 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
         "a second resume starts nothing"
     );
     manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(alpha))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(alpha))
         .await
         .unwrap()
         .expect("the resumed session resolves");
@@ -5902,7 +5902,7 @@ async fn a_box_destroyed_inside_the_landing_window_is_not_resurrected() {
     // publish.
     let book = manager.loopback_book();
     book.set_range_verdict(crate::net::dns::RangeVerdict::Present);
-    let drawn = crate::sessions::draw_interim_upgrades(book, &registry);
+    let drawn = crate::box_manager::draw_interim_upgrades(book, &registry);
     let upgrade = drawn
         .first()
         .expect("the draw found the box standing at the interim");
@@ -5928,7 +5928,7 @@ async fn a_box_destroyed_inside_the_landing_window_is_not_resurrected() {
     // The apply re-checks and publishes nothing: the name the destroy
     // withdrew stays withdrawn, the publish stays withdrawn, and the grant
     // drawn inside the window is released rather than left spoken for.
-    let applied = crate::sessions::apply_interim_upgrade(book, &registry, upgrade);
+    let applied = crate::box_manager::apply_interim_upgrade(book, &registry, upgrade);
     assert!(
         !applied,
         "a box destroyed inside the landing's window is not resurrected"
@@ -6016,7 +6016,7 @@ async fn a_box_destroyed_between_enumeration_and_grant_is_released_once() {
         crate::net::dns::LoopbackGrant::Granted(address) => address,
         other => panic!("a present book grants the drawn box: {other:?}"),
     };
-    let upgrade = crate::sessions::InterimUpgrade {
+    let upgrade = crate::box_manager::InterimUpgrade {
         session: standing.session,
         name: standing.name,
         ports: standing.ports,
@@ -6025,7 +6025,7 @@ async fn a_box_destroyed_between_enumeration_and_grant_is_released_once() {
     };
 
     assert!(
-        !crate::sessions::apply_interim_upgrade(book, &registry, &upgrade),
+        !crate::box_manager::apply_interim_upgrade(book, &registry, &upgrade),
         "a box destroyed inside the window is not re-published"
     );
     assert_eq!(
@@ -6174,7 +6174,7 @@ async fn a_box_re_registered_inside_the_landing_window_keeps_its_grant() {
 
     let book = manager.loopback_book();
     book.set_range_verdict(crate::net::dns::RangeVerdict::Present);
-    let drawn = crate::sessions::draw_interim_upgrades(book, &registry);
+    let drawn = crate::box_manager::draw_interim_upgrades(book, &registry);
     let upgrade = drawn
         .iter()
         .find(|upgrade| upgrade.session == web)
@@ -6202,7 +6202,7 @@ async fn a_box_re_registered_inside_the_landing_window_keeps_its_grant() {
         "the renamed box publishes at the grant the draw recorded"
     );
 
-    let applied = crate::sessions::apply_interim_upgrade(book, &registry, upgrade);
+    let applied = crate::box_manager::apply_interim_upgrade(book, &registry, upgrade);
     assert!(!applied, "the stale move is discarded");
     assert_eq!(
         registry
@@ -6845,7 +6845,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
         "both boxes are resumed"
     );
     let record = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(newer))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(newer))
         .await
         .unwrap()
         .expect("the box resolves")
@@ -6878,7 +6878,7 @@ async fn shared_port_pair(
     server: &TestServer,
     client: &mut TestClient,
 ) -> (
-    crate::sessions::ManagerHandle,
+    crate::box_manager::BoxManagerHandle,
     SessionId,
     SessionId,
     std::net::Ipv4Addr,
@@ -6942,7 +6942,7 @@ async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes
     let mut client = server.connect().await;
     let (manager, holder, yielder, published) = shared_port_pair(&server, &mut client).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(yielder))
         .await
         .unwrap()
         .expect("the yielding box resolves");
@@ -7040,7 +7040,7 @@ async fn a_destroyed_holders_shared_port_is_not_bound_for_a_box_that_is_not_runn
     let mut client = server.connect().await;
     let (manager, holder, yielder, _published) = shared_port_pair(&server, &mut client).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(yielder))
         .await
         .unwrap()
         .expect("the yielding box resolves");
@@ -7085,7 +7085,7 @@ async fn a_hand_over_bind_the_switch_refuses_leaves_the_election_standing() {
     let mut client = server.connect().await;
     let (manager, holder, yielder, _published) = shared_port_pair(&server, &mut client).await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(yielder))
         .await
         .unwrap()
         .expect("the yielding box resolves");
@@ -7760,11 +7760,11 @@ async fn create_logs_dynamic_ingress() {
         .unwrap();
     client
         .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::SessionConfig {
+            config: minimald_rpc::BoxConfig {
                 name: Some("dyn-bare-logged".to_string()),
                 project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
                 network: boxes::NetworkMode::OwnIp,
-                policy: boxes::SessionPolicy::default(),
+                policy: boxes::BoxPolicy::default(),
                 task_addresses: Vec::new(),
                 box_id: None,
                 box_addresses: None,
@@ -7841,12 +7841,12 @@ async fn expose_unenrolled_local_rpc_evaluates_dynamic_ingress() {
     )
     .await;
     let web_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
     let db_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(db))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(db))
         .await
         .unwrap()
         .expect("the unenrolled box resolves");
@@ -7939,7 +7939,7 @@ async fn expose_allow_publishes_and_lists() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -8058,7 +8058,7 @@ async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -8066,10 +8066,10 @@ async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
         .ensure_host("tester".to_string())
         .await
         .expect("the allowing box launches its host");
-    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
         "gateweb".to_string(),
         switch,
-        &boxes::SessionPolicy::default(),
+        &boxes::BoxPolicy::default(),
         crate::net::SwitchSubnet::default(),
         None,
     ));
@@ -8202,7 +8202,7 @@ async fn vm_backed_expose_reports_admission_to_host() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -8321,7 +8321,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -8539,7 +8539,7 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
         std::collections::BTreeMap::new(),
     );
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -8636,7 +8636,7 @@ async fn expose_self_allocated_box_without_a_registered_address_is_refused() {
     let manager = server.state.sessions_manager().await;
     let registry = manager.hostnames();
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -8732,12 +8732,12 @@ async fn expose_deny_typed_error() {
     let manager = server.state.sessions_manager().await;
     let handles = [
         manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(closed))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(closed))
             .await
             .unwrap()
             .expect("the denying box resolves"),
         manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(bare))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(bare))
             .await
             .unwrap()
             .expect("the unenrolled box resolves"),
@@ -8826,7 +8826,7 @@ async fn expose_host_address_answers_before_the_stance() {
     let id = create_configured_session(&mut client, "hostweb", "/uwu").await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the host-address box resolves");
@@ -8895,7 +8895,7 @@ async fn expose_rejected_leaves_no_partial_mapping() {
     .await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -9030,12 +9030,12 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
     )
     .await;
     let web_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the first box resolves");
     let db_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(db))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(db))
         .await
         .unwrap()
         .expect("the second box resolves");
@@ -9199,7 +9199,7 @@ async fn expose_publishes_at_the_registered_address() {
          publishes the interim — the address the registry holds"
     );
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -9301,7 +9301,7 @@ async fn expose_on_stopped_box_refused() {
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the box resolves while it runs");
@@ -9323,7 +9323,7 @@ async fn expose_on_stopped_box_refused() {
     handle.stop().await;
     manager.evict(web).await;
     let stopped = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("a stopped box's record still resolves, still active");
@@ -9390,7 +9390,7 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
     let manager = server.state.sessions_manager().await;
     let registry = manager.hostnames();
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -9483,7 +9483,7 @@ async fn expose_logs_every_path() {
     )
     .await;
     let web_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
@@ -9527,7 +9527,7 @@ async fn expose_logs_every_path() {
     )
     .await;
     let closed_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(closed))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(closed))
         .await
         .unwrap()
         .expect("the unenrolled box resolves");
@@ -9554,7 +9554,7 @@ async fn expose_logs_every_path() {
     )
     .await;
     let broken_handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(broken))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(broken))
         .await
         .unwrap()
         .expect("the broken box resolves");
@@ -9659,8 +9659,8 @@ async fn expose_logs_every_path() {
 /// The ingress policy a seeded listen plan's gate is built over: the same
 /// shape the box's record carries — allow, over `range`, declaring nothing
 /// — so the watcher's verdicts are the box's own.
-fn listen_policy_over(range: (u16, u16)) -> boxes::SessionPolicy {
-    boxes::SessionPolicy::new(
+fn listen_policy_over(range: (u16, u16)) -> boxes::BoxPolicy {
+    boxes::BoxPolicy::new(
         None,
         Some(boxes::IngressPolicy {
             port_mappings: vec![],
@@ -9704,9 +9704,9 @@ async fn soon(mut what: impl FnMut() -> bool) {
 /// proof: the watcher commits and withdraws its rows on its own cadence, so a
 /// row it owes is read on a later poll, never on the one the caller missed.
 async fn listed_once(
-    handle: &crate::session::SessionHandle,
-    holds: impl Fn(&crate::session::LiveIngressRows) -> bool,
-) -> crate::session::LiveIngressRows {
+    handle: &crate::box_actor::BoxHandle,
+    holds: impl Fn(&crate::box_actor::LiveIngressRows) -> bool,
+) -> crate::box_actor::LiveIngressRows {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let rows = handle.live_ingress().await.expect("the actor answers");
@@ -9754,14 +9754,14 @@ fn served_naming(
 /// so a test that needs a second box builds it itself.
 async fn box_with_listen_plan(
     client: &mut TestClient,
-    manager: &crate::sessions::ManagerHandle,
+    manager: &crate::box_manager::BoxManagerHandle,
     name: &str,
     switch: std::net::Ipv4Addr,
     loopback: std::net::Ipv4Addr,
     range: (u16, u16),
 ) -> (
-    crate::session::SessionHandle,
-    std::sync::Arc<crate::net::switch::SessionGate>,
+    crate::box_actor::BoxHandle,
+    std::sync::Arc<crate::net::switch::BoxGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     let (handle, gate, served, _gate, _id) = box_with_scripted_plan(
@@ -9796,7 +9796,7 @@ async fn box_with_listen_plan(
 )]
 async fn box_with_scripted_plan(
     client: &mut TestClient,
-    manager: &crate::sessions::ManagerHandle,
+    manager: &crate::box_manager::BoxManagerHandle,
     name: &str,
     handed: bool,
     switch: std::net::Ipv4Addr,
@@ -9804,8 +9804,8 @@ async fn box_with_scripted_plan(
     range: (u16, u16),
     script: Vec<(u16, GateAnswer)>,
 ) -> (
-    crate::session::SessionHandle,
-    std::sync::Arc<crate::net::switch::SessionGate>,
+    crate::box_actor::BoxHandle,
+    std::sync::Arc<crate::net::switch::BoxGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     tokio::sync::watch::Sender<u64>,
     boxes::SessionId,
@@ -9842,7 +9842,7 @@ async fn box_with_scripted_plan(
         id
     };
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the box resolves");
@@ -9859,16 +9859,16 @@ async fn box_with_scripted_plan(
     // The plan a real launch gathers itself, seeded into this one: the facts
     // a box's host builds its watcher from, riding the mock's `Launched` the
     // way a real launch's plan rides its own.
-    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
         name.to_string(),
         switch,
         &listen_policy_over(range),
         crate::net::SwitchSubnet::default(),
         None,
     ));
-    crate::session::listen_plan_seam::seed(
+    crate::box_actor::listen_plan_seam::seed(
         id,
-        crate::session::listen_plan_seam::Seeded {
+        crate::box_actor::listen_plan_seam::Seeded {
             lease: switch,
             published: loopback,
             control: crate::net::policy::ControlChannel::Unix(sock),
@@ -10277,7 +10277,7 @@ async fn expose_on_listen_published_port_is_already_published() {
     );
     assert_eq!(
         handle.live_ingress().await.expect("the actor answers"),
-        crate::session::LiveIngressRows {
+        crate::box_actor::LiveIngressRows {
             exposed: Vec::new(),
             listened: vec![minimald_rpc::LiveMapping {
                 local: format!("{loopback}:{port}"),
@@ -10643,7 +10643,7 @@ async fn listen_plan_travels_in_launched() {
     )
     .await;
     let bare = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(bare_id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(bare_id))
         .await
         .unwrap()
         .expect("the bare box resolves");
@@ -11037,7 +11037,7 @@ async fn cancelled_publish_releases_its_reservation() {
         Vec::new(),
     )
     .await;
-    let publications = crate::session::listen_plan_seam::publications_of(id)
+    let publications = crate::box_actor::listen_plan_seam::publications_of(id)
         .expect("the launch handed its publication set back");
 
     // The publish a cancellation drops: a reservation on the box's real
@@ -11163,7 +11163,7 @@ async fn revocation_during_in_flight_bind_leaves_no_forward() {
         ],
     )
     .await;
-    let publications = crate::session::listen_plan_seam::publications_of(id)
+    let publications = crate::box_actor::listen_plan_seam::publications_of(id)
         .expect("the launch handed its publication set back");
 
     // The expose surface: its bind on `a` is held at the stand-in, the set
@@ -11331,7 +11331,7 @@ async fn revocation_withdraws_regardless_of_owner() {
         !gate.admits_tcp(listen_port),
         "the gate refuses the revoked port: no new connection rides on it"
     );
-    let publications = crate::session::listen_plan_seam::publications_of(id)
+    let publications = crate::box_actor::listen_plan_seam::publications_of(id)
         .expect("the launch handed its publication set back");
     assert_eq!(
         publications.held_by(listen_port),
@@ -11405,9 +11405,9 @@ async fn respawn_frees_published_ports() {
         .lock()
         .await
         .control_socket();
-    crate::session::listen_plan_seam::seed(
+    crate::box_actor::listen_plan_seam::seed(
         id,
-        crate::session::listen_plan_seam::Seeded {
+        crate::box_actor::listen_plan_seam::Seeded {
             lease: switch,
             published: loopback,
             control: crate::net::policy::ControlChannel::Unix(sock),
@@ -11451,9 +11451,9 @@ async fn respawn_frees_published_ports() {
         .lock()
         .await
         .control_socket();
-    crate::session::listen_plan_seam::seed(
+    crate::box_actor::listen_plan_seam::seed(
         id,
-        crate::session::listen_plan_seam::Seeded {
+        crate::box_actor::listen_plan_seam::Seeded {
             lease: switch,
             published: loopback,
             control: crate::net::policy::ControlChannel::Unix(sock),
@@ -11491,7 +11491,7 @@ async fn respawn_frees_published_ports() {
 /// fake report door seeded for it.
 struct VmBackedBox {
     _server: TestServer,
-    handle: crate::session::SessionHandle,
+    handle: crate::box_actor::BoxHandle,
     sock: std::path::PathBuf,
     forwarder: tokio::task::JoinHandle<()>,
     served: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -11515,7 +11515,7 @@ async fn vm_backed_allow_box(name: &str, octet: u8, status: u16) -> VmBackedBox 
     )
     .await;
     let handle = manager
-        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the allowing box resolves");

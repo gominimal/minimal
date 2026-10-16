@@ -339,7 +339,7 @@ impl IngressPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // An empty table today, so an unknown field would be one the proxy document
 // has not bound here yet — refused like every other field the policy schemas
-// do not know (the same `deny_unknown_fields` [`SessionPolicy`] carries),
+// do not know (the same `deny_unknown_fields` [`BoxPolicy`] carries),
 // rather than silently ignored into a shape no reader can tell from the
 // minimum.
 #[serde(deny_unknown_fields)]
@@ -388,12 +388,12 @@ impl CredentialedUpstream {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // Every field is an `Option`, so without this an unrelated JSON object would
 // decode as an all-`None` policy. That matters because `GetSessionPolicy`'s
-// response is an `#[serde(untagged)]` `Errorable<SessionPolicy>`: the daemon's
+// response is an `#[serde(untagged)]` `Errorable<BoxPolicy>`: the daemon's
 // `{"error":"no session found"}` reply must fall through to the `Err` arm, not
 // masquerade as a valid empty policy (a silent false negative on a
 // security-introspection command).
 #[serde(deny_unknown_fields)]
-pub struct SessionPolicy {
+pub struct BoxPolicy {
     /// Egress policy; `None` when no explicit egress config is present.
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when no explicit ingress config is present.
@@ -410,7 +410,7 @@ pub struct SessionPolicy {
     pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
-impl SessionPolicy {
+impl BoxPolicy {
     /// Builds a policy from its egress and ingress halves, carrying no
     /// credentialed-upstream declaration (NET-134): the lane a box asks the
     /// proxy for is its declaration's own, never a default.
@@ -471,7 +471,7 @@ pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce
 /// it has one, otherwise the default [`effective_egress`] resolves for an
 /// absent one. This is what the gate enforces and what `min session policy`
 /// shows; the declaration itself stays untouched on the record, so the
-/// strict [`SessionPolicy`] a client reads back is exactly what the box was
+/// strict [`BoxPolicy`] a client reads back is exactly what the box was
 /// launched with.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -514,14 +514,14 @@ impl EffectiveEgress {
 /// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
 /// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
-/// [`SessionPolicy`] declaration. The ingress half is carried verbatim:
+/// [`BoxPolicy`] declaration. The ingress half is carried verbatim:
 /// ingress has no rollout default.
 ///
 /// The egress here is not an `Option`: an absent section has already been
 /// resolved into [`EffectiveEgress::DenyAll`] or [`EffectiveEgress::AllowAll`],
 /// so a reader cannot mistake "no declaration" for "no rules".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-// Same reason as the attribute on `SessionPolicy`: the response rides an
+// Same reason as the attribute on `BoxPolicy`: the response rides an
 // `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
 // must fall through to the `Err` arm rather than decode as a valid policy —
 // a silent false negative on a security-introspection command. Its `egress`
@@ -535,7 +535,7 @@ impl EffectiveEgress {
 // cannot see is a security fact this command exists to state, and
 // `min session policy` reads no other reply that carries it.
 #[serde(deny_unknown_fields)]
-pub struct EffectiveSessionPolicy {
+pub struct EffectiveBoxPolicy {
     /// The effective egress: the declaration, or the default the rollout
     /// phase and the daemon's opt-out leave in force.
     pub egress: EffectiveEgress,
@@ -936,7 +936,7 @@ impl fmt::Display for SessionId {
 /// [`CreateSessionResponse::Pending`]: ../minimald_rpc/enum.CreateSessionResponse.html#variant.Pending
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionStatus {
+pub enum BoxState {
     /// Composition is in flight; the record is a stub awaiting the
     /// `SubmitVerdict` round-trip to finalize. Accepts the legacy
     /// on-disk spelling `"draft"` so records written before the
@@ -963,7 +963,7 @@ pub enum SessionStatus {
 }
 
 /// Default for [`Record::hooks_enabled`] (and for the matching field on
-/// `minimald_rpc::SessionConfig`): hooks are on unless the user opted
+/// `minimald_rpc::BoxConfig`): hooks are on unless the user opted
 /// out. A bare `#[serde(default)]` would give `false`, silently
 /// disabling hooks on every record written before the field existed.
 fn hooks_enabled_default() -> bool {
@@ -1151,13 +1151,13 @@ pub struct Record {
     /// launch (R2.6). Defaults to an all-`None` policy for sessions that
     /// predate this field or specify none.
     #[serde(default)]
-    pub policy: SessionPolicy,
+    pub policy: BoxPolicy,
 
-    /// Lifecycle status. Defaults to [`SessionStatus::Active`] for
+    /// Lifecycle status. Defaults to [`BoxState::Active`] for
     /// on-disk records predating this field — those records were
     /// always finalized at create time.
     #[serde(default)]
-    pub status: SessionStatus,
+    pub status: BoxState,
 
     /// Whether this session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`.
@@ -1467,7 +1467,7 @@ mod tests {
         );
     }
 
-    fn record_with(network: NetworkMode, policy: SessionPolicy) -> Record {
+    fn record_with(network: NetworkMode, policy: BoxPolicy) -> Record {
         Record {
             id: SessionId::nil(),
             name: None,
@@ -1475,7 +1475,7 @@ mod tests {
             project_path: HostAbsPath::try_new("/p").unwrap(),
             network,
             policy,
-            status: SessionStatus::default(),
+            status: BoxState::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1531,7 +1531,7 @@ mod tests {
     /// nothing may smuggle a steering setting through it.
     #[test]
     fn credentialed_upstream_declaration_parses() {
-        let declared: SessionPolicy = serde_json_lenient::from_str(
+        let declared: BoxPolicy = serde_json_lenient::from_str(
             r#"{"egress":null,"ingress":null,"credentialed_upstream":{}}"#,
         )
         .expect("a policy carrying the declaration must parse");
@@ -1543,16 +1543,15 @@ mod tests {
         // And it round-trips with the policy that carries it, so the host
         // the registration reaches reads the same lane the client declared.
         let json = serde_json_lenient::to_string(&declared).unwrap();
-        let round_tripped: SessionPolicy = serde_json_lenient::from_str(&json).unwrap();
+        let round_tripped: BoxPolicy = serde_json_lenient::from_str(&json).unwrap();
         assert_eq!(round_tripped, declared);
 
         // A policy written before the field existed declares nothing: the
         // absent declaration is the default, the JSON such a policy already
         // serialized to still parses, and serializing it back changes
         // nothing — the field rides additively, never as a migration.
-        let legacy: SessionPolicy =
-            serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#)
-                .expect("a policy predating the field must still parse");
+        let legacy: BoxPolicy = serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#)
+            .expect("a policy predating the field must still parse");
         assert_eq!(
             legacy.credentialed_upstream, None,
             "no declaration in the JSON is no lane, not an error"
@@ -1568,7 +1567,7 @@ mod tests {
         // proxy document will bind is refused until that document lands,
         // never silently dropped from a declaration that cannot carry it.
         assert!(
-            serde_json_lenient::from_str::<SessionPolicy>(
+            serde_json_lenient::from_str::<BoxPolicy>(
                 r#"{"egress":null,"ingress":null,"credentialed_upstream":{"steering":"dns"}}"#
             )
             .is_err(),
@@ -1583,7 +1582,7 @@ mod tests {
         // shipped R2.1 rule that rejected it there.
         let record = record_with(
             NetworkMode::HostNet,
-            SessionPolicy::new(
+            BoxPolicy::new(
                 Some(EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".into()]),
                     deny_subnets: Some(vec!["192.168.0.0/16".into()]),
@@ -1913,7 +1912,7 @@ mod tests {
         // an egress declaration on. It is the only mode that rejects egress.
         let record = record_with(
             NetworkMode::NoNet,
-            SessionPolicy::new(Some(EgressPolicy::default()), None),
+            BoxPolicy::new(Some(EgressPolicy::default()), None),
         );
         let err = record.validate_policy().unwrap_err();
         assert_eq!(
@@ -1942,7 +1941,7 @@ mod tests {
             deny_subnets: Some(vec!["169.254.169.254/32".into()]),
         };
         for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
-            let record = record_with(network, SessionPolicy::new(Some(egress.clone()), None));
+            let record = record_with(network, BoxPolicy::new(Some(egress.clone()), None));
             assert!(
                 record.validate_policy().is_ok(),
                 "all four egress fields must validate on {network:?}"
@@ -1961,10 +1960,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(
-            NetworkMode::HostNet,
-            SessionPolicy::new(None, Some(ingress)),
-        );
+        let record = record_with(NetworkMode::HostNet, BoxPolicy::new(None, Some(ingress)));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::IngressRequiresOwnIp {
@@ -1989,7 +1985,7 @@ mod tests {
         };
         let err = record_with(
             NetworkMode::HostNet,
-            SessionPolicy::new(None, Some(static_ingress)),
+            BoxPolicy::new(None, Some(static_ingress)),
         )
         .validate_policy()
         .unwrap_err();
@@ -2004,12 +2000,9 @@ mod tests {
             dynamic_allowed_range: Some((8000, 8443)),
             dynamic_ingress: None,
         };
-        let err = record_with(
-            NetworkMode::NoNet,
-            SessionPolicy::new(None, Some(range_only)),
-        )
-        .validate_policy()
-        .unwrap_err();
+        let err = record_with(NetworkMode::NoNet, BoxPolicy::new(None, Some(range_only)))
+            .validate_policy()
+            .unwrap_err();
         assert_eq!(
             err,
             PolicyError::DynamicIngressRequiresOwnIp {
@@ -2034,8 +2027,7 @@ mod tests {
             dynamic_ingress: Some(DynamicIngress::Allow),
         };
         assert_eq!(
-            record_with(NetworkMode::HostNet, SessionPolicy::new(None, Some(mixed)))
-                .validate_policy(),
+            record_with(NetworkMode::HostNet, BoxPolicy::new(None, Some(mixed))).validate_policy(),
             Err(PolicyError::DynamicIngressRequiresOwnIp {
                 mode: NetworkMode::HostNet
             })
@@ -2057,11 +2049,8 @@ mod tests {
             dynamic_ingress: None,
         };
         assert_eq!(
-            record_with(
-                NetworkMode::HostNet,
-                SessionPolicy::new(None, Some(ingress))
-            )
-            .validate_policy(),
+            record_with(NetworkMode::HostNet, BoxPolicy::new(None, Some(ingress)))
+                .validate_policy(),
             Err(PolicyError::UnsupportedIngressProtocol {
                 proto: IpProto::Icmp
             })
@@ -2083,11 +2072,8 @@ mod tests {
             dynamic_ingress: None,
         };
         assert_eq!(
-            record_with(
-                NetworkMode::HostNet,
-                SessionPolicy::new(None, Some(ingress))
-            )
-            .validate_policy(),
+            record_with(NetworkMode::HostNet, BoxPolicy::new(None, Some(ingress)))
+                .validate_policy(),
             Err(PolicyError::PrivilegedPort { external_port: 80 })
         );
     }
@@ -2105,7 +2091,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::UnsupportedIngressProtocol {
@@ -2128,7 +2114,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::PrivilegedPort { external_port: 80 })
@@ -2148,7 +2134,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert!(record.validate_policy().is_ok());
     }
 
@@ -2173,7 +2159,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::DuplicateIngressPort {
@@ -2225,7 +2211,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert!(record.validate_policy().is_ok());
     }
 
@@ -2242,7 +2228,7 @@ mod tests {
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::InvalidIngressPort { internal_port: 0 })
@@ -2264,11 +2250,8 @@ mod tests {
             dynamic_ingress: None,
         };
         assert_eq!(
-            record_with(
-                NetworkMode::HostNet,
-                SessionPolicy::new(None, Some(ingress))
-            )
-            .validate_policy(),
+            record_with(NetworkMode::HostNet, BoxPolicy::new(None, Some(ingress)))
+                .validate_policy(),
             Err(PolicyError::InvalidIngressPort { internal_port: 0 })
         );
     }
@@ -2277,7 +2260,7 @@ mod tests {
     fn egress_on_own_ip_is_allowed() {
         let record = record_with(
             NetworkMode::OwnIp,
-            SessionPolicy::new(Some(EgressPolicy::default()), None),
+            BoxPolicy::new(Some(EgressPolicy::default()), None),
         );
         assert!(record.validate_policy().is_ok());
     }
@@ -2291,7 +2274,7 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".into(), "not-a-cidr".into()]),
             ..EgressPolicy::default()
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(Some(egress), None));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::InvalidSubnet {
@@ -2307,7 +2290,7 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".into(), "fd00::/8".into()]),
             ..EgressPolicy::default()
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(Some(egress), None));
         assert!(record.validate_policy().is_ok());
     }
 
@@ -2321,7 +2304,7 @@ mod tests {
                 deny_subnets: Some(vec!["10.0.0.0/8".into(), "not-a-cidr".into()]),
                 ..EgressPolicy::default()
             };
-            let record = record_with(network, SessionPolicy::new(Some(egress), None));
+            let record = record_with(network, BoxPolicy::new(Some(egress), None));
             assert_eq!(
                 record.validate_policy(),
                 Err(PolicyError::InvalidDenySubnet {
@@ -2349,7 +2332,7 @@ mod tests {
                     allow_dns_hosts: Some(vec!["github.com".into(), host.into()]),
                     ..EgressPolicy::default()
                 };
-                let record = record_with(network, SessionPolicy::new(Some(egress), None));
+                let record = record_with(network, BoxPolicy::new(Some(egress), None));
                 assert_eq!(
                     record.validate_new_policy(),
                     Err(PolicyError::InvalidDnsHost { host: host.into() })
@@ -2374,7 +2357,7 @@ mod tests {
             ..EgressPolicy::default()
         };
         for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
-            let record = record_with(network, SessionPolicy::new(Some(egress.clone()), None));
+            let record = record_with(network, BoxPolicy::new(Some(egress.clone()), None));
             assert!(record.validate_new_policy().is_ok());
         }
     }
@@ -2409,7 +2392,7 @@ mod tests {
         };
         let record = record_with(
             NetworkMode::HostNet,
-            SessionPolicy::new(Some(EgressPolicy::default()), Some(ingress)),
+            BoxPolicy::new(Some(EgressPolicy::default()), Some(ingress)),
         );
         assert_eq!(
             record.validate_policy(),
@@ -2430,7 +2413,7 @@ mod tests {
             dynamic_allowed_range: Some((8443, 8000)),
             dynamic_ingress: None,
         };
-        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::InvalidDynamicRange { lo: 8443, hi: 8000 })
@@ -2451,7 +2434,7 @@ mod tests {
                 dynamic_allowed_range: Some(range),
                 dynamic_ingress: None,
             };
-            let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+            let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
             assert_eq!(
                 record.validate_policy(),
                 Err(PolicyError::PrivilegedDynamicRange { lo: range.0 })
@@ -2469,7 +2452,7 @@ mod tests {
                 dynamic_allowed_range: Some(range),
                 dynamic_ingress: None,
             };
-            let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+            let record = record_with(NetworkMode::OwnIp, BoxPolicy::new(None, Some(ingress)));
             assert!(record.validate_policy().is_ok());
         }
     }
@@ -2478,12 +2461,12 @@ mod tests {
     fn empty_policy_on_host_net_is_allowed() {
         // An all-`None` policy (the default) is fine on any mode: it configures
         // nothing, so there is nothing to reject.
-        let record = record_with(NetworkMode::HostNet, SessionPolicy::default());
+        let record = record_with(NetworkMode::HostNet, BoxPolicy::default());
         assert!(record.validate_policy().is_ok());
         // An empty (deny-all-external) ingress is likewise not a configuration.
         let record = record_with(
             NetworkMode::HostNet,
-            SessionPolicy::new(None, Some(IngressPolicy::default())),
+            BoxPolicy::new(None, Some(IngressPolicy::default())),
         );
         assert!(record.validate_policy().is_ok());
     }
@@ -2525,7 +2508,7 @@ mod tests {
         // An ingress policy with only the new field is valid on an OwnIp PTask.
         let record = record_with(
             NetworkMode::OwnIp,
-            SessionPolicy::new(None, Some(ingress.clone())),
+            BoxPolicy::new(None, Some(ingress.clone())),
         );
         assert!(
             record.validate_policy().is_ok(),
@@ -2541,10 +2524,7 @@ mod tests {
             dynamic_ingress: Some(DynamicIngress::Deny),
         };
         for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
-            let record = record_with(
-                network,
-                SessionPolicy::new(None, Some(deny_ingress.clone())),
-            );
+            let record = record_with(network, BoxPolicy::new(None, Some(deny_ingress.clone())));
             assert!(
                 record.validate_policy().is_ok(),
                 "dynamic_ingress = deny must be accepted on {network:?}"
@@ -2559,7 +2539,7 @@ mod tests {
                     dynamic_ingress: Some(mode),
                     ..IngressPolicy::default()
                 };
-                let record = record_with(network, SessionPolicy::new(None, Some(ingest)));
+                let record = record_with(network, BoxPolicy::new(None, Some(ingest)));
                 assert_eq!(
                     record.validate_policy(),
                     Err(PolicyError::DynamicIngressRequiresOwnIp { mode: network }),
@@ -2584,7 +2564,7 @@ mod tests {
             "attrs": {},
         });
         let parsed: Record = serde_json_lenient::from_value(raw).expect("deserialize");
-        assert_eq!(parsed.status, SessionStatus::Active);
+        assert_eq!(parsed.status, BoxState::Active);
     }
 
     /// A name persisted as an empty string predates the rename/activate
@@ -2605,7 +2585,7 @@ mod tests {
 
     #[test]
     fn session_status_default_is_active() {
-        assert_eq!(SessionStatus::default(), SessionStatus::Active);
+        assert_eq!(BoxState::default(), BoxState::Active);
     }
 
     /// Records persisted before the `Draft` → `Pending` rename used
@@ -2614,17 +2594,16 @@ mod tests {
     /// alias on a future rename.
     #[test]
     fn legacy_draft_string_deserializes_as_pending() {
-        let parsed: SessionStatus =
-            serde_json_lenient::from_value(serde_json_lenient::json!("draft"))
-                .expect("deserialize");
-        assert_eq!(parsed, SessionStatus::Pending);
+        let parsed: BoxState = serde_json_lenient::from_value(serde_json_lenient::json!("draft"))
+            .expect("deserialize");
+        assert_eq!(parsed, BoxState::Pending);
     }
 
     /// The canonical serialized form is `"pending"`; the alias is
     /// read-only.
     #[test]
     fn pending_serializes_as_pending_not_draft() {
-        let s = serde_json_lenient::to_string(&SessionStatus::Pending).expect("serialize");
+        let s = serde_json_lenient::to_string(&BoxState::Pending).expect("serialize");
         assert_eq!(s, "\"pending\"");
     }
 }

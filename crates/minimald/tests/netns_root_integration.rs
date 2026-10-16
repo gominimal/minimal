@@ -99,8 +99,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use boxes::SessionPolicy;
-use minimald::net::switch::{SessionGate, attach_to_switch, open_tap, tap_netns_commands};
+use boxes::BoxPolicy;
+use minimald::net::switch::{BoxGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 use minimald::nsenter::GROUP_GRACE;
 
@@ -619,8 +619,8 @@ async fn network_none_attach_works() {
         return;
     }
     announce_to_the_runner("network_none_attach_works");
+    use minimald::box_runtime::{Pty, WinSize};
     use minimald::nsenter::{Injection, session_leader_pid};
-    use minimald::session_host::{Pty, WinSize};
     use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
@@ -645,7 +645,7 @@ async fn network_none_attach_works() {
     let mut container = sandbox
         .new_container(&plan)
         .expect("building none-box container");
-    // The session host's own sequence (session_host.rs:2207): the box becomes
+    // The session host's own sequence (box_runtime.rs:2207): the box becomes
     // its own session leader *before* `Sandbox::command` builds the command
     // whose program the seccomp closure swap replaces, so the swap is what has
     // to carry the runctl to the child hakoniwa forks.
@@ -670,7 +670,7 @@ async fn network_none_attach_works() {
     // The terminal the launch hands the box, on stdin — the fd hakoniwa's
     // `TIOCSCTTY` acts on, so `Runctl::NewSession` can make it the box's
     // controlling terminal.  A real session wires stdout and stderr to the
-    // same slave (session_host.rs:2256-2260); stdout stays a pipe here so the
+    // same slave (box_runtime.rs:2256-2260); stdout stays a pipe here so the
     // report below arrives byte-exact, and the box's stdin — the one the
     // terminal dance needs — is the part this proof exercises.  The pair
     // outlives the box: closing the master while the box runs would SIGHUP it.
@@ -1803,8 +1803,8 @@ async fn netns_ownip_ptask_to_ptask() {
     // inbound listeners. PTask B declares the port its listener sits on inbound,
     // which is what the inbound gate needs to admit A's connection.
     const PORT: u16 = 9009;
-    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &SessionPolicy::default()).await;
-    let b_policy = SessionPolicy {
+    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &BoxPolicy::default()).await;
+    let b_policy = BoxPolicy {
         ingress: Some(IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: PORT,
@@ -1895,7 +1895,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // targets the PTask's `INTERNAL` listener — so the inbound gate must see
     // that port declared or the proof's own gate would drop the connection it
     // exists to expose.
-    let gate_policy = SessionPolicy {
+    let gate_policy = BoxPolicy {
         ingress: Some(IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: EXTERNAL,
@@ -2021,7 +2021,7 @@ impl Ptask {
         lease: PtaskLease,
         subnet: SwitchSubnet,
         api_sock: &std::path::Path,
-        policy: &SessionPolicy,
+        policy: &BoxPolicy,
     ) -> Self {
         let tap = format!("tap-{name}");
         let _ = sudo(&["ip", "link", "del", &tap]);
@@ -2058,7 +2058,7 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
+        let gate = BoxGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
         let relay = attach_to_switch(
             fd,
             api_sock,

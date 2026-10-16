@@ -175,7 +175,7 @@ fn ls_shows_shared_resource_pool() {
             id: SessionId::nil(),
             name: None,
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
@@ -215,7 +215,7 @@ fn ls_table_exposes_project_path_and_status() {
             id: SessionId::nil(),
             name: Some("s1".to_string()),
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-            status: boxes::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             git: None,
             host_ip_enforcement: None,
             shared_port_collisions: Vec::new(),
@@ -259,7 +259,7 @@ fn ls_table_shows_host_address_enforcement() {
         id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: boxes::SessionStatus::Active,
+        status: boxes::BoxState::Active,
         git: None,
         host_ip_enforcement: enforcement,
         shared_port_collisions: Vec::new(),
@@ -318,7 +318,7 @@ fn ls_reports_yielded_shared_address_ports() {
         id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
         name: name.map(str::to_string),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: boxes::SessionStatus::Active,
+        status: boxes::BoxState::Active,
         git: None,
         host_ip_enforcement: None,
         shared_port_collisions: collisions,
@@ -393,7 +393,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
-        status: boxes::SessionStatus::Active,
+        status: boxes::BoxState::Active,
         git: None,
         host_ip_enforcement: enforcement,
         shared_port_collisions: Vec::new(),
@@ -1049,7 +1049,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
         &daemon,
         "dyn-allow-policy",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::new(
+        boxes::BoxPolicy::new(
             None,
             Some(boxes::IngressPolicy {
                 port_mappings: vec![],
@@ -1063,7 +1063,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
         &daemon,
         "dyn-explicit-deny-policy",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::new(
+        boxes::BoxPolicy::new(
             None,
             Some(boxes::IngressPolicy {
                 port_mappings: vec![],
@@ -1077,7 +1077,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
         &daemon,
         "dyn-bare-policy",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
 
@@ -1891,7 +1891,7 @@ async fn policy_json_carries_schema_and_pending() {
         &daemon,
         "policy-json",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::new(
+        boxes::BoxPolicy::new(
             None,
             Some(boxes::IngressPolicy {
                 port_mappings: vec![boxes::PortMapping {
@@ -2038,7 +2038,7 @@ async fn policy_json_carries_schema_and_pending() {
 /// middle one, never collapsed into the first.
 #[test]
 fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
-    let policy = boxes::EffectiveSessionPolicy {
+    let policy = boxes::EffectiveBoxPolicy {
         egress: boxes::EffectiveEgress::AllowAll,
         ingress: None,
         credentialed_upstream: None,
@@ -2166,7 +2166,7 @@ async fn policy_shows_effective_egress() {
         &daemon,
         "egress-policy",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::new(Some(egress.clone()), None),
+        boxes::BoxPolicy::new(Some(egress.clone()), None),
     )
     .await;
 
@@ -2225,7 +2225,7 @@ async fn policy_shows_effective_egress() {
         &daemon,
         "egress-policy-host",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::new(Some(egress.clone()), None),
+        boxes::BoxPolicy::new(Some(egress.clone()), None),
     )
     .await;
     let resp = client
@@ -2307,7 +2307,7 @@ async fn policy_shows_effective_egress() {
         &daemon,
         "egress-policy-none",
         boxes::NetworkMode::NoNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
     let resp = client
@@ -2354,7 +2354,7 @@ async fn policy_shows_deny_all_default() {
         &daemon,
         "bare-own-ip",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
 
@@ -2387,7 +2387,7 @@ async fn policy_shows_deny_all_default() {
     // The default's own posture, with the phase passed explicitly: once in
     // force, a bare own-address box resolves to deny-all, and the command's
     // renderer prints it as that — and nothing else.
-    let in_force = boxes::EffectiveSessionPolicy {
+    let in_force = boxes::EffectiveBoxPolicy {
         egress: boxes::effective_egress(
             None,
             boxes::NetworkMode::OwnIp,
@@ -2447,7 +2447,7 @@ async fn policy_shows_deny_all_default() {
         &daemon,
         "bare-host-net",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
     let resp = client
@@ -2719,7 +2719,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &daemon,
         "unset-own-ip",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
     let resp = client
@@ -2810,7 +2810,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &daemon,
         "unset-host-ip",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
     let resp = client
@@ -2870,7 +2870,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &daemon,
         "unset-beside-declared-deny-all",
         boxes::NetworkMode::OwnIp,
-        boxes::SessionPolicy::new(Some(boxes::EgressPolicy::deny_all()), None),
+        boxes::BoxPolicy::new(Some(boxes::EgressPolicy::deny_all()), None),
     )
     .await;
     let resp = client
@@ -2977,7 +2977,7 @@ fn policy_shows_baseline_set() {
     // way the command renders it: the box's own rules, and the helper's
     // enumeration beside them — the microVM backend's fabric, the plan the
     // helper's run path builds its registry and this set from.
-    let deny_all = boxes::EffectiveSessionPolicy {
+    let deny_all = boxes::EffectiveBoxPolicy {
         egress: boxes::effective_egress(
             None,
             boxes::NetworkMode::OwnIp,
@@ -4438,7 +4438,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
     let mut client = daemon.server.connect().await;
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
-    let config = minimald_rpc::SessionConfig {
+    let config = minimald_rpc::BoxConfig {
         name: Some(name.to_string()),
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
         network: boxes::NetworkMode::NoNet,
@@ -4498,7 +4498,7 @@ async fn create_session_at(
         name,
         project_path,
         boxes::NetworkMode::NoNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await
 }
@@ -4510,11 +4510,11 @@ async fn create_session_with(
     name: &str,
     project_path: paths::HostAbsPath,
     network: boxes::NetworkMode,
-    policy: boxes::SessionPolicy,
+    policy: boxes::BoxPolicy,
 ) -> SessionId {
     let mut client = daemon.server.connect().await;
 
-    let config = minimald_rpc::SessionConfig {
+    let config = minimald_rpc::BoxConfig {
         name: Some(name.to_string()),
         project_path,
         network,
@@ -4578,7 +4578,7 @@ async fn create_session_with_policy(
     daemon: &common::TestDaemon,
     name: &str,
     network: boxes::NetworkMode,
-    policy: boxes::SessionPolicy,
+    policy: boxes::BoxPolicy,
 ) -> SessionId {
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
@@ -4659,7 +4659,7 @@ async fn net_forward_relays_over_ssh_channel() {
         &daemon,
         "web",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
 
@@ -4705,7 +4705,7 @@ async fn net_forward_survives_a_refused_box_port() {
         &daemon,
         "web",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
 
@@ -4783,7 +4783,7 @@ async fn net_forward_closes_with_session() {
         &daemon,
         "web",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
 
@@ -4840,7 +4840,7 @@ async fn net_forward_announces_the_bound_local_port() {
         &daemon,
         "web",
         boxes::NetworkMode::HostNet,
-        boxes::SessionPolicy::default(),
+        boxes::BoxPolicy::default(),
     )
     .await;
 

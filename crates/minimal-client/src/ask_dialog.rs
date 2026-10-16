@@ -29,7 +29,7 @@ use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use crate::attach::AskWatch;
 
 /// The ask dialog's question: the native dialog's own frame
-/// (`minimald::session_host::ASK_PROMPT`), so a human, and the e2e's pty
+/// (`minimald::box_runtime::ASK_PROMPT`), so a human, and the e2e's pty
 /// driver, meet one dialog wherever the box runs.
 pub const ASK_DIALOG_PROMPT: &str = "Allow the publish to the host?";
 

@@ -19,7 +19,7 @@
 //! - [`BridgeChannel`] is the trivial synchronous [`sandbox::Channel`]. For each
 //!   request it clones the connection and forwards it (with the request line)
 //!   down an mpsc to the actor, then returns immediately.
-//! - [`SessionChannel`] is the actor: it owns the context and graph and processes
+//! - [`BoxChannel`] is the actor: it owns the context and graph and processes
 //!   requests one at a time on the runtime, so every handler is a plain
 //!   `async fn` that `.await`s — no nested runtimes, no sync/async bridge writers.
 
@@ -104,9 +104,9 @@ const ATTACH_ENV_HOOK_POSIX: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\n[ -r ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     " ] && . ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     "\n: \n",
 );
 
@@ -120,9 +120,9 @@ const ATTACH_ENV_HOOK_BASH: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\n__minimal_attach_env() {\n    [ -r ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     " ] && . ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     "\n    return 0\n}\ntrap '__minimal_attach_env' DEBUG\n",
 );
 
@@ -170,9 +170,9 @@ const ATTACH_ENV_HOOK_ZSH: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\nautoload -Uz add-zsh-hook\n__minimal_attach_env() {\n    [ -r ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     " ] && . ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     "\n}\nadd-zsh-hook precmd __minimal_attach_env\nadd-zsh-hook preexec __minimal_attach_env\n",
 );
 
@@ -182,13 +182,13 @@ const ATTACH_ENV_HOOK_FISH: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\nfunction __minimal_attach_env --on-event fish_prompt\n    test -r ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\n    and source ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\nend\nfunction __minimal_attach_env_preexec --on-event fish_preexec\n    test -r ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\n    and source ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\nend\n",
 );
 
@@ -199,19 +199,19 @@ const ATTACH_ENV_HOOK_NU: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\n$env.config.hooks.pre_prompt ++= [{||\n    let p = \"",
-    crate::session_host::ATTACH_ENV_JSON,
+    crate::box_runtime::ATTACH_ENV_JSON,
     "\"\n    if ($p | path exists) { load-env (open $p) }\n}]\n$env.config.hooks.pre_execution ++= [{||\n    let p = \"",
-    crate::session_host::ATTACH_ENV_JSON,
+    crate::box_runtime::ATTACH_ENV_JSON,
     "\"\n    if ($p | path exists) { load-env (open $p) }\n}]\n",
 );
 
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
-/// the same directory at [`SessionChannel::working`], so this is the prefix
+/// the same directory at [`BoxChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
 pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_DEFAULT_WD);
 
 /// Where the session's home directory appears inside the sandbox, backed by
-/// [`SessionChannel::home`]. The second of the two directories a sandbox path
+/// [`BoxChannel::home`]. The second of the two directories a sandbox path
 /// can name on the daemon's side.
 pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
@@ -238,7 +238,7 @@ pub struct EnvArgs {
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
-    session: crate::session::WeakSessionHandle,
+    session: crate::box_actor::WeakBoxHandle,
     /// The owning session's id, for the helper channel's request spans
     /// (`session.id`), beside the box id: host-side facts about who is
     /// asking, never read from the request.
@@ -269,7 +269,7 @@ impl EnvArgs {
         cwd: impl Into<DaemonAbsPath>,
         home: impl Into<DaemonAbsPath>,
         state_base_dir: impl Into<DaemonAbsPath>,
-        session: crate::session::WeakSessionHandle,
+        session: crate::box_actor::WeakBoxHandle,
     ) -> Self {
         Self {
             name: name.into(),
@@ -398,7 +398,7 @@ pub struct Env {
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
     /// Variables the channel actor has added since launch; see
-    /// [`SessionChannel::runtime_env`].
+    /// [`BoxChannel::runtime_env`].
     runtime_env: RuntimeEnv,
     /// Extra directories kept alive for the environment's lifetime (e.g. a
     /// temporary `/state` directory). Dropped after the sandbox.
@@ -408,7 +408,7 @@ pub struct Env {
 /// Environment variables a *running* session has acquired, on top of the ones
 /// it was launched with. Usually happens due to `min add`.
 ///
-/// Shared between [`Env`] and the [`SessionChannel`] actor that learns of them.
+/// Shared between [`Env`] and the [`BoxChannel`] actor that learns of them.
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeEnv(Arc<Mutex<BTreeMap<String, String>>>);
 
@@ -601,7 +601,7 @@ impl Env {
         let command_cwd = sandbox.command_cwd().map_err(sandbox_err_to_io)?;
 
         let runtime_env = RuntimeEnv::default();
-        let channel = SessionChannel {
+        let channel = BoxChannel {
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(sandbox.rootfs().to_path_buf()).unwrap(),
             )
@@ -683,7 +683,7 @@ impl Env {
     ///
     /// Exposed so the launcher can answer "is this shell installed in
     /// this session" before it spawns one
-    /// ([`crate::session_shell::resolve`]) — the same question
+    /// ([`crate::attach_shell::resolve`]) — the same question
     /// [`install_min_helpers`] answers about directories it writes into.
     /// Only meaningful once [`Env::build`] has returned: the rootfs is
     /// what that assembles.
@@ -715,10 +715,10 @@ impl Env {
     /// session **as it stands now** — `/workbench`, the composed session
     /// variables, and anything `min add` has installed since launch.
     #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn command_environment(&self) -> crate::session_host::SessionEnvironment {
+    pub(crate) fn command_environment(&self) -> crate::box_runtime::BoxEnvironment {
         let mut vars = self.sandbox.command_env();
         vars.extend(self.runtime_env.snapshot());
-        crate::session_host::SessionEnvironment {
+        crate::box_runtime::BoxEnvironment {
             cwd: self.command_cwd.clone(),
             vars,
         }
@@ -842,7 +842,7 @@ struct ChannelRequest {
 }
 
 /// The synchronous [`sandbox::Channel`] that bridges the listener thread to the
-/// async [`SessionChannel`] actor. It does no work itself beyond handing each
+/// async [`BoxChannel`] actor. It does no work itself beyond handing each
 /// request off; the connection clone stays open in the actor until the handler
 /// finishes, at which point dropping it closes the connection and the client's
 /// `socat` sees EOF.
@@ -876,7 +876,7 @@ impl sandbox::Channel for BridgeChannel {
 ///
 /// Owns the session's [`Context`] and [`Graph`] and processes one request at a
 /// time, so all of its handlers can be plain `async fn`s.
-struct SessionChannel {
+struct BoxChannel {
     ctx: Context,
     graph: Graph,
     /// The box's name, as the environment was built with it — the one fact
@@ -906,7 +906,7 @@ struct SessionChannel {
     ot: Option<OpTracker>,
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
-    session: crate::session::WeakSessionHandle,
+    session: crate::box_actor::WeakBoxHandle,
     /// Accumulates env vars of newly-installed packages, shared with the owning [`Env`].
     runtime_env: RuntimeEnv,
     rx: mpsc::Receiver<ChannelRequest>,
@@ -961,7 +961,7 @@ fn channel_request_span<'a>(
     (span, request)
 }
 
-/// The methods [`SessionChannel::handle`] dispatches: the only values the
+/// The methods [`BoxChannel::handle`] dispatches: the only values the
 /// `session.channel` span's `method` takes besides `other`. Keep it in step
 /// with the arms of `handle`.
 const CHANNEL_METHODS: &[&str] = &[
@@ -979,7 +979,7 @@ const CHANNEL_METHODS: &[&str] = &[
 ];
 
 /// The `method` a helper request is recorded under: the text before its
-/// first `%` when that is a method [`SessionChannel::handle`] dispatches,
+/// first `%` when that is a method [`BoxChannel::handle`] dispatches,
 /// else `other` (a line with no `%` is never dispatched, so it is `other`
 /// too). The line comes from inside the box and the span is exported and
 /// spooled, so no box-chosen text, of any length, reaches the host's
@@ -992,7 +992,7 @@ fn channel_method(request: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-impl SessionChannel {
+impl BoxChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
         while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
@@ -1320,7 +1320,7 @@ impl SessionChannel {
     /// kicks off a session side-op check run and streams each object's results
     /// back to the client until the run completes.
     async fn run_check(&mut self, stream: &mut UnixStream, args: &str) {
-        use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+        use crate::box_ops::{CheckOpts, CheckOutcome, CheckUpdate};
 
         let Some(session) = self.session.upgrade() else {
             let _ = writeln!(stream, "error: session is gone");
@@ -1569,7 +1569,7 @@ impl SessionChannel {
             }
         };
 
-        use crate::session_sop::{BuildOutcome, BuildUpdate};
+        use crate::box_ops::{BuildOutcome, BuildUpdate};
         let mut renderer = orchestrator::BuildRenderer::new(flag_verbose);
         let mut outcome = None;
         // The same meter as `min add`. Unscoped: this build runs on the
@@ -1615,7 +1615,7 @@ impl SessionChannel {
     /// where the user typed it and stays inside the workspace — the one
     /// directory the daemon and the sandbox share.
     async fn run_materialize(&mut self, stream: &mut UnixStream, request: &str) {
-        use crate::session_sop::{MaterializeOutcome, MaterializeUpdate};
+        use crate::box_ops::{MaterializeOutcome, MaterializeUpdate};
         use tokio::io::AsyncWriteExt as _;
 
         let prepared: Result<_, String> = async {
@@ -1922,7 +1922,7 @@ fn install_scope(graph: &Graph, pkgs: &[(&str, BuildSpecRef)]) -> HashSet<String
 /// the session to put it.
 #[derive(Debug, PartialEq)]
 struct MaterializeArgs {
-    opts: crate::session_sop::MaterializeOpts,
+    opts: crate::box_ops::MaterializeOpts,
     /// Where the artifact lands, as an absolute path in the *sandbox* —
     /// resolved against the sandbox cwd, and not yet tied to a daemon
     /// directory. [`sandbox_to_daemon`] decides which one it names.
@@ -1995,7 +1995,7 @@ impl MaterializeArgs {
         };
 
         Ok(Self {
-            opts: crate::session_sop::MaterializeOpts { output_name, arch },
+            opts: crate::box_ops::MaterializeOpts { output_name, arch },
             output,
         })
     }
@@ -2443,9 +2443,9 @@ mod tests {
             // through `$MINIMAL_ATTACH_ENV`, so a composed variable of that
             // name cannot redirect or break the refresh.
             assert!(
-                body.contains(crate::session_host::ATTACH_ENV_SH)
-                    || body.contains(crate::session_host::ATTACH_ENV_FISH)
-                    || body.contains(crate::session_host::ATTACH_ENV_JSON),
+                body.contains(crate::box_runtime::ATTACH_ENV_SH)
+                    || body.contains(crate::box_runtime::ATTACH_ENV_FISH)
+                    || body.contains(crate::box_runtime::ATTACH_ENV_JSON),
                 "{rel} should hard-code the published path: {body}"
             );
             assert!(
@@ -2476,7 +2476,7 @@ mod tests {
     }
 
     /// Runs a rootfs's bash rc the way an attach does — the argv
-    /// `crate::session_shell`'s table gives bash — with `home` standing in
+    /// `crate::attach_shell`'s table gives bash — with `home` standing in
     /// for the session home, and returns the shell's stdout.
     ///
     /// `None` when the host has no bash to run it with: the caller skips,
@@ -2716,19 +2716,19 @@ exit $rc
     use tempfile::tempdir;
 
     /// Builds a `Context` and `Graph` from mctx's fakerepo fixture, plus a
-    /// `SessionChannel` wired to them with a dummy receiver so handlers can be
+    /// `BoxChannel` wired to them with a dummy receiver so handlers can be
     /// driven directly.
-    fn setup_channel() -> (TempDir, TempDir, TempDir, SessionChannel) {
-        setup_channel_with(crate::session::WeakSessionHandle::dangling(), "web")
+    fn setup_channel() -> (TempDir, TempDir, TempDir, BoxChannel) {
+        setup_channel_with(crate::box_actor::WeakBoxHandle::dangling(), "web")
     }
 
     /// [`setup_channel`] for a channel bound to the session that owns it: the
     /// session's weak handle and the box's name, so the paths that reach into
     /// the session — the expose hop — can be driven against a live one.
     fn setup_channel_with(
-        session: crate::session::WeakSessionHandle,
+        session: crate::box_actor::WeakBoxHandle,
         name: &str,
-    ) -> (TempDir, TempDir, TempDir, SessionChannel) {
+    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -2747,7 +2747,7 @@ exit $rc
         graph.top_levels = vec![];
 
         let (_tx, rx) = mpsc::channel(1);
-        let channel = SessionChannel {
+        let channel = BoxChannel {
             name: name.to_string(),
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(rootfs.path().to_path_buf()).unwrap(),
@@ -2851,7 +2851,7 @@ exit $rc
     /// the name, so it writes those lines; each request leaves exactly one,
     /// naming the box, the port as given, and the outcome. Every path the
     /// actor did see — including a publish that failed, whatever the source
-    /// — leaves its own line there, pinned by the expose tests in `session`,
+    /// — leaves its own line there, pinned by the expose tests in `box_actor`,
     /// so the channel writes none for it: one request, one line, on every
     /// path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2864,7 +2864,7 @@ exit $rc
         // each request's line below is found and counted by the box it
         // names.
         let (_state, _rootfs, _cwd, mut chan) =
-            setup_channel_with(crate::session::WeakSessionHandle::dangling(), "chanweb");
+            setup_channel_with(crate::box_actor::WeakBoxHandle::dangling(), "chanweb");
         let (mut ours, theirs) = UnixStream::pair().unwrap();
         #[expect(
             clippy::large_futures,
@@ -2902,7 +2902,7 @@ exit $rc
             crate::test_harness::create_configured_session(&mut client, "recweb", "/tmp").await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the session resolves");
@@ -2951,7 +2951,7 @@ exit $rc
         // channel of the next request, which no actor saw: that one is the
         // `ActorGone` failure, and its line is this channel's.
         let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(
-            crate::session::WeakSessionHandle::answering(vec![Err(
+            crate::box_actor::WeakBoxHandle::answering(vec![Err(
                 crate::net::policy::ExposeFailure::Publish {
                     port: 3000,
                     source: std::io::Error::new(
@@ -3077,7 +3077,7 @@ exit $rc
         // below bind at the box's own address.
         let manager = server.state.sessions_manager().await;
         manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
-        let web = crate::session::tests::finalize_declared_dynamic_ingress_session(
+        let web = crate::box_actor::tests::finalize_declared_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 51),
@@ -3085,7 +3085,7 @@ exit $rc
         )
         .await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3100,7 +3100,7 @@ exit $rc
             .lock()
             .await
             .control_socket();
-        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (forwarder, served) = crate::box_actor::tests::fake_forwarder(sock, 200).await;
         let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
 
         // The declared port: the gate admitted it when the box attached, so
@@ -3147,7 +3147,7 @@ exit $rc
     /// below: each pins the line the box's caller reads, which is where a
     /// refusal names its way forward.
     async fn expose_reply(
-        handle: &crate::session::SessionHandle,
+        handle: &crate::box_actor::BoxHandle,
         name: &str,
         port: u16,
     ) -> Vec<String> {
@@ -3171,7 +3171,7 @@ exit $rc
     async fn expose_deny_reply_names_the_way_forward() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        let id = crate::session::tests::finalize_dynamic_ingress_session(
+        let id = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 52),
@@ -3182,7 +3182,7 @@ exit $rc
         .await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3206,7 +3206,7 @@ exit $rc
     async fn expose_reply_names_the_renamed_box() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        let id = crate::session::tests::finalize_dynamic_ingress_session(
+        let id = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 54),
@@ -3217,7 +3217,7 @@ exit $rc
         .await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3273,7 +3273,7 @@ exit $rc
             .unwrap();
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3294,7 +3294,7 @@ exit $rc
     async fn expose_ask_unattended_reply_names_the_way_forward() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        let id = crate::session::tests::finalize_dynamic_ingress_session(
+        let id = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 53),
@@ -3305,7 +3305,7 @@ exit $rc
         .await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3332,7 +3332,7 @@ exit $rc
         let id = crate::test_harness::create_configured_session(&mut client, "web", "/uwu").await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3364,7 +3364,7 @@ exit $rc
         // publish below binds at the box's own address.
         let manager = server.state.sessions_manager().await;
         manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
-        let web = crate::session::tests::finalize_dynamic_ingress_session(
+        let web = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 61),
@@ -3374,7 +3374,7 @@ exit $rc
         )
         .await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3389,7 +3389,7 @@ exit $rc
             .lock()
             .await
             .control_socket();
-        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (forwarder, served) = crate::box_actor::tests::fake_forwarder(sock, 200).await;
         let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
 
         // The stance the create stored — the fixed point every request below
@@ -3711,7 +3711,7 @@ exit $rc
     #[test]
     fn materialize_args_parse_both_flag_forms() {
         let expected = MaterializeArgs {
-            opts: crate::session_sop::MaterializeOpts {
+            opts: crate::box_ops::MaterializeOpts {
                 output_name: "image".to_string(),
                 arch: Some("arm64".to_string()),
             },
