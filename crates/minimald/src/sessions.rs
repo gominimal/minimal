@@ -1092,20 +1092,24 @@ impl Manager {
     }
 
     /// Whether the session that answers to `name` is in the tearing-down
-    /// set. A store error reads as not: the caller then reports the plain
-    /// collision it already had.
-    async fn name_is_being_destroyed(&self, name: &str) -> bool {
+    /// set: `None` when no record answers to it any more (a teardown that
+    /// ended since the caller's collision). A store error reads as
+    /// `Some(false)`: the caller then reports the plain collision it
+    /// already had.
+    async fn name_is_being_destroyed(&self, name: &str) -> Option<bool> {
         match self
             .store
             .find(RecordPredicate::Name(name.to_string()))
             .await
         {
-            Ok(Some(handle)) => self
-                .tearing_down
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(handle.id()),
-            _ => false,
+            Ok(Some(handle)) => Some(
+                self.tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(handle.id()),
+            ),
+            Ok(None) => None,
+            Err(_) => Some(false),
         }
     }
 
@@ -1306,15 +1310,29 @@ impl Manager {
             // say so, rather than report a plain collision the user cannot
             // see in `min ls`, where that session is no longer listed.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The teardown runs beside this mainloop, so it can end
+                // between the collision and the re-read: a record gone by
+                // then was a session destroyed meanwhile, and the name is
+                // free now.
                 return Err(match name {
-                    Some(name) if self.name_is_being_destroyed(&name).await => SessionsError::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!(
-                            "a session named `{name}` is still being destroyed; \
+                    Some(name) => match self.name_is_being_destroyed(&name).await {
+                        Some(true) => SessionsError::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "a session named `{name}` is still being destroyed; \
                                  try again once it is gone"
+                            ),
                         ),
-                    ),
-                    _ => e,
+                        None => SessionsError::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "a session named `{name}` was being destroyed as this one \
+                                 was created, and is gone now; try again"
+                            ),
+                        ),
+                        Some(false) => e,
+                    },
+                    None => e,
                 });
             }
             Err(e) => return Err(e),
