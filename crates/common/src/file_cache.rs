@@ -226,10 +226,12 @@ impl FileCache {
         // Renaming over an existing entry is fine: it holds the same verified bytes.
         tmp.persist(&cached_path)
             .map_err(|e| Either::Left(e.error.into()))?;
-        // Fsync the directory so the rename itself survives a crash.
-        fs::File::open(&dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| Either::Left(e.into()))?;
+        // Fsync the directory so the rename itself survives a crash. This buys durability, not
+        // integrity (`read_cached` re-hashes every read), so a failure only warns: some
+        // filesystems refuse a directory fsync.
+        if let Err(e) = fs::File::open(&dir).and_then(|d| d.sync_all()) {
+            tracing::warn!("could not fsync cache directory {}: {e}", dir.display());
+        }
         Ok(cached_path)
     }
 }
