@@ -80,7 +80,12 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     .await?;
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
-                        Materialized::File(path) => build_deps.push(SandboxMapped::File(path)),
+                        // A copy, not a hardlink: the path is the download cache's own file,
+                        // and /build is writable, so a hardlink would let a build rewrite the
+                        // cached source under a concurrent build of the same source
+                        // (build-servers#231). The cache re-hashes on every hit, so only a
+                        // reader already past that check could see the change.
+                        Materialized::File(path) => build_deps.push(SandboxMapped::FileCopy(path)),
                         Materialized::TempDir(td) => build_deps.push(SandboxMapped::TempDir(td)),
                     }
                 }
@@ -448,6 +453,31 @@ mod tests {
         }
     }
 
+    /// Serves the same file for every source, as the download cache does on a hit.
+    #[derive(Debug)]
+    struct OneFileFetcher(PathBuf);
+
+    impl SourceFetcher for OneFileFetcher {
+        async fn download_web(
+            &self,
+            _url: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            Ok(self.0.clone())
+        }
+
+        async fn download_gcs(
+            &self,
+            _bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn graph_from(ncl: &str) -> Graph {
         Graph::new()
             .ingest(Layer::new_for_test(ncl.to_string()).unwrap())
@@ -542,5 +572,54 @@ mod tests {
             msg.contains("amd64/macos"),
             "error should name the unbuildable target, got: {msg}"
         );
+    }
+
+    /// A non-extracted source reaches the sandbox's writable /build as a private
+    /// copy of the cached file. A hardlink there would be the download cache's own
+    /// inode, so a build appending to its input changed the cached source for any
+    /// concurrent build of it (build-servers#231, reproduced from inside a real
+    /// build sandbox).
+    #[test]
+    fn a_non_extracted_source_is_mapped_as_a_private_copy() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let cached = tmp.path().join("payload.tar.gz");
+        std::fs::write(&cached, b"payload").unwrap();
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, Source, ..} = import "minimal.ncl" in
+            {
+                name = "uses-raw-source",
+                build_deps = [
+                    {
+                        url = "https://example.invalid/payload.tar.gz",
+                        sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+                        extract = false,
+                    } | Source,
+                ],
+                cmd = "true",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("uses-raw-source").unwrap();
+        let fetcher = OneFileFetcher(cached.clone());
+        let sb = SpecBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            override_deps: None,
+            stdout_writer: None,
+            stderr_writer: None,
+            cancel: CancellationToken::new(),
+            cpu_weight: None,
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+        let build = dg.get(&bsr).unwrap();
+        let op = OpTracker::new_root();
+        let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
+        assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
     }
 }
