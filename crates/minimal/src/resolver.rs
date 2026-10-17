@@ -1349,14 +1349,19 @@ const FOREIGN_OPERATOR_SERVICE: &str = "the host's DNS service belongs to anothe
 /// `owner_is_account` true: then the service is another operator's, and
 /// reinstalling it would take it over, so the step is unavailable,
 /// saying so. A root-owned socket, or one whose uid names no account, is
-/// a stale or relaxed install the custody check re-surfaces. Pure.
+/// a stale or relaxed install the custody check re-surfaces, and a
+/// socket left behind with no service installed ([`AnswererStep::Absent`])
+/// is one the step's install replaces. Pure.
 fn refuse_foreign_operator(
     step: AnswererStep,
     owner: Option<u32>,
     operator_uid: Option<u32>,
     owner_is_account: bool,
 ) -> AnswererStep {
-    if matches!(step, AnswererStep::SourceUnavailable { .. }) {
+    if matches!(
+        step,
+        AnswererStep::SourceUnavailable { .. } | AnswererStep::Absent
+    ) {
         return step;
     }
     match owner {
@@ -8918,6 +8923,13 @@ resolvectl domain minzone0 '~min.internal'
             refuse_foreign_operator(step.clone(), Some(4242), Some(1000), false),
             step,
             "a channel socket whose owner is no account stays a custody failure"
+        );
+        // A socket another account's service left behind, with no service
+        // installed: the step's install replaces it, so it is offered.
+        assert_eq!(
+            refuse_foreign_operator(AnswererStep::Absent, Some(4242), Some(1000), true),
+            AnswererStep::Absent,
+            "a leftover socket with no service installed refuses nothing"
         );
         // One another existing account owns is that operator's service:
         // the step is unavailable, saying so, and carries nothing that
