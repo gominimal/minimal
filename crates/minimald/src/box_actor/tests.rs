@@ -5107,6 +5107,68 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
     );
 }
 
+/// A restarted daemon's resume launches the host of a restored own-address
+/// box — no RPC, no exec, no attach — so the box's declared ingress is
+/// bound and its name keeps answering without a client. A `HostNet` box
+/// gets no such launch: it owns no declared ingress and publishes no
+/// address, so its restored actor alone is the whole box, as before.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "restored-own-ip",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        handed,
+    )
+    .await;
+    create_configured_session(&mut client, "restored-hostnet", "/uwu").await;
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both active sessions are resumed"
+    );
+
+    let web = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the own-address box's session resolves");
+    for _ in 0..100 {
+        if web.get_attrs().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        web.get_attrs().await.is_some(),
+        "the resumed own-address box holds a host no client asked for"
+    );
+
+    let hostnet = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Name(
+            "restored-hostnet".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .expect("the host-network box's session resolves");
+    // Held for a settle rather than read once: a launch wrongly spawned
+    // for it would be in flight alongside the own-address box's.
+    for _ in 0..20 {
+        assert!(
+            hostnet.get_attrs().await.is_none(),
+            "a resumed host-network box launches no host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// One restored session whose actor cannot start costs only its own name:
 /// the resume logs it and goes on, and the other session still routes.
 #[cfg(target_os = "linux")]
