@@ -90,6 +90,34 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
+/// The control sockets of this state dir's running VM host daemons, for the
+/// release the finalize-install script asks each daemon for. The enumeration
+/// spans every VM that ever ran (NET-057), and a stopped VM's socket files
+/// stay behind after its daemon exits, so a file's presence says nothing
+/// about liveness: a control socket is kept only when a connection to it
+/// succeeds at render time. A refused connection (a leftover file with no
+/// listener) or a missing file is a daemon that is not running; it cannot
+/// hold the hook port, so the script does not ask it to release it. Each
+/// connection is bounded by [`client::PROBE_TIMEOUT`]: a daemon that does
+/// not accept within it is skipped rather than stalling the render.
+///
+/// The probe runs when the script is rendered, not when it runs. A VM
+/// started in between is not in the list, so if its daemon holds the hook
+/// port then, the service start reports that it cannot take the port and
+/// prints the remedy. Listing every enumerated VM instead would make the
+/// release fail on any stopped VM's unreachable control socket.
+pub(crate) async fn running_vm_controls(minimal_dir: Option<&std::path::Path>) -> Vec<String> {
+    let mut running = Vec::new();
+    let vms = client::enumerate_vm_sockets(minimal_dir, true).unwrap_or_default();
+    for control in vms.iter().filter_map(|vm| control_sock_beside(&vm.sock)) {
+        let probe = tokio::net::UnixStream::connect(&control);
+        if let Ok(Ok(_)) = tokio::time::timeout(client::PROBE_TIMEOUT, probe).await {
+            running.push(control.display().to_string());
+        }
+    }
+    running
+}
+
 /// The host reads `min finalize-install` decides its script from (NET-122): this
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
@@ -109,17 +137,10 @@ pub(crate) async fn advisory_host_reads(
         crate::resolver::read_answerer_step()
     );
     // The daemons the step asks to release the hook port: this CLI's
-    // own state dir's — its VM host daemons, default VM and named VMs
-    // alike, or its native daemon — never another state dir's.
+    // own state dir's — its running VM host daemons or its native
+    // daemon — never another state dir's.
     let controls = match daemon_provider_kind(global) {
-        paths::ProviderKind::Minvmd => {
-            client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|vm| control_sock_beside(&vm.sock))
-                .map(|sock| sock.display().to_string())
-                .collect()
-        }
+        paths::ProviderKind::Minvmd => running_vm_controls(global.minimal_dir.as_deref()).await,
         paths::ProviderKind::Minimald => {
             client::resolve_socket_path(global.minimal_dir.as_deref(), false)
                 .ok()
@@ -4428,6 +4449,59 @@ mod tests {
         assert_eq!(
             host_asks_target(None, Some("web"), Some(addresses), false),
             None
+        );
+    }
+
+    /// The finalize-install script's controls span only the VM host daemons
+    /// whose daemon is listening: a stopped VM's state dir is still
+    /// enumerated (NET-057) and its socket files stay behind after its
+    /// daemon exits, so a leftover file with no listener is skipped, and a
+    /// daemon that cannot hold the hook port is not asked to release it.
+    #[tokio::test]
+    async fn running_vm_controls_skip_a_stopped_named_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        // A running named VM: its bridge and control sockets are listening,
+        // so its daemon's control socket is asked for the release.
+        let alpha = provider.join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let _alpha_bridge = std::os::unix::net::UnixListener::bind(alpha.join("ssh.sock")).unwrap();
+        let _alpha_control =
+            std::os::unix::net::UnixListener::bind(alpha.join("control.sock")).unwrap();
+        // A stopped named VM that ran: both socket files remain, but nothing
+        // listens behind them, so its daemon's control socket is not asked.
+        let beta = provider.join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(beta.join("ssh.sock")).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(beta.join("control.sock")).unwrap());
+        assert!(beta.join("ssh.sock").exists() && beta.join("control.sock").exists());
+        assert_eq!(
+            running_vm_controls(Some(base.path())).await,
+            vec![alpha.join("control.sock").display().to_string()]
+        );
+    }
+
+    /// A stopped default VM is skipped the same way: the default VM is always
+    /// enumerated, so only a listener on its control socket would put its
+    /// daemon in the script, and on a host where only a named VM runs there
+    /// is none.
+    #[tokio::test]
+    async fn running_vm_controls_skip_a_stopped_default_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        let gamma = provider.join("gamma");
+        std::fs::create_dir_all(&gamma).unwrap();
+        let _gamma_bridge = std::os::unix::net::UnixListener::bind(gamma.join("ssh.sock")).unwrap();
+        let _gamma_control =
+            std::os::unix::net::UnixListener::bind(gamma.join("control.sock")).unwrap();
+        // The default VM ran once and stopped: its socket files remain in
+        // the provider dir with no listener behind them.
+        drop(std::os::unix::net::UnixListener::bind(provider.join("ssh.sock")).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(provider.join("control.sock")).unwrap());
+        assert_eq!(
+            running_vm_controls(Some(base.path())).await,
+            vec![gamma.join("control.sock").display().to_string()]
         );
     }
 
