@@ -1799,14 +1799,37 @@ mod tests {
         let mut ctx = Context::new(config).unwrap();
         let graph = ctx.graph_from_all_packages().unwrap();
 
-        // Adding to an inline [stack] must keep its sibling keys.
+        let read_doc = || {
+            std::fs::read_to_string(&mfile_path)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap()
+        };
+        let str_list = |item: &Item| -> Vec<String> {
+            item.as_array()
+                .unwrap_or_else(|| panic!("expected an array, got {item:?}"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        // Adding to an inline [stack] must edit it in place and keep its
+        // sibling keys.
         ctx.add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
             .unwrap();
-        let output = String::from_utf8(std::fs::read(&mfile_path).unwrap()).unwrap();
-        assert!(output.contains("build_packages = [\"uroot\"]"));
-        assert!(output.contains("use = \"fake-stack\""));
+        ctx.add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::RuntimePackages)
+            .unwrap();
+        let doc = read_doc();
+        assert!(doc["stack"].is_inline_table(), "stack lost inline form");
+        assert_eq!(str_list(&doc["stack"]["build_packages"]), ["uroot"]);
+        assert_eq!(
+            str_list(&doc["stack"]["runtime_packages"]),
+            ["extra-runtime-pkg"]
+        );
+        assert_eq!(doc["stack"]["use"].as_str(), Some("fake-stack"));
 
-        // Adding to an inline task must keep its sibling keys.
+        // Adding to an inline task must edit it in place and keep its
+        // sibling keys.
         ctx.add_deps(
             &graph,
             ["uroot"],
@@ -1815,19 +1838,33 @@ mod tests {
             },
         )
         .unwrap();
-        let output = String::from_utf8(std::fs::read(&mfile_path).unwrap()).unwrap();
-        assert!(output.contains("packages = [\"uroot\"]"));
-        assert!(output.contains("exec = \"./something\""));
+        let doc = read_doc();
+        assert!(doc["tasks"]["something"].is_inline_table());
+        assert_eq!(str_list(&doc["tasks"]["something"]["packages"]), ["uroot"]);
+        assert_eq!(
+            doc["tasks"]["something"]["exec"].as_str(),
+            Some("./something")
+        );
+
+        // A task that is not in the inline `tasks` table is still an error.
+        assert!(
+            ctx.add_deps(
+                &graph,
+                ["uroot"],
+                AddDepMode::TaskPackages {
+                    name: "missing".to_string(),
+                },
+            )
+            .is_err()
+        );
 
         // Adding to an inline [session] must not replace the whole table.
         ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
             .unwrap();
-        let output = String::from_utf8(std::fs::read(&mfile_path).unwrap()).unwrap();
-        assert!(output.contains("ANSWER = \"42\""));
-        assert!(
-            output.contains("packages = [\"uroot\"]"),
-            "session packages lost: {output:?}"
-        );
+        let doc = read_doc();
+        assert!(doc["session"].is_inline_table(), "session lost inline form");
+        assert_eq!(str_list(&doc["session"]["packages"]), ["uroot"]);
+        assert_eq!(doc["session"]["vars"]["ANSWER"].as_str(), Some("42"));
 
         // The surviving settings must still parse into the config.
         let session = ctx.minimal_file().session.clone().unwrap_or_default();
