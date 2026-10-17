@@ -3236,6 +3236,15 @@ const MACOS_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on t
      resolver setting for box names, the boot-time setup for the loopback IPs boxes use, and \
      Minimal's DNS service";
 
+/// The note the macOS removal prints when a VM is running, in place of
+/// taking the range aliases off lo0. The check matches any `minvmd`
+/// process on the host, not only the caller's VM, so the note covers one
+/// left behind too. Echoed inside single quotes, so it holds none.
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_UNDO_VM_RUNNING_NOTE: &str = "note: the loopback IPs boxes use stay on lo0 while a \
+     VM is running; stop every VM (run min stop, and end any minvmd process still running), \
+     then run min finalize-install --undo again";
+
 /// The lead-in sentence of the removal script on Linux.
 #[cfg(any(test, not(target_os = "macos")))]
 const LINUX_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
@@ -3415,16 +3424,21 @@ fn channel_dir_removal(channel: &str) -> String {
 /// install from before the bundle left, its channel's directories when
 /// empty — then the range unit, booted out and its plist and script
 /// removed (a unit that runs the bundle's program has no script, and its
-/// program went with the bundle), then
-/// the resolver file. Every step tolerates what is already gone — a job
-/// that is not loaded, a file that is not there — so the script succeeds
-/// on a host it already cleaned, or on one `min finalize-install` never touched.
-/// `channel` is the machine-global channel path the step's plist names.
-///
-/// The range's loopback aliases are left as they are: the unit that adds
-/// them is gone, so the next boot does not re-apply them.
+/// program went with the bundle), every alias in its reserved range taken
+/// off lo0 (the range is reserved, so this includes one the range program
+/// found already there and skipped) unless a VM host daemon is running
+/// (its boxes use them; the script names the way to finish with
+/// [`MACOS_UNDO_VM_RUNNING_NOTE`]), then the resolver file and its
+/// directory when empty. Every step tolerates what is already gone — a
+/// job that is not loaded, a file that is not there — so the script succeeds on a host it already cleaned, or on one
+/// `min finalize-install` never touched. `channel` is the machine-global
+/// channel path the step's plist names.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_undo_command(channel: &str) -> String {
+    let aliases = switch::loopback::range_hosts()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "{header}\n\
          # The box-name service: unload it, then remove its plist, its channel\n\
@@ -3432,13 +3446,22 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
          {service}\
          {channel_dirs}\
          \n\
-         # The local range unit: unload it, then remove its program and plist.\n\
-         # The aliases it added to lo0 stay until the next boot.\n\
+         # The local range unit: unload it, remove its program and plist, and\n\
+         # take the aliases it added to lo0 off, unless a VM is running: its\n\
+         # boxes use them, so they stay until the VM stops.\n\
          (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)\n\
          rm -f {RANGE_PLIST_PATH} {RANGE_PROGRAM_PATH}\n\
+         if pgrep -x minvmd >/dev/null 2>&1 ; then\n\
+         \x20 echo '{MACOS_UNDO_VM_RUNNING_NOTE}' >&2\n\
+         else\n\
+         \x20 for addr in {aliases}; do\n\
+         \x20   /sbin/ifconfig lo0 -alias \"$addr\" 2>/dev/null || true\n\
+         \x20 done\n\
+         fi\n\
          \n\
-         # The resolver file.\n\
-         rm -f {RESOLVER_FILE}\n",
+         # The resolver file, and its directory when it is empty.\n\
+         rm -f {RESOLVER_FILE}\n\
+         rmdir /etc/resolver 2>/dev/null || true\n",
         header = script_header(MACOS_UNDO_WHAT, UNDO_SHOWN_BY),
         service = macos_service_removal(channel, ""),
         channel_dirs = channel_dir_removal(channel),
@@ -5755,8 +5778,13 @@ mod tests {
 
         // macOS: both jobs booted out (tolerating a job not loaded), the
         // two plists, the app bundle, the range script and the program an
-        // install from before the bundle left removed, the resolver file,
-        // and the channel's directories only when empty.
+        // install from before the bundle left removed, the range's
+        // loopback aliases taken off, the resolver file with its
+        // directory, and the channel's directories only when empty.
+        let addresses = switch::loopback::range_hosts()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         for step in [
             format!("(launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true)"),
             format!("(launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)"),
@@ -5766,7 +5794,12 @@ mod tests {
                  \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\""
             ),
             format!("rm -f {RANGE_PLIST_PATH} {RANGE_PROGRAM_PATH}"),
+            "if pgrep -x minvmd >/dev/null 2>&1 ; then".to_string(),
+            format!("echo '{MACOS_UNDO_VM_RUNNING_NOTE}' >&2"),
+            format!("for addr in {addresses}; do"),
+            "/sbin/ifconfig lo0 -alias \"$addr\" 2>/dev/null || true".to_string(),
             format!("rm -f {RESOLVER_FILE}"),
+            "rmdir /etc/resolver 2>/dev/null || true".to_string(),
             "rmdir \"/Library/Application Support/minimal/run\" 2>/dev/null || true".to_string(),
             "rmdir \"/Library/Application Support/minimal\" 2>/dev/null || true".to_string(),
         ] {
@@ -5778,6 +5811,18 @@ mod tests {
         assert!(
             !mac.contains("rmdir \"/Library/Application Support\""),
             "a directory that is not the step's is never removed: {mac}"
+        );
+        // The aliases come off only after the range unit is booted out, so
+        // its program cannot put them back.
+        let bootout_range = mac
+            .find(&format!("launchctl bootout system/{RANGE_UNIT_LABEL}"))
+            .expect("the range unit is booted out");
+        let vm_check = mac
+            .find("if pgrep -x minvmd")
+            .expect("the removal checks for a running VM");
+        assert!(
+            bootout_range < vm_check,
+            "the range unit is booted out before its aliases come off: {mac}"
         );
         // The service's removal is the step's own failure cleanup.
         assert!(mac.contains(&macos_service_removal(channel, "")), "{mac}");
@@ -5891,12 +5936,20 @@ mod tests {
     /// with nothing installed, with every system tool a stand-in that
     /// fails the way the real one does when its target is not there, exits
     /// 0. The stand-ins record what ran; nothing outside the temp dir is
-    /// touched, because `rm` and `rmdir` are stand-ins too.
+    /// touched, because `rm` and `rmdir` are stand-ins too, and the macOS
+    /// script's absolute-path `ifconfig` is pointed at one.
     #[test]
     fn finalize_install_undo_succeeds_on_a_clean_host() {
         use std::os::unix::fs::PermissionsExt as _;
         let stubs = tempfile::tempdir().expect("a temp dir");
-        for tool in ["launchctl", "systemctl", "resolvectl", "rmdir", "ip"] {
+        for tool in [
+            "launchctl",
+            "systemctl",
+            "resolvectl",
+            "rmdir",
+            "ip",
+            "pgrep",
+        ] {
             let path = stubs.path().join(tool);
             std::fs::write(
                 &path,
@@ -5920,15 +5973,29 @@ exit 0
         )
         .unwrap();
         std::fs::set_permissions(&rm, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for script in [
-            macos_undo_command("/nonexistent/minimal/run/answerer.sock"),
-            linux_undo_command("/nonexistent/minimal/answerer.sock"),
-        ] {
+        // The script sends `ifconfig`'s stderr to /dev/null, so its
+        // stand-in logs its calls to a file.
+        let calls = stubs.path().join("calls");
+        let ifconfig = stubs.path().join("ifconfig");
+        std::fs::write(
+            &ifconfig,
+            format!(
+                "#!/bin/sh\necho \"ifconfig $*\" >> {}\nexit 1\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ifconfig, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prepare = |script: String| {
             // The link test reads `/sys/class/net`; on a clean host the
             // link is absent, so `ip` is never reached. The profile, the
             // tree and the record are read the same way, so a host the
             // suite runs on that has any of them is still a clean one here.
-            let script = script
+            script
+                .replace(
+                    "/sbin/ifconfig",
+                    &stubs.path().join("ifconfig").display().to_string(),
+                )
                 .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
                 .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
                 .replace(
@@ -5943,12 +6010,21 @@ exit 0
                 .replace(
                     CLASSIFIER_TREE_RECORD,
                     "/nonexistent/var/lib/minimal/classifier",
-                );
-            let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
+                )
+        };
+        let run = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
                 .env("PATH", stubs.path())
                 .output()
-                .expect("sh runs");
+                .expect("sh runs")
+        };
+        for script in [
+            macos_undo_command("/nonexistent/minimal/run/answerer.sock"),
+            linux_undo_command("/nonexistent/minimal/answerer.sock"),
+        ] {
+            let script = prepare(script);
+            let output = run(&script);
             assert!(
                 output.status.success(),
                 "the removal succeeds on a clean host: {}\n{script}",
@@ -5964,6 +6040,36 @@ exit 0
                 "no profile to unload and no membership to take back on a clean host: {stderr}"
             );
         }
+        // No VM running (`pgrep` exits 1): the macOS removal takes every
+        // range alias off lo0, with no note.
+        let calls_made = std::fs::read_to_string(&calls).unwrap_or_default();
+        for addr in switch::loopback::range_hosts() {
+            assert!(
+                calls_made.contains(&format!("ifconfig lo0 -alias {addr}\n")),
+                "the alias {addr} comes off lo0: {calls_made}"
+            );
+        }
+
+        // A VM running (`pgrep` exits 0): the aliases stay, the note says
+        // how to finish, and the rest of the removal still runs and succeeds.
+        std::fs::remove_file(&calls).unwrap();
+        let pgrep = stubs.path().join("pgrep");
+        std::fs::write(&pgrep, "#!/bin/sh\necho \"$0 $*\" >&2\nexit 0\n").unwrap();
+        std::fs::set_permissions(&pgrep, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = prepare(macos_undo_command("/nonexistent/minimal/run/answerer.sock"));
+        let output = run(&script);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}\n{script}");
+        assert!(stderr.contains(MACOS_UNDO_VM_RUNNING_NOTE), "{stderr}");
+        assert!(
+            !calls.exists(),
+            "no alias comes off lo0 while a VM runs: {}",
+            std::fs::read_to_string(&calls).unwrap_or_default()
+        );
+        assert!(
+            stderr.contains(&format!("rm -f {RESOLVER_FILE}")),
+            "the rest of the removal runs: {stderr}"
+        );
     }
 
     /// The profile comes away only when the step's record says the step
