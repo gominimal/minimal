@@ -73,7 +73,6 @@ export GH_STUB_LOG="$tmp/gh.log" GH_STUB_PKGS="$tmp/pkgs" GH_STUB_AHEAD=7
 export GH_STUB_TAGS="libkrun/libkrun=v1.19.6
 libkrun/libkrunfw=v5.5.0
 containers/gvisor-tap-vsock=v0.8.9
-goreleaser/nfpm=v2.47.0
 rust-lang/rust=1.99.0
 model-checking/kani=kani-0.68.0
 zizmorcore/zizmor=v1.30.1
@@ -86,11 +85,10 @@ amoslives/vale-ste=v0.1.1"
 # make_tree DIR — a fixture repo whose pins all agree with each other.
 make_tree() {
     local d="$1"
-    mkdir -p "$d/.minimal" "$d/vendor/libkrun" "$d/vendor/gvproxy" "$d/vendor/nfpm" "$d/.github/workflows"
+    mkdir -p "$d/.minimal" "$d/vendor/libkrun" "$d/vendor/gvproxy" "$d/.github/workflows"
     printf '[upstream]\nlocked_commit = "%s"\n' "$commit" >"$d/.minimal/minimal.toml"
     printf '# lock\nversion=v1.19.4\ncommit=abc\n' >"$d/vendor/libkrun/libkrun.lock"
     printf 'version=v0.8.9\ngvproxy-darwin=00\n' >"$d/vendor/gvproxy/gvproxy.lock"
-    printf 'version=v2.47.0\n' >"$d/vendor/nfpm/nfpm.lock"
     printf '[toolchain]\nchannel = "1.97.0"\n' >"$d/rust-toolchain.toml"
     printf 'env:\n    KANI_VERSION: 0.68.0\n' >"$d/.github/workflows/ci-kani.yml"
     printf 'kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.68.0")\n' >"$d/justfile"
