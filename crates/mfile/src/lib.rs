@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
+use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -932,7 +934,20 @@ impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
     pub fn from_toml_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        toml::from_slice(bytes).map_err(Error::Format)
+        Self::parse(bytes)
+    }
+
+    /// Deserializes `minimal.toml` bytes, mapping serde's opaque untagged
+    /// `LinkConfig` failure to [`Error::LinkConfig`], which names the keys a
+    /// link table must set instead of quoting serde's internal enum name.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        toml::from_slice(bytes).map_err(|e| {
+            if e.message().contains("untagged enum LinkConfig") {
+                Error::LinkConfig(e)
+            } else {
+                Error::Format(e)
+            }
+        })
     }
 
     /// Searches from the given directory backwards to load the `minimal.toml` file.
@@ -1044,7 +1059,7 @@ impl File {
                 }
 
                 return Self::init_toml(
-                    toml::from_slice(&file_data).map_err(Error::Format)?,
+                    Self::parse(&file_data)?,
                     &path,
                     Layout::Root,
                     hash_bytes(&file_data),
@@ -1058,13 +1073,122 @@ impl File {
         let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => Self::init_toml(
-                toml::from_slice(&file_data).map_err(Error::Format)?,
+                Self::parse(&file_data)?,
                 &path,
                 Layout::DotMinimal,
                 hash_bytes(&file_data),
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
+        }
+    }
+
+    /// Read-modify-write `minimal.toml` under an exclusive lock, so
+    /// concurrent `min` commands cannot lose each other's edits.
+    ///
+    /// The lock is a sidecar `<path>.lock` file held for the whole
+    /// read-edit-write sequence (a platform-specific advisory write
+    /// lock via fd-lock — `flock` on most Unix, `fcntl` on Solaris,
+    /// `LockFile` on Windows); the content is re-read **inside** the
+    /// lock, so every serialized writer sees the previous writer's
+    /// result. The write itself is atomic (temp file + rename), so a
+    /// concurrent reader never sees a torn file and cannot write a
+    /// partial view back.
+    ///
+    /// The `edit` closure receives the current content (`None` if the
+    /// file does not exist yet) and returns `Ok(Some(new))` to write,
+    /// `Ok(None)` to leave the file untouched, or an error to abort
+    /// without writing.
+    pub fn edit_exclusively<E>(
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        // Resolve symlinks so the lock and the atomic replace both
+        // target the canonical file: `persist` would otherwise replace
+        // the symlink entry itself, and equivalent paths could use
+        // different sidecar locks.
+        let resolved;
+        let path = match std::fs::canonicalize(path) {
+            Ok(p) => {
+                resolved = p;
+                resolved.as_path()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
+            Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
+        };
+        // The sidecar deliberately lives beside the edited file rather
+        // than in an app state directory: the lock must be shared with
+        // any other writer of this exact path regardless of user or
+        // environment, it is keyed by the file's own location, and this
+        // function is static with no state-dir handle available. See the
+        // review thread on PR gominimal/minimal#2302 for the trade-offs.
+        let mut lock_path = OsString::from(path.as_os_str());
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+
+        let mut lock = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => fd_lock::RwLock::new(f),
+            Err(e) => return Err(Error::IO("locking", lock_path, e).into()),
+        };
+        let _guard = match lock.write() {
+            Ok(g) => g,
+            Err(e) => return Err(Error::IO("locking", lock_path, e).into()),
+        };
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Error::IO("reading", path.to_path_buf(), e).into()),
+        };
+
+        match edit(content.as_deref())? {
+            None => Ok(()),
+            Some(new) => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let mut builder = tempfile::Builder::new();
+                #[cfg(unix)]
+                builder.permissions(std::fs::Permissions::from_mode(0o666));
+                let mut tmp = match builder.tempfile_in(&parent) {
+                    Ok(t) => t,
+                    Err(e) => return Err(Error::IO("creating temp", path.to_path_buf(), e).into()),
+                };
+                if let Err(e) = tmp.write_all(new.as_bytes()) {
+                    return Err(Error::IO("writing temp", path.to_path_buf(), e).into());
+                }
+                if let Err(e) = tmp.as_file().sync_all() {
+                    return Err(Error::IO("syncing temp", path.to_path_buf(), e).into());
+                }
+                // Preserve an existing file's mode across the rename, so the
+                // replace does not regress permissions std::fs::write kept.
+                match std::fs::metadata(path) {
+                    Ok(meta) => {
+                        if let Err(e) = std::fs::set_permissions(tmp.path(), meta.permissions()) {
+                            return Err(
+                                Error::IO("setting permissions", path.to_path_buf(), e).into()
+                            );
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
+                }
+                match tmp.persist(path) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(Error::IO("replacing", path.to_path_buf(), e.error).into()),
+                }
+            }
         }
     }
 
@@ -2699,5 +2823,149 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             CaptureWriter(self.0.clone())
         }
+    }
+
+    #[test]
+    fn edit_exclusively_serializes_writers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+
+        let writers: Vec<String> = (0..8).map(|i| format!("k{i} = {i}\n")).collect();
+        std::thread::scope(|s| {
+            for line in &writers {
+                let path = &path;
+                s.spawn(move || {
+                    File::edit_exclusively::<Error>(path, |content| {
+                        let Some(mut content) = content.map(str::to_string) else {
+                            panic!("minimal.toml vanished under the lock");
+                        };
+                        content.push_str(line);
+                        Ok(Some(content))
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let final_content = std::fs::read_to_string(&path).unwrap();
+        for line in &writers {
+            assert!(
+                final_content.contains(line),
+                "lost edit `{line:?}`; file:\n{final_content}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_exclusively_never_exposes_a_torn_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..64 {
+                    File::edit_exclusively::<Error>(&path, |content| {
+                        let mut content = content
+                            .expect("minimal.toml vanished under the lock")
+                            .to_string();
+                        content.push_str(&format!("k{i} = {i}\n"));
+                        Ok(Some(content))
+                    })
+                    .unwrap();
+                }
+            });
+            s.spawn(|| {
+                for _ in 0..512 {
+                    // The atomic-replace write means every read observes
+                    // either the old or the new file — never a truncated
+                    // prefix of one, which `std::fs::write` in place can
+                    // produce. A torn write leaves a partial table that
+                    // fails to parse as a whole document.
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    toml::from_str::<toml::Value>(&content).unwrap_or_else(|e| {
+                        panic!("torn read: {e}; content: {content:?}");
+                    });
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn link_missing_repo_and_dir_names_the_fields() {
+        let err = File::from_toml_bytes(indoc! {b"
+            [upstream]
+            branch = \"main\"
+        "})
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`repo`"), "message: {msg}");
+        assert!(msg.contains("`dir`"), "message: {msg}");
+    }
+
+    #[test]
+    fn edit_exclusively_creates_a_missing_file_at_the_requested_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        File::edit_exclusively::<Error>(&path, |content| {
+            assert!(content.is_none(), "a missing file reads as None");
+            Ok(Some("[stack]\nname = \"base\"\n".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[stack]\nname = \"base\"\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_follows_a_symlink_instead_of_replacing_it() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        File::edit_exclusively::<Error>(&link, |content| {
+            let mut content = content.expect("target vanished").to_string();
+            content.push_str("k = \"v\"\n");
+            Ok(Some(content))
+        })
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("symlink entry vanished")
+                .file_type()
+                .is_symlink(),
+            "the edit replaced the symlink entry itself"
+        );
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("k = \"v\""), "content: {content}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_keys_the_lock_sidecar_by_the_canonical_path() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        File::edit_exclusively::<Error>(&link, |_| Ok(None)).unwrap();
+
+        assert!(
+            !dir.path().join(format!("{MFILE_NAME}.lock")).exists(),
+            "lock sidecar created at the symlink spelling"
+        );
+        assert!(
+            dir.path().join("real.toml.lock").exists(),
+            "lock sidecar not created at the canonical target"
+        );
     }
 }

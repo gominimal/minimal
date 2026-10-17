@@ -6,6 +6,11 @@ use std::path::PathBuf;
 pub enum Error {
     IO(&'static str, PathBuf, std::io::Error),
     Format(toml::de::Error),
+    /// An `[upstream]` or sideload table does not deserialize into the
+    /// untagged `LinkConfig` enum — a missing key, but also a wrong
+    /// field type — so serde's error names neither the file nor the
+    /// offending field.
+    LinkConfig(toml::de::Error),
     NotFound,
     ConflictingLayouts(Vec<PathBuf>),
     MissingParamDefault(String),
@@ -25,6 +30,13 @@ impl fmt::Display for Error {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
+            Error::LinkConfig(_) => write!(
+                f,
+                "invalid link: an `[upstream]` or sideload table must be \
+                 either `repo` (a git URL string, with optional string \
+                 `branch` and `locked_commit`) or `dir` (a directory \
+                 path string)"
+            ),
             Error::NotFound => write!(f, "not found"),
             Error::ConflictingLayouts(paths) => write!(
                 f,
@@ -66,6 +78,7 @@ impl std::error::Error for Error {
         match self {
             Error::IO(_, _, e) => Some(e),
             Error::Format(e) => Some(e),
+            Error::LinkConfig(e) => Some(e),
             Error::NotFound => None,
             Error::ConflictingLayouts(_) => None,
             Error::MissingParamDefault(_) => None,
