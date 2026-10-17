@@ -1207,6 +1207,20 @@ fn setup_zed_is_hidden() {
     assert!(!session.find_subcommand("attach").unwrap().is_hide_set());
 }
 
+/// The `spin` demo exists only in debug builds: clap's typo tips draw
+/// candidates from hidden subcommands too, so hiding it is not enough
+/// to keep it out of release output.
+#[cfg(not(debug_assertions))]
+#[test]
+fn spin_absent_in_release() {
+    use clap::CommandFactory as _;
+    let cli = Cli::command();
+    assert!(
+        cli.find_subcommand("spin").is_none(),
+        "spin must not exist in release builds"
+    );
+}
+
 /// `--raw` and `--json` select mutually exclusive output formats, so
 /// passing both must be rejected rather than silently letting one win.
 #[test]
