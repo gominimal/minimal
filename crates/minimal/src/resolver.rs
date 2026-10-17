@@ -3237,11 +3237,13 @@ const MACOS_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on t
      Minimal's DNS service";
 
 /// The note the macOS removal prints when a VM is running, in place of
-/// taking the range aliases off lo0. Echoed inside single quotes, so it
-/// holds none.
+/// taking the range aliases off lo0. The check matches any `minvmd`
+/// process on the host, not only the caller's VM, so the note covers one
+/// left behind too. Echoed inside single quotes, so it holds none.
 #[cfg(any(test, target_os = "macos"))]
 const MACOS_UNDO_VM_RUNNING_NOTE: &str = "note: the loopback IPs boxes use stay on lo0 while a \
-     VM is running: run min stop, then run min finalize-install --undo again";
+     VM is running; stop every VM (run min stop, and end any minvmd process still running), \
+     then run min finalize-install --undo again";
 
 /// The lead-in sentence of the removal script on Linux.
 #[cfg(any(test, not(target_os = "macos")))]
@@ -3422,12 +3424,13 @@ fn channel_dir_removal(channel: &str) -> String {
 /// install from before the bundle left, its channel's directories when
 /// empty — then the range unit, booted out and its plist and script
 /// removed (a unit that runs the bundle's program has no script, and its
-/// program went with the bundle), its loopback aliases taken off lo0 unless
-/// a VM host daemon is running (its boxes use them; the script names the
-/// way to finish with [`MACOS_UNDO_VM_RUNNING_NOTE`]), then the resolver
-/// file and its directory when empty. Every step tolerates
-/// what is already gone — a job that is not loaded, a file that is not
-/// there — so the script succeeds on a host it already cleaned, or on one
+/// program went with the bundle), every alias in its reserved range taken
+/// off lo0 (the range is reserved, so this includes one the range program
+/// found already there and skipped) unless a VM host daemon is running
+/// (its boxes use them; the script names the way to finish with
+/// [`MACOS_UNDO_VM_RUNNING_NOTE`]), then the resolver file and its
+/// directory when empty. Every step tolerates what is already gone — a
+/// job that is not loaded, a file that is not there — so the script succeeds on a host it already cleaned, or on one
 /// `min finalize-install` never touched. `channel` is the machine-global
 /// channel path the step's plist names.
 #[cfg(any(test, target_os = "macos"))]
@@ -5808,6 +5811,18 @@ mod tests {
         assert!(
             !mac.contains("rmdir \"/Library/Application Support\""),
             "a directory that is not the step's is never removed: {mac}"
+        );
+        // The aliases come off only after the range unit is booted out, so
+        // its program cannot put them back.
+        let bootout_range = mac
+            .find(&format!("launchctl bootout system/{RANGE_UNIT_LABEL}"))
+            .expect("the range unit is booted out");
+        let vm_check = mac
+            .find("if pgrep -x minvmd")
+            .expect("the removal checks for a running VM");
+        assert!(
+            bootout_range < vm_check,
+            "the range unit is booted out before its aliases come off: {mac}"
         );
         // The service's removal is the step's own failure cleanup.
         assert!(mac.contains(&macos_service_removal(channel, "")), "{mac}");

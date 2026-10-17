@@ -626,8 +626,9 @@ unit. On macOS the program copy is the app bundle, and `--undo` also removes
 the bare program and the range script that an earlier release installed.
 On macOS the local range addresses come off the loopback too, and `--undo`
 removes the resolver file's directory when it holds nothing else. While a VM
-is running, the addresses stay and a note says so: run `min stop`, then
-`--undo` again.
+is running, the addresses stay and a note says so: stop every VM, then run
+`--undo` again. The check counts any `minvmd` process on the host, so end one
+that `min stop` leaves behind too.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
 
