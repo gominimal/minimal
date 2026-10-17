@@ -1,4 +1,4 @@
-# INSTALLED FILE — the source of record is gominimal/foundry:spec/deploy/spec-lint.yml.
+# INSTALLED FILE — the source of record is gominimal/foundry:plugins/spec/linter/deploy/spec-lint.yml.
 #
 # Copy it verbatim into `.github/workflows/spec-lint.yml` in every repo that
 # holds specs. foundry's spec-drift.yml fails when an installed copy and this
@@ -86,7 +86,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           path: linter
           persist-credentials: false
-          sparse-checkout: spec
+          sparse-checkout: plugins/spec/linter
 
       - name: Lint the specs this PR touches
         id: lint
@@ -148,7 +148,7 @@ jobs:
           printf 'linting %d file(s):\n' "${#files[@]}"
           printf '  %s\n' "${files[@]}"
 
-          if [ ! -f linter/spec/spec_lint.py ]; then
+          if [ ! -f linter/plugins/spec/linter/spec_lint.py ]; then
             echo "::warning::the linter could not be checked out of gominimal/foundry; no comment this run"
             echo "state=quiet" >> "$GITHUB_OUTPUT"
             exit 0
@@ -158,7 +158,7 @@ jobs:
           # --repo-root . from inside the PR tree, so `verify:` and `proof:`
           # targets resolve and findings read `docs/specs/...` rather than
           # `pr/docs/specs/...`.
-          ( cd pr && python3 "$GITHUB_WORKSPACE/linter/spec/spec_lint.py" \
+          ( cd pr && python3 "$GITHUB_WORKSPACE/linter/plugins/spec/linter/spec_lint.py" \
               --repo-root . --format markdown "${files[@]}" ) > /tmp/lint.md 2>/tmp/lint.err
           if [ ! -s /tmp/lint.md ]; then
             echo "::warning::the linter produced no output"
