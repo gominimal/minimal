@@ -652,8 +652,12 @@ pub struct EnvArgs<'a> {
 /// - `echo`, list-form `exec` and `cmdcmd` actions take values verbatim;
 ///   their runners start no shell.
 ///
-/// Numbers and booleans are rendered in place in every action, since their
-/// text cannot carry shell syntax.
+/// Numbers, booleans and enum values keep their real values in every
+/// action: number and boolean text cannot carry shell syntax, and an enum
+/// value is one of the author's own permitted values. Only string values
+/// stand in as a token or a variable reference while the Nickel expression
+/// evaluates, so an expression that compares, measures or parses a string
+/// argument does not see its value.
 ///
 /// Shared by the invocation path ([`Env::task_invocations`]) and the
 /// sandbox-free `echo` short-circuits, so an echoed string is interpolated
@@ -797,14 +801,14 @@ fn scalar_text(s: &args::ScalarArg) -> String {
 
 /// Binds a `bash` argument for Nickel: each string becomes a reference to
 /// the variable [`task_arg_env`] holds it in, so the script carries the
-/// reference and never the value.
+/// reference and never the value. An enum value is bound as it is.
 fn env_reference_arg(name: &str, arg: &args::Arg) -> args::Arg {
     let var = arg_env_name(name);
     let reference = |v: String| args::ScalarArg::String(format!("${{{v}}}"));
     match arg {
-        args::Arg::Scalar(args::ScalarArg::String(_)) | args::Arg::Enum(_) => {
-            args::Arg::Scalar(reference(var))
-        }
+        args::Arg::Scalar(args::ScalarArg::String(_)) => args::Arg::Scalar(reference(var)),
+        // Validated against the author's permitted set, so author text.
+        args::Arg::Enum(_) => arg.clone(),
         args::Arg::Scalar(other) => args::Arg::Scalar(other.clone()),
         args::Arg::Array(items) => args::Arg::Array(
             items
@@ -827,7 +831,7 @@ const SENTINEL_CLOSE: char = '\u{E001}';
 
 /// Binds an `exec` argument for Nickel: each string becomes an opaque
 /// token naming its slot in `values`, which [`fill_sentinels`] swaps back
-/// once the words are split.
+/// once the words are split. An enum value is bound as it is.
 fn sentinel_arg(arg: &args::Arg, values: &mut Vec<String>) -> args::Arg {
     let mut token = |v: &str| {
         values.push(v.to_string());
@@ -837,7 +841,8 @@ fn sentinel_arg(arg: &args::Arg, values: &mut Vec<String>) -> args::Arg {
         args::Arg::Scalar(args::ScalarArg::String(s)) => {
             args::Arg::Scalar(args::ScalarArg::String(token(s)))
         }
-        args::Arg::Enum(s) => args::Arg::Enum(token(s)),
+        // Validated against the author's permitted set, so author text.
+        args::Arg::Enum(_) => arg.clone(),
         args::Arg::Scalar(other) => args::Arg::Scalar(other.clone()),
         args::Arg::Array(items) => args::Arg::Array(
             items
@@ -1895,6 +1900,48 @@ mod tests {
             "error should name the variable, got: {err}"
         );
         assert!(task_arg_env(Some(&parsed)).is_err());
+    }
+
+    /// An enum value is one of the author's permitted values, so a Nickel
+    /// expression sees the real value and takes the branch it selects, in
+    /// `exec` and in `bash`; `bash` still binds `MIN_ARG_<NAME>` for it.
+    #[test]
+    fn interpolate_enum_value_reaches_nickel_expressions() {
+        let schema: args::ArgsSpec = toml::from_str("profile = \"[debug, release]\"").unwrap();
+        let branch = "%{if profile == \"release\" then \"--release\" else \"--debug\"}";
+        for (value, want) in [("release", "--release"), ("debug", "--debug")] {
+            let exec = mfile::Task {
+                action: mfile::TaskAction::exec_from_str(&format!("runner {branch} done")),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            let parsed = exec
+                .args
+                .parse_argv_named("task", vec!["--profile", value])
+                .unwrap();
+            let resolved = interpolate_task_strings(&exec, Some(&parsed)).unwrap();
+            assert_eq!(
+                resolved.exec_and_args(),
+                Some((
+                    "/bin/runner".to_string(),
+                    vec![want.to_string(), "done".to_string()]
+                )),
+                "exec, profile {value:?}"
+            );
+
+            let bash = mfile::Task {
+                action: mfile::TaskAction::Bash(format!(
+                    "printf '[%s]\\n' {branch} \"$MIN_ARG_PROFILE\""
+                )),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                run_bash_action(&bash, &parsed),
+                format!("[{want}]\n[{value}]\n"),
+                "bash, profile {value:?}"
+            );
+        }
     }
 
     /// `echo` runs no shell, so the value is printed verbatim.

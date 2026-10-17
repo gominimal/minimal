@@ -126,9 +126,20 @@ bash = "echo \"Hello %{name}!\""  # same as: echo "Hello $MIN_ARG_NAME!"
   `${MIN_ARG_NAME}`, not the value.
 
 An array argument `files` sets `MIN_ARG_FILES_COUNT` to its length and
-`MIN_ARG_FILES_0`, `MIN_ARG_FILES_1`, and so on to its elements. Number and
-boolean values appear in the script as their text. Argument names that map to
-the same variable, such as `a-b` and `a_b`, are an error.
+`MIN_ARG_FILES_0`, `MIN_ARG_FILES_1`, and so on to its elements. Argument
+names that map to the same variable, such as `a-b` and `a_b`, are an error.
+
+Number and boolean arguments keep their real values in `%{...}` expressions,
+such as `%{std.string.from_number count}`. Minimal does not replace them with
+a variable reference. Enum arguments keep their real values too, because
+an enum value is always one of the values the task lists. So
+`%{if profile == "release" then "--release" else ""}` takes the branch the
+value selects, in `exec` and in `bash`.
+
+Inside a `%{...}` expression, a string argument in an `exec` string or a
+`bash` script is an opaque placeholder. You can place it or join it with other
+text. An expression that compares or parses it does not see the value the
+caller passed.
 
 `echo` and list-form `exec` actions take each value as it is. Neither one
 runs a shell.
