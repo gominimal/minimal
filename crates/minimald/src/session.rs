@@ -4273,6 +4273,10 @@ impl Session {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
         };
+        // The host is out of the actor's hands now: out of the slot too, so a
+        // handle that outlives a `Stop` reads no host rather than probing the
+        // one being stopped.
+        self.publish_host();
         if let Some((host, mut sops)) = inner {
             for s in sops.drain(..) {
                 s.shutdown().await;
