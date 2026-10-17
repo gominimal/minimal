@@ -3415,16 +3415,18 @@ fn channel_dir_removal(channel: &str) -> String {
 /// install from before the bundle left, its channel's directories when
 /// empty — then the range unit, booted out and its plist and script
 /// removed (a unit that runs the bundle's program has no script, and its
-/// program went with the bundle), then
-/// the resolver file. Every step tolerates what is already gone — a job
-/// that is not loaded, a file that is not there — so the script succeeds
-/// on a host it already cleaned, or on one `min finalize-install` never touched.
-/// `channel` is the machine-global channel path the step's plist names.
-///
-/// The range's loopback aliases are left as they are: the unit that adds
-/// them is gone, so the next boot does not re-apply them.
+/// program went with the bundle), its loopback aliases taken off lo0, then
+/// the resolver file and its directory when empty. Every step tolerates
+/// what is already gone — a job that is not loaded, a file that is not
+/// there — so the script succeeds on a host it already cleaned, or on one
+/// `min finalize-install` never touched. `channel` is the machine-global
+/// channel path the step's plist names.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_undo_command(channel: &str) -> String {
+    let aliases = switch::loopback::range_hosts()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "{header}\n\
          # The box-name service: unload it, then remove its plist, its channel\n\
@@ -3432,13 +3434,17 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
          {service}\
          {channel_dirs}\
          \n\
-         # The local range unit: unload it, then remove its program and plist.\n\
-         # The aliases it added to lo0 stay until the next boot.\n\
+         # The local range unit: unload it, remove its program and plist, and\n\
+         # take the aliases it added to lo0 off.\n\
          (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)\n\
          rm -f {RANGE_PLIST_PATH} {RANGE_PROGRAM_PATH}\n\
+         for addr in {aliases}; do\n\
+         \x20 /sbin/ifconfig lo0 -alias \"$addr\" 2>/dev/null || true\n\
+         done\n\
          \n\
-         # The resolver file.\n\
-         rm -f {RESOLVER_FILE}\n",
+         # The resolver file, and its directory when it is empty.\n\
+         rm -f {RESOLVER_FILE}\n\
+         rmdir /etc/resolver 2>/dev/null || true\n",
         header = script_header(MACOS_UNDO_WHAT, UNDO_SHOWN_BY),
         service = macos_service_removal(channel, ""),
         channel_dirs = channel_dir_removal(channel),
@@ -5755,8 +5761,13 @@ mod tests {
 
         // macOS: both jobs booted out (tolerating a job not loaded), the
         // two plists, the app bundle, the range script and the program an
-        // install from before the bundle left removed, the resolver file,
-        // and the channel's directories only when empty.
+        // install from before the bundle left removed, the range's
+        // loopback aliases taken off, the resolver file with its
+        // directory, and the channel's directories only when empty.
+        let addresses = switch::loopback::range_hosts()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         for step in [
             format!("(launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true)"),
             format!("(launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)"),
@@ -5766,7 +5777,10 @@ mod tests {
                  \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\""
             ),
             format!("rm -f {RANGE_PLIST_PATH} {RANGE_PROGRAM_PATH}"),
+            format!("for addr in {addresses}; do"),
+            "/sbin/ifconfig lo0 -alias \"$addr\" 2>/dev/null || true".to_string(),
             format!("rm -f {RESOLVER_FILE}"),
+            "rmdir /etc/resolver 2>/dev/null || true".to_string(),
             "rmdir \"/Library/Application Support/minimal/run\" 2>/dev/null || true".to_string(),
             "rmdir \"/Library/Application Support/minimal\" 2>/dev/null || true".to_string(),
         ] {
@@ -5891,12 +5905,20 @@ mod tests {
     /// with nothing installed, with every system tool a stand-in that
     /// fails the way the real one does when its target is not there, exits
     /// 0. The stand-ins record what ran; nothing outside the temp dir is
-    /// touched, because `rm` and `rmdir` are stand-ins too.
+    /// touched, because `rm` and `rmdir` are stand-ins too, and the macOS
+    /// script's absolute-path `ifconfig` is pointed at one.
     #[test]
     fn finalize_install_undo_succeeds_on_a_clean_host() {
         use std::os::unix::fs::PermissionsExt as _;
         let stubs = tempfile::tempdir().expect("a temp dir");
-        for tool in ["launchctl", "systemctl", "resolvectl", "rmdir", "ip"] {
+        for tool in [
+            "launchctl",
+            "systemctl",
+            "resolvectl",
+            "rmdir",
+            "ip",
+            "ifconfig",
+        ] {
             let path = stubs.path().join(tool);
             std::fs::write(
                 &path,
@@ -5929,6 +5951,10 @@ exit 0
             // tree and the record are read the same way, so a host the
             // suite runs on that has any of them is still a clean one here.
             let script = script
+                .replace(
+                    "/sbin/ifconfig",
+                    &stubs.path().join("ifconfig").display().to_string(),
+                )
                 .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
                 .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
                 .replace(
