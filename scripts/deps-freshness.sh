@@ -66,7 +66,6 @@ libkrunfw (pkgs)           | pkgs packages/libkrunfw/build.ncl version          
 alpine rootfs (pkgs)       | pkgs packages/microvm-rootfs/build.ncl alpine_release   | alpine
 libkrun (vendored)         | kv vendor/libkrun/libkrun.lock version                  | gh-release libkrun/libkrun
 gvproxy                    | kv vendor/gvproxy/gvproxy.lock version                  | gh-release containers/gvisor-tap-vsock
-nfpm                       | kv vendor/nfpm/nfpm.lock version                        | gh-release goreleaser/nfpm
 rust toolchain             | re rust-toolchain.toml ^channel = "([^"]+)" *$          | gh-release rust-lang/rust
 kani                       | re .github/workflows/ci-kani.yml ^ *KANI_VERSION: *([0-9.]+) *$ | gh-release model-checking/kani
 zizmor                     | re .github/workflows/ci.yml ^ *tool: [a-z0-9,-]*zizmor@([0-9.]+) | gh-release zizmorcore/zizmor
