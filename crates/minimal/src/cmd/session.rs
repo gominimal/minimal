@@ -92,17 +92,18 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
 
 /// The control sockets of this state dir's running VM host daemons, for the
 /// release the finalize-install script asks each daemon for. The enumeration
-/// spans every VM that ever ran (NET-057), so the bridge socket each entry
-/// carries — bound only while the VMM lives, never cleaned up at exit — is
-/// what separates a running VM's daemon from a stopped one's leftover state
-/// dir: a stopped VM cannot hold the hook port, so asking its daemon would
-/// render a control socket that is not listening.
+/// spans every VM that ever ran (NET-057), and a stopped VM's socket files
+/// stay behind after its daemon exits, so a file's presence says nothing
+/// about liveness: a control socket is kept only when a connection to it
+/// succeeds at render time. A refused connection (a leftover file with no
+/// listener) or a missing file is a daemon that is not running; it cannot
+/// hold the hook port, so the script does not ask it to release it.
 pub(crate) fn running_vm_controls(minimal_dir: Option<&std::path::Path>) -> Vec<String> {
     client::enumerate_vm_sockets(minimal_dir, true)
         .unwrap_or_default()
         .iter()
-        .filter(|vm| vm.sock.exists())
         .filter_map(|vm| control_sock_beside(&vm.sock))
+        .filter(|control| std::os::unix::net::UnixStream::connect(control).is_ok())
         .map(|sock| sock.display().to_string())
         .collect()
 }
@@ -4442,54 +4443,55 @@ mod tests {
     }
 
     /// The finalize-install script's controls span only the VM host daemons
-    /// whose VM is running: a stopped VM's state dir is still enumerated
-    /// (NET-057), but its bridge socket went with the VMM, and a daemon that
-    /// cannot hold the hook port must not be asked to release it.
+    /// whose daemon is listening: a stopped VM's state dir is still
+    /// enumerated (NET-057) and its socket files stay behind after its
+    /// daemon exits, so a leftover file with no listener is skipped, and a
+    /// daemon that cannot hold the hook port is not asked to release it.
     #[test]
     fn running_vm_controls_skip_a_stopped_named_vm() {
         let base = tempfile::tempdir().unwrap();
         let provider = base.path().join("providers").join("local-minvmd0");
         std::fs::create_dir_all(&provider).unwrap();
-        // A running named VM: the VMM's bridge socket is bound, so its
-        // daemon's control socket beside it is asked for the release.
-        std::fs::create_dir_all(provider.join("alpha")).unwrap();
-        let alpha_sock = provider.join("alpha").join("ssh.sock");
-        let _alpha_bridge = std::os::unix::net::UnixListener::bind(&alpha_sock).unwrap();
-        // A stopped named VM: its state dir remains, its bridge socket does
-        // not, so its daemon's control socket is not asked.
-        std::fs::create_dir_all(provider.join("beta")).unwrap();
+        // A running named VM: its bridge and control sockets are listening,
+        // so its daemon's control socket is asked for the release.
+        let alpha = provider.join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let _alpha_bridge = std::os::unix::net::UnixListener::bind(alpha.join("ssh.sock")).unwrap();
+        let _alpha_control =
+            std::os::unix::net::UnixListener::bind(alpha.join("control.sock")).unwrap();
+        // A stopped named VM that ran: both socket files remain, but nothing
+        // listens behind them, so its daemon's control socket is not asked.
+        let beta = provider.join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(beta.join("ssh.sock")).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(beta.join("control.sock")).unwrap());
+        assert!(beta.join("ssh.sock").exists() && beta.join("control.sock").exists());
         assert_eq!(
             running_vm_controls(Some(base.path())),
-            vec![
-                provider
-                    .join("alpha")
-                    .join("control.sock")
-                    .display()
-                    .to_string()
-            ]
+            vec![alpha.join("control.sock").display().to_string()]
         );
     }
 
     /// A stopped default VM is skipped the same way: the default VM is always
-    /// enumerated, so its bridge socket is the only thing that keeps its
-    /// daemon's control socket out of the script on a host where only a
-    /// named VM runs.
+    /// enumerated, so only a listener on its control socket would put its
+    /// daemon in the script, and on a host where only a named VM runs there
+    /// is none.
     #[test]
     fn running_vm_controls_skip_a_stopped_default_vm() {
         let base = tempfile::tempdir().unwrap();
         let provider = base.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(provider.join("gamma")).unwrap();
-        let gamma_sock = provider.join("gamma").join("ssh.sock");
-        let _gamma_bridge = std::os::unix::net::UnixListener::bind(&gamma_sock).unwrap();
+        let gamma = provider.join("gamma");
+        std::fs::create_dir_all(&gamma).unwrap();
+        let _gamma_bridge = std::os::unix::net::UnixListener::bind(gamma.join("ssh.sock")).unwrap();
+        let _gamma_control =
+            std::os::unix::net::UnixListener::bind(gamma.join("control.sock")).unwrap();
+        // The default VM ran once and stopped: its socket files remain in
+        // the provider dir with no listener behind them.
+        drop(std::os::unix::net::UnixListener::bind(provider.join("ssh.sock")).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(provider.join("control.sock")).unwrap());
         assert_eq!(
             running_vm_controls(Some(base.path())),
-            vec![
-                provider
-                    .join("gamma")
-                    .join("control.sock")
-                    .display()
-                    .to_string()
-            ]
+            vec![gamma.join("control.sock").display().to_string()]
         );
     }
 
