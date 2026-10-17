@@ -6,9 +6,10 @@ use std::path::PathBuf;
 pub enum Error {
     IO(&'static str, PathBuf, std::io::Error),
     Format(toml::de::Error),
-    /// A `[upstream]` or sideload table sets neither `repo` nor `dir`, so
-    /// serde's untagged `LinkConfig` match fails with an error that names
-    /// neither the file nor the missing key.
+    /// An `[upstream]` or sideload table does not deserialize into the
+    /// untagged `LinkConfig` enum — a missing key, but also a wrong
+    /// field type — so serde's error names neither the file nor the
+    /// offending field.
     LinkConfig(toml::de::Error),
     NotFound,
     ConflictingLayouts(Vec<PathBuf>),
@@ -31,9 +32,10 @@ impl fmt::Display for Error {
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::LinkConfig(_) => write!(
                 f,
-                "invalid link: an `[upstream]` or sideload table must set \
-                 either `repo` (a git link, with optional `branch` and \
-                 `locked_commit`) or `dir` (a directory link)"
+                "invalid link: an `[upstream]` or sideload table must be \
+                 either `repo` (a git URL string, with optional string \
+                 `branch` and `locked_commit`) or `dir` (a directory \
+                 path string)"
             ),
             Error::NotFound => write!(f, "not found"),
             Error::ConflictingLayouts(paths) => write!(

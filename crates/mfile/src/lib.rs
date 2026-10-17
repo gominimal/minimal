@@ -1087,11 +1087,13 @@ impl File {
     /// concurrent `min` commands cannot lose each other's edits.
     ///
     /// The lock is a sidecar `<path>.lock` file held for the whole
-    /// read-edit-write sequence (fcntl `write` lock via fd-lock); the
-    /// content is re-read **inside** the lock, so every serialized writer
-    /// sees the previous writer's result. The write itself is
-    /// atomic (temp file + rename), so a concurrent reader never sees a
-    /// torn file and cannot write a partial view back.
+    /// read-edit-write sequence (a platform-specific advisory write
+    /// lock via fd-lock — `flock` on most Unix, `fcntl` on Solaris,
+    /// `LockFile` on Windows); the content is re-read **inside** the
+    /// lock, so every serialized writer sees the previous writer's
+    /// result. The write itself is atomic (temp file + rename), so a
+    /// concurrent reader never sees a torn file and cannot write a
+    /// partial view back.
     ///
     /// The `edit` closure receives the current content (`None` if the
     /// file does not exist yet) and returns `Ok(Some(new))` to write,
@@ -1104,6 +1106,25 @@ impl File {
     where
         E: From<Error>,
     {
+        // Resolve symlinks so the lock and the atomic replace both
+        // target the canonical file: `persist` would otherwise replace
+        // the symlink entry itself, and equivalent paths could use
+        // different sidecar locks.
+        let resolved;
+        let path = match std::fs::canonicalize(path) {
+            Ok(p) => {
+                resolved = p;
+                resolved.as_path()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
+            Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
+        };
+        // The sidecar deliberately lives beside the edited file rather
+        // than in an app state directory: the lock must be shared with
+        // any other writer of this exact path regardless of user or
+        // environment, it is keyed by the file's own location, and this
+        // function is static with no state-dir handle available. See the
+        // review thread on PR gominimal/minimal#2302 for the trade-offs.
         let mut lock_path = OsString::from(path.as_os_str());
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
@@ -2881,5 +2902,70 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("`repo`"), "message: {msg}");
         assert!(msg.contains("`dir`"), "message: {msg}");
+    }
+
+    #[test]
+    fn edit_exclusively_creates_a_missing_file_at_the_requested_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        File::edit_exclusively::<Error>(&path, |content| {
+            assert!(content.is_none(), "a missing file reads as None");
+            Ok(Some("[stack]\nname = \"base\"\n".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[stack]\nname = \"base\"\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_follows_a_symlink_instead_of_replacing_it() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        File::edit_exclusively::<Error>(&link, |content| {
+            let mut content = content.expect("target vanished").to_string();
+            content.push_str("k = \"v\"\n");
+            Ok(Some(content))
+        })
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("symlink entry vanished")
+                .file_type()
+                .is_symlink(),
+            "the edit replaced the symlink entry itself"
+        );
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("k = \"v\""), "content: {content}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_keys_the_lock_sidecar_by_the_canonical_path() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        File::edit_exclusively::<Error>(&link, |_| Ok(None)).unwrap();
+
+        assert!(
+            !dir.path().join(format!("{MFILE_NAME}.lock")).exists(),
+            "lock sidecar created at the symlink spelling"
+        );
+        assert!(
+            dir.path().join("real.toml.lock").exists(),
+            "lock sidecar not created at the canonical target"
+        );
     }
 }
