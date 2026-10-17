@@ -555,7 +555,6 @@ enum SessionMessage {
         /// The attaching connection's liveness, see [`Session::creator`].
         Option<std::sync::Weak<()>>,
     ),
-    GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     /// Hand back this session's host, minting one — with no channel bound to
     /// it — if the session has none running. Used by the exec path, which runs
     /// a command inside the session's sandbox and so needs the sandbox up, but
@@ -612,6 +611,10 @@ enum SessionMessage {
     /// would strand it) or an `Active` with a minted host. A `Draft` that
     /// was merely created isn't busy — nothing is in flight to strand.
     IsBusy(oneshot::Sender<bool>),
+    /// Test-only: park the actor for the duration, holding its mailbox the
+    /// way a long inline message does.
+    #[cfg(test)]
+    Park(std::time::Duration),
     /// Shutdown-stop: kill the host (if any), withdraw the hostname, and stop
     /// the actor — the on-disk record is kept.
     Stop(oneshot::Sender<()>),
@@ -886,6 +889,8 @@ struct PendingAsk {
 #[derive(Debug)]
 pub struct Session {
     receiver: crate::traced::Receiver<SessionMessage>,
+    /// The slot this actor's handle reads its host from; see [`HostSlot`].
+    host_slot: HostSlot,
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
     daemon_ctx: Arc<mctx::DaemonContext>,
@@ -1152,6 +1157,7 @@ impl Session {
             workspace_uploads_in_flight: 0,
             creator,
             manager,
+            host_slot: Arc::clone(&weak_self.1),
             weak_self,
             // No host yet; the first launch sets this. `Interactive` is the
             // conservative default — it is the one value that never licenses
@@ -1294,7 +1300,8 @@ impl Session {
         }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
-        let weak_self = WeakSessionHandle(sender.downgrade());
+        let host_slot = HostSlot::default();
+        let weak_self = WeakSessionHandle(sender.downgrade(), Arc::clone(&host_slot));
         let actor = Self::assemble(conf, receiver, inner, weak_self);
 
         // Register the PTask hostname before the actor goes live, so the
@@ -1321,7 +1328,7 @@ impl Session {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(SessionHandle(sender))
+        Ok(SessionHandle(sender, host_slot))
     }
 
     /// Register this session's PTask hostname (R3.1/R3.6). A HostNet PTask's
@@ -1949,6 +1956,28 @@ impl Session {
         reg.deregister(&registry_name(&record));
     }
 
+    /// Publishes the host this actor holds to the slot its handle reads
+    /// ([`HostSlot`]). Called after every message, so between messages —
+    /// and for as long as one parks the actor — the slot holds the host the
+    /// actor last had, and a listing's probe never waits on this mailbox.
+    /// Also called where a host is installed ([`Self::ensure_host`],
+    /// [`Self::mint_session_host`], [`Self::launch_host_for_hooks`]),
+    /// which is before the message that
+    /// launched it replies: a caller that awaits an attach or `ensure_host`
+    /// and then reads attrs sees the new host.
+    fn publish_host(&self) {
+        let host = match &self.inner {
+            SessionInner::Active {
+                host: Some((h, _)), ..
+            } => Some(AttrsProbe(h.clone())),
+            _ => None,
+        };
+        *self
+            .host_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = host;
+    }
+
     /// The async task which handles interactions with the session.
     ///
     /// On an actor-initiated termination (abort, failed verdict resume) the
@@ -1957,6 +1986,8 @@ impl Session {
     /// instead of deadlocking against a full manager mailbox.
     async fn mainloop(mut self) {
         let mut teardown = Teardown::ManagerInitiated;
+        let _clear_slot = ClearSlotOnExit(Arc::clone(&self.host_slot));
+        self.publish_host();
         while let Some((msg, caller)) = self.receiver.recv().await {
             // Opened now, a child of the sender's ids (see
             // `traced::Receiver::recv`), so compose, graph resolution and
@@ -1976,6 +2007,7 @@ impl Session {
                 teardown = t;
                 break;
             }
+            self.publish_host();
         }
         if matches!(teardown, Teardown::SelfInitiated) {
             let session_id = *self.record.id();
@@ -2009,29 +2041,6 @@ impl Session {
             SessionMessage::EnsureHost(r, session_hnd, conn_username) => {
                 let _ = r.send(self.ensure_host(session_hnd, conn_username).await);
             }
-            SessionMessage::GetHostAttrs(r) => match &self.inner {
-                SessionInner::Active {
-                    host: Some((h, _)), ..
-                } => {
-                    // Forwarded off-actor for the same reason as
-                    // `GetWorkspaceDelta`: the host loop can be mid-attach or
-                    // mid-teardown, and awaiting it from here parks this
-                    // actor — which the manager awaits in turn, from its own
-                    // mainloop, where a park costs every session RPC.
-                    //
-                    // Bounded *inside* the task: dropping the caller's
-                    // receiver does not cancel a spawned future, so an
-                    // unbounded probe would strand one task per poll against
-                    // a host that never answers.
-                    let h = h.clone();
-                    crate::traced::spawn(async move {
-                        let _ = r.send(probe_host(h.get_attrs()).await);
-                    });
-                }
-                _ => {
-                    let _ = r.send(None);
-                }
-            },
             SessionMessage::GetWorkspaceDelta(r) => match &self.inner {
                 SessionInner::Active {
                     host: Some((h, _)), ..
@@ -2053,7 +2062,7 @@ impl Session {
                     host: Some((h, _)), ..
                 } => {
                     // Off-actor and bounded for the same reasons as
-                    // `GetHostAttrs`.
+                    // `GetWorkspaceDelta`.
                     let h = h.clone();
                     crate::traced::spawn(async move {
                         let _ = r.send(probe_host(h.get_screen()).await);
@@ -2113,6 +2122,10 @@ impl Session {
             },
             SessionMessage::Rename(new_name, r) => {
                 let _ = r.send(self.rename(new_name).await);
+            }
+            #[cfg(test)]
+            SessionMessage::Park(d) => {
+                tokio::time::sleep(d).await;
             }
             SessionMessage::IsBusy(r) => {
                 let _ = r.send(match &self.inner {
@@ -4260,6 +4273,10 @@ impl Session {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
         };
+        // The host is out of the actor's hands now: out of the slot too, so a
+        // handle that outlives a `Stop` reads no host rather than probing the
+        // one being stopped.
+        self.publish_host();
         if let Some((host, mut sops)) = inner {
             for s in sops.drain(..) {
                 s.shutdown().await;
@@ -5060,6 +5077,7 @@ impl Session {
         // Minted for an exec: a command is about to run in this sandbox, so a
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
+        self.publish_host();
         Ok(host)
     }
 
@@ -5143,6 +5161,7 @@ impl Session {
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
+        self.publish_host();
         outcome
     }
 
@@ -5295,6 +5314,7 @@ impl Session {
         // attach may replace this shell rather than inherit its blank `TERM`.
         // See [`HostOrigin::Hooks`].
         self.host_origin = HostOrigin::Hooks;
+        self.publish_host();
         Ok(())
     }
 
@@ -5769,15 +5789,53 @@ impl Session {
     }
 }
 
+/// The host a session actor last published, read by its handle: a listing's
+/// attrs probe goes to the host through this slot rather than through the
+/// actor's mailbox, so an actor that is parked (a `ConfigureLoadout` inside
+/// its package-graph clone, an inline attach) costs the listing nothing, and
+/// a session with no host reads as `None` at once instead of after
+/// [`HOST_PROBE_TIMEOUT`]. The actor refreshes it after every message it
+/// handles ([`Session::publish_host`]).
+pub(crate) type HostSlot = Arc<std::sync::Mutex<Option<AttrsProbe>>>;
+
+/// Empties a [`HostSlot`] when the actor that publishes it ends, however it
+/// ends: a teardown's `break` (which publishes nothing after it), or a panic
+/// unwinding the actor's task. A listing then reads no host for an actor
+/// that is gone, and the slot holds no sender that would keep the host's
+/// mailbox open.
+struct ClearSlotOnExit(HostSlot);
+
+impl Drop for ClearSlotOnExit {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// What the [`HostSlot`] hands out: a host's attrs, and nothing else. The
+/// slot is read by every holder of a [`SessionHandle`], so it carries no
+/// way to kill, attach to or rename the host: those stay with the actor,
+/// which serializes them and checks an attach before binding a channel.
+#[derive(Debug, Clone)]
+pub(crate) struct AttrsProbe(crate::session_host::HostHandle);
+
+impl AttrsProbe {
+    async fn get_attrs(&self) -> Result<HostAttrs, ()> {
+        self.0.get_attrs().await
+    }
+}
+
 /// The handle to the session.
 #[derive(Debug, Clone)]
-pub struct SessionHandle(crate::traced::Sender<SessionMessage>);
+pub struct SessionHandle(crate::traced::Sender<SessionMessage>, HostSlot);
 
 impl SessionHandle {
     /// Returns a non-owning handle to this session.
     #[must_use]
     pub fn downgrade(&self) -> WeakSessionHandle {
-        WeakSessionHandle(self.0.downgrade())
+        WeakSessionHandle(self.0.downgrade(), Arc::clone(&self.1))
     }
 
     /// The session's composition, if it has one. See
@@ -5947,14 +6005,41 @@ impl SessionHandle {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
     }
-    /// Returns the host attributes of the running session, if any. A dead
-    /// actor (self-terminated or mid-teardown) reads as `None` rather than a
-    /// panic — the manager polls this while actors come and go.
+    /// Returns the host attributes of the running session, if any: `None`
+    /// for a session without a host, a dead host, or a host that misses
+    /// [`HOST_PROBE_TIMEOUT`]. Read through the host slot, not the actor's
+    /// mailbox (see [`HostSlot`]): the manager polls this for every running
+    /// session on each listing, and an actor parked in a long message held
+    /// every `min ls` for the probe's full deadline (710d: 2 s per call
+    /// through a stalled clone, on every distro).
     pub async fn get_attrs(&self) -> Option<HostAttrs> {
-        let (send, recv) = oneshot::channel();
-        // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetHostAttrs(send)).await;
-        recv.await.ok().flatten()
+        let host = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        probe_host(host?.get_attrs()).await
+    }
+
+    /// Test-only: puts `host` in the slot a listing reads, as the actor does
+    /// after a message; the actor's next message overwrites it.
+    #[cfg(test)]
+    pub(crate) fn put_host_for_test(&self, host: crate::session_host::HostHandle) {
+        *self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AttrsProbe(host));
+    }
+
+    /// Test-only: parks the actor for `d`, the shape of a message that holds
+    /// its mailbox (a clone inside `ConfigureLoadout`, an inline attach).
+    #[cfg(test)]
+    pub(crate) async fn park_for(&self, d: std::time::Duration) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a gone actor cannot be parked, and the test's assertion says so"
+        )]
+        let _ = self.0.send(SessionMessage::Park(d)).await;
     }
 
     /// Returns the workspace's at-risk report (what a destroy would lose),
@@ -6425,14 +6510,14 @@ impl SessionHandle {
 
 /// A non-owning handle to the [`Session`] actor.
 #[derive(Debug, Clone)]
-pub struct WeakSessionHandle(crate::traced::WeakSender<SessionMessage>);
+pub struct WeakSessionHandle(crate::traced::WeakSender<SessionMessage>, HostSlot);
 
 impl WeakSessionHandle {
     /// Promotes to a strong [`SessionHandle`], or `None` if the session actor
     /// has already shut down (all strong senders dropped).
     #[must_use]
     pub fn upgrade(&self) -> Option<SessionHandle> {
-        Some(SessionHandle(self.0.upgrade()?))
+        Some(SessionHandle(self.0.upgrade()?, Arc::clone(&self.1)))
     }
 
     /// A dangling handle whose actor is already gone (`upgrade` always yields
@@ -6445,7 +6530,7 @@ impl WeakSessionHandle {
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
-        Self(weak)
+        Self(weak, HostSlot::default())
     }
 
     /// A handle to a stand-in "actor" that answers each expose request with
@@ -6483,7 +6568,7 @@ impl WeakSessionHandle {
                 }
             }
         });
-        Self(weak)
+        Self(weak, HostSlot::default())
     }
 }
 

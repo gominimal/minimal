@@ -2809,6 +2809,97 @@ pub(crate) mod tests {
         .expect("the destroy never claimed the session");
     }
 
+    /// A listing must not wait on a session actor: its attrs come from the
+    /// host the actor last published, not from the actor's mailbox. With an
+    /// actor parked (a clone inside `ConfigureLoadout`, an inline attach),
+    /// `list` answered only after `HOST_PROBE_TIMEOUT` for that session —
+    /// 2 s per `min ls` through the whole of a stalled activation (710d).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_does_not_wait_on_a_parked_actor() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        handle.park_for(std::time::Duration::from_secs(3)).await;
+        // Let the actor take the park before measuring.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+            .await
+            .expect("`list` waited on the parked actor")
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].attrs.is_none(), "no host, so no attrs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the listing took {:?}",
+            started.elapsed()
+        );
+        drop(handle);
+    }
+
+    /// The slot path with a live host, the 710d case itself: an actor parked
+    /// in a long message still has its host's attrs listed, at once, read
+    /// through the slot and not the actor's mailbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_actors_live_host_is_still_listed() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        handle.park_for(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Published while the actor is parked, as a host it had before
+        // would be.
+        handle.put_host_for_test(crate::session_host::HostHandle::answering_attrs());
+        let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+            .await
+            .expect("`list` waited on the parked actor")
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].attrs.is_some(),
+            "the live host's attrs come through the slot while the actor is parked"
+        );
+        drop(handle);
+    }
+
+    /// The slot is emptied when the actor ends, so a handle that outlives
+    /// it reads no host, and holds no sender to one. The destroy's message
+    /// ends the actor with a `break`, after which nothing is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ended_actors_slot_is_emptied() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+        handle.put_host_for_test(crate::session_host::HostHandle::answering_attrs());
+        assert!(
+            handle.get_attrs().await.is_some(),
+            "the slot serves the host it holds"
+        );
+        mngr.delete_session(id).await.unwrap();
+        // The destroy replies just before the actor's loop ends.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.get_attrs().await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ended actor's slot still served a host");
+    }
+
     /// Destroying an unknown ID is a `NotFound` error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_unknown_id_errors() {
