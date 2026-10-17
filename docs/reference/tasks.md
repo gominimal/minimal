@@ -89,10 +89,13 @@ exec = 'curl -s -o /dev/null -w "%{http_code}" https://example.com'
 exec = 'curl -s -o /dev/null -w "%{"%"}{http_code}" https://example.com'
 ```
 
-Substituted argument values are quoted for the action they land in, so a
-value never runs as shell code or splits into extra words. In a single `exec`
-string each `%{name}` becomes exactly one argument, whatever spaces, quotes,
-or metacharacters the value holds:
+Argument values are data. What reaches the program depends on the action.
+
+Minimal splits an `exec` string into words before it fills in any value, and
+no shell runs the result. Each string value lands inside the one word that
+holds its reference. This holds whatever spaces, quotes, or shell syntax the
+value contains. It also holds whether the reference is bare, in single quotes,
+or in double quotes:
 
 ```toml
 [tasks.deploy]
@@ -100,11 +103,35 @@ args.environment = "string"
 exec = "runner --environment=%{environment} apply"
 ```
 
-`--environment "stage; rm -rf /"` reaches the runner as the single argument
-`stage; rm -rf /`. In a `bash` script, reference values inside double quotes
-— `"echo \"Hello %{name}!\""` — and the value arrives intact even when it
-contains quotes or `$(...)`. `echo`, list-form `exec`, and `cmd` actions pass
-values to their runner directly, without a shell.
+Passing `--environment "stage; rm -rf /"` runs `runner` with the two
+arguments `--environment=stage; rm -rf /` and `apply`.
+
+Minimal never pastes a string value into a `bash` script. Instead, it sets
+each argument `name` in the script's environment as `MIN_ARG_<NAME>`. In that
+variable name, the argument name is in upper case, and `_` replaces every
+character other than a letter or digit. A reference `%{name}` to a string
+argument becomes `${MIN_ARG_NAME}` in the script. The shell expands it as a
+variable and never runs the value. Quote it as you quote any shell variable:
+
+```toml
+[tasks.greet]
+args.name = "string"
+bash = "echo \"Hello %{name}!\""  # same as: echo "Hello $MIN_ARG_NAME!"
+```
+
+- Inside double quotes, the value arrives whole.
+- Outside quotes, the shell splits the value into words and expands
+  wildcards in it, as it does for any unquoted variable.
+- Inside single quotes, the shell prints the reference itself, such as
+  `${MIN_ARG_NAME}`, not the value.
+
+An array argument `files` sets `MIN_ARG_FILES_COUNT` to its length and
+`MIN_ARG_FILES_0`, `MIN_ARG_FILES_1`, and so on to its elements. Number and
+boolean values appear in the script as their text. Argument names that map to
+the same variable, such as `a-b` and `a_b`, are an error.
+
+`echo` and list-form `exec` actions take each value as it is. Neither one
+runs a shell.
 
 
 ### `description` - Describe the task

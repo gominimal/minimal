@@ -11,6 +11,7 @@ publish.workspace = true
 anyhow.workspace = true
 check.workspace = true
 codespan-reporting.workspace = true
+shlex.workspace = true
 google-cloud-auth.workspace = true
 google-cloud-storage.workspace = true
 thiserror.workspace = true
