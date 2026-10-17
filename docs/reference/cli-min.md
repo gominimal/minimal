@@ -624,8 +624,10 @@ or a classifier tree installed another way stays, with a note. It also removes t
 service and its program copy, the resolver hook, and on macOS the local range
 unit. On macOS the program copy is the app bundle, and `--undo` also removes
 the bare program and the range script that an earlier release installed.
-On macOS the local range addresses come off the loopback too, and the
-resolver file's directory is removed when it holds nothing else.
+On macOS the local range addresses come off the loopback too, and `--undo`
+removes the resolver file's directory when it holds nothing else. While a VM
+is running, the addresses stay and a note says so: run `min stop`, then
+`--undo` again.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
 
