@@ -34,6 +34,18 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 mod helpers;
+
+/// How many sessions may run their `on_destroy` hooks at once, daemon-wide.
+/// A destroy used to run on the session manager's loop, one at a time; off
+/// it (inbox#710) nothing else bounds how many sandboxed hook runs a caller
+/// that destroys many sessions at once can drive. Past this a destroy waits
+/// for a slot, its session still in the manager's tearing-down set.
+const DESTROY_HOOK_RUNS_MAX: usize = 4;
+
+/// The slots [`DESTROY_HOOK_RUNS_MAX`] counts.
+static DESTROY_HOOK_RUNS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(DESTROY_HOOK_RUNS_MAX);
+
 // The per-message span names: a file of its own, because the daemon's refusal guard scans this
 // file's string literals for RPC names (crates/minimal/src/tests.rs) and span names are not refusals.
 mod kind;
@@ -2169,6 +2181,14 @@ impl Session {
                 // shell has already gone. Failures are reported back to the
                 // destroying client, never obeyed: a session must stay
                 // destroyable whatever its hooks do.
+                //
+                // A slot of [`DESTROY_HOOK_RUNS`] is held across the hook run
+                // only, and only when there are hooks to run.
+                let hook_slot = if self.has_hooks_for(crate::hooks::HookEvent::Destroy) {
+                    DESTROY_HOOK_RUNS.acquire().await.ok()
+                } else {
+                    None
+                };
                 let hook_failures: Vec<String> = self
                     .run_hooks_headless(crate::hooks::HookEvent::Destroy)
                     .await
@@ -2183,6 +2203,7 @@ impl Session {
                         line
                     })
                     .collect();
+                drop(hook_slot);
                 self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable

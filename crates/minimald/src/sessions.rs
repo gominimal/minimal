@@ -1619,6 +1619,18 @@ impl Manager {
                             let actor = match (claimed, seed) {
                                 (Some(hnd), _) => Some(hnd),
                                 (None, Some(seed)) => match Session::run(seed).await {
+                                    // The check above ran before the bring-up;
+                                    // a shutdown that began during it stops the
+                                    // fresh actor as it stops a live one, and
+                                    // the destroy is refused before its hooks
+                                    // would mint a sandbox.
+                                    Ok(hnd) if in_shutdown.is_cancelled() => {
+                                        hnd.stop().await;
+                                        return Err(SessionsError::new(
+                                            std::io::ErrorKind::ConnectionRefused,
+                                            "in shutdown",
+                                        ));
+                                    }
                                     Ok(hnd) => Some(hnd),
                                     // A record the actor refuses to come up on — a
                                     // restart-orphaned `Materializing` one is the
