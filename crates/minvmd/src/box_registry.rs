@@ -143,6 +143,19 @@ pub const NET_138_WITHDRAWAL_BOUND: Duration = Duration::from_secs(60);
 /// How often the drainer looks for detached rows whose grace has passed.
 pub const DETACH_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a row's name stays in the zone after the drainer withdrew the
+/// row at its detach-expiry bound, answering NODATA with no row behind it
+/// ([`BoxRegistry::withdraw_expired_detached`]). macOS's resolver caches an
+/// NXDOMAIN for the whole name well past the SOA negative TTL the answer
+/// carries, so a box that comes back after a VM restart stays unresolvable
+/// on the host for as long as that cache holds; a NODATA answer is cached
+/// per type at that TTL, so the name goes stale for seconds, not minutes.
+/// The bound is [`RESUME_ATTACH_BOUND`]'s: the same VM-cold-boot estimate
+/// that bounds a resume, covering a box that comes back from a restart.
+/// An explicit withdrawal or destroy clears it, keeping NET-012's
+/// destroyed-box NXDOMAIN immediate.
+pub const WITHDRAWN_NAME_GRACE: Duration = RESUME_ATTACH_BOUND;
+
 const _: () = assert!(
     DETACH_GRACE.as_secs() + DETACH_SWEEP_INTERVAL.as_secs() < NET_138_WITHDRAWAL_BOUND.as_secs(),
     "a detached row must be withdrawn inside NET-138's 60 s bound"
@@ -2784,6 +2797,15 @@ pub struct BoxRegistry {
     /// of [`Self::held_names`], so a hold that re-confirms a name and the
     /// expiry that would drop it never interleave.
     unconfirmed_holds: Arc<Mutex<BTreeMap<String, Instant>>>,
+    /// The names of rows this daemon withdrew at their detach-expiry bound,
+    /// each with when the withdrawal happened: held in the zone NODATA for
+    /// [`WITHDRAWN_NAME_GRACE`] ([`Self::zone_view`]), because the host
+    /// resolver caches an NXDOMAIN name-wide for minutes while a NODATA
+    /// answer ages out at the zone's negative TTL. Keyed by the name's
+    /// [`canonical_box_name`] form and shared by every clone; an explicit
+    /// withdrawal or destroy clears a name from here, keeping the
+    /// destroyed-box NXDOMAIN (NET-012) immediate.
+    withdrawn_names: Arc<Mutex<BTreeMap<String, Instant>>>,
     /// The table's change pings: one `()` to every live subscriber whenever
     /// a row lands, goes, or is marked stopped. The host answerer
     /// ([`crate::net::answerer`]) subscribes — a daemon that does not hold
@@ -2900,6 +2922,7 @@ impl Clone for BoxRegistry {
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
             unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
+            withdrawn_names: Arc::clone(&self.withdrawn_names),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
@@ -2940,6 +2963,7 @@ impl BoxRegistry {
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
+            withdrawn_names: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
@@ -3773,7 +3797,7 @@ impl BoxRegistry {
     pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
         // The box's end is observed here, so the withdrawal's own line
         // measures itself against this instant (NET-133's bound).
-        self.withdraw_where(switch_addr, |_, _| Some(Instant::now()))
+        self.withdraw_where(switch_addr, |_, _| Some(Instant::now()), false)
     }
 
     /// Withdraws the row at `switch_addr` when `ended_at` says its box
@@ -3785,10 +3809,20 @@ impl BoxRegistry {
     /// the row's creation, when it is a client box's, goes dormant
     /// ([`Creation`]) and is persisted; and the switch address returns to
     /// the hand-out book, quarantined when the row was ever attributed.
+    ///
+    /// When `retain_name_grace` is set and the row was not a task row's,
+    /// its name enters the withdrawn-name grace
+    /// ([`WITHDRAWN_NAME_GRACE`]) before the withdrawal is announced
+    /// ([`Self::retired`]), so every subscriber that folds on that ping
+    /// finds the name already held NODATA rather than a window that
+    /// answers NXDOMAIN; otherwise a standing grace entry for the row's
+    /// name is cleared and its end announced, keeping the explicit
+    /// withdrawal's NXDOMAIN (NET-012) immediate.
     fn withdraw_where(
         &self,
         switch_addr: Ipv4Addr,
         ended_at: impl FnOnce(&Rows, &BoxRecord) -> Option<Instant>,
+        retain_name_grace: bool,
     ) -> Option<Arc<BoxRecord>> {
         let mut rows = self
             .rows
@@ -3810,6 +3844,12 @@ impl BoxRegistry {
             .as_deref()
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
+        // The grace change is published by the same ping that announces the
+        // row's end: a subscriber folding on it sees the name held NODATA
+        // the moment the row is gone, never an NXDOMAIN window in between.
+        if let Some(record) = removed.as_deref().filter(|record| !record.is_task_row()) {
+            self.retain_or_clear_withdrawn_name(record.name(), retain_name_grace);
+        }
         self.retired(&removed, withdrawal);
         // A dormant creation keeps its switch and task addresses reserved
         // ([`Creation`]): only a row no creation is kept for returns them.
@@ -4279,6 +4319,12 @@ impl BoxRegistry {
                 self.give_back_creation_addrs(creation);
                 self.persist();
             }
+            // This is an explicit withdrawal: whatever grace the name
+            // carried ends here (NET-012), and no row's end announces it,
+            // so the clear publishes its own ping.
+            if self.retain_or_clear_withdrawn_name(name, false) {
+                self.ping();
+            }
             return Ok(None);
         };
         if canonical_box_name(record.name()) != canonical_box_name(name) {
@@ -4333,6 +4379,10 @@ impl BoxRegistry {
             .as_deref()
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
+        // The creator withdrew its box: an explicit withdrawal, so the
+        // name's grace ends with the row (NET-012), published by the same
+        // ping that announces the row's end.
+        self.retain_or_clear_withdrawn_name(name, false);
         self.retired(&removed, withdrawal);
         self.retire_task_rows(task_rows, true);
         if let Some(record) = &removed {
@@ -4420,14 +4470,19 @@ impl BoxRegistry {
     /// or its resume bound has run out, and the drainer's next sweep
     /// withdraws it ([`Self::withdraw_expired_detached`]) — so a resume
     /// racing that sweep reinstates the row rather than answering with one
-    /// about to go.
+    /// about to go. The row's name keeps its withdrawn-name grace: this is
+    /// the detach-expiry end, not an explicit withdrawal.
     fn withdraw_if_past_its_bound(&self, creation: &Creation) {
         let now = self.now();
-        self.withdraw_where(creation.switch_address, |rows, record| {
-            (record.box_id == creation.id())
-                .then(|| record.past_its_bound(rows, now))
-                .flatten()
-        });
+        self.withdraw_where(
+            creation.switch_address,
+            |rows, record| {
+                (record.box_id == creation.id())
+                    .then(|| record.past_its_bound(rows, now))
+                    .flatten()
+            },
+            true,
+        );
     }
 
     /// Gives a creator its box's row back (NET-138): the row its creator
@@ -4595,7 +4650,11 @@ impl BoxRegistry {
     /// returns them: the same withdrawal the drainer always made, at the
     /// bound's end rather than at the relay's ([`Self::withdraw_where`]).
     /// Each row's bound is decided again under the write of the row lock it
-    /// leaves under, so a row a relay carried since the scan stays.
+    /// leaves under, so a row a relay carried since the scan stays. Each
+    /// withdrawn row's name enters the withdrawn-name grace
+    /// ([`WITHDRAWN_NAME_GRACE`]): the box may be restarting, and its name
+    /// answers NODATA rather than an NXDOMAIN the host resolver would
+    /// cache name-wide for minutes.
     fn withdraw_expired_detached(&self) -> Vec<Arc<BoxRecord>> {
         let now = self.now();
         let rows = self
@@ -4611,7 +4670,7 @@ impl BoxRegistry {
         expired
             .into_iter()
             .filter_map(|addr| {
-                self.withdraw_where(addr, |rows, record| record.past_its_bound(rows, now))
+                self.withdraw_where(addr, |rows, record| record.past_its_bound(rows, now), true)
             })
             .collect()
     }
@@ -5045,6 +5104,44 @@ impl BoxRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Records or clears a row's withdrawn-name grace
+    /// ([`WITHDRAWN_NAME_GRACE`]) as its withdrawal asks: `retain` holds
+    /// `name` in the zone NODATA for the bound, and clearing it ends the
+    /// hold at once. Returns whether the map changed — the caller's ping
+    /// is decided by the row's end, so this is a fact the caller that
+    /// clears outside a withdrawal publishes itself.
+    fn retain_or_clear_withdrawn_name(&self, name: &str, retain: bool) -> bool {
+        let key = canonical_box_name(name);
+        let mut withdrawn = self
+            .withdrawn_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retain {
+            withdrawn.insert(key, self.now());
+            true
+        } else {
+            withdrawn.remove(&key).is_some()
+        }
+    }
+
+    /// Drops every withdrawn-name grace whose [`WITHDRAWN_NAME_GRACE`] has
+    /// passed, and returns how many it dropped. The fold in
+    /// [`Self::zone_view`] already expires each name at its bound, so this
+    /// reclaims the map's memory and nothing observable changes; the
+    /// answer the name gives is the same the instant the view says so.
+    /// Run on the withdrawal drainer's sweep
+    /// ([`Self::spawn_withdrawal_drainer`]).
+    fn expire_withdrawn_names(&self) -> usize {
+        let now = self.now();
+        let mut withdrawn = self
+            .withdrawn_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = withdrawn.len();
+        withdrawn.retain(|_, since| now.saturating_duration_since(*since) < WITHDRAWN_NAME_GRACE);
+        before - withdrawn.len()
+    }
+
     /// Subscribes to the table's change pings: one `()` per registration,
     /// withdrawal, and stopped mark, for as long as the returned receiver
     /// lives. The host answerer subscribes — a daemon that does not hold
@@ -5100,6 +5197,13 @@ impl BoxRegistry {
     /// the `host_ip` interim) fold in after the rows as address-less
     /// entries: a name a row publishes is the row's, and a name only
     /// held answers NODATA.
+    ///
+    /// The names of rows withdrawn at their detach-expiry bound
+    /// ([`WITHDRAWN_NAME_GRACE`]) fold in after them the same way, with
+    /// `live: false`: the box's namespace is not running, so the name
+    /// answers NODATA rather than an NXDOMAIN the host's resolver would
+    /// cache name-wide for minutes — a box that comes back from a VM
+    /// restart stays resolvable through the window.
     #[must_use]
     pub fn zone_view(&self) -> zone_answer::ZoneView {
         // The rows lock first, the stopped set inside it — the order every
@@ -5142,6 +5246,31 @@ impl BoxRegistry {
                     zone_answer::ZoneRow {
                         address: None,
                         live: true,
+                    },
+                );
+            }
+        }
+        drop(held_names);
+        // Withdrawn names fold in last: a name a row or a hold publishes
+        // keeps its entry — the grace never shadows a box that came back or
+        // a name a session holds — and a name only the grace keeps answers
+        // NODATA for its window. The expiry is decided here, so a view
+        // never carries a name whose grace has passed, sweep or no sweep.
+        let withdrawn_names = self
+            .withdrawn_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.now();
+        for name in withdrawn_names.keys().filter(|&name| {
+            now.saturating_duration_since(withdrawn_names[name]) < WITHDRAWN_NAME_GRACE
+        }) {
+            let zone_name = zone_name(name);
+            if view.rows().find(|(held, _)| *held == zone_name).is_none() {
+                view.hold(
+                    zone_name,
+                    zone_answer::ZoneRow {
+                        address: None,
+                        live: false,
                     },
                 );
             }
@@ -5277,6 +5406,7 @@ impl BoxRegistry {
                         });
                     }
                     registry.expire_unconfirmed_holds();
+                    registry.expire_withdrawn_names();
                 }
             });
         if let Err(error) = spawned {
@@ -8651,6 +8781,154 @@ mod tests {
             boxes::core::zone_answer::decide(&a, &registry.zone_view()),
             boxes::core::zone_answer::Verdict::Nxdomain,
             "a withdrawn namespace's name is held by nothing"
+        );
+    }
+
+    /// NET-128: a box's row withdrawn at its detachment bound — the
+    /// VM-restart gap, not a creator's destroy — keeps its name in the
+    /// zone answering NODATA for a bounded grace, because the host
+    /// resolver caches an NXDOMAIN name-wide, past the SOA negative TTL.
+    /// An explicit withdrawal clears the grace, keeping NET-012's
+    /// destroyed-box NXDOMAIN immediate.
+    #[test]
+    fn the_zone_view_holds_a_withdrawn_name_nodata_for_its_grace() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        let a = boxes::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
+        };
+
+        // The detachment bound ends the row: the grace holds the name
+        // in-zone, address-less — the box exists, no address to tell.
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            !registry.withdraw_expired_detached().is_empty(),
+            "the row is gone"
+        );
+        let view = registry.zone_view();
+        assert_eq!(
+            view.rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row),
+            Some(zone_answer::ZoneRow {
+                address: None,
+                live: false,
+            }),
+            "a withdrawn name is held for its grace, live: false"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
+            "a name in its grace answers NODATA, not NXDOMAIN"
+        );
+
+        // The grace ages out at its bound: the name is gone with it, and
+        // the answer is the pre-box NXDOMAIN again.
+        registry.advance_clock(WITHDRAWN_NAME_GRACE);
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
+            "a grace past its bound holds nothing"
+        );
+    }
+
+    /// NET-012: a creator's destroy is an explicit withdrawal — it ends
+    /// a standing grace at once, so the destroyed box's NXDOMAIN is
+    /// immediate, grace or not.
+    #[test]
+    fn a_destroy_clears_a_withdrawn_names_grace_at_once() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        let a = boxes::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
+        };
+
+        // A grace standing from the row's detachment bound.
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            !registry.withdraw_expired_detached().is_empty(),
+            "the row is gone"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nodata,
+            "the grace holds the name first"
+        );
+
+        // The creator's destroy of a row the bound already took is the
+        // no-row path: it clears the standing grace all the same.
+        assert!(
+            registry
+                .withdraw_client_box(
+                    "web",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id())
+                )
+                .expect("the creator's own pair")
+                .is_none(),
+            "the row is gone; the destroy ends what stands"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
+            "a destroyed box's name is held by nothing, grace or not"
+        );
+    }
+
+    /// A box that comes back within its grace re-registers its row, and
+    /// the row wins: the grace never shadows a live answer.
+    #[test]
+    fn a_row_returning_within_its_grace_answers_its_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        let a = boxes::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
+        };
+
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            !registry.withdraw_expired_detached().is_empty(),
+            "the row is gone"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nodata,
+            "the grace holds the name first"
+        );
+
+        // The box re-registers its name while the grace stands: the new
+        // row answers its address, never the grace's NODATA.
+        registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "a name with a row behind it answers the row's address"
         );
     }
 
