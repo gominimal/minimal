@@ -89,6 +89,23 @@ exec = 'curl -s -o /dev/null -w "%{http_code}" https://example.com'
 exec = 'curl -s -o /dev/null -w "%{"%"}{http_code}" https://example.com'
 ```
 
+Substituted argument values are quoted for the action they land in, so a
+value never runs as shell code or splits into extra words. In a single `exec`
+string each `%{name}` becomes exactly one argument, whatever spaces, quotes,
+or metacharacters the value holds:
+
+```toml
+[tasks.deploy]
+args.environment = "string"
+exec = "runner --environment=%{environment} apply"
+```
+
+`--environment "stage; rm -rf /"` reaches the runner as the single argument
+`stage; rm -rf /`. In a `bash` script, reference values inside double quotes
+— `"echo \"Hello %{name}!\""` — and the value arrives intact even when it
+contains quotes or `$(...)`. `echo`, list-form `exec`, and `cmd` actions pass
+values to their runner directly, without a shell.
+
 
 ### `description` - Describe the task
 

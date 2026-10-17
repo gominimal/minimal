@@ -638,6 +638,14 @@ pub struct EnvArgs<'a> {
 /// the task's parameters — `task_packages` plus any `parsed_args` — so that
 /// `%{name}`-style placeholders are resolved.
 ///
+/// Argument values are spliced safely for the action they land in: an
+/// `exec` single string is shlex-split after interpolation, so each
+/// reference becomes exactly one argv entry (values are shell-quoted
+/// against the split); a `bash` script is run through the shell, so values
+/// are escaped for a double-quoted context. `echo`, multi-entry `exec`, and
+/// command-capture actions pass values to their runner verbatim, without a
+/// shell, so they need no quoting.
+///
 /// Shared by the invocation path ([`Env::task_invocations`]) and the
 /// sandbox-free `echo` short-circuits, so an echoed string is interpolated
 /// the same way an `exec`/`bash` action would be.
@@ -655,12 +663,20 @@ pub fn interpolate_task_strings(
         ),
     )]
     .into_iter();
-    let var_ctx = if let Some(args) = parsed_args {
-        common::ncl_eval::VarCtx::from_iter(
-            base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
-        )
-    } else {
-        common::ncl_eval::VarCtx::from_iter(base)
+    let args = parsed_args
+        .map(|args| args.iter().map(|(k, v)| (k.as_str(), v.clone())))
+        .into_iter()
+        .flatten();
+    let var_ctx = match &task.action {
+        mfile::TaskAction::Exec(mfile::StrOrList::Single(_)) => {
+            common::ncl_eval::VarCtx::from_iter(
+                base.chain(args.map(|(k, v)| (k, quote_for_shlex(v)))),
+            )
+        }
+        mfile::TaskAction::Bash(_) => common::ncl_eval::VarCtx::from_iter(
+            base.chain(args.map(|(k, v)| (k, escape_for_dquote(v)))),
+        ),
+        _ => common::ncl_eval::VarCtx::from_iter(base.chain(args)),
     };
     task.map_exec_strings(|s| {
         var_ctx.eval_string(s).map_err(|_| {
@@ -678,6 +694,57 @@ pub fn interpolate_task_strings(
         })
     })
     .map_err(Error::Other)
+}
+
+/// Quotes an argument value so that, once spliced into an `exec` single
+/// string and shlex-split by [`mfile::Task::exec_and_args`], it yields
+/// exactly one argv entry with the original value — whatever spaces,
+/// quotes, or shell metacharacters it contains.
+fn quote_for_shlex(arg: args::Arg) -> args::Arg {
+    let quote_str = |s: String| format!("'{}'", s.replace('\'', "'\\''"));
+    match arg {
+        args::Arg::Scalar(args::ScalarArg::String(s)) => {
+            args::Arg::Scalar(args::ScalarArg::String(quote_str(s)))
+        }
+        args::Arg::Array(items) => args::Arg::Array(
+            items
+                .into_iter()
+                .map(|item| match item {
+                    args::ScalarArg::String(s) => args::ScalarArg::String(quote_str(s)),
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Escapes an argument value for a double-quoted context in a `bash`
+/// script: spliced inside `"... %{name} ..."` it can neither terminate the
+/// quoted region nor expand `$(...)`/backticks, while remaining the same
+/// text outside quotes.
+fn escape_for_dquote(arg: args::Arg) -> args::Arg {
+    let escape_str = |s: String| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+    };
+    match arg {
+        args::Arg::Scalar(args::ScalarArg::String(s)) => {
+            args::Arg::Scalar(args::ScalarArg::String(escape_str(s)))
+        }
+        args::Arg::Array(items) => args::Arg::Array(
+            items
+                .into_iter()
+                .map(|item| match item {
+                    args::ScalarArg::String(s) => args::ScalarArg::String(escape_str(s)),
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Names whoever put a patch path into the environment: the package that
@@ -1431,13 +1498,80 @@ mod tests {
         .unwrap();
         let task = mf.task("useparam").unwrap();
 
-        for (argv, want) in [("", "echo hi"), ("--greeting bye", "echo bye")] {
+        for (argv, want) in [("", "echo 'hi'"), ("--greeting bye", "echo 'bye'")] {
             let parsed = task.args.parse(argv).unwrap();
             let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
             let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
                 panic!("expected a single exec string");
             };
             assert_eq!(cmd, want, "argv `{argv}`");
+        }
+    }
+
+    /// Hostile argument values must not run as shell code when spliced into
+    /// a single `exec` string: each `%{name}` reference must contribute
+    /// exactly one argv entry after `exec_and_args` shlex-splits the
+    /// interpolated string — never extra words, never metacharacters
+    /// re-interpreted by a shell.
+    #[test]
+    fn interpolate_quotes_exec_args_against_shell_metacharacters() {
+        let schema: args::ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+        for hostile in [
+            "harmless",
+            "two words",
+            "x; rm -rf /",
+            "$(touch /tmp/pwned)",
+            "it's \"quoted\"",
+            "",
+        ] {
+            let task = mfile::Task {
+                action: mfile::TaskAction::exec_from_str("runner --name=%{name} run"),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            let parsed = task
+                .args
+                .parse_argv_named("task", vec!["--name", hostile])
+                .unwrap();
+            let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+            let (_exec, argv) = resolved.exec_and_args().unwrap();
+            assert_eq!(
+                argv,
+                [format!("--name={hostile}"), "run".to_string()],
+                "one argv entry per reference, for value {hostile:?}"
+            );
+        }
+    }
+
+    /// Hostile argument values must not break out of a `bash` action's
+    /// quoting: spliced values may not terminate a quoted region, run
+    /// commands, or expand `$(...)`. The documented `echo "Hello %{name}!"`
+    /// pattern keeps its exact output for both friendly and hostile values.
+    #[test]
+    fn interpolate_escapes_bash_args_inside_double_quotes() {
+        let schema: args::ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+        for (value, want) in [
+            ("World", "echo \"Hello World!\""),
+            (
+                "x\"; touch /tmp/pwned; echo \"",
+                "echo \"Hello x\\\"; touch /tmp/pwned; echo \\\"!\"",
+            ),
+            ("$(reboot)", "echo \"Hello \\$(reboot)!\""),
+        ] {
+            let task = mfile::Task {
+                action: mfile::TaskAction::Bash("echo \"Hello %{name}!\"".to_string()),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            let parsed = task
+                .args
+                .parse_argv_named("task", vec!["--name", value])
+                .unwrap();
+            let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+            let mfile::TaskAction::Bash(cmd) = resolved.action else {
+                panic!("expected a bash action");
+            };
+            assert_eq!(cmd, want, "for value {value:?}");
         }
     }
 
