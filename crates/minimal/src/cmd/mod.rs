@@ -757,16 +757,48 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
 /// back to `cmd_activate`.
-pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id: boxes::SessionId) {
+///
+/// With `only_if_unfinalized` (the cleanup after an activation the client
+/// gave up on) the daemon keeps a session that finished after all
+/// (inbox#690), and the answer says which it did. Only a confirmed destroy
+/// is [`CleanupOutcome::Destroyed`]: an error or a timeout is
+/// [`CleanupOutcome::Unknown`], since the session may still be live.
+pub(crate) async fn best_effort_destroy(
+    client: &mut client::Client,
+    session_id: boxes::SessionId,
+    only_if_unfinalized: bool,
+) -> minimal_client::box_registration::CleanupOutcome {
+    use minimal_client::box_registration::CleanupOutcome;
     /// Ceiling on how long we let a cleanup RPC run. Chosen well
     /// above a healthy `DestroySession` (single-digit milliseconds
     /// on a UDS) so the timeout only fires against pathologies.
     const DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// A conditional destroy waits in the session's mailbox behind any
+    /// finalize still running, by design, and a stalled fetch can hold that
+    /// finalize for minutes. This gives a finalize that is nearly done time
+    /// to end; past it the outcome is unknown, and is said to be.
+    const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     use minimald_rpc::DestroySession;
-    let call = client
-        .oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest { id: session_id });
-    match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
-        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
+    let ceiling = if only_if_unfinalized {
+        CLEANUP_TIMEOUT
+    } else {
+        DESTROY_TIMEOUT
+    };
+    let call = client.oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest {
+        id: session_id,
+        only_if_unfinalized,
+    });
+    match tokio::time::timeout(ceiling, call).await {
+        Ok(Ok(minimald_rpc::Errorable::Ok(resp))) => {
+            if resp.kept {
+                eprintln!(
+                    "note: the session {session_id} finished activating after this client gave \
+                     up on it, so it was kept: it is live (`min ls`)"
+                );
+                return CleanupOutcome::Kept;
+            }
+            return CleanupOutcome::Destroyed;
+        }
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
@@ -779,14 +811,23 @@ pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id:
                  run `min session destroy {session_id}` to remove it"
             );
         }
+        Err(_) if only_if_unfinalized => {
+            eprintln!(
+                "warning: the daemon did not answer the cleanup of session {session_id} \
+                 within {ceiling:?}: its finalize may still be running, and the session \
+                 may yet become live, so it was left as it is; check `min ls`, and run \
+                 `min session destroy {session_id}` to remove it",
+            );
+        }
         Err(_) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: the \
-                 daemon did not answer within {DESTROY_TIMEOUT:?}; the session may \
+                 daemon did not answer within {ceiling:?}; the session may \
                  still exist; run `min session destroy {session_id}` to remove it",
             );
         }
     }
+    CleanupOutcome::Unknown
 }
 
 /// The stderr line activation prints for a declared port the box yields

@@ -32,8 +32,8 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 // library's, shared with `min dash` so the two front-ends cannot drift.
 pub(crate) use minimal_client::box_registration::withdraw_box_row;
 use minimal_client::box_registration::{
-    BOX_CONTROL_TIMEOUT, control_request_with_vm_host, finalize_holding_lease,
-    register_box_reminting_autogen, resume_box_row,
+    BOX_CONTROL_TIMEOUT, CleanupOutcome, control_request_with_vm_host,
+    register_box_reminting_autogen, resume_box_row, settle_lease_after_cleanup,
 };
 #[cfg(test)]
 use minimal_client::box_registration::{
@@ -1594,39 +1594,53 @@ pub(crate) async fn activate_session(
     // the composer's post-gate check guarantees any duplicates
     // are exact matches (same source), so collapsing is safe.
     minimal_client::dedup_patch_uploads(&mut collected_patches);
-    // The registration's lease is held across the finalize and committed
-    // only once the session is active: until then an activation that dies
-    // leaves the VM host daemon to withdraw the row on the lease's close.
+    // The registration's lease is held across the finalize and, when that
+    // fails, across the cleanup destroy too: only the destroy's answer says
+    // whether a box is live behind the row (inbox#690). Until the lease is
+    // committed, an activation that dies leaves the VM host daemon to
+    // withdraw the row on the lease's close.
     let lease = registered
         .as_mut()
         .and_then(|registration| registration.lease.take());
-    if let Err(e) = finalize_holding_lease(
-        lease,
-        upload_and_finalize(
-            &mut client,
-            id,
-            &collected_patches,
-            &hook_scripts,
-            finalize_hook_budget,
-        ),
+    if let Err(e) = upload_and_finalize(
+        &mut client,
+        id,
+        &collected_patches,
+        &hook_scripts,
+        finalize_hook_budget,
     )
     .await
     {
         // Best-effort teardown: the session is stuck in
         // Materializing on the daemon. Destroy it so the operator's
         // `min ls` doesn't fill with half-finalized sessions, and
-        // withdraw the row the registration bought with it (T66).
-        best_effort_destroy(&mut client, id).await;
-        withdraw_box_row(
-            control_sock.clone(),
-            config.name.as_deref(),
-            config.box_addresses,
-            registered
-                .as_ref()
-                .and_then(|registration| registration.box_id),
-        )
-        .await;
+        // withdraw the row the registration bought with it (T66) —
+        // unless the session finished first and was kept, or may have.
+        let outcome = best_effort_destroy(&mut client, id, true).await;
+        if !settle_lease_after_cleanup(lease, outcome).await {
+            withdraw_box_row(
+                control_sock.clone(),
+                config.name.as_deref(),
+                config.box_addresses,
+                registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
+            )
+            .await;
+        }
+        // A kept session is active: it gets the `host_ip` name hold an
+        // activation that succeeded makes below.
+        if outcome == CleanupOutcome::Kept
+            && kind == paths::ProviderKind::Minvmd
+            && config.network == boxes::NetworkMode::HostNet
+            && let Some(name) = config.name.as_deref()
+        {
+            hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
+        }
         return Err(e);
+    }
+    if let Some(lease) = lease {
+        lease.commit().await;
     }
 
     // The session is `Active` now — a Ctrl-C must no longer tear it down
@@ -3911,7 +3925,10 @@ pub(crate) async fn destroy_session(
     use minimald_rpc::{DestroySession, DestroySessionRequest};
 
     let resp = client
-        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id })
+        .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
         .context("DestroySession RPC failed")?;
 
@@ -7116,7 +7133,10 @@ mod tests {
 
         // The Delete choice destroyed it daemon-side: the name is released.
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7201,7 +7221,10 @@ mod tests {
         // the hold is made for a session that is gone, and released again
         // by its id once the second lookup finds no session.
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7247,7 +7270,10 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id: gone })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id: gone,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7327,7 +7353,10 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -7381,7 +7410,10 @@ mod tests {
         );
 
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}

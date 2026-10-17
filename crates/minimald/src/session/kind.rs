@@ -20,6 +20,7 @@ impl SessionMessage {
             Self::Abort { .. } => "Abort",
             Self::Rename { .. } => "Rename",
             Self::IsBusy { .. } => "IsBusy",
+            Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::Stop { .. } => "Stop",
             Self::Destroy { .. } => "Destroy",
             Self::GetRecord { .. } => "GetRecord",
@@ -46,6 +47,8 @@ impl SessionMessage {
             Self::PeekIngressCells(_) => "PeekIngressCells",
             #[cfg(test)]
             Self::CheckPackagesAtFinalize(..) => "CheckPackagesAtFinalize",
+            #[cfg(test)]
+            Self::HoldUntil(..) => "HoldUntil",
         }
     }
 }
