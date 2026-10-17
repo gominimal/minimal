@@ -1224,7 +1224,7 @@ impl Context {
         let mut did_edit = false;
         match mode {
             AddDepMode::BuildPackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
+                if let Some(h) = doc["stack"].as_table_like_mut() {
                     did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
                     println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
@@ -1234,7 +1234,7 @@ impl Context {
                 }
             }
             AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
+                if let Some(h) = doc["stack"].as_table_like_mut() {
                     did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
                     println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
@@ -1246,7 +1246,7 @@ impl Context {
             AddDepMode::TaskPackages { name } => {
                 if let Some(tasks) = doc.get_mut("tasks")
                     && let Some(t) = tasks.get_mut(&name)
-                    && let Some(t) = t.as_table_mut()
+                    && let Some(t) = t.as_table_like_mut()
                 {
                     did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
                     println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
@@ -1258,7 +1258,7 @@ impl Context {
                 }
             }
             AddDepMode::SessionPackages => {
-                if let Some(h) = doc["session"].as_table_mut() {
+                if let Some(h) = doc["session"].as_table_like_mut() {
                     did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
                 } else {
                     doc.insert(
@@ -1295,7 +1295,7 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(
+fn upsert_toml_packages_list<T: TableLike + ?Sized>(
     t: &mut T,
     key: &str,
     upsert: &[String],
@@ -1757,6 +1757,82 @@ mod tests {
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
         );
+    }
+
+    #[test]
+    fn add_deps_inline_tables() {
+        let state = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let mfile_path = cwd.path().join("minimal.toml");
+        std::fs::write(
+            &mfile_path,
+            format!(
+                indoc! {
+                    "
+                    stack = {{ use = \"fake-stack\", build_packages = [] }}
+                    tasks = {{ something = {{ exec = \"./something\" }} }}
+                    session = {{ packages = [], vars = {{ ANSWER = \"42\" }} }}
+
+                    [upstream]
+                    dir = \"{}\"
+                    "
+                },
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-stack")
+                    .to_str()
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(cwd.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        // Adding to an inline [stack] must keep its sibling keys.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap();
+        let output = String::from_utf8(std::fs::read(&mfile_path).unwrap()).unwrap();
+        assert!(output.contains("build_packages = [\"uroot\"]"));
+        assert!(output.contains("use = \"fake-stack\""));
+
+        // Adding to an inline task must keep its sibling keys.
+        ctx.add_deps(
+            &graph,
+            ["uroot"],
+            AddDepMode::TaskPackages {
+                name: "something".to_string(),
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(std::fs::read(&mfile_path).unwrap()).unwrap();
+        assert!(output.contains("packages = [\"uroot\"]"));
+        assert!(output.contains("exec = \"./something\""));
+
+        // Adding to an inline [session] must not replace the whole table.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
+            .unwrap();
+        let output = String::from_utf8(std::fs::read(&mfile_path).unwrap()).unwrap();
+        assert!(output.contains("ANSWER = \"42\""));
+        assert!(
+            output.contains("packages = [\"uroot\"]"),
+            "session packages lost: {output:?}"
+        );
+
+        // The surviving settings must still parse into the config.
+        let session = ctx.minimal_file().session.clone().unwrap_or_default();
+        assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
+        assert!(session.packages.contains(&"uroot".to_string()));
     }
 
     #[test]
