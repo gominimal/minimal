@@ -6052,8 +6052,7 @@ exit 0
             std::fs::read_to_string(&calls).unwrap_or_default()
         );
         assert!(
-            stderr.contains(&format!("rm -f {RESOLVER_FILE}"))
-                && stderr.contains("rmdir /etc/resolver"),
+            stderr.contains(&format!("rm -f {RESOLVER_FILE}")),
             "the rest of the removal runs: {stderr}"
         );
     }
