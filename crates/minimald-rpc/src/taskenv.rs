@@ -41,6 +41,20 @@ pub const TASK_ENV_PREFIX: &str = "MINIMAL_TASK_ENV_";
 /// task as a variable called `DROP`.
 pub const TASK_ENV_DROP: &str = "MINIMAL_TASK_DROP";
 
+/// Channel env var carrying the declared patch paths the daemon must
+/// *remove* from the task's declarations, as a JSON array — the keys
+/// exactly as `minimal.toml` wrote them, so a removal matches the
+/// declaration it names.
+///
+/// The client gates a task's `patch.dir` / `patch.file` entries against
+/// `[patches]` before the run; the entries the policy ignores cannot be
+/// carried the way a resolved value can (the daemon mounts the declared
+/// path itself), so an ignored entry has to be named for removal.
+///
+/// Deliberately **not** under [`TASK_ENV_PREFIX`], for the same reason as
+/// [`TASK_ENV_DROP`].
+pub const TASK_PATCH_DROP: &str = "MINIMAL_TASK_PATCH_DROP";
+
 /// The channel env var name carrying task variable `name`.
 #[must_use]
 pub fn wire_name(name: &str) -> String {
@@ -86,18 +100,36 @@ pub fn drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<S
         .unwrap_or_default()
 }
 
-/// A task's `env_vars` as the client resolved them: the values to apply,
-/// and the names to remove.
+/// The declared patch paths a client asked the daemon to drop, from a
+/// channel's env map. Same contract as
+/// [`drops_from_channel_env`]: absent, empty, or unparseable removes
+/// nothing, and an older client sends none at all.
+#[must_use]
+pub fn patch_drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<String> {
+    env_vars
+        .get(TASK_PATCH_DROP)
+        .and_then(|raw| serde_json_lenient::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
+/// A task's `env_vars` as the client resolved them, plus the `patch`
+/// entries its policy dropped: the values to apply, and the names to
+/// remove.
 ///
 /// The two halves are disjoint by construction — a name is either resolved
 /// or dropped — and travel together because the daemon needs both to
-/// arrive at the set the task actually sees.
+/// arrive at the set the task actually sees. `patch_drop` is a third,
+/// separate list: declared patch paths, not variable names, removed from
+/// the task's `patch.dir` / `patch.file` maps before they are mounted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskEnv {
     /// Values to apply over the task's own declarations.
     pub set: BTreeMap<String, String>,
     /// Names to remove from the task's declarations entirely.
     pub drop: BTreeSet<String>,
+    /// Declared patch paths to remove from the task's `patch` entries
+    /// entirely — the keys exactly as `minimal.toml` wrote them.
+    pub patch_drop: BTreeSet<String>,
 }
 
 impl TaskEnv {
@@ -106,7 +138,7 @@ impl TaskEnv {
     /// `env_vars`.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty() && self.drop.is_empty()
+        self.set.is_empty() && self.drop.is_empty() && self.patch_drop.is_empty()
     }
 }
 
@@ -280,6 +312,43 @@ mod tests {
     #[test]
     fn the_drop_carrier_is_not_under_the_value_prefix() {
         assert!(!TASK_ENV_DROP.starts_with(TASK_ENV_PREFIX));
+        assert!(!TASK_PATCH_DROP.starts_with(TASK_ENV_PREFIX));
+    }
+
+    /// The patch drop list round-trips, and the paths on it are the raw
+    /// declared keys — `~/`-rooted or otherwise — so a removal matches the
+    /// `minimal.toml` entry it names.
+    #[test]
+    fn patch_drop_list_round_trips() {
+        let drops: BTreeSet<String> = ["~/.claude".to_string(), "/etc/secrets".to_string()]
+            .into_iter()
+            .collect();
+        let mut channel = BTreeMap::new();
+        channel.insert(TASK_PATCH_DROP.to_string(), encode_drops(&drops));
+
+        assert_eq!(patch_drops_from_channel_env(&channel), drops);
+        // The carrier is not itself a task variable.
+        assert!(from_channel_env(&channel).is_empty());
+        // And it is not the env-drop carrier: the two lists stay separate.
+        assert!(drops_from_channel_env(&channel).is_empty());
+    }
+
+    /// No patch drop list, an empty one, and a malformed one all mean
+    /// "remove nothing" — same fail-safe as the env drop list, and an
+    /// older client sends none at all.
+    #[test]
+    fn an_absent_or_unparseable_patch_drop_list_removes_nothing() {
+        let mut absent = BTreeMap::new();
+        absent.insert("MINIMAL_SESSION_ID".to_string(), "an-id".to_string());
+        assert!(patch_drops_from_channel_env(&absent).is_empty());
+
+        let mut empty = BTreeMap::new();
+        empty.insert(TASK_PATCH_DROP.to_string(), encode_drops(&BTreeSet::new()));
+        assert!(patch_drops_from_channel_env(&empty).is_empty());
+
+        let mut junk = BTreeMap::new();
+        junk.insert(TASK_PATCH_DROP.to_string(), "not json".to_string());
+        assert!(patch_drops_from_channel_env(&junk).is_empty());
     }
 
     /// No drop list, an empty one, and a malformed one all mean "remove

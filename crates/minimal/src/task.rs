@@ -289,11 +289,16 @@ fn resolve_task_env(
 #[derive(Default)]
 struct RefuseAndRecord {
     names: std::cell::RefCell<Vec<String>>,
+    patch_paths: std::cell::RefCell<Vec<String>>,
 }
 
 impl RefuseAndRecord {
-    fn into_names(self) -> Vec<String> {
-        self.names.into_inner()
+    fn recorded_names(&self) -> Vec<String> {
+        self.names.borrow().clone()
+    }
+
+    fn recorded_patch_paths(&self) -> Vec<String> {
+        self.patch_paths.borrow().clone()
     }
 }
 
@@ -316,9 +321,19 @@ impl boxes::core::hooks::PolicyHooks for RefuseAndRecord {
     fn on_patch_unapproved(
         &self,
         _policy: boxes::core::policy::PatchesPolicy,
-        _items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
+        items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
     ) -> boxes::core::hooks::HookResult<boxes::core::policy::PatchesPolicy> {
-        unreachable!("task env resolution never gates patches")
+        // Same record-and-refuse as the vars half: an unapproved patch
+        // path must not reach the daemon's mount set, and the names land
+        // in the operator's snippet instead.
+        let mut paths = self.patch_paths.borrow_mut();
+        for item in items {
+            let path = item.item().to_string();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        boxes::core::hooks::HookResult::Abort
     }
 }
 
@@ -339,6 +354,37 @@ fn refused_vars_snippet(names: &[String]) -> String {
     doc.to_string()
 }
 
+/// Format refused patch paths as the `[patches] allow` snippet an
+/// operator can paste — the patch-side sibling of
+/// [`refused_vars_snippet`](fn@refused_vars_snippet), emitted through
+/// `toml_edit` for the same escaping reason.
+fn refused_patches_snippet(paths: &[String]) -> String {
+    let mut doc = toml_edit::DocumentMut::new();
+    let mut patches = toml_edit::Table::new();
+    let mut allow = toml_edit::Array::new();
+    for path in paths {
+        allow.push(path.as_str());
+    }
+    patches.insert("allow", toml_edit::value(allow));
+    doc.insert("patches", toml_edit::Item::Table(patches));
+    doc.to_string()
+}
+
+/// Var lookup over the resolved task env plus the client's home: the
+/// values a `[patches]` pattern's `$VAR` references expand against
+/// client-side. Task vars are in because the task's own declarations can
+/// name them; `HOME` is in because `~` in a pattern must expand to the
+/// same directory the declared `~/` keys will.
+struct TaskEnvLookup {
+    vars: std::collections::BTreeMap<String, String>,
+}
+
+impl boxes::core::expansion::VarLookup for TaskEnvLookup {
+    fn lookup(&self, name: &str) -> Option<&str> {
+        self.vars.get(name).map(String::as_str)
+    }
+}
+
 /// The `[vars] deny` rejection body: names the task, the variable, and the
 /// file the rule lives in, so the fix is reachable without guessing where
 /// the policy is stored. Split out for unit tests.
@@ -349,6 +395,101 @@ fn denied_task_var_message(task_name: &str, name: &str, policy_path: &std::path:
          this task should see it",
         path = policy_path.display(),
     )
+}
+
+/// The `[patches] deny` rejection body for a task patch: names the task,
+/// the declared path, and the file the rule lives in. Split out for unit
+/// tests.
+fn denied_task_patch_message(task_name: &str, path: &str, policy_path: &std::path::Path) -> String {
+    format!(
+        "task '{task_name}' declares `patch.{path}`, but it is denied by \
+         `[patches] deny` in {policy}; remove the declaration, or the deny \
+         rule if this task should mount it",
+        policy = policy_path.display(),
+    )
+}
+
+/// Gate a task's declared `patch.dir` / `patch.file` entries against
+/// `[patches]`, the same two lanes as the `env_vars` gate above: the
+/// interactive prompt on a real terminal, the collect-and-refuse
+/// `RefuseAndRecord` anywhere else. Returns the raw declared keys the
+/// policy ignored, for the daemon to drop from the mount set — the wire
+/// half of the fix, since the daemon holds no policy and mounts what it
+/// is given.
+fn resolve_task_patches(
+    task: &mfile::Task,
+    task_name: &str,
+    patches_policy: boxes::core::policy::PatchesPolicy,
+    policy_path: &std::path::Path,
+    source: &boxes::core::source::Source,
+    hooks: &dyn boxes::core::hooks::PolicyHooks,
+    resolved_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<std::collections::BTreeSet<String>, anyhow::Error> {
+    use boxes::core::compose::{TaskPatchEntry, gate_task_patch_paths};
+
+    // Echo tasks never reach the daemon's mount path — the daemon answers
+    // an echo from the declaration itself — so there is nothing to gate.
+    if task.action.as_echo().is_some() {
+        return Ok(Default::default());
+    }
+
+    // The gate expands policy patterns through this lookup. A pattern
+    // naming `$HOME` is the common case for patches, so the resolved
+    // task vars share the lookup with the client's own home — the same
+    // base the daemon expands `~/` keys against.
+    let mut vars: std::collections::BTreeMap<String, String> = resolved_env.set.clone();
+    if let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = home.to_str()
+    {
+        vars.insert("HOME".to_string(), home.to_string());
+    }
+    let lookup = TaskEnvLookup { vars };
+
+    // Dir entries first, then files, each in declaration order — the
+    // same order `to_fs_mappings` iterates when mounting.
+    let mut entries: Vec<TaskPatchEntry<'_>> = Vec::new();
+    for key in task.patch.dir.keys() {
+        entries.push(TaskPatchEntry {
+            declared: key,
+            is_file: false,
+            source,
+        });
+    }
+    for key in task.patch.file.keys() {
+        entries.push(TaskPatchEntry {
+            declared: key,
+            is_file: true,
+            source,
+        });
+    }
+
+    let home_fallback = std::env::var_os("HOME").and_then(|h| h.into_string().ok());
+    let (verdicts, _policy) = match gate_task_patch_paths(
+        &entries,
+        patches_policy,
+        Some(hooks),
+        &lookup,
+        home_fallback.as_deref(),
+    ) {
+        Ok(out) => out,
+        Err(boxes::core::compose::ComposeError::Denied { what, .. }) => {
+            bail!(denied_task_patch_message(task_name, &what, policy_path))
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("gating `patch` for task '{task_name}'"));
+        }
+    };
+
+    // Verdicts pair with `entries` in order; an ignored entry's raw
+    // declared key is what the daemon must remove from its mount set.
+    let mut drops = std::collections::BTreeSet::new();
+    for (entry, verdict) in entries.iter().zip(verdicts) {
+        if matches!(verdict, boxes::core::compose::NameVerdict::Ignored) {
+            drops.insert(entry.declared.to_string());
+        }
+    }
+    Ok(drops)
 }
 
 /// The whitespace rejection body: the name is debug-quoted so the offending
@@ -609,7 +750,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         );
         // Checked before the result: the hook refused, so `task_env` is
         // the abort error and the names are the useful half of it.
-        let refused = hooks.into_names();
+        let refused = hooks.recorded_names();
         if !refused.is_empty() {
             let count = refused.len();
             let snippet = refused_vars_snippet(&refused);
@@ -623,7 +764,33 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 s = if count == 1 { "" } else { "s" },
             );
         }
-        (task_env?, user_policy)
+        let task_env = task_env?;
+        let patch_drops = resolve_task_patches(
+            &declared,
+            &args.task,
+            user_policy.patches().clone(),
+            &policy_path,
+            &source,
+            &hooks,
+            &task_env,
+        )?;
+        let refused_patches = hooks.recorded_patch_paths();
+        if !refused_patches.is_empty() {
+            let count = refused_patches.len();
+            let snippet = refused_patches_snippet(&refused_patches);
+            bail!(
+                "task '{task}' declares {count} patch{es} that your policy does \
+                 not allow, and stdin/stderr is not a terminal.\n\n\
+                 Add the following to {path}:\n\n{snippet}\n\
+                 Then re-run this command.",
+                task = args.task,
+                path = policy_path.display(),
+                es = if count == 1 { "" } else { "es" },
+            );
+        }
+        let mut task_env = task_env;
+        task_env.patch_drop = patch_drops;
+        (task_env, user_policy)
     } else {
         let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
         let task_env = resolve_task_env(
@@ -635,6 +802,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             &hooks,
             |k| std::env::var(k),
         );
+        let task_env = task_env?;
+        // Same lane for patches, against the same interactive hook, so a
+        // rule the user records for a patch lands in the same policy
+        // save as a rule recorded for a variable.
+        let patch_drops = resolve_task_patches(
+            &declared,
+            &args.task,
+            user_policy.patches().clone(),
+            &policy_path,
+            &source,
+            &hooks,
+            &task_env,
+        )?;
         // Persist before propagating a refusal: a rule the user chose to
         // record is theirs whether or not this run goes on to fail.
         let after = hooks.into_final_policy();
@@ -644,7 +824,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
             }
         }
-        (task_env?, after)
+        let mut task_env = task_env;
+        task_env.patch_drop = patch_drops;
+        (task_env, after)
     };
 
     crate::ensure_daemon(global)?;
@@ -1166,6 +1348,11 @@ mod tests {
     struct ScriptedHook {
         decision: boxes::core::decision::ItemDecision,
         asked: std::cell::RefCell<Vec<String>>,
+        /// Answers patch-path referrals the same way as names; `None`
+        /// (the default) refuses them, standing in for the
+        /// non-interactive lane's collect-and-refuse.
+        patch_decision: Option<boxes::core::decision::ItemDecision>,
+        asked_paths: std::cell::RefCell<Vec<String>>,
     }
 
     impl ScriptedHook {
@@ -1173,11 +1360,22 @@ mod tests {
             Self {
                 decision,
                 asked: std::cell::RefCell::new(Vec::new()),
+                patch_decision: None,
+                asked_paths: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn allowing_patches(mut self) -> Self {
+            self.patch_decision = Some(boxes::core::decision::ItemDecision::AllowOnce);
+            self
         }
 
         fn asked(&self) -> Vec<String> {
             self.asked.borrow().clone()
+        }
+
+        fn asked_paths(&self) -> Vec<String> {
+            self.asked_paths.borrow().clone()
         }
     }
 
@@ -1196,9 +1394,17 @@ mod tests {
         fn on_patch_unapproved(
             &self,
             _policy: boxes::core::policy::PatchesPolicy,
-            _items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
+            items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
         ) -> boxes::core::hooks::HookResult<boxes::core::policy::PatchesPolicy> {
-            unreachable!("task env resolution never gates patches")
+            match self.patch_decision {
+                Some(d) => {
+                    self.asked_paths
+                        .borrow_mut()
+                        .extend(items.iter().map(|i| i.item().to_string()));
+                    boxes::core::hooks::HookResult::decided(vec![d; items.len()])
+                }
+                None => boxes::core::hooks::HookResult::Abort,
+            }
         }
     }
 
@@ -1218,9 +1424,9 @@ mod tests {
         fn on_patch_unapproved(
             &self,
             _policy: boxes::core::policy::PatchesPolicy,
-            _items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
+            items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
         ) -> boxes::core::hooks::HookResult<boxes::core::policy::PatchesPolicy> {
-            unreachable!("task env resolution never gates patches")
+            panic!("the policy should have decided alone, was asked about {items:?}");
         }
     }
 
@@ -1560,7 +1766,7 @@ mod tests {
             "names the gate that failed: {chain}"
         );
         assert_eq!(
-            hooks.into_names(),
+            hooks.recorded_names(),
             vec!["AWS_SECRET_ACCESS_KEY".to_string(), "OTHER".to_string()],
             "the refused names are what the caller's snippet is built from",
         );
@@ -1606,7 +1812,7 @@ mod tests {
         assert!(msg.contains("AWS_KEY"), "names the denied variable: {msg}");
         assert!(msg.contains("[vars] deny"), "names the rule: {msg}");
         assert!(
-            hooks.into_names().is_empty(),
+            hooks.recorded_names().is_empty(),
             "the hook must not be consulted once a name is denied",
         );
     }
@@ -1639,6 +1845,178 @@ mod tests {
         .expect("an echo task neither resolves nor denies");
 
         assert!(out.is_empty(), "nothing to send: {out:?}");
+    }
+
+    /// A denied patch path is reported with the task, the declared path,
+    /// and the policy file the rule lives in.
+    #[test]
+    fn a_denied_patch_is_reported_with_the_policy_file() {
+        let msg = denied_task_patch_message("t", "/etc/secrets", &policy_path_fixture());
+        assert!(msg.contains("task 't'"), "names the task: {msg}");
+        assert!(msg.contains("/etc/secrets"), "names the path: {msg}");
+        assert!(msg.contains("[patches] deny"), "names the rule: {msg}");
+        assert!(
+            msg.contains("user_policy.toml"),
+            "names the policy file: {msg}"
+        );
+    }
+
+    /// A declared patch the policy denies fails the gate client-side, and
+    /// the hook is never consulted — the same short-circuit as a denied
+    /// variable.
+    #[test]
+    fn a_denied_task_patch_fails_the_gate_before_the_hook() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.file]\n\"/etc/passwd\" = \"ro\"\n",
+        );
+        // Pinned: the fixture must declare a patch, not just an exec.
+        assert!(task.patch.file.contains_key("/etc/passwd"));
+        let policy = boxes::core::policy::PatchesPolicy::default()
+            .with_deny(vec!["/etc/passwd".to_string()]);
+
+        let err = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("a denied patch must fail the gate");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("patch./etc/passwd"),
+            "names the declared path: {msg}"
+        );
+        assert!(msg.contains("[patches] deny"), "names the rule: {msg}");
+    }
+
+    /// The refusal snippet is the `[patches] allow` block an operator
+    /// pastes, and stays valid TOML for a path that needs escaping.
+    #[test]
+    fn the_patch_refusal_snippet_is_pasteable_toml() {
+        let snippet = refused_patches_snippet(&["/etc/secrets".to_string()]);
+        assert!(snippet.contains("[patches]"), "{snippet}");
+        assert!(snippet.contains("/etc/secrets"), "{snippet}");
+        let parsed: toml::Value = toml::from_str(&snippet).expect("snippet must parse");
+        assert!(parsed.get("patches").is_some());
+    }
+
+    /// The non-interactive patch hook refuses and records, the same
+    /// contract as its vars half: nothing reaches the daemon's mount set,
+    /// and the paths land in the snippet the caller builds.
+    #[test]
+    fn the_non_interactive_patch_hook_refuses_and_records() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.file]\n\"/opt/tool/bin\" = \"ro\"\n",
+        );
+        let hooks = RefuseAndRecord::default();
+
+        let err = resolve_task_patches(
+            &task,
+            "t",
+            boxes::core::policy::PatchesPolicy::default(),
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("a refusing hook must fail the run");
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("patch"), "names the gate: {chain}");
+        assert_eq!(
+            hooks.recorded_patch_paths(),
+            vec!["/opt/tool/bin".to_string()],
+            "the refused paths are what the caller's snippet is built from",
+        );
+    }
+
+    /// An ignored patch path lands in the drop list the daemon removes
+    /// from the mount set, keyed exactly as declared.
+    #[test]
+    fn an_ignored_task_patch_lands_in_the_drop_list() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.file]\n\"/opt/tool/bin\" = \"ro\"\n\
+             [tasks.t.patch.dir]\n\"/opt/cache\" = \"rw\"\n",
+        );
+        let policy =
+            boxes::core::policy::PatchesPolicy::default().with_ignore(vec!["/opt/**".to_string()]);
+
+        let drops = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect("ignored entries drop, they do not fail");
+
+        let expect: std::collections::BTreeSet<String> = ["/opt/tool/bin", "/opt/cache"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        assert_eq!(drops, expect, "raw declared keys, verbatim");
+    }
+
+    /// An echo task's patches are gated by nobody, the same exemption as
+    /// its `env_vars`: the daemon answers an echo from the declaration
+    /// and returns before it builds an environment to mount into.
+    #[test]
+    fn an_echo_task_gates_no_patches_whatever_it_declares() {
+        let task = task_from_toml(
+            "[tasks.t]\necho = 'hi'\n[tasks.t.patch.file]\n\"/etc/passwd\" = \"ro\"\n",
+        );
+        assert_eq!(task.action.as_echo(), Some("hi"));
+        let policy = boxes::core::policy::PatchesPolicy::default()
+            .with_deny(vec!["/etc/passwd".to_string()]);
+
+        let drops = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect("an echo task neither resolves nor denies");
+
+        assert!(drops.is_empty(), "nothing to drop: {drops:?}");
+    }
+
+    /// The interactive lane's hook approves an undecided patch on the
+    /// spot, and an approved patch is kept — it must not land in the
+    /// drop list the daemon removes from the mount set.
+    #[test]
+    fn an_approved_task_patch_is_kept_out_of_the_drop_list() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.file]\n\"/opt/tool/bin\" = \"ro\"\n",
+        );
+        let hooks =
+            ScriptedHook::new(boxes::core::decision::ItemDecision::AllowOnce).allowing_patches();
+
+        let drops = resolve_task_patches(
+            &task,
+            "t",
+            boxes::core::policy::PatchesPolicy::default(),
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect("an approved patch runs");
+
+        assert_eq!(
+            hooks.asked_paths(),
+            vec!["/opt/tool/bin".to_string()],
+            "the prompt was about the declared path"
+        );
+        assert!(drops.is_empty(), "an approved patch is not dropped");
     }
 
     /// `cmd_task_run` rejects a task the project's minimal.toml does not
