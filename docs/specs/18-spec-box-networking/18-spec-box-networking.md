@@ -953,6 +953,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald stopped_shared_address_box_is_nodata
   <!-- S1b-2b; design §7.1; state-driven; the host-address lane and the macOS interim; the name stays in-zone, so no name-wide negative caching -->
+  - WHEN a box's row is withdrawn at its detachment bound THE SYSTEM SHALL answer its name NODATA for a bounded window after the withdrawal, and SHALL answer NXDOMAIN once that window and any row or hold behind the name are gone.
+    tier:   T0
+    verify: cargo nextest run -p minvmd the_zone_view_holds_a_withdrawn_name_nodata_for_its_grace
+    <!-- state-driven; macOS's resolver caches an NXDOMAIN name-wide for minutes, past the SOA negative TTL the answer carries, so a box that comes back after a VM restart stays unresolvable on the host; a NODATA answer ages out at that TTL; the window is the registry's withdrawn-name grace, and an explicit withdrawal or destroy clears it, keeping NET-012's destroyed-box NXDOMAIN immediate -->
 
 - **NET-129** WHEN a host-address box is published THE SYSTEM SHALL answer its name with its node's published host-loopback address at the box's own port numbers.
   tier:     T0
