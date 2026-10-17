@@ -112,42 +112,46 @@ impl ProjectOp for UpdateProject {
             return Ok(report);
         };
 
-        let toml = std::fs::read_to_string(&p)
-            .map_err(|e| Error::Other(anyhow!("reading {} for update: {e}", p.display())))?;
-        let mut doc = toml
-            .parse::<DocumentMut>()
-            .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+        // The whole read-edit-write runs under the file's sidecar lock (with
+        // an atomic replace), so a concurrent `min` command can neither lose
+        // our re-pin nor have its own edit lost by us.
+        mfile::File::edit_exclusively::<anyhow::Error>(&p, |content| {
+            let toml =
+                content.ok_or_else(|| anyhow!("reading {} for update: not found", p.display()))?;
+            let mut doc = toml.parse::<DocumentMut>().map_err(anyhow::Error::from)?;
 
-        if new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()) {
-            if let Some(new_rev) = new_up_rev {
-                doc["upstream"]["locked_commit"] = value(new_rev.clone());
-                // `new_up_rev` is only set when the upstream has a tracking branch.
-                let (repo, branch, from) = upstream.expect("upstream present for new rev");
-                report.upstream = Some(RevChange {
-                    repo,
-                    branch: branch.expect("tracking branch present for new rev"),
-                    from,
-                    to: new_rev,
-                });
-            }
-
-            for (i, rev) in sideload_updates.into_iter().enumerate() {
-                if let Some(new_rev) = rev {
-                    if let Some((repo, branch, from)) = &sideloads[i] {
-                        report.sideloads.push(RevChange {
-                            repo: repo.clone(),
-                            branch: branch.clone(),
-                            from: from.clone(),
-                            to: new_rev.clone(),
-                        });
-                    }
-                    doc["upstream"]["sideload"][i]["locked_commit"] = value(new_rev);
+            if new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()) {
+                if let Some(new_rev) = new_up_rev {
+                    doc["upstream"]["locked_commit"] = value(new_rev.clone());
+                    // `new_up_rev` is only set when the upstream has a tracking branch.
+                    let (repo, branch, from) = upstream.expect("upstream present for new rev");
+                    report.upstream = Some(RevChange {
+                        repo,
+                        branch: branch.expect("tracking branch present for new rev"),
+                        from,
+                        to: new_rev,
+                    });
                 }
-            }
 
-            std::fs::write(&p, doc.to_string())
-                .map_err(|e| Error::Other(anyhow!("writing {}: {e}", p.display())))?;
-        }
+                for (i, rev) in sideload_updates.into_iter().enumerate() {
+                    if let Some(new_rev) = rev {
+                        if let Some((repo, branch, from)) = &sideloads[i] {
+                            report.sideloads.push(RevChange {
+                                repo: repo.clone(),
+                                branch: branch.clone(),
+                                from: from.clone(),
+                                to: new_rev.clone(),
+                            });
+                        }
+                        doc["upstream"]["sideload"][i]["locked_commit"] = value(new_rev);
+                    }
+                }
+
+                Ok(Some(doc.to_string()))
+            } else {
+                Ok(None)
+            }
+        })?;
 
         Ok(report)
     }

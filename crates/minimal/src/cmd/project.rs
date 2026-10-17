@@ -218,8 +218,10 @@ pub(crate) fn run_init_flow(
         }
     }
 
-    std::fs::write(&plan.toml_path, &plan.content)
-        .with_context(|| format!("writing {}", plan.toml_path.display()))?;
+    mfile::File::edit_exclusively::<anyhow::Error>(&plan.toml_path, |_| {
+        Ok(Some(plan.content.clone()))
+    })
+    .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
     Ok(if exists {
         InitOutcome::Updated(plan.toml_path)

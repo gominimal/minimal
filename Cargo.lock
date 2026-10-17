@@ -3949,6 +3949,7 @@ dependencies = [
  "args",
  "boxes",
  "common",
+ "fd-lock",
  "indoc",
  "paths",
  "serde",
