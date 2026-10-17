@@ -1602,4 +1602,142 @@ kill "$peer" 2>/dev/null
             .expect("read on the channel after teardown");
         assert_eq!(n, 0, "the forward's channel must see EOF, not more bytes");
     }
+
+    /// A write that never completes must not park the session loop forever.
+    /// russh bounds every transport write only by the inactivity timer, so
+    /// with `inactivity_timeout: None` a wedged write parks the loop for
+    /// good — and keepalives are dispatched from that same loop, so they
+    /// stop firing too: the connection outlives every keepalive budget
+    /// while both directions sit dark. Arming the timer bounds the park:
+    /// the session future must resolve with an inactivity error instead of
+    /// hanging.
+    #[tokio::test]
+    async fn a_wedged_transport_write_ends_the_session_on_the_inactivity_deadline() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use tokio::net::UnixStream;
+
+        /// A passthrough transport whose write side can be wedged at will:
+        /// reads always delegate (the client's replies keep flowing until
+        /// the wedge), while writes, flushes and shutdowns park forever
+        /// once `stuck` is set — a transport that accepted the connection
+        /// and then stopped draining.
+        struct Wedgeable<T> {
+            inner: T,
+            stuck: std::sync::Arc<AtomicBool>,
+        }
+        impl<T: AsyncRead + Unpin> AsyncRead for Wedgeable<T> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+        impl<T: AsyncWrite + Unpin> AsyncWrite for Wedgeable<T> {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.stuck.load(Ordering::Relaxed) {
+                    return Poll::Pending;
+                }
+                Pin::new(&mut self.get_mut().inner).poll_write(_cx, _buf)
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.stuck.load(Ordering::Relaxed) {
+                    return Poll::Pending;
+                }
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.stuck.load(Ordering::Relaxed) {
+                    return Poll::Pending;
+                }
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        // Handshake a real russh client against the server through the
+        // wedgeable wrapper with a tight keepalive/inactivity pair, then
+        // wedge it. The keepalive queues a transport write that can never
+        // complete; the inactivity timer must then end the session. Under
+        // the old `inactivity_timeout: None` the session future never
+        // resolves and the timeout below fires instead.
+        let server = crate::test_harness::TestServer::new().await;
+        let host_key = server.state.host_key().await.unwrap();
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+        let stuck = std::sync::Arc::new(AtomicBool::new(false));
+        let wedged = Wedgeable {
+            inner: server_side,
+            stuck: stuck.clone(),
+        };
+
+        let server_setup = {
+            let state = server.state.clone();
+            async move {
+                Connection::from_stream(
+                    wedged,
+                    Arc::new(russh::server::Config {
+                        keys: vec![host_key],
+                        auth_rejection_time_initial: Some(Duration::ZERO),
+                        nodelay: true,
+                        keepalive_interval: Some(Duration::from_millis(50)),
+                        // Far above the inactivity budget: the wedged
+                        // write must be resolved by the inactivity
+                        // deadline, not by exhausting keepalives.
+                        keepalive_max: 100,
+                        inactivity_timeout: Some(Duration::from_millis(200)),
+                        ..Default::default()
+                    }),
+                    state,
+                    true,
+                )
+                .await
+                .expect("handshake over the in-memory pair")
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let ((_conn, session_fut), client) = tokio::join!(server_setup, client_setup);
+        let mut client = client.expect("client handshake");
+
+        let auth = client
+            .authenticate_none(&SessionId::nil().to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+
+        // Hold the client open: dropping it would EOF the server's read
+        // side and end the session for the wrong reason. The wedge is the
+        // write side only.
+        stuck.store(true, Ordering::Relaxed);
+
+        // Under the old `inactivity_timeout: None` this future never
+        // resolves and the timeout fires instead.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), session_fut).await;
+        let err = outcome
+            .expect("a wedged write must not park the session loop forever")
+            .expect_err("the wedged transport ends the session with an error");
+        assert!(
+            matches!(
+                err,
+                ConnectionError::Protocol(russh::Error::InactivityTimeout)
+            ),
+            "the session must end on the inactivity deadline, got: {err}"
+        );
+    }
 }
