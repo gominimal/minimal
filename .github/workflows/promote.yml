@@ -49,14 +49,17 @@ jobs:
             # Reading a team's members needs the org `members` permission, which
             # the default GITHUB_TOKEN lacks. A short-lived gominimal-aw-bot
             # token carries only that permission (org standard — App tokens over
-            # PATs, see gominimal/min-aw ADR-0002).
+            # PATs, see gominimal/min-aw ADR-0002), and reaches this repository
+            # only: without `repositories` the token covers every repository the
+            # App is installed on. The org permission holds either way.
             - name: Mint team-read token (gominimal-aw-bot)
               id: team-token
-              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3 # zizmor: ignore[github-app] members:read is an org permission, so the token cannot be narrowed to repositories
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
               with:
                   app-id: ${{ vars.AW_BOT_APP_ID }}
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
                   owner: gominimal
+                  repositories: ${{ github.event.repository.name }}
                   permission-members: read
 
             # Fails the gate when the team cannot be read or has no one else in
