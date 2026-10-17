@@ -2411,7 +2411,7 @@ STUB
     # ruleset tests read the same input in depth; this pins what the step
     # decided, at the layer the installer owns: the transaction replaces the
     # table rather than adding to it, the cohort's two identities, the
-    # answerer as the deny subtree's one destination, and the retarget that
+    # answerer as the deny subtree's one destination, and the steer that
     # makes the answerer the destination a deny-all box's lookups reach.
     want_ok "the step loaded one transaction, exactly once" \
         [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
@@ -2439,9 +2439,9 @@ originates is refused" \
         grep -q 'ct state established,related accept' "$nft_input"
     want_ok "the deny rule admits the answerer by address and port only" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
-    want_ok "the deny subtree's DNS-port lookups are retargeted onto the answerer" \
-        grep -q 'level 3 "minimald.slice/boxes/deny" ip daddr 127.0.0.1 udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
-    want_ok "the retarget runs at dstnat, before the filter chain decides" \
+    want_ok "the deny subtree's DNS-port lookups are steered onto the answerer" \
+        grep -q 'level 3 "minimald.slice/boxes/deny" udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
+    want_ok "the steer runs at dstnat, before the filter chain decides" \
         grep -q 'type nat hook output priority dstnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
