@@ -1760,6 +1760,12 @@ impl BoxManager {
                     // package-graph clone holds shutdown for that clone's
                     // connect timeout (minutes on a dropped route), as the
                     // inline destroy used to; its hooks' timeouts come after.
+                    // So does a wait for a hook slot: a destroy with hooks
+                    // first takes one of the actor's `DESTROY_HOOK_RUNS`, so
+                    // with every slot held it waits behind those runs, each
+                    // bounded by its own hooks' timeouts. That wait is the
+                    // price of the cap, and it ends: no slot is held past
+                    // its run.
                     while self.teardowns.join_next().await.is_some() {}
                     // Release the cache's held-open alog fd: it lives on the
                     // state volume, and a surviving write-open fd there makes
