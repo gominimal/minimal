@@ -2288,6 +2288,25 @@ impl Drop for Registration {
     }
 }
 
+/// What a connect the channel socket's own mode refused means: the
+/// socket is owner-only, so the host's DNS service is another account's.
+/// The gate's refusal says the same once a connect gets through
+/// ([`refuse_foreign_peer`]).
+const FOREIGN_CHANNEL_CONNECT: &str = "the host's DNS service belongs to another \
+     account; hosts with more than one operator are not supported";
+
+/// A channel connect's error, with a refusal by the socket's mode (an
+/// owner-only socket another account holds) said as
+/// [`FOREIGN_CHANNEL_CONNECT`] rather than a bare `Permission denied`.
+/// The kind stays `PermissionDenied`, the kind the gate's refusal carries.
+fn foreign_channel_connect(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(io::ErrorKind::PermissionDenied, FOREIGN_CHANNEL_CONNECT)
+    } else {
+        error
+    }
+}
+
 /// One node's first publish: connect to the answerer channel, say the
 /// hello — the node's id, the protocol version this copy speaks — wait
 /// for the answerer's ack, then publish `rows` and wait for the ack that
@@ -2300,7 +2319,7 @@ impl Drop for Registration {
 /// error the loop surfaces, never a reason to host.
 fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io::Result<Published> {
     let mut registration = Registration {
-        stream: UnixStream::connect(sock)?,
+        stream: UnixStream::connect(sock).map_err(foreign_channel_connect)?,
     };
     // The hello and its reply are bounded like a publish's: a service
     // manager starts a socket-activated answerer at the connect, so the
@@ -4854,6 +4873,29 @@ mod tests {
         handle
             .join()
             .expect("the gate's thread ends when its stop is set");
+    }
+
+    /// A channel socket whose mode refuses the connect itself (the
+    /// owner-only socket of another account's service) is said in a plain
+    /// sentence, the gate's own, never a bare `Permission denied`.
+    #[test]
+    fn a_connect_the_socket_mode_refuses_names_the_other_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: geteuid only reads the process's own uid.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root connects through any mode; there is no refusal to see.
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let _listener = UnixListener::bind(&channel).expect("the channel binds");
+        std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o000))
+            .expect("the channel's mode is set");
+        let Err(refused) = connect_and_publish(&channel, "vm-a", Vec::new()) else {
+            panic!("a connect the socket's mode refuses never publishes");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(refused.to_string(), FOREIGN_CHANNEL_CONNECT);
     }
 
     /// A burst of foreign connects is one line's worth of news: every

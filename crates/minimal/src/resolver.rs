@@ -1087,6 +1087,14 @@ pub(crate) struct AnswererFacts {
     /// predates that — or one a foreign hand relaxed — is re-surfaced,
     /// so a step re-run re-binds it.
     pub channel_mode: Option<u32>,
+    /// The owning uid of the installed channel socket's node, read with
+    /// [`AnswererFacts::channel_mode`]: the unit the step installs binds it
+    /// as the operator's, so a node anyone else owns is re-surfaced the
+    /// same way.
+    pub channel_owner: Option<u32>,
+    /// The operator's uid ([`account_uid`]), the owner the channel socket
+    /// must carry; `None` when the operator's name resolves to no account.
+    pub operator_uid: Option<u32>,
     /// The channel protocol version the installed copy answered the
     /// probe with, when it exists, runs, and answers a number.
     pub installed_version: Option<u32>,
@@ -1125,7 +1133,7 @@ fn unit_program_argument(text: &str) -> Option<&str> {
 /// when every check holds — every directory component of every path
 /// root-owned with no group or other write, the copy and every unit
 /// file root-owned the same, the unit naming the copy, the channel
-/// socket owner-only when it exists — *and* the copy
+/// socket owner-only and the operator's when it exists — *and* the copy
 /// answers the probe with this daemon's version; custody failed, naming
 /// the first check that did not hold; protocol mismatch when the copy
 /// answers anything else, or nothing at all.
@@ -1197,6 +1205,17 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
     {
         checks.push(format!(
             "its channel socket at {} is connectable by others, not owner-only",
+            minvmd::net::answerer::resolve_channel_sock().display()
+        ));
+    }
+    // The channel socket's owner, on the same terms: a node another
+    // account owns (an install that predates the owner, or a hand that
+    // changed it) is re-surfaced, and an absent node carries no check.
+    if let Some(owner) = facts.channel_owner
+        && Some(owner) != facts.operator_uid
+    {
+        checks.push(format!(
+            "its channel socket at {} is owned by uid {owner}, not the operator's",
             minvmd::net::answerer::resolve_channel_sock().display()
         ));
     }
@@ -1282,16 +1301,41 @@ pub(crate) fn operator_name() -> String {
         .unwrap_or_default()
 }
 
-/// The uid of the operator [`operator_name`] names, for the socket owner
-/// the channel's unit sets: the name's own uid when the account reads,
-/// this process's when it does not (the unit's user is checked at the
-/// step's run time regardless).
-pub(crate) fn operator_uid() -> u32 {
-    nix::unistd::User::from_name(&operator_name())
+/// The uid of the account `name`, when the password database has one —
+/// for the operator [`operator_name`] names, the socket owner the
+/// channel's unit sets. `None` when the name resolves to no account: the
+/// step then cannot be offered ([`require_operator_account`]), and no
+/// other uid stands in for it.
+fn account_uid(name: &str) -> Option<u32> {
+    nix::unistd::User::from_name(name)
         .ok()
         .flatten()
         .map(|user| user.uid.as_raw())
-        .unwrap_or_else(|| nix::unistd::geteuid().as_raw())
+}
+
+/// Why the step is unavailable when the operator's name resolves to no
+/// account: the unit would own the channel socket by that account's uid.
+fn operator_unresolved(name: &str) -> String {
+    if name.is_empty() {
+        "no account name could be read for the DNS service to run as".to_string()
+    } else {
+        format!(
+            "this machine has no account named {name}, the account the DNS service would run as"
+        )
+    }
+}
+
+/// `step`, unless it still needs the service step and the operator's
+/// name (`name`, resolved to `uid`) is no account on this machine: then
+/// the step cannot be offered, and says so, naming the account. Pure.
+fn require_operator_account(step: AnswererStep, name: &str, uid: Option<u32>) -> AnswererStep {
+    if step.holds() || uid.is_some() {
+        return step;
+    }
+    AnswererStep::SourceUnavailable {
+        service: Box::new(step),
+        reason: operator_unresolved(name),
+    }
 }
 
 /// Where the answerer program is on this machine, pure over where to look:
@@ -1417,9 +1461,20 @@ pub(crate) fn set_handover_controls(controls: Vec<String>) {
 /// the daemons connect to are one path by one definition.
 pub(crate) fn answerer_install(verified: &VerifiedSource) -> Option<AnswererInstall> {
     let channel = minvmd::net::answerer::resolve_channel_sock();
+    let operator = operator_name();
+    // The detection already turned an unresolved operator into an
+    // unavailable step ([`require_operator_account`]); an account gone
+    // since is left out the same way, never owned by a stand-in uid.
+    let Some(operator_uid) = account_uid(&operator) else {
+        tracing::warn!(
+            "the answerer service step is left out of the advisory: {}",
+            operator_unresolved(&operator)
+        );
+        return None;
+    };
     let install = AnswererInstall {
-        operator: operator_name(),
-        operator_uid: operator_uid(),
+        operator,
+        operator_uid,
         channel_dir: channel.parent().unwrap_or(&channel).display().to_string(),
         channel: channel.display().to_string(),
         source: verified.path.clone(),
@@ -1743,6 +1798,14 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     let unit_text = tokio::fs::read_to_string(ANSWERER_UNIT_PATHS[ANSWERER_UNIT_PATHS.len() - 1])
         .await
         .ok();
+    let channel = file_custody(
+        &minvmd::net::answerer::resolve_channel_sock()
+            .display()
+            .to_string(),
+    )
+    .await;
+    let operator = operator_name();
+    let operator_uid = account_uid(&operator);
     let facts = AnswererFacts {
         components: path_component_custody(&paths).await,
         program: file_custody(ANSWERER_PROGRAM_PATH).await,
@@ -1751,16 +1814,19 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
             .as_deref()
             .and_then(unit_program_argument)
             .map(str::to_string),
-        channel_mode: file_custody(
-            &minvmd::net::answerer::resolve_channel_sock()
-                .display()
-                .to_string(),
-        )
-        .await
-        .map(|custody| custody.mode),
+        channel_mode: channel.map(|custody| custody.mode),
+        channel_owner: channel.map(|custody| custody.owner),
+        operator_uid,
         installed_version: installed_protocol_version().await,
     };
     let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
+    // The unit owns the channel socket by the operator's uid, so an
+    // operator whose name resolves to no account leaves the step nothing
+    // to offer.
+    let step = require_operator_account(step, &operator, operator_uid);
+    if matches!(step, AnswererStep::SourceUnavailable { .. }) {
+        return step;
+    }
     // The copy source's identity, only when the step would carry the copy
     // (NET-122's privileged step copies this program as root): checked
     // unprivileged before the step is ever offered, and pinned by hash for
@@ -8581,6 +8647,8 @@ resolvectl domain minzone0 '~min.internal'
                 .collect(),
             unit_program: Some(ANSWERER_PROGRAM_PATH.to_string()),
             channel_mode: Some(0o600),
+            channel_owner: Some(1000),
+            operator_uid: Some(1000),
             installed_version: version,
         }
     }
@@ -8783,8 +8851,20 @@ resolvectl domain minzone0 '~min.internal'
                 && failed_check.contains("is connectable by others, not owner-only")),
             "a world-connectable channel socket fails custody: {step:?}"
         );
+        // A socket node another account owns fails custody the same way,
+        // with its own check naming the owner.
+        let mut foreign_owned = root_owned_answerer_facts(Some(daemon));
+        foreign_owned.channel_owner = Some(0);
+        let step = answerer_step_over(&foreign_owned, daemon);
+        assert!(
+            matches!(step, AnswererStep::CustodyFailed { ref failed_check } if failed_check
+                .contains("its channel socket at")
+                && failed_check.contains("is owned by uid 0, not the operator's")),
+            "a channel socket another account owns fails custody: {step:?}"
+        );
         let mut no_socket_node = root_owned_answerer_facts(Some(daemon));
         no_socket_node.channel_mode = None;
+        no_socket_node.channel_owner = None;
         assert_eq!(
             answerer_step_over(&no_socket_node, daemon),
             AnswererStep::Installed,
@@ -9103,6 +9183,43 @@ resolvectl domain minzone0 '~min.internal'
             advisory.contains(&format!("\n{}", command(port, None)))
                 && !advisory.contains("install the Minimal box-name service"),
             "the command carries no answerer step: {advisory}"
+        );
+
+        // An operator whose name resolves to no account: the unit would own
+        // the channel socket by that account's uid, so the step is
+        // unavailable, naming the account — no other uid stands in.
+        assert_eq!(account_uid("root"), Some(0));
+        assert_eq!(account_uid("minimal-no-such-account"), None);
+        let unresolved =
+            require_operator_account(AnswererStep::Absent, "minimal-no-such-account", None);
+        assert_eq!(
+            unresolved,
+            AnswererStep::SourceUnavailable {
+                service: Box::new(AnswererStep::Absent),
+                reason: operator_unresolved("minimal-no-such-account"),
+            }
+        );
+        let advisory = advise(&unresolved);
+        assert!(
+            advisory.contains(
+                "this machine has no account named minimal-no-such-account, the account the \
+                 DNS service would run as; the DNS service install is unavailable"
+            ),
+            "{advisory}"
+        );
+        assert!(
+            !advisory.contains("install the Minimal box-name service"),
+            "the command carries no answerer step: {advisory}"
+        );
+        assert_eq!(
+            require_operator_account(AnswererStep::Installed, "minimal-no-such-account", None),
+            AnswererStep::Installed,
+            "a service that holds needs no step"
+        );
+        assert_eq!(
+            require_operator_account(AnswererStep::Absent, "operator", Some(1000)),
+            AnswererStep::Absent,
+            "a resolved operator leaves the step as it was"
         );
 
         // A macOS release build with no TEAMID or identifier compiled in.
@@ -10099,6 +10216,8 @@ resolvectl domain minzone0 '~min.internal'
                 .collect(),
             unit_program: Some(LEGACY_MACOS_ANSWERER_PROGRAM_PATH.to_string()),
             channel_mode: Some(0o600),
+            channel_owner: Some(1000),
+            operator_uid: Some(1000),
             installed_version: Some(daemon),
         };
         let step = answerer_step_over(&facts, daemon);
