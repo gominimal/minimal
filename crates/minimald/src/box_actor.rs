@@ -5457,6 +5457,8 @@ impl BoxActor {
                     .as_utf8_path()
                     .as_std_path()
                     .to_path_buf(),
+                Some(Arc::clone(&self.hostnames)),
+                record.id,
             ));
             // The set this launch is running on, handed back so a test can
             // contend with its two real surfaces over the real port — a

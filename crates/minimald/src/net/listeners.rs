@@ -126,7 +126,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -697,6 +697,16 @@ pub struct ListenPlan {
     /// The daemon's state directory: the audit log the publication's
     /// decision record is appended to lives under it ([`crate::audit`]).
     state_dir: PathBuf,
+    /// The hostname registry (NET-129), where each published port is
+    /// recorded as held by this box's stable session id — so a declared
+    /// publish of the same port elsewhere sees the holder and yields,
+    /// and the close hands the port over. `None` when the launch carried
+    /// no reporter: a box with no registry behind it records nothing.
+    hostnames: Option<Arc<RwLock<crate::net::dns::HostnameRegistry>>>,
+    /// The stable id the holds are recorded under (NET-129): the box's
+    /// own id, keying the registry's holder table exactly as its declared
+    /// publish does.
+    session_id: boxes::SessionId,
 }
 
 impl ListenPlan {
@@ -708,6 +718,7 @@ impl ListenPlan {
     /// same port. `state_dir` is the daemon's state directory, the one the
     /// runtime expose path audits its decisions under, so both surfaces'
     /// records land in the one log.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         box_name: String,
@@ -717,6 +728,8 @@ impl ListenPlan {
         gate: Arc<BoxGate>,
         publications: BoxPublications,
         state_dir: PathBuf,
+        hostnames: Option<Arc<RwLock<crate::net::dns::HostnameRegistry>>>,
+        session_id: boxes::SessionId,
     ) -> Self {
         Self {
             box_name,
@@ -726,7 +739,40 @@ impl ListenPlan {
             gate,
             publications,
             state_dir,
+            hostnames,
+            session_id,
         }
+    }
+
+    /// Records `port` as held by this box at its published address
+    /// (NET-129): the dynamic port's one holder of record, read by every
+    /// declared publish of the port — so another box's declaration collides
+    /// with the box that is serving and yields its forward, instead of
+    /// failing on a bind the forwarder refuses. A port another box already
+    /// holds is left alone: the record never displaces a holder.
+    fn record_dynamic_hold(&self, port: u16) {
+        let Some(registry) = self.hostnames.as_ref() else {
+            return;
+        };
+        registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .record_dynamic_hold(self.session_id, self.published, port);
+    }
+
+    /// Releases the hold [`Self::record_dynamic_hold`] recorded — the
+    /// listener closed or the box stopped — returning the hand-overs the
+    /// release elected, so the close's own line can say them beside the
+    /// registry's. A port the box still declares keeps its record: the
+    /// declaration is the claim now.
+    fn release_dynamic_hold(&self, port: u16) -> Vec<crate::net::dns::PortHandOver> {
+        let Some(registry) = self.hostnames.as_ref() else {
+            return Vec::new();
+        };
+        registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .release_dynamic_hold(self.session_id, self.published, port)
     }
 }
 
@@ -1973,6 +2019,15 @@ impl WatchState {
                                     return Appearance::Settled;
                                 }
                                 self.forwards.insert(port, mapping);
+                                // The publication stands at the box's
+                                // published address, so the box is the
+                                // port's one holder of record (NET-129):
+                                // recorded here, at the moment the forward
+                                // is bound and admitted, so a declared
+                                // publish of the same port elsewhere sees
+                                // the box that is serving and yields
+                                // instead of failing on it.
+                                self.plan.record_dynamic_hold(port);
                                 self.plan.publications.mark_audit_refused(port, false);
                                 tracing::info!(
                                     session = %self.plan.box_name,
@@ -2261,6 +2316,24 @@ impl WatchState {
                 self.plan
                     .publications
                     .withdraw(port, PublicationOwner::Listen);
+                // The forward is down, so the box's hold of record ends with
+                // it (NET-129): the port passes to the box created earliest
+                // among those still publishing it — a declared yielder's
+                // forward binds at its next hand-over or attach, so a port
+                // the closing listener held is never left unheld while
+                // another box waits on it. Said here beside the withdraw,
+                // as the hand-over's own line; the registry has already sent
+                // each to the sessions manager.
+                for hand_over in self.plan.release_dynamic_hold(port) {
+                    tracing::info!(
+                        session_id = %hand_over.holder,
+                        address = %hand_over.address,
+                        port = hand_over.port,
+                        from = %self.plan.box_name,
+                        action = "shared-address-port-hand-over",
+                        "a shared-address port passes to the earliest-created box still publishing it"
+                    );
+                }
                 // The host-held grant's row comes down with it (T94): the
                 // runtime port this publication recorded at the VM host
                 // daemon stops being named by a row whose port nothing
@@ -2773,6 +2846,8 @@ mod tests {
             Arc::clone(&gate),
             BoxPublications::default(),
             state_dir,
+            None,
+            boxes::SessionId::nil(),
         );
         (ListenWatcher::start(plan, leader), gate)
     }
@@ -2844,6 +2919,8 @@ mod tests {
             Arc::clone(&gate),
             publications,
             dir.path().to_path_buf(),
+            None,
+            boxes::SessionId::nil(),
         );
         let watcher = ListenWatcher::start(plan, Leader::Resolved(std::process::id()));
         (watcher, gate, server, served)
@@ -3055,6 +3132,8 @@ mod tests {
             gate,
             BoxPublications::default(),
             state_dir,
+            None,
+            boxes::SessionId::nil(),
         );
         let launch = tracing::info_span!("session.host.message");
         let launch_id = launch.id().unwrap();
@@ -3314,6 +3393,8 @@ mod tests {
                 Arc::clone(&gate),
                 publications.clone(),
                 dir.path().to_path_buf(),
+                None,
+                boxes::SessionId::nil(),
             ),
             Leader::Resolved(std::process::id()),
         );
@@ -4946,6 +5027,8 @@ mod tests {
                 Arc::clone(&gate),
                 BoxPublications::default(),
                 dir.path().to_path_buf(),
+                None,
+                boxes::SessionId::nil(),
             ),
             Leader::Resolved(std::process::id()),
         );
