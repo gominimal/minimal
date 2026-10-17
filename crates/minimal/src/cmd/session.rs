@@ -90,6 +90,23 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
+/// The control sockets of this state dir's running VM host daemons, for the
+/// release the finalize-install script asks each daemon for. The enumeration
+/// spans every VM that ever ran (NET-057), so the bridge socket each entry
+/// carries — bound only while the VMM lives, never cleaned up at exit — is
+/// what separates a running VM's daemon from a stopped one's leftover state
+/// dir: a stopped VM cannot hold the hook port, so asking its daemon would
+/// render a control socket that is not listening.
+pub(crate) fn running_vm_controls(minimal_dir: Option<&std::path::Path>) -> Vec<String> {
+    client::enumerate_vm_sockets(minimal_dir, true)
+        .unwrap_or_default()
+        .iter()
+        .filter(|vm| vm.sock.exists())
+        .filter_map(|vm| control_sock_beside(&vm.sock))
+        .map(|sock| sock.display().to_string())
+        .collect()
+}
+
 /// The host reads `min finalize-install` decides its script from (NET-122): this
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
@@ -109,17 +126,10 @@ pub(crate) async fn advisory_host_reads(
         crate::resolver::read_answerer_step()
     );
     // The daemons the step asks to release the hook port: this CLI's
-    // own state dir's — its VM host daemons, default VM and named VMs
-    // alike, or its native daemon — never another state dir's.
+    // own state dir's — its running VM host daemons or its native
+    // daemon — never another state dir's.
     let controls = match daemon_provider_kind(global) {
-        paths::ProviderKind::Minvmd => {
-            client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|vm| control_sock_beside(&vm.sock))
-                .map(|sock| sock.display().to_string())
-                .collect()
-        }
+        paths::ProviderKind::Minvmd => running_vm_controls(global.minimal_dir.as_deref()),
         paths::ProviderKind::Minimald => {
             client::resolve_socket_path(global.minimal_dir.as_deref(), false)
                 .ok()
@@ -4428,6 +4438,58 @@ mod tests {
         assert_eq!(
             host_asks_target(None, Some("web"), Some(addresses), false),
             None
+        );
+    }
+
+    /// The finalize-install script's controls span only the VM host daemons
+    /// whose VM is running: a stopped VM's state dir is still enumerated
+    /// (NET-057), but its bridge socket went with the VMM, and a daemon that
+    /// cannot hold the hook port must not be asked to release it.
+    #[test]
+    fn running_vm_controls_skip_a_stopped_named_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        // A running named VM: the VMM's bridge socket is bound, so its
+        // daemon's control socket beside it is asked for the release.
+        std::fs::create_dir_all(provider.join("alpha")).unwrap();
+        let alpha_sock = provider.join("alpha").join("ssh.sock");
+        let _alpha_bridge = std::os::unix::net::UnixListener::bind(&alpha_sock).unwrap();
+        // A stopped named VM: its state dir remains, its bridge socket does
+        // not, so its daemon's control socket is not asked.
+        std::fs::create_dir_all(provider.join("beta")).unwrap();
+        assert_eq!(
+            running_vm_controls(Some(base.path())),
+            vec![
+                provider
+                    .join("alpha")
+                    .join("control.sock")
+                    .display()
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A stopped default VM is skipped the same way: the default VM is always
+    /// enumerated, so its bridge socket is the only thing that keeps its
+    /// daemon's control socket out of the script on a host where only a
+    /// named VM runs.
+    #[test]
+    fn running_vm_controls_skip_a_stopped_default_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(provider.join("gamma")).unwrap();
+        let gamma_sock = provider.join("gamma").join("ssh.sock");
+        let _gamma_bridge = std::os::unix::net::UnixListener::bind(&gamma_sock).unwrap();
+        assert_eq!(
+            running_vm_controls(Some(base.path())),
+            vec![
+                provider
+                    .join("gamma")
+                    .join("control.sock")
+                    .display()
+                    .to_string()
+            ]
         );
     }
 
