@@ -997,11 +997,12 @@ pub struct ClientBoxSpec {
 /// a row stands for it. A creation lives from its registration until its
 /// creator withdraws the box ([`BoxRegistry::withdraw_client_box`]) or a
 /// new registration takes its name; a row withdrawn at the end of its
-/// detach grace or its resume bound leaves the creation **dormant** (`standing: false`) for
-/// its creator to resume ([`BoxRegistry::resume_client_box`]). A creation,
-/// standing or dormant, keeps its addresses reserved: its switch and task
-/// addresses stay out of the hand-out book — taken again from a fresh book
-/// at reload — and its published loopback address stays the answerer's
+/// detach grace or its resume bound leaves the creation **dormant**
+/// (`standing: false`) for its creator to resume
+/// ([`BoxRegistry::resume_client_box`]). A creation, standing or dormant,
+/// keeps its addresses reserved: its switch and task addresses stay out of
+/// the hand-out book — taken again from a fresh book at reload — and its
+/// published loopback address stays the answerer's
 /// link for its name, so a resume finds every address its box was created
 /// with. Its creator's withdrawal releases them all. There is at most one
 /// creation per box name.
@@ -6888,7 +6889,7 @@ mod tests {
     #[test]
     fn a_reloaded_row_awaits_its_box_under_the_resume_bound() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let web = persisted_registry(&dir)
+        persisted_registry(&dir)
             .register_client_box(client_spec("web"))
             .expect("the plan has an address for the box");
 
@@ -6913,26 +6914,23 @@ mod tests {
             "the dormant creation keeps its switch address reserved"
         );
 
-        let again = persisted_registry(&dir);
-        again.spawn_withdrawal_drainer(|_| {});
-        let claim = again.begin_registration("web");
-        again
-            .resume_client_box(
-                "web",
-                web.switch_addr(),
-                web.loopback_addr(),
-                Some(web.box_id()),
-                web.loopback_addr(),
-                claim.generation(),
-            )
-            .expect("the dormant creation resumes after its bound");
-        let table = again.table();
-        table.mark_attributed(web.switch_addr().octets());
-        again.advance_clock(RESUME_ATTACH_BOUND);
+        // A reload alone, no resume: the reloaded row's first frame clears
+        // the bound the load armed.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let web = persisted_registry(&dir)
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let reloaded = persisted_registry(&dir);
+        reloaded.spawn_withdrawal_drainer(|_| {});
+        reloaded
+            .table()
+            .mark_attributed(web.switch_addr().octets())
+            .expect("the reloaded row stands at its switch address");
+        reloaded.advance_clock(RESUME_ATTACH_BOUND);
         let_the_drainer_sweep();
         assert!(
-            again.row_by_name("web").is_some(),
-            "a reloaded row its box attached to stands past the bound"
+            reloaded.row_by_name("web").is_some(),
+            "a reloaded row its box's first frame reached stands past the bound"
         );
     }
 

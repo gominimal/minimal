@@ -1080,11 +1080,11 @@ impl BoxManager {
     /// (`record.box_addresses`) also gets its host launched, detached from
     /// this resume and unattached to any client: the host's launch is what
     /// attaches the box's shuttle, which marks the box's host-side row
-    /// carried ([`mark_row`]) and binds its declared ingress forwards — so
-    /// the box's published name keeps answering and its ingress binds
-    /// without waiting for a client's first exec or attach. The row a
-    /// reloaded host registry reinstated awaits this first frame under its
-    /// resume bound, which the VM's cold boot must fit inside.
+    /// carried (minvmd's `BoxTable::carry`) and binds its declared ingress
+    /// forwards — so the box's published name keeps answering and its
+    /// ingress binds without waiting for a client's first exec or attach.
+    /// The row a reloaded host registry reinstated awaits this first frame
+    /// under its resume bound, which the VM's cold boot must fit inside.
     ///
     /// Resuming through [`BoxActor::run`] keeps one registration path, with
     /// its collision rules and its rule never to wait on the range verdict.

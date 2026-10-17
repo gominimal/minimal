@@ -5158,10 +5158,15 @@ async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
         .await
         .unwrap()
         .expect("the host-network box's session resolves");
-    assert!(
-        hostnet.get_attrs().await.is_none(),
-        "a resumed host-network box launches no host"
-    );
+    // Held for a settle rather than read once: a launch wrongly spawned
+    // for it would be in flight alongside the own-address box's.
+    for _ in 0..20 {
+        assert!(
+            hostnet.get_attrs().await.is_none(),
+            "a resumed host-network box launches no host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// One restored session whose actor cannot start costs only its own name:
