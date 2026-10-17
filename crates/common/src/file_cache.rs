@@ -178,9 +178,10 @@ impl FileCache {
         let dir = self.sha_dir(sha256).map_err(Either::Left)?;
         let cached_path = dir.join(filename);
 
-        // Dropping `tmp` on any early return removes the temp file.
+        // Dropping `tmp` on any early return removes the temp file. The prefix is fixed rather than
+        // derived from `filename`, so a filename near NAME_MAX still fits.
         let mut tmp = tempfile::Builder::new()
-            .prefix(&format!(".{filename}."))
+            .prefix(".dl.")
             .suffix(".part")
             .permissions(fs::Permissions::from_mode(0o666))
             .tempfile_in(&dir)
@@ -512,6 +513,35 @@ mod tests {
             vec!["src.tar.gz".to_string()],
             "only the final file should remain"
         );
+    }
+
+    /// A filename close to NAME_MAX (255) must still cache: the temp file
+    /// name must not grow with the filename.
+    #[tokio::test]
+    async fn write_through_accepts_filename_near_name_max() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().to_path_buf()).unwrap();
+        let op = OpTracker::new_with_root(&None);
+        let content = b"long-name";
+        let sha = sha256_hex(content);
+        let filename = format!("{}.tar.gz", "a".repeat(247));
+        assert_eq!(filename.len(), 254);
+
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        resume.notify_one();
+        let mut resp = PausingResponse {
+            head: Some(Bytes::from_static(content)),
+            tail: None,
+            paused: std::sync::Arc::new(tokio::sync::Notify::new()),
+            resume,
+        };
+
+        let path = cache
+            .write_through(&filename, &sha, &mut resp, &op)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .expect("a 254-byte filename should cache");
+        assert_eq!(fs::read(&path).unwrap(), content);
     }
 
     /// A fake URL whose filename is whatever the test sets.
