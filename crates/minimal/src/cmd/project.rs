@@ -218,7 +218,18 @@ pub(crate) fn run_init_flow(
         }
     }
 
-    mfile::File::edit_exclusively::<anyhow::Error>(&plan.toml_path, |_| {
+    mfile::File::edit_exclusively::<anyhow::Error>(&plan.toml_path, |content| {
+        // The `exists` check above ran before the lock was taken, so a
+        // concurrent writer (another `min add`/`min update` scaffolding
+        // this file) may have created it since. Re-check under the lock:
+        // clobbering it without --force is the same destructive overwrite
+        // that check exists to prevent.
+        if content.is_some() && !force {
+            bail!(
+                "refusing to overwrite existing {} without confirmation; pass --force",
+                plan.toml_path.display()
+            );
+        }
         Ok(Some(plan.content.clone()))
     })
     .with_context(|| format!("writing {}", plan.toml_path.display()))?;
