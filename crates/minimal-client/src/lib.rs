@@ -588,9 +588,11 @@ impl Client {
     ///
     /// `task_env` carries a task's `env_vars` already resolved against the
     /// invoking shell: values under
-    /// [`TASK_ENV_PREFIX`](minimald_rpc::taskenv::TASK_ENV_PREFIX), and the
-    /// names to remove under
-    /// [`TASK_ENV_DROP`](minimald_rpc::taskenv::TASK_ENV_DROP). Only
+    /// [`TASK_ENV_PREFIX`](minimald_rpc::taskenv::TASK_ENV_PREFIX), the
+    /// variable names to remove under
+    /// [`TASK_ENV_DROP`](minimald_rpc::taskenv::TASK_ENV_DROP), and the
+    /// declared patch paths the policy ignored under
+    /// [`TASK_PATCH_DROP`](minimald_rpc::taskenv::TASK_PATCH_DROP). Only
     /// [`ExecRequest::TaskRun`](minimald_rpc::exec::ExecRequest::TaskRun) has
     /// any to send; every other caller passes an empty
     /// [`TaskEnv`](minimald_rpc::taskenv::TaskEnv) and the daemon behaves
@@ -644,6 +646,20 @@ impl Client {
                 )
                 .await
                 .context("set task env drop list")?;
+        }
+        // Same contract for the patch entries the client's policy dropped:
+        // the raw declared keys the daemon removes from the task's `patch`
+        // maps before mounting. Absent means the client gated nothing —
+        // or predates the gate.
+        if !task_env.patch_drop.is_empty() {
+            channel
+                .set_env(
+                    true,
+                    minimald_rpc::taskenv::TASK_PATCH_DROP,
+                    minimald_rpc::taskenv::encode_drops(&task_env.patch_drop),
+                )
+                .await
+                .context("set task patch drop list")?;
         }
         channel
             .exec(true, command)

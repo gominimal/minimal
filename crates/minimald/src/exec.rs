@@ -116,6 +116,16 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// Declared patch paths the client's `[patches]` policy ignored, to
+    /// be removed from the task's `patch.dir` / `patch.file` declarations
+    /// before anything is mounted. The keys are raw — exactly as
+    /// `minimal.toml` wrote them — because patch keys are never
+    /// interpolated, so a removal matches the declaration it names.
+    ///
+    /// Empty when the client sent none — an older `min`, or any caller
+    /// other than `min task run` — in which case the declared patches
+    /// apply as before.
+    pub patch_drop: BTreeSet<String>,
     /// The client's invocation directory relative to the uploaded tree,
     /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
     /// is absolute or holds a `..`. A task that declares `inherit_cwd`
@@ -413,6 +423,15 @@ async fn task_producer(
         // matches how the client decided.
         for name in &exec.drop_env {
             task.vars.remove(name);
+        }
+        // Patch removals join them: the client's `[patches]` gate decided
+        // these declared paths must not mount, and the keys are raw —
+        // never interpolated — so they match the declarations exactly.
+        // The daemon holds no policy; applying the client's verdicts
+        // here is the whole wire contract.
+        for key in &exec.patch_drop {
+            task.patch.dir.remove(key);
+            task.patch.file.remove(key);
         }
         for (name, value) in &exec.env {
             task.vars
@@ -1872,6 +1891,10 @@ pub(crate) async fn handle_exec(
                 trace_env.clone(),
             );
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
+            // Patch paths the client's policy dropped, same wire contract
+            // as `drop_env`: absent from an older client, meaning the
+            // declared patches apply as before.
+            let patch_drop = minimald_rpc::taskenv::patch_drops_from_channel_env(&config.env_vars);
             let span = span.clone();
             session.channel_success(id)?;
             spawn(tracing::Instrument::instrument(
@@ -1890,6 +1913,7 @@ pub(crate) async fn handle_exec(
                             task: task.clone(),
                             env: task_env,
                             drop_env,
+                            patch_drop,
                             cwd,
                         },
                     };

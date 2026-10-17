@@ -2501,3 +2501,184 @@ mod extend_from_wire {
         assert_eq!(names, vec!["helix", "ripgrep"]);
     }
 }
+
+// =================================================================
+// Task patch gating
+// =================================================================
+
+/// [`gate_task_patch_paths`] drives the `[patches]` policy over a task's
+/// declared `patch.dir` / `patch.file` entries. These tests pin its
+/// verdicts; the client wiring that calls it is covered in `minimal`.
+mod gate_task_patch_paths {
+    use super::*;
+    use crate::core::compose::{TaskPatchEntry, gate_task_patch_paths};
+    use crate::core::policy::PatchesPolicy;
+
+    /// A var lookup that answers nothing — for policies with no `$VAR`
+    /// patterns, which is every policy below.
+    struct NoVars;
+    impl crate::core::expansion::VarLookup for NoVars {
+        fn lookup(&self, _: &str) -> Option<&str> {
+            None
+        }
+    }
+
+    fn entries_for<'a>(
+        source: &'a Source,
+        declared: &[(&'a str, bool)],
+    ) -> Vec<TaskPatchEntry<'a>> {
+        declared
+            .iter()
+            .map(|&(d, is_file)| TaskPatchEntry {
+                declared: d,
+                is_file,
+                source,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_denied_entry_aborts_before_the_hook() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("/etc/passwd", true)]);
+        let policy = PatchesPolicy::default().with_deny(vec!["/etc/passwd".to_string()]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { what, .. } if what == "/etc/passwd"));
+    }
+
+    #[test]
+    fn an_ignored_entry_reports_ignored() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("/opt/tool/bin", true)]);
+        let policy = PatchesPolicy::default().with_ignore(vec!["/opt/**".to_string()]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Ignored]);
+    }
+
+    #[test]
+    fn an_allowed_entry_reports_allowed() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("/usr/local/bin/tool", true)]);
+        let policy = PatchesPolicy::default().with_allow(vec!["/usr/**".to_string()]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    #[test]
+    fn an_unmatched_entry_without_a_hook_requires_one() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("/home/dev/notes.txt", true)]);
+        let err = gate_task_patch_paths(&entries, PatchesPolicy::default(), None, &NoVars, None)
+            .unwrap_err();
+        assert!(matches!(err, ComposeError::HookRequired { .. }));
+    }
+
+    #[test]
+    fn an_unmatched_entry_with_a_hook_can_be_allowed() {
+        struct Allow;
+        impl crate::core::hooks::PolicyHooks for Allow {
+            fn on_var_unapproved(
+                &self,
+                _: crate::core::policy::VarsPolicy,
+                _: &[Unapproved<'_, str>],
+            ) -> HookResult<crate::core::policy::VarsPolicy> {
+                panic!("var hook should not have been invoked")
+            }
+            fn on_patch_unapproved(
+                &self,
+                _: PatchesPolicy,
+                _: &[Unapproved<'_, camino::Utf8Path>],
+            ) -> HookResult<PatchesPolicy> {
+                HookResult::decided(vec![ItemDecision::AllowOnce])
+            }
+        }
+        let source = project_source();
+        let entries = entries_for(&source, &[("/home/dev/notes.txt", true)]);
+        let (verdicts, _) = gate_task_patch_paths(
+            &entries,
+            PatchesPolicy::default(),
+            Some(&Allow),
+            &NoVars,
+            None,
+        )
+        .unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    #[test]
+    fn a_directory_entry_is_denied_by_a_contained_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let secrets = root.join(".ssh");
+        std::fs::create_dir(secrets.as_std_path()).unwrap();
+        std::fs::write(secrets.join("id_ed25519").as_std_path(), "x").unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(secrets.as_str(), false)]);
+        let policy = PatchesPolicy::default().with_deny(vec![format!("{}/**", secrets)]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }));
+    }
+
+    #[test]
+    fn a_directory_entry_denied_on_its_own_path_stays_denied() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("/srv/data", false)]);
+        let policy = PatchesPolicy::default().with_deny(vec!["/srv/data".to_string()]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }));
+    }
+
+    #[test]
+    fn a_tilde_entry_expands_against_the_home_fallback() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("~/.config/app", true)]);
+        let policy = PatchesPolicy::default().with_allow(vec!["/home/dev/**".to_string()]);
+        let (verdicts, _) =
+            gate_task_patch_paths(&entries, policy, None, &NoVars, Some("/home/dev")).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    #[test]
+    fn a_tilde_entry_without_a_home_fallback_needs_approval() {
+        let source = project_source();
+        let entries = entries_for(&source, &[("~/.config/app", true)]);
+        let err = gate_task_patch_paths(&entries, PatchesPolicy::default(), None, &NoVars, None)
+            .unwrap_err();
+        assert!(matches!(err, ComposeError::HookRequired { .. }));
+    }
+
+    #[test]
+    fn use_rule_rechecks_the_amended_policy() {
+        struct Amend;
+        impl crate::core::hooks::PolicyHooks for Amend {
+            fn on_var_unapproved(
+                &self,
+                _: crate::core::policy::VarsPolicy,
+                _: &[Unapproved<'_, str>],
+            ) -> HookResult<crate::core::policy::VarsPolicy> {
+                panic!("var hook should not have been invoked")
+            }
+            fn on_patch_unapproved(
+                &self,
+                _: PatchesPolicy,
+                _: &[Unapproved<'_, camino::Utf8Path>],
+            ) -> HookResult<PatchesPolicy> {
+                HookResult::decided(vec![ItemDecision::UseRule])
+            }
+        }
+        let source = project_source();
+        let entries = entries_for(&source, &[("/home/dev/notes.txt", true)]);
+        let err = gate_task_patch_paths(
+            &entries,
+            PatchesPolicy::default(),
+            Some(&Amend),
+            &NoVars,
+            None,
+        )
+        .unwrap_err();
+        // UseRule with no recorded rule: still undecided — a contract
+        // error, not a silent allow.
+        assert!(err.to_string().contains("UseRule returned for a patch"));
+    }
+}
