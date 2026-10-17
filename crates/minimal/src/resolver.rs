@@ -1338,6 +1338,38 @@ fn require_operator_account(step: AnswererStep, name: &str, uid: Option<u32>) ->
     }
 }
 
+/// What a channel socket another operator's account owns means: the
+/// host's DNS service is that account's. The same sentence the daemons
+/// say when the socket refuses their connect.
+const FOREIGN_OPERATOR_SERVICE: &str = "the host's DNS service belongs to another account; \
+     hosts with more than one operator are not supported";
+
+/// `step`, unless the channel socket's owner (`owner`) is another
+/// existing account than the operator's (`operator_uid`) — not root, and
+/// `owner_is_account` true: then the service is another operator's, and
+/// reinstalling it would take it over, so the step is unavailable,
+/// saying so. A root-owned socket, or one whose uid names no account, is
+/// a stale or relaxed install the custody check re-surfaces. Pure.
+fn refuse_foreign_operator(
+    step: AnswererStep,
+    owner: Option<u32>,
+    operator_uid: Option<u32>,
+    owner_is_account: bool,
+) -> AnswererStep {
+    if matches!(step, AnswererStep::SourceUnavailable { .. }) {
+        return step;
+    }
+    match owner {
+        Some(owner) if owner != 0 && Some(owner) != operator_uid && owner_is_account => {
+            AnswererStep::SourceUnavailable {
+                service: Box::new(step),
+                reason: FOREIGN_OPERATOR_SERVICE.to_string(),
+            }
+        }
+        _ => step,
+    }
+}
+
 /// Where the answerer program is on this machine, pure over where to look:
 /// beside the running `min` first (a release ships the two together; a dev
 /// build puts them in one target dir), then each directory of `path`. Only
@@ -1824,6 +1856,15 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     // operator whose name resolves to no account leaves the step nothing
     // to offer.
     let step = require_operator_account(step, &operator, operator_uid);
+    // A channel socket another operator's account owns is that operator's
+    // service: no step is offered that would take it over.
+    let owner_is_account = facts.channel_owner.is_some_and(|owner| {
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner))
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let step = refuse_foreign_operator(step, facts.channel_owner, operator_uid, owner_is_account);
     if matches!(step, AnswererStep::SourceUnavailable { .. }) {
         return step;
     }
@@ -8861,6 +8902,55 @@ resolvectl domain minzone0 '~min.internal'
                 .contains("its channel socket at")
                 && failed_check.contains("is owned by uid 0, not the operator's")),
             "a channel socket another account owns fails custody: {step:?}"
+        );
+        // A root-owned socket, or one whose uid names no account, is a
+        // stale or relaxed install: it stays a custody failure, the step
+        // re-runs and re-binds it.
+        assert_eq!(
+            refuse_foreign_operator(step.clone(), Some(0), Some(1000), true),
+            step,
+            "a root-owned channel socket stays a custody failure"
+        );
+        let mut accountless = root_owned_answerer_facts(Some(daemon));
+        accountless.channel_owner = Some(4242);
+        let step = answerer_step_over(&accountless, daemon);
+        assert_eq!(
+            refuse_foreign_operator(step.clone(), Some(4242), Some(1000), false),
+            step,
+            "a channel socket whose owner is no account stays a custody failure"
+        );
+        // One another existing account owns is that operator's service:
+        // the step is unavailable, saying so, and carries nothing that
+        // would take the service over.
+        let other_operator = refuse_foreign_operator(step.clone(), Some(4242), Some(1000), true);
+        assert_eq!(
+            other_operator,
+            AnswererStep::SourceUnavailable {
+                service: Box::new(step),
+                reason: FOREIGN_OPERATOR_SERVICE.to_string(),
+            }
+        );
+        let advisory = advisory_at(
+            &Hook::configured("test", Some(15353), "routes the zone"),
+            15353,
+            false,
+            Some(true),
+            &range_step_on_this_os(),
+            &other_operator,
+            None,
+        )
+        .expect("a host whose DNS service is another operator's is advised");
+        assert!(
+            advisory.contains(
+                "the host's DNS service belongs to another account; hosts with more than \
+                 one operator are not supported"
+            ),
+            "{advisory}"
+        );
+        assert!(
+            !advisory.contains("install the Minimal box-name service")
+                && !advisory.contains("reinstalls it"),
+            "the command carries no answerer step: {advisory}"
         );
         let mut no_socket_node = root_owned_answerer_facts(Some(daemon));
         no_socket_node.channel_mode = None;

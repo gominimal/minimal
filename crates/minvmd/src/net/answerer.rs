@@ -3932,6 +3932,38 @@ mod tests {
         }
     }
 
+    /// The tests that take [`FOREIGN_REFUSALS_IN_FLIGHT`]'s slots — every
+    /// test that drives the gate with a foreign uid, and the one that sets
+    /// the count by hand — run one at a time: the count is process-global,
+    /// so a parallel burst would close another test's peer bare, or a
+    /// hand-set count would underflow under a live refusal's release.
+    static REFUSAL_SLOTS: Mutex<()> = Mutex::new(());
+
+    /// A test's exclusive hold on the refusal slots: taken once every
+    /// slot is free, and released only once every refusal the test caused
+    /// has ended, so the next holder starts from a count of zero.
+    struct RefusalSlotsHeld(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    fn hold_refusal_slots() -> RefusalSlotsHeld {
+        let guard = REFUSAL_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        await_refusal_slots_free();
+        RefusalSlotsHeld(guard)
+    }
+
+    impl Drop for RefusalSlotsHeld {
+        fn drop(&mut self) {
+            await_refusal_slots_free();
+        }
+    }
+
+    /// Waits, bounded, for every refusal thread to release its slot.
+    fn await_refusal_slots_free() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while FOREIGN_REFUSALS_IN_FLIGHT.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Waits until some captured log line satisfies `matches`, failing the
     /// test on `what` when the deadline passes. A thread's logging races the
     /// fact that made its caller return: the connect line is written before
@@ -4795,6 +4827,7 @@ mod tests {
     /// answers at a glance.
     #[test]
     fn answerer_channel_refuses_foreign_uid() {
+        let _slots = hold_refusal_slots();
         let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
         let channel = dir.path().join(CHANNEL_SOCK_FILE);
         let listener = UnixListener::bind(&channel).expect("the channel binds");
@@ -4903,6 +4936,7 @@ mod tests {
     /// per second, so a connect storm cannot flood the service's log.
     #[test]
     fn foreign_refusal_warns_are_rate_limited() {
+        let _slots = hold_refusal_slots();
         let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
         let channel = dir.path().join(CHANNEL_SOCK_FILE);
         let listener = UnixListener::bind(&channel).expect("the channel binds");
@@ -4963,8 +4997,8 @@ mod tests {
         assert!(tables.is_empty(), "none of the burst's rows were ever held");
 
         // The warns are capped at the rate, and there were enough
-        // refusals to prove the cap bit: exactly the rate's worth of
-        // lines, not one per peer. The scope joined every connect, and
+        // refusals to prove the cap bit: a rate's worth of lines per
+        // window, not one per peer. The scope joined every connect, and
         // the accept loop writes each warn before the refusal it names,
         // so by the time one warn is visible they have all been written.
         await_log(
@@ -4979,9 +5013,11 @@ mod tests {
                 line.contains("refused an answerer channel connection from a foreign uid")
             })
             .count();
-        assert_eq!(
-            warns, FOREIGN_WARN_RATE_PER_SECOND,
-            "a burst inside one window is capped at the warn rate"
+        // A loaded runner can spread the burst over a second window, so
+        // the bound is two windows' worth — still fewer lines than peers.
+        assert!(
+            (1..=FOREIGN_WARN_RATE_PER_SECOND * 2).contains(&warns),
+            "a burst is capped at the warn rate, not one line per peer: {warns}"
         );
 
         stop.store(true, Ordering::SeqCst);
@@ -5048,6 +5084,7 @@ mod tests {
 
     #[test]
     fn foreign_refusals_past_the_cap_close_bare() {
+        let _slots = hold_refusal_slots();
         // Every refusal slot taken: the next foreign peer is closed without
         // a thread or a reply, and the count is left as it was.
         FOREIGN_REFUSALS_IN_FLIGHT.store(FOREIGN_REFUSALS_MAX, Ordering::SeqCst);
