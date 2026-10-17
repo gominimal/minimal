@@ -484,7 +484,7 @@ async fn task_producer(
                     .container(planned.plan())
                     .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 let mut cmd = env
-                    .command(&container, &inv.executable, inv.args.iter())
+                    .invocation_command(&container, &inv)
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
                 if let Some(dir) = &start_dir {
                     cmd.current_dir(dir);
