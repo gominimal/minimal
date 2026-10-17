@@ -1531,10 +1531,9 @@ const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
 /// hello is drained unread, on a thread of its own, so a foreign peer that
 /// never writes cannot stall the gate's accept loop.
 fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) {
-    // The channel is world-connectable (its mode grants the connect; this
-    // gate decides), so the refusals in flight are capped: past the cap a
-    // foreign peer is closed bare, and no peer can grow this service's
-    // threads or fds by connecting.
+    // The refusals in flight are capped: past the cap a foreign peer is
+    // closed bare, and no peer can grow this service's threads or fds
+    // by connecting, however connectable the socket's mode left it.
     if FOREIGN_REFUSALS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= FOREIGN_REFUSALS_MAX {
         FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         return;
@@ -1562,6 +1561,15 @@ fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) 
 
 /// The most foreign-peer refusals answered at once ([`refuse_foreign_peer`]).
 const FOREIGN_REFUSALS_MAX: usize = 4;
+
+/// How many foreign-peer warns the accept loop writes per second: a
+/// burst of foreign connects is one operator-readable line's worth of
+/// news, not one line each — the refusals themselves are never limited,
+/// only the warns.
+const FOREIGN_WARN_RATE_PER_SECOND: usize = 4;
+
+/// The window [`FOREIGN_WARN_RATE_PER_SECOND`] is counted over.
+const FOREIGN_WARN_WINDOW: Duration = Duration::from_secs(1);
 
 /// The foreign-peer refusals answering now.
 static FOREIGN_REFUSALS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
@@ -1765,6 +1773,10 @@ fn serve_channel(
         return;
     }
     let mut next: u64 = 0;
+    // The foreign-uid warns this loop wrote inside the current window:
+    // a connect storm is capped at a few lines a second, while every
+    // peer is still refused.
+    let mut foreign_warns: std::collections::VecDeque<Instant> = Default::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -1789,8 +1801,9 @@ fn serve_channel(
                 // The uid gate, before any byte of the peer is read: a
                 // foreign process is refused on what it is, not on what
                 // it says, and the refusal is a warn naming its uid —
-                // the one a misconfigured unit's service user answers at
-                // a glance.
+                // rate-limited, since one line tells the operator as
+                // much as a storm of them — the one a misconfigured
+                // unit's service user answers at a glance.
                 match peer_uid(&stream) {
                     Ok(uid) if uid == expected_uid => {
                         let connection = next;
@@ -1815,13 +1828,24 @@ fn serve_channel(
                         }
                     }
                     Ok(uid) => {
-                        tracing::warn!(
-                            component = COMPONENT,
-                            peer_uid = uid,
-                            service_uid = expected_uid,
-                            "refused an answerer channel connection from a foreign uid; \
-                             only the uid this answerer serves may publish rows"
-                        );
+                        // The warn is rate-limited; the refusal never is.
+                        let now = Instant::now();
+                        while foreign_warns
+                            .front()
+                            .is_some_and(|at| now.duration_since(*at) >= FOREIGN_WARN_WINDOW)
+                        {
+                            foreign_warns.pop_front();
+                        }
+                        if foreign_warns.len() < FOREIGN_WARN_RATE_PER_SECOND {
+                            tracing::warn!(
+                                component = COMPONENT,
+                                peer_uid = uid,
+                                service_uid = expected_uid,
+                                "refused an answerer channel connection from a foreign uid; \
+                                 only the uid this answerer serves may publish rows"
+                            );
+                            foreign_warns.push_back(now);
+                        }
                         refuse_foreign_peer(stream, uid, expected_uid);
                     }
                     Err(error) => {
@@ -4824,6 +4848,98 @@ mod tests {
                     && line.contains(&format!("service_uid={expected_uid}"))
             },
             "the gate never warned about the foreign peer",
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the gate's thread ends when its stop is set");
+    }
+
+    /// A burst of foreign connects is one line's worth of news: every
+    /// peer is refused, but the warns naming them are capped at a few
+    /// per second, so a connect storm cannot flood the service's log.
+    #[test]
+    fn foreign_refusal_warns_are_rate_limited() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        let registered = Arc::new(RegisteredTables::new());
+        let tables = Arc::clone(&registered);
+        // SAFETY: geteuid only reads the process's own uid; the xor flips
+        // the low bit, so this test's connects are foreign.
+        let expected_uid = unsafe { libc::geteuid() } ^ 1;
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-warn-rate".to_string())
+            .spawn(move || {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                serve_channel(
+                    listener,
+                    registered,
+                    expected_uid,
+                    None,
+                    SERVICE_HOLDER,
+                    gate,
+                );
+            })
+            .expect("the gate's thread spawns");
+
+        // A burst inside one window: far more foreign connects than the
+        // warn rate. The connects are made in parallel so they are
+        // accepted back-to-back, inside the window, rather than one per
+        // accept-poll slice apart; past the in-flight cap the later ones
+        // are closed bare (that cap is the other test's proof), but none
+        // is served.
+        let connects = std::thread::scope(|scope| {
+            (0..(FOREIGN_WARN_RATE_PER_SECOND * 4))
+                .map(|_| {
+                    scope.spawn(|| {
+                        connect_and_publish(
+                            &channel,
+                            "vm-a",
+                            vec![published_row("web-a", Ipv4Addr::new(127, 0, 64, 9))],
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|joined| joined.join().expect("the connect's thread ends"))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            connects.iter().all(|connect| connect.is_err()),
+            "every foreign peer of the burst is refused, none served"
+        );
+        assert!(tables.is_empty(), "none of the burst's rows were ever held");
+
+        // The warns are capped at the rate, and there were enough
+        // refusals to prove the cap bit: exactly the rate's worth of
+        // lines, not one per peer. The scope joined every connect, and
+        // the accept loop writes each warn before the refusal it names,
+        // so by the time one warn is visible they have all been written.
+        await_log(
+            &buf,
+            |line| line.contains("refused an answerer channel connection from a foreign uid"),
+            "the gate never warned about the foreign peers",
+        );
+        let warns = buf
+            .contents()
+            .lines()
+            .filter(|line| {
+                line.contains("refused an answerer channel connection from a foreign uid")
+            })
+            .count();
+        assert_eq!(
+            warns, FOREIGN_WARN_RATE_PER_SECOND,
+            "a burst inside one window is capped at the warn rate"
         );
 
         stop.store(true, Ordering::SeqCst);
