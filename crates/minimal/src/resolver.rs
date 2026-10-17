@@ -1357,8 +1357,8 @@ pub(crate) const TEST_ANSWERER_SOURCE: &str = "/opt/minimal-test/bin/minzoned";
 
 /// The control sockets the answerer step asks to release the hook port,
 /// set by the `min finalize-install` run that renders the advisory (its own state dir's
-/// daemons: the VM host daemons, default VM and named VMs alike, or the
-/// native daemon).
+/// daemons: the running VM host daemons, see `running_vm_controls` in
+/// `cmd/session.rs`, or the native daemon).
 static HANDOVER_CONTROLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Records the control sockets the next render's answerer step releases.

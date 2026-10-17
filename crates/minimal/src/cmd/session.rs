@@ -98,6 +98,12 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
 /// succeeds at render time. A refused connection (a leftover file with no
 /// listener) or a missing file is a daemon that is not running; it cannot
 /// hold the hook port, so the script does not ask it to release it.
+///
+/// The probe runs when the script is rendered, not when it runs. A VM
+/// started in between is not in the list, so if its daemon holds the hook
+/// port then, the service start reports that it cannot take the port and
+/// prints the remedy. Listing every enumerated VM instead would make the
+/// release fail on any stopped VM's unreachable control socket.
 pub(crate) fn running_vm_controls(minimal_dir: Option<&std::path::Path>) -> Vec<String> {
     client::enumerate_vm_sockets(minimal_dir, true)
         .unwrap_or_default()
