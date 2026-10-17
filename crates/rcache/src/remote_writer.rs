@@ -34,6 +34,12 @@ const INITIAL_RETRY_BACKOFF_MS: u64 = 2000;
 /// HTTP status returned by GCS when an `if_generation_match` precondition
 /// fails (i.e. the object's generation has changed since we read it).
 const PRECONDITION_FAILED: u16 = 412;
+/// GCS returns 429 when one object name is mutated more than about once a second.
+const TOO_MANY_REQUESTS: u16 = 429;
+/// Retries for a 429 on an artifact write; the collision is another uploader of the
+/// same content, so a short wait is enough.
+const MAX_OBJECT_WRITE_RETRIES: u32 = 5;
+const OBJECT_WRITE_BACKOFF_MS: u64 = 600;
 
 /// HTTP status returned by GCS when reading a non-existent object.
 const NOT_FOUND: u16 = 404;
@@ -147,38 +153,60 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
         if indexed_sha == Some(sha256) {
             return Ok(false); // Cached one is up to date.
         }
+        let object = self
+            .base
+            .join(&format!("{}.zst", hex::encode(sha256)))
+            .unwrap()
+            .object;
+        let local_len = tar_file.metadata().map(|m| m.len()).unwrap_or(0);
         if let Ok(stat) = self
             .backend
-            .open_object(
-                self.base.bucket.clone(),
-                self.base
-                    .join(&format!("{}.zst", hex::encode(sha256)))
-                    .unwrap()
-                    .object,
-            )
+            .open_object(self.base.bucket.clone(), object.clone())
             .send()
             .await
-            && stat.object().size > 1024 * 1024
+            && stat.object().size as u64 == local_len
         {
-            // Object already exists and is large enough to be real, skip the upload.
-            // We still push to the pending-set because while this tarball may exist,
-            // its likely not wired to this spec hash.
+            // The object is content-addressed: the same name with the same length is
+            // the same bytes, so nothing to write. (Only a partial earlier upload
+            // differs in length.) Small identical outputs — several packages
+            // produce the same empty tarball — are the common case here, and
+            // rewriting them from parallel uploaders trips GCS's per-object
+            // mutation rate limit. Still pending: the index may not map this
+            // spec hash to it yet.
             self.pending.push((spec_hash.clone(), sha256));
             return Ok(false);
         }
 
-        self.backend
-            .write_object(
-                self.base.bucket.clone(),
-                self.base
-                    .join(&format!("{}.zst", hex::encode(sha256)))
-                    .unwrap()
-                    .object,
-                tokio::fs::File::from_std(tar_file),
-            )
-            .set_cache_control("public, max-age=7200")
-            .send_buffered()
-            .await?;
+        let mut attempt = 0;
+        loop {
+            let f = tar_file.try_clone().map_err(Error::IO)?;
+            match self
+                .backend
+                .write_object(
+                    self.base.bucket.clone(),
+                    object.clone(),
+                    tokio::fs::File::from_std(f),
+                )
+                .set_cache_control("public, max-age=7200")
+                .send_buffered()
+                .await
+            {
+                Ok(_) => break,
+                Err(e)
+                    if e.http_status_code() == Some(TOO_MANY_REQUESTS)
+                        && attempt < MAX_OBJECT_WRITE_RETRIES =>
+                {
+                    // Another uploader wrote this same object within the last second.
+                    attempt += 1;
+                    let backoff_ms = OBJECT_WRITE_BACKOFF_MS.saturating_mul(1u64 << attempt.min(4));
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        backoff_ms + jitter_ms(backoff_ms),
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(Error::Backend(e)),
+            }
+        }
 
         self.pending.push((spec_hash.clone(), sha256));
         Ok(true)
