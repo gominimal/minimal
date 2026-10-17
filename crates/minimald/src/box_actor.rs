@@ -1053,6 +1053,14 @@ pub struct BoxActor {
     /// [`PACKAGE_CHECK_DEADLINE`] in every build; the test-only switch
     /// above carries a shorter one to drive the expiry path.
     package_check_deadline: std::time::Duration,
+
+    /// Package names the compose-time graph declared, captured by
+    /// [`Self::configure_loadout`] so [`Self::check_composed_packages`]
+    /// can judge the composition's names without re-evaluating the
+    /// project graph — the most expensive step of a compose. `None`
+    /// when compose saw no mfile (or the actor was rebuilt from disk),
+    /// where the check falls back to evaluating the graph itself.
+    composed_graph_names: Option<Arc<[String]>>,
 }
 
 /// Why a session host was launched.
@@ -1153,6 +1161,10 @@ impl BoxActor {
             forwards: Vec::new(),
             check_packages_at_finalize: !cfg!(any(test, feature = "test-support")),
             package_check_deadline: PACKAGE_CHECK_DEADLINE,
+            // Filled by `configure_loadout` from the graph it evaluates;
+            // `None` until then (and forever for an actor restored from
+            // disk, whose compose predates this process).
+            composed_graph_names: None,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -2400,12 +2412,18 @@ impl BoxActor {
                 hooks_enabled,
             )
         };
-        let outcome = match tokio::runtime::Handle::current().runtime_flavor() {
+        let (outcome, graph_names) = match tokio::runtime::Handle::current().runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(scaffold_and_compose)
             }
             _ => scaffold_and_compose(),
         }?;
+        // Set before the outcome match: whichever arm later promotes
+        // this session to `Active` — the one-shot `Ready` here, or the
+        // `Pending` park resuming through `handle_verdict` — the
+        // finalize check judges against the graph this same compose
+        // evaluated, never a re-evaluation.
+        self.composed_graph_names = graph_names.map(Arc::from);
 
         match outcome {
             // The composition is complete: promote the record
@@ -5637,9 +5655,13 @@ impl BoxActor {
     /// not declare, naming each such package and who declared it (the
     /// project or a loadout).
     ///
-    /// Resolves names only, through the lookup the launch uses
-    /// ([`crate::env::session_package`]): nothing is built, and the graph is
-    /// dropped here, since the launch evaluates its own. A context or graph
+    /// Resolves names only: nothing is built, and no graph is retained
+    /// here, since the launch evaluates its own. When
+    /// [`Self::configure_loadout`] captured the compose-time graph's
+    /// names, membership in them answers the same lookup the launch uses
+    /// ([`crate::env::session_package`]) without re-evaluating the graph
+    /// — the most expensive step of a compose — a second time; otherwise
+    /// the check evaluates the graph itself, once. A context or graph
     /// that cannot be evaluated at all (an upstream that does not resolve)
     /// is not judged here; the launch reports it, as it did before this
     /// check existed — and so is one that does not resolve within
@@ -5648,7 +5670,10 @@ impl BoxActor {
     /// round-trip's other deadline is the client's, and its expiry does not
     /// cancel the daemon-side finalize. An expired check steps aside,
     /// warned, and the launch resolves the names at first exec, as it
-    /// always has.
+    /// always has. Because tokio polls the check before its timer, expiry
+    /// is not left to the race between them: the check measures its own
+    /// budget first, and a deadline already lapsed steps aside before any
+    /// verdict.
     ///
     /// Returns `Ok(true)` when the check stepped aside (expired deadline,
     /// no session context, or no package graph) so the client can warn the
@@ -5658,50 +5683,88 @@ impl BoxActor {
         if comp.packages().is_empty() {
             return Ok(false);
         }
+        let started = std::time::Instant::now();
         let checked: Result<Result<bool, std::io::Error>, _> =
             tokio::time::timeout(self.package_check_deadline, async {
-                let ctx = match self.build_context(true).await {
-                    Ok(ctx) => ctx,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "package check skipped at finalize: no session context"
-                        );
-                        return Ok(true);
-                    }
-                };
-                // CPU-heavy (nickel evaluation), so on the blocking pool, as the
-                // launch runs it.
-                let graph = crate::traced::spawn_blocking(move || {
-                    let mut ctx = ctx;
-                    ctx.graph_from_all_packages().map_err(|e| e.to_string())
-                })
-                .await
-                .map_err(std::io::Error::other)?;
-                let graph = match graph {
-                    Ok(graph) => graph,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "package check skipped at finalize: no package graph"
-                        );
-                        return Ok(true);
-                    }
-                };
-                let unknown: Vec<String> = comp
-                    .packages()
-                    .iter()
-                    .filter_map(|p| {
-                        crate::env::session_package(&graph, p.package())
-                            .err()
-                            .map(|e| {
-                                format!(
-                                    "{e} (declared by {})",
-                                    boxes::core::source::Provenanced::source(p)
+                // The budget check first: tokio polls this future before
+                // its timer, and judging the captured names (the match
+                // below) is cheap enough to complete within that first
+                // poll, so an already-lapsed deadline — a
+                // `Duration::ZERO` switch — would never fire against it
+                // (see the expiry test). Measuring costs nothing on the
+                // slow fallback, which the timeout bounds anyway.
+                if started.elapsed() >= self.package_check_deadline {
+                    return Ok(true);
+                }
+                let unknown: Vec<String> = match self.composed_graph_names.as_ref() {
+                    Some(known) => {
+                        let declared: Vec<(String, String)> = comp
+                            .packages()
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p.package().to_string(),
+                                    boxes::core::source::Provenanced::source(p).to_string(),
                                 )
                             })
-                    })
-                    .collect();
+                            .collect();
+                        let known = Arc::clone(known);
+                        crate::traced::spawn_blocking(move || {
+                            declared
+                                .into_iter()
+                                .filter(|(name, _)| !known.contains(name))
+                                .map(|(name, source)| {
+                                    format!("no such package: {name} (declared by {source})")
+                                })
+                                .collect()
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?
+                    }
+                    None => {
+                        let ctx = match self.build_context(true).await {
+                            Ok(ctx) => ctx,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "package check skipped at finalize: no session context"
+                                );
+                                return Ok(true);
+                            }
+                        };
+                        // CPU-heavy (nickel evaluation), so on the blocking pool, as
+                        // the launch runs it.
+                        let graph = crate::traced::spawn_blocking(move || {
+                            let mut ctx = ctx;
+                            ctx.graph_from_all_packages().map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?;
+                        let graph = match graph {
+                            Ok(graph) => graph,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "package check skipped at finalize: no package graph"
+                                );
+                                return Ok(true);
+                            }
+                        };
+                        comp.packages()
+                            .iter()
+                            .filter_map(|p| {
+                                crate::env::session_package(&graph, p.package())
+                                    .err()
+                                    .map(|e| {
+                                        format!(
+                                            "{e} (declared by {})",
+                                            boxes::core::source::Provenanced::source(p)
+                                        )
+                                    })
+                            })
+                            .collect()
+                    }
+                };
                 if unknown.is_empty() {
                     return Ok(false);
                 }
