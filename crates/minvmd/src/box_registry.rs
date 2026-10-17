@@ -6914,6 +6914,7 @@ mod tests {
         );
 
         let again = persisted_registry(&dir);
+        again.spawn_withdrawal_drainer(|_| {});
         let claim = again.begin_registration("web");
         again
             .resume_client_box(
