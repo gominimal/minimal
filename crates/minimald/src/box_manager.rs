@@ -3100,11 +3100,13 @@ pub(crate) mod tests {
     /// promotion hostage to work the client has stopped waiting for.
     ///
     /// A zero deadline pins the expiry path without a slow graph to wait
-    /// out: the check body gets its single poll before the deadline fires
-    /// (tokio polls the future before the delay), and cannot complete
-    /// within it, since its graph evaluation round-trips the blocking
-    /// pool. The composition names an unknown package so a check that
-    /// ignored its deadline would refuse instead of activate.
+    /// out: the check measures its budget before any judging, and an
+    /// already-lapsed deadline steps aside at that first measurement —
+    /// deterministically, because tokio polls the check once before its
+    /// timer, so the zero-duration timer alone cannot be relied on to
+    /// fire first against judging this cheap. The composition names an
+    /// unknown package so a check that ignored its deadline would refuse
+    /// instead of activate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finalize_with_an_expired_package_check_still_activates() {
         let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
