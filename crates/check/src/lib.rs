@@ -270,7 +270,7 @@ impl CheckCache {
             (bsr, lib_path.to_path_buf()),
             || -> Result<Arc<HashSet<String>>, anyhow::Error> {
                 let full_path = dep_path.join(lib_path);
-                let data = std::fs::read(&full_path)
+                let data = map_output(&full_path)
                     .map_err(|e| anyhow!("reading library {}: {e}", full_path.display()))?;
                 let elf = object::File::parse(&*data)
                     .map_err(|e| anyhow!("parsing {}: {e}", full_path.display()))?;
@@ -315,7 +315,7 @@ impl CheckCache {
 
                 if likely_glibc_stub_lib {
                     let libc_path = dep_path.join("usr/lib/libc.so.6");
-                    let data = std::fs::read(&libc_path)
+                    let data = map_output(&libc_path)
                         .map_err(|e| anyhow!("reading libc {}: {e}", libc_path.display()))?;
                     let libc = object::File::parse(&*data)
                         .map_err(|e| anyhow!("parsing {}: {e}", libc_path.display()))?;
@@ -335,6 +335,47 @@ impl CheckCache {
 
 /// Parameters that remain constant across all checkers within a single
 /// [`run_checks`] invocation.
+/// A file's bytes for ELF/archive parsing, mapped rather than read.
+///
+/// `object`'s parsers touch the header and the tables they walk, so a mapped
+/// file costs those pages; `fs::read` pulled in every byte. A full-catalog check
+/// sweep reads every artifact of every package on both arches, which on a host
+/// with a cold page cache made the sweep disk-bound (build-servers#210: 4x
+/// slower per package than warm, and >90% of check time spent waiting).
+pub(crate) enum OutputBytes {
+    Mapped(memmap2::Mmap),
+    /// `mmap` refuses a zero-length mapping; an empty file is simply empty.
+    Empty,
+}
+
+impl std::ops::Deref for OutputBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            OutputBytes::Mapped(m) => m,
+            OutputBytes::Empty => &[],
+        }
+    }
+}
+
+/// Map `path` read-only (see [`OutputBytes`]).
+pub(crate) fn map_output(path: &Path) -> std::io::Result<OutputBytes> {
+    let f = std::fs::File::open(path)?;
+    if f.metadata()?.len() == 0 {
+        return Ok(OutputBytes::Empty);
+    }
+    // SAFETY: the mapped files are committed cache entries (and the outputs of
+    // the build being checked), which nothing rewrites in place while a check
+    // runs; the mapping is read-only and dropped before the check returns.
+    let map = unsafe { memmap2::Mmap::map(&f)? };
+    // The parsers jump between the header and a few tables; default readahead
+    // pulls in a window behind every fault. On a cold sweep of 39 GiB of
+    // artifacts: read whole 123 s / 19 GiB from disk, mapped 48 s / 6.3 GiB,
+    // mapped + random 26 s / 1.8 GiB. Advisory, so a refusal is ignored.
+    let _ = map.advise(memmap2::Advice::Random);
+    Ok(OutputBytes::Mapped(map))
+}
+
 #[derive(Clone)]
 pub struct CheckCtx {
     pub filter_names: Vec<String>,
