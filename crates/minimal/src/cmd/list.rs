@@ -600,26 +600,32 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         }
         read
     };
-    // A listing whose status read answered takes its verdict from that
-    // status below, so it hands the daemon-report verdict nothing to decide
-    // — each listing pays one detection, not one here and one below.
     let mut surfaces = if args.json || args.raw {
         Vec::new()
     } else {
-        crate::resolver::live_name_surfaces(listings.iter().zip(&vm_answerers).map(
-            |(listing, status)| match status {
-                Some(_) => (None, false),
-                None => (listing.resp.zone_answerer_port, listing.resp.answerer_bound),
-            },
-        ))
+        crate::resolver::live_name_surfaces(
+            listings
+                .iter()
+                .map(|listing| (listing.resp.zone_answerer_port, listing.resp.answerer_bound)),
+        )
         .await
     };
     // One verdict per VM from that VM's own status, over the verdict its
     // daemon's report would have decided: the read that cannot be made —
     // no control socket, the deadline, a daemon that predates the verb —
-    // keeps the silence a daemon-report verdict is, for that VM alone.
+    // keeps the silence a daemon-report verdict is, for that VM alone. A
+    // listing whose own daemon reports an answerer port — a native
+    // minimald, whose control socket the fallback listing reads too —
+    // keeps the daemon-report verdict above, the precedence its
+    // `DNS SERVICE` row prints with: its answerer is that daemon's own
+    // report, and the status read would only pay the list's detection a
+    // second time and swap the daemon's bound report for a liveness query
+    // keyed on the VM host's row.
     for (index, reply) in vm_answerers.iter().enumerate() {
         if let Some(reply) = reply
+            && listings
+                .get(index)
+                .is_some_and(|listing| listing.resp.zone_answerer_port.is_none())
             && let Some(slot) = surfaces.get_mut(index)
         {
             *slot = crate::resolver::vm_host_name_surface(reply.clone()).await;
