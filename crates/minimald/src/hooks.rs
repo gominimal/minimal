@@ -271,6 +271,8 @@ const OUTPUT_TAIL_BYTES: usize = 4096;
 /// than per hook. Each script still gets at most its own timeout, but
 /// never more than what is left; once the budget is spent the remaining
 /// hooks are reported [`HookStatus::NotRun`] without being started.
+/// Collecting a hook's output can add up to [`TAIL_JOIN_BUDGET`] after
+/// its deadline.
 ///
 /// Teardown passes one. A per-script cap alone bounds nothing in
 /// aggregate — nothing limits how many hooks a composition may carry,
@@ -309,7 +311,8 @@ pub(crate) async fn run_hooks<C: BoxCommands>(
             .script_of(ph.hook())
             .expect("filtered to hooks with a script for this event");
         // A hook gets the smaller of its own timeout and what remains of
-        // the run's budget, so the last hook cannot extend past it.
+        // the run's budget, so the last hook cannot extend past it by
+        // more than the `TAIL_JOIN_BUDGET` its output collection takes.
         let allowed = match deadline {
             None => script.timeout(),
             Some(d) => {
@@ -553,9 +556,26 @@ async fn run_one<C: BoxCommands>(
         }
     };
 
-    // Write the script, then close stdin — an interpreter reads to EOF
-    // before it runs anything, so a hook that never terminates cannot be
-    // blamed on a stdin left open.
+    // What the hook printed must survive the timeout. `wait_with_output`
+    // reads the pipes through the same future that waits, and dropping
+    // it at the deadline drops the bytes it had already read with it —
+    // the empty `TimedOut` report. So the pipes are drained by their own
+    // tasks, keeping only the tail ([`OUTPUT_TAIL_BYTES`]), while the
+    // deadline waits on the child alone. The reading has to happen
+    // concurrently: a hook that prints past the pipe's own buffer would
+    // block on the write until it is drained. It also has to start
+    // before the script is written: `sh -s` runs commands as it reads
+    // them, so a body larger than the stdin pipe whose early commands
+    // fill stdout would otherwise block both pipes until the deadline.
+    let mut readers = capturing.then(|| {
+        (
+            spawn_tail_reader(child.stdout.take()),
+            spawn_tail_reader(child.stderr.take()),
+        )
+    });
+
+    // Write the script, then close stdin, so a hook that never
+    // terminates cannot be blamed on a stdin left open.
     //
     // Bounded by the same deadline as the run itself: an interpreter that
     // never reads its stdin leaves this blocked once the body outgrows the
@@ -576,25 +596,12 @@ async fn run_one<C: BoxCommands>(
         if let Some(reason) = failed {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return outcome(HookStatus::NotRun { reason });
+            let mut o = outcome(HookStatus::NotRun { reason });
+            o.output = joined_tail(&mut readers).await;
+            return o;
         }
         drop(stdin);
     }
-
-    // What the hook printed must survive the timeout. `wait_with_output`
-    // reads the pipes through the same future that waits, and dropping
-    // it at the deadline drops the bytes it had already read with it —
-    // the empty `TimedOut` report. So the pipes are drained by their own
-    // tasks, keeping only the tail ([`OUTPUT_TAIL_BYTES`]), while the
-    // deadline waits on the child alone. The reading has to happen
-    // concurrently: a hook that prints past the pipe's own buffer would
-    // block on the write until it is drained.
-    let mut readers = capturing.then(|| {
-        (
-            spawn_tail_reader(child.stdout.take()),
-            spawn_tail_reader(child.stderr.take()),
-        )
-    });
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
@@ -709,6 +716,15 @@ fn spawn_tail_reader(
                     let excess = buf.len().saturating_sub(OUTPUT_TAIL_BYTES);
                     if excess > 0 {
                         buf.drain(..excess);
+                        // The cut is a raw byte offset; drop the rest of
+                        // a UTF-8 sequence it split, so the tail does not
+                        // open on a replacement character.
+                        let split = buf
+                            .iter()
+                            .take(3)
+                            .take_while(|b| (**b & 0xC0) == 0x80)
+                            .count();
+                        buf.drain(..split);
                     }
                 }
             }
@@ -1368,6 +1384,68 @@ mod tests {
         })
         .await
         .expect("the reader task outlived its handle");
+    }
+
+    /// The reader trims at a raw byte offset; a cut that splits a UTF-8
+    /// sequence must not leave its continuation bytes to open the tail
+    /// as a replacement character.
+    #[tokio::test]
+    async fn tail_reader_does_not_keep_a_split_utf8_sequence() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut writer, pipe) = tokio::io::duplex(64 * 1024);
+        let mut reader = spawn_tail_reader(Some(pipe));
+        // One byte plus 2049 two-byte chars: 4099 bytes, so the raw
+        // cut of 3 lands inside the first `é`.
+        let mut data = b"a".to_vec();
+        data.extend_from_slice("é".repeat(OUTPUT_TAIL_BYTES / 2 + 1).as_bytes());
+        writer.write_all(&data).await.unwrap();
+        drop(writer);
+        (&mut reader.join).await.unwrap();
+        let buf = reader.tail.lock().unwrap().clone();
+        let tail = tail_of(&buf, &[]);
+        assert!(
+            tail.starts_with('é') && !tail.contains('\u{FFFD}'),
+            "{:?}",
+            &tail[..8.min(tail.len())],
+        );
+    }
+
+    /// `sh -s` runs commands as it reads them, so a script larger than
+    /// the stdin pipe whose early commands fill stdout needs its output
+    /// drained while the body is still being written.
+    #[tokio::test]
+    async fn large_script_that_prints_early_is_not_stalled_on_its_pipes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        let mut body = String::from("head -c 262144 /dev/zero | tr '\\0' x; echo\n");
+        for _ in 0..8192 {
+            body.push_str("# padding to outgrow the stdin pipe buffer\n");
+        }
+        body.push_str("echo finished\n");
+        let script = HookScript::inline(&body)
+            .with_timeout(Duration::from_secs(30))
+            .unwrap();
+        let hook = LifecycleHook::builder()
+            .with_on_activate(script)
+            .build()
+            .unwrap();
+        let comp = composition_of(vec![ProvenancedHook::new(hook, loadout("dev"))]);
+
+        let outcomes = run_hooks(
+            &HostCommands,
+            &ctx(&comp, dir),
+            HookEvent::Activate,
+            HookOutput::Capture,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcomes[0].status, HookStatus::Ok),
+            "{:?}",
+            outcomes[0].status,
+        );
+        assert!(outcomes[0].output.contains("finished"));
     }
 
     /// Setup runs project-first; teardown runs the exact reverse.
