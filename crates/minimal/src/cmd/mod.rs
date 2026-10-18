@@ -994,8 +994,63 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
     )
 }
 
+/// The text for a session-creating RPC that failed because the daemon was
+/// shutting down at that moment — the `min stop` race: an activation sent
+/// while the daemon tears down loses that race, and the raw chain beneath
+/// (a refused RPC, the daemon-side refusal, "shutting down") reads like an
+/// internal error rather than the lost race it is. The daemon marks its
+/// shutdown refusals with a single constant the client can match on, so the
+/// race is named here in one plain sentence. Any other failure keeps the
+/// chain, wrapped exactly as before.
+pub(crate) fn session_rpc_failed(rpc: &str, error: anyhow::Error) -> anyhow::Error {
+    if error
+        .chain()
+        .any(|cause| cause.to_string().contains(minimald_rpc::SHUTDOWN_REFUSAL))
+    {
+        return anyhow::anyhow!(
+            "{rpc} failed because the daemon was shutting down, so no session \
+             was created. Run the command again once the daemon is running."
+        );
+    }
+    error.context(format!("{rpc} RPC failed"))
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::session_rpc_failed;
+
+    /// An RPC refused because the daemon was shutting down — the `min stop`
+    /// race — surfaces as one plain sentence, not the raw RPC chain. The
+    /// refusal reaches the client as the daemon-side stderr text, wrapped in
+    /// the transport failure, so the test builds that chain and checks the
+    /// mapping keys on the refusal marker rather than the wrapping.
+    #[test]
+    fn a_shutdown_raced_rpc_failure_names_the_lost_race() {
+        let raw = anyhow::anyhow!(
+            "minimald-v1-ConfigureLoadout RPC failed on the daemon side: Internal error: {}",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed("ConfigureLoadout", raw);
+        assert_eq!(
+            error.to_string(),
+            "ConfigureLoadout failed because the daemon was shutting down, so no session \
+             was created. Run the command again once the daemon is running."
+        );
+    }
+
+    /// Any other RPC failure keeps its chain, wrapped exactly as before:
+    /// only the shutdown race is reworded.
+    #[test]
+    fn an_ordinary_rpc_failure_keeps_its_chain() {
+        let raw = anyhow::anyhow!("the daemon exploded");
+        let error = session_rpc_failed("CreateSession", raw);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+        assert_eq!(
+            error.source().map(|source| source.to_string()),
+            Some("the daemon exploded".to_string())
+        );
+    }
+
     /// NET-129: the activate warning for a yielded shared-address port is a
     /// `warning:` line naming the port, the box that holds it, and the way
     /// out of the collision: a different external port, since the check keys

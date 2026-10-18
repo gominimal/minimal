@@ -871,7 +871,7 @@ pub(crate) async fn activate_session(
                         .and_then(|registration| registration.box_id),
                 )
                 .await;
-                return Err(error.context("CreateSession RPC failed"));
+                return Err(session_rpc_failed("CreateSession", error));
             }
         };
         match resp {
@@ -1418,7 +1418,7 @@ pub(crate) async fn activate_session(
                     .and_then(|registration| registration.box_id),
             )
             .await;
-            return Err(error.context("ConfigureLoadout RPC failed"));
+            return Err(session_rpc_failed("ConfigureLoadout", error));
         }
         Ok(configured) => configured,
     };

@@ -1053,7 +1053,7 @@ impl BoxManager {
         if self.in_shutdown.is_cancelled() {
             return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
-                "in shutdown",
+                minimald_rpc::SHUTDOWN_REFUSAL,
             ));
         }
         let Some(handle) = self.store.find(pred.into()).await? else {
@@ -1211,7 +1211,7 @@ impl BoxManager {
         if self.in_shutdown.is_cancelled() {
             return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
-                "in shutdown",
+                minimald_rpc::SHUTDOWN_REFUSAL,
             ));
         }
         // NET-079: a host that decides per box refuses a host-address
@@ -1422,7 +1422,7 @@ impl BoxManager {
                     if self.in_shutdown.is_cancelled() {
                         return Err(BoxManagerError::new(
                             std::io::ErrorKind::ConnectionRefused,
-                            "in shutdown",
+                            minimald_rpc::SHUTDOWN_REFUSAL,
                         ));
                     }
                     let handle =
