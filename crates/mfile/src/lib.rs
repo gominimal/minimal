@@ -1116,9 +1116,14 @@ impl File {
     /// atomic (temp file + rename), so a concurrent reader never sees a
     /// torn file and cannot write a partial view back.
     ///
-    /// The lock is best-effort: on a filesystem without `flock` support
-    /// the edit runs unlocked after a warning, still with the atomic
-    /// write. It only excludes processes that share the state directory,
+    /// The lock is best-effort. The edit runs unlocked after one warning,
+    /// still with the atomic write, when the lock cannot be had: the state
+    /// directory cannot be resolved (no `HOME`), the lock directory or lock
+    /// file cannot be created or opened (a read-only or unwritable state
+    /// directory, as in a daemon whose `HOME` is `/`), or the filesystem
+    /// does not support `flock`. Errors reading or writing `path` itself
+    /// still fail the edit. The lock only excludes processes that share the
+    /// state directory,
     /// so an edit made inside a session VM does not exclude one made on
     /// the host. The rename keeps the file's mode, but not its owner, ACLs
     /// or extended attributes.
@@ -1134,25 +1139,16 @@ impl File {
     where
         E: From<Error>,
     {
-        let Some(state) = paths::try_minimal_state_dir() else {
-            return Err(Error::IO(
-                "locking",
-                path.to_path_buf(),
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "cannot find the Minimal state directory (is HOME set?)",
-                ),
-            )
-            .into());
-        };
-        let lock_dir = AsRef::<Path>::as_ref(&state).join("mfile-locks");
-        Self::edit_exclusively_in(&lock_dir, path, edit)
+        let lock_dir = paths::try_minimal_state_dir()
+            .map(|state| AsRef::<Path>::as_ref(&state).join("mfile-locks"));
+        Self::edit_exclusively_in(lock_dir.as_deref(), path, edit)
     }
 
     /// [`File::edit_exclusively`] with the lock directory passed in, so
-    /// tests do not write to the real state directory.
+    /// tests do not write to the real state directory. `None` means the
+    /// state directory could not be resolved, and the edit runs unlocked.
     fn edit_exclusively_in<E>(
-        lock_dir: &Path,
+        lock_dir: Option<&Path>,
         path: &Path,
         edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
     ) -> Result<(), E>
@@ -1186,7 +1182,17 @@ impl File {
             .unwrap_or_else(|| PathBuf::from("."));
 
         // Held until this function returns, so across the write below.
-        let _lock = Self::lock_for(lock_dir, path)?;
+        let _lock = match lock_dir {
+            Some(lock_dir) => Self::lock_for(lock_dir, path)?,
+            None => {
+                tracing::warn!(
+                    "cannot find the Minimal state directory (is HOME set?); editing {} without \
+                     the lock",
+                    path.display()
+                );
+                None
+            }
+        };
 
         let content = match std::fs::read_to_string(path) {
             Ok(s) => Some(s),
@@ -1233,8 +1239,10 @@ impl File {
 
     /// Takes the exclusive lock for the canonical `path`, saying so on
     /// stderr before it waits for another process to release it. `None`
-    /// means the lock file's filesystem does not support `flock`, and the
-    /// caller edits unlocked.
+    /// means the lock cannot be had, because the lock directory or file
+    /// cannot be created or opened (a read-only or unwritable state
+    /// directory) or the filesystem does not support `flock`; it warns once
+    /// and the caller edits unlocked.
     fn lock_for(lock_dir: &Path, path: &Path) -> Result<Option<std::fs::File>, Error> {
         use sha2::Digest as _;
         let digest = sha2::Sha256::digest(path.as_os_str().as_bytes());
@@ -1242,11 +1250,12 @@ impl File {
         let lock_path = lock_dir.join(format!("{name}.lock"));
 
         if let Err(e) = std::fs::create_dir_all(lock_dir) {
-            return Err(Error::IO(
-                "creating lock directory",
-                lock_dir.to_path_buf(),
-                e,
-            ));
+            tracing::warn!(
+                "cannot create lock directory {} ({e}); editing {} without the lock",
+                lock_dir.display(),
+                path.display()
+            );
+            return Ok(None);
         }
         let file = match std::fs::OpenOptions::new()
             .create(true)
@@ -1256,7 +1265,14 @@ impl File {
             .open(&lock_path)
         {
             Ok(f) => f,
-            Err(e) => return Err(Error::IO("opening lock", lock_path, e)),
+            Err(e) => {
+                tracing::warn!(
+                    "cannot open lock {} ({e}); editing {} without the lock",
+                    lock_path.display(),
+                    path.display()
+                );
+                return Ok(None);
+            }
         };
 
         let locked = match file.try_lock() {
@@ -2931,7 +2947,7 @@ mod tests {
         path: &Path,
         edit: impl FnOnce(Option<&str>) -> Result<Option<String>, Error>,
     ) -> Result<(), Error> {
-        File::edit_exclusively_in(TEST_LOCK_DIR.path(), path, edit)
+        File::edit_exclusively_in(Some(TEST_LOCK_DIR.path()), path, edit)
     }
 
     #[test]
@@ -3135,5 +3151,61 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![OsString::from(MFILE_NAME)]);
+    }
+
+    /// Edits `minimal.toml` in a fresh directory with `lock_dir` as the
+    /// lock directory and asserts the write landed.
+    fn assert_edit_lands_with_lock_dir(lock_dir: Option<&Path>) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        File::edit_exclusively_in::<Error>(lock_dir, &path, |content| {
+            assert!(content.is_none());
+            Ok(Some("k = \"v\"\n".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = \"v\"\n");
+    }
+
+    #[test]
+    fn edit_exclusively_runs_unlocked_when_the_lock_dir_cannot_be_created() {
+        // A lock directory beneath a regular file cannot be created, even
+        // by root (ENOTDIR), like a state dir on a read-only filesystem.
+        let state = tempdir().unwrap();
+        let blocker = state.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        assert_edit_lands_with_lock_dir(Some(&blocker.join("mfile-locks")));
+    }
+
+    #[test]
+    fn edit_exclusively_runs_unlocked_when_the_lock_dir_is_read_only() {
+        // An existing read-only lock directory: the lock file cannot be
+        // opened (EACCES), unless the test runs as root, which locks.
+        let state = tempdir().unwrap();
+        let lock_dir = state.path().join("mfile-locks");
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert_edit_lands_with_lock_dir(Some(&lock_dir));
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn edit_exclusively_runs_unlocked_without_a_state_dir() {
+        assert_edit_lands_with_lock_dir(None);
+    }
+
+    #[test]
+    fn edit_exclusively_still_fails_when_the_target_cannot_be_written() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join(MFILE_NAME);
+
+        let err = File::edit_exclusively_in::<Error>(None, &path, |_| {
+            Ok(Some("k = \"v\"\n".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::IO(..)), "error: {err:?}");
     }
 }
