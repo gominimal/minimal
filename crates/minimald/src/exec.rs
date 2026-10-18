@@ -406,9 +406,34 @@ fn apply_patch_verdict(
     Ok(())
 }
 
+/// Refuses a task started from inside a box (`min run <task>`) that
+/// declares any patch path.
+///
+/// No client policy runs on that path: the daemon reads the task from the
+/// box's own workspace `minimal.toml`, which anything in the box can edit,
+/// so a verdict is impossible there and every patch is refused rather than
+/// mounted. A task that declares no patches runs as before.
+///
+/// # Errors
+///
+/// The refusal text, naming the task and the host-side command that can
+/// check its patches.
+pub(crate) fn refuse_in_box_patches(
+    task_name: &str,
+    patch: &mfile::EnvPatches,
+) -> Result<(), String> {
+    if patch.dir.is_empty() && patch.file.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "this task declares patches; run it from the host with `min task run {task_name}` so \
+         your patch policy can approve them"
+    ))
+}
+
 #[cfg(test)]
 mod patch_verdict_tests {
-    use super::apply_patch_verdict;
+    use super::{apply_patch_verdict, refuse_in_box_patches};
     use minimald_rpc::taskenv::PatchVerdict;
 
     fn patches(dirs: &[&str], files: &[&str]) -> mfile::EnvPatches {
@@ -468,6 +493,20 @@ mod patch_verdict_tests {
         let v = verdict(&["/opt/cache"], &[]);
         let err = apply_patch_verdict("t", &mut p, Some(&v)).unwrap_err();
         assert!(err.contains("`/etc/shadow`"), "{err}");
+    }
+
+    /// An in-box run refuses any declared patch, dir or file, and names
+    /// the host-side command; a task without patches passes.
+    #[test]
+    fn an_in_box_run_refuses_any_patch() {
+        refuse_in_box_patches("t", &patches(&[], &[])).expect("nothing to refuse");
+        for p in [patches(&["/opt/cache"], &[]), patches(&[], &["~/.netrc"])] {
+            assert_eq!(
+                refuse_in_box_patches("t", &p).unwrap_err(),
+                "this task declares patches; run it from the host with `min task run t` so \
+                 your patch policy can approve them"
+            );
+        }
     }
 }
 

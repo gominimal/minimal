@@ -1463,6 +1463,14 @@ impl BoxChannel {
             Ok(Some(v)) => v,
         };
 
+        // The task came from the box's own workspace minimal.toml, which
+        // anything in the box can edit, and no client checked its patches
+        // against a policy: refuse them all rather than mount host paths.
+        if let Err(e) = crate::exec::refuse_in_box_patches(task_name, &task.patch) {
+            let _ = writeln!(stream, "error: {e}");
+            return;
+        }
+
         let parsed_args = if !task.args.is_empty() {
             match task.args.parse(args) {
                 Err(e) => {
@@ -2729,6 +2737,21 @@ exit $rc
         session: crate::box_actor::WeakBoxHandle,
         name: &str,
     ) -> (TempDir, TempDir, TempDir, BoxChannel) {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        setup_channel_at(
+            session,
+            name,
+            &manifest_dir.join("../mctx/testdata/fakerepo"),
+        )
+    }
+
+    /// [`setup_channel_with`] against the project at `repo` rather than the
+    /// fakerepo fixture, for tests that need a task the fixture lacks.
+    fn setup_channel_at(
+        session: crate::box_actor::WeakBoxHandle,
+        name: &str,
+        repo: &Path,
+    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -2736,7 +2759,7 @@ exit $rc
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
-            .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+            .with_repo_dir(repo.to_path_buf())
             .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
             .with_no_fetch(true)
             .build()
@@ -2783,6 +2806,45 @@ exit $rc
             .lines()
             .map_while(Result::ok)
             .collect()
+    }
+
+    /// An in-box `min run` of a task that declares a patch is refused before
+    /// anything resolves, naming the host-side command. A task without
+    /// patches is not refused for it and goes on to the session, which is
+    /// gone here because the harness's session handle is dangling.
+    #[tokio::test]
+    async fn in_box_run_refuses_a_task_with_patches() {
+        let repo = tempdir().unwrap();
+        let fakepkgs = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mctx/testdata/fakepkgs")
+            .canonicalize()
+            .unwrap();
+        let manifest = format!(
+            "[upstream]\ndir = {:?}\n\n\
+             [tasks.leak]\npackages = [\"uroot\"]\nexec = \"/bbin/date\"\n\
+             patch.dir.\"/home/user/.ssh\" = \"read-only\"\n\n\
+             [tasks.plain]\npackages = [\"uroot\"]\nexec = \"/bbin/date\"\n",
+            fakepkgs.display().to_string()
+        );
+        std::fs::write(repo.path().join("minimal.toml"), manifest).unwrap();
+        for (task, want) in [
+            (
+                "leak",
+                "error: this task declares patches; run it from the host with `min task run \
+                 leak` so your patch policy can approve them",
+            ),
+            ("plain", "error: session is gone"),
+        ] {
+            let (_state, _rootfs, _cwd, mut chan) = setup_channel_at(
+                crate::box_actor::WeakBoxHandle::dangling(),
+                "web",
+                repo.path(),
+            );
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            chan.handle(&format!("run%{task}"), &mut ours).await;
+            drop(ours);
+            assert_eq!(read_lines(&theirs), vec![want.to_string()], "task {task}");
+        }
     }
 
     #[tokio::test]
