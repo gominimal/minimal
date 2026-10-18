@@ -1171,11 +1171,7 @@ impl File {
                 let target = std::fs::read_link(path).unwrap_or_default();
                 let e = std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!(
-                        "{} is a symlink to {}, which does not exist",
-                        path.display(),
-                        target.display()
-                    ),
+                    format!("symlink to {}, which does not exist", target.display()),
                 );
                 return Err(Error::IO("resolving", path.to_path_buf(), e).into());
             }
@@ -3164,8 +3160,14 @@ mod tests {
 
         let err = edit_in_test(&link, |_| Ok(Some("k = \"v\"\n".to_string()))).unwrap_err();
 
-        let msg = err.to_string();
-        assert!(msg.contains(&link.display().to_string()), "error: {msg}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "resolving I/O error at path {}: symlink to {}, which does not exist",
+                link.display(),
+                target.display()
+            )
+        );
         assert!(
             std::fs::symlink_metadata(&link).unwrap().is_symlink(),
             "the edit replaced the dangling symlink"
