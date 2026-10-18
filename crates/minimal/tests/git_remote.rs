@@ -89,13 +89,14 @@ async fn git_push_through_min_binary_lands_commit_in_workspace() {
 
 /// `git push <url> <refs>...` from `src`, with the `git-remote-min` helper
 /// in `helpers` first on PATH and the daemon socket under `state_home`.
+/// Returns the push's stderr, which carries the hook's `remote:` lines.
 async fn push_refs(
     src: &std::path::Path,
     helpers: &std::path::Path,
     state_home: &std::path::Path,
     url: &str,
     refs: &[&str],
-) {
+) -> String {
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let out = tokio::process::Command::new("git")
         .current_dir(src)
@@ -113,6 +114,7 @@ async fn push_refs(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+    String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
 /// The commit `rev` names in the repo at `cwd`.
@@ -334,4 +336,70 @@ async fn git_first_push_of_several_refs_checks_out_only_the_first() {
         .await
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&feature_ref).trim(), feature_tip);
+}
+
+#[tokio::test]
+async fn git_push_into_detached_head_moves_ref_and_says_so() {
+    // Same harness shape as the tests above.
+    let state_home = tempfile::TempDir::new().unwrap();
+    let sock_dir = state_home.path().join("minimal/providers/local-minimald0");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+
+    let server = TestServer::new().await;
+    server.listen_on_uds(&sock_dir.join("ssh.sock")).await;
+
+    let mut client = server.connect().await;
+    let session_id = create_configured_session(&mut client, "git-push-detached", "/tmp").await;
+
+    let helpers = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_min"),
+        helpers.path().join("git-remote-min"),
+    )
+    .unwrap();
+    let url = format!("min://{session_id}");
+
+    // Populate the workspace with `main` checked out.
+    let src_dir = tempfile::TempDir::new().unwrap();
+    let src = src_dir.path();
+    run_git(src, &["init", "-q", "-b", "main"]).await;
+    run_git(src, &["config", "user.email", "t@example.com"]).await;
+    run_git(src, &["config", "user.name", "Test"]).await;
+    tokio::fs::write(src.join("hello.txt"), b"hi there\n")
+        .await
+        .unwrap();
+    run_git(src, &["add", "hello.txt"]).await;
+    run_git(src, &["commit", "-q", "-m", "first commit"]).await;
+    let first = rev_parse(src, "main").await;
+    push_refs(src, helpers.path(), state_home.path(), &url, &["main"]).await;
+
+    // Detach the workspace HEAD at the first commit. The detached form is
+    // longer than `ref: refs/heads/main\n`, so a plain write replaces it.
+    let sftp = client.open_sftp(session_id).await;
+    sftp.write("/workbench/.git/HEAD", format!("{first}\n").as_bytes())
+        .await
+        .unwrap();
+
+    // Advance `main` and push it.
+    tokio::fs::write(src.join("main2.txt"), b"main two\n")
+        .await
+        .unwrap();
+    run_git(src, &["add", "main2.txt"]).await;
+    run_git(src, &["commit", "-q", "-m", "main second commit"]).await;
+    let main_tip = rev_parse(src, "main").await;
+    let stderr = push_refs(src, helpers.path(), state_home.path(), &url, &["main"]).await;
+
+    // The push says HEAD is detached ...
+    assert!(
+        stderr.contains("remote worktree HEAD is detached; moved refs without checking out"),
+        "push stderr should note the detached HEAD: {stderr}",
+    );
+    // ... HEAD stays detached at the first commit and the worktree is
+    // unchanged ...
+    let head = sftp.read("/workbench/.git/HEAD").await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&head).trim(), first);
+    assert!(sftp.read("/workbench/main2.txt").await.is_err());
+    // ... and the main ref landed at the pushed tip.
+    let main_ref = sftp.read("/workbench/.git/refs/heads/main").await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&main_ref).trim(), main_tip);
 }

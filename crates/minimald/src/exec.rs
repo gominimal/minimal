@@ -2514,6 +2514,7 @@ async fn handle_git_receive(
                 # born, and that branch is the one checked out.
                 cur=$(g symbolic-ref -q HEAD)
                 born=
+                detached_moved=
                 g rev-parse -q --verify HEAD >/dev/null && born=yes
 
                 zero=0000000000000000000000000000000000000000
@@ -2530,7 +2531,10 @@ async fn handle_git_receive(
                     # already moved in receive-pack, so there is nothing more
                     # to do. Only on the still-unborn first push does the
                     # hook check out the first arriving branch.
+                    # A detached HEAD (`cur` empty) matches no branch, so
+                    # every push lands here; note it for the message below.
                     if [ "$ref" != "$cur" ] && [ -n "$born" ]; then
+                        [ -z "$cur" ] && detached_moved=yes
                         continue
                     fi
 
@@ -2562,7 +2566,13 @@ async fn handle_git_receive(
                         continue
                     fi
                     g checkout -qf "$branch"
-                done"#
+                done
+
+                # A detached HEAD stays detached, as with plain git; say so
+                # once, so the pusher knows the worktree did not change.
+                if [ -n "$detached_moved" ]; then
+                    echo "remote worktree HEAD is detached; moved refs without checking out (run git switch <branch> in the session)" >&2
+                fi"#
                     .as_bytes(),
             )
             .await
