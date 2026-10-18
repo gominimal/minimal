@@ -1054,15 +1054,19 @@ mod tests {
     /// workspace upload with "No such file or directory".
     ///
     /// The race is staged without threads: the walk streams through a
-    /// bounded pipe, and `sub/` holds four incompressible files, so
-    /// the first `poll_write` — where `sub/` is deleted — is
-    /// guaranteed to land while the walk is still processing `sub/`'s
-    /// already-listed names, whichever order the filesystem happens to
-    /// return them in. The entries the walk reaches after the deletion
-    /// then hit `NotFound`. Which sites fire varies with readdir order
-    /// (the directory recursion, the file opens, the symlink's
-    /// `read_link`), but at least two of the four files always follow
-    /// the deletion point, so the test is deterministic on any order.
+    /// bounded pipe, and the first `poll_write` deletes `sub/` while
+    /// the first large file the walk reaches is still streaming.
+    /// Where that lands depends on readdir order. If the root yields
+    /// `r1.bin` or `r2.bin` before `sub`, the deletion lands before
+    /// the walk recurses into `sub/`, which then hits the
+    /// subdirectory `read_dir` `NotFound` arm and contributes no
+    /// entries. If `sub` comes first, the deletion lands while `sub/`'s
+    /// already-listed names are being processed, and the names after
+    /// the deletion point hit the `File::open` (and, depending on the
+    /// order inside `sub/`, the `read_link`) `NotFound` arms. Either
+    /// way at most three of `sub/`'s six entries precede the deletion
+    /// point, so the `< 4` assertion holds on any order. No order
+    /// pins one particular per-site arm.
     #[tokio::test]
     async fn stream_skips_entries_vanishing_mid_walk() {
         let dir = tempfile::TempDir::new().unwrap();
