@@ -6938,6 +6938,7 @@ async fn await_served(served: &std::sync::Mutex<Vec<String>>, count: usize) -> V
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes_it() {
+    let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let (manager, holder, yielder, published) = shared_port_pair(&server, &mut client).await;
@@ -7009,6 +7010,21 @@ async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes
     assert!(
         recorded,
         "the box's record names the port it bound at the hand-over"
+    );
+
+    // The hand-over says its info line with the plain box name, the one a
+    // diagnostics bundle's grep is written against — never a Debug-rendered
+    // Option.
+    let logged = capture.contents();
+    let hand_over_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("bound the shared-address port this box took over while it runs")
+        })
+        .unwrap_or_else(|| panic!("the hand-over must say its info line, got: {logged}"));
+    assert!(
+        hand_over_line.contains("session_name=\"yielder\""),
+        "the hand-over names the box that took the port over: {hand_over_line}"
     );
 
     // The box stops for good: the forward bound at the hand-over comes down
@@ -8458,7 +8474,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
         .lines()
         .find(|line| {
             line.contains("the VM host daemon did not admit the port report")
-                && line.contains("name=Some(\"vmrefweb\")")
+                && line.contains("session_name=\"vmrefweb\"")
         })
         .unwrap_or_else(|| panic!("the refused report must say its warn line, got: {logged}"));
     assert!(
