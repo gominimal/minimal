@@ -1236,7 +1236,7 @@ impl BoxManager {
             let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
             REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
-                session_name = ?config.name,
+                session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 network_mode = %config.network.word(),
                 host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
                 refused_unenforceable_creates = refused_unenforceable_creates(),

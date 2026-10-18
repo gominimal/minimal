@@ -1256,7 +1256,7 @@ impl BoxActor {
             let record = obj.record();
             tracing::info!(
                 session = %record.id,
-                session_name = record.name.as_deref().unwrap_or("-"),
+                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 network = %record.network.word(),
                 egress_default_phase = ?boxes::EGRESS_DEFAULT_PHASE,
                 deny_all_opt_out = conf.deny_all_opt_out,
@@ -3804,7 +3804,7 @@ impl BoxActor {
         {
             tracing::warn!(
                 session_id = %record.id,
-                session_name = record.name.as_deref().unwrap_or("-"),
+                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 port,
                 source = ?source,
                 reason = %report,
@@ -4009,7 +4009,7 @@ impl BoxActor {
                 Err(error) => {
                     tracing::warn!(
                         session_id = %record.id,
-                        session_name = record.name.as_deref().unwrap_or("-"),
+                        session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                         %local,
                         %error,
                         action = "shared-address-port-hand-over",
@@ -4029,7 +4029,7 @@ impl BoxActor {
             bound_any = true;
             tracing::info!(
                 session_id = %record.id,
-                session_name = record.name.as_deref().unwrap_or("-"),
+                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 %local,
                 held_by_host,
                 action = "shared-address-port-hand-over",
