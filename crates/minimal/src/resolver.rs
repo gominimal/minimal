@@ -2463,13 +2463,18 @@ pub(crate) const UNDO_SHOWN_BY: &str = "min finalize-install --undo --show --scr
 /// file. `chown root:wheel` and the `0755`/`0644` modes then converge both
 /// files to the exact state the custody checks ([`range_step_over`])
 /// verify, whatever a previous attempt or a tampered host left there. The
-/// boot step loads last: `launchctl bootout` of the old unit first —
+/// boot step loads next: `launchctl bootout` of the old unit first —
 /// guarded, because a first run has nothing to boot out — then `bootstrap`
 /// loads the new unit into the system domain, where launchd starts it at
 /// once, asynchronously, so the range appears on the loopback within about
 /// a second of the script returning, and [`RANGE_UNIT_PLIST`]'s `RunAtLoad`
 /// re-applies it at every boot after. A re-run replaces the unit and
 /// re-runs the program rather than dying on a label collision.
+///
+/// Last, the script flushes the system resolver cache
+/// (`dscacheutil -flushcache`, `killall -HUP mDNSResponder`, each
+/// `|| true`), so a negative answer cached before the resolver file existed
+/// does not outlive it.
 ///
 /// Where the step installs the answerer, its verified copy runs before all
 /// of the above ([`macos_names_steps`]): the copy's checks are the ones that
@@ -2533,7 +2538,8 @@ pub(crate) fn macos_names_steps(port: u16, install: Option<&AnswererInstall>) ->
     // file on its own schedule and keeps its negative cache, so ask the
     // system to re-read the first and drop the second.
     script.push_str(
-        "# Reload the resolver: the file is read on demand, and cached\n\
+        "\n\
+         # Reload the resolver: the file is read on demand, and cached\n\
          # negatives from before it existed must not outlive it.\n\
          dscacheutil -flushcache 2>/dev/null || true\n\
          killall -HUP mDNSResponder 2>/dev/null || true\n",
@@ -6927,8 +6933,15 @@ exit 0
         // Without the answerer step the flush still runs, after the range
         // unit the script installs.
         let bare = macos_names_steps(15353, None);
+        let range_at = bare
+            .find(&format!("launchctl bootstrap system {RANGE_PLIST_PATH}"))
+            .expect("the script loads the range unit");
         for line in [flush, hup] {
-            assert!(bare.contains(line), "{line}: {bare}");
+            let at = bare.find(line).unwrap_or_else(|| panic!("{line}: {bare}"));
+            assert!(
+                range_at < at,
+                "the flush follows the range unit's load: {bare}"
+            );
         }
         // The undo script flushes after the resolver file is gone, so its
         // cached answers do not outlive it.
