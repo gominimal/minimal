@@ -2504,14 +2504,17 @@ async fn handle_git_receive(
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
                 # The branch currently checked out in the worktree, and
-                # whether HEAD is born yet. The first push into a fresh
-                # workspace has no commit on HEAD; each pushed branch must be
-                # created (once) to populate the worktree. After that, a push
-                # to any branch other than the checked-out one must not move
-                # HEAD or touch the worktree.
+                # whether HEAD resolves to a commit (`born`). The first push
+                # into a fresh workspace has no commit on HEAD, so the first
+                # pushed branch that checks out cleanly populates the
+                # worktree and becomes HEAD. After that, a push to any branch
+                # other than the checked-out one must not move HEAD or touch
+                # the worktree. post-receive runs after the refs moved, so a
+                # first push that includes HEAD's own branch already reads as
+                # born, and that branch is the one checked out.
                 cur=$(g symbolic-ref -q HEAD)
-                g rev-parse -q --verify HEAD >/dev/null
-                head_born=$?
+                born=
+                g rev-parse -q --verify HEAD >/dev/null && born=yes
 
                 zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
@@ -2527,7 +2530,7 @@ async fn handle_git_receive(
                     # already moved in receive-pack, so there is nothing more
                     # to do. Only on the still-unborn first push does the
                     # hook check out the first arriving branch.
-                    if [ "$ref" != "$cur" ] && [ "$head_born" -eq 0 ]; then
+                    if [ "$ref" != "$cur" ] && [ -n "$born" ]; then
                         continue
                     fi
 
@@ -2543,7 +2546,7 @@ async fn handle_git_receive(
                             # HEAD is born now: later refs in this same push
                             # are other branches and must not move it.
                             cur=$ref
-                            head_born=0
+                            born=yes
                         else
                             echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
                         fi
