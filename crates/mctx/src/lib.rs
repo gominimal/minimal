@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings, task_arg_env};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
