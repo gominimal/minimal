@@ -3996,7 +3996,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
     assert!(
-        held_ls.contains("DNS SERVICE:     this VM's box names are not answered"),
+        held_ls.contains("DNS SERVICE:     box names are not answered"),
         "a port held by a process no channel reaches is not an answered zone: {held_ls}"
     );
     assert!(

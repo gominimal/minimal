@@ -4383,9 +4383,11 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
         ZoneAnswererStatus::ManagerHeld { port } => Some(format!(
             "Minimal's DNS service answers this VM's box names on 127.0.0.1:{port} (UDP)"
         )),
+        // Worded with no host kind, like [`port_held_no_channel_warning`]:
+        // a native minimald reports this state over the same control
+        // socket, and `min ls` prints it for that host too.
         ZoneAnswererStatus::PortHeldNoChannel { port } => Some(format!(
-            "this VM's box names are not answered: another program holds \
-             127.0.0.1:{port} (UDP)"
+            "box names are not answered: another program holds 127.0.0.1:{port} (UDP)"
         )),
         // The status that carries the hostname proxy's terminal publish
         // failure says nothing about the zone answerer, so the answerer
@@ -5058,8 +5060,7 @@ mod tests {
             .expect("the no-channel state prints its line");
         assert_eq!(
             line,
-            "this VM's box names are not answered: another program holds \
-             127.0.0.1:7656 (UDP)"
+            "box names are not answered: another program holds 127.0.0.1:7656 (UDP)"
         );
         assert!(
             !line.contains("answers") && !line.contains("answering"),
