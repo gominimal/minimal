@@ -2009,7 +2009,7 @@ fn log_node_port_assignment(surface: &str, assigned: &NodePortAssignment) {
     let holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
         .then(|| port_holder(assigned.preferred))
         .flatten()
-        .map(|(pid, exe)| format!("pid {pid} ({exe})"))
+        .map(|(_, holder)| holder)
         .unwrap_or_default();
     tracing::info!(
         surface,
