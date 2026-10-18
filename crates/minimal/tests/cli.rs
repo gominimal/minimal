@@ -117,6 +117,7 @@ async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
 /// control socket beside its ssh socket on either backend, so the read the
 /// cause keys on works against a native minimald the same as against a VM
 /// host daemon.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn finalize_install_names_item_names_the_held_port_a_reachable_daemon_reports() {
     let (daemon, args) = common::setup().await;
