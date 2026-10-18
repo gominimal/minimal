@@ -1079,10 +1079,12 @@ impl BoxManager {
     /// A resumed box with an own address its VM handed it
     /// (`record.box_addresses`) also gets its host launched, detached from
     /// this resume and unattached to any client: the host's launch is what
-    /// attaches the box's shuttle, which marks the box's host-side row
-    /// carried (minvmd's `BoxTable::carry`) and binds its declared ingress
-    /// forwards — so the box's published name keeps answering and its
-    /// ingress binds without waiting for a client's first exec or attach.
+    /// attaches the box's shuttle, whose lease announcement — a gratuitous
+    /// ARP from the box's address, the one frame an idle box sends — marks
+    /// the box's host-side row carried (minvmd's `BoxTable::carry`), and
+    /// the attach binds its declared ingress forwards — so the box's
+    /// published name keeps answering and its ingress binds without waiting
+    /// for a client's first exec or attach.
     /// The row a reloaded host registry reinstated awaits this first frame
     /// under its resume bound, which the VM's cold boot must fit inside.
     ///
@@ -1162,7 +1164,8 @@ impl BoxManager {
             match BoxActor::run(self.session_config(handle)).await {
                 Ok(session) => {
                     // An own-address box's host is what carries its shuttle,
-                    // and with the shuttle the row's first frame — the frame
+                    // and with the shuttle the row's first frame — the lease
+                    // announcement its attach sends (`net::switch`), the frame
                     // that stands the reloaded row and binds the declared
                     // ingress. Launched detached from this resume and never
                     // attached to a client, so the next attach or exec finds
