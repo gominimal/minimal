@@ -7075,7 +7075,7 @@ mod tests {
         assert_eq!(refused.to_string(), minimald_rpc::SHUTDOWN_REFUSAL);
 
         // The same refusal reaches a client's `CreateSession` as the stderr
-        // text the client-side match keys on: the marker ends the message.
+        // text the client-side match keys on, exactly.
         let mut channel = client.open_subsystem(CreateSession::NAME, &[]).await;
         let body = serde_json_lenient::to_vec(&crate::test_harness::create_session_req(
             "after-shutdown",
@@ -7091,9 +7091,10 @@ mod tests {
             }
         }
         let stderr = String::from_utf8_lossy(&err_buf);
-        assert!(
-            stderr.ends_with(minimald_rpc::SHUTDOWN_REFUSAL),
-            "a create refused in shutdown should end with the refusal marker, got {stderr:?}",
+        assert_eq!(
+            stderr,
+            format!("Internal error: {}", minimald_rpc::SHUTDOWN_REFUSAL),
+            "a create refused in shutdown should carry exactly the refusal",
         );
     }
 

@@ -1000,20 +1000,32 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
 /// (a refused RPC, the daemon-side refusal, "shutting down") reads like an
 /// internal error rather than the lost race it is. The daemon marks its
 /// shutdown refusals with a single constant the client can match on, so the
-/// race is named here in plain language, without the RPC's name, which
-/// means nothing to the reader (the debug log keeps it). The refusal is the
-/// whole of the daemon's message, so a cause matches only when it ends with
-/// the marker, not when the same words appear inside other text. Any other
-/// failure keeps the chain, wrapped exactly as before.
+/// race is named here in plain language. The wire carries no structured
+/// refusal, only the daemon's stderr text, so the match is exact: the
+/// error must be the client's daemon-side failure for this very RPC whose
+/// whole daemon message is the refusal. An error that merely ends with the
+/// same words, or wraps them in other causes, is not reworded. The plain
+/// line wraps the original error rather than replacing it, so the full
+/// chain still prints beneath it. Any other failure keeps the chain,
+/// wrapped exactly as before.
 pub(crate) fn session_rpc_failed(rpc: SessionRpc, error: anyhow::Error) -> anyhow::Error {
-    if error
-        .chain()
-        .any(|cause| cause.to_string().ends_with(minimald_rpc::SHUTDOWN_REFUSAL))
-    {
-        tracing::debug!(rpc = rpc.name(), error = %format!("{error:#}"), "refused: the daemon is shutting down");
-        return anyhow::anyhow!(rpc.shutdown_race_message());
+    if error.chain().count() == 1 && error.to_string() == shutdown_refusal_text(rpc) {
+        return error.context(rpc.shutdown_race_message());
     }
     error.context(format!("{} RPC failed", rpc.name()))
+}
+
+/// The exact error `minimal_client`'s oneshot RPC raises when the daemon
+/// refuses `rpc` because it is shutting down: the client's daemon-side
+/// prefix, then the daemon's `ConnectionError::Internal` rendering of
+/// [`minimald_rpc::SHUTDOWN_REFUSAL`].
+fn shutdown_refusal_text(rpc: SessionRpc) -> String {
+    format!(
+        "{}{} RPC failed on the daemon side: Internal error: {}",
+        minimald_rpc::RPC_SUBSYSTEM_PREFIX,
+        rpc.name(),
+        minimald_rpc::SHUTDOWN_REFUSAL
+    )
 }
 
 /// The two session-creating RPCs [`session_rpc_failed`] words a failure of.
@@ -1068,11 +1080,17 @@ mod tests {
             "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {}",
             minimald_rpc::SHUTDOWN_REFUSAL
         );
+        let original = raw.to_string();
         let error = session_rpc_failed(SessionRpc::CreateSession, raw);
         assert_eq!(
             error.to_string(),
             "The daemon was shutting down, so no session was created. \
              Run the command again once the daemon is running."
+        );
+        // The original refusal stays in the chain beneath the plain line.
+        assert_eq!(
+            error.source().map(|source| source.to_string()),
+            Some(original)
         );
     }
 
@@ -1095,9 +1113,37 @@ mod tests {
         );
     }
 
-    /// The marker matches only as the end of the daemon's message: a failure
-    /// that merely mentions the same words inside other text is not the
-    /// shutdown refusal, and keeps its chain.
+    /// An unrelated error whose text merely ends with the marker is not the
+    /// shutdown refusal: it is not the daemon-side failure of this RPC, so
+    /// it keeps its chain. Nor is the refusal of another RPC, or the refusal
+    /// wrapped in other context.
+    #[test]
+    fn an_unrelated_error_ending_with_the_marker_is_not_reworded() {
+        let unrelated = anyhow::anyhow!(
+            "upload workspace: peer said {}",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, unrelated);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+
+        let other_rpc = anyhow::anyhow!(
+            "minimald-v1-ConfigureLoadout RPC failed on the daemon side: Internal error: {}",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, other_rpc);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+
+        let wrapped = anyhow::anyhow!(
+            "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {}",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        )
+        .context("something else failed");
+        let error = session_rpc_failed(SessionRpc::CreateSession, wrapped);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+    }
+
+    /// A failure that merely mentions the marker inside other text is not
+    /// the shutdown refusal either, and keeps its chain.
     #[test]
     fn the_shutdown_marker_inside_other_text_is_not_the_refusal() {
         let raw = anyhow::anyhow!(
