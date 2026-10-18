@@ -1296,7 +1296,7 @@ const KEEPALIVE_MAX: usize = 3;
 /// resetting the clock) is never reaped: a healthy idle attach sees a
 /// keepalive every [`KEEPALIVE_INTERVAL`], long before this fires.
 const INACTIVITY_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30 * 60 * (KEEPALIVE_MAX as u64 + 1));
+    KEEPALIVE_INTERVAL.saturating_mul(KEEPALIVE_MAX as u32 + 1);
 
 /// Builds the shared russh server config from the server state.
 async fn build_russh_config(
@@ -2949,6 +2949,16 @@ mod tests {
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
         super::test_config(dir.path())
+    }
+
+    /// The inactivity deadline is the whole keepalive budget, derived from the
+    /// keepalive settings rather than restated: a healthy idle attach answers a
+    /// keepalive every interval (resetting the clock), so the deadline must
+    /// outlast every keepalive round the budget allows.
+    #[test]
+    fn inactivity_deadline_spans_the_full_keepalive_budget() {
+        assert_eq!(INACTIVITY_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        assert!(INACTIVITY_TIMEOUT > KEEPALIVE_INTERVAL * KEEPALIVE_MAX as u32);
     }
 
     /// The node address's interim opening follows the port the proxy actually
