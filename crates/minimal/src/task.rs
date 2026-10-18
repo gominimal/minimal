@@ -479,6 +479,9 @@ fn resolve_task_patches(
         Err(boxes::core::compose::ComposeError::TaskPatchDotSegment { what, .. }) => {
             bail!(dot_segment_task_patch_message(task_name, &what))
         }
+        Err(boxes::core::compose::ComposeError::TaskPatchUnchecked { what, gap, .. }) => {
+            bail!(unchecked_task_patch_message(task_name, &what, &gap))
+        }
         Err(e) => {
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("gating `patch` for task '{task_name}'"));
@@ -519,6 +522,28 @@ fn dot_segment_task_patch_message(task_name: &str, path: &str) -> String {
          `.` or `..` segment, so your [patches] policy cannot tell what it \
          mounts; declare the path it means without them"
     )
+}
+
+/// The rejection body for a declared patch directory whose files could
+/// not all be checked against `[patches] deny`. Split out for unit tests.
+fn unchecked_task_patch_message(
+    task_name: &str,
+    path: &str,
+    gap: &boxes::core::compose::TaskPatchWalkGap,
+) -> String {
+    use boxes::core::compose::TaskPatchWalkGap;
+    match gap {
+        TaskPatchWalkGap::TooLarge { limit } => format!(
+            "task '{task_name}': cannot check every file in patch directory {path} \
+             against your [patches] deny rules: it holds more than {limit} entries. \
+             Declare a smaller directory inside it, the part the task needs."
+        ),
+        TaskPatchWalkGap::Unreadable { dir, error } => format!(
+            "task '{task_name}': cannot check patch directory {path} against your \
+             [patches] deny rules: {dir} cannot be read ({error}). Make it readable, \
+             or declare a directory that leaves it out."
+        ),
+    }
 }
 
 /// Why a policy refusal could not become a prompt, for the refusal text:
@@ -1971,6 +1996,38 @@ mod tests {
         .expect("an echo task neither resolves nor denies");
 
         assert!(out.is_empty(), "nothing to send: {out:?}");
+    }
+
+    /// A patch directory the deny probe could not finish is refused with
+    /// the reason, and the refusal never suggests dropping a deny rule.
+    #[test]
+    fn an_unchecked_patch_directory_is_reported_with_the_reason() {
+        use boxes::core::compose::TaskPatchWalkGap;
+        let msg = unchecked_task_patch_message(
+            "t",
+            "/data",
+            &TaskPatchWalkGap::TooLarge { limit: 100_000 },
+        );
+        assert_eq!(
+            msg,
+            "task 't': cannot check every file in patch directory /data against your \
+             [patches] deny rules: it holds more than 100000 entries. Declare a smaller \
+             directory inside it, the part the task needs."
+        );
+        let msg = unchecked_task_patch_message(
+            "t",
+            "/data",
+            &TaskPatchWalkGap::Unreadable {
+                dir: "/data/locked".to_owned(),
+                error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+        );
+        assert_eq!(
+            msg,
+            "task 't': cannot check patch directory /data against your [patches] deny \
+             rules: /data/locked cannot be read (permission denied). Make it readable, or \
+             declare a directory that leaves it out."
+        );
     }
 
     /// A denied patch path is reported with the task, the declared path,

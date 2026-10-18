@@ -3108,4 +3108,102 @@ mod gate_task_patch_paths {
         // error, not a silent allow.
         assert!(err.to_string().contains("UseRule returned for a patch"));
     }
+
+    /// An allowed directory holding `n` plain files, with its policy's
+    /// `allow` naming it and `deny` set to `deny`.
+    fn allowed_dir_with_files(
+        tmp: &tempfile::TempDir,
+        n: usize,
+        deny: Vec<String>,
+    ) -> (
+        camino::Utf8PathBuf,
+        crate::core::policy::ExpandedPatchesPolicy,
+    ) {
+        let dir = canonical_root(tmp).join("data");
+        std::fs::create_dir(dir.as_std_path()).unwrap();
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i}")).as_std_path(), "x").unwrap();
+        }
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![dir.to_string()])
+            .with_deny(deny)
+            .expand_with(&NoVars, None)
+            .unwrap();
+        (dir, policy)
+    }
+
+    /// With a deny set, a directory holding more entries than the walk
+    /// visits is refused: the files past the limit went unchecked.
+    #[test]
+    fn a_directory_over_the_walk_limit_is_refused_under_a_deny() {
+        use crate::core::compose::{TaskPatchWalkGap, check_task_patch_dir};
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, policy) = allowed_dir_with_files(&tmp, 4, vec!["/nowhere/**".to_string()]);
+        let source = project_source();
+        let gap = check_task_patch_dir(&policy, &source, &dir, true, 3).unwrap_err();
+        assert!(
+            matches!(gap, TaskPatchWalkGap::TooLarge { limit: 3 }),
+            "{gap}"
+        );
+        // At the limit, every entry was checked.
+        let decision = check_task_patch_dir(&policy, &source, &dir, true, 4).unwrap();
+        assert_eq!(decision, crate::core::policy::PathDecision::Allowed);
+    }
+
+    /// With no deny set, nothing is walked, so a directory over the limit
+    /// keeps its own decision.
+    #[test]
+    fn a_directory_over_the_walk_limit_keeps_its_own_decision_without_a_deny() {
+        use crate::core::compose::check_task_patch_dir;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, policy) = allowed_dir_with_files(&tmp, 4, Vec::new());
+        let source = project_source();
+        let decision = check_task_patch_dir(&policy, &source, &dir, true, 3).unwrap();
+        assert_eq!(decision, crate::core::policy::PathDecision::Allowed);
+    }
+
+    /// With a deny set, a directory holding a subdirectory that cannot be
+    /// read is refused, naming the subdirectory: a file in it could match
+    /// the deny.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_holding_an_unreadable_subdirectory_is_refused_under_a_deny() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let dir = root.join("data");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(locked.as_std_path()).unwrap();
+        std::fs::set_permissions(locked.as_std_path(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        // Root reads it regardless, so there is nothing to refuse.
+        if std::fs::read_dir(locked.as_std_path()).is_ok() {
+            std::fs::set_permissions(locked.as_std_path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            eprintln!("skipped: running as root, a 0o000 directory is readable");
+            return;
+        }
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(dir.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![dir.to_string()])
+            .with_deny(vec!["/nowhere/**".to_string()]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        // Restored first, so the temp dir is removable whatever happens.
+        std::fs::set_permissions(locked.as_std_path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        match err {
+            ComposeError::TaskPatchUnchecked {
+                what,
+                gap: crate::core::compose::TaskPatchWalkGap::Unreadable { dir: at, error },
+                ..
+            } => {
+                assert_eq!(what, dir.as_str());
+                assert_eq!(at, locked.as_str());
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected an unreadable refusal, got {other}"),
+        }
+    }
 }

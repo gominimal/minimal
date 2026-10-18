@@ -529,6 +529,18 @@ pub enum ComposeError {
     /// [`gate_task_patch_paths`].
     #[error("the patch path `{what}` (from {from}) holds a `.` or `..` segment")]
     TaskPatchDotSegment { what: String, from: Source },
+    /// A task's declared `patch.dir` entry could not be checked file by
+    /// file against a `[patches] deny`: the walk of what it holds could
+    /// not finish. The entry is refused rather than mounted unchecked.
+    /// Surfaces from [`gate_task_patch_paths`].
+    #[error(
+        "the patch directory `{what}` (from {from}) cannot be checked against [patches] deny: {gap}"
+    )]
+    TaskPatchUnchecked {
+        what: String,
+        from: Source,
+        gap: TaskPatchWalkGap,
+    },
     /// User cancelled at the prompt.
     #[error("user aborted session construction")]
     Aborted,
@@ -1556,10 +1568,30 @@ pub struct TaskPatchEntry<'a> {
 }
 
 /// Upper bound on the entries a directory walk in [`check_task_patch_dir`]
-/// visits. The walk is a best-effort deny probe of this machine's view of
-/// the directory, so a huge tree stops it rather than stalling every
-/// `min task run`.
-const TASK_PATCH_DIR_WALK_LIMIT: usize = 10_000;
+/// visits, so a huge tree stops the walk rather than stalling every
+/// `min task run`. Reaching it refuses the entry.
+const TASK_PATCH_DIR_WALK_LIMIT: usize = 100_000;
+
+/// Why [`check_task_patch_dir`] could not check every file a directory
+/// holds against `[patches] deny`. Either one refuses the entry
+/// ([`ComposeError::TaskPatchUnchecked`]).
+#[derive(Debug)]
+pub enum TaskPatchWalkGap {
+    /// The directory holds more than `limit` entries.
+    TooLarge { limit: usize },
+    /// The directory at `dir`, the declared one or one inside it, could
+    /// not be read.
+    Unreadable { dir: String, error: std::io::Error },
+}
+
+impl fmt::Display for TaskPatchWalkGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { limit } => write!(f, "it holds more than {limit} entries"),
+            Self::Unreadable { dir, error } => write!(f, "{dir} cannot be read ({error})"),
+        }
+    }
+}
 
 /// Whether a declared key holds a `.` or `..` segment. The daemon hands
 /// the raw key to the OS, which resolves `..` after any symlinked parent,
@@ -1780,22 +1812,32 @@ fn decide_answered_task_patch_forms(
 /// The probe follows a contained symlink to a directory and walks what the
 /// target holds, since the mount keeps the link and so exposes it.
 ///
-/// The probe is best-effort: it stops at the first denial and after
-/// [`TASK_PATCH_DIR_WALK_LIMIT`] entries, and a directory that cannot be
-/// read (missing for a `create_if_missing` mount, or unreadable) is
-/// decided by its own path alone. Only an entry checked with `resolve`
-/// is walked; see [`gate_task_patch_paths`] for why `~/` entries are not.
+/// With no `deny` rule there is nothing to probe for, so the directory's
+/// own decision stands and nothing is walked. With one, the walk must
+/// check every file or the entry is refused: more than `limit` entries
+/// ([`TASK_PATCH_DIR_WALK_LIMIT`] in use), or a directory in the tree that
+/// cannot be read, gives [`TaskPatchWalkGap`]. A directory that is not
+/// found is skipped: a declared one missing for a `create_if_missing`
+/// mount holds nothing yet, and one inside it vanished during the walk.
+/// The walk stops at the first denial. Only an entry checked with
+/// `resolve` is walked; see [`gate_task_patch_paths`] for why `~/`
+/// entries are not.
 fn check_task_patch_dir(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
     dir: &camino::Utf8Path,
     resolve: bool,
-) -> crate::core::policy::PathDecision {
+    limit: usize,
+) -> Result<crate::core::policy::PathDecision, TaskPatchWalkGap> {
     use crate::core::policy::PathDecision;
     let own = check_task_patch_path(expanded, source, dir, resolve);
-    if !resolve || own == PathDecision::Denied {
-        return own;
+    if !resolve || own == PathDecision::Denied || expanded.deny().is_empty() {
+        return Ok(own);
     }
+    let unreadable = |cur: &std::path::Path, error| TaskPatchWalkGap::Unreadable {
+        dir: cur.to_string_lossy().into_owned(),
+        error,
+    };
     // Lossy rather than skipped: a non-UTF-8 name must still meet a `**`
     // deny on its directory.
     let utf8 = |p: &std::path::Path| camino::Utf8PathBuf::from(p.to_string_lossy().into_owned());
@@ -1811,13 +1853,16 @@ fn check_task_patch_dir(
     let mut stack = vec![(dir.as_std_path().to_path_buf(), root_canonical)];
     let mut seen = 0usize;
     while let Some((cur, canonical)) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&cur) else {
-            continue;
+        let read = match std::fs::read_dir(&cur) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable(&cur, e)),
         };
-        for entry in read.flatten() {
+        for entry in read {
+            let entry = entry.map_err(|e| unreadable(&cur, e))?;
             seen += 1;
-            if seen > TASK_PATCH_DIR_WALK_LIMIT {
-                return own;
+            if seen > limit {
+                return Err(TaskPatchWalkGap::TooLarge { limit });
             }
             let file_type = entry.file_type().ok();
             let on_disk = canonical.as_ref().map(|c| c.join(entry.file_name()));
@@ -1832,13 +1877,13 @@ fn check_task_patch_dir(
             // so only a symlink pays for the resolution.
             let is_link = file_type.is_some_and(|t| t.is_symlink());
             if check_task_patch_path(expanded, source, &path, is_link) == PathDecision::Denied {
-                return PathDecision::Denied;
+                return Ok(PathDecision::Denied);
             }
             if let Some(on_disk) = &on_disk
                 && *on_disk != entry.path()
                 && decide_task_patch_path(expanded, source, &utf8(on_disk)) == PathDecision::Denied
             {
-                return PathDecision::Denied;
+                return Ok(PathDecision::Denied);
             }
             if is_link
                 && let Ok(target) = std::fs::canonicalize(entry.path())
@@ -1849,22 +1894,37 @@ fn check_task_patch_dir(
             }
         }
     }
-    own
+    Ok(own)
 }
 
 /// A declared entry's decision: the file form checks its one path, the
 /// directory form also probes the files it currently holds.
+///
+/// # Errors
+///
+/// [`ComposeError::TaskPatchUnchecked`] when a directory's probe could
+/// not finish ([`check_task_patch_dir`]).
 fn check_task_patch_entry(
     expanded: &ExpandedPatchesPolicy,
     entry: &TaskPatchEntry<'_>,
     path: &camino::Utf8Path,
     resolve: bool,
-) -> crate::core::policy::PathDecision {
+) -> Result<crate::core::policy::PathDecision, ComposeError> {
     if entry.is_file {
-        check_task_patch_path(expanded, entry.source, path, resolve)
-    } else {
-        check_task_patch_dir(expanded, entry.source, path, resolve)
+        return Ok(check_task_patch_path(expanded, entry.source, path, resolve));
     }
+    check_task_patch_dir(
+        expanded,
+        entry.source,
+        path,
+        resolve,
+        TASK_PATCH_DIR_WALK_LIMIT,
+    )
+    .map_err(|gap| ComposeError::TaskPatchUnchecked {
+        what: entry.declared.to_owned(),
+        from: entry.source.clone(),
+        gap,
+    })
 }
 
 /// Drive the `[patches]` policy over a task's declared `patch.dir` /
@@ -1915,6 +1975,8 @@ fn check_task_patch_entry(
 ///   path is never preceded by a prompt about its neighbours.
 /// - [`ComposeError::TaskPatchDotSegment`] — a declared key holds a `.`
 ///   or `..` segment. Checked before anything else.
+/// - [`ComposeError::TaskPatchUnchecked`] — a `deny` rule is set and a
+///   directory entry's probe could not check every file it holds.
 /// - [`ComposeError::HookRequired`] — an entry needed approval and there
 ///   was no hook to ask.
 /// - [`ComposeError::Aborted`] — the hook cancelled.
@@ -1967,7 +2029,7 @@ pub fn gate_task_patch_paths(
     for (i, entry) in entries.iter().enumerate() {
         let path = expand_declared(entry.declared);
         let resolve = resolvable(entry.declared);
-        match check_task_patch_entry(&expanded, entry, &path, resolve) {
+        match check_task_patch_entry(&expanded, entry, &path, resolve)? {
             PathDecision::Allowed => verdicts.push(NameVerdict::Allowed),
             PathDecision::Ignored => verdicts.push(NameVerdict::Ignored),
             PathDecision::Denied => {
@@ -2022,7 +2084,7 @@ pub fn gate_task_patch_paths(
             // holds, which its forms alone do not see.
             if rule_used[i] {
                 let path = expand_declared(entry.declared);
-                match check_task_patch_entry(&expanded, entry, &path, resolvable(entry.declared)) {
+                match check_task_patch_entry(&expanded, entry, &path, resolvable(entry.declared))? {
                     PathDecision::NeedsApproval => {}
                     stricter => outcome = outcome.combine(stricter),
                 }
