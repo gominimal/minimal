@@ -1726,6 +1726,10 @@ impl WatchState {
                         // so the row that reads reachable appears only
                         // once the gate admits (NET-044).
                         self.plan.gate.admit_published(port);
+                        // The standing forward serves from here on, so the
+                        // box holds its port of record (NET-129), exactly
+                        // as the fresh publish below records it.
+                        self.plan.record_dynamic_hold(port);
                         if let Some(mapping) = self.forwards.get(&port) {
                             self.plan.publications.list(
                                 port,
@@ -3565,6 +3569,102 @@ mod tests {
             "the record the retry wrote is the publication's whole audit: {:?}",
             audit_records(dir.path())
         );
+    }
+
+    /// NET-129 holds the re-admit to the fresh publish's record: a forward
+    /// whose allow could not be audited stands refused and holds nothing,
+    /// and the retry that writes the record and re-admits it records the
+    /// box as the port's holder at its published address, so a declared
+    /// publish of the port yields to it. The close releases the hold.
+    #[tokio::test]
+    async fn a_re_admitted_unaudited_forward_records_its_dynamic_hold() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::os::unix::fs::symlink(&planted, dir.path().join("audit")).unwrap();
+        let refusing_unexpose = Arc::new(AtomicBool::new(true));
+        let unexpose_flag = Arc::clone(&refusing_unexpose);
+        let sock = dir.path().join("gvproxy.sock");
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/unexpose") && unexpose_flag.load(Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let gate = Arc::new(BoxGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(port),
+            SwitchSubnet::default(),
+            None,
+        ));
+        let registry = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+            "dev", false,
+        )));
+        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let declared = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let watcher = ListenWatcher::start(
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(sock),
+                Arc::clone(&gate),
+                BoxPublications::default(),
+                dir.path().to_path_buf(),
+                Some(Arc::clone(&registry)),
+                holder,
+            ),
+            Leader::Resolved(std::process::id()),
+        );
+
+        // Bound, unwound for the audit, and the unwind's unexpose refused:
+        // the forward stands refused, and the box holds nothing yet.
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/expose"
+        );
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/unexpose"
+        );
+        soon(|| !gate.admits_tcp(port)).await;
+
+        // The log heals: the retry re-admits the standing forward and
+        // records the hold, so a declared publish of the port yields.
+        std::fs::remove_file(dir.path().join("audit")).unwrap();
+        refusing_unexpose.store(false, Ordering::SeqCst);
+        soon(|| gate.admits_tcp(port)).await;
+        let collisions = registry.write().unwrap().publish_own_address(
+            declared,
+            "declared",
+            PUBLISHED,
+            BTreeSet::from([port]),
+        );
+        assert_eq!(
+            collisions.iter().map(|c| c.port).collect::<Vec<_>>(),
+            vec![port],
+            "the declared publish yields to the re-admitted forward's hold"
+        );
+
+        // The listener closes: the hold passes to the declared publisher.
+        drop(listener);
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/unexpose"
+        );
+        soon(|| {
+            registry
+                .read()
+                .unwrap()
+                .holds_shared_port(declared, PUBLISHED, port)
+        })
+        .await;
+        watcher.stop().await;
+        server.abort();
     }
 
     /// NET-046's common unwind: the listen whose `Published` record the log
