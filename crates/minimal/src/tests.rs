@@ -271,6 +271,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
+            // Not a product path: the destroy-race test's own connection to
+            // the harness daemon. The destroy it drives sends no gated RPC —
+            // the race's loser just reports what the daemon said — so the
+            // harness connection carries no gate to record.
+            "cmd/session.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",

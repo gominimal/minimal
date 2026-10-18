@@ -3699,6 +3699,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         record.id,
         record.name.as_deref(),
         record.box_addresses,
+        args.force,
     )
     .await
 }
@@ -3882,6 +3883,7 @@ pub(crate) async fn destroy_all_sessions(
             session.id,
             session.name.as_deref(),
             box_addresses,
+            force,
         )
         .await
         {
@@ -3907,6 +3909,7 @@ pub(crate) async fn destroy_session(
     id: boxes::SessionId,
     name: Option<&str>,
     box_addresses: Option<boxes::BoxAddresses>,
+    force: bool,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
 
@@ -3941,6 +3944,22 @@ pub(crate) async fn destroy_session(
             release_held_box_name(control_sock, id, name, box_addresses).await;
         }
         minimald_rpc::Errorable::Err { error } => {
+            // Two concurrent destroys race inside the daemon: the loser is
+            // told the session is already gone ("no session with ID ...").
+            // The session being destroyed is the goal state, so report it
+            // rather than failing — and under `--force` that leniency is the
+            // explicitly requested behaviour. Any other error stays an error.
+            if error.contains("no session with ID") {
+                let label = match name {
+                    Some(name) => name.to_string(),
+                    None => id.to_string(),
+                };
+                if force {
+                    println!("Session {label} is already destroyed");
+                    return Ok(());
+                }
+                bail!("session {label} is already destroyed")
+            }
             bail!("the daemon reported an error destroying the session: {error}")
         }
     }
@@ -7135,6 +7154,49 @@ mod tests {
             request.session_id,
             Some(id),
             "the release names the session, so it frees only that session's hold"
+        );
+    }
+
+    /// The destroy race's loser: a second destroy of an already-destroyed
+    /// session is told so by the daemon ("no session with ID ...") — the
+    /// goal state, not a failure. Under `--force` the destroy reports it and
+    /// succeeds; without, it fails naming the session.
+    #[tokio::test]
+    async fn a_destroy_of_an_already_destroyed_session_reports_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let mut client = client::Client::connect(&ssh_sock).await.unwrap();
+        let global = GlobalArgs::default();
+
+        // The first destroy wins the race.
+        destroy_session(&mut client, &global, id, Some("web"), None, false)
+            .await
+            .expect("the first destroy succeeds");
+
+        // The loser is told the session is already gone: under `--force`
+        // that is the goal state, reported and not a failure.
+        destroy_session(&mut client, &global, id, Some("web"), None, true)
+            .await
+            .expect("a forced destroy of a destroyed session succeeds");
+
+        // Without `--force` the same answer is an error — one that names
+        // the session rather than forwarding the daemon's internals.
+        let err = destroy_session(&mut client, &global, id, Some("web"), None, false)
+            .await
+            .expect_err("an unforced destroy of a destroyed session fails");
+        assert!(
+            err.to_string().contains("web is already destroyed"),
+            "the error names the session: {err}"
         );
     }
 
