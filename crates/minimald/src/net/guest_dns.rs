@@ -63,6 +63,12 @@ pub const LISTENER_PORT: u16 = ANSWERER_PORT;
 /// schedule, so the listener holds no state for a slow upstream beyond this.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on forwards in flight at once: each holds a socket for up to
+/// [`FORWARD_TIMEOUT`], so a box flooding in-zone A questions at a slow
+/// gateway cannot hold more descriptors than this in the daemon. A question
+/// that finds no room is dropped, and the box's resolver stack retries.
+const MAX_IN_FLIGHT_FORWARDS: usize = 256;
+
 /// Starts the guest's DNS listener on the answerer's port at the guest's
 /// loopback, for the daemon's lifetime, forwarding the zone's A questions to
 /// `subnet`'s gateway.
@@ -118,6 +124,17 @@ pub async fn start(subnet: SwitchSubnet) {
 /// and skipped: a peer that vanished mid-exchange must not take the listener
 /// down.
 async fn serve(socket: Arc<UdpSocket>, gateway: SocketAddr) -> std::io::Result<()> {
+    serve_bounded(socket, gateway, MAX_IN_FLIGHT_FORWARDS).await
+}
+
+/// [`serve`] over a forward bound the caller names — the split the tests
+/// drive, so a saturated bound is reachable without a flood.
+async fn serve_bounded(
+    socket: Arc<UdpSocket>,
+    gateway: SocketAddr,
+    max_in_flight: usize,
+) -> std::io::Result<()> {
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(max_in_flight));
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
@@ -134,10 +151,21 @@ async fn serve(socket: Arc<UdpSocket>, gateway: SocketAddr) -> std::io::Result<(
                 // no other lookup's turn: the relay's discipline, applied to a
                 // listener that has one socket for every peer. The reply is
                 // sent from a clone, so the loop's receive is never taken.
+                // The permit is held for the forward's life, bounding the
+                // sockets a flood can hold open.
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    tracing::debug!(
+                        component = COMPONENT,
+                        %peer,
+                        "dropping a lookup at the guest listener: too many forwards in flight"
+                    );
+                    continue;
+                };
                 let listener = socket.clone();
                 let datagram = datagram.to_vec();
                 drop(crate::traced::spawn(async move {
                     forward(listener, gateway, datagram, peer).await;
+                    drop(permit);
                 }));
                 continue;
             }
@@ -255,9 +283,11 @@ fn answer(query: &Message, rcode: ResponseCode) -> Option<Vec<u8>> {
 /// Forwards one query's datagram to the gateway verbatim and relays the
 /// gateway's reply verbatim: the listener holds no opinion about the wire
 /// format beyond the verdicts above, so an EDNS option or an unknown
-/// record type the verdict let through survives the trip. A reply that
-/// never comes — the timeout, a socket error — is dropped: the box's
-/// resolver stack retries on its own schedule.
+/// record type the verdict let through survives the trip. The forward
+/// socket is connected to the gateway, so the kernel drops a datagram from
+/// any other sender: a process elsewhere in the guest cannot race a forged
+/// answer onto the box. A reply that never comes — the timeout, a socket
+/// error — is dropped: the box's resolver stack retries on its own schedule.
 async fn forward(
     listener: Arc<UdpSocket>,
     gateway: SocketAddr,
@@ -276,7 +306,15 @@ async fn forward(
                 return;
             }
         };
-    if let Err(error) = forward_socket.send_to(&datagram, gateway).await {
+    if let Err(error) = forward_socket.connect(gateway).await {
+        tracing::debug!(
+            component = COMPONENT,
+            %error,
+            "could not connect a forward socket to {gateway}"
+        );
+        return;
+    }
+    if let Err(error) = forward_socket.send(&datagram).await {
         tracing::debug!(
             component = COMPONENT,
             %error,
@@ -285,25 +323,24 @@ async fn forward(
         return;
     }
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let reply =
-        match tokio::time::timeout(FORWARD_TIMEOUT, forward_socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _))) => buf[..len].to_vec(),
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    component = COMPONENT,
-                    %error,
-                    "the gateway {gateway} would not take a forwarded lookup"
-                );
-                return;
-            }
-            Err(_) => {
-                tracing::debug!(
-                    component = COMPONENT,
-                    "a forwarded lookup to {gateway} timed out unanswered"
-                );
-                return;
-            }
-        };
+    let reply = match tokio::time::timeout(FORWARD_TIMEOUT, forward_socket.recv(&mut buf)).await {
+        Ok(Ok(len)) => buf[..len].to_vec(),
+        Ok(Err(error)) => {
+            tracing::debug!(
+                component = COMPONENT,
+                %error,
+                "the gateway {gateway} would not take a forwarded lookup"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(
+                component = COMPONENT,
+                "a forwarded lookup to {gateway} timed out unanswered"
+            );
+            return;
+        }
+    };
     if let Err(error) = listener.send_to(&reply, peer).await {
         tracing::debug!(
             component = COMPONENT,
@@ -497,6 +534,121 @@ mod tests {
             .expect("the relayed reply arrives");
         assert_eq!(&buf[..len], &reply_bytes[..], "the reply is verbatim");
 
+        served.abort();
+    }
+
+    /// A loopback UDP socket on an OS-assigned port.
+    async fn loopback_socket(what: &str) -> UdpSocket {
+        UdpSocket::bind(std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            0,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{what} binds a loopback port: {e}"))
+    }
+
+    /// A reply from anyone but the gateway never reaches the box: the
+    /// forward socket is connected to the gateway, so a forged answer raced
+    /// onto its port is dropped by the kernel, and the gateway's own reply
+    /// is the one the box reads.
+    #[tokio::test]
+    async fn forged_reply_from_a_non_gateway_is_dropped() {
+        let standin = loopback_socket("a stand-in gateway").await;
+        let gateway = standin.local_addr().expect("the stand-in names its port");
+        let listener = loopback_socket("the test listener").await;
+        let relay = listener.local_addr().expect("the listener names its port");
+        let served = crate::traced::spawn(super::serve(listener.into(), gateway));
+
+        let query = query_of(&[("host.min.internal.".to_string(), RecordType::A)]);
+        let datagram = query.to_vec().expect("the query encodes");
+        let box_socket = loopback_socket("a stand-in box").await;
+        box_socket
+            .send_to(&datagram, relay)
+            .await
+            .expect("the box's lookup reaches the listener");
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let (_, from) = tokio::time::timeout(Duration::from_secs(5), standin.recv_from(&mut buf))
+            .await
+            .expect("the gateway is asked")
+            .expect("the forwarded datagram arrives");
+
+        // A forger elsewhere in the guest races an answer onto the forward
+        // socket's port before the gateway replies.
+        let mut forged = Message::response(query.metadata.id, query.metadata.op_code);
+        forged.metadata = Metadata::response_from_request(&query.metadata);
+        forged.metadata.response_code = ResponseCode::ServFail;
+        let forged_bytes = forged.to_vec().expect("the forged reply encodes");
+        let forger = loopback_socket("a forger").await;
+        forger
+            .send_to(&forged_bytes, from)
+            .await
+            .expect("the forger's datagram is sent");
+
+        let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
+        reply.metadata = Metadata::response_from_request(&query.metadata);
+        reply.metadata.response_code = ResponseCode::NoError;
+        let reply_bytes = reply.to_vec().expect("the reply encodes");
+        standin
+            .send_to(&reply_bytes, from)
+            .await
+            .expect("the gateway answers");
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), box_socket.recv_from(&mut buf))
+            .await
+            .expect("the box is answered")
+            .expect("the relayed reply arrives");
+        assert_eq!(
+            &buf[..len],
+            &reply_bytes[..],
+            "the box reads the gateway's reply, never the forger's"
+        );
+        served.abort();
+    }
+
+    /// Forwards in flight are bounded: with the bound full — the gateway
+    /// holding the one forward it allows unanswered — a second in-zone A
+    /// question is dropped, never forwarded, so a flood cannot hold an
+    /// unbounded number of sockets open in the daemon.
+    #[tokio::test]
+    async fn forwards_in_flight_are_bounded() {
+        let standin = loopback_socket("a stand-in gateway").await;
+        let gateway = standin.local_addr().expect("the stand-in names its port");
+        let listener = loopback_socket("the test listener").await;
+        let relay = listener.local_addr().expect("the listener names its port");
+        let served = crate::traced::spawn(super::serve_bounded(listener.into(), gateway, 1));
+
+        let box_socket = loopback_socket("a stand-in box").await;
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let first = query_of(&[("one.min.internal.".to_string(), RecordType::A)])
+            .to_vec()
+            .expect("the query encodes");
+        box_socket
+            .send_to(&first, relay)
+            .await
+            .expect("the first lookup is sent");
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), standin.recv_from(&mut buf))
+            .await
+            .expect("the first lookup is forwarded")
+            .expect("the forwarded datagram arrives");
+        assert_eq!(
+            &buf[..len],
+            &first[..],
+            "the first lookup is forwarded verbatim"
+        );
+
+        // The gateway never answers the first, so its permit stays held.
+        let second = query_of(&[("two.min.internal.".to_string(), RecordType::A)])
+            .to_vec()
+            .expect("the query encodes");
+        box_socket
+            .send_to(&second, relay)
+            .await
+            .expect("the second lookup is sent");
+        let forwarded =
+            tokio::time::timeout(Duration::from_millis(250), standin.recv_from(&mut buf)).await;
+        assert!(
+            forwarded.is_err(),
+            "a lookup past the bound is dropped, not forwarded: {forwarded:?}"
+        );
         served.abort();
     }
 
