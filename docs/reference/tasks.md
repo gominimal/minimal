@@ -280,7 +280,7 @@ stops the run, and an ignored path stays out. An uncovered path gets a prompt, w
 terminal stops the run instead. The daemon refuses a task that declares
 patches when the `min` that started it did not check them. Inside a session,
 `min run` refuses a task that declares patches, since no policy check runs
-there; run it from the host with `min task run`.
+there. Run such a task from the host with `min task run`.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
 
