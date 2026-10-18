@@ -2791,6 +2791,83 @@ mod gate_task_patch_paths {
         assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
     }
 
+    /// A symlink to a directory inside a declared directory is walked at
+    /// its target, since the mount keeps the link: a declared `/opt/cache`
+    /// holding `link -> /etc` meets a deny on `/etc/shadow`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_subdirectory_is_walked_at_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let etc = root.join("etc");
+        std::fs::create_dir(etc.as_std_path()).unwrap();
+        std::fs::write(etc.join("shadow").as_std_path(), "x").unwrap();
+        let cache = root.join("opt/cache");
+        std::fs::create_dir_all(cache.as_std_path()).unwrap();
+        std::os::unix::fs::symlink(etc.as_std_path(), cache.join("link").as_std_path()).unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(cache.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![cache.to_string()])
+            .with_deny(vec![format!("{etc}/shadow")]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
+    }
+
+    /// A link cycle inside a declared directory ends the walk rather than
+    /// looping, and a directory holding nothing denied stays allowed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_cycle_in_a_declared_directory_ends_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let cache = root.join("opt/cache");
+        std::fs::create_dir_all(cache.join("sub").as_std_path()).unwrap();
+        std::os::unix::fs::symlink(cache.as_std_path(), cache.join("sub/up").as_std_path())
+            .unwrap();
+        std::os::unix::fs::symlink(root.as_std_path(), cache.join("top").as_std_path()).unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(cache.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![cache.to_string()])
+            .with_deny(vec![format!("{root}/elsewhere")]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// A declared file that is a dangling symlink is checked at the target
+    /// it points to, absolute or relative, since writing a missing `rw`
+    /// entry creates that target. A link that cannot be followed, such as
+    /// one pointing at itself, denies the entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_entry_meets_the_targets_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let ssh = root.join("home/.ssh");
+        std::fs::create_dir_all(ssh.as_std_path()).unwrap();
+        std::fs::create_dir(root.join("tmp").as_std_path()).unwrap();
+        let absolute = root.join("tmp/abs");
+        std::os::unix::fs::symlink(ssh.join("authorized_keys2").as_std_path(), &absolute).unwrap();
+        let relative = root.join("tmp/rel");
+        std::os::unix::fs::symlink("../home/.ssh/authorized_keys2", &relative).unwrap();
+        let looped = root.join("tmp/loop");
+        std::os::unix::fs::symlink(looped.as_std_path(), &looped).unwrap();
+
+        let source = project_source();
+        for key in [&absolute, &relative, &looped] {
+            assert!(!key.as_std_path().exists(), "{key} dangles");
+            let entries = entries_for(&source, &[(key.as_str(), true)]);
+            let policy = PatchesPolicy::default()
+                .with_allow(vec![format!("{root}/tmp/**")])
+                .with_deny(vec![format!("{ssh}/**")]);
+            let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+            assert!(matches!(err, ComposeError::Denied { .. }), "{key}: {err}");
+        }
+    }
+
     /// A hook that records every item it is asked about, then answers
     /// each with "allow always": the item becomes an allow rule and the
     /// answer is `UseRule`, as the interactive prompt does.

@@ -1569,24 +1569,72 @@ fn has_dot_segment(declared: &str) -> bool {
     declared.split('/').any(|seg| seg == "." || seg == "..")
 }
 
+/// The most symlinks [`resolve_existing_prefix`] follows by hand, Linux's
+/// own `MAXSYMLINKS`. A chain longer than this cannot be mounted anyway.
+const TASK_PATCH_LINK_HOPS: usize = 40;
+
+/// Why [`resolve_existing_prefix`] could not say where a path leads: a
+/// dangling symlink it could not follow (unreadable, too many hops, or a
+/// target it cannot pin down). The caller denies the entry, since the
+/// daemon would write through the link to a path no rule was checked on.
+#[derive(Debug)]
+struct UnresolvableLink;
+
 /// The path `path` reaches on this machine: its deepest existing ancestor
 /// canonicalized, with the missing tail joined back on. So a
 /// `create_if_missing` entry under a symlinked parent resolves to the
-/// directory the parent points at. `None` when it resolves to itself or
-/// to nothing.
-fn resolve_existing_prefix(path: &camino::Utf8Path) -> Option<camino::Utf8PathBuf> {
+/// directory the parent points at. A dangling symlink on the way, which
+/// canonicalization cannot see through, is followed by hand: writing a
+/// missing `rw` entry creates the link's target, so the target is what
+/// must be checked. `Ok(None)` when it resolves to itself.
+fn resolve_existing_prefix(
+    path: &camino::Utf8Path,
+) -> Result<Option<camino::Utf8PathBuf>, UnresolvableLink> {
+    let resolved = resolve_path(path, 0)?;
+    Ok(resolved.filter(|out| out != path))
+}
+
+/// [`resolve_existing_prefix`]'s walk, `hops` links in. `Ok(None)` only
+/// for a path that is not UTF-8 once canonicalized, which no rule can
+/// match differently from the declared form.
+fn resolve_path(
+    path: &camino::Utf8Path,
+    hops: usize,
+) -> Result<Option<camino::Utf8PathBuf>, UnresolvableLink> {
     let mut tail: Vec<&str> = Vec::new();
     let mut cur = path;
     loop {
         if let Ok(canonical) = std::fs::canonicalize(cur.as_std_path()) {
-            let mut out = camino::Utf8PathBuf::from_path_buf(canonical).ok()?;
+            let Ok(mut out) = camino::Utf8PathBuf::from_path_buf(canonical) else {
+                return Ok(None);
+            };
             for seg in tail.iter().rev() {
                 out.push(seg);
             }
-            return (out != path).then_some(out);
+            return Ok(Some(out));
         }
-        tail.push(cur.file_name()?);
-        cur = cur.parent()?;
+        // `cur` does not resolve. If it is a link, it dangles: follow it
+        // to where it points, where a write through it would land.
+        if std::fs::symlink_metadata(cur.as_std_path()).is_ok_and(|m| m.file_type().is_symlink()) {
+            if hops >= TASK_PATCH_LINK_HOPS {
+                return Err(UnresolvableLink);
+            }
+            let target = std::fs::read_link(cur.as_std_path()).map_err(|_| UnresolvableLink)?;
+            let target =
+                camino::Utf8PathBuf::from_path_buf(target).map_err(|_| UnresolvableLink)?;
+            let mut next = match cur.parent() {
+                Some(parent) if target.is_relative() => parent.join(target),
+                _ => target,
+            };
+            for seg in tail.iter().rev() {
+                next.push(seg);
+            }
+            return resolve_path(&next, hops + 1);
+        }
+        // A `..` from a link's target, under a parent that does not exist,
+        // has no name to carry: the walk cannot say where it lands.
+        tail.push(cur.file_name().ok_or(UnresolvableLink)?);
+        cur = cur.parent().ok_or(UnresolvableLink)?;
     }
 }
 
@@ -1615,7 +1663,8 @@ fn decide_task_patch_path(
 /// path past a deny on its target, nor onto a target no rule allows. A
 /// symlinked prefix such as macOS's `/tmp` → `/private/tmp` therefore needs
 /// the resolved form allowed too; the prompt and the refusal snippet name
-/// it (see [`task_patch_forms`]).
+/// it (see [`task_patch_forms`]). A dangling link that cannot be followed
+/// denies the entry ([`UnresolvableLink`]).
 fn check_task_patch_path(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
@@ -1628,8 +1677,9 @@ fn check_task_patch_path(
         return own;
     }
     match resolve_existing_prefix(path) {
-        Some(resolved) => own.combine(decide_task_patch_path(expanded, source, &resolved)),
-        None => own,
+        Ok(Some(resolved)) => own.combine(decide_task_patch_path(expanded, source, &resolved)),
+        Ok(None) => own,
+        Err(UnresolvableLink) => PathDecision::Denied,
     }
 }
 
@@ -1647,7 +1697,7 @@ fn task_patch_forms(
     resolve: bool,
 ) -> Vec<(String, camino::Utf8PathBuf)> {
     let mut forms = vec![(declared.to_owned(), path.to_path_buf())];
-    if resolve && let Some(resolved) = resolve_existing_prefix(path) {
+    if resolve && let Ok(Some(resolved)) = resolve_existing_prefix(path) {
         forms.push((resolved.to_string(), resolved));
     }
     forms
@@ -1727,6 +1777,9 @@ fn decide_answered_task_patch_forms(
 /// so a rule naming the declared directory, as the prompt and the refusal
 /// snippet record it, approves the entry whatever it holds.
 ///
+/// The probe follows a contained symlink to a directory and walks what the
+/// target holds, since the mount keeps the link and so exposes it.
+///
 /// The probe is best-effort: it stops at the first denial and after
 /// [`TASK_PATCH_DIR_WALK_LIMIT`] entries, and a directory that cannot be
 /// read (missing for a `create_if_missing` mount, or unreadable) is
@@ -1743,12 +1796,21 @@ fn check_task_patch_dir(
     if !resolve || own == PathDecision::Denied {
         return own;
     }
-    // A symlinked directory (or parent) holds its files where it points,
-    // so each file is checked under that root as well as the declared one.
-    let resolved_root = resolve_existing_prefix(dir);
+    // Lossy rather than skipped: a non-UTF-8 name must still meet a `**`
+    // deny on its directory.
+    let utf8 = |p: &std::path::Path| camino::Utf8PathBuf::from(p.to_string_lossy().into_owned());
+    // Each directory is walked as it is reached through the mount and as
+    // it sits on disk, so each file is checked in both forms. A symlinked
+    // directory (the declared one, or one met mid-walk) holds its files
+    // where it points, and the mount keeps the link, so it is walked at
+    // its target. Canonical directories already walked are skipped, which
+    // ends a link cycle.
+    let root_canonical = std::fs::canonicalize(dir.as_std_path()).ok();
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        root_canonical.iter().cloned().collect();
+    let mut stack = vec![(dir.as_std_path().to_path_buf(), root_canonical)];
     let mut seen = 0usize;
-    let mut stack = vec![dir.as_std_path().to_path_buf()];
-    while let Some(cur) = stack.pop() {
+    while let Some((cur, canonical)) = stack.pop() {
         let Ok(read) = std::fs::read_dir(&cur) else {
             continue;
         };
@@ -1758,24 +1820,32 @@ fn check_task_patch_dir(
                 return own;
             }
             let file_type = entry.file_type().ok();
+            let on_disk = canonical.as_ref().map(|c| c.join(entry.file_name()));
             if file_type.is_some_and(|t| t.is_dir()) {
-                stack.push(entry.path());
+                if on_disk.as_ref().is_none_or(|c| visited.insert(c.clone())) {
+                    stack.push((entry.path(), on_disk));
+                }
                 continue;
             }
-            // Lossy rather than skipped: a non-UTF-8 name must still
-            // meet a `**` deny on its directory.
-            let path = camino::Utf8PathBuf::from(entry.path().to_string_lossy().into_owned());
+            let path = utf8(&entry.path());
             // Only a symlink reaches somewhere other than its own path,
             // so only a symlink pays for the resolution.
             let is_link = file_type.is_some_and(|t| t.is_symlink());
             if check_task_patch_path(expanded, source, &path, is_link) == PathDecision::Denied {
                 return PathDecision::Denied;
             }
-            if let Some(root) = &resolved_root
-                && let Ok(rel) = path.strip_prefix(dir)
-                && decide_task_patch_path(expanded, source, &root.join(rel)) == PathDecision::Denied
+            if let Some(on_disk) = &on_disk
+                && *on_disk != entry.path()
+                && decide_task_patch_path(expanded, source, &utf8(on_disk)) == PathDecision::Denied
             {
                 return PathDecision::Denied;
+            }
+            if is_link
+                && let Ok(target) = std::fs::canonicalize(entry.path())
+                && target.is_dir()
+                && visited.insert(target.clone())
+            {
+                stack.push((entry.path(), Some(target)));
             }
         }
     }
