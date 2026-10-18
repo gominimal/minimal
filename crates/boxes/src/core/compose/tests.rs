@@ -2766,6 +2766,29 @@ mod gate_task_patch_paths {
         assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
     }
 
+    /// A declared directory that is a symlink is probed where it points:
+    /// a deny naming one file in the target denies the entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_probed_at_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let ssh = root.join("home/.ssh");
+        std::fs::create_dir_all(ssh.as_std_path()).unwrap();
+        std::fs::write(ssh.join("id").as_std_path(), "x").unwrap();
+        std::fs::create_dir(root.join("tmp").as_std_path()).unwrap();
+        let link = root.join("tmp/d");
+        std::os::unix::fs::symlink(ssh.as_std_path(), link.as_std_path()).unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(link.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![format!("{root}/tmp/**")])
+            .with_deny(vec![format!("{ssh}/id")]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
+    }
+
     /// The resolved form only tightens: an allow on the declared string
     /// decides, so a symlinked prefix (macOS's `/tmp` -> `/private/tmp`)
     /// does not turn an allowed entry into a prompt.

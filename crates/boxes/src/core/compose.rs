@@ -1661,6 +1661,9 @@ fn check_task_patch_dir(
     if !resolve || own == PathDecision::Denied {
         return own;
     }
+    // A symlinked directory (or parent) holds its files where it points,
+    // so each file is checked under that root as well as the declared one.
+    let resolved_root = resolve_existing_prefix(dir);
     let mut seen = 0usize;
     let mut stack = vec![dir.as_std_path().to_path_buf()];
     while let Some(cur) = stack.pop() {
@@ -1684,6 +1687,12 @@ fn check_task_patch_dir(
             // so only a symlink pays for the resolution.
             let is_link = file_type.is_some_and(|t| t.is_symlink());
             if check_task_patch_path(expanded, source, &path, is_link) == PathDecision::Denied {
+                return PathDecision::Denied;
+            }
+            if let Some(root) = &resolved_root
+                && let Ok(rel) = path.strip_prefix(dir)
+                && decide_task_patch_path(expanded, source, &root.join(rel)) == PathDecision::Denied
+            {
                 return PathDecision::Denied;
             }
         }
