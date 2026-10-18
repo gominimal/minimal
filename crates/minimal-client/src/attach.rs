@@ -105,6 +105,22 @@ pub fn attach_command(
     wire: Option<&str>,
     session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
+    attach_command_with_env(sock, id, wire, session_keys, &[])
+}
+
+/// [`attach_command`], plus `channel_env`: extra variables sent on the
+/// channel ahead of the exec request, each set on ssh and named in a
+/// `SendEnv` option. `min session run` carries a task's `[patches]`
+/// verdict ([`minimald_rpc::taskenv::TASK_PATCH_VERDICT`]) this way, which
+/// the daemon reads from the channel config like the native client's
+/// `set_env`.
+pub fn attach_command_with_env(
+    sock: &Path,
+    id: boxes::SessionId,
+    wire: Option<&str>,
+    session_keys: Option<&boxes::keys::SessionKeys>,
+    channel_env: &[(&str, &str)],
+) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
@@ -136,6 +152,10 @@ pub fn attach_command(
     let (trace_var, trace_value) = trace_env();
     ssh.env(trace_var, trace_value);
     ssh.args(["-o", &format!("SendEnv={trace_var}")]);
+    for (name, value) in channel_env {
+        ssh.env(name, value);
+        ssh.args(["-o", &format!("SendEnv={name}")]);
+    }
     ssh.args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
@@ -1081,6 +1101,39 @@ mod tests {
         for stdio in ["stdin", "stdout", "stderr"] {
             assert!(!debug.contains(stdio), "{stdio} overridden: {debug}");
         }
+    }
+
+    /// Channel env rides ahead of the command: each variable is set on ssh
+    /// and named in a `SendEnv` option before the host alias, so ssh sends
+    /// it as an env request rather than as part of the remote command.
+    #[test]
+    fn channel_env_is_set_and_sent_before_the_command() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let cmd = attach_command_with_env(
+            &sock,
+            boxes::SessionId::nil(),
+            Some("wire"),
+            None,
+            &[("MINIMAL_TASK_PATCH_VERDICT", r#"{"allow":[],"drop":[]}"#)],
+        )
+        .unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let send = args
+            .iter()
+            .position(|a| a == "SendEnv=MINIMAL_TASK_PATCH_VERDICT")
+            .expect("named in a SendEnv option");
+        let host = args
+            .iter()
+            .position(|a| a == "local-minimald0")
+            .expect("host alias");
+        assert!(send < host, "options precede the host: {args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("wire"));
+        assert!(cmd.get_envs().any(|(k, v)| {
+            k == "MINIMAL_TASK_PATCH_VERDICT" && v.is_some_and(|v| v == r#"{"allow":[],"drop":[]}"#)
+        }));
     }
 
     /// Every attach bounds its connect and handshake with the shared deadline;

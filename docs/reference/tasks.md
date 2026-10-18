@@ -245,7 +245,7 @@ interactive = true
 ```
 
 
-### `patches` - Map in files/directories from the system
+### `patches` - Map in files/directories from the system {#patches}
 
 _Optional. `patches` is an alias of the canonical `patch` key; both parse_
 
@@ -273,6 +273,12 @@ In a task the daemon runs in the session layout, `~/` expands to the session hom
 mounts a mapping inside that home or the project tree at the matching path under `/home` or
 `/workbench`. It mounts the mapping on top of the read-write session mounts, so a read-only mapping
 stays read-only. It mounts any other absolute path at that same path.
+
+Before `min task run` or `min session run` starts the task, Minimal checks each declared path
+against the `[patches]` section of your [user policy](./user-policy.md#task-patches). A denied path
+stops the run, and an ignored path stays out. An uncovered path gets a prompt, which without a
+terminal stops the run instead. The daemon refuses a task that declares
+patches when the `min` that started it did not check them.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
 

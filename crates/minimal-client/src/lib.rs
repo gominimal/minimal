@@ -591,8 +591,8 @@ impl Client {
     /// [`TASK_ENV_PREFIX`](minimald_rpc::taskenv::TASK_ENV_PREFIX), the
     /// variable names to remove under
     /// [`TASK_ENV_DROP`](minimald_rpc::taskenv::TASK_ENV_DROP), and the
-    /// declared patch paths the policy ignored under
-    /// [`TASK_PATCH_DROP`](minimald_rpc::taskenv::TASK_PATCH_DROP). Only
+    /// `[patches]` verdict on its declared patch paths under
+    /// [`TASK_PATCH_VERDICT`](minimald_rpc::taskenv::TASK_PATCH_VERDICT). Only
     /// [`ExecRequest::TaskRun`](minimald_rpc::exec::ExecRequest::TaskRun) has
     /// any to send; every other caller passes an empty
     /// [`TaskEnv`](minimald_rpc::taskenv::TaskEnv) and the daemon behaves
@@ -647,19 +647,21 @@ impl Client {
                 .await
                 .context("set task env drop list")?;
         }
-        // Same contract for the patch entries the client's policy dropped:
-        // the raw declared keys the daemon removes from the task's `patch`
-        // maps before mounting. Absent means the client gated nothing —
-        // or predates the gate.
-        if !task_env.patch_drop.is_empty() {
-            channel
-                .set_env(
-                    true,
-                    minimald_rpc::taskenv::TASK_PATCH_DROP,
-                    minimald_rpc::taskenv::encode_drops(&task_env.patch_drop),
+        // The patch verdict is the opposite: sent whenever the client gated,
+        // empty or not, because a daemon refuses a task that declares
+        // patches without one.
+        if let Some(verdict) = &task_env.patch {
+            let encoded = minimald_rpc::taskenv::encode_patch_verdict(verdict).map_err(|len| {
+                anyhow::anyhow!(
+                    "the task's patch declarations are too large to send ({len} bytes, \
+                     limit {}); declare fewer `patch` entries",
+                    minimald_rpc::taskenv::TASK_PATCH_VERDICT_MAX_BYTES
                 )
+            })?;
+            channel
+                .set_env(true, minimald_rpc::taskenv::TASK_PATCH_VERDICT, encoded)
                 .await
-                .context("set task patch drop list")?;
+                .context("set task patch verdict")?;
         }
         channel
             .exec(true, command)

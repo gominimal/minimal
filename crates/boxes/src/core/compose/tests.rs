@@ -2642,25 +2642,169 @@ mod gate_task_patch_paths {
         assert_eq!(verdicts, vec![NameVerdict::Allowed]);
     }
 
-    /// An ignore on a contained file still drops an allowed directory.
+    /// An ignore on a contained file does not apply to the directory: a
+    /// bind mount cannot leave one file out, and dropping the whole entry
+    /// over it would remove a mount the user allowed without a word.
     #[test]
-    fn a_directory_entry_is_dropped_by_an_ignored_contained_file() {
+    fn an_ignored_contained_file_leaves_an_allowed_directory_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        // Canonical, so the declared and resolved forms agree (macOS
-        // tempdirs sit behind the `/var` -> `/private/var` link).
-        let root =
-            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let root = canonical_root(&tmp);
         let cache = root.join("cache");
         std::fs::create_dir(cache.as_std_path()).unwrap();
-        std::fs::write(cache.join("token").as_std_path(), "x").unwrap();
+        std::fs::write(cache.join(".DS_Store").as_std_path(), "x").unwrap();
 
         let source = project_source();
         let entries = entries_for(&source, &[(cache.as_str(), false)]);
         let policy = PatchesPolicy::default()
             .with_allow(vec![cache.to_string()])
-            .with_ignore(vec![format!("{cache}/token")]);
+            .with_ignore(vec!["**/.DS_Store".to_string()]);
         let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
-        assert_eq!(verdicts, vec![NameVerdict::Ignored]);
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// A tempdir with its symlinks resolved, so the declared and resolved
+    /// forms of a path under it agree (macOS tempdirs sit behind the
+    /// `/var` -> `/private/var` link).
+    fn canonical_root(tmp: &tempfile::TempDir) -> camino::Utf8PathBuf {
+        camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap()
+    }
+
+    /// A `..` segment is refused outright, whatever the policy says: the
+    /// literal string `/tmp/../home/u/.ssh/authorized_keys2` matches a
+    /// `/tmp/**` allow and misses a `~/.ssh/**` deny, yet the OS writes
+    /// into `.ssh`.
+    #[test]
+    fn a_dot_dot_segment_is_refused_before_the_policy_decides() {
+        let source = project_source();
+        for declared in [
+            "/tmp/../home/u/.ssh/authorized_keys2",
+            "/tmp/./x",
+            "~/../u/.ssh",
+        ] {
+            let entries = entries_for(&source, &[(declared, true)]);
+            let policy = PatchesPolicy::default()
+                .with_allow(vec!["/tmp/**".to_string()])
+                .with_deny(vec!["/home/u/.ssh/**".to_string()]);
+            let err = gate_task_patch_paths(&entries, policy, None, &NoVars, Some("/home/u"))
+                .unwrap_err();
+            assert!(
+                matches!(err, ComposeError::TaskPatchDotSegment { ref what, .. } if what == declared),
+                "{declared}: {err}"
+            );
+        }
+    }
+
+    /// A `create_if_missing` entry that does not exist yet, under a
+    /// symlinked parent, is checked where the parent points: a deny on
+    /// the target applies though the declared string matches only an
+    /// allow.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_entry_under_a_symlinked_parent_meets_the_targets_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let ssh = root.join("home/.ssh");
+        std::fs::create_dir_all(ssh.as_std_path()).unwrap();
+        std::fs::create_dir(root.join("tmp").as_std_path()).unwrap();
+        let link = root.join("tmp/link");
+        std::os::unix::fs::symlink(ssh.as_std_path(), link.as_std_path()).unwrap();
+        let declared = link.join("authorized_keys2");
+        assert!(!declared.as_std_path().exists());
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(declared.as_str(), true)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![format!("{root}/tmp/**")])
+            .with_deny(vec![format!("{ssh}/**")]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
+    }
+
+    /// A declared path that is itself a symlink meets a deny on its
+    /// target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_entry_meets_the_targets_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let ssh = root.join("home/.ssh");
+        std::fs::create_dir_all(ssh.as_std_path()).unwrap();
+        std::fs::write(ssh.join("id").as_std_path(), "x").unwrap();
+        std::fs::create_dir(root.join("tmp").as_std_path()).unwrap();
+        let key = root.join("tmp/key");
+        std::os::unix::fs::symlink(ssh.join("id").as_std_path(), key.as_std_path()).unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(key.as_str(), true)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![format!("{root}/tmp/**")])
+            .with_deny(vec![format!("{ssh}/**")]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
+    }
+
+    /// A directory entry holding a symlink to a denied target is denied.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_holding_a_symlink_to_a_denied_target_is_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let ssh = root.join("home/.ssh");
+        std::fs::create_dir_all(ssh.as_std_path()).unwrap();
+        std::fs::write(ssh.join("id").as_std_path(), "x").unwrap();
+        let cache = root.join("proj/cache");
+        std::fs::create_dir_all(cache.as_std_path()).unwrap();
+        std::os::unix::fs::symlink(ssh.join("id").as_std_path(), cache.join("k").as_std_path())
+            .unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(cache.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![cache.to_string()])
+            .with_deny(vec![format!("{ssh}/**")]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
+    }
+
+    /// The resolved form only tightens: an allow on the declared string
+    /// decides, so a symlinked prefix (macOS's `/tmp` -> `/private/tmp`)
+    /// does not turn an allowed entry into a prompt.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_prefix_does_not_unsettle_an_allow_on_the_declared_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        std::fs::create_dir(root.join("real").as_std_path()).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(root.join("real").as_std_path(), alias.as_std_path()).unwrap();
+        let declared = alias.join("tool");
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(declared.as_str(), true)]);
+        let policy = PatchesPolicy::default().with_allow(vec![format!("{alias}/**")]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// A `~/` entry is matched as declared and never walked: the daemon
+    /// mounts `~/` from the session's home, so a denied file in this
+    /// machine's home says nothing about the mount.
+    #[test]
+    fn a_tilde_directory_is_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = canonical_root(&tmp);
+        let app = home.join(".config/app");
+        std::fs::create_dir_all(app.as_std_path()).unwrap();
+        std::fs::write(app.join("secret").as_std_path(), "x").unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[("~/.config/app", false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec!["~/.config/app".to_string()])
+            .with_deny(vec!["~/.config/app/secret".to_string()]);
+        let (verdicts, _) =
+            gate_task_patch_paths(&entries, policy, None, &NoVars, Some(home.as_str())).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
     }
 
     /// `UseRule` after the hook records the declared directory path, as

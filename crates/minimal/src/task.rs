@@ -412,10 +412,11 @@ fn denied_task_patch_message(task_name: &str, path: &str, policy_path: &std::pat
 /// Gate a task's declared `patch.dir` / `patch.file` entries against
 /// `[patches]`, the same two lanes as the `env_vars` gate above: the
 /// interactive prompt on a real terminal, the collect-and-refuse
-/// `RefuseAndRecord` anywhere else. Returns the raw declared keys the
-/// policy ignored, for the daemon to drop from the mount set — the wire
-/// half of the fix, since the daemon holds no policy and mounts what it
-/// is given.
+/// `RefuseAndRecord` anywhere else. Returns the verdict the daemon
+/// applies: the raw declared keys the policy allowed, and those it
+/// ignored, for the daemon to drop from the mount set. The daemon holds
+/// no policy, mounts only allowed keys, and refuses a task whose patches
+/// arrive with no verdict.
 fn resolve_task_patches(
     task: &mfile::Task,
     task_name: &str,
@@ -424,7 +425,7 @@ fn resolve_task_patches(
     source: &boxes::core::source::Source,
     hooks: &dyn boxes::core::hooks::PolicyHooks,
     resolved_env: &minimald_rpc::taskenv::TaskEnv,
-) -> Result<std::collections::BTreeSet<String>, anyhow::Error> {
+) -> Result<minimald_rpc::taskenv::PatchVerdict, anyhow::Error> {
     use boxes::core::compose::{TaskPatchEntry, gate_task_patch_paths};
 
     // Echo tasks never reach the daemon's mount path — the daemon answers
@@ -475,21 +476,46 @@ fn resolve_task_patches(
         Err(boxes::core::compose::ComposeError::Denied { what, .. }) => {
             bail!(denied_task_patch_message(task_name, &what, policy_path))
         }
+        Err(boxes::core::compose::ComposeError::TaskPatchDotSegment { what, .. }) => {
+            bail!(dot_segment_task_patch_message(task_name, &what))
+        }
         Err(e) => {
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("gating `patch` for task '{task_name}'"));
         }
     };
 
-    // Verdicts pair with `entries` in order; an ignored entry's raw
-    // declared key is what the daemon must remove from its mount set.
-    let mut drops = std::collections::BTreeSet::new();
+    // Verdicts pair with `entries` in order, each naming its raw declared
+    // key: an allowed one may mount, an ignored one the daemon removes.
+    let mut out = minimald_rpc::taskenv::PatchVerdict::default();
     for (entry, verdict) in entries.iter().zip(verdicts) {
-        if matches!(verdict, boxes::core::compose::NameVerdict::Ignored) {
-            drops.insert(entry.declared.to_string());
-        }
+        let key = entry.declared.to_string();
+        match verdict {
+            boxes::core::compose::NameVerdict::Allowed => out.allow.insert(key),
+            boxes::core::compose::NameVerdict::Ignored => out.drop.insert(key),
+        };
     }
-    Ok(drops)
+    Ok(out)
+}
+
+/// The rejection body for a declared patch key holding a `.` or `..`
+/// segment. Split out for unit tests.
+fn dot_segment_task_patch_message(task_name: &str, path: &str) -> String {
+    format!(
+        "task '{task_name}' declares the patch path `{path}`, which holds a \
+         `.` or `..` segment, so your [patches] policy cannot tell what it \
+         mounts; declare the path it means without them"
+    )
+}
+
+/// Why a policy refusal could not become a prompt, for the refusal text:
+/// `--no-input` when the user set it, otherwise the terminal check.
+fn no_prompt_reason(no_input: bool) -> &'static str {
+    if no_input {
+        "--no-input is set"
+    } else {
+        "stdin/stderr is not a terminal"
+    }
 }
 
 /// The non-interactive lane of [`resolve_task_patches`]: gate against a
@@ -503,9 +529,10 @@ fn resolve_task_patches_non_interactive(
     policy_path: &std::path::Path,
     source: &boxes::core::source::Source,
     resolved_env: &minimald_rpc::taskenv::TaskEnv,
-) -> Result<std::collections::BTreeSet<String>, anyhow::Error> {
+    no_input: bool,
+) -> Result<minimald_rpc::taskenv::PatchVerdict, anyhow::Error> {
     let hooks = RefuseAndRecord::default();
-    let drops = resolve_task_patches(
+    let verdict = resolve_task_patches(
         task,
         task_name,
         patches_policy,
@@ -520,14 +547,76 @@ fn resolve_task_patches_non_interactive(
         let snippet = refused_patches_snippet(&refused);
         bail!(
             "task '{task_name}' declares {count} patch{es} that your policy does \
-             not allow, and stdin/stderr is not a terminal.\n\n\
+             not allow, and {reason}.\n\n\
              Add the following to {path}:\n\n{snippet}\n\
              Then re-run this command.",
+            reason = no_prompt_reason(no_input),
             path = policy_path.display(),
             es = if count == 1 { "" } else { "es" },
         );
     }
-    drops
+    verdict
+}
+
+/// Gate a task's declared patches for `min session run`, which runs a task
+/// in a session that already exists: the task as the session project's
+/// `minimal.toml` declares it on this machine, through the same two lanes
+/// as `min task run`, saving any rule the user records at the prompt.
+///
+/// A task this machine cannot find declared (one a stack provides, or a
+/// project whose `minimal.toml` is gone) gets an empty verdict rather than
+/// an error. The daemon still runs it when it declares no patches, and
+/// refuses it when it does, since nothing here checked them.
+pub(crate) fn gate_session_task_patches(
+    global: &GlobalArgs,
+    project_path: &camino::Utf8Path,
+    task_name: &str,
+) -> Result<minimald_rpc::taskenv::PatchVerdict, anyhow::Error> {
+    let Ok(declared) = declared_task(project_path, task_name) else {
+        return Ok(minimald_rpc::taskenv::PatchVerdict::default());
+    };
+    if declared.patch.dir.is_empty() && declared.patch.file.is_empty() {
+        return Ok(minimald_rpc::taskenv::PatchVerdict::default());
+    }
+    let policy_path = crate::config::user_policy_path(global);
+    let user_policy = crate::config::read_user_policy(global)?;
+    let source = boxes::core::source::Source::Project {
+        path: paths::HostPath::try_new(project_path.to_path_buf())
+            .context("Invalid project path")?,
+    };
+    // No env resolution on this lane: `min session run` leaves a task's
+    // `env_vars` to the daemon, so only HOME feeds a pattern's `$VAR`.
+    let resolved_env = minimald_rpc::taskenv::TaskEnv::default();
+    if global.no_input || !crate::can_prompt_interactively() {
+        return resolve_task_patches_non_interactive(
+            &declared,
+            task_name,
+            user_policy.patches().clone(),
+            &policy_path,
+            &source,
+            &resolved_env,
+            global.no_input,
+        );
+    }
+    let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
+    let verdict = resolve_task_patches(
+        &declared,
+        task_name,
+        user_policy.patches().clone(),
+        &policy_path,
+        &source,
+        &hooks,
+        &resolved_env,
+    );
+    // Persist before propagating a refusal, as `min task run` does.
+    let after = hooks.into_final_policy();
+    if after != user_policy {
+        match crate::prompt::save_user_policy(&policy_path, &after) {
+            Ok(()) => eprintln!("Updated {}", policy_path.display()),
+            Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+        }
+    }
+    verdict
 }
 
 /// The whitespace rejection body: the name is debug-quoted so the offending
@@ -794,23 +883,25 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             let snippet = refused_vars_snippet(&refused);
             bail!(
                 "task '{task}' declares {count} environment variable{s} that your \
-                 policy does not allow, and stdin/stderr is not a terminal.\n\n\
+                 policy does not allow, and {reason}.\n\n\
                  Add the following to {path}:\n\n{snippet}\n\
                  Then re-run this command.",
+                reason = no_prompt_reason(global.no_input),
                 task = args.task,
                 path = policy_path.display(),
                 s = if count == 1 { "" } else { "s" },
             );
         }
         let mut task_env = task_env?;
-        task_env.patch_drop = resolve_task_patches_non_interactive(
+        task_env.patch = Some(resolve_task_patches_non_interactive(
             &declared,
             &args.task,
             user_policy.patches().clone(),
             &policy_path,
             &source,
             &task_env,
-        )?;
+            global.no_input,
+        )?);
         (task_env, user_policy)
     } else {
         let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
@@ -828,7 +919,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // save as a rule recorded for a variable. Gated only once the
         // vars resolved; either error is held until after the save.
         let gated = task_env.and_then(|mut task_env| {
-            task_env.patch_drop = resolve_task_patches(
+            task_env.patch = Some(resolve_task_patches(
                 &declared,
                 &args.task,
                 user_policy.patches().clone(),
@@ -836,7 +927,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 &source,
                 &hooks,
                 &task_env,
-            )?;
+            )?);
             Ok(task_env)
         });
         // Persist before propagating a refusal: a rule the user chose to
@@ -1972,6 +2063,7 @@ mod tests {
             &policy_path_fixture(),
             &project_source(),
             &minimald_rpc::taskenv::TaskEnv::default(),
+            true,
         )
         .expect_err("an unapproved patch must fail the run");
 
@@ -1980,6 +2072,82 @@ mod tests {
         assert!(msg.contains("[patches]"), "carries the snippet: {msg}");
         assert!(msg.contains("/opt/tool/bin"), "names the path: {msg}");
         assert!(msg.contains("user_policy.toml"), "names the file: {msg}");
+        assert!(msg.contains("--no-input is set"), "names the cause: {msg}");
+    }
+
+    /// The refusal names what stopped the prompt: `--no-input` when the
+    /// user set it, so a user at a terminal is not told it is missing.
+    #[test]
+    fn the_refusal_names_the_cause_of_no_prompt() {
+        assert_eq!(no_prompt_reason(true), "--no-input is set");
+        assert_eq!(no_prompt_reason(false), "stdin/stderr is not a terminal");
+    }
+
+    /// A declared key with a `..` segment is refused with a message that
+    /// names the task and the path, before any policy decision.
+    #[test]
+    fn a_dot_dot_patch_key_is_refused_by_name() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.file]\n\
+             \"/tmp/../etc/shadow\" = \"rw\"\n",
+        );
+        let policy =
+            boxes::core::policy::PatchesPolicy::default().with_allow(vec!["/tmp/**".to_string()]);
+
+        let err = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("a `..` key must fail the gate");
+
+        let msg = err.to_string();
+        assert!(msg.contains("task 't'"), "{msg}");
+        assert!(msg.contains("`/tmp/../etc/shadow`"), "{msg}");
+        assert!(msg.contains("`..` segment"), "{msg}");
+    }
+
+    /// `min session run` gates the task as the session project declares
+    /// it: a task with no patches, or one this machine cannot find, gets
+    /// an empty verdict; a declared patch the policy does not allow is
+    /// refused non-interactively with the snippet.
+    #[test]
+    fn session_run_gates_the_project_tasks_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        std::fs::write(
+            dir.join(mfile::MFILE_NAME),
+            "[tasks.plain]\nexec = 'true'\n\
+             [tasks.mounts]\nexec = 'true'\n[tasks.mounts.patch.file]\n\
+             \"/opt/tool/bin\" = \"ro\"\n",
+        )
+        .unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+
+        let empty = minimald_rpc::taskenv::PatchVerdict::default();
+        assert_eq!(
+            gate_session_task_patches(&global, dir, "plain").unwrap(),
+            empty
+        );
+        assert_eq!(
+            gate_session_task_patches(&global, dir, "from-a-stack").unwrap(),
+            empty,
+            "an undeclared task is left to the daemon, which refuses its patches"
+        );
+        let err = gate_session_task_patches(&global, dir, "mounts")
+            .expect_err("an unapproved patch must fail the run");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'mounts' declares 1 patch "), "{msg}");
+        assert!(msg.contains("/opt/tool/bin"), "{msg}");
     }
 
     /// An ignored patch path lands in the drop list the daemon removes
@@ -1993,7 +2161,7 @@ mod tests {
         let policy =
             boxes::core::policy::PatchesPolicy::default().with_ignore(vec!["/opt/**".to_string()]);
 
-        let drops = resolve_task_patches(
+        let verdict = resolve_task_patches(
             &task,
             "t",
             policy,
@@ -2008,7 +2176,8 @@ mod tests {
             .map(String::from)
             .into_iter()
             .collect();
-        assert_eq!(drops, expect, "raw declared keys, verbatim");
+        assert_eq!(verdict.drop, expect, "raw declared keys, verbatim");
+        assert!(verdict.allow.is_empty(), "nothing ignored is allowed");
     }
 
     /// An echo task's patches are gated by nobody, the same exemption as
@@ -2023,7 +2192,7 @@ mod tests {
         let policy = boxes::core::policy::PatchesPolicy::default()
             .with_deny(vec!["/etc/passwd".to_string()]);
 
-        let drops = resolve_task_patches(
+        let verdict = resolve_task_patches(
             &task,
             "t",
             policy,
@@ -2034,7 +2203,11 @@ mod tests {
         )
         .expect("an echo task neither resolves nor denies");
 
-        assert!(drops.is_empty(), "nothing to drop: {drops:?}");
+        assert_eq!(
+            verdict,
+            minimald_rpc::taskenv::PatchVerdict::default(),
+            "nothing to send"
+        );
     }
 
     /// The interactive lane's hook approves an undecided patch on the
@@ -2048,7 +2221,7 @@ mod tests {
         let hooks =
             ScriptedHook::new(boxes::core::decision::ItemDecision::AllowOnce).allowing_patches();
 
-        let drops = resolve_task_patches(
+        let verdict = resolve_task_patches(
             &task,
             "t",
             boxes::core::policy::PatchesPolicy::default(),
@@ -2064,7 +2237,11 @@ mod tests {
             vec!["/opt/tool/bin".to_string()],
             "the prompt was about the declared path"
         );
-        assert!(drops.is_empty(), "an approved patch is not dropped");
+        assert!(verdict.drop.is_empty(), "an approved patch is not dropped");
+        assert!(
+            verdict.allow.contains("/opt/tool/bin"),
+            "an approved patch is named as allowed, or the daemon refuses it"
+        );
     }
 
     /// `cmd_task_run` rejects a task the project's minimal.toml does not

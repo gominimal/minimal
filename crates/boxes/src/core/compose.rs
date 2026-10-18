@@ -523,6 +523,12 @@ pub enum ComposeError {
     /// metadata, not an error.
     #[error("policy denied `{what}` (from {from})")]
     Denied { what: String, from: Source },
+    /// A task's declared `patch.dir` / `patch.file` key holds a `.` or
+    /// `..` segment, so the policy cannot tell which path it mounts: the
+    /// OS resolves `..` after any symlinked parent. Surfaces from
+    /// [`gate_task_patch_paths`].
+    #[error("the patch path `{what}` (from {from}) holds a `.` or `..` segment")]
+    TaskPatchDotSegment { what: String, from: Source },
     /// User cancelled at the prompt.
     #[error("user aborted session construction")]
     Aborted,
@@ -1549,25 +1555,49 @@ pub struct TaskPatchEntry<'a> {
     pub source: &'a Source,
 }
 
-/// One declared path's [`PathDecision`](crate::core::policy::PathDecision):
-/// the declared form, plus the canonicalized form when it differs,
-/// combined. Canonicalization is best-effort — an entry that does not
-/// exist yet (`create_if_missing`) is checked by its declared form alone.
-fn check_task_patch_path(
+/// Upper bound on the entries a directory walk in [`check_task_patch_dir`]
+/// visits. The walk is a best-effort deny probe of this machine's view of
+/// the directory, so a huge tree stops it rather than stalling every
+/// `min task run`.
+const TASK_PATCH_DIR_WALK_LIMIT: usize = 10_000;
+
+/// Whether a declared key holds a `.` or `..` segment. The daemon hands
+/// the raw key to the OS, which resolves `..` after any symlinked parent,
+/// so no lexical collapse here could say what the mount will reach. Such
+/// keys are refused instead.
+fn has_dot_segment(declared: &str) -> bool {
+    declared.split('/').any(|seg| seg == "." || seg == "..")
+}
+
+/// The path `path` reaches on this machine: its deepest existing ancestor
+/// canonicalized, with the missing tail joined back on. So a
+/// `create_if_missing` entry under a symlinked parent resolves to the
+/// directory the parent points at. `None` when it resolves to itself or
+/// to nothing.
+fn resolve_existing_prefix(path: &camino::Utf8Path) -> Option<camino::Utf8PathBuf> {
+    let mut tail: Vec<&str> = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(cur.as_std_path()) {
+            let mut out = camino::Utf8PathBuf::from_path_buf(canonical).ok()?;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return (out != path).then_some(out);
+        }
+        tail.push(cur.file_name()?);
+        cur = cur.parent()?;
+    }
+}
+
+/// One path's decision against the expanded policy, as written.
+fn decide_task_patch_path(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
     path: &camino::Utf8Path,
 ) -> crate::core::policy::PathDecision {
     let item = NameItem { source };
-    let canonical = std::fs::canonicalize(path.as_std_path())
-        .ok()
-        .and_then(|p| {
-            camino::Utf8PathBuf::from_path_buf(p)
-                .ok()
-                .filter(|c| c != path)
-        });
-    let target = path.to_path_buf();
-    match expanded.check(canonical.as_deref(), &target, item) {
+    match expanded.check(None, path, item) {
         CheckOutcome::Decided(Decision::Allowed(_)) => crate::core::policy::PathDecision::Allowed,
         CheckOutcome::Decided(Decision::Ignored) => crate::core::policy::PathDecision::Ignored,
         CheckOutcome::Decided(Decision::Denied(_)) => crate::core::policy::PathDecision::Denied,
@@ -1575,62 +1605,104 @@ fn check_task_patch_path(
     }
 }
 
-/// A declared directory entry's decision: the directory's own path, then
-/// every file it currently holds. A directory that cannot be walked (missing
-/// for a future `create_if_missing` mount, or unreadable) is decided by its
-/// own path alone.
+/// One declared path's [`PathDecision`](crate::core::policy::PathDecision).
 ///
-/// Contained files can only make the entry stricter: a `deny` or `ignore`
-/// on one denies or drops the whole entry, but the allow step is the
-/// directory's own. A rule naming the declared directory, as the prompt
-/// and the refusal snippet record it, therefore approves the entry
-/// whatever it holds. Folding contained files' `NeedsApproval` in as well
-/// would leave a non-empty directory undecidable by any exact-path rule.
+/// The declared form decides: it is the string the daemon is handed, and
+/// on a VM-backed host the daemon resolves it in a filesystem this process
+/// cannot see. When `resolve` is set, the form the path reaches on this
+/// machine ([`resolve_existing_prefix`]) is checked too, and can only make
+/// the entry stricter: a `deny` or `ignore` on the resolved form applies,
+/// but its allow step does not. That keeps a symlink, including a
+/// symlinked parent of an entry that does not exist yet, from carrying a
+/// path past a deny on its target. It does not let this machine's view
+/// raise prompts the daemon's view would not, such as macOS's
+/// `/tmp` → `/private/tmp`.
+fn check_task_patch_path(
+    expanded: &ExpandedPatchesPolicy,
+    source: &Source,
+    path: &camino::Utf8Path,
+    resolve: bool,
+) -> crate::core::policy::PathDecision {
+    use crate::core::policy::PathDecision;
+    let own = decide_task_patch_path(expanded, source, path);
+    if !resolve || own == PathDecision::Denied {
+        return own;
+    }
+    match resolve_existing_prefix(path).map(|r| decide_task_patch_path(expanded, source, &r)) {
+        Some(stricter @ (PathDecision::Denied | PathDecision::Ignored)) => own.combine(stricter),
+        _ => own,
+    }
+}
+
+/// A declared directory entry's decision: the directory's own path, then
+/// a deny probe over what it currently holds on this machine.
+///
+/// Contained files can only deny the entry. A `deny` on one denies the
+/// whole entry, since mounting the directory would expose it. An `ignore`
+/// on one does not apply: a bind mount cannot leave a single file out, and
+/// dropping the whole directory over one ignored file would remove a mount
+/// the user allowed without a word. The allow step is the directory's own,
+/// so a rule naming the declared directory, as the prompt and the refusal
+/// snippet record it, approves the entry whatever it holds.
+///
+/// The probe is best-effort: it stops at the first denial and after
+/// [`TASK_PATCH_DIR_WALK_LIMIT`] entries, and a directory that cannot be
+/// read (missing for a `create_if_missing` mount, or unreadable) is
+/// decided by its own path alone. Only an entry checked with `resolve`
+/// is walked; see [`gate_task_patch_paths`] for why `~/` entries are not.
 fn check_task_patch_dir(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
     dir: &camino::Utf8Path,
+    resolve: bool,
 ) -> crate::core::policy::PathDecision {
     use crate::core::policy::PathDecision;
-    let own = check_task_patch_path(expanded, source, dir);
-    let mut contents = PathDecision::Allowed;
-    // Best-effort name walk: any IO failure (a missing directory a
-    // `create_if_missing` mount would create, a permission error) leaves
-    // the entry's fate to the path check above.
+    let own = check_task_patch_path(expanded, source, dir, resolve);
+    if !resolve || own == PathDecision::Denied {
+        return own;
+    }
+    let mut seen = 0usize;
     let mut stack = vec![dir.as_std_path().to_path_buf()];
     while let Some(cur) = stack.pop() {
         let Ok(read) = std::fs::read_dir(&cur) else {
             continue;
         };
         for entry in read.flatten() {
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if is_dir {
+            seen += 1;
+            if seen > TASK_PATCH_DIR_WALK_LIMIT {
+                return own;
+            }
+            let file_type = entry.file_type().ok();
+            if file_type.is_some_and(|t| t.is_dir()) {
                 stack.push(entry.path());
-            } else {
-                // Lossy rather than skipped: a non-UTF-8 name must still
-                // meet a `**` deny or ignore on its directory.
-                let path = camino::Utf8PathBuf::from(entry.path().to_string_lossy().into_owned());
-                contents = contents.combine(check_task_patch_path(expanded, source, &path));
+                continue;
+            }
+            // Lossy rather than skipped: a non-UTF-8 name must still
+            // meet a `**` deny on its directory.
+            let path = camino::Utf8PathBuf::from(entry.path().to_string_lossy().into_owned());
+            // Only a symlink reaches somewhere other than its own path,
+            // so only a symlink pays for the resolution.
+            let is_link = file_type.is_some_and(|t| t.is_symlink());
+            if check_task_patch_path(expanded, source, &path, is_link) == PathDecision::Denied {
+                return PathDecision::Denied;
             }
         }
     }
-    match contents {
-        PathDecision::Denied | PathDecision::Ignored => own.combine(contents),
-        PathDecision::NeedsApproval | PathDecision::Allowed => own,
-    }
+    own
 }
 
 /// A declared entry's decision: the file form checks its one path, the
-/// directory form also checks the files it currently holds.
+/// directory form also probes the files it currently holds.
 fn check_task_patch_entry(
     expanded: &ExpandedPatchesPolicy,
     entry: &TaskPatchEntry<'_>,
     path: &camino::Utf8Path,
+    resolve: bool,
 ) -> crate::core::policy::PathDecision {
     if entry.is_file {
-        check_task_patch_path(expanded, entry.source, path)
+        check_task_patch_path(expanded, entry.source, path, resolve)
     } else {
-        check_task_patch_dir(expanded, entry.source, path)
+        check_task_patch_dir(expanded, entry.source, path, resolve)
     }
 }
 
@@ -1648,24 +1720,36 @@ fn check_task_patch_entry(
 /// Unlike [`gate_patches`], which checks each file a walked patch source
 /// produced, this checks the *declared* paths themselves: a task's patch
 /// is a host path the sandbox mounts (or creates) directly, not a source
-/// pattern to walk. A directory entry is checked twice — once as the
-/// declared path (a deny on the directory itself must deny the entry) and
-/// once per file the directory currently holds (a deny on a contained file
-/// must deny the entry that would mount it, an ignore on one drops it). The
-/// allow step is the directory's own path, so a rule naming the declared
-/// directory approves it however many files it holds. A directory that
-/// cannot be read is decided by its own path alone.
+/// pattern to walk. The declared string decides, since it is what the
+/// daemon is handed: the allow step matches it as written, so a rule
+/// naming the declared directory approves it however many files it holds.
 ///
-/// `~/`-rooted entries are expanded against `home_fallback` for the
-/// check; a `~` entry with no fallback routes to the hook (fail-closed).
-/// Each path is also checked in canonicalized form, so a symlink cannot
-/// evade a deny rule that names its target.
+/// A key holding a `.` or `..` segment is refused outright
+/// ([`ComposeError::TaskPatchDotSegment`]): the OS resolves `..` after any
+/// symlinked parent, so the declared string would not say what it mounts.
+///
+/// An absolute entry is also checked as it resolves on this machine, and
+/// a directory entry is probed for contained files a `deny` names. Both
+/// can only make the entry stricter (see [`check_task_patch_path`] and
+/// [`check_task_patch_dir`]), so a symlink, including a symlinked parent
+/// of an entry that does not exist yet, cannot carry it past a deny on
+/// its target. On a VM-backed host this machine is not the daemon's, so
+/// the extra checks are a best-effort backstop there.
+///
+/// `~/`-rooted entries are matched as declared, with `~/` expanded against
+/// `home_fallback` the same way the policy's own `~` is. They are neither
+/// resolved nor walked: the daemon mounts `~/` from the session's home,
+/// not this machine's, so what this machine's home holds says nothing
+/// about the mount. A `~` entry with no fallback routes to the hook
+/// (fail-closed).
 ///
 /// # Errors
 ///
 /// - [`ComposeError::Denied`] — a `deny` rule matched. Returned from the
 ///   first denial found, before any hook is consulted, so a forbidden
 ///   path is never preceded by a prompt about its neighbours.
+/// - [`ComposeError::TaskPatchDotSegment`] — a declared key holds a `.`
+///   or `..` segment. Checked before anything else.
 /// - [`ComposeError::HookRequired`] — an entry needed approval and there
 ///   was no hook to ask.
 /// - [`ComposeError::Aborted`] — the hook cancelled.
@@ -1692,6 +1776,18 @@ pub fn gate_task_patch_paths(
             _ => camino::Utf8PathBuf::from(declared),
         }
     };
+    // Only an absolute key names a path on the daemon's filesystem that
+    // this machine can look at; a `~/` key names the session's home.
+    let resolvable = |declared: &str| declared.starts_with('/');
+
+    // Refused before any decision, so no prompt is ever about a path whose
+    // meaning the gate cannot pin down.
+    if let Some(entry) = entries.iter().find(|e| has_dot_segment(e.declared)) {
+        return Err(ComposeError::TaskPatchDotSegment {
+            what: entry.declared.to_owned(),
+            from: entry.source.clone(),
+        });
+    }
 
     // Pass 1: categorize per entry. Undecided entries are seeded
     // `Ignored` and queued; pass 3 overwrites every one. The placeholder
@@ -1701,7 +1797,7 @@ pub fn gate_task_patch_paths(
     let mut unapproved: Vec<usize> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         let path = expand_declared(entry.declared);
-        let verdict = check_task_patch_entry(&expanded, entry, &path);
+        let verdict = check_task_patch_entry(&expanded, entry, &path, resolvable(entry.declared));
         match verdict {
             crate::core::policy::PathDecision::Allowed => verdicts.push(NameVerdict::Allowed),
             crate::core::policy::PathDecision::Ignored => verdicts.push(NameVerdict::Ignored),
@@ -1741,30 +1837,37 @@ pub fn gate_task_patch_paths(
         if policy_updated {
             expanded = policy.expand_with(resolved_vars, home_fallback)?;
         }
-        // Pass 3: apply.
+        // Pass 3: apply. Only a `UseRule` answer needs the entry decided
+        // again, against the policy as the hook amended it.
         for (&i, decision) in unapproved.iter().zip(decisions) {
             let entry = &entries[i];
-            let path = expand_declared(entry.declared);
-            let verdict = check_task_patch_entry(&expanded, entry, &path);
             verdicts[i] = match decision {
                 ItemDecision::AllowOnce => NameVerdict::Allowed,
                 ItemDecision::IgnoreOnce => NameVerdict::Ignored,
-                ItemDecision::UseRule => match verdict {
-                    crate::core::policy::PathDecision::Allowed => NameVerdict::Allowed,
-                    crate::core::policy::PathDecision::Ignored => NameVerdict::Ignored,
-                    crate::core::policy::PathDecision::Denied => {
-                        return Err(ComposeError::Denied {
-                            what: entry.declared.to_owned(),
-                            from: entry.source.clone(),
-                        });
+                ItemDecision::UseRule => {
+                    let path = expand_declared(entry.declared);
+                    match check_task_patch_entry(
+                        &expanded,
+                        entry,
+                        &path,
+                        resolvable(entry.declared),
+                    ) {
+                        crate::core::policy::PathDecision::Allowed => NameVerdict::Allowed,
+                        crate::core::policy::PathDecision::Ignored => NameVerdict::Ignored,
+                        crate::core::policy::PathDecision::Denied => {
+                            return Err(ComposeError::Denied {
+                                what: entry.declared.to_owned(),
+                                from: entry.source.clone(),
+                            });
+                        }
+                        crate::core::policy::PathDecision::NeedsApproval => {
+                            return Err(ComposeError::use_rule_undecided(
+                                HookDomain::Patch,
+                                format!("source path `{}`", entry.declared),
+                            ));
+                        }
                     }
-                    crate::core::policy::PathDecision::NeedsApproval => {
-                        return Err(ComposeError::use_rule_undecided(
-                            HookDomain::Patch,
-                            format!("source path `{}`", entry.declared),
-                        ));
-                    }
-                },
+                }
             };
         }
     }

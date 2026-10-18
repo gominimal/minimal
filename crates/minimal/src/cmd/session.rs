@@ -1856,7 +1856,20 @@ pub async fn cmd_session_run(
         "found session"
     );
 
-    session_via_ssh(
+    // Gate the task's declared patches against `[patches]` here, as `min
+    // task run` does: the daemon holds no policy, and refuses a task that
+    // declares patches without this verdict.
+    let verdict =
+        crate::task::gate_session_task_patches(global, r.project_path.as_utf8_path(), &args.task)?;
+    let verdict = minimald_rpc::taskenv::encode_patch_verdict(&verdict).map_err(|len| {
+        anyhow::anyhow!(
+            "the task's patch declarations are too large to send ({len} bytes, limit {}); \
+             declare fewer `patch` entries",
+            minimald_rpc::taskenv::TASK_PATCH_VERDICT_MAX_BYTES
+        )
+    })?;
+
+    session_via_ssh_with_env(
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone
@@ -1872,6 +1885,7 @@ pub async fn cmd_session_run(
         ),
         None,
         None,
+        &[(minimald_rpc::taskenv::TASK_PATCH_VERDICT, verdict.as_str())],
     )
     .await
 }
@@ -2014,6 +2028,19 @@ pub(crate) async fn session_via_ssh(
     config_dir: Option<&std::path::Path>,
     host_asks_for: Option<&str>,
 ) -> Result<(), anyhow::Error> {
+    session_via_ssh_with_env(sock, id, wire, config_dir, host_asks_for, &[]).await
+}
+
+/// [`session_via_ssh`], plus `channel_env` sent on the exec channel ahead
+/// of the request (see [`minimal_client::attach::attach_command_with_env`]).
+pub(crate) async fn session_via_ssh_with_env(
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    wire: Option<String>,
+    config_dir: Option<&std::path::Path>,
+    host_asks_for: Option<&str>,
+    channel_env: &[(&str, &str)],
+) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
     // session-key config from `config_dir` and forwards it per channel; the
@@ -2023,8 +2050,13 @@ pub(crate) async fn session_via_ssh(
     } else {
         None
     };
-    let mut ssh =
-        minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
+    let mut ssh = minimal_client::attach::attach_command_with_env(
+        sock,
+        id,
+        wire.as_deref(),
+        session_keys.as_ref(),
+        channel_env,
+    )?;
 
     // The session's record, read before the attach or the exec on a
     // VM-backed host — one with a VM host daemon's control socket beside

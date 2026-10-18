@@ -41,19 +41,26 @@ pub const TASK_ENV_PREFIX: &str = "MINIMAL_TASK_ENV_";
 /// task as a variable called `DROP`.
 pub const TASK_ENV_DROP: &str = "MINIMAL_TASK_DROP";
 
-/// Channel env var carrying the declared patch paths the daemon must
-/// *remove* from the task's declarations, as a JSON array — the keys
-/// exactly as `minimal.toml` wrote them, so a removal matches the
-/// declaration it names.
+/// Channel env var carrying the client's `[patches]` verdict on a task's
+/// declared `patch.dir` / `patch.file` entries, as a JSON
+/// [`PatchVerdict`]: the keys it allowed and the keys it dropped, each
+/// exactly as `minimal.toml` wrote them.
 ///
-/// The client gates a task's `patch.dir` / `patch.file` entries against
-/// `[patches]` before the run; the entries the policy ignores cannot be
-/// carried the way a resolved value can (the daemon mounts the declared
-/// path itself), so an ignored entry has to be named for removal.
+/// The client gates those entries before the run, because the daemon
+/// holds no policy and mounts the declared path itself. The verdict is
+/// required, not advisory: a daemon mounts only the keys it names as
+/// allowed, and refuses a task that declares patches when the verdict is
+/// absent (an older client, or a lane that never gated), unparseable, or
+/// larger than [`TASK_PATCH_VERDICT_MAX_BYTES`].
 ///
 /// Deliberately **not** under [`TASK_ENV_PREFIX`], for the same reason as
 /// [`TASK_ENV_DROP`].
-pub const TASK_PATCH_DROP: &str = "MINIMAL_TASK_PATCH_DROP";
+pub const TASK_PATCH_VERDICT: &str = "MINIMAL_TASK_PATCH_VERDICT";
+
+/// The largest encoded [`TASK_PATCH_VERDICT`] a daemon reads. A task
+/// declares a handful of patches; anything near this bound is not a
+/// verdict worth parsing, and the client refuses to send one.
+pub const TASK_PATCH_VERDICT_MAX_BYTES: usize = 64 * 1024;
 
 /// The channel env var name carrying task variable `name`.
 #[must_use]
@@ -100,45 +107,77 @@ pub fn drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<S
         .unwrap_or_default()
 }
 
-/// The declared patch paths a client asked the daemon to drop, from a
-/// channel's env map. Same contract as
-/// [`drops_from_channel_env`]: absent, empty, or unparseable removes
-/// nothing, and an older client sends none at all.
-#[must_use]
-pub fn patch_drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<String> {
-    env_vars
-        .get(TASK_PATCH_DROP)
-        .and_then(|raw| serde_json_lenient::from_str(raw).ok())
-        .unwrap_or_default()
+/// The client's `[patches]` verdict on a task's declared `patch.dir` /
+/// `patch.file` keys, carried under [`TASK_PATCH_VERDICT`].
+///
+/// Both lists hold raw declared keys. A daemon removes every `drop` key,
+/// mounts the `allow` keys that remain, and refuses the task if it
+/// declares any key the verdict does not name: a key the client never
+/// saw was never gated.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PatchVerdict {
+    /// Declared keys the policy, or the user at its prompt, allowed.
+    pub allow: BTreeSet<String>,
+    /// Declared keys the policy ignored, to remove before mounting.
+    pub drop: BTreeSet<String>,
 }
 
-/// A task's `env_vars` as the client resolved them, plus the `patch`
-/// entries its policy dropped: the values to apply, and the names to
-/// remove.
+/// Encode a verdict for [`TASK_PATCH_VERDICT`].
 ///
-/// The two halves are disjoint by construction — a name is either resolved
-/// or dropped — and travel together because the daemon needs both to
-/// arrive at the set the task actually sees. `patch_drop` is a third,
-/// separate list: declared patch paths, not variable names, removed from
-/// the task's `patch.dir` / `patch.file` maps before they are mounted.
+/// # Errors
+///
+/// The encoded form when it exceeds [`TASK_PATCH_VERDICT_MAX_BYTES`], as
+/// its length: a daemon would refuse it, so the client must not send it.
+pub fn encode_patch_verdict(verdict: &PatchVerdict) -> Result<String, usize> {
+    let encoded = serde_json_lenient::to_string(verdict)
+        .expect("two sets of strings always serialize to JSON");
+    if encoded.len() > TASK_PATCH_VERDICT_MAX_BYTES {
+        return Err(encoded.len());
+    }
+    Ok(encoded)
+}
+
+/// The patch verdict a client sent, from a channel's env map.
+///
+/// `None` when it is absent, unparseable, or over
+/// [`TASK_PATCH_VERDICT_MAX_BYTES`]. Unlike the drop lists, `None` is not
+/// "remove nothing": it means no client checked the task's patches, and a
+/// daemon must not mount any.
+#[must_use]
+pub fn patch_verdict_from_channel_env(env_vars: &BTreeMap<String, String>) -> Option<PatchVerdict> {
+    let raw = env_vars.get(TASK_PATCH_VERDICT)?;
+    if raw.len() > TASK_PATCH_VERDICT_MAX_BYTES {
+        return None;
+    }
+    serde_json_lenient::from_str(raw).ok()
+}
+
+/// A task's `env_vars` as the client resolved them, plus its `[patches]`
+/// verdict: the values to apply, the names to remove, and which declared
+/// patches may mount.
+///
+/// The two env halves are disjoint by construction — a name is either
+/// resolved or dropped — and travel together because the daemon needs
+/// both to arrive at the set the task actually sees. `patch` is separate:
+/// declared patch paths, not variable names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskEnv {
     /// Values to apply over the task's own declarations.
     pub set: BTreeMap<String, String>,
     /// Names to remove from the task's declarations entirely.
     pub drop: BTreeSet<String>,
-    /// Declared patch paths to remove from the task's `patch` entries
-    /// entirely — the keys exactly as `minimal.toml` wrote them.
-    pub patch_drop: BTreeSet<String>,
+    /// The client's verdict on the task's declared patches. `None` for
+    /// every caller that does not run a task; a task run always sends
+    /// one, empty when the task declares no patches.
+    pub patch: Option<PatchVerdict>,
 }
 
 impl TaskEnv {
     /// `true` when there is nothing for the daemon to apply — the case for
-    /// every caller other than a task run, and for a task declaring no
-    /// `env_vars`.
+    /// every caller other than a task run.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty() && self.drop.is_empty() && self.patch_drop.is_empty()
+        self.set.is_empty() && self.drop.is_empty() && self.patch.is_none()
     }
 }
 
@@ -312,43 +351,74 @@ mod tests {
     #[test]
     fn the_drop_carrier_is_not_under_the_value_prefix() {
         assert!(!TASK_ENV_DROP.starts_with(TASK_ENV_PREFIX));
-        assert!(!TASK_PATCH_DROP.starts_with(TASK_ENV_PREFIX));
+        assert!(!TASK_PATCH_VERDICT.starts_with(TASK_ENV_PREFIX));
     }
 
-    /// The patch drop list round-trips, and the paths on it are the raw
-    /// declared keys — `~/`-rooted or otherwise — so a removal matches the
+    /// The patch verdict round-trips, and the paths on it are the raw
+    /// declared keys — `~/`-rooted or otherwise — so each matches the
     /// `minimal.toml` entry it names.
     #[test]
-    fn patch_drop_list_round_trips() {
-        let drops: BTreeSet<String> = ["~/.claude".to_string(), "/etc/secrets".to_string()]
-            .into_iter()
-            .collect();
+    fn patch_verdict_round_trips() {
+        let verdict = PatchVerdict {
+            allow: ["~/.claude".to_string()].into_iter().collect(),
+            drop: ["/etc/secrets".to_string()].into_iter().collect(),
+        };
         let mut channel = BTreeMap::new();
-        channel.insert(TASK_PATCH_DROP.to_string(), encode_drops(&drops));
+        channel.insert(
+            TASK_PATCH_VERDICT.to_string(),
+            encode_patch_verdict(&verdict).unwrap(),
+        );
 
-        assert_eq!(patch_drops_from_channel_env(&channel), drops);
+        assert_eq!(patch_verdict_from_channel_env(&channel), Some(verdict));
         // The carrier is not itself a task variable.
         assert!(from_channel_env(&channel).is_empty());
-        // And it is not the env-drop carrier: the two lists stay separate.
+        // And it is not the env-drop carrier: the two stay separate.
         assert!(drops_from_channel_env(&channel).is_empty());
     }
 
-    /// No patch drop list, an empty one, and a malformed one all mean
-    /// "remove nothing" — same fail-safe as the env drop list, and an
-    /// older client sends none at all.
+    /// An empty verdict is still a verdict: the client checked a task
+    /// that declares no patches, which differs from not checking at all.
     #[test]
-    fn an_absent_or_unparseable_patch_drop_list_removes_nothing() {
+    fn an_empty_patch_verdict_is_present() {
+        let mut channel = BTreeMap::new();
+        channel.insert(
+            TASK_PATCH_VERDICT.to_string(),
+            encode_patch_verdict(&PatchVerdict::default()).unwrap(),
+        );
+        assert_eq!(
+            patch_verdict_from_channel_env(&channel),
+            Some(PatchVerdict::default())
+        );
+    }
+
+    /// No verdict, a malformed one, and an oversized one all read as
+    /// "never checked", which a daemon refuses for a task with patches.
+    #[test]
+    fn an_absent_unparseable_or_oversized_patch_verdict_is_none() {
         let mut absent = BTreeMap::new();
         absent.insert("MINIMAL_SESSION_ID".to_string(), "an-id".to_string());
-        assert!(patch_drops_from_channel_env(&absent).is_empty());
-
-        let mut empty = BTreeMap::new();
-        empty.insert(TASK_PATCH_DROP.to_string(), encode_drops(&BTreeSet::new()));
-        assert!(patch_drops_from_channel_env(&empty).is_empty());
+        assert_eq!(patch_verdict_from_channel_env(&absent), None);
 
         let mut junk = BTreeMap::new();
-        junk.insert(TASK_PATCH_DROP.to_string(), "not json".to_string());
-        assert!(patch_drops_from_channel_env(&junk).is_empty());
+        junk.insert(TASK_PATCH_VERDICT.to_string(), "not json".to_string());
+        assert_eq!(patch_verdict_from_channel_env(&junk), None);
+
+        let huge = PatchVerdict {
+            allow: (0..TASK_PATCH_VERDICT_MAX_BYTES / 8)
+                .map(|i| format!("/p/{i}"))
+                .collect(),
+            drop: BTreeSet::new(),
+        };
+        assert!(
+            encode_patch_verdict(&huge).is_err(),
+            "the client refuses it"
+        );
+        let mut oversized = BTreeMap::new();
+        oversized.insert(
+            TASK_PATCH_VERDICT.to_string(),
+            serde_json_lenient::to_string(&huge).unwrap(),
+        );
+        assert_eq!(patch_verdict_from_channel_env(&oversized), None);
     }
 
     /// No drop list, an empty one, and a malformed one all mean "remove

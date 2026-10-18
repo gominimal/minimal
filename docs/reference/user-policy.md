@@ -154,6 +154,33 @@ deny   = ["~/.ssh/**", "**/*.pem"]
 ignore = ["**/.DS_Store"]
 ```
 
+#### Task patches {#task-patches}
+
+Before `min task run` or `min session run` starts a task, Minimal checks the
+task's [`patch.dir` and `patch.file`](./tasks.md#patches) entries against
+`[patches]` too. A task patch is a host path that the session mounts directly,
+so the rules apply to the **declared path** itself:
+
+- `allow` must match the path as `minimal.toml` declares it. A rule naming a
+  declared directory approves that directory whatever it holds.
+- `deny` on the declared path, or on any file a declared directory holds,
+  stops the run.
+- For a declared absolute path, Minimal also checks the path it resolves to on
+  your machine. A symlink cannot carry the path past a `deny` on its target.
+  This includes a symlinked parent of a path that does not exist yet.
+- `ignore` on the declared path leaves that entry out. An `ignore` on a file
+  inside a declared directory does not apply, because a mount cannot leave
+  one file out.
+- A declared path with a `.` or `..` segment stops the run.
+- Minimal matches a `~/` path as declared, and expands its `~/` against your
+  home the same way as a rule's `~/`. The session mounts `~/` from the
+  session's own home, so Minimal does not check what your home holds.
+
+On a host where Minimal runs in a VM (macOS), the symlink and directory checks
+read your computer's files. The VM's files can differ, so there these checks
+are a backstop. Without a terminal, or with `--no-input`, a path that needs
+approval stops the run. The error prints the `[patches] allow` lines to add.
+
 ### `[hooks]` — Lifecycle-script rules
 
 Patterns match the **project root path** that declared the hook — as you refer

@@ -116,16 +116,16 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
-    /// Declared patch paths the client's `[patches]` policy ignored, to
-    /// be removed from the task's `patch.dir` / `patch.file` declarations
-    /// before anything is mounted. The keys are raw — exactly as
-    /// `minimal.toml` wrote them — because patch keys are never
-    /// interpolated, so a removal matches the declaration it names.
+    /// The client's `[patches]` verdict on the task's declared
+    /// `patch.dir` / `patch.file` keys, applied by
+    /// [`apply_patch_verdict`] before anything is mounted. The keys are
+    /// raw — exactly as `minimal.toml` wrote them — because patch keys are
+    /// never interpolated, so each matches the declaration it names.
     ///
-    /// Empty when the client sent none — an older `min`, or any caller
-    /// other than `min task run` — in which case the declared patches
-    /// apply as before.
-    pub patch_drop: BTreeSet<String>,
+    /// `None` when the client sent none (an older `min`), or sent one this
+    /// daemon could not read; a task that declares patches is then
+    /// refused.
+    pub patch: Option<minimald_rpc::taskenv::PatchVerdict>,
     /// The client's invocation directory relative to the uploaded tree,
     /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
     /// is absolute or holds a `..`. A task that declares `inherit_cwd`
@@ -356,6 +356,121 @@ fn parse_task_args(
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
 /// governed by the consumer's stream.
+/// Apply the client's `[patches]` verdict to a task's declared patches:
+/// remove every dropped key, then require every key left to be one the
+/// verdict allowed.
+///
+/// The daemon holds no policy, so this is the only thing standing between
+/// a project's `patch` declarations and a mount. It fails closed: a task
+/// that declares patches with no verdict (an older `min`, or a verdict
+/// this daemon could not read) is refused, and so is a key the verdict
+/// does not name, since the client never checked it. A task that
+/// declares no patches needs no verdict.
+///
+/// # Errors
+///
+/// The refusal text, naming the task and what to do about it.
+fn apply_patch_verdict(
+    task_name: &str,
+    patch: &mut mfile::EnvPatches,
+    verdict: Option<&minimald_rpc::taskenv::PatchVerdict>,
+) -> Result<(), String> {
+    if patch.dir.is_empty() && patch.file.is_empty() {
+        return Ok(());
+    }
+    let Some(verdict) = verdict else {
+        return Err(format!(
+            "task '{task_name}' declares `patch` entries, and the `min` that \
+             started it did not check them against your [patches] policy, so \
+             the task did not run. Upgrade min to match the daemon, then run \
+             the task again"
+        ));
+    };
+    for key in &verdict.drop {
+        patch.dir.remove(key);
+        patch.file.remove(key);
+    }
+    if let Some(key) = patch
+        .dir
+        .keys()
+        .chain(patch.file.keys())
+        .find(|key| !verdict.allow.contains(*key))
+    {
+        return Err(format!(
+            "task '{task_name}' declares the patch path `{key}`, which `min` \
+             did not check against your [patches] policy, so the task did not \
+             run. The task's declaration here differs from the minimal.toml \
+             `min` read; run the task again once they match"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod patch_verdict_tests {
+    use super::apply_patch_verdict;
+    use minimald_rpc::taskenv::PatchVerdict;
+
+    fn patches(dirs: &[&str], files: &[&str]) -> mfile::EnvPatches {
+        let mut p = mfile::EnvPatches::default();
+        for d in dirs {
+            p.dir
+                .insert((*d).to_string(), mfile::PatchSetting::default());
+        }
+        for f in files {
+            p.file
+                .insert((*f).to_string(), mfile::PatchSetting::default());
+        }
+        p
+    }
+
+    fn verdict(allow: &[&str], drop: &[&str]) -> PatchVerdict {
+        PatchVerdict {
+            allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            drop: drop.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// A task with no patches needs no verdict: every non-patch task run
+    /// from an older client keeps working.
+    #[test]
+    fn a_task_without_patches_needs_no_verdict() {
+        let mut p = patches(&[], &[]);
+        apply_patch_verdict("t", &mut p, None).expect("nothing to gate");
+    }
+
+    /// No verdict for a task with patches is a refusal that names the fix,
+    /// never a mount of what the project declared.
+    #[test]
+    fn a_task_with_patches_and_no_verdict_is_refused() {
+        let mut p = patches(&["/opt/cache"], &[]);
+        let err = apply_patch_verdict("t", &mut p, None).unwrap_err();
+        assert!(err.contains("task 't'"), "{err}");
+        assert!(err.contains("Upgrade min"), "{err}");
+    }
+
+    /// Dropped keys leave both maps, allowed keys stay.
+    #[test]
+    fn dropped_keys_go_and_allowed_keys_stay() {
+        let mut p = patches(&["/opt/cache"], &["/etc/token", "~/.claude.json"]);
+        let v = verdict(&["/opt/cache", "~/.claude.json"], &["/etc/token"]);
+        apply_patch_verdict("t", &mut p, Some(&v)).expect("every key was gated");
+        assert!(p.dir.contains_key("/opt/cache"));
+        assert!(p.file.contains_key("~/.claude.json"));
+        assert!(!p.file.contains_key("/etc/token"));
+    }
+
+    /// A declared key the verdict does not name was never gated, so the
+    /// task is refused rather than the key mounted.
+    #[test]
+    fn a_key_the_verdict_does_not_name_is_refused() {
+        let mut p = patches(&["/opt/cache"], &["/etc/shadow"]);
+        let v = verdict(&["/opt/cache"], &[]);
+        let err = apply_patch_verdict("t", &mut p, Some(&v)).unwrap_err();
+        assert!(err.contains("`/etc/shadow`"), "{err}");
+    }
+}
+
 async fn task_producer(
     exec: TaskExec,
     session: BoxHandle,
@@ -424,15 +539,11 @@ async fn task_producer(
         for name in &exec.drop_env {
             task.vars.remove(name);
         }
-        // Patch removals join them: the client's `[patches]` gate decided
-        // these declared paths must not mount, and the keys are raw —
-        // never interpolated — so they match the declarations exactly.
-        // The daemon holds no policy; applying the client's verdicts
-        // here is the whole wire contract.
-        for key in &exec.patch_drop {
-            task.patch.dir.remove(key);
-            task.patch.file.remove(key);
-        }
+        // The daemon holds no policy, so the client's `[patches]` verdict
+        // decides what mounts: dropped keys go, and a task declaring a
+        // key the verdict does not allow is refused before any mount.
+        apply_patch_verdict(&exec.task, &mut task.patch, exec.patch.as_ref())
+            .map_err(io::Error::other)?;
         for (name, value) in &exec.env {
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
@@ -1891,10 +2002,10 @@ pub(crate) async fn handle_exec(
                 trace_env.clone(),
             );
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
-            // Patch paths the client's policy dropped, same wire contract
-            // as `drop_env`: absent from an older client, meaning the
-            // declared patches apply as before.
-            let patch_drop = minimald_rpc::taskenv::patch_drops_from_channel_env(&config.env_vars);
+            // The client's `[patches]` verdict. Unlike `drop_env`, absence
+            // is a signal: no verdict means no client checked the task's
+            // patches, and `apply_patch_verdict` refuses a task with any.
+            let patch = minimald_rpc::taskenv::patch_verdict_from_channel_env(&config.env_vars);
             let span = span.clone();
             session.channel_success(id)?;
             spawn(tracing::Instrument::instrument(
@@ -1913,7 +2024,7 @@ pub(crate) async fn handle_exec(
                             task: task.clone(),
                             env: task_env,
                             drop_env,
-                            patch_drop,
+                            patch,
                             cwd,
                         },
                     };
