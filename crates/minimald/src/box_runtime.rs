@@ -4805,6 +4805,10 @@ impl BoxLauncher for SandboxLauncher {
                     gate,
                     self.publications,
                     self.state_dir,
+                    own_address
+                        .as_ref()
+                        .map(crate::net::provider::OwnAddressReporter::registry),
+                    session_id,
                 ))
             }
             _ => None,
