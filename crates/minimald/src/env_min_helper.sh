@@ -32,6 +32,19 @@ __min_is_help_flag() {
     esac
 }
 
+# A help flag anywhere in the arguments. Only for commands whose every
+# argument is a flag or a package, output, or object name, none of which
+# can be `-h` or `--help`; `min run` forwards later arguments to the task.
+__min_has_help_flag() {
+    local arg
+    for arg in "$@"; do
+        if __min_is_help_flag "$arg"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Usage text for the dispatch level named by $1 (default: top). Help
 # requests print it to stdout and exit 0; error paths print it to stderr.
 __min_usage() {
@@ -47,6 +60,8 @@ __min_usage() {
             echo "Check minimal configuration (bare, by exception): min check"
             echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>"
             echo "Publish a port from inside the box: min net expose <port>"
+            echo ""
+            echo "Shortcuts: min search <query> is min package search <query>, min run <task name> is min task run <task name>, and pkg is short for package."
             ;;
         package)
             echo "Usage: min package <subcommand>"
@@ -60,7 +75,10 @@ __min_usage() {
             echo "Usage: min package build <packages>"
             ;;
         search)
-            echo "Usage: min search <search term>"
+            echo "Usage: min package search <query>"
+            ;;
+        patched-build)
+            echo "Usage: min package patched-build <package name>"
             ;;
         add)
             echo "Usage: min add [--session|--build|--runtime] <packages>"
@@ -177,7 +195,7 @@ min_search() {
         return 0
     fi
     if [[ -z "$term" ]]; then
-        echo "Usage: min_search <search term>" >&2
+        __min_usage search >&2
         return 1
     fi
 
@@ -186,12 +204,12 @@ min_search() {
 
 min_patched_pkg() {
     local pkg="$1"
-    if [[ "$pkg" == "-h" || "$pkg" == "--help" ]]; then
-        echo "Usage: min package patched-build <package-name>" >&2
+    if __min_is_help_flag "$pkg"; then
+        __min_usage patched-build
         return 0
     fi
     if [[ -z "$pkg" || "$pkg" == -* ]]; then
-        echo "Usage: min package patched-build <package-name>" >&2
+        __min_usage patched-build >&2
         return 1
     fi
 
@@ -203,7 +221,7 @@ __min_add() {
     shift
     local packages="$@"
     if [[ -z "$prefix" || -z "$packages" ]]; then
-        echo "Usage: min_add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
+        __min_usage add >&2
         return 1
     fi
 
@@ -213,7 +231,7 @@ __min_add() {
 min_add() {
     local flag="$1"
 
-    if __min_is_help_flag "$flag"; then
+    if __min_has_help_flag "$@"; then
         __min_usage add
         return 0
     fi
@@ -225,13 +243,8 @@ min_add() {
         shift
     fi
 
-    if __min_is_help_flag "$1"; then
-        __min_usage add
-        return 0
-    fi
-
     if [[ -z "$1" ]]; then
-        echo "Usage: min add [--session|--build|--runtime] <packages>" >&2
+        __min_usage add >&2
         return 1
     fi
 
@@ -295,7 +308,7 @@ min_package() {
             min_patched_pkg "$@"
             ;;
         build)
-            if __min_is_help_flag "$1"; then
+            if __min_has_help_flag "$@"; then
                 __min_usage build
                 return 0
             fi
@@ -319,7 +332,7 @@ min_package() {
 }
 
 min_check() {
-    if __min_is_help_flag "$1"; then
+    if __min_has_help_flag "$@"; then
         __min_usage check
         return 0
     fi
@@ -327,7 +340,7 @@ min_check() {
 }
 
 min_materialize() {
-    if __min_is_help_flag "$1"; then
+    if __min_has_help_flag "$@"; then
         __min_usage materialize
         return 0
     fi
@@ -353,7 +366,7 @@ min_net() {
                 return 0
             fi
             if [[ -z "$port" ]]; then
-                echo "Usage: min net expose <port>" >&2
+                __min_usage expose >&2
                 return 1
             fi
             __min_rpc "net-expose" "$port"
