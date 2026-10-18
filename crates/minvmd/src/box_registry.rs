@@ -5354,12 +5354,14 @@ impl BoxRegistry {
 
     /// Drops every withdrawn-name grace whose deadline has passed, and
     /// returns how many it dropped. The fold in [`Self::zone_view`]
-    /// already expires each name at its bound, so this reclaims the
-    /// map's memory and nothing observable changes; the answer the name
-    /// gives is the same the instant the view says so. The drop is
-    /// persisted ([`Self::persist_withdrawn_names`]) when it changed
-    /// anything, so a restart does not reload a grace that had already
-    /// aged out. Run on the withdrawal drainer's sweep
+    /// already expires each name at its bound, so a lookup answers the
+    /// same the instant the view says so; the drop reclaims the map's
+    /// memory and, when it changed anything, is persisted
+    /// ([`Self::persist_withdrawn_names`]), so a restart does not reload a
+    /// grace that had already aged out, and pinged, so the subscribers
+    /// that fold only on a ping — the publish to a shared answerer and
+    /// the zone-table dump — drop the name at the deadline too, within a
+    /// sweep. Run on the withdrawal drainer's sweep
     /// ([`Self::spawn_withdrawal_drainer`]).
     fn expire_withdrawn_names(&self) -> usize {
         let now = self.now();
@@ -5373,6 +5375,7 @@ impl BoxRegistry {
         drop(withdrawn);
         if dropped > 0 {
             self.persist_withdrawn_names();
+            self.ping();
         }
         dropped
     }
@@ -9165,6 +9168,146 @@ mod tests {
             boxes::core::zone_answer::decide(&a, &registry.zone_view()),
             boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a name with a row behind it answers the row's address"
+        );
+    }
+
+    /// The drainer's sweep that drops an aged-out grace pings the table,
+    /// so a subscriber that folds only on a ping (the publish to a shared
+    /// answerer, the zone-table dump) drops the name at its deadline.
+    #[test]
+    fn an_aged_out_grace_is_dropped_with_a_ping() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            !registry.withdraw_expired_detached().is_empty(),
+            "the row is gone"
+        );
+
+        let pings = registry.subscribe_table_pings();
+        assert_eq!(
+            registry.expire_withdrawn_names(),
+            0,
+            "a grace inside its window stays"
+        );
+        assert!(pings.try_recv().is_err(), "nothing changed, nothing pinged");
+
+        registry.advance_clock(WITHDRAWN_NAME_GRACE);
+        assert_eq!(
+            registry.expire_withdrawn_names(),
+            1,
+            "the aged-out grace is dropped"
+        );
+        assert!(
+            pings.try_recv().is_ok(),
+            "the drop is announced to the ping-driven subscribers"
+        );
+    }
+
+    /// NET-012: a client box whose row the detachment bound withdrew,
+    /// leaving its creation dormant, is destroyed by its creator — the
+    /// no-row withdrawal that proves and ends the dormant creation. The
+    /// destroy clears the name's grace at once: NXDOMAIN, not NODATA.
+    #[test]
+    fn a_proven_dormant_destroy_clears_a_withdrawn_names_grace() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the default plan has hand-out addresses");
+        let a = boxes::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
+        };
+
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            !registry.withdraw_expired_detached().is_empty(),
+            "the row is gone, its creation dormant"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nodata,
+            "the grace holds the name first"
+        );
+
+        assert!(
+            registry
+                .withdraw_client_box(
+                    "web",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id())
+                )
+                .expect("the creator's own pair")
+                .is_none(),
+            "the no-row path: the destroy proves and ends the dormant creation"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
+            "a destroyed box's name is held by nothing, grace or not"
+        );
+    }
+
+    /// NET-012: a box that re-registered within its grace and is then
+    /// destroyed takes the row path, and the destroy clears the grace with
+    /// the row: NXDOMAIN at once, never the grace's NODATA.
+    #[test]
+    fn a_destroy_after_re_registering_within_the_grace_clears_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        let a = boxes::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
+        };
+
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            !registry.withdraw_expired_detached().is_empty(),
+            "the row is gone"
+        );
+        let back = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+
+        assert!(
+            registry
+                .withdraw_client_box(
+                    "web",
+                    back.switch_addr(),
+                    back.loopback_addr(),
+                    Some(back.box_id())
+                )
+                .expect("the creator's own pair")
+                .is_some(),
+            "the row path: the re-registered row is withdrawn"
+        );
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
+            "a destroyed box's name is held by nothing, grace or not"
         );
     }
 
