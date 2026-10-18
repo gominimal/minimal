@@ -668,10 +668,13 @@ pub enum ExposeRefusal {
     NotRunning,
     /// The port is held already by this box's other runtime surface — the
     /// reservation or publication that holds it, whichever surface that
-    /// is, named by the owner the loser is refused with.
+    /// is, named by the owner the loser is refused with. While `pending`
+    /// is true the hold is a reservation whose publish has not landed
+    /// yet: the port is on its way to being published, not there yet.
     AlreadyPublished {
         port: u16,
         owner: super::listeners::PublicationOwner,
+        pending: bool,
     },
     /// The box shares the host's network (`host_ip`), so the port already
     /// answers on the host and there is nothing to publish. The request's
@@ -777,11 +780,18 @@ impl fmt::Display for ExposeRefusal {
                      start the box and try again"
                 )
             }
-            Self::AlreadyPublished { port, owner } => write!(
-                f,
-                "port {port} is published already by this box ({})",
-                owner.as_str()
-            ),
+            Self::AlreadyPublished {
+                port,
+                owner,
+                pending,
+            } => {
+                let state = if *pending {
+                    "is being published"
+                } else {
+                    "is published already"
+                };
+                write!(f, "port {port} {state} by this box ({})", owner.as_str())
+            }
             Self::NeedsNoExposing { port, .. } => write!(
                 f,
                 "port {port} needs no exposing: this box shares the host's network"
@@ -1657,6 +1667,28 @@ mod tests {
             .for_caller("web", NetworkMode::HostNet, 3001),
             "port 3001 needs no exposing: this box shares the host's network, so it \
              already answers at web.min.internal:3001"
+        );
+        // The hold a port loses to is one watch in either of its two
+        // states: the publication it stands on, or the reservation still
+        // on its way there. Each state is its own verdict, and the in-box
+        // line names it the same way the log does.
+        assert_eq!(
+            ExposeRefusal::AlreadyPublished {
+                port: 3001,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false
+            }
+            .for_caller("web", NetworkMode::OwnIp, 3001),
+            "port 3001 is published already by this box (listen)"
+        );
+        assert_eq!(
+            ExposeRefusal::AlreadyPublished {
+                port: 3001,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: true
+            }
+            .for_caller("web", NetworkMode::OwnIp, 3001),
+            "port 3001 is being published by this box (listen)"
         );
         // A refusal with no way forward beyond its own words is its verdict.
         assert_eq!(

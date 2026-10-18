@@ -1290,6 +1290,14 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 /// Unanswered keepalives tolerated before the connection is torn down.
 const KEEPALIVE_MAX: usize = 3;
 
+/// Wall-clock budget for tearing down a connection whose transport has
+/// stopped making progress — a full keepalive cycle plus one interval, so
+/// an otherwise-quiet but healthy attach (which answers each keepalive,
+/// resetting the clock) is never reaped: a healthy idle attach sees a
+/// keepalive every [`KEEPALIVE_INTERVAL`], long before this fires.
+const INACTIVITY_TIMEOUT: std::time::Duration =
+    KEEPALIVE_INTERVAL.saturating_mul(KEEPALIVE_MAX as u32 + 1);
+
 /// Builds the shared russh server config from the server state.
 async fn build_russh_config(
     state: &ServerStateHandle,
@@ -1298,9 +1306,14 @@ async fn build_russh_config(
         keys: vec![state.host_key().await?],
         auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         nodelay: true,
-        // Keepalives own deadness detection; the default 600s inactivity
-        // reaper would kill healthy idle attaches, so it is explicitly off.
-        inactivity_timeout: None,
+        // Keepalives own deadness detection, so this must never reap an
+        // idle-but-alive attach (the default 600s would). But russh bounds
+        // every transport write by the inactivity timer, and with `None` a
+        // wedged write parks the session loop forever — keepalives are
+        // dispatched from that same loop, so they stop firing too and the
+        // connection outlives every budget. Arming it at the keepalive
+        // budget bounds a stuck transport without touching a healthy one.
+        inactivity_timeout: Some(INACTIVITY_TIMEOUT),
         keepalive_interval: Some(KEEPALIVE_INTERVAL),
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
@@ -2936,6 +2949,27 @@ mod tests {
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
         super::test_config(dir.path())
+    }
+
+    /// The inactivity deadline is the whole keepalive budget, derived from the
+    /// keepalive settings rather than restated: a healthy idle attach answers a
+    /// keepalive every interval (resetting the clock), so the deadline must
+    /// outlast every keepalive round the budget allows.
+    #[test]
+    fn inactivity_deadline_spans_the_full_keepalive_budget() {
+        assert_eq!(INACTIVITY_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        assert!(INACTIVITY_TIMEOUT > KEEPALIVE_INTERVAL * KEEPALIVE_MAX as u32);
+    }
+
+    /// The production config arms the inactivity deadline: with `None` a
+    /// wedged transport write parks the session loop forever.
+    #[tokio::test]
+    async fn the_production_config_arms_the_inactivity_deadline() {
+        let server = crate::test_harness::TestServer::new().await;
+        let config = build_russh_config(&server.state).await.unwrap();
+        assert_eq!(config.inactivity_timeout, Some(INACTIVITY_TIMEOUT));
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, KEEPALIVE_MAX);
     }
 
     /// The node address's interim opening follows the port the proxy actually

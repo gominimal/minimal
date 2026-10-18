@@ -237,6 +237,13 @@ impl OwnAddressReporter {
         self.runtime_ingress.clone()
     }
 
+    /// The registry this reporter reports to, for the listen watcher's
+    /// dynamic-port records and releases (NET-129): a watcher holding this
+    /// handle needs no other path to the registry.
+    pub(crate) fn registry(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
+        Arc::clone(&self.registry)
+    }
+
     /// Reports `lease` — with the box's ingress declaration as an
     /// external→internal port map — and registers `session_name`'s box name
     /// against it, so the name routes exactly when the box is reachable. The

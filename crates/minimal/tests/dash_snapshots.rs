@@ -494,6 +494,40 @@ fn sidebar_and_info_show_git_context() {
     );
 }
 
+/// The Info section's net row spells the mode the way the rest of the CLI
+/// does (`--network` values, `min session policy`): `own_ip`, not a Rust
+/// enum name.
+#[test]
+fn detail_pane_spells_the_network_mode_word() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: None,
+            policy_error: None,
+        },
+    );
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    let net_row = rendered
+        .lines()
+        .find(|l| l.contains("net "))
+        .unwrap_or_else(|| panic!("net row missing:\n{rendered}"));
+    assert!(
+        net_row.contains("net     own_ip"),
+        "net row must spell the mode word, got: {net_row}"
+    );
+    assert!(!net_row.contains("OwnIp"), "net row: {net_row}");
+}
+
 /// A session with no git info renders neither a repo nor a branch row,
 /// keeping the Info column layout byte-identical to pre-git renders.
 #[test]
@@ -545,7 +579,7 @@ fn sidebar_truncates_a_long_branch() {
         "full branch must not fit: {row}"
     );
     // The right-aligned cells survive truncation.
-    assert!(row.contains("OwnIp"), "network label clipped: {row}");
+    assert!(row.contains("own_ip"), "network label clipped: {row}");
 }
 
 /// A session with fresh stdout renders its activity spinner in the sidebar

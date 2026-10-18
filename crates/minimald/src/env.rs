@@ -446,14 +446,21 @@ fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<Str
 
 /// Looks up a session package by name in `graph`.
 ///
-/// The one lookup both [`Env::build`] (at launch) and session activation's
-/// finalize check use, so a name activation accepts is one the launch
-/// resolves, and both report an unknown name in the same words.
+/// The lookup [`Env::build`] uses at launch. Session activation's finalize
+/// check judges the same names against the same graph's names, and both
+/// word an unknown name through [`unknown_package`].
 pub(crate) fn session_package(graph: &Graph, name: &str) -> std::io::Result<BuildSpecRef> {
     graph
         .by_name(name)
         .copied()
-        .ok_or_else(|| std::io::Error::other(format!("no such package: {name}")))
+        .ok_or_else(|| unknown_package(name))
+}
+
+/// The error for a session package `name` the graph does not declare,
+/// shared by the launch ([`session_package`]) and the finalize check, so
+/// both report an unknown name in the same words.
+pub(crate) fn unknown_package(name: &str) -> std::io::Error {
+    std::io::Error::other(format!("no such package: {name}"))
 }
 
 impl Env {
