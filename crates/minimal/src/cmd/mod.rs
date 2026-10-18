@@ -1000,20 +1000,25 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
 /// (a refused RPC, the daemon-side refusal, "shutting down") reads like an
 /// internal error rather than the lost race it is. The daemon marks its
 /// shutdown refusals with a single constant the client can match on, so the
-/// race is named here in one plain sentence. Any other failure keeps the
+/// race is named here in one plain sentence, without the RPC's name, which
+/// means nothing to the reader. The refusal is the whole of the daemon's
+/// message, so a cause matches only when it ends with the marker, not when
+/// the same words appear inside other text. Any other failure keeps the
 /// chain, wrapped exactly as before.
 pub(crate) fn session_rpc_failed(rpc: &str, error: anyhow::Error) -> anyhow::Error {
     if error
         .chain()
-        .any(|cause| cause.to_string().contains(minimald_rpc::SHUTDOWN_REFUSAL))
+        .any(|cause| cause.to_string().ends_with(minimald_rpc::SHUTDOWN_REFUSAL))
     {
-        return anyhow::anyhow!(
-            "{rpc} failed because the daemon was shutting down, so no session \
-             was created. Run the command again once the daemon is running."
-        );
+        return anyhow::anyhow!(SHUTDOWN_RACE_MESSAGE);
     }
     error.context(format!("{rpc} RPC failed"))
 }
+
+/// What [`session_rpc_failed`] prints for an activation that lost the race
+/// with a daemon shutdown.
+const SHUTDOWN_RACE_MESSAGE: &str = "the daemon was shutting down, so no session was created. \
+                                     Run the command again once the daemon is running.";
 
 #[cfg(test)]
 mod tests {
@@ -1033,9 +1038,23 @@ mod tests {
         let error = session_rpc_failed("ConfigureLoadout", raw);
         assert_eq!(
             error.to_string(),
-            "ConfigureLoadout failed because the daemon was shutting down, so no session \
-             was created. Run the command again once the daemon is running."
+            "the daemon was shutting down, so no session was created. \
+             Run the command again once the daemon is running."
         );
+    }
+
+    /// The marker matches only as the end of the daemon's message: a failure
+    /// that merely mentions the same words inside other text is not the
+    /// shutdown refusal, and keeps its chain.
+    #[test]
+    fn the_shutdown_marker_inside_other_text_is_not_the_refusal() {
+        let raw = anyhow::anyhow!(
+            "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {} \
+             was not expected here",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed("CreateSession", raw);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
     }
 
     /// Any other RPC failure keeps its chain, wrapped exactly as before:
