@@ -88,7 +88,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
 - **PKV-004** THE SYSTEM SHALL parse `<spec_hash>.intoto.jsonl` one envelope per line, accepting exactly the DSSE fields `payload`, `payloadType` and `signatures[]{keyid, sig}`, and SHALL reject an envelope with any other field, an empty line inside the file (the terminating newline is not one), an empty `signatures`, or more than 8 signatures, before verifying any signature.
   tier:     T1
   verify:   cargo nextest run -p verify envelope_parse_rejects_unknown_fields_and_oversize
-  property: parse(e) = Ok ⇒ fields(e) ⊆ {payload, payloadType, signatures} ∧ 1 ≤ |signatures| ≤ 8 ∧ ∀s ∈ signatures. fields(s) = {keyid, sig}
+  property: parse(e) = Ok ⇒ fields(e) = {payload, payloadType, signatures} ∧ 1 ≤ |signatures| ≤ 8 ∧ ∀s ∈ signatures. fields(s) = {keyid, sig}
   - WHEN the file holds more than one envelope THE SYSTEM SHALL verify every envelope's signatures (PKV-005, PKV-006), select the envelopes whose statement decodes with `predicateType` SLSA Provenance v1, and accept exactly one such envelope; IF none or more than one such envelope verifies THEN THE SYSTEM SHALL exit 6 with `provenance: none` or `provenance: ambiguous`; an envelope with another `predicateType` is reported in `detail` and never used by the `provenance` check.
     tier:   T1
     verify: cargo nextest run -p verify multi_envelope_exactly_one_provenance
