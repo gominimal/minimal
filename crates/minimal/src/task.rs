@@ -402,9 +402,9 @@ fn denied_task_var_message(task_name: &str, name: &str, policy_path: &std::path:
 /// tests.
 fn denied_task_patch_message(task_name: &str, path: &str, policy_path: &std::path::Path) -> String {
     format!(
-        "task '{task_name}' declares `patch.{path}`, but it is denied by \
-         `[patches] deny` in {policy}; remove the declaration, or the deny \
-         rule if this task should mount it",
+        "task '{task_name}' declares the patch path `{path}`, but it is \
+         denied by `[patches] deny` in {policy}; remove the declaration, or \
+         the deny rule if this task should mount it",
         policy = policy_path.display(),
     )
 }
@@ -490,6 +490,44 @@ fn resolve_task_patches(
         }
     }
     Ok(drops)
+}
+
+/// The non-interactive lane of [`resolve_task_patches`]: gate against a
+/// collect-and-refuse hook, and turn a refusal into the `[patches] allow`
+/// snippet the operator pastes. The recorded paths are read before the
+/// gate's own result, which is the abort error once the hook refused.
+fn resolve_task_patches_non_interactive(
+    task: &mfile::Task,
+    task_name: &str,
+    patches_policy: boxes::core::policy::PatchesPolicy,
+    policy_path: &std::path::Path,
+    source: &boxes::core::source::Source,
+    resolved_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<std::collections::BTreeSet<String>, anyhow::Error> {
+    let hooks = RefuseAndRecord::default();
+    let drops = resolve_task_patches(
+        task,
+        task_name,
+        patches_policy,
+        policy_path,
+        source,
+        &hooks,
+        resolved_env,
+    );
+    let refused = hooks.recorded_patch_paths();
+    if !refused.is_empty() {
+        let count = refused.len();
+        let snippet = refused_patches_snippet(&refused);
+        bail!(
+            "task '{task_name}' declares {count} patch{es} that your policy does \
+             not allow, and stdin/stderr is not a terminal.\n\n\
+             Add the following to {path}:\n\n{snippet}\n\
+             Then re-run this command.",
+            path = policy_path.display(),
+            es = if count == 1 { "" } else { "es" },
+        );
+    }
+    drops
 }
 
 /// The whitespace rejection body: the name is debug-quoted so the offending
@@ -764,32 +802,15 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 s = if count == 1 { "" } else { "s" },
             );
         }
-        let task_env = task_env?;
-        let patch_drops = resolve_task_patches(
+        let mut task_env = task_env?;
+        task_env.patch_drop = resolve_task_patches_non_interactive(
             &declared,
             &args.task,
             user_policy.patches().clone(),
             &policy_path,
             &source,
-            &hooks,
             &task_env,
         )?;
-        let refused_patches = hooks.recorded_patch_paths();
-        if !refused_patches.is_empty() {
-            let count = refused_patches.len();
-            let snippet = refused_patches_snippet(&refused_patches);
-            bail!(
-                "task '{task}' declares {count} patch{es} that your policy does \
-                 not allow, and stdin/stderr is not a terminal.\n\n\
-                 Add the following to {path}:\n\n{snippet}\n\
-                 Then re-run this command.",
-                task = args.task,
-                path = policy_path.display(),
-                es = if count == 1 { "" } else { "es" },
-            );
-        }
-        let mut task_env = task_env;
-        task_env.patch_drop = patch_drops;
         (task_env, user_policy)
     } else {
         let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
@@ -802,19 +823,22 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             &hooks,
             |k| std::env::var(k),
         );
-        let task_env = task_env?;
         // Same lane for patches, against the same interactive hook, so a
         // rule the user records for a patch lands in the same policy
-        // save as a rule recorded for a variable.
-        let patch_drops = resolve_task_patches(
-            &declared,
-            &args.task,
-            user_policy.patches().clone(),
-            &policy_path,
-            &source,
-            &hooks,
-            &task_env,
-        )?;
+        // save as a rule recorded for a variable. Gated only once the
+        // vars resolved; either error is held until after the save.
+        let gated = task_env.and_then(|mut task_env| {
+            task_env.patch_drop = resolve_task_patches(
+                &declared,
+                &args.task,
+                user_policy.patches().clone(),
+                &policy_path,
+                &source,
+                &hooks,
+                &task_env,
+            )?;
+            Ok(task_env)
+        });
         // Persist before propagating a refusal: a rule the user chose to
         // record is theirs whether or not this run goes on to fail.
         let after = hooks.into_final_policy();
@@ -824,9 +848,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
             }
         }
-        let mut task_env = task_env;
-        task_env.patch_drop = patch_drops;
-        (task_env, after)
+        (gated?, after)
     };
 
     crate::ensure_daemon(global)?;
@@ -1887,7 +1909,7 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("patch./etc/passwd"),
+            msg.contains("patch path `/etc/passwd`"),
             "names the declared path: {msg}"
         );
         assert!(msg.contains("[patches] deny"), "names the rule: {msg}");
@@ -1932,6 +1954,32 @@ mod tests {
             vec!["/opt/tool/bin".to_string()],
             "the refused paths are what the caller's snippet is built from",
         );
+    }
+
+    /// The non-interactive lane surfaces the `[patches] allow` snippet,
+    /// not the hook's abort: the recorded paths are read before the gate's
+    /// own error is propagated.
+    #[test]
+    fn the_non_interactive_patch_refusal_carries_the_allow_snippet() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.file]\n\"/opt/tool/bin\" = \"ro\"\n",
+        );
+
+        let err = resolve_task_patches_non_interactive(
+            &task,
+            "t",
+            boxes::core::policy::PatchesPolicy::default(),
+            &policy_path_fixture(),
+            &project_source(),
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("an unapproved patch must fail the run");
+
+        let msg = err.to_string();
+        assert!(msg.contains("task 't' declares 1 patch "), "{msg}");
+        assert!(msg.contains("[patches]"), "carries the snippet: {msg}");
+        assert!(msg.contains("/opt/tool/bin"), "names the path: {msg}");
+        assert!(msg.contains("user_policy.toml"), "names the file: {msg}");
     }
 
     /// An ignored patch path lands in the drop list the daemon removes

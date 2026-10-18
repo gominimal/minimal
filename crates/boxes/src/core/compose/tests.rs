@@ -2620,6 +2620,97 @@ mod gate_task_patch_paths {
         assert!(matches!(err, ComposeError::Denied { .. }));
     }
 
+    /// A rule naming the declared directory approves it with whatever it
+    /// holds: the allow step is the directory's own, which is the rule the
+    /// prompt records and the refusal snippet prints.
+    #[test]
+    fn an_exact_allow_on_a_non_empty_directory_allows_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonical, so the declared and resolved forms agree (macOS
+        // tempdirs sit behind the `/var` -> `/private/var` link).
+        let root =
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir_all(cache.join("nested").as_std_path()).unwrap();
+        std::fs::write(cache.join("a.txt").as_std_path(), "x").unwrap();
+        std::fs::write(cache.join("nested/b.txt").as_std_path(), "x").unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(cache.as_str(), false)]);
+        let policy = PatchesPolicy::default().with_allow(vec![cache.to_string()]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// An ignore on a contained file still drops an allowed directory.
+    #[test]
+    fn a_directory_entry_is_dropped_by_an_ignored_contained_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonical, so the declared and resolved forms agree (macOS
+        // tempdirs sit behind the `/var` -> `/private/var` link).
+        let root =
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(cache.as_std_path()).unwrap();
+        std::fs::write(cache.join("token").as_std_path(), "x").unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(cache.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![cache.to_string()])
+            .with_ignore(vec![format!("{cache}/token")]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Ignored]);
+    }
+
+    /// `UseRule` after the hook records the declared directory path, as
+    /// the interactive "allow always" does, settles a non-empty directory
+    /// rather than failing the hook contract.
+    #[test]
+    fn use_rule_with_a_recorded_directory_rule_allows_a_non_empty_directory() {
+        struct RecordDir(String);
+        impl crate::core::hooks::PolicyHooks for RecordDir {
+            fn on_var_unapproved(
+                &self,
+                _: crate::core::policy::VarsPolicy,
+                _: &[Unapproved<'_, str>],
+            ) -> HookResult<crate::core::policy::VarsPolicy> {
+                panic!("var hook should not have been invoked")
+            }
+            fn on_patch_unapproved(
+                &self,
+                policy: PatchesPolicy,
+                _: &[Unapproved<'_, camino::Utf8Path>],
+            ) -> HookResult<PatchesPolicy> {
+                HookResult::decided_with_policy(
+                    vec![ItemDecision::UseRule],
+                    policy.with_allow(vec![self.0.clone()]),
+                )
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonical, so the declared and resolved forms agree (macOS
+        // tempdirs sit behind the `/var` -> `/private/var` link).
+        let root =
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(cache.as_std_path()).unwrap();
+        std::fs::write(cache.join("a.txt").as_std_path(), "x").unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(cache.as_str(), false)]);
+        let hook = RecordDir(cache.to_string());
+        let (verdicts, _) = gate_task_patch_paths(
+            &entries,
+            PatchesPolicy::default(),
+            Some(&hook),
+            &NoVars,
+            None,
+        )
+        .unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
     #[test]
     fn a_directory_entry_denied_on_its_own_path_stays_denied() {
         let source = project_source();

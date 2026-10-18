@@ -1579,33 +1579,45 @@ fn check_task_patch_path(
 /// every file it currently holds. A directory that cannot be walked (missing
 /// for a future `create_if_missing` mount, or unreadable) is decided by its
 /// own path alone.
+///
+/// Contained files can only make the entry stricter: a `deny` or `ignore`
+/// on one denies or drops the whole entry, but the allow step is the
+/// directory's own. A rule naming the declared directory, as the prompt
+/// and the refusal snippet record it, therefore approves the entry
+/// whatever it holds. Folding contained files' `NeedsApproval` in as well
+/// would leave a non-empty directory undecidable by any exact-path rule.
 fn check_task_patch_dir(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
     dir: &camino::Utf8Path,
 ) -> crate::core::policy::PathDecision {
-    let mut verdict = check_task_patch_path(expanded, source, dir);
+    use crate::core::policy::PathDecision;
+    let own = check_task_patch_path(expanded, source, dir);
+    let mut contents = PathDecision::Allowed;
     // Best-effort name walk: any IO failure (a missing directory a
     // `create_if_missing` mount would create, a permission error) leaves
     // the entry's fate to the path check above.
-    let mut stack = vec![dir.to_path_buf()];
+    let mut stack = vec![dir.as_std_path().to_path_buf()];
     while let Some(cur) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(cur.as_std_path()) else {
+        let Ok(read) = std::fs::read_dir(&cur) else {
             continue;
         };
         for entry in read.flatten() {
-            let Ok(path) = camino::Utf8PathBuf::from_path_buf(entry.path()) else {
-                continue;
-            };
             let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
             if is_dir {
-                stack.push(path);
+                stack.push(entry.path());
             } else {
-                verdict = verdict.combine(check_task_patch_path(expanded, source, &path));
+                // Lossy rather than skipped: a non-UTF-8 name must still
+                // meet a `**` deny or ignore on its directory.
+                let path = camino::Utf8PathBuf::from(entry.path().to_string_lossy().into_owned());
+                contents = contents.combine(check_task_patch_path(expanded, source, &path));
             }
         }
     }
-    verdict
+    match contents {
+        PathDecision::Denied | PathDecision::Ignored => own.combine(contents),
+        PathDecision::NeedsApproval | PathDecision::Allowed => own,
+    }
 }
 
 /// A declared entry's decision: the file form checks its one path, the
@@ -1639,9 +1651,10 @@ fn check_task_patch_entry(
 /// pattern to walk. A directory entry is checked twice — once as the
 /// declared path (a deny on the directory itself must deny the entry) and
 /// once per file the directory currently holds (a deny on a contained file
-/// must deny the entry that would mount it), with the outcomes combined
-/// by [`PathDecision::combine`]'s most-restrictive-first precedence. A
-/// directory that cannot be read is decided by its own path alone.
+/// must deny the entry that would mount it, an ignore on one drops it). The
+/// allow step is the directory's own path, so a rule naming the declared
+/// directory approves it however many files it holds. A directory that
+/// cannot be read is decided by its own path alone.
 ///
 /// `~/`-rooted entries are expanded against `home_fallback` for the
 /// check; a `~` entry with no fallback routes to the hook (fail-closed).
