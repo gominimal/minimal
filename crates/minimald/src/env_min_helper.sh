@@ -33,14 +33,28 @@ __min_is_help_flag() {
 }
 
 # A help flag anywhere in the arguments. Only for commands whose every
-# argument is a flag or a package, output, or object name, none of which
-# can be `-h` or `--help`; `min run` forwards later arguments to the task.
+# argument is a valueless flag or a package or object name, none of which
+# can be `-h` or `--help`; `min run` forwards later arguments to the task,
+# and `min materialize` uses __min_materialize_has_help_flag.
 __min_has_help_flag() {
     local arg
     for arg in "$@"; do
         if __min_is_help_flag "$arg"; then
             return 0
         fi
+    done
+    return 1
+}
+
+# A help flag in a `min materialize` argument slot. The value that follows
+# `-o`/`--output` or `--arch` is a path or an arch, never a help request.
+__min_materialize_has_help_flag() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o|--output|--arch) shift ;;
+            -h|--help) return 0 ;;
+        esac
+        shift
     done
     return 1
 }
@@ -287,6 +301,7 @@ min_task() {
             ;;
         *)
             echo "error: unknown subcommand '$subcmd'. Expected 'run'" >&2
+            __min_usage task >&2
             return 1
             ;;
     esac
@@ -324,6 +339,7 @@ min_package() {
             ;;
         *)
             echo "error: unknown subcommand '$subcmd'. Expected 'add', 'build', 'search', or 'patched-build'" >&2
+            __min_usage package >&2
             return 1
             ;;
     esac
@@ -338,7 +354,7 @@ min_check() {
 }
 
 min_materialize() {
-    if __min_has_help_flag "$@"; then
+    if __min_materialize_has_help_flag "$@"; then
         __min_usage materialize
         return 0
     fi
@@ -375,6 +391,7 @@ min_net() {
             ;;
         *)
             echo "error: unknown subcommand '$subcmd'. Expected 'expose'" >&2
+            __min_usage net >&2
             return 1
             ;;
     esac

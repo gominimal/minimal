@@ -2858,6 +2858,12 @@ exit $rc
                 "Usage: min materialize --output <path> [--arch <arch>] <output name>",
             ),
             (
+                "materialize --arch x86_64 --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
                 "net expose --help",
                 0,
                 "stdout",
@@ -2867,6 +2873,14 @@ exit $rc
             ("task", 1, "stderr", "Usage: min task run <task name>"),
             ("net", 1, "stderr", "Usage: min net expose <port>"),
             ("bogus", 1, "stderr", "Usage: min <subcommand>"),
+            (
+                "package bogus",
+                1,
+                "stderr",
+                "Usage: min package <subcommand>",
+            ),
+            ("task bogus", 1, "stderr", "Usage: min task run <task name>"),
+            ("net bogus", 1, "stderr", "Usage: min net expose <port>"),
         ] {
             let Some((stdout, stderr, exit)) = run_min_command(rootfs, args) else {
                 return;
@@ -2875,10 +2889,18 @@ exit $rc
                 exit, code,
                 "`{args}` should exit {code}, got: {stdout} {stderr}"
             );
-            let out = if stream == "stdout" { &stdout } else { &stderr };
+            let (out, other) = if stream == "stdout" {
+                (&stdout, &stderr)
+            } else {
+                (&stderr, &stdout)
+            };
             assert!(
                 out.contains(usage),
                 "`{args}` should print `{usage}` on {stream}, got: {stdout} {stderr}"
+            );
+            assert!(
+                other.is_empty(),
+                "`{args}` should print only on {stream}, got: {stdout} {stderr}"
             );
             assert!(
                 !stdout.contains("RPC-CALLED") && !stderr.contains("RPC-CALLED"),
@@ -2889,7 +2911,8 @@ exit $rc
 
     /// In an argument slot a bare `help` is a package name, search term, or
     /// task name, not a help request, so it still reaches the daemon. So
-    /// does a help flag after a task name: it is the task's argument.
+    /// does a help flag after a task name: it is the task's argument. So
+    /// does a help flag in a materialize value slot: it is the path.
     #[test]
     fn help_word_in_argument_slot_reaches_rpc() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2902,6 +2925,8 @@ exit $rc
             "package build help",
             "task run help",
             "run mytask --help",
+            "materialize --output --help x",
+            "materialize -o -h x",
         ] {
             let Some((stdout, stderr, _)) = run_min_command(rootfs, args) else {
                 return;
