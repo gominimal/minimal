@@ -638,14 +638,16 @@ async fn run_one<C: BoxCommands>(
 /// forever, so the buffers are read for whatever arrived rather than
 /// waited on to the end.
 async fn joined_tail(readers: &mut Option<ReaderPair>) -> String {
-    let Some((stdout, stderr)) = readers.take() else {
+    let Some((mut stdout, mut stderr)) = readers.take() else {
         return String::new();
     };
     let _ = tokio::time::timeout(
         TAIL_JOIN_BUDGET,
-        futures::future::join(stdout.join, stderr.join),
+        futures::future::join(&mut stdout.join, &mut stderr.join),
     )
     .await;
+    // A reader still blocked on a held pipe is aborted when the pair
+    // drops at the end of this function (see [`TailReader`]'s `Drop`).
     let (out, err) = (
         &*stdout.tail.lock().unwrap_or_else(|p| p.into_inner()),
         &*stderr.tail.lock().unwrap_or_else(|p| p.into_inner()),
@@ -663,7 +665,20 @@ struct TailReader {
     join: tokio::task::JoinHandle<()>,
 }
 
-/// How long a timed-out run waits for its pipe readers to finish. Not
+/// Dropping a `JoinHandle` detaches its task rather than ending it, so
+/// a reader blocked on a pipe that a grandchild holds open would
+/// outlive the run, and keep its span open, for as long as that
+/// grandchild lives. Every path out of a run drops its readers, so
+/// aborting here ends them all: the bounded join, the failed wait,
+/// and an early return alike.
+impl Drop for TailReader {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
+/// How long a run waits for its pipe readers to finish once the child
+/// is reaped. Not
 /// part of the hook's timeout: it exists only so a grandchild holding a
 /// pipe open cannot stretch the report, and most reaps in a few
 /// milliseconds once the kill closes the interpreter's end.
@@ -1261,7 +1276,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = camino::Utf8Path::from_path(tmp.path()).unwrap();
         let script = HookScript::inline("echo before-hang; sleep 30")
-            .with_timeout(Duration::from_secs(1))
+            .with_timeout(Duration::from_secs(3))
             .unwrap();
         let hook = LifecycleHook::builder()
             .with_on_activate(script)
@@ -1299,7 +1314,7 @@ mod tests {
         // The backgrounded sleep inherits stdout and holds it open long
         // past the interpreter's own kill.
         let script = HookScript::inline("echo held; sleep 30 & sleep 30")
-            .with_timeout(Duration::from_secs(1))
+            .with_timeout(Duration::from_secs(3))
             .unwrap();
         let hook = LifecycleHook::builder()
             .with_on_activate(script)
@@ -1332,6 +1347,27 @@ mod tests {
             "a held pipe must not stretch the report: {:?}",
             started.elapsed(),
         );
+    }
+
+    /// A reader past the join's bound is ended, not detached: a pipe
+    /// held open forever must not keep its task alive with it.
+    #[tokio::test]
+    async fn a_dropped_tail_reader_stops_reading_a_held_pipe() {
+        // The writer half is kept alive for the whole test, so the
+        // reader never sees EOF on its own.
+        let (_held, pipe) = tokio::io::duplex(64);
+        let reader = spawn_tail_reader(Some(pipe));
+        let tail = reader.tail.clone();
+        drop(reader);
+        // The aborted task drops its future, and with it the only
+        // other handle on the tail.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::sync::Arc::strong_count(&tail) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reader task outlived its handle");
     }
 
     /// Setup runs project-first; teardown runs the exact reverse.
