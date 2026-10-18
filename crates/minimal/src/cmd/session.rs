@@ -3944,11 +3944,12 @@ pub(crate) async fn destroy_session(
             release_held_box_name(control_sock, id, name, box_addresses).await;
         }
         minimald_rpc::Errorable::Err { error } => {
-            // Two concurrent destroys race inside the daemon: the loser is
-            // told the session is already gone ("no session with ID ...").
-            // The session being destroyed is the goal state, so report it
-            // rather than failing — and under `--force` that leniency is the
-            // explicitly requested behaviour. Any other error stays an error.
+            // Two concurrent destroys race inside the daemon, and the loser
+            // is told the session is already gone (UNKNOWN_SESSION_ID_LEAD).
+            // Under `--force` that is the goal state, so it is reported as
+            // success. Without it, the destroy fails naming the session
+            // instead of forwarding the daemon's text. Any other error is
+            // forwarded unchanged.
             if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) {
                 let label = match name {
                     Some(name) => name.to_string(),

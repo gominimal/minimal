@@ -288,7 +288,9 @@ min session destroy [--all] [-f|--force] [SESSION]
 ```
 
 Destroys a session and ends its processes. `--all` destroys all sessions.
-`-f/--force` skips the confirmation.
+`-f/--force` skips the confirmation. Under `-f`, if another destroy removed
+the session first, the command reports the session as already destroyed and
+succeeds. Without `-f`, the command fails and names the session.
 
 Before it destroys one session, the command asks for confirmation if the
 session holds uncommitted changes or commits that no remote has. It also asks
