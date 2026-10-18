@@ -218,23 +218,33 @@ pub(crate) fn run_init_flow(
         }
     }
 
-    mfile::File::edit_exclusively::<anyhow::Error>(&plan.toml_path, |content| {
+    // Whether the file existed under the lock, which decides Created vs
+    // Updated, and whether the edit refused, so the refusal is not wrapped
+    // in the "writing" context meant for I/O errors.
+    let mut existed = exists;
+    let mut refused = false;
+    let written = mfile::File::edit_exclusively::<anyhow::Error>(&plan.toml_path, |content| {
         // The `exists` check above ran before the lock was taken, so a
         // concurrent writer (another `min add`/`min update` scaffolding
         // this file) may have created it since. Re-check under the lock:
         // clobbering it without --force is the same destructive overwrite
         // that check exists to prevent.
-        if content.is_some() && !force {
+        existed = content.is_some();
+        if existed && !force {
+            refused = true;
             bail!(
                 "refusing to overwrite existing {} without confirmation; pass --force",
                 plan.toml_path.display()
             );
         }
         Ok(Some(plan.content.clone()))
-    })
-    .with_context(|| format!("writing {}", plan.toml_path.display()))?;
+    });
+    match written {
+        Err(e) if refused => return Err(e),
+        written => written.with_context(|| format!("writing {}", plan.toml_path.display()))?,
+    }
 
-    Ok(if exists {
+    Ok(if existed {
         InitOutcome::Updated(plan.toml_path)
     } else {
         InitOutcome::Created(plan.toml_path)

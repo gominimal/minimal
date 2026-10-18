@@ -934,18 +934,38 @@ impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
     pub fn from_toml_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        Self::parse(bytes)
+        Self::parse(bytes, None)
     }
 
     /// Deserializes `minimal.toml` bytes, mapping serde's opaque untagged
     /// `LinkConfig` failure to [`Error::LinkConfig`], which names the keys a
-    /// link table must set instead of quoting serde's internal enum name.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+    /// link table must set and where the bad table is, instead of quoting
+    /// serde's internal enum name.
+    fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
         toml::from_slice(bytes).map_err(|e| {
-            if e.message().contains("untagged enum LinkConfig") {
-                Error::LinkConfig(e)
-            } else {
-                Error::Format(e)
+            if !e.message().contains("untagged enum LinkConfig") {
+                return Error::Format(e);
+            }
+            let start = e.span().map(|s| s.start.min(bytes.len()));
+            let line = start.map(|s| bytes[..s].iter().filter(|b| **b == b'\n').count() + 1);
+            // The nearest table header at or above the bad table's line.
+            let table = start.and_then(|s| {
+                let line_end = bytes[s..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(bytes.len(), |p| s + p);
+                String::from_utf8_lossy(&bytes[..line_end])
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| l.starts_with('['))
+                    .map(|l| l.split_once('#').map_or(l, |(h, _)| h).trim().to_string())
+            });
+            Error::LinkConfig {
+                path: path.map(Path::to_path_buf),
+                line,
+                table,
+                source: Box::new(e),
             }
         })
     }
@@ -1059,7 +1079,7 @@ impl File {
                 }
 
                 return Self::init_toml(
-                    Self::parse(&file_data)?,
+                    Self::parse(&file_data, Some(&path))?,
                     &path,
                     Layout::Root,
                     hash_bytes(&file_data),
@@ -1073,7 +1093,7 @@ impl File {
         let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => Self::init_toml(
-                Self::parse(&file_data)?,
+                Self::parse(&file_data, Some(&path))?,
                 &path,
                 Layout::DotMinimal,
                 hash_bytes(&file_data),
@@ -1086,15 +1106,22 @@ impl File {
     /// Read-modify-write `minimal.toml` under an exclusive lock, so
     /// concurrent `min` commands cannot lose each other's edits.
     ///
-    /// The lock is an advisory `flock` on the file's parent directory,
-    /// held for the whole read-edit-write sequence; the content is
-    /// re-read **inside** the lock, so every serialized writer sees the
-    /// previous writer's result. Locking the directory rather than a
-    /// sidecar file leaves nothing behind in the project tree, and the
-    /// lock follows the directory's inode, so every spelling of the path
-    /// shares it. The write itself is atomic (temp file + rename), so a
-    /// concurrent reader never sees a torn file and cannot write a
-    /// partial view back.
+    /// The lock is an advisory `flock` on a file in the per-user Minimal
+    /// state directory (`<state>/minimal/mfile-locks/`), named by a hash of
+    /// the file's canonical path. Nothing is left in the project tree, and
+    /// every spelling of the path (relative, absolute, through a symlink)
+    /// shares one lock. It is held for the whole read-edit-write sequence;
+    /// the content is re-read **inside** the lock, so every serialized
+    /// writer sees the previous writer's result. The write itself is
+    /// atomic (temp file + rename), so a concurrent reader never sees a
+    /// torn file and cannot write a partial view back.
+    ///
+    /// The lock is best-effort: on a filesystem without `flock` support
+    /// the edit runs unlocked after a warning, still with the atomic
+    /// write. It only excludes processes that share the state directory,
+    /// so an edit made inside a session VM does not exclude one made on
+    /// the host. The rename keeps the file's mode, but not its owner, ACLs
+    /// or extended attributes.
     ///
     /// The `edit` closure receives the current content (`None` if the
     /// file does not exist yet) and returns `Ok(Some(new))` to write,
@@ -1107,35 +1134,59 @@ impl File {
     where
         E: From<Error>,
     {
-        // Resolve symlinks so the lock and the atomic replace both
+        let Some(state) = paths::try_minimal_state_dir() else {
+            return Err(Error::IO(
+                "locking",
+                path.to_path_buf(),
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "cannot find the Minimal state directory (is HOME set?)",
+                ),
+            )
+            .into());
+        };
+        let lock_dir = AsRef::<Path>::as_ref(&state).join("mfile-locks");
+        Self::edit_exclusively_in(&lock_dir, path, edit)
+    }
+
+    /// [`File::edit_exclusively`] with the lock directory passed in, so
+    /// tests do not write to the real state directory.
+    fn edit_exclusively_in<E>(
+        lock_dir: &Path,
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
+    ) -> Result<(), E>
+    where
+        E: From<Error>,
+    {
+        // Resolve symlinks so the lock key and the atomic replace both
         // target the real file: `persist` would otherwise replace the
-        // symlink entry itself, and a writer using the link and one
-        // using the target would lock different directories.
-        let resolved;
+        // symlink entry itself. A file that does not exist yet is keyed
+        // by its canonical parent, so `min init` shares the lock with the
+        // edits that follow it.
         let path = match std::fs::canonicalize(path) {
-            Ok(p) => {
-                resolved = p;
-                resolved.as_path()
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                match (std::fs::canonicalize(parent), path.file_name()) {
+                    (Ok(p), Some(name)) => p.join(name),
+                    _ => path.to_path_buf(),
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
             Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
         };
+        let path = path.as_path();
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // A read-only descriptor is enough for `flock`, so any user who
-        // can read the directory can take the lock.
-        let mut lock = match std::fs::File::open(&parent) {
-            Ok(f) => fd_lock::RwLock::new(f),
-            Err(e) => return Err(Error::IO("locking", parent, e).into()),
-        };
-        let _guard = match lock.write() {
-            Ok(g) => g,
-            Err(e) => return Err(Error::IO("locking", parent, e).into()),
-        };
+        // Held until this function returns, so across the write below.
+        let _lock = Self::lock_for(lock_dir, path)?;
 
         let content = match std::fs::read_to_string(path) {
             Ok(s) => Some(s),
@@ -1177,6 +1228,64 @@ impl File {
                     Err(e) => Err(Error::IO("replacing", path.to_path_buf(), e.error).into()),
                 }
             }
+        }
+    }
+
+    /// Takes the exclusive lock for the canonical `path`, saying so on
+    /// stderr before it waits for another process to release it. `None`
+    /// means the lock file's filesystem does not support `flock`, and the
+    /// caller edits unlocked.
+    fn lock_for(lock_dir: &Path, path: &Path) -> Result<Option<std::fs::File>, Error> {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(path.as_os_str().as_bytes());
+        let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let lock_path = lock_dir.join(format!("{name}.lock"));
+
+        if let Err(e) = std::fs::create_dir_all(lock_dir) {
+            return Err(Error::IO(
+                "creating lock directory",
+                lock_dir.to_path_buf(),
+                e,
+            ));
+        }
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => return Err(Error::IO("opening lock", lock_path, e)),
+        };
+
+        let locked = match file.try_lock() {
+            Ok(()) => Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!(
+                    "waiting for another command to finish editing {}",
+                    path.display()
+                );
+                file.lock()
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        };
+        match locked {
+            Ok(()) => Ok(Some(file)),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EBADF | libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) || e.raw_os_error() == Some(libc::ENOTSUP) =>
+            {
+                tracing::warn!(
+                    "cannot lock {} ({e}); editing {} without the lock",
+                    lock_path.display(),
+                    path.display()
+                );
+                Ok(None)
+            }
+            Err(e) => Err(Error::IO("locking", lock_path, e)),
         }
     }
 
@@ -2813,6 +2922,18 @@ mod tests {
         }
     }
 
+    /// One lock directory for the whole test process, so tests never write
+    /// to the real state directory; lock files are keyed by each test's
+    /// own temp path, so tests do not contend.
+    static TEST_LOCK_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempdir().unwrap());
+
+    fn edit_in_test(
+        path: &Path,
+        edit: impl FnOnce(Option<&str>) -> Result<Option<String>, Error>,
+    ) -> Result<(), Error> {
+        File::edit_exclusively_in(TEST_LOCK_DIR.path(), path, edit)
+    }
+
     #[test]
     fn edit_exclusively_serializes_writers() {
         let dir = tempdir().unwrap();
@@ -2824,7 +2945,7 @@ mod tests {
             for line in &writers {
                 let path = &path;
                 s.spawn(move || {
-                    File::edit_exclusively::<Error>(path, |content| {
+                    edit_in_test(path, |content| {
                         let Some(mut content) = content.map(str::to_string) else {
                             panic!("minimal.toml vanished under the lock");
                         };
@@ -2854,7 +2975,7 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 for i in 0..64 {
-                    File::edit_exclusively::<Error>(&path, |content| {
+                    edit_in_test(&path, |content| {
                         let mut content = content
                             .expect("minimal.toml vanished under the lock")
                             .to_string();
@@ -2890,6 +3011,66 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("`repo`"), "message: {msg}");
         assert!(msg.contains("`dir`"), "message: {msg}");
+        assert!(msg.contains("[upstream]"), "message: {msg}");
+    }
+
+    /// A sideload missing `repo`/`dir` is mapped too, and the message
+    /// points at the sideload's table rather than at `[upstream]`. Also
+    /// pins the serde wording the mapping matches on.
+    #[test]
+    fn sideload_missing_repo_and_dir_names_the_table_and_line() {
+        let err = File::from_toml_bytes(indoc! {b"
+            [upstream]
+            repo = \"https://example.com/pkgs.git\"
+
+            [[upstream.sideload]]
+            dir = \"../local\"
+
+            [[upstream.sideload]]
+            branch = \"main\"
+        "})
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::LinkConfig { .. }),
+            "not mapped to LinkConfig: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("`repo`"), "message: {msg}");
+        assert!(msg.contains("[[upstream.sideload]]"), "message: {msg}");
+        assert!(msg.contains("line 7"), "message: {msg}");
+        assert!(!msg.contains("untagged"), "message: {msg}");
+    }
+
+    /// A second editor waits while the lock is held, including one that
+    /// names the file through a symlink: both spellings share one lock.
+    #[test]
+    #[cfg(unix)]
+    fn edit_exclusively_waits_for_the_holder_across_spellings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+
+        let held = File::lock_for(TEST_LOCK_DIR.path(), &std::fs::canonicalize(&path).unwrap())
+            .unwrap()
+            .expect("flock is supported on the test filesystem");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                edit_in_test(&link, |content| Ok(content.map(|c| format!("{c}k = 1\n")))).unwrap();
+                tx.send(()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the edit ran while another holder had the lock"
+            );
+            drop(held);
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the edit runs once the lock is released");
+        });
+        assert!(std::fs::read_to_string(&path).unwrap().contains("k = 1"));
     }
 
     #[test]
@@ -2897,7 +3078,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
 
-        File::edit_exclusively::<Error>(&path, |content| {
+        edit_in_test(&path, |content| {
             assert!(content.is_none(), "a missing file reads as None");
             Ok(Some("[stack]\nname = \"base\"\n".to_string()))
         })
@@ -2918,7 +3099,7 @@ mod tests {
         let link = dir.path().join(MFILE_NAME);
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        File::edit_exclusively::<Error>(&link, |content| {
+        edit_in_test(&link, |content| {
             let mut content = content.expect("target vanished").to_string();
             content.push_str("k = \"v\"\n");
             Ok(Some(content))
@@ -2942,7 +3123,7 @@ mod tests {
         let path = dir.path().join(MFILE_NAME);
         std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
 
-        File::edit_exclusively::<Error>(&path, |content| {
+        edit_in_test(&path, |content| {
             let mut content = content.expect("minimal.toml vanished").to_string();
             content.push_str("k = \"v\"\n");
             Ok(Some(content))

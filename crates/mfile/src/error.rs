@@ -9,8 +9,15 @@ pub enum Error {
     /// An `[upstream]` or sideload table does not deserialize into the
     /// untagged `LinkConfig` enum — a missing key, but also a wrong
     /// field type — so serde's error names neither the file nor the
-    /// offending field.
-    LinkConfig(toml::de::Error),
+    /// offending field. Carries the file (when it is known), the 1-based
+    /// line the bad table starts on, and that table's header (when one
+    /// precedes it), so the message can point at the table to fix.
+    LinkConfig {
+        path: Option<PathBuf>,
+        line: Option<usize>,
+        table: Option<String>,
+        source: Box<toml::de::Error>,
+    },
     NotFound,
     ConflictingLayouts(Vec<PathBuf>),
     MissingParamDefault(String),
@@ -30,13 +37,27 @@ impl fmt::Display for Error {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
-            Error::LinkConfig(_) => write!(
-                f,
-                "invalid link: an `[upstream]` or sideload table must be \
-                 either `repo` (a git URL string, with optional string \
-                 `branch` and `locked_commit`) or `dir` (a directory \
-                 path string)"
-            ),
+            Error::LinkConfig {
+                path, line, table, ..
+            } => {
+                write!(f, "invalid link")?;
+                if let Some(path) = path {
+                    write!(f, " in {}", path.display())?;
+                }
+                if let Some(line) = line {
+                    write!(f, " at line {line}")?;
+                }
+                if let Some(table) = table {
+                    write!(f, " ({table})")?;
+                }
+                write!(
+                    f,
+                    ": an `[upstream]` or sideload table must be \
+                     either `repo` (a git URL string, with optional string \
+                     `branch` and `locked_commit`) or `dir` (a directory \
+                     path string)"
+                )
+            }
             Error::NotFound => write!(f, "not found"),
             Error::ConflictingLayouts(paths) => write!(
                 f,
@@ -78,7 +99,9 @@ impl std::error::Error for Error {
         match self {
             Error::IO(_, _, e) => Some(e),
             Error::Format(e) => Some(e),
-            Error::LinkConfig(e) => Some(e),
+            // The serde error only restates serde's internal enum name,
+            // which the Display above replaces; it stays for Debug.
+            Error::LinkConfig { .. } => None,
             Error::NotFound => None,
             Error::ConflictingLayouts(_) => None,
             Error::MissingParamDefault(_) => None,

@@ -1209,8 +1209,8 @@ impl Context {
             }
         };
 
-        // The whole read-edit-write runs under `minimal.toml`'s sidecar lock
-        // so a concurrent `min` command cannot interleave between our read
+        // The whole read-edit-write runs under `File::edit_exclusively`'s
+        // lock so a concurrent `min` command cannot interleave between our read
         // and our write (the write itself is an atomic replace).
         let mut did_edit = false;
         mfile::File::edit_exclusively(&mfile_path, |content| {

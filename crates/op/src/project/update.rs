@@ -112,8 +112,8 @@ impl ProjectOp for UpdateProject {
             return Ok(report);
         };
 
-        // The whole read-edit-write runs under the file's sidecar lock (with
-        // an atomic replace), so a concurrent `min` command can neither lose
+        // The whole read-edit-write runs under `File::edit_exclusively`'s
+        // lock (with an atomic replace), so a concurrent `min` command can neither lose
         // our re-pin nor have its own edit lost by us.
         mfile::File::edit_exclusively::<anyhow::Error>(&p, |content| {
             let toml =
