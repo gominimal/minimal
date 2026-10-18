@@ -509,7 +509,7 @@ pub(crate) fn run_compose(
     declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
     hooks_enabled: bool,
-) -> Result<(ComposeOutcome, Option<Vec<String>>), std::io::Error> {
+) -> Result<(ComposeOutcome, Option<std::collections::HashSet<String>>), std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
     let graph_names = match &resolution {
         ProjectResolution::NoMFile => None,

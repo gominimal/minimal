@@ -728,6 +728,11 @@ enum BoxMessage {
     /// so a finalize sent after the ack sees it.
     #[cfg(test)]
     CheckPackagesAtFinalize(std::time::Duration, oneshot::Sender<()>),
+    /// Test-only: drop the compose-time graph names, as an actor restored
+    /// from disk lacks them, so the finalize check takes its fallback and
+    /// evaluates the graph itself. Acknowledged once dropped.
+    #[cfg(test)]
+    ForgetComposedGraphNames(oneshot::Sender<()>),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -1060,7 +1065,7 @@ pub struct BoxActor {
     /// project graph — the most expensive step of a compose. `None`
     /// when compose saw no mfile (or the actor was rebuilt from disk),
     /// where the check falls back to evaluating the graph itself.
-    composed_graph_names: Option<Arc<[String]>>,
+    composed_graph_names: Option<HashSet<String>>,
 }
 
 /// Why a session host was launched.
@@ -2319,6 +2324,15 @@ impl BoxActor {
                 )]
                 let _ = r.send(());
             }
+            #[cfg(test)]
+            BoxMessage::ForgetComposedGraphNames(r) => {
+                self.composed_graph_names = None;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -2423,7 +2437,7 @@ impl BoxActor {
         // `Pending` park resuming through `handle_verdict` — the
         // finalize check judges against the graph this same compose
         // evaluated, never a re-evaluation.
-        self.composed_graph_names = graph_names.map(Arc::from);
+        self.composed_graph_names = graph_names;
 
         match outcome {
             // The composition is complete: promote the record
@@ -5680,6 +5694,16 @@ impl BoxActor {
     /// operator; `Ok(false)` when it ran to a verdict (nothing unknown, or
     /// an unknown package refused via `Err`).
     async fn check_composed_packages(&self, comp: &Composition) -> Result<bool, std::io::Error> {
+        // Both expiry routes (the budget measured up front, the timer
+        // below) step aside with the same warning.
+        fn warn_check_expired(deadline: std::time::Duration) {
+            tracing::warn!(
+                ?deadline,
+                "package check skipped at finalize: the session graph did not \
+                 resolve within its deadline; unknown package names will surface \
+                 at first exec, as before this check existed",
+            );
+        }
         if comp.packages().is_empty() {
             return Ok(false);
         }
@@ -5694,33 +5718,24 @@ impl BoxActor {
                 // (see the expiry test). Measuring costs nothing on the
                 // slow fallback, which the timeout bounds anyway.
                 if started.elapsed() >= self.package_check_deadline {
+                    warn_check_expired(self.package_check_deadline);
                     return Ok(true);
                 }
                 let unknown: Vec<String> = match self.composed_graph_names.as_ref() {
-                    Some(known) => {
-                        let declared: Vec<(String, String)> = comp
-                            .packages()
-                            .iter()
-                            .map(|p| {
-                                (
-                                    p.package().to_string(),
-                                    boxes::core::source::Provenanced::source(p).to_string(),
-                                )
-                            })
-                            .collect();
-                        let known = Arc::clone(known);
-                        crate::traced::spawn_blocking(move || {
-                            declared
-                                .into_iter()
-                                .filter(|(name, _)| !known.contains(name))
-                                .map(|(name, source)| {
-                                    format!("no such package: {name} (declared by {source})")
-                                })
-                                .collect()
+                    // A handful of set lookups: judged inline, no
+                    // blocking-pool round-trip.
+                    Some(known) => comp
+                        .packages()
+                        .iter()
+                        .filter(|p| !known.contains(p.package()))
+                        .map(|p| {
+                            format!(
+                                "{} (declared by {})",
+                                crate::env::unknown_package(p.package()),
+                                boxes::core::source::Provenanced::source(p)
+                            )
                         })
-                        .await
-                        .map_err(std::io::Error::other)?
-                    }
+                        .collect(),
                     None => {
                         let ctx = match self.build_context(true).await {
                             Ok(ctx) => ctx,
@@ -5782,12 +5797,7 @@ impl BoxActor {
                 // first exec — so the check tolerates it too. The evaluation
                 // the timeout detached keeps running on the blocking pool and
                 // warms the cache that launch reads.
-                tracing::warn!(
-                    deadline = ?self.package_check_deadline,
-                    "package check skipped at finalize: the session graph did not \
-                     resolve within its deadline; unknown package names will surface \
-                     at first exec, as before this check existed",
-                );
+                warn_check_expired(self.package_check_deadline);
                 Ok(true)
             }
         }
@@ -6322,6 +6332,22 @@ impl BoxHandle {
             .send(BoxMessage::CheckPackagesAtFinalize(deadline, send))
             .await;
         recv.await.expect("the session actor should ack the switch");
+    }
+
+    /// Test-only: drop the compose-time graph names (see
+    /// [`BoxMessage::ForgetComposedGraphNames`]).
+    #[cfg(test)]
+    pub(crate) async fn forget_composed_graph_names(&self) {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(BoxMessage::ForgetComposedGraphNames(send))
+            .await;
+        recv.await.expect("the session actor should ack the drop");
     }
 
     /// Test-only peek at the actor's held [`Composition`]. Bumps the
