@@ -277,7 +277,7 @@ async fn serve_get_session_record(
 /// Stand-in for `session_name` on the lifecycle records when the session
 /// carries no user-assigned name. `BoxConfig::name` is `None` for an
 /// anonymous session, and an absent field reads like a logging bug.
-const ANONYMOUS_SESSION: &str = "<anonymous>";
+pub(crate) const ANONYMOUS_SESSION: &str = "<anonymous>";
 
 /// The egress rule counts a session config parses to, one per egress field.
 /// Logged beside the record the daemon stores at session start, they are the
@@ -4742,7 +4742,7 @@ mod tests {
             assert!(
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
-                        && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains(&format!("session_name=\"{name}\""))
                         && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
