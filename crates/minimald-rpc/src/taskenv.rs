@@ -110,8 +110,8 @@ pub fn drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<S
 /// The client's `[patches]` verdict on a task's declared `patch.dir` /
 /// `patch.file` keys, carried under [`TASK_PATCH_VERDICT`].
 ///
-/// Both lists hold raw declared keys. A daemon removes every `drop` key,
-/// mounts the declarations that remain only when `allow` names each one
+/// Both lists hold raw declared keys, each with its kind. A daemon removes
+/// every `drop` entry from the map of its kind, mounts the declarations that remain only when `allow` names each one
 /// as checked, and refuses the task otherwise: a declaration the client
 /// never saw was never gated. An allowed entry carries its kind and mode
 /// as well as its key, because the client checks a directory differently
@@ -121,8 +121,8 @@ pub fn drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<S
 pub struct PatchVerdict {
     /// Declarations the policy, or the user at its prompt, allowed.
     pub allow: BTreeSet<AllowedPatch>,
-    /// Declared keys the policy ignored, to remove before mounting.
-    pub drop: BTreeSet<String>,
+    /// Declarations the policy ignored, to remove before mounting.
+    pub drop: BTreeSet<DroppedPatch>,
 }
 
 impl PatchVerdict {
@@ -147,6 +147,17 @@ pub struct AllowedPatch {
     pub is_file: bool,
     /// `true` for a read-only declaration, `false` for read-write.
     pub read_only: bool,
+}
+
+/// One declaration a [`PatchVerdict`] dropped. It carries its kind
+/// because the client gates a `patch.dir` and a `patch.file` entry under
+/// the same key separately, so dropping one must leave the other.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct DroppedPatch {
+    /// The declared key, verbatim.
+    pub path: String,
+    /// `true` for a `patch.file` entry, `false` for `patch.dir`.
+    pub is_file: bool,
 }
 
 /// Encode a verdict for [`TASK_PATCH_VERDICT`].
@@ -394,7 +405,12 @@ mod tests {
             }]
             .into_iter()
             .collect(),
-            drop: ["/etc/secrets".to_string()].into_iter().collect(),
+            drop: [DroppedPatch {
+                path: "/etc/secrets".to_string(),
+                is_file: true,
+            }]
+            .into_iter()
+            .collect(),
         };
         let mut channel = BTreeMap::new();
         channel.insert(

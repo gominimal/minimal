@@ -508,7 +508,12 @@ fn resolve_task_patches(
                     read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
                 })
             }
-            boxes::core::compose::NameVerdict::Ignored => out.drop.insert(key),
+            boxes::core::compose::NameVerdict::Ignored => {
+                out.drop.insert(minimald_rpc::taskenv::DroppedPatch {
+                    path: key,
+                    is_file: entry.is_file,
+                })
+            }
         };
     }
     Ok(out)
@@ -2252,11 +2257,18 @@ mod tests {
         )
         .expect("ignored entries drop, they do not fail");
 
-        let expect: std::collections::BTreeSet<String> = ["/opt/tool/bin", "/opt/cache"]
-            .map(String::from)
-            .into_iter()
-            .collect();
-        assert_eq!(verdict.drop, expect, "raw declared keys, verbatim");
+        let expect: std::collections::BTreeSet<_> =
+            [("/opt/tool/bin", true), ("/opt/cache", false)]
+                .map(|(path, is_file)| minimald_rpc::taskenv::DroppedPatch {
+                    path: path.to_string(),
+                    is_file,
+                })
+                .into_iter()
+                .collect();
+        assert_eq!(
+            verdict.drop, expect,
+            "raw declared keys, verbatim, with their kind"
+        );
         assert!(verdict.allow.is_empty(), "nothing ignored is allowed");
     }
 

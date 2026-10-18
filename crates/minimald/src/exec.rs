@@ -352,13 +352,10 @@ fn parse_task_args(
         .map_err(|e| e.to_string())
 }
 
-/// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
-/// `env` lives on a single stack frame across every spawn — that frame
-/// is alive for the whole life of this tokio task, which in turn is
-/// governed by the consumer's stream.
 /// Apply the client's `[patches]` verdict to a task's declared patches:
-/// remove every dropped key, then require every declaration left to be one
-/// the verdict allowed, with the kind and mode the client checked.
+/// remove every dropped declaration from the map of its kind, then require
+/// every declaration left to be one the verdict allowed, with the kind and
+/// mode the client checked.
 ///
 /// The daemon holds no policy, so this is the only thing standing between
 /// a project's `patch` declarations and a mount. It fails closed: a task
@@ -387,9 +384,12 @@ fn apply_patch_verdict(
              the task again"
         ));
     };
-    for key in &verdict.drop {
-        patch.dir.remove(key);
-        patch.file.remove(key);
+    for dropped in &verdict.drop {
+        if dropped.is_file {
+            patch.file.remove(&dropped.path);
+        } else {
+            patch.dir.remove(&dropped.path);
+        }
     }
     // An allowed key must also keep the kind and mode it was checked as:
     // the client walks a directory and not a file, and a read-only entry
@@ -444,7 +444,7 @@ pub(crate) fn refuse_in_box_patches(
 #[cfg(test)]
 mod patch_verdict_tests {
     use super::{apply_patch_verdict, refuse_in_box_patches};
-    use minimald_rpc::taskenv::{AllowedPatch, PatchVerdict};
+    use minimald_rpc::taskenv::{AllowedPatch, DroppedPatch, PatchVerdict};
 
     fn patches(dirs: &[&str], files: &[&str]) -> mfile::EnvPatches {
         let mut p = mfile::EnvPatches::default();
@@ -461,7 +461,7 @@ mod patch_verdict_tests {
 
     /// A verdict allowing each `(key, is_file)` read-only, the mode
     /// [`patches`] declares.
-    fn verdict(allow: &[(&str, bool)], drop: &[&str]) -> PatchVerdict {
+    fn verdict(allow: &[(&str, bool)], drop: &[(&str, bool)]) -> PatchVerdict {
         PatchVerdict {
             allow: allow
                 .iter()
@@ -471,7 +471,13 @@ mod patch_verdict_tests {
                     read_only: true,
                 })
                 .collect(),
-            drop: drop.iter().map(|s| (*s).to_string()).collect(),
+            drop: drop
+                .iter()
+                .map(|(path, is_file)| DroppedPatch {
+                    path: (*path).to_string(),
+                    is_file: *is_file,
+                })
+                .collect(),
         }
     }
 
@@ -493,18 +499,29 @@ mod patch_verdict_tests {
         assert!(err.contains("Upgrade min"), "{err}");
     }
 
-    /// Dropped keys leave both maps, allowed keys stay.
+    /// Dropped keys leave the map of their kind, allowed keys stay.
     #[test]
     fn dropped_keys_go_and_allowed_keys_stay() {
         let mut p = patches(&["/opt/cache"], &["/etc/token", "~/.claude.json"]);
         let v = verdict(
             &[("/opt/cache", false), ("~/.claude.json", true)],
-            &["/etc/token"],
+            &[("/etc/token", true)],
         );
         apply_patch_verdict("t", &mut p, Some(&v)).expect("every key was gated");
         assert!(p.dir.contains_key("/opt/cache"));
         assert!(p.file.contains_key("~/.claude.json"));
         assert!(!p.file.contains_key("/etc/token"));
+    }
+
+    /// A key declared as both a directory and a file is gated per kind:
+    /// dropping the directory leaves the allowed file mounted.
+    #[test]
+    fn a_dropped_dir_leaves_an_allowed_file_under_the_same_key() {
+        let mut p = patches(&["/opt/shared"], &["/opt/shared"]);
+        let v = verdict(&[("/opt/shared", true)], &[("/opt/shared", false)]);
+        apply_patch_verdict("t", &mut p, Some(&v)).expect("each kind was gated");
+        assert!(p.file.contains_key("/opt/shared"), "the allowed file stays");
+        assert!(!p.dir.contains_key("/opt/shared"), "the dropped dir goes");
     }
 
     /// A declared key the verdict does not name was never gated, so the
@@ -553,6 +570,10 @@ mod patch_verdict_tests {
     }
 }
 
+/// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
+/// `env` lives on a single stack frame across every spawn — that frame
+/// is alive for the whole life of this tokio task, which in turn is
+/// governed by the consumer's stream.
 async fn task_producer(
     exec: TaskExec,
     session: BoxHandle,
