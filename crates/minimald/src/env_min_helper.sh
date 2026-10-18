@@ -60,8 +60,6 @@ __min_usage() {
             echo "Check minimal configuration (bare, by exception): min check"
             echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>"
             echo "Publish a port from inside the box: min net expose <port>"
-            echo ""
-            echo "Shortcuts: min search <query> is min package search <query>, min run <task name> is min task run <task name>, and pkg is short for package."
             ;;
         package)
             echo "Usage: min package <subcommand>"
