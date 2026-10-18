@@ -772,9 +772,10 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // lanes that exercise only the vsock bridge) we warn and boot without
     // egress rather than failing the VM — the daemon then has no network, the
     // pre-existing behaviour.
-    let _gvproxy = match gvproxy_binary {
-        binary if binary.exists() => {
-            let switch_sock = switch_sock.context("resolving switch socket")?;
+    // The reaper above decided whether the binary is installed: a switch
+    // socket comes back only when it is, so the decision is made once.
+    let _gvproxy = match (gvproxy_binary, switch_sock) {
+        (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             // The stale gvproxy of a killed supervisor was reaped above,
             // before the node proxy port was drawn, so it can no longer
@@ -907,7 +908,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 }
             }
         }
-        binary if crate::cmd::own_ip_requested() => {
+        (binary, None) if crate::cmd::own_ip_requested() => {
             // An own-IP VM cannot work without the switch: fail loudly rather
             // than booting a session that silently has no network.
             bail!(
@@ -916,7 +917,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 binary.display()
             );
         }
-        binary => {
+        (binary, None) => {
             // Non-own-IP boots (e.g. the boot/session e2e lanes) tolerate a
             // missing gvproxy: warn and boot without guest egress.
             tracing::warn!(
@@ -3438,17 +3439,15 @@ mod tests {
         );
     }
 
-    /// A stale gvproxy from a killed supervisor holds the hostname proxy's
-    /// default port, so the reaper must run before the draw: drawing first
-    /// hands the proxy an ephemeral port for no reason. The hold here is a
-    /// loopback listener — the shape a leftover gvproxy's forwards have —
-    /// and the "reap" is the listener's death, which is what the reaper's
-    /// bounded wait observes in the real flow. The ports dir is the
-    /// assignment's own reservation dir.
+    /// A preferred port something holds is skipped with `bind refused`, and
+    /// the same draw hands it back once the holder releases it. This pins
+    /// only the draw's half of the reap-before-draw fix: the order of the
+    /// reap and the draw in `run_foreground` needs a real VM, so only the
+    /// e2e lanes check it.
     #[test]
-    fn node_port_draw_skips_a_held_default_and_takes_it_back_after_a_reap() {
-        // The default the assignment prefers: hold it on the loopback the
-        // TCP probe addresses, so the first draw sees it refused.
+    fn node_port_draw_skips_a_held_preferred_port_and_hands_it_back_once_released() {
+        // The preferred port: hold it on the loopback the TCP probe
+        // addresses, so the first draw sees it refused.
         let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let default = stale.local_addr().unwrap().port();
         let ports = tempfile::tempdir().expect("a test reservation dir");
@@ -3460,9 +3459,7 @@ mod tests {
             "the held default is not handed to the proxy"
         );
 
-        // The reaper's wait then takes the holder away, and the same draw
-        // hands the default back: the proxy returns to its default port
-        // after a kill-based restart.
+        // Release the holder, and the same draw hands the port back.
         drop(stale);
         let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
         assert_eq!(drawn_after.port, default);
