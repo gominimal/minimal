@@ -391,9 +391,7 @@ pub fn display_name_of(entry: &minimald_rpc::ListSessionsEntry) -> String {
 /// Render a network mode the way the sidebar shows it.
 pub fn network_mode_label(mode: NetworkMode) -> &'static str {
     match mode {
-        NetworkMode::HostNet => "Host",
-        NetworkMode::OwnIp => "OwnIp",
-        NetworkMode::NoNet => "NoNet",
+        NetworkMode::HostNet | NetworkMode::OwnIp | NetworkMode::NoNet => mode.word(),
         // NetworkMode is #[non_exhaustive]; render future variants by debug.
         _ => "Custom",
     }
