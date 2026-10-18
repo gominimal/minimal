@@ -2766,6 +2766,10 @@ exit $rc
             ("task --help", 0, "stdout"),
             ("net --help", 0, "stdout"),
             ("add --help", 0, "stdout"),
+            ("add -h", 0, "stdout"),
+            ("add --build --help", 0, "stdout"),
+            ("run --help", 0, "stdout"),
+            ("task run --help", 0, "stdout"),
             ("search --help", 0, "stdout"),
             ("package build --help", 0, "stdout"),
             ("package search --help", 0, "stdout"),
@@ -2792,6 +2796,30 @@ exit $rc
             assert!(
                 !stdout.contains("RPC-CALLED") && !stderr.contains("RPC-CALLED"),
                 "`{args}` must not reach the daemon, got: {stdout} {stderr}"
+            );
+        }
+    }
+
+    /// In an argument slot a bare `help` is a package name, search term, or
+    /// task name, not a help request, so it still reaches the daemon.
+    #[test]
+    fn help_word_in_argument_slot_reaches_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for args in [
+            "search help",
+            "add help",
+            "package build help",
+            "task run help",
+        ] {
+            let Some((stdout, stderr, _)) = run_min_command(rootfs, args) else {
+                return;
+            };
+            assert!(
+                stderr.contains("RPC-CALLED"),
+                "`{args}` should reach the daemon, got: {stdout} {stderr}"
             );
         }
     }

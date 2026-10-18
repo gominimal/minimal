@@ -15,9 +15,19 @@ __min_term_cols() {
     fi
 }
 
+# A help request in a subcommand slot, where `help` cannot be a verb.
 __min_is_help() {
     case "$1" in
         -h|--help|help) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A help request in an argument slot. A bare `help` there is a package
+# name, search term, or task name, so only the flags count.
+__min_is_help_flag() {
+    case "$1" in
+        -h|--help) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -162,7 +172,7 @@ __min_rpc() {
 
 min_search() {
     local term="$1"
-    if __min_is_help "$term"; then
+    if __min_is_help_flag "$term"; then
         __min_usage search
         return 0
     fi
@@ -203,7 +213,7 @@ __min_add() {
 min_add() {
     local flag="$1"
 
-    if __min_is_help "$flag"; then
+    if __min_is_help_flag "$flag"; then
         __min_usage add
         return 0
     fi
@@ -213,6 +223,11 @@ min_add() {
         flag="--session"
     else
         shift
+    fi
+
+    if __min_is_help_flag "$1"; then
+        __min_usage add
+        return 0
     fi
 
     if [[ -z "$1" ]]; then
@@ -235,6 +250,10 @@ min_add() {
 }
 
 min_run() {
+    if __min_is_help_flag "$1"; then
+        __min_usage task
+        return 0
+    fi
     __min_rpc "run" "$@"
 }
 
@@ -276,7 +295,7 @@ min_package() {
             min_patched_pkg "$@"
             ;;
         build)
-            if __min_is_help "$1"; then
+            if __min_is_help_flag "$1"; then
                 __min_usage build
                 return 0
             fi
@@ -300,7 +319,7 @@ min_package() {
 }
 
 min_check() {
-    if __min_is_help "$1"; then
+    if __min_is_help_flag "$1"; then
         __min_usage check
         return 0
     fi
@@ -308,7 +327,7 @@ min_check() {
 }
 
 min_materialize() {
-    if __min_is_help "$1"; then
+    if __min_is_help_flag "$1"; then
         __min_usage materialize
         return 0
     fi
@@ -329,7 +348,7 @@ min_net() {
     case "$subcmd" in
         expose)
             local port="$1"
-            if __min_is_help "$port"; then
+            if __min_is_help_flag "$port"; then
                 __min_usage expose
                 return 0
             fi
