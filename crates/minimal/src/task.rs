@@ -417,6 +417,12 @@ fn denied_task_patch_message(task_name: &str, path: &str, policy_path: &std::pat
 /// ignored, for the daemon to drop from the mount set. The daemon holds
 /// no policy, mounts only allowed keys, and refuses a task whose patches
 /// arrive with no verdict.
+///
+/// An echo task is gated like any other. The daemon answers one from the
+/// declaration only when its session-workspace `minimal.toml` declares it
+/// as an echo; a stack-provided echo task, or one whose workspace copy
+/// differs, reaches the mount path and needs this verdict. A task that
+/// declares no patches gets an empty verdict without a prompt.
 fn resolve_task_patches(
     task: &mfile::Task,
     task_name: &str,
@@ -427,12 +433,6 @@ fn resolve_task_patches(
     resolved_env: &minimald_rpc::taskenv::TaskEnv,
 ) -> Result<minimald_rpc::taskenv::PatchVerdict, anyhow::Error> {
     use boxes::core::compose::{TaskPatchEntry, gate_task_patch_paths};
-
-    // Echo tasks never reach the daemon's mount path — the daemon answers
-    // an echo from the declaration itself — so there is nothing to gate.
-    if task.action.as_echo().is_some() {
-        return Ok(Default::default());
-    }
 
     // The gate expands policy patterns through this lookup. A pattern
     // naming `$HOME` is the common case for patches, so the resolved
@@ -2193,11 +2193,11 @@ mod tests {
         assert!(verdict.allow.is_empty(), "nothing ignored is allowed");
     }
 
-    /// An echo task's patches are gated by nobody, the same exemption as
-    /// its `env_vars`: the daemon answers an echo from the declaration
-    /// and returns before it builds an environment to mount into.
+    /// An echo task's patches are gated like any other task's: the daemon
+    /// short-circuits only an echo its workspace `minimal.toml` declares,
+    /// so a stack-provided one reaches the mount path and needs a verdict.
     #[test]
-    fn an_echo_task_gates_no_patches_whatever_it_declares() {
+    fn an_echo_task_gates_its_patches_like_any_task() {
         let task = task_from_toml(
             "[tasks.t]\necho = 'hi'\n[tasks.t.patch.file]\n\"/etc/passwd\" = \"ro\"\n",
         );
@@ -2205,7 +2205,7 @@ mod tests {
         let policy = boxes::core::policy::PatchesPolicy::default()
             .with_deny(vec!["/etc/passwd".to_string()]);
 
-        let verdict = resolve_task_patches(
+        let err = resolve_task_patches(
             &task,
             "t",
             policy,
@@ -2214,7 +2214,27 @@ mod tests {
             &NeverAsked,
             &minimald_rpc::taskenv::TaskEnv::default(),
         )
-        .expect("an echo task neither resolves nor denies");
+        .expect_err("a denied patch on an echo task must fail the run");
+        assert!(err.to_string().contains("`/etc/passwd`"), "{err}");
+    }
+
+    /// An echo task that declares no patches gets an empty verdict and no
+    /// prompt, so gating it costs nothing.
+    #[test]
+    fn an_echo_task_without_patches_gets_an_empty_verdict() {
+        let task = task_from_toml("[tasks.t]\necho = 'hi'\n");
+        assert_eq!(task.action.as_echo(), Some("hi"));
+
+        let verdict = resolve_task_patches(
+            &task,
+            "t",
+            boxes::core::policy::PatchesPolicy::default(),
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect("nothing to gate");
 
         assert_eq!(
             verdict,
