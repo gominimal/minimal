@@ -118,7 +118,8 @@ pub fn run(
 /// to the bind they guard; the resolved pair is returned so the spawn
 /// block does not resolve twice.
 #[cfg(minvmd_libkrun)]
-fn reap_stale_gvproxy_before_port_draw() -> Result<(PathBuf, Option<PathBuf>)> {
+fn reap_stale_gvproxy_before_port_draw() -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)>
+{
     let binary = crate::image::resolve_gvproxy_path();
     if !binary.exists() {
         return Ok((binary, None));
