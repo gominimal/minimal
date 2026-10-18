@@ -46,7 +46,7 @@ build = [
     "sandbox",
 ]
 # The session plane's library crates.
-session = ["minimal-client", "minimal-tui", "minimald-rpc", "sessions"]
+session = ["boxes", "minimal-client", "minimald-rpc"]
 # The build-plane facade the product crates embed.
 facade = ["mctx"]
 # The product surface: the binaries users run.
@@ -67,15 +67,8 @@ product = ["leaf", "shared", "build", "session", "facade"]
 
 [[exception]]
 from = "mfile"
-to = "sessions"
-reason = "the [session] and [tasks] tables of minimal.toml are typed in `sessions`; splitting the types out is tracked"
-since = "2026-10-14"
-issue = "unassigned"
-
-[[exception]]
-from = "minimal-tui"
-to = "mfile"
-reason = "the dashboard reads minimal.toml directly for the project view"
+to = "boxes"
+reason = "the [session] and [tasks] tables of minimal.toml are typed in `boxes`; splitting the types out is tracked"
 since = "2026-10-14"
 issue = "unassigned"
 

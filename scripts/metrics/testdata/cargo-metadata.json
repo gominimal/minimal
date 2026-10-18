@@ -376,6 +376,10 @@
     },
     {
      "kind": null,
+     "name": "boxes"
+    },
+    {
+     "kind": null,
      "name": "common"
     },
     {
@@ -385,10 +389,6 @@
     {
      "kind": null,
      "name": "serde"
-    },
-    {
-     "kind": null,
-     "name": "sessions"
     },
     {
      "kind": null,
@@ -419,38 +419,6 @@
    "id": "path+file:///workbench/minimal/crates/mfile#0.0.1",
    "manifest_path": "<root>/crates/mfile/Cargo.toml",
    "name": "mfile"
-  },
-  {
-   "dependencies": [
-    {
-     "kind": null,
-     "name": "camino"
-    },
-    {
-     "kind": null,
-     "name": "dirs"
-    },
-    {
-     "kind": null,
-     "name": "serde"
-    },
-    {
-     "kind": null,
-     "name": "thiserror"
-    },
-    {
-     "kind": "dev",
-     "name": "tempfile"
-    },
-    {
-     "kind": "dev",
-     "name": "toml"
-    }
-   ],
-   "description": "Realm-tagged path types distinguishing host, sandbox, and daemon filesystems.",
-   "id": "path+file:///workbench/minimal/crates/paths#0.0.1",
-   "manifest_path": "<root>/crates/paths/Cargo.toml",
-   "name": "paths"
   },
   {
    "dependencies": [
@@ -515,10 +483,42 @@
      "name": "tempfile"
     }
    ],
-   "description": "Session domain types shared by min and minimald: loadouts, lifecycle hooks and the client/daemon composition pipeline, the session's network mode and policy (including the pure egress verdict), on-disk session state, and the JSON wire forms of all of these.",
-   "id": "path+file:///workbench/minimal/crates/sessions#0.0.1",
-   "manifest_path": "<root>/crates/sessions/Cargo.toml",
-   "name": "sessions"
+   "description": "Box domain types shared by min and minimald: loadouts, lifecycle hooks and the client/daemon composition pipeline, the box's network mode and policy (including the pure egress verdict), on-disk box state, and the JSON wire forms of all of these.",
+   "id": "path+file:///workbench/minimal/crates/boxes#0.0.1",
+   "manifest_path": "<root>/crates/boxes/Cargo.toml",
+   "name": "boxes"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "camino"
+    },
+    {
+     "kind": null,
+     "name": "dirs"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": "dev",
+     "name": "toml"
+    }
+   ],
+   "description": "Realm-tagged path types distinguishing host, sandbox, and daemon filesystems.",
+   "id": "path+file:///workbench/minimal/crates/paths#0.0.1",
+   "manifest_path": "<root>/crates/paths/Cargo.toml",
+   "name": "paths"
   },
   {
    "dependencies": [
@@ -608,7 +608,7 @@
     }
    ],
    "description": "The embedded Minimal standard library.",
-   "id": "path+file:///workbench/minimal/crates/stdlib#0.0.21",
+   "id": "path+file:///workbench/minimal/crates/stdlib#0.0.22",
    "manifest_path": "<root>/crates/stdlib/Cargo.toml",
    "name": "stdlib"
   },
@@ -708,6 +708,10 @@
     },
     {
      "kind": null,
+     "name": "mlog"
+    },
+    {
+     "kind": null,
      "name": "moka"
     },
     {
@@ -755,6 +759,97 @@
    "id": "path+file:///workbench/minimal/crates/check#0.0.1",
    "manifest_path": "<root>/crates/check/Cargo.toml",
    "name": "check"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "json-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-appender-tracing"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-http"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-otlp"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry-semantic-conventions"
+    },
+    {
+     "kind": null,
+     "name": "opentelemetry_sdk"
+    },
+    {
+     "kind": null,
+     "name": "paths"
+    },
+    {
+     "kind": null,
+     "name": "reqwest"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-appender"
+    },
+    {
+     "kind": null,
+     "name": "tracing-opentelemetry"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "version"
+    },
+    {
+     "kind": "dev",
+     "name": "opentelemetry_sdk"
+    },
+    {
+     "kind": "dev",
+     "name": "serde_json"
+    },
+    {
+     "kind": "dev",
+     "name": "serde_json_lenient"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    }
+   ],
+   "description": "JSON file-log layer both minimald and minvmd write through; one definition of the on-disk log format.",
+   "id": "path+file:///workbench/minimal/crates/mlog#0.0.1",
+   "manifest_path": "<root>/crates/mlog/Cargo.toml",
+   "name": "mlog"
+  },
+  {
+   "dependencies": [],
+   "description": "Shared build-time version identity for min, mip, minimald, and minvmd.",
+   "id": "path+file:///workbench/minimal/crates/version#0.8.0",
+   "manifest_path": "<root>/crates/version/Cargo.toml",
+   "name": "version"
   },
   {
    "dependencies": [
@@ -1089,6 +1184,10 @@
     {
      "kind": null,
      "name": "sandbox"
+    },
+    {
+     "kind": null,
+     "name": "shlex"
     },
     {
      "kind": null,
@@ -1465,13 +1564,6 @@
    "name": "remote-proto"
   },
   {
-   "dependencies": [],
-   "description": "Shared build-time version identity for min, mip, minimald, and minvmd.",
-   "id": "path+file:///workbench/minimal/crates/version#0.8.0",
-   "manifest_path": "<root>/crates/version/Cargo.toml",
-   "name": "version"
-  },
-  {
    "dependencies": [
     {
      "kind": null,
@@ -1484,6 +1576,10 @@
     {
      "kind": null,
      "name": "async-tar"
+    },
+    {
+     "kind": null,
+     "name": "boxes"
     },
     {
      "kind": null,
@@ -1503,11 +1599,23 @@
     },
     {
      "kind": null,
+     "name": "common"
+    },
+    {
+     "kind": null,
+     "name": "crossterm"
+    },
+    {
+     "kind": null,
      "name": "diagnostics"
     },
     {
      "kind": null,
      "name": "dirs"
+    },
+    {
+     "kind": null,
+     "name": "futures"
     },
     {
      "kind": null,
@@ -1532,10 +1640,6 @@
     {
      "kind": null,
      "name": "minimal-client"
-    },
-    {
-     "kind": null,
-     "name": "minimal-tui"
     },
     {
      "kind": null,
@@ -1567,6 +1671,10 @@
     },
     {
      "kind": null,
+     "name": "ratatui"
+    },
+    {
+     "kind": null,
      "name": "reqwest"
     },
     {
@@ -1580,10 +1688,6 @@
     {
      "kind": null,
      "name": "serde_json_lenient"
-    },
-    {
-     "kind": null,
-     "name": "sessions"
     },
     {
      "kind": null,
@@ -1623,6 +1727,10 @@
     },
     {
      "kind": null,
+     "name": "unicode-width"
+    },
+    {
+     "kind": null,
      "name": "url"
     },
     {
@@ -1631,7 +1739,7 @@
     },
     {
      "kind": "dev",
-     "name": "minimald"
+     "name": "insta"
     },
     {
      "kind": "dev",
@@ -1644,9 +1752,13 @@
     {
      "kind": "dev",
      "name": "tokio"
+    },
+    {
+     "kind": "dev",
+     "name": "minimald"
     }
    ],
-   "description": "The min CLI: sessions, tasks, loadouts, packages, networking, diagnostics and project setup, over SSH to minimald, auto-spawning minvmd where the daemon lives in a microVM.",
+   "description": "The min CLI: sessions, tasks, loadouts, packages, networking, diagnostics, project setup, and the min dash session-manager TUI, over SSH to minimald, auto-spawning minvmd where the daemon lives in a microVM.",
    "id": "path+file:///workbench/minimal/crates/minimal#0.8.0",
    "manifest_path": "<root>/crates/minimal/Cargo.toml",
    "name": "minimal"
@@ -1664,6 +1776,10 @@
     {
      "kind": null,
      "name": "async-tar"
+    },
+    {
+     "kind": null,
+     "name": "boxes"
     },
     {
      "kind": null,
@@ -1711,10 +1827,6 @@
     },
     {
      "kind": null,
-     "name": "sessions"
-    },
-    {
-     "kind": null,
      "name": "tokio"
     },
     {
@@ -1743,6 +1855,10 @@
    "dependencies": [
     {
      "kind": null,
+     "name": "boxes"
+    },
+    {
+     "kind": null,
      "name": "chrono"
     },
     {
@@ -1768,10 +1884,6 @@
     {
      "kind": null,
      "name": "serde_json_lenient"
-    },
-    {
-     "kind": null,
-     "name": "sessions"
     }
    ],
    "description": "The client/daemon wire contract: minimald's oneshot SSH RPC request/response types, the tagged exec-channel vocabulary, and the task-env and trace propagation keys. Transport-free (no russh, no tokio); the one contract both min and minimald build against.",
@@ -1787,95 +1899,7 @@
     },
     {
      "kind": null,
-     "name": "camino"
-    },
-    {
-     "kind": null,
-     "name": "chrono"
-    },
-    {
-     "kind": null,
-     "name": "common"
-    },
-    {
-     "kind": null,
-     "name": "crossterm"
-    },
-    {
-     "kind": null,
-     "name": "dirs"
-    },
-    {
-     "kind": null,
-     "name": "futures"
-    },
-    {
-     "kind": null,
-     "name": "mfile"
-    },
-    {
-     "kind": null,
-     "name": "minimal-client"
-    },
-    {
-     "kind": null,
-     "name": "minimald-rpc"
-    },
-    {
-     "kind": null,
-     "name": "paths"
-    },
-    {
-     "kind": null,
-     "name": "ratatui"
-    },
-    {
-     "kind": null,
-     "name": "serde"
-    },
-    {
-     "kind": null,
-     "name": "serde_json_lenient"
-    },
-    {
-     "kind": null,
-     "name": "sessions"
-    },
-    {
-     "kind": null,
-     "name": "tokio"
-    },
-    {
-     "kind": null,
-     "name": "tracing"
-    },
-    {
-     "kind": null,
-     "name": "unicode-width"
-    },
-    {
-     "kind": "dev",
-     "name": "insta"
-    },
-    {
-     "kind": "dev",
-     "name": "nix"
-    },
-    {
-     "kind": "dev",
-     "name": "tempfile"
-    }
-   ],
-   "description": "min dash \u2014 interactive session manager TUI for minimald sessions",
-   "id": "path+file:///workbench/minimal/crates/minimal-tui#0.8.0",
-   "manifest_path": "<root>/crates/minimal-tui/Cargo.toml",
-   "name": "minimal-tui"
-  },
-  {
-   "dependencies": [
-    {
-     "kind": null,
-     "name": "anyhow"
+     "name": "boxes"
     },
     {
      "kind": null,
@@ -1924,10 +1948,6 @@
     {
      "kind": null,
      "name": "serde_json_lenient"
-    },
-    {
-     "kind": null,
-     "name": "sessions"
     },
     {
      "kind": null,
@@ -2015,90 +2035,6 @@
    "dependencies": [
     {
      "kind": null,
-     "name": "json-subscriber"
-    },
-    {
-     "kind": null,
-     "name": "libc"
-    },
-    {
-     "kind": null,
-     "name": "opentelemetry"
-    },
-    {
-     "kind": null,
-     "name": "opentelemetry-appender-tracing"
-    },
-    {
-     "kind": null,
-     "name": "opentelemetry-http"
-    },
-    {
-     "kind": null,
-     "name": "opentelemetry-otlp"
-    },
-    {
-     "kind": null,
-     "name": "opentelemetry-semantic-conventions"
-    },
-    {
-     "kind": null,
-     "name": "opentelemetry_sdk"
-    },
-    {
-     "kind": null,
-     "name": "paths"
-    },
-    {
-     "kind": null,
-     "name": "reqwest"
-    },
-    {
-     "kind": null,
-     "name": "tracing"
-    },
-    {
-     "kind": null,
-     "name": "tracing-appender"
-    },
-    {
-     "kind": null,
-     "name": "tracing-opentelemetry"
-    },
-    {
-     "kind": null,
-     "name": "tracing-subscriber"
-    },
-    {
-     "kind": null,
-     "name": "version"
-    },
-    {
-     "kind": "dev",
-     "name": "opentelemetry_sdk"
-    },
-    {
-     "kind": "dev",
-     "name": "serde_json"
-    },
-    {
-     "kind": "dev",
-     "name": "serde_json_lenient"
-    },
-    {
-     "kind": "dev",
-     "name": "tempfile"
-    }
-   ],
-   "description": "JSON file-log layer both minimald and minvmd write through; one definition of the on-disk log format.",
-   "id": "path+file:///workbench/minimal/crates/mlog#0.0.1",
-   "manifest_path": "<root>/crates/mlog/Cargo.toml",
-   "name": "mlog"
-  },
-  {
-   "dependencies": [
-    {
-     "kind": null,
      "name": "smoltcp"
     },
     {
@@ -2156,6 +2092,10 @@
     {
      "kind": null,
      "name": "boringtun"
+    },
+    {
+     "kind": null,
+     "name": "boxes"
     },
     {
      "kind": null,
@@ -2280,10 +2220,6 @@
     {
      "kind": null,
      "name": "serde_json_lenient"
-    },
-    {
-     "kind": null,
-     "name": "sessions"
     },
     {
      "kind": null,
@@ -2427,6 +2363,10 @@
     },
     {
      "kind": null,
+     "name": "switch"
+    },
+    {
+     "kind": null,
      "name": "tracing-subscriber"
     },
     {
@@ -2449,12 +2389,14 @@
   "path+file:///workbench/minimal/crates/graph#0.0.1",
   "path+file:///workbench/minimal/crates/checkouts#0.0.1",
   "path+file:///workbench/minimal/crates/mfile#0.0.1",
+  "path+file:///workbench/minimal/crates/boxes#0.0.1",
   "path+file:///workbench/minimal/crates/paths#0.0.1",
-  "path+file:///workbench/minimal/crates/sessions#0.0.1",
   "path+file:///workbench/minimal/crates/decode#0.0.1",
-  "path+file:///workbench/minimal/crates/stdlib#0.0.21",
+  "path+file:///workbench/minimal/crates/stdlib#0.0.22",
   "path+file:///workbench/minimal/crates/rcache#0.0.1",
   "path+file:///workbench/minimal/crates/check#0.0.1",
+  "path+file:///workbench/minimal/crates/mlog#0.0.1",
+  "path+file:///workbench/minimal/crates/version#0.8.0",
   "path+file:///workbench/minimal/crates/op#0.0.1",
   "path+file:///workbench/minimal/crates/sandbox#0.0.1",
   "path+file:///workbench/minimal/crates/diagnostics#0.0.1",
@@ -2463,13 +2405,10 @@
   "path+file:///workbench/minimal/crates/mip#0.8.0",
   "path+file:///workbench/minimal/crates/remote-client#0.0.1",
   "path+file:///workbench/minimal/crates/remote-proto#0.0.1",
-  "path+file:///workbench/minimal/crates/version#0.8.0",
   "path+file:///workbench/minimal/crates/minimal#0.8.0",
   "path+file:///workbench/minimal/crates/minimal-client#0.8.0",
   "path+file:///workbench/minimal/crates/minimald-rpc#0.0.1",
-  "path+file:///workbench/minimal/crates/minimal-tui#0.8.0",
   "path+file:///workbench/minimal/crates/minvmd#0.8.0",
-  "path+file:///workbench/minimal/crates/mlog#0.0.1",
   "path+file:///workbench/minimal/crates/switch#0.0.1",
   "path+file:///workbench/minimal/crates/minimald#0.8.0",
   "path+file:///workbench/minimal/crates/minzoned#0.8.0"
