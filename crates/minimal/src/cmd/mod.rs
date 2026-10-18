@@ -1005,12 +1005,13 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
 /// error must be the client's daemon-side failure for this very RPC whose
 /// whole daemon message is the refusal. An error that merely ends with the
 /// same words, or wraps them in other causes, is not reworded. The plain
-/// line wraps the original error rather than replacing it, so the full
-/// chain still prints beneath it. Any other failure keeps the chain,
-/// wrapped exactly as before.
+/// line stands alone, without the RPC's name, which means nothing to the
+/// reader (the debug log keeps the raw error). Any other failure keeps the
+/// chain, wrapped exactly as before.
 pub(crate) fn session_rpc_failed(rpc: SessionRpc, error: anyhow::Error) -> anyhow::Error {
     if error.chain().count() == 1 && error.to_string() == shutdown_refusal_text(rpc) {
-        return error.context(rpc.shutdown_race_message());
+        tracing::debug!(rpc = rpc.name(), error = %format!("{error:#}"), "refused: the daemon is shutting down");
+        return anyhow::anyhow!(rpc.shutdown_race_message());
     }
     error.context(format!("{} RPC failed", rpc.name()))
 }
@@ -1080,18 +1081,15 @@ mod tests {
             "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {}",
             minimald_rpc::SHUTDOWN_REFUSAL
         );
-        let original = raw.to_string();
         let error = session_rpc_failed(SessionRpc::CreateSession, raw);
         assert_eq!(
             error.to_string(),
             "The daemon was shutting down, so no session was created. \
              Run the command again once the daemon is running."
         );
-        // The original refusal stays in the chain beneath the plain line.
-        assert_eq!(
-            error.source().map(|source| source.to_string()),
-            Some(original)
-        );
+        // The plain line stands alone: no RPC name reaches the user.
+        assert!(error.source().is_none());
+        assert!(!format!("{error:#}").contains("RPC"));
     }
 
     /// A refused `ConfigureLoadout` follows a `CreateSession` that worked, so
