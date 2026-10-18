@@ -1000,45 +1000,97 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
 /// (a refused RPC, the daemon-side refusal, "shutting down") reads like an
 /// internal error rather than the lost race it is. The daemon marks its
 /// shutdown refusals with a single constant the client can match on, so the
-/// race is named here in one plain sentence, without the RPC's name, which
-/// means nothing to the reader. The refusal is the whole of the daemon's
-/// message, so a cause matches only when it ends with the marker, not when
-/// the same words appear inside other text. Any other failure keeps the
-/// chain, wrapped exactly as before.
-pub(crate) fn session_rpc_failed(rpc: &str, error: anyhow::Error) -> anyhow::Error {
+/// race is named here in plain language, without the RPC's name, which
+/// means nothing to the reader (the debug log keeps it). The refusal is the
+/// whole of the daemon's message, so a cause matches only when it ends with
+/// the marker, not when the same words appear inside other text. Any other
+/// failure keeps the chain, wrapped exactly as before.
+pub(crate) fn session_rpc_failed(rpc: SessionRpc, error: anyhow::Error) -> anyhow::Error {
     if error
         .chain()
         .any(|cause| cause.to_string().ends_with(minimald_rpc::SHUTDOWN_REFUSAL))
     {
-        return anyhow::anyhow!(SHUTDOWN_RACE_MESSAGE);
+        tracing::debug!(rpc = rpc.name(), error = %format!("{error:#}"), "refused: the daemon is shutting down");
+        return anyhow::anyhow!(rpc.shutdown_race_message());
     }
-    error.context(format!("{rpc} RPC failed"))
+    error.context(format!("{} RPC failed", rpc.name()))
 }
 
-/// What [`session_rpc_failed`] prints for an activation that lost the race
-/// with a daemon shutdown.
-const SHUTDOWN_RACE_MESSAGE: &str = "the daemon was shutting down, so no session was created. \
-                                     Run the command again once the daemon is running.";
+/// The two session-creating RPCs [`session_rpc_failed`] words a failure of.
+/// They differ in what the lost race leaves behind: a refused
+/// `CreateSession` created nothing, while a refused `ConfigureLoadout`
+/// leaves the session it follows created but never started, in a state the
+/// daemon deletes when it starts again.
+#[derive(Clone, Copy)]
+pub(crate) enum SessionRpc {
+    CreateSession,
+    ConfigureLoadout,
+}
+
+impl SessionRpc {
+    fn name(self) -> &'static str {
+        match self {
+            SessionRpc::CreateSession => "CreateSession",
+            SessionRpc::ConfigureLoadout => "ConfigureLoadout",
+        }
+    }
+
+    /// What [`session_rpc_failed`] prints for an activation that lost the
+    /// race with a daemon shutdown at this step.
+    fn shutdown_race_message(self) -> &'static str {
+        match self {
+            SessionRpc::CreateSession => {
+                "The daemon was shutting down, so no session was created. \
+                 Run the command again once the daemon is running."
+            }
+            SessionRpc::ConfigureLoadout => {
+                "The daemon was shutting down, so the session was created but not \
+                 started; the daemon removes it when it starts again. \
+                 Run the command again once the daemon is running."
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::session_rpc_failed;
+    use crate::{SessionRpc, session_rpc_failed};
 
     /// An RPC refused because the daemon was shutting down — the `min stop`
-    /// race — surfaces as one plain sentence, not the raw RPC chain. The
+    /// race — surfaces as plain language, not the raw RPC chain. The
     /// refusal reaches the client as the daemon-side stderr text, wrapped in
     /// the transport failure, so the test builds that chain and checks the
-    /// mapping keys on the refusal marker rather than the wrapping.
+    /// mapping keys on the refusal marker rather than the wrapping. A refused
+    /// `CreateSession` created nothing.
     #[test]
-    fn a_shutdown_raced_rpc_failure_names_the_lost_race() {
+    fn a_shutdown_raced_create_names_the_lost_race() {
+        let raw = anyhow::anyhow!(
+            "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {}",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, raw);
+        assert_eq!(
+            error.to_string(),
+            "The daemon was shutting down, so no session was created. \
+             Run the command again once the daemon is running."
+        );
+    }
+
+    /// A refused `ConfigureLoadout` follows a `CreateSession` that worked, so
+    /// the text says the session exists but was not started, and that the
+    /// daemon deletes it when it starts again, rather than that nothing was
+    /// created.
+    #[test]
+    fn a_shutdown_raced_configure_says_the_session_was_not_started() {
         let raw = anyhow::anyhow!(
             "minimald-v1-ConfigureLoadout RPC failed on the daemon side: Internal error: {}",
             minimald_rpc::SHUTDOWN_REFUSAL
         );
-        let error = session_rpc_failed("ConfigureLoadout", raw);
+        let error = session_rpc_failed(SessionRpc::ConfigureLoadout, raw);
         assert_eq!(
             error.to_string(),
-            "the daemon was shutting down, so no session was created. \
+            "The daemon was shutting down, so the session was created but not \
+             started; the daemon removes it when it starts again. \
              Run the command again once the daemon is running."
         );
     }
@@ -1053,7 +1105,7 @@ mod tests {
              was not expected here",
             minimald_rpc::SHUTDOWN_REFUSAL
         );
-        let error = session_rpc_failed("CreateSession", raw);
+        let error = session_rpc_failed(SessionRpc::CreateSession, raw);
         assert_eq!(error.to_string(), "CreateSession RPC failed");
     }
 
@@ -1062,7 +1114,7 @@ mod tests {
     #[test]
     fn an_ordinary_rpc_failure_keeps_its_chain() {
         let raw = anyhow::anyhow!("the daemon exploded");
-        let error = session_rpc_failed("CreateSession", raw);
+        let error = session_rpc_failed(SessionRpc::CreateSession, raw);
         assert_eq!(error.to_string(), "CreateSession RPC failed");
         assert_eq!(
             error.source().map(|source| source.to_string()),
