@@ -1582,6 +1582,8 @@ pub enum TaskPatchWalkGap {
     /// The directory at `dir`, the declared one or one inside it, could
     /// not be read.
     Unreadable { dir: String, error: std::io::Error },
+    /// The declared directory is a file.
+    NotADirectory,
 }
 
 impl fmt::Display for TaskPatchWalkGap {
@@ -1589,6 +1591,7 @@ impl fmt::Display for TaskPatchWalkGap {
         match self {
             Self::TooLarge { limit } => write!(f, "it holds more than {limit} entries"),
             Self::Unreadable { dir, error } => write!(f, "{dir} cannot be read ({error})"),
+            Self::NotADirectory => write!(f, "it is a file, not a directory"),
         }
     }
 }
@@ -1819,6 +1822,8 @@ fn decide_answered_task_patch_forms(
 /// cannot be read, gives [`TaskPatchWalkGap`]. A directory that is not
 /// found is skipped: a declared one missing for a `create_if_missing`
 /// mount holds nothing yet, and one inside it vanished during the walk.
+/// A declared directory that is a file gives
+/// [`TaskPatchWalkGap::NotADirectory`].
 /// The walk stops at the first denial. Only an entry checked with
 /// `resolve` is walked; see [`gate_task_patch_paths`] for why `~/`
 /// entries are not.
@@ -1856,6 +1861,9 @@ fn check_task_patch_dir(
         let read = match std::fs::read_dir(&cur) {
             Ok(read) => read,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if cur == dir.as_std_path() && e.kind() == std::io::ErrorKind::NotADirectory => {
+                return Err(TaskPatchWalkGap::NotADirectory);
+            }
             Err(e) => return Err(unreadable(&cur, e)),
         };
         for entry in read {

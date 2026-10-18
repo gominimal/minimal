@@ -543,6 +543,10 @@ fn unchecked_task_patch_message(
              [patches] deny rules: {dir} cannot be read ({error}). Make it readable, \
              or declare a directory that leaves it out."
         ),
+        TaskPatchWalkGap::NotADirectory => format!(
+            "task '{task_name}': patch directory {path} is a file, not a directory. \
+             Declare it under patch.file instead."
+        ),
     }
 }
 
@@ -2027,6 +2031,12 @@ mod tests {
             "task 't': cannot check patch directory /data against your [patches] deny \
              rules: /data/locked cannot be read (permission denied). Make it readable, or \
              declare a directory that leaves it out."
+        );
+        let msg = unchecked_task_patch_message("t", "/data", &TaskPatchWalkGap::NotADirectory);
+        assert_eq!(
+            msg,
+            "task 't': patch directory /data is a file, not a directory. Declare it under \
+             patch.file instead."
         );
     }
 

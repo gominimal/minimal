@@ -3206,4 +3206,31 @@ mod gate_task_patch_paths {
             other => panic!("expected an unreadable refusal, got {other}"),
         }
     }
+
+    /// With a deny set, a `patch.dir` entry naming a regular file is
+    /// refused as a file, not reported as unreadable.
+    #[test]
+    fn a_directory_entry_naming_a_file_is_refused_under_a_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = canonical_root(&tmp).join("notes.txt");
+        std::fs::write(file.as_std_path(), "x").unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(file.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![file.to_string()])
+            .with_deny(vec!["/nowhere/**".to_string()]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ComposeError::TaskPatchUnchecked {
+                    ref what,
+                    gap: crate::core::compose::TaskPatchWalkGap::NotADirectory,
+                    ..
+                } if what == file.as_str()
+            ),
+            "{err}"
+        );
+    }
 }
