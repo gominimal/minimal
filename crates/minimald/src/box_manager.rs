@@ -1236,7 +1236,7 @@ impl BoxManager {
             let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
             REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
-                session_name = ?config.name,
+                session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 network_mode = %config.network.word(),
                 host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
                 refused_unenforceable_creates = refused_unenforceable_creates(),
@@ -2992,6 +2992,20 @@ pub(crate) mod tests {
         SessionId,
         Result<minimald_rpc::FinalizeSessionResponse, std::io::Error>,
     ) {
+        let (state, cache, mngr, id, handle) =
+            configure_with_package_check(extra, contribution, deadline).await;
+        let outcome = handle.finalize().await;
+        (state, cache, mngr, id, outcome)
+    }
+
+    /// [`finalize_with_package_check`] up to, not including, the finalize:
+    /// returns the configured session's handle so a test can change the
+    /// workspace or the actor between compose and finalize.
+    async fn configure_with_package_check(
+        extra: &[&str],
+        contribution: WireContribution,
+        deadline: std::time::Duration,
+    ) -> (TempDir, TempDir, BoxManagerHandle, SessionId, BoxHandle) {
         let (state, cache, mngr) = manager().await;
         let id = mngr.create_session(sample_config(), None).await.unwrap();
         seed_workspace_package(&mngr, id, "pkg-ok").await;
@@ -3012,8 +3026,65 @@ pub(crate) mod tests {
             .expect("packages gate nothing at compose");
         assert!(response.is_none(), "nothing in the composition is gated");
         handle.check_packages_at_finalize(deadline).await;
-        let outcome = handle.finalize().await;
-        (state, cache, mngr, id, outcome)
+        (state, cache, mngr, id, handle)
+    }
+
+    /// Removes local package `pkg` from the session's workspace, so a graph
+    /// evaluated after this no longer declares it.
+    async fn remove_workspace_package(mngr: &BoxManagerHandle, id: SessionId, pkg: &str) {
+        let paths = session(mngr, id).await.paths().await.unwrap();
+        tokio::fs::remove_dir_all(paths.working.as_utf8_path().join("packages").join(pkg))
+            .await
+            .unwrap();
+    }
+
+    /// Finalize judges the names the compose-time graph declared and does
+    /// not evaluate the graph again: a package removed from the workspace
+    /// after compose still counts as declared, so the session activates
+    /// with a verdict. The control is the next test, where the same removal
+    /// is seen by an actor that must evaluate the graph itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_judges_the_compose_time_graph() {
+        let (_state, _cache, mngr, id, handle) =
+            configure_with_package_check(&[], WireContribution::default(), PACKAGE_CHECK_DEADLINE)
+                .await;
+        remove_workspace_package(&mngr, id, "pkg-ok").await;
+        let response = handle
+            .finalize()
+            .await
+            .expect("the compose-time graph declared pkg-ok");
+        assert!(
+            !response.package_check_skipped,
+            "a check judged against captured names reaches a verdict"
+        );
+        assert_eq!(status_of(&mngr, id).await, boxes::BoxState::Active);
+    }
+
+    /// Without compose-time names (an actor restored from disk), finalize
+    /// evaluates the graph itself and still refuses: both the unknown
+    /// package and one removed from the workspace after compose are named.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_without_compose_time_names_evaluates_the_graph() {
+        let (_state, _cache, mngr, id, handle) = configure_with_package_check(
+            &["no-such-pkg-rr"],
+            WireContribution::default(),
+            PACKAGE_CHECK_DEADLINE,
+        )
+        .await;
+        handle.forget_composed_graph_names().await;
+        remove_workspace_package(&mngr, id, "pkg-ok").await;
+        let err = handle
+            .finalize()
+            .await
+            .expect_err("the fallback check must still refuse an unknown package");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-rr")
+                && msg.contains("no such package: pkg-ok"),
+            "the fallback judges a freshly evaluated graph, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, boxes::BoxState::Active);
     }
 
     async fn status_of(mngr: &BoxManagerHandle, id: SessionId) -> boxes::BoxState {
@@ -3100,11 +3171,13 @@ pub(crate) mod tests {
     /// promotion hostage to work the client has stopped waiting for.
     ///
     /// A zero deadline pins the expiry path without a slow graph to wait
-    /// out: the check body gets its single poll before the deadline fires
-    /// (tokio polls the future before the delay), and cannot complete
-    /// within it, since its graph evaluation round-trips the blocking
-    /// pool. The composition names an unknown package so a check that
-    /// ignored its deadline would refuse instead of activate.
+    /// out: the check measures its budget before any judging, and an
+    /// already-lapsed deadline steps aside at that first measurement —
+    /// deterministically, because tokio polls the check once before its
+    /// timer, so the zero-duration timer alone cannot be relied on to
+    /// fire first against judging this cheap. The composition names an
+    /// unknown package so a check that ignored its deadline would refuse
+    /// instead of activate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finalize_with_an_expired_package_check_still_activates() {
         let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(

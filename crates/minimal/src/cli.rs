@@ -153,7 +153,8 @@ pub enum Command {
     /// Draws the same build-hold-fade spinner used by the file-upload
     /// phases of `min session activate` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
-    /// on Ctrl-C, whichever comes first.
+    /// on Ctrl-C, whichever comes first. Debug builds only.
+    #[cfg(debug_assertions)]
     #[command(hide = true)]
     Spin(SpinArgs),
     /// Print the privileged command that installs this host's resolver,
@@ -1101,6 +1102,7 @@ pub struct AddKind {
 #[derive(Debug, Args)]
 pub struct UpdateArgs {}
 
+#[cfg(debug_assertions)]
 #[derive(Debug, Args)]
 pub struct SpinArgs {
     /// How long to keep the spinner visible before auto-exiting.

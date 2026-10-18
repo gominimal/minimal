@@ -728,6 +728,11 @@ enum BoxMessage {
     /// so a finalize sent after the ack sees it.
     #[cfg(test)]
     CheckPackagesAtFinalize(std::time::Duration, oneshot::Sender<()>),
+    /// Test-only: drop the compose-time graph names, as an actor restored
+    /// from disk lacks them, so the finalize check takes its fallback and
+    /// evaluates the graph itself. Acknowledged once dropped.
+    #[cfg(test)]
+    ForgetComposedGraphNames(oneshot::Sender<()>),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -1053,6 +1058,14 @@ pub struct BoxActor {
     /// [`PACKAGE_CHECK_DEADLINE`] in every build; the test-only switch
     /// above carries a shorter one to drive the expiry path.
     package_check_deadline: std::time::Duration,
+
+    /// Package names the compose-time graph declared, captured by
+    /// [`Self::configure_loadout`] so [`Self::check_composed_packages`]
+    /// can judge the composition's names without re-evaluating the
+    /// project graph — the most expensive step of a compose. `None`
+    /// when compose saw no mfile (or the actor was rebuilt from disk),
+    /// where the check falls back to evaluating the graph itself.
+    composed_graph_names: Option<HashSet<String>>,
 }
 
 /// Why a session host was launched.
@@ -1153,6 +1166,10 @@ impl BoxActor {
             forwards: Vec::new(),
             check_packages_at_finalize: !cfg!(any(test, feature = "test-support")),
             package_check_deadline: PACKAGE_CHECK_DEADLINE,
+            // Filled by `configure_loadout` from the graph it evaluates;
+            // `None` until then (and forever for an actor restored from
+            // disk, whose compose predates this process).
+            composed_graph_names: None,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -1256,7 +1273,7 @@ impl BoxActor {
             let record = obj.record();
             tracing::info!(
                 session = %record.id,
-                name = ?record.name,
+                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 network = %record.network.word(),
                 egress_default_phase = ?boxes::EGRESS_DEFAULT_PHASE,
                 deny_all_opt_out = conf.deny_all_opt_out,
@@ -2307,6 +2324,15 @@ impl BoxActor {
                 )]
                 let _ = r.send(());
             }
+            #[cfg(test)]
+            BoxMessage::ForgetComposedGraphNames(r) => {
+                self.composed_graph_names = None;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -2400,12 +2426,18 @@ impl BoxActor {
                 hooks_enabled,
             )
         };
-        let outcome = match tokio::runtime::Handle::current().runtime_flavor() {
+        let (outcome, graph_names) = match tokio::runtime::Handle::current().runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(scaffold_and_compose)
             }
             _ => scaffold_and_compose(),
         }?;
+        // Set before the outcome match: whichever arm later promotes
+        // this session to `Active` — the one-shot `Ready` here, or the
+        // `Pending` park resuming through `handle_verdict` — the
+        // finalize check judges against the graph this same compose
+        // evaluated, never a re-evaluation.
+        self.composed_graph_names = graph_names;
 
         match outcome {
             // The composition is complete: promote the record
@@ -3410,8 +3442,9 @@ impl BoxActor {
                 (crate::audit::DecisionOutcome::Published, None)
             }
             // The one refusal that names a publication: the port is held,
-            // live, by one of the box's two runtime surfaces, and the
-            // reservation that refused the request carried whose — this
+            // pending or published, by one of the box's two runtime
+            // surfaces, and the reservation that refused the request carried
+            // whose — this
             // surface's own on a true duplicate, the listen watcher's when
             // the box's process published first — so the line a diagnostics
             // bundle's log tail reads tells the two apart, without reading
@@ -3770,6 +3803,7 @@ impl BoxActor {
                 return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished {
                     port,
                     owner: held.owner,
+                    pending: !held.published,
                 }));
             }
         };
@@ -3804,7 +3838,7 @@ impl BoxActor {
         {
             tracing::warn!(
                 session_id = %record.id,
-                name = ?record.name,
+                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 port,
                 source = ?source,
                 reason = %report,
@@ -4009,7 +4043,7 @@ impl BoxActor {
                 Err(error) => {
                     tracing::warn!(
                         session_id = %record.id,
-                        name = ?record.name,
+                        session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                         %local,
                         %error,
                         action = "shared-address-port-hand-over",
@@ -4029,7 +4063,7 @@ impl BoxActor {
             bound_any = true;
             tracing::info!(
                 session_id = %record.id,
-                name = ?record.name,
+                session_name = record.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
                 %local,
                 held_by_host,
                 action = "shared-address-port-hand-over",
@@ -5457,6 +5491,8 @@ impl BoxActor {
                     .as_utf8_path()
                     .as_std_path()
                     .to_path_buf(),
+                Some(Arc::clone(&self.hostnames)),
+                record.id,
             ));
             // The set this launch is running on, handed back so a test can
             // contend with its two real surfaces over the real port — a
@@ -5643,9 +5679,13 @@ impl BoxActor {
     /// not declare, naming each such package and who declared it (the
     /// project or a loadout).
     ///
-    /// Resolves names only, through the lookup the launch uses
-    /// ([`crate::env::session_package`]): nothing is built, and the graph is
-    /// dropped here, since the launch evaluates its own. A context or graph
+    /// Resolves names only: nothing is built, and no graph is retained
+    /// here, since the launch evaluates its own. When
+    /// [`Self::configure_loadout`] captured the compose-time graph's
+    /// names, membership in them answers the same lookup the launch uses
+    /// ([`crate::env::session_package`]) without re-evaluating the graph
+    /// — the most expensive step of a compose — a second time; otherwise
+    /// the check evaluates the graph itself, once. A context or graph
     /// that cannot be evaluated at all (an upstream that does not resolve)
     /// is not judged here; the launch reports it, as it did before this
     /// check existed — and so is one that does not resolve within
@@ -5654,60 +5694,102 @@ impl BoxActor {
     /// round-trip's other deadline is the client's, and its expiry does not
     /// cancel the daemon-side finalize. An expired check steps aside,
     /// warned, and the launch resolves the names at first exec, as it
-    /// always has.
+    /// always has. Because tokio polls the check before its timer, expiry
+    /// is not left to the race between them: the check measures its own
+    /// budget first, and a deadline already lapsed steps aside before any
+    /// verdict.
     ///
     /// Returns `Ok(true)` when the check stepped aside (expired deadline,
     /// no session context, or no package graph) so the client can warn the
     /// operator; `Ok(false)` when it ran to a verdict (nothing unknown, or
     /// an unknown package refused via `Err`).
     async fn check_composed_packages(&self, comp: &Composition) -> Result<bool, std::io::Error> {
+        // Both expiry routes (the budget measured up front, the timer
+        // below) step aside with the same warning.
+        fn warn_check_expired(deadline: std::time::Duration) {
+            tracing::warn!(
+                ?deadline,
+                "package check skipped at finalize: the session graph did not \
+                 resolve within its deadline; unknown package names will surface \
+                 at first exec, as before this check existed",
+            );
+        }
         if comp.packages().is_empty() {
             return Ok(false);
         }
+        let started = std::time::Instant::now();
         let checked: Result<Result<bool, std::io::Error>, _> =
             tokio::time::timeout(self.package_check_deadline, async {
-                let ctx = match self.build_context(true).await {
-                    Ok(ctx) => ctx,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "package check skipped at finalize: no session context"
-                        );
-                        return Ok(true);
-                    }
-                };
-                // CPU-heavy (nickel evaluation), so on the blocking pool, as the
-                // launch runs it.
-                let graph = crate::traced::spawn_blocking(move || {
-                    let mut ctx = ctx;
-                    ctx.graph_from_all_packages().map_err(|e| e.to_string())
-                })
-                .await
-                .map_err(std::io::Error::other)?;
-                let graph = match graph {
-                    Ok(graph) => graph,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "package check skipped at finalize: no package graph"
-                        );
-                        return Ok(true);
-                    }
-                };
-                let unknown: Vec<String> = comp
-                    .packages()
-                    .iter()
-                    .filter_map(|p| {
-                        crate::env::session_package(&graph, p.package())
-                            .err()
-                            .map(|e| {
-                                format!(
-                                    "{e} (declared by {})",
-                                    boxes::core::source::Provenanced::source(p)
-                                )
+                // The budget check first: tokio polls this future before
+                // its timer, and judging the captured names (the match
+                // below) is cheap enough to complete within that first
+                // poll, so an already-lapsed deadline — a
+                // `Duration::ZERO` switch — would never fire against it
+                // (see the expiry test). Measuring costs nothing on the
+                // slow fallback, which the timeout bounds anyway.
+                if started.elapsed() >= self.package_check_deadline {
+                    warn_check_expired(self.package_check_deadline);
+                    return Ok(true);
+                }
+                let unknown: Vec<String> = match self.composed_graph_names.as_ref() {
+                    // A handful of set lookups: judged inline, no
+                    // blocking-pool round-trip.
+                    Some(known) => comp
+                        .packages()
+                        .iter()
+                        .filter(|p| !known.contains(p.package()))
+                        .map(|p| {
+                            format!(
+                                "{} (declared by {})",
+                                crate::env::unknown_package(p.package()),
+                                boxes::core::source::Provenanced::source(p)
+                            )
+                        })
+                        .collect(),
+                    None => {
+                        let ctx = match self.build_context(true).await {
+                            Ok(ctx) => ctx,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "package check skipped at finalize: no session context"
+                                );
+                                return Ok(true);
+                            }
+                        };
+                        // CPU-heavy (nickel evaluation), so on the blocking pool, as
+                        // the launch runs it.
+                        let graph = crate::traced::spawn_blocking(move || {
+                            let mut ctx = ctx;
+                            ctx.graph_from_all_packages().map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?;
+                        let graph = match graph {
+                            Ok(graph) => graph,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "package check skipped at finalize: no package graph"
+                                );
+                                return Ok(true);
+                            }
+                        };
+                        comp.packages()
+                            .iter()
+                            .filter_map(|p| {
+                                crate::env::session_package(&graph, p.package())
+                                    .err()
+                                    .map(|e| {
+                                        format!(
+                                            "{e} (declared by {})",
+                                            boxes::core::source::Provenanced::source(p)
+                                        )
+                                    })
                             })
-                    })
-                    .collect();
+                            .collect()
+                    }
+                };
                 if unknown.is_empty() {
                     return Ok(false);
                 }
@@ -5725,12 +5807,7 @@ impl BoxActor {
                 // first exec — so the check tolerates it too. The evaluation
                 // the timeout detached keeps running on the blocking pool and
                 // warms the cache that launch reads.
-                tracing::warn!(
-                    deadline = ?self.package_check_deadline,
-                    "package check skipped at finalize: the session graph did not \
-                     resolve within its deadline; unknown package names will surface \
-                     at first exec, as before this check existed",
-                );
+                warn_check_expired(self.package_check_deadline);
                 Ok(true)
             }
         }
@@ -6265,6 +6342,22 @@ impl BoxHandle {
             .send(BoxMessage::CheckPackagesAtFinalize(deadline, send))
             .await;
         recv.await.expect("the session actor should ack the switch");
+    }
+
+    /// Test-only: drop the compose-time graph names (see
+    /// [`BoxMessage::ForgetComposedGraphNames`]).
+    #[cfg(test)]
+    pub(crate) async fn forget_composed_graph_names(&self) {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(BoxMessage::ForgetComposedGraphNames(send))
+            .await;
+        recv.await.expect("the session actor should ack the drop");
     }
 
     /// Test-only peek at the actor's held [`Composition`]. Bumps the
