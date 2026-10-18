@@ -2503,6 +2503,15 @@ async fn handle_git_receive(
                 WORK_TREE=$(dirname "$GIT_DIR_ABS")
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
+                # The branch currently checked out in the worktree, and
+                # whether HEAD is born yet. The first push into a fresh
+                # workspace has no commit on HEAD; each pushed branch must be
+                # created (once) to populate the worktree. After that, a push
+                # to any branch other than the checked-out one must not move
+                # HEAD or touch the worktree.
+                cur=$(g symbolic-ref -q HEAD)
+                g rev-parse -q --verify HEAD >/dev/null
+                head_born=$?
 
                 zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
@@ -2512,6 +2521,15 @@ async fn handle_git_receive(
                     # receive.denyDeleteCurrent refuses it during receive-pack.
                     [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
+
+                    # A push to a branch that is not the one checked out
+                    # leaves HEAD and the worktree alone: the ref itself has
+                    # already moved in receive-pack, so there is nothing more
+                    # to do. Only on the still-unborn first push does the
+                    # hook check out the first arriving branch.
+                    if [ "$ref" != "$cur" ] && [ "$head_born" -eq 0 ]; then
+                        continue
+                    fi
 
                     if [ "$old" = "$zero" ]; then
                         # Previously-unborn branch: nothing tracked, so tracked
