@@ -7978,6 +7978,7 @@ async fn expose_allow_publishes_and_lists() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: 3000,
                 owner: crate::net::listeners::PublicationOwner::Expose,
+                pending: false,
             },
         )) => {}
         other => panic!("a second request for a live port is a duplicate: {other:?}"),
@@ -9511,6 +9512,7 @@ async fn expose_logs_every_path() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: 3000,
                 owner: crate::net::listeners::PublicationOwner::Expose,
+                pending: false,
             },
         )) => {}
         other => panic!("the second request for a live port is a duplicate: {other:?}"),
@@ -10007,6 +10009,7 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, listen_port),
         other => panic!("a port the watcher published is a typed duplicate: {other:?}"),
@@ -10260,6 +10263,7 @@ async fn expose_on_listen_published_port_is_already_published() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, port),
         other => panic!("the runtime expose is refused as the duplicate it is: {other:?}"),
@@ -10672,6 +10676,7 @@ async fn listen_plan_travels_in_launched() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, seeded_port),
         other => panic!("the seeded box's two surfaces read one set: {other:?}"),
@@ -10900,6 +10905,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: true,
             },
         )) => assert_eq!(asked, b_port),
         other => panic!(
@@ -10930,7 +10936,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
     assert!(
         b_refusal.contains("owner=listen")
             && b_refusal.contains(&format!(
-                "reason=port {b_port} is published already by this box (listen)"
+                "reason=port {b_port} is being published by this box (listen)"
             )),
         "the refusal names the owner holding the port and the reason it \
          gave: {b_refusal}"
@@ -11472,6 +11478,7 @@ async fn respawn_frees_published_ports() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, port),
         other => panic!("the respawn's watcher owns the port it published: {other:?}"),

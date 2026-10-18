@@ -3770,6 +3770,7 @@ impl BoxActor {
                 return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished {
                     port,
                     owner: held.owner,
+                    pending: !held.published,
                 }));
             }
         };
