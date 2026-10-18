@@ -1171,7 +1171,11 @@ impl File {
                 let target = std::fs::read_link(path).unwrap_or_default();
                 let e = std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("symlink to {}, which does not exist", target.display()),
+                    format!(
+                        "symlink to {0}, which does not exist; create {0} or replace the link \
+                         with a file",
+                        target.display()
+                    ),
                 );
                 return Err(Error::IO("resolving", path.to_path_buf(), e).into());
             }
@@ -3163,7 +3167,8 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "resolving I/O error at path {}: symlink to {}, which does not exist",
+                "resolving I/O error at path {0}: symlink to {1}, which does not exist; \
+                 create {1} or replace the link with a file",
                 link.display(),
                 target.display()
             )
