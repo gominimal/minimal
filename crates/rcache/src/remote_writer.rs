@@ -158,7 +158,9 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             .join(&format!("{}.zst", hex::encode(sha256)))
             .unwrap()
             .object;
-        let local_len = tar_file.metadata().map(|m| m.len()).unwrap_or(0);
+        // An unreadable length is an error, not 0: a 0 would match an empty
+        // object left by a partial upload under this name.
+        let local_len = tar_file.metadata().map(|m| m.len()).map_err(Error::IO)?;
         if self.object_present(&object, local_len).await {
             // The object is content-addressed: the same name with the same length is
             // the same bytes, so nothing to write. (Only a partial earlier upload
@@ -209,6 +211,16 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
                         self.pending.push((spec_hash.clone(), sha256));
                         return Ok(false);
                     }
+                }
+                // Out of retries on a 429: the name was mutated within the last
+                // second, so the other uploader's object has very likely landed.
+                // One last look before giving up, as after every other 429.
+                Err(e) if e.http_status_code() == Some(TOO_MANY_REQUESTS) => {
+                    if self.object_present(&object, local_len).await {
+                        self.pending.push((spec_hash.clone(), sha256));
+                        return Ok(false);
+                    }
+                    return Err(Error::Backend(e));
                 }
                 Err(e) => return Err(Error::Backend(e)),
             }
@@ -598,6 +610,47 @@ mod tests {
             got.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(got, bytes, "the retry sends every byte of the artifact");
+    }
+
+    /// Out of retries on a 429, the object is looked for one last time: when
+    /// the other uploader's write has landed, the upload is a skip, not an
+    /// error that would abort the whole upload session.
+    #[tokio::test(start_paused = true)]
+    async fn upload_out_of_retries_on_429_still_skips_a_present_object() {
+        let mut mock = MockStorage::new();
+        let mut seq = Sequence::new();
+        mock.expect_open_object()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Err(http_404_error()));
+        for _ in 0..MAX_OBJECT_WRITE_RETRIES {
+            mock.expect_write_object_buffered()
+                .times(1)
+                .in_sequence(&mut seq)
+                .return_once(|_p: Payload<gcs::streaming_source::FileSource>, _, _| {
+                    Err(http_429_error())
+                });
+            mock.expect_open_object()
+                .times(1)
+                .in_sequence(&mut seq)
+                .returning(|_, _| Err(http_404_error()));
+        }
+        // The last attempt, past the retry budget, and the look after it.
+        mock.expect_write_object_buffered()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_p: Payload<gcs::streaming_source::FileSource>, _, _| {
+                Err(http_429_error())
+            });
+        mock.expect_open_object()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| existing(18));
+        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let (file, _shared) = artifact(&[7u8; 18]);
+        let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
+        assert!(!wrote, "the other uploader's write stands");
+        assert_eq!(writer.pending.len(), 1);
     }
 
     /// A 429 is another uploader writing this same content: when the object
