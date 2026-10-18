@@ -99,9 +99,7 @@ impl std::error::Error for Error {
         match self {
             Error::IO(_, _, e) => Some(e),
             Error::Format(e) => Some(e),
-            // The serde error only restates serde's internal enum name,
-            // which the Display above replaces; it stays for Debug.
-            Error::LinkConfig { .. } => None,
+            Error::LinkConfig { source, .. } => Some(source.as_ref()),
             Error::NotFound => None,
             Error::ConflictingLayouts(_) => None,
             Error::MissingParamDefault(_) => None,

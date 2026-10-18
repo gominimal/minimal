@@ -1159,9 +1159,26 @@ impl File {
         // target the real file: `persist` would otherwise replace the
         // symlink entry itself. A file that does not exist yet is keyed
         // by its canonical parent, so `min init` shares the lock with the
-        // edits that follow it.
+        // edits that follow it. A dangling symlink is refused: the replace
+        // would swap the link entry for a regular file, and following it
+        // would create a file wherever the link points.
         let path = match std::fs::canonicalize(path) {
             Ok(p) => p,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) =>
+            {
+                let target = std::fs::read_link(path).unwrap_or_default();
+                let e = std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{} is a symlink to {}, which does not exist",
+                        path.display(),
+                        target.display()
+                    ),
+                );
+                return Err(Error::IO("resolving", path.to_path_buf(), e).into());
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let parent = path
                     .parent()
@@ -1203,9 +1220,22 @@ impl File {
         match edit(content.as_deref())? {
             None => Ok(()),
             Some(new) => {
+                // The existing file's mode, which the replace keeps.
+                let existing = match std::fs::metadata(path) {
+                    Ok(meta) => Some(meta.permissions()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
+                };
+                // Over an existing file, the temp starts owner-only and takes
+                // that file's mode just before the rename, so a private file
+                // is never exposed through the temp. A new file gets 0o666
+                // less the umask (open(2) applies it), as std::fs::write gave.
                 let mut builder = tempfile::Builder::new();
-                #[cfg(unix)]
-                builder.permissions(std::fs::Permissions::from_mode(0o666));
+                builder.permissions(std::fs::Permissions::from_mode(if existing.is_some() {
+                    0o600
+                } else {
+                    0o666
+                }));
                 let mut tmp = match builder.tempfile_in(&parent) {
                     Ok(t) => t,
                     Err(e) => return Err(Error::IO("creating temp", path.to_path_buf(), e).into()),
@@ -1216,18 +1246,10 @@ impl File {
                 if let Err(e) = tmp.as_file().sync_all() {
                     return Err(Error::IO("syncing temp", path.to_path_buf(), e).into());
                 }
-                // Preserve an existing file's mode across the rename, so the
-                // replace does not regress permissions std::fs::write kept.
-                match std::fs::metadata(path) {
-                    Ok(meta) => {
-                        if let Err(e) = std::fs::set_permissions(tmp.path(), meta.permissions()) {
-                            return Err(
-                                Error::IO("setting permissions", path.to_path_buf(), e).into()
-                            );
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
+                if let Some(perms) = existing
+                    && let Err(e) = std::fs::set_permissions(tmp.path(), perms)
+                {
+                    return Err(Error::IO("setting permissions", path.to_path_buf(), e).into());
                 }
                 match tmp.persist(path) {
                     Ok(_) => Ok(()),
@@ -3131,6 +3153,63 @@ mod tests {
         );
         let content = std::fs::read_to_string(&target).unwrap();
         assert!(content.contains("k = \"v\""), "content: {content}");
+    }
+
+    #[test]
+    fn edit_exclusively_refuses_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("missing.toml");
+        let link = dir.path().join(MFILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = edit_in_test(&link, |_| Ok(Some("k = \"v\"\n".to_string()))).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains(&link.display().to_string()), "error: {msg}");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the edit replaced the dangling symlink"
+        );
+        assert!(!target.exists(), "the edit created the link's target");
+    }
+
+    #[test]
+    fn edit_exclusively_gives_a_new_file_the_mode_fs_write_would() {
+        // Compare with a file std::fs::write creates under the same umask;
+        // setting the umask here would race the other test threads.
+        let dir = tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        std::fs::write(&reference, "").unwrap();
+        let expected = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+        let path = dir.path().join(MFILE_NAME);
+
+        edit_in_test(&path, |_| Ok(Some("k = \"v\"\n".to_string()))).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, expected,
+            "mode {mode:o}, std::fs::write gives {expected:o}"
+        );
+        if expected & 0o022 == 0 {
+            assert_eq!(
+                mode & 0o022,
+                0,
+                "a new file is group/world-writable: {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_exclusively_keeps_a_private_file_private() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = \"v\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        edit_in_test(&path, |_| Ok(Some("k = \"w\"\n".to_string()))).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
     }
 
     #[test]
