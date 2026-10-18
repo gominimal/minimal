@@ -179,3 +179,102 @@ async fn git_push_of_other_branch_leaves_workspace_on_current_branch() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&feature_ref).trim(), feature_tip);
 }
+
+/// `git push <url> <refs>...` from `src`, with the `git-remote-min` helper
+/// in `helpers` first on PATH and the daemon socket under `state_home`.
+async fn push_refs(
+    src: &std::path::Path,
+    helpers: &std::path::Path,
+    state_home: &std::path::Path,
+    url: &str,
+    refs: &[&str],
+) {
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let out = tokio::process::Command::new("git")
+        .current_dir(src)
+        .env("PATH", format!("{}:{inherited_path}", helpers.display()))
+        .env("XDG_STATE_HOME", state_home)
+        .arg("push")
+        .arg(url)
+        .args(refs)
+        .output()
+        .await
+        .expect("git push should run");
+    assert!(
+        out.status.success(),
+        "git push {refs:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[tokio::test]
+async fn git_push_of_several_refs_syncs_only_the_current_branch() {
+    // Same harness shape as the tests above.
+    let state_home = tempfile::TempDir::new().unwrap();
+    let sock_dir = state_home.path().join("minimal/providers/local-minimald0");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+
+    let server = TestServer::new().await;
+    server.listen_on_uds(&sock_dir.join("ssh.sock")).await;
+
+    let mut client = server.connect().await;
+    let session_id = create_configured_session(&mut client, "git-push-several-refs", "/tmp").await;
+
+    let helpers = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_min"),
+        helpers.path().join("git-remote-min"),
+    )
+    .unwrap();
+    let url = format!("min://{session_id}");
+
+    // Populate the workspace with `main` checked out.
+    let src_dir = tempfile::TempDir::new().unwrap();
+    let src = src_dir.path();
+    run_git(src, &["init", "-q", "-b", "main"]).await;
+    run_git(src, &["config", "user.email", "t@example.com"]).await;
+    run_git(src, &["config", "user.name", "Test"]).await;
+    tokio::fs::write(src.join("hello.txt"), b"hi there\n")
+        .await
+        .unwrap();
+    run_git(src, &["add", "hello.txt"]).await;
+    run_git(src, &["commit", "-q", "-m", "first commit"]).await;
+    push_refs(src, helpers.path(), state_home.path(), &url, &["main"]).await;
+
+    // Advance `main`, and grow a new `feature` branch off the first commit.
+    tokio::fs::write(src.join("main2.txt"), b"main two\n")
+        .await
+        .unwrap();
+    run_git(src, &["add", "main2.txt"]).await;
+    run_git(src, &["commit", "-q", "-m", "main second commit"]).await;
+    run_git(src, &["checkout", "-q", "-b", "feature", "HEAD~1"]).await;
+    tokio::fs::write(src.join("feature.txt"), b"feature\n")
+        .await
+        .unwrap();
+    run_git(src, &["add", "feature.txt"]).await;
+    run_git(src, &["commit", "-q", "-m", "feature commit"]).await;
+
+    // One push carrying both refs: the checked-out `main` syncs into the
+    // worktree, while `feature` only moves its ref.
+    push_refs(
+        src,
+        helpers.path(),
+        state_home.path(),
+        &url,
+        &["main", "feature"],
+    )
+    .await;
+
+    let sftp = client.open_sftp(session_id).await;
+    let head = sftp.read("/workbench/.git/HEAD").await.unwrap();
+    assert_eq!(head, b"ref: refs/heads/main\n");
+    let main2 = sftp.read("/workbench/main2.txt").await.unwrap();
+    assert_eq!(main2, b"main two\n");
+    assert!(sftp.read("/workbench/feature.txt").await.is_err());
+    assert!(
+        sftp.read("/workbench/.git/refs/heads/feature")
+            .await
+            .is_ok()
+    );
+}

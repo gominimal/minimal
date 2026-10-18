@@ -2539,7 +2539,12 @@ async fn handle_git_receive(
                         # pushed tip and checks it out; WITHOUT -f, git refuses
                         # to overwrite untracked files (its stderr names them),
                         # and we surface the skip like the dirty case below.
-                        if ! g checkout -q -B "$branch" "$new"; then
+                        if g checkout -q -B "$branch" "$new"; then
+                            # HEAD is born now: later refs in this same push
+                            # are other branches and must not move it.
+                            cur=$ref
+                            head_born=0
+                        else
                             echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
                         fi
                         continue
