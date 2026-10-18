@@ -2961,6 +2961,17 @@ mod tests {
         assert!(INACTIVITY_TIMEOUT > KEEPALIVE_INTERVAL * KEEPALIVE_MAX as u32);
     }
 
+    /// The production config arms the inactivity deadline: with `None` a
+    /// wedged transport write parks the session loop forever.
+    #[tokio::test]
+    async fn the_production_config_arms_the_inactivity_deadline() {
+        let server = crate::test_harness::TestServer::new().await;
+        let config = build_russh_config(&server.state).await.unwrap();
+        assert_eq!(config.inactivity_timeout, Some(INACTIVITY_TIMEOUT));
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, KEEPALIVE_MAX);
+    }
+
     /// The node address's interim opening follows the port the proxy actually
     /// bound, not the configured one the switch was built with: a daemon whose
     /// default was busy binds an OS-chosen port, and `record_bound` re-points

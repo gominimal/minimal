@@ -42,11 +42,10 @@ const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 /// Bounding the *size* of the request is not the same as bounding the *wait*
 /// for it: a client that writes half an object and then holds the channel open
 /// sends nothing more and never signals EOF, so the read below would park
-/// forever. Nothing else reclaims it — the daemon arms its inactivity
-/// timeout at the full keepalive budget (a live attach must not be
-/// reaped), and the SSH keepalives it uses instead only detect a peer
-/// that has *stopped answering*, not one that answers and stays silent.
-/// The body is a two-field object
+/// forever. Nothing else reclaims it — the daemon arms its inactivity timeout
+/// at the full keepalive budget (a live attach must not be reaped), and the SSH
+/// keepalives it uses instead only detect a peer that has *stopped answering*,
+/// not one that answers and stays silent. The body is a two-field object
 /// written immediately after the subsystem opens, so this is a generous
 /// allowance for a slow link rather than a working deadline.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
