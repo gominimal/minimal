@@ -163,6 +163,18 @@ impl FileCache {
     /// content-addressed path only after its SHA-256 matches. A failed or mismatched download
     /// therefore never appears under the hash, and concurrent readers see either nothing or the
     /// whole verified file.
+    ///
+    /// Returns the cached path, replacing any existing entry on success. `sha256` must match the
+    /// lowercase hexadecimal digest of the response bytes. Updates `op` with bytes received, using
+    /// the response's content length, when available, as the progress total only.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Either::Right` for response stream errors. Returns `Either::Left` for
+    /// [FileCacheError::BadSha] if `sha256` contains `/`, [FileCacheError::HashMismatch] if the
+    /// digest differs, or [FileCacheError::IO] if accessing or creating the cache directory,
+    /// creating the temporary file, writing or syncing it, or persisting it fails. Failure to sync
+    /// the directory after publication does not prevent a successful return.
     pub async fn write_through<R>(
         &self,
         filename: &str,
