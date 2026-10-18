@@ -415,6 +415,9 @@ pub async fn attach_to_switch(
 ) -> io::Result<SwitchRelay> {
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
+    if gate.is_some() {
+        announce_lease(&mut sock, lease).await?;
+    }
     let (sock_rx, sock_tx) = sock.into_split();
     spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
 }
@@ -442,9 +445,60 @@ pub async fn attach_to_switch_vsock(
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
-    let sock = connect_switch_vsock(cid, port).await?;
+    let mut sock = connect_switch_vsock(cid, port).await?;
+    if gate.is_some() {
+        announce_lease(&mut sock, lease).await?;
+    }
     let (sock_rx, sock_tx) = tokio::io::split(sock);
     spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
+}
+
+/// A gratuitous ARP announcing `lease` from its own MAC
+/// ([`super::MacAddr::for_switch_ip`]): a broadcast request whose sender and
+/// target protocol addresses are both the lease, padded to Ethernet's
+/// 60-byte minimum. It is the frame a box's kernel would send at link-up
+/// with `arp_notify` set, and it passes the relay's lease check (NET-084)
+/// by construction.
+fn gratuitous_arp(lease: Ipv4Addr) -> Vec<u8> {
+    const ETHERTYPE_ARP: u16 = 0x0806;
+    let mac = super::MacAddr::for_switch_ip(lease).0;
+    let ip = lease.octets();
+    let mut frame = Vec::with_capacity(60);
+    frame.extend_from_slice(&[0xff; 6]); // destination MAC: broadcast
+    frame.extend_from_slice(&mac); // source MAC
+    frame.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes()); // ptype: IPv4
+    frame.extend_from_slice(&[6, 4]); // hlen, plen
+    frame.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+    frame.extend_from_slice(&mac); // sender MAC
+    frame.extend_from_slice(&ip); // sender protocol address
+    frame.extend_from_slice(&[0; 6]); // target MAC
+    frame.extend_from_slice(&ip); // target protocol address
+    frame.resize(60, 0);
+    frame
+}
+
+/// Writes one gratuitous ARP for `lease` onto a box relay's switch
+/// connection, framed as every relayed frame is, before the relay starts.
+///
+/// The host-side gate counts a box's row carried only once a frame from the
+/// box's address crosses it (minvmd's `BoxTable::carry`), and the tap's
+/// static configuration sends none: no DHCP, and no gratuitous ARP at
+/// link-up. A box whose host runs idle — a resumed box's host, launched
+/// with no client — would otherwise leave a reloaded row awaiting its first
+/// frame until its resume bound withdrew it, its name and ingress with it
+/// (NET-138). The announcement is that first frame, sent at every box
+/// attach.
+async fn announce_lease<W>(sock: &mut W, lease: Ipv4Addr) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let frame = gratuitous_arp(lease);
+    let mut framed = Vec::with_capacity(2 + frame.len());
+    framed.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+    framed.extend_from_slice(&frame);
+    sock.write_all(&framed).await
 }
 
 /// Attaches the guest's **root** namespace tap — the daemon's own, which
@@ -5914,6 +5968,81 @@ pub(crate) mod tests {
     fn open_tap_rejects_an_overlong_name() {
         let err = open_tap("this-name-is-way-too-long").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// NET-138: a box's attach announces its lease before any frame of the
+    /// box's own, so an idle box — a resumed box's host, launched with no
+    /// client — still reaches the host-side gate with a frame from its
+    /// address, the one thing that carries its row. The announcement is a
+    /// gratuitous ARP from the lease at the lease's own MAC, admitted by
+    /// the lease check; the daemon's own, ungated attach announces nothing.
+    #[tokio::test]
+    async fn a_box_attach_announces_its_lease_before_any_box_frame() {
+        let lease = Ipv4Addr::new(100, 64, 0, 9);
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let api_sock = dir.path().join("gvproxy.sock");
+        let listener = tokio::net::UnixListener::bind(&api_sock).expect("binding the stand-in");
+
+        for gated in [true, false] {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `socketpair` with a valid domain/type either returns -1
+            // (checked) or fills `fds` with two fresh descriptors.
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+            // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor
+            // just returned by socketpair.
+            let tap_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: as above; held so the tap side stays open and idle.
+            let _box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+            let gate = gated.then(|| {
+                Arc::new(BoxGate::for_session(
+                    lease.to_string(),
+                    lease,
+                    &boxes::BoxPolicy::default(),
+                    SwitchSubnet::default(),
+                    None,
+                ))
+            });
+            let (relay, accepted) = tokio::join!(
+                attach_to_switch(tap_fd, &api_sock, gate, lease, SwitchSubnet::default()),
+                listener.accept(),
+            );
+            let _relay = relay.expect("the attach completes against the stand-in");
+            let (mut switch, _) = accepted.expect("the attach dials the stand-in");
+
+            let mut head = vec![0u8; CONNECT_REQUEST.len()];
+            switch.read_exact(&mut head).await.expect("the upgrade");
+            assert_eq!(head, CONNECT_REQUEST, "the upgrade comes first");
+            let mut len_buf = [0u8; 2];
+            let read =
+                tokio::time::timeout(Duration::from_millis(300), switch.read_exact(&mut len_buf))
+                    .await;
+            if !gated {
+                assert!(read.is_err(), "the daemon's own attach announces nothing");
+                continue;
+            }
+            read.expect("a box's attach speaks without any box frame")
+                .expect("the announcement's length");
+            let mut frame = vec![0u8; u16::from_le_bytes(len_buf) as usize];
+            switch
+                .read_exact(&mut frame)
+                .await
+                .expect("the announcement");
+            let summary = egress::summarize(&frame);
+            assert_eq!(summary.family(), egress::FrameFamily::Arp, "an ARP frame");
+            assert_eq!(summary.source(), Some(lease.octets()), "from the lease");
+            assert!(
+                egress::foreign_source(&summary, lease.octets()).is_none(),
+                "the lease check admits it"
+            );
+            assert_eq!(
+                &frame[6..12],
+                &super::super::MacAddr::for_switch_ip(lease).0[..],
+                "sent at the lease's own MAC"
+            );
+            assert_eq!(frame.len(), 60, "padded to Ethernet's minimum");
+        }
     }
 
     #[test]

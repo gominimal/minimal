@@ -51,7 +51,8 @@
 //! again, so a box whose shuttle reconnects keeps its row. The client boxes'
 //! registrations — the creator's declarations, never anything the guest said
 //! — are persisted in this daemon's state dir ([`BoxRegistry::persisting_to`])
-//! and reloaded detached at start, and a creator whose box outlived its row
+//! and reloaded under the resume bound at start — a VM's cold boot
+//! outlasts the detach grace — and a creator whose box outlived its row
 //! asks for the row back from that persisted record
 //! ([`BoxRegistry::resume_client_box`]).
 
@@ -99,9 +100,9 @@ const ADMIT_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1)
 /// answers it.
 const ALLOW_ALL_SUBNET: &str = "0.0.0.0/0";
 
-/// How long a detached row — one whose last carrying relay ended, or one
-/// reloaded from the persisted registry at start — stands before it is
-/// withdrawn, unless a relay carries its box's frames again first.
+/// How long a detached row — one whose last carrying relay ended — stands
+/// before it is withdrawn, unless a relay carries its box's frames again
+/// first.
 ///
 /// NET-138 bounds a row's withdrawal at 60 seconds from the end of the
 /// box's attachment. The grace runs from the drainer's arrival of the
@@ -128,10 +129,13 @@ pub const DETACH_GRACE: Duration = Duration::from_secs(45);
 /// row it was resumed for, while a resume nobody follows with an attach
 /// holds its addresses no longer than this. NET-138's 60 s runs from the
 /// end of an attachment, and a reinstated row has had none since it was
-/// published. The bound is armed only when a resume reinstates a withdrawn
-/// row: a resume of a row that stands changes nothing about its liveness,
-/// so it never stretches a detached row's grace past
-/// [`NET_138_WITHDRAWAL_BOUND`] nor puts a bound on a row a relay carries.
+/// published. The bound is armed when a resume reinstates a withdrawn row
+/// and when a load reinstates a standing creation
+/// ([`BoxRegistry::persisting_to`]) — the same wait for the box's first
+/// frame, over the same cold boot: a resume of a row that stands changes
+/// nothing about its liveness, so it never stretches a detached row's
+/// grace past [`NET_138_WITHDRAWAL_BOUND`] nor puts a bound on a row a
+/// relay carries.
 pub const RESUME_ATTACH_BOUND: Duration = Duration::from_secs(300);
 
 /// NET-138's bound on a detached row: withdrawn no later than 60 seconds
@@ -455,14 +459,14 @@ pub struct BoxRecord {
 /// - **awaiting** — no relay has carried it yet, and no grace runs: a
 ///   fresh registration stands until its box's first frame or its
 ///   creator's withdrawal; one its creator reinstated
-///   ([`BoxRegistry::resume_client_box`]) stands until a relay carries its
-///   box or one of its task rows, or until [`RESUME_ATTACH_BOUND`] passes
-///   and it is withdrawn as at a grace's end;
+///   ([`BoxRegistry::resume_client_box`]) or the load reloaded from the
+///   persisted registry ([`BoxRegistry::persisting_to`]) stands until a
+///   relay carries its box or one of its task rows, or until
+///   [`RESUME_ATTACH_BOUND`] passes and it is withdrawn as at a grace's
+///   end;
 /// - **attached** — at least one relay carries it;
-/// - **detached** — its last relay ended, or it was reloaded from the
-///   persisted registry at start ([`BoxRegistry::persisting_to`]); it is
-///   withdrawn once [`DETACH_GRACE`] passes unless a relay carries it
-///   again first.
+/// - **detached** — its last relay ended; it is withdrawn once
+///   [`DETACH_GRACE`] passes unless a relay carries it again first.
 ///
 /// A detached row decides frames exactly as an attached one does: the
 /// gate's verdict reads the row's rules, never its liveness, and the row's
@@ -993,11 +997,12 @@ pub struct ClientBoxSpec {
 /// a row stands for it. A creation lives from its registration until its
 /// creator withdraws the box ([`BoxRegistry::withdraw_client_box`]) or a
 /// new registration takes its name; a row withdrawn at the end of its
-/// detach grace leaves the creation **dormant** (`standing: false`) for
-/// its creator to resume ([`BoxRegistry::resume_client_box`]). A creation,
-/// standing or dormant, keeps its addresses reserved: its switch and task
-/// addresses stay out of the hand-out book — taken again from a fresh book
-/// at reload — and its published loopback address stays the answerer's
+/// detach grace or its resume bound leaves the creation **dormant**
+/// (`standing: false`) for its creator to resume
+/// ([`BoxRegistry::resume_client_box`]). A creation, standing or dormant,
+/// keeps its addresses reserved: its switch and task addresses stay out of
+/// the hand-out book — taken again from a fresh book at reload — and its
+/// published loopback address stays the answerer's
 /// link for its name, so a resume finds every address its box was created
 /// with. Its creator's withdrawal releases them all. There is at most one
 /// creation per box name.
@@ -3114,12 +3119,14 @@ impl BoxRegistry {
     ///
     /// Every creation whose row stood at the last write is reinstated at
     /// its own addresses with its own box id, compiled from its creator's
-    /// declaration as a registration is, and marked **detached** from this
-    /// instant ([`RowLiveness`]): the VM the row's box ran in ended with
-    /// the previous run, so the row is withdrawn once [`DETACH_GRACE`]
-    /// passes unless the box's shuttle carries a frame from its address
-    /// again. A resume does not extend that grace; once the row has gone,
-    /// its creator's resume reinstates it ([`Self::resume_client_box`]). A
+    /// declaration as a registration is, and awaits its box's first frame
+    /// under [`RESUME_ATTACH_BOUND`] from this instant ([`RowLiveness`]):
+    /// the VM the row's box ran in ended with the previous run, so the
+    /// box's host is not launched in the new VM until the guest daemon
+    /// starts, and the row is withdrawn once the bound passes unless the
+    /// box's shuttle carries a frame from its address again. A resume
+    /// does not extend that bound; once the row has gone, its creator's
+    /// resume reinstates it ([`Self::resume_client_box`]). A
     /// dormant creation stays dormant. The hand-out book takes every
     /// creation's switch and task addresses, dormant ones' included, so a
     /// fresh book hands none of them to a new box; their quarantine is not
@@ -3203,13 +3210,14 @@ impl BoxRegistry {
         );
         match self.try_register_since(registration, None, None) {
             Ok(record) => {
-                record.liveness().detached_since = Some(now);
+                record.liveness().resumed_since = Some(now);
                 tracing::info!(
                     box = %record.name(),
                     switch_addr = %record.switch_addr(),
-                    grace = ?DETACH_GRACE,
-                    "reloaded a persisted box's row detached; it is withdrawn after the \
-                     grace unless its box attaches again or its creator resumes it"
+                    bound = ?RESUME_ATTACH_BOUND,
+                    "reloaded a persisted box's row; it awaits its box's first frame \
+                     under the resume bound and is withdrawn once that bound passes \
+                     unless its box attaches again or its creator resumes it"
                 );
                 true
             }
@@ -6772,10 +6780,11 @@ mod tests {
 
     /// NET-138: the client boxes' registrations persist host-side, and a
     /// registry started over the file reinstates each standing row — its
-    /// name, both addresses, its box id and its compiled rules — detached
-    /// from the load, with its switch address out of the hand-out book.
+    /// name, both addresses, its box id and its compiled rules — awaiting
+    /// its box's first frame under the resume bound, with its switch
+    /// address out of the hand-out book.
     #[test]
-    fn registry_persists_and_reloads_rows_as_detached() {
+    fn registry_persists_and_reloads_rows_awaiting_their_boxes() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let before = persisted_registry(&dir);
         let mut spec = client_spec("web");
@@ -6801,7 +6810,10 @@ mod tests {
             web.egress(),
             "compiled from its declaration"
         );
-        assert!(reloaded.is_detached(), "reloaded detached");
+        assert!(
+            !reloaded.is_detached(),
+            "reloaded awaiting its box's first frame"
+        );
         assert_eq!(after.live_switch_addrs(), 1, "its switch address is out");
         let api = after
             .register_client_box(client_spec("api"))
@@ -6813,11 +6825,11 @@ mod tests {
         );
     }
 
-    /// NET-138: a reloaded row no relay carries again is withdrawn after its
-    /// grace, as any detached row is, and stays withdrawn across the next
-    /// reload: its creation is kept dormant, its switch address reserved
-    /// for it across the reload too, so the reloaded book hands it to no
-    /// other box.
+    /// NET-138: a reloaded row no relay carries again is withdrawn once its
+    /// resume bound passes, as any row awaiting its box is, and stays
+    /// withdrawn across the next reload: its creation is kept dormant, its
+    /// switch address reserved for it across the reload too, so the
+    /// reloaded book hands it to no other box.
     #[test]
     fn a_reloaded_row_not_reattributed_is_withdrawn() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -6830,10 +6842,10 @@ mod tests {
         after.spawn_withdrawal_drainer(move |name| {
             let _ = released.send(name.to_string());
         });
-        after.advance_clock(DETACH_GRACE);
+        after.advance_clock(RESUME_ATTACH_BOUND);
         wait_until(
             || after.row_by_name("web").is_none(),
-            "the reloaded row is withdrawn once its grace passes",
+            "the reloaded row is withdrawn once its bound passes",
         );
         assert!(
             releases.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -6866,6 +6878,60 @@ mod tests {
             "the creator's destroy ends the dormant creation"
         );
         assert_eq!(again.live_switch_addrs(), 1, "only the new box's is out");
+    }
+
+    /// NET-138 (finding: a reload armed the detach grace): a reloaded row
+    /// awaits its box's first frame under the resume bound, not the detach
+    /// grace — the VM's cold boot outlasts the grace — so it stands past
+    /// [`DETACH_GRACE`] and is withdrawn only once
+    /// [`RESUME_ATTACH_BOUND`] passes; a frame carried within the bound
+    /// stands it back up the way any attributed row stands.
+    #[test]
+    fn a_reloaded_row_awaits_its_box_under_the_resume_bound() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        persisted_registry(&dir)
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+
+        let registry = persisted_registry(&dir);
+        registry.spawn_withdrawal_drainer(|_| {});
+        registry.advance_clock(DETACH_GRACE);
+        let_the_drainer_sweep();
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "the reloaded row stands past the detach grace: its VM's cold boot \
+             outlasts the grace"
+        );
+
+        registry.advance_clock(RESUME_ATTACH_BOUND.saturating_sub(DETACH_GRACE));
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the reloaded row is withdrawn at its bound",
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            1,
+            "the dormant creation keeps its switch address reserved"
+        );
+
+        // A reload alone, no resume: the reloaded row's first frame clears
+        // the bound the load armed.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let web = persisted_registry(&dir)
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let reloaded = persisted_registry(&dir);
+        reloaded.spawn_withdrawal_drainer(|_| {});
+        reloaded
+            .table()
+            .mark_attributed(web.switch_addr().octets())
+            .expect("the reloaded row stands at its switch address");
+        reloaded.advance_clock(RESUME_ATTACH_BOUND);
+        let_the_drainer_sweep();
+        assert!(
+            reloaded.row_by_name("web").is_some(),
+            "a reloaded row its box's first frame reached stands past the bound"
+        );
     }
 
     /// NET-138: the persisted registry is its owner's alone — mode 0600,
@@ -7924,10 +7990,10 @@ mod tests {
         assert_eq!(registry.live_switch_addrs(), 3);
 
         registry.spawn_withdrawal_drainer(|_| {});
-        registry.advance_clock(DETACH_GRACE);
+        registry.advance_clock(RESUME_ATTACH_BOUND);
         wait_until(
             || registry.table().is_empty(),
-            "the reloaded box goes at its grace's end, its task rows with it",
+            "the reloaded box goes at its bound, its task rows with it",
         );
         let claim = registry.begin_registration("web");
         let resumed = registry

@@ -496,14 +496,25 @@ pub(crate) fn build_composables(
 /// the user's machine, taken from the session record: the two are
 /// different filesystems, and only the second is a stable identity for
 /// the project (see [`build_composables`]).
+///
+/// Also returns the package names the compose-time graph declared —
+/// `None` when the workspace had no mfile. Evaluating that graph is
+/// among the most expensive steps of this chain, and the finalize-time
+/// package check asks the same question of the same workspace:
+/// handing the names back lets its caller answer from them instead of
+/// evaluating the graph a second time.
 pub(crate) fn run_compose(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
     declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
     hooks_enabled: bool,
-) -> Result<ComposeOutcome, std::io::Error> {
+) -> Result<(ComposeOutcome, Option<std::collections::HashSet<String>>), std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
+    let graph_names = match &resolution {
+        ProjectResolution::NoMFile => None,
+        ProjectResolution::Full(_, graph) => Some(graph.names().map(str::to_owned).collect()),
+    };
     let (project_composable, package_composables) = build_composables(
         project_path,
         declared_path,
@@ -511,7 +522,8 @@ pub(crate) fn run_compose(
         &contribution,
         hooks_enabled,
     )?;
-    run_composer(contribution, project_composable, package_composables)
+    let outcome = run_composer(contribution, project_composable, package_composables)?;
+    Ok((outcome, graph_names))
 }
 
 /// Assemble the [`SessionComposer`], `add()` the daemon-side

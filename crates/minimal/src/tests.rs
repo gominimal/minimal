@@ -271,6 +271,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
+            // Not a product path: the destroy-race test's own connection to
+            // the harness daemon. The destroy it drives sends no gated RPC —
+            // the race's loser just reports what the daemon said — so the
+            // harness connection carries no gate to record.
+            "cmd/session.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
@@ -1205,6 +1210,20 @@ fn setup_zed_is_hidden() {
     assert!(setup_zed.is_hide_set(), "setup-zed must stay hidden");
     // The visible siblings are unaffected.
     assert!(!session.find_subcommand("attach").unwrap().is_hide_set());
+}
+
+/// The `spin` demo exists only in debug builds: clap's typo tips draw
+/// candidates from hidden subcommands too, so hiding it is not enough
+/// to keep it out of release output.
+#[cfg(not(debug_assertions))]
+#[test]
+fn spin_absent_in_release() {
+    use clap::CommandFactory as _;
+    let cli = Cli::command();
+    assert!(
+        cli.find_subcommand("spin").is_none(),
+        "spin must not exist in release builds"
+    );
 }
 
 /// `--raw` and `--json` select mutually exclusive output formats, so

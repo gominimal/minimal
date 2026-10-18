@@ -3886,6 +3886,7 @@ dependencies = [
  "rcache",
  "sandbox",
  "serial_test",
+ "shlex",
  "stdlib",
  "tempfile",
  "thiserror 2.0.21",

@@ -560,7 +560,12 @@ pub struct HostnameRegistry {
     /// naming the port, the lowest [`SessionId`] still publishing it takes
     /// over ([`Self::hand_over`]) — the id is a UUIDv7, so that is the box
     /// created earliest — a running box before a stopped one. An entry
-    /// exists exactly while some box publishes the port at the address.
+    /// exists exactly while some box publishes the port at the address or
+    /// holds it dynamically: a listen watcher's record of a port the box's
+    /// process bound and no declaration names
+    /// ([`Self::record_dynamic_hold`]), which stands until the listener's
+    /// forward comes down ([`Self::release_dynamic_hold`]) or the box is
+    /// destroyed ([`Self::unpublish_own_address`]).
     own_holders: HashMap<(Ipv4Addr, u16), SessionId>,
     /// The published `address:port`s each box has bound a forward for
     /// (NET-129): marked when the box launches holding them
@@ -676,6 +681,14 @@ impl HostnameRegistry {
     /// registry's lock is held no longer for it.
     pub fn notify_hand_overs(&mut self, sender: tokio::sync::mpsc::UnboundedSender<PortHandOver>) {
         self.hand_overs = Some(sender);
+    }
+
+    /// The box holding `port` at `address` of record (NET-129), declared or
+    /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
+    /// also asks for a declared publish, cannot see a dynamic holder.
+    #[cfg(test)]
+    pub(crate) fn shared_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<SessionId> {
+        self.own_holders.get(&(address, port)).copied()
     }
 
     /// Whether `session_id` holds `port` at `address` now (NET-129): it
@@ -1294,6 +1307,47 @@ impl HostnameRegistry {
         self.own_bound.insert(session_id, bound.clone());
     }
 
+    /// Records a box's dynamically published port — one the listen watcher
+    /// bound because the box's process listened on it (NET-016), never named
+    /// by any declaration — as held at its published address (NET-129), so
+    /// the port is one box's to serve exactly as a declared publish's is.
+    /// The same election reads both: a later declared publish of the port
+    /// collides with the dynamic holder and yields, and the holder's close
+    /// hands the port to the yielder ([`Self::release_dynamic_hold`]). A
+    /// holder of record is never displaced: the record is a no-op on a port
+    /// another box — declared or dynamic — already holds.
+    pub fn record_dynamic_hold(&mut self, session_id: SessionId, address: Ipv4Addr, port: u16) {
+        self.own_holders
+            .entry((address, port))
+            .or_insert(session_id);
+    }
+
+    /// Releases a box's dynamically published port ([`Self::record_dynamic_hold`]):
+    /// the listener closed, so the holder's own claim on it ends and the port
+    /// passes to the box created earliest among those still publishing it
+    /// there, a running box first ([`Self::hand_over`]) — the same election a
+    /// declared holder's destroy makes. A port the box still declares keeps
+    /// its record: the declaration is the claim now, and re-electing a holder
+    /// for a port the same box publishes would churn the record and hand a
+    /// declared forward's port to a box that yielded it on purpose. The
+    /// hand-overs are returned as data, for the caller to say beside the
+    /// release; the registry sends each to its subscriber as it is made.
+    pub fn release_dynamic_hold(
+        &mut self,
+        session_id: SessionId,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Vec<PortHandOver> {
+        let declared = self
+            .own_published
+            .get(&session_id)
+            .is_some_and(|own| own.address == address && own.ports.contains(&port));
+        if declared {
+            return Vec::new();
+        }
+        self.hand_over(session_id, address, [port])
+    }
+
     /// The name a collision report names its other box by: its current
     /// registered box name, or its stable id when nothing answers for it.
     fn own_holder_name(&self, holder: SessionId) -> String {
@@ -1342,11 +1396,27 @@ impl HostnameRegistry {
         self.stopped.remove(&session_id);
         self.hands.remove(&session_id);
         self.own_bound.remove(&session_id);
-        let Some(own) = self.own_published.remove(&session_id) else {
-            return (None, Vec::new());
-        };
-        let hand_overs = self.hand_over(session_id, own.address, own.ports);
-        (Some(own.address), hand_overs)
+        let own = self.own_published.remove(&session_id);
+        let mut hand_overs = Vec::new();
+        if let Some(own) = own.as_ref() {
+            hand_overs = self.hand_over(session_id, own.address, own.ports.clone());
+        }
+        // The declared publish's ports are handed over above; the dynamic
+        // holds a listen watcher recorded — ports no declaration names —
+        // are swept here too, wherever they stand, so a destroyed box's
+        // listeners pass like its declared ports do. The declared ports
+        // no longer name this box, so what is left naming it is exactly
+        // the dynamic set.
+        let dynamic: Vec<(Ipv4Addr, u16)> = self
+            .own_holders
+            .iter()
+            .filter(|(_, holder)| **holder == session_id)
+            .map(|((address, port), _)| (*address, *port))
+            .collect();
+        for (address, port) in dynamic {
+            hand_overs.extend(self.hand_over(session_id, address, [port]));
+        }
+        (own.map(|own| own.address), hand_overs)
     }
 
     /// Marks a box's host as running: its name answers at its address — the
@@ -3715,6 +3785,182 @@ mod tests {
                 },
             ],
             "the third box yields each port to its own holder"
+        );
+    }
+
+    /// NET-129's election reads dynamic holds too: a box's listen watcher
+    /// records a port its process bound (NET-016) as held at the box's
+    /// published address, so a later declared publish of the port collides
+    /// with the dynamic holder — names it, yields, and never binds a second
+    /// forward over the one the dynamic holder serves — exactly as it would
+    /// against a declared publish. First-come holds: the dynamic holder of
+    /// record is never displaced.
+    #[test]
+    fn a_dynamic_hold_makes_a_declared_publish_yield() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let first = id("1");
+        let second = id("2");
+        let port = BTreeSet::from([8080u16]);
+
+        // `first`'s listen watcher records the port its process bound. Its
+        // box name is registered without a publish, the way a box whose
+        // listeners are all dynamic registers.
+        reg.register_host_net(first, "first");
+        reg.record_dynamic_hold(first, node, 8080);
+        // `second` declares the same port: it yields to the dynamic holder.
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, port.clone()),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }],
+            "a declared publish yields to a dynamic hold"
+        );
+        reg.register_own_ip(second, "second", port);
+        assert!(reg.shared_port_collisions(first).is_empty());
+
+        // The dynamic holder's record stands: a record on a held port is a
+        // no-op, never a displacement.
+        reg.record_dynamic_hold(second, node, 8080);
+        assert_eq!(
+            reg.shared_port_collisions(second),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }],
+            "a dynamic record never displaces the holder of record"
+        );
+
+        // A declared publish first, a dynamic record second: the declared
+        // holder stands, so the yielder's record claims nothing.
+        let third = id("3");
+        let elsewhere = Ipv4Addr::new(127, 0, 64, 9);
+        reg.publish_own_address(third, "third", elsewhere, BTreeSet::from([8080u16]));
+        reg.record_dynamic_hold(third, node, 8080);
+        assert!(reg.shared_port_collisions(third).is_empty());
+    }
+
+    /// A dynamic hold's release — the listener closed — hands the port to
+    /// the box created earliest among those still publishing it there, a
+    /// running box first, the same election a declared holder's destroy
+    /// makes: a declared forward waiting on the port binds it at last
+    /// (NET-129). A port the holder still declares keeps its record: the
+    /// declaration is the claim now, and the release hands nothing over.
+    #[test]
+    fn releasing_a_dynamic_hold_hands_the_port_to_the_declared_publisher() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let (sender, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        reg.notify_hand_overs(sender);
+        let first = id("1");
+        let second = id("2");
+        let port = BTreeSet::from([8080u16]);
+
+        reg.register_host_net(first, "first");
+        reg.record_dynamic_hold(first, node, 8080);
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, port.clone()),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }]
+        );
+        reg.register_own_ip(second, "second", port);
+
+        // The listener closes: the declared publisher receives the port.
+        assert_eq!(
+            reg.release_dynamic_hold(first, node, 8080),
+            vec![PortHandOver {
+                holder: second,
+                address: node,
+                port: 8080,
+            }],
+            "the closed listener's port passes to the declared publisher"
+        );
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(PortHandOver {
+                holder: second,
+                address: node,
+                port: 8080,
+            }),
+            "the hand-over is sent as it is made"
+        );
+        assert!(sent.try_recv().is_err());
+        assert!(reg.shared_port_collisions(second).is_empty());
+
+        // With nobody publishing it, the port goes unheld: `9090` is a
+        // dynamic hold with no declared publish behind it.
+        let (sender, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        reg.notify_hand_overs(sender);
+        reg.record_dynamic_hold(second, node, 9090);
+        assert!(reg.release_dynamic_hold(second, node, 9090).is_empty());
+        assert!(sent.try_recv().is_err());
+        let third = id("3");
+        assert!(
+            reg.publish_own_address(third, "third", node, BTreeSet::from([9090u16]))
+                .is_empty(),
+            "a port nobody holds takes its next publish cleanly"
+        );
+
+        // A release on a port the session still declares hands nothing over.
+        let second_ports = BTreeSet::from([7070u16]);
+        reg.publish_own_address(second, "second", node, second_ports.clone());
+        reg.record_dynamic_hold(second, node, 7070);
+        assert!(
+            reg.release_dynamic_hold(second, node, 7070).is_empty(),
+            "the declaration is the claim: the release is a no-op"
+        );
+        assert!(
+            reg.shared_port_collisions(second).is_empty(),
+            "the declared holder keeps its port"
+        );
+    }
+
+    /// A destroyed box's dynamic holds pass like its declared ports do
+    /// (NET-129): the unpublish sweeps every port the box held of record —
+    /// the declared ones by its publish, the dynamic ones wherever they
+    /// stand — so a declared publisher waiting on the port binds it, and a
+    /// stale dynamic hold never outlives the box that made it.
+    #[test]
+    fn unpublish_sweeps_the_destroyed_boxs_dynamic_holds_too() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let first = id("1");
+        let second = id("2");
+
+        // One dynamic hold, no publish: only the sweep's hand-over names it.
+        reg.register_host_net(first, "first");
+        reg.record_dynamic_hold(first, node, 8080);
+        reg.publish_own_address(second, "second", node, BTreeSet::from([8080u16]));
+        reg.register_own_ip(second, "second", BTreeSet::from([8080u16]));
+        assert_eq!(
+            reg.unpublish_own_address(first),
+            (
+                None,
+                vec![PortHandOver {
+                    holder: second,
+                    address: node,
+                    port: 8080,
+                }]
+            ),
+            "the destroyed box's dynamic hold passes to the declared publisher"
+        );
+        assert!(reg.shared_port_collisions(second).is_empty());
+
+        // A destroy with no publisher waiting releases the port outright.
+        reg.record_dynamic_hold(first, node, 9090);
+        assert_eq!(
+            reg.unpublish_own_address(first),
+            (None, Vec::new()),
+            "a dynamic hold nobody waits on is simply released"
+        );
+        let third = id("3");
+        assert!(
+            reg.publish_own_address(third, "third", node, BTreeSet::from([9090u16]))
+                .is_empty(),
+            "the released port takes its next publish cleanly"
         );
     }
 

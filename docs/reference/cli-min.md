@@ -288,7 +288,9 @@ min session destroy [--all] [-f|--force] [SESSION]
 ```
 
 Destroys a session and ends its processes. `--all` destroys all sessions.
-`-f/--force` skips the confirmation.
+`-f/--force` skips the confirmation. Under `-f`, if another destroy removed
+the session first, the command reports the session as already destroyed and
+succeeds. Without `-f`, the command fails and names the session.
 
 Before it destroys one session, the command asks for confirmation if the
 session holds uncommitted changes or commits that no remote has. It also asks
@@ -624,7 +626,11 @@ or a classifier tree installed another way stays, with a note. It also removes t
 service and its program copy, the resolver hook, and on macOS the local range
 unit. On macOS the program copy is the app bundle, and `--undo` also removes
 the bare program and the range script that an earlier release installed.
-The local range addresses on macOS stay on the loopback until the next boot.
+On macOS the local range addresses come off the loopback too, and `--undo`
+removes the resolver file's directory when it holds nothing else. While a VM
+is running, the addresses stay and a note says so: stop every VM, then run
+`--undo` again. The check counts any `minvmd` process on the host, so end one
+that `min stop` leaves behind too.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
 
@@ -888,6 +894,16 @@ fetch from it directly:
 git remote add session min://<session>
 git push session
 ```
+
+When the workspace's worktree is clean, a push to its checked-out branch also
+checks out the new tip. That rewrites files under any process running in the
+session. When the worktree holds uncommitted changes, the branch ref still
+moves, and the push warns that it skipped the checkout. A push to any other
+branch moves only that branch's ref. A push into a worktree with a detached
+HEAD moves only the refs and warns that it skipped the checkout. HEAD stays
+detached. The first push into an empty workspace checks out the branch that
+the fresh repository's HEAD already names, if the push includes it.
+Otherwise it checks out the first pushed branch.
 
 Only the `connect` capability is implemented: on `connect`, the helper
 opens an exec channel to `minimald` over its Unix domain socket (the same
