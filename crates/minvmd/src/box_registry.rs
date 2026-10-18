@@ -3302,7 +3302,7 @@ impl BoxRegistry {
             let mut withdrawn = self
                 .withdrawn_names
                 .lock()
-                .unwrap_or_else(|poison| std::sync::PoisonError::into_inner(poison));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *withdrawn = read_withdrawn_names_file(&path.with_file_name(WITHDRAWN_NAMES_FILE))
                 .into_iter()
                 .filter_map(|(name, deadline)| {
