@@ -577,10 +577,12 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // the VM host daemon's — every VM's in-VM daemon starts none, so each
     // reply reports no answerer and the facts come from the host. Each
     // listed VM's status is read over its own minvmd control socket, beside
-    // the ssh socket the listing reached it on, never through the in-VM
-    // daemon (a guest relaying a host fact is forgeable from inside the
-    // escape boundary), and the liveness proof is this CLI's own A query at
-    // the port that read named. The status decides that VM's own verdict
+    // the ssh socket the listing reached it on; a native minimald answers
+    // the same status verb on its own control socket beside its ssh socket,
+    // so the native fallback listing reads it the same way. Never through
+    // the in-VM daemon (a guest relaying a host fact is forgeable from
+    // inside the escape boundary), and the liveness proof is this CLI's own
+    // A query at the port that read named. The status decides that VM's own verdict
     // and its own `DNS SERVICE` row — a VM whose minvmd holds the port
     // is named there, and a sibling registered with another daemon says
     // who holds it, so no row speaks with another VM's state. Read in the
@@ -598,14 +600,18 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         }
         read
     };
+    // A listing whose status read answered takes its verdict from that
+    // status below, so it hands the daemon-report verdict nothing to decide
+    // — each listing pays one detection, not one here and one below.
     let mut surfaces = if args.json || args.raw {
         Vec::new()
     } else {
-        crate::resolver::live_name_surfaces(
-            listings
-                .iter()
-                .map(|listing| (listing.resp.zone_answerer_port, listing.resp.answerer_bound)),
-        )
+        crate::resolver::live_name_surfaces(listings.iter().zip(&vm_answerers).map(
+            |(listing, status)| match status {
+                Some(_) => (None, false),
+                None => (listing.resp.zone_answerer_port, listing.resp.answerer_bound),
+            },
+        ))
         .await
     };
     // One verdict per VM from that VM's own status, over the verdict its

@@ -124,26 +124,14 @@ async fn finalize_install_names_item_names_the_held_port_a_reachable_daemon_repo
     // status verb with the one fact this test is about: the port is held,
     // no channel behind it.
     let sock = minimal_client::resolve_socket_path(args.minimal_dir.as_deref(), false).unwrap();
-    let control = sock.parent().unwrap().join("control.sock");
-    let control = tokio::net::UnixListener::bind(&control).unwrap();
     let status = minimald_rpc::BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
         answerer: minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 },
         proxy_down: None,
     });
-    let status_line = format!("{}\n", serde_json_lenient::to_string(&status).unwrap());
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = control.accept().await else {
-                return;
-            };
-            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-            let mut line = String::new();
-            let mut reader = tokio::io::BufReader::new(&mut stream);
-            if reader.read_line(&mut line).await.is_ok() {
-                let _ = stream.write_all(status_line.as_bytes()).await;
-            }
-        }
-    });
+    answering_control_sock(
+        &sock.parent().unwrap().join("control.sock"),
+        serde_json_lenient::to_string(&status).unwrap(),
+    );
     let out = run_min(&args, &["finalize-install", "--show", "--json"]).await;
     assert_eq!(
         out.status.code(),
@@ -5099,7 +5087,8 @@ async fn activate_own_ip_on_vm_host<G>(
 
 /// A box control socket that answers every request with `reply`, one line
 /// per connection.
-fn answering_control_sock(path: &std::path::Path, reply: &'static str) {
+fn answering_control_sock(path: &std::path::Path, reply: impl Into<String>) {
+    let reply = reply.into();
     let listener = tokio::net::UnixListener::bind(path).unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {

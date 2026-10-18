@@ -4360,11 +4360,14 @@ fn reply_answers_host_row(reply: &Message) -> bool {
         })
 }
 
-/// `min ls`'s DNS SERVICE line on a VM-backed host (NET-138): the line
-/// that says who answers this VM's box names, as the status read reported
-/// it: this VM's host daemon when it holds the port, another VM host
-/// daemon when this one's table is registered with it, or the installed
-/// DNS service (NET-122's host service) when that holds the port. The
+/// `min ls`'s DNS SERVICE line from a control socket's status read
+/// (NET-138) — a VM host daemon's, or a native minimald's, which answers
+/// the same verb — printed when the listing's daemon reports no answerer
+/// port of its own: the line that says who answers this VM's box names,
+/// as the status read reported it: this VM's host daemon when it holds the
+/// port, another VM host daemon when this one's table is registered with
+/// it, or the installed DNS service (NET-122's host service) when that
+/// holds the port. The
 /// fourth arm is the one that must not claim an answer: a port held by a
 /// process no channel reaches means this VM's names are not answered, and
 /// the line says that instead. `None` for the pre-acquisition state —
@@ -4399,8 +4402,9 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
     }
 }
 
-/// The live surface on a VM-backed host, from the reply the VM host
-/// daemon's control socket answered — `min ls`'s form. The no-channel state
+/// The live surface from the reply a control socket answered — the VM host
+/// daemon's, or a native minimald's beside its ssh socket, which answers
+/// the same status verb — `min ls`'s form. The no-channel state
 /// settles the proxy by the status's own word, without paying the
 /// detection or the liveness query: the port is no daemon's answerer, so
 /// the two reads could only misreport native. The two decided states read
