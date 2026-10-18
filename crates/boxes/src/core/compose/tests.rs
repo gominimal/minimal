@@ -2587,9 +2587,11 @@ mod gate_task_patch_paths {
             fn on_patch_unapproved(
                 &self,
                 _: PatchesPolicy,
-                _: &[Unapproved<'_, camino::Utf8Path>],
+                items: &[Unapproved<'_, camino::Utf8Path>],
             ) -> HookResult<PatchesPolicy> {
-                HookResult::decided(vec![ItemDecision::AllowOnce])
+                // One answer per form: on macOS `/home` resolves elsewhere,
+                // so the entry is asked about twice.
+                HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
             }
         }
         let source = project_source();
@@ -2789,22 +2791,111 @@ mod gate_task_patch_paths {
         assert!(matches!(err, ComposeError::Denied { .. }), "{err}");
     }
 
-    /// The resolved form only tightens: an allow on the declared string
-    /// decides, so a symlinked prefix (macOS's `/tmp` -> `/private/tmp`)
-    /// does not turn an allowed entry into a prompt.
+    /// A hook that records every item it is asked about, then answers
+    /// each with "allow always": the item becomes an allow rule and the
+    /// answer is `UseRule`, as the interactive prompt does.
+    #[derive(Default)]
+    struct AllowAlways(std::cell::RefCell<Vec<String>>);
+    impl crate::core::hooks::PolicyHooks for AllowAlways {
+        fn on_var_unapproved(
+            &self,
+            _: crate::core::policy::VarsPolicy,
+            _: &[Unapproved<'_, str>],
+        ) -> HookResult<crate::core::policy::VarsPolicy> {
+            panic!("var hook should not have been invoked")
+        }
+        fn on_patch_unapproved(
+            &self,
+            policy: PatchesPolicy,
+            items: &[Unapproved<'_, camino::Utf8Path>],
+        ) -> HookResult<PatchesPolicy> {
+            let names: Vec<String> = items.iter().map(|i| i.item().to_string()).collect();
+            self.0.borrow_mut().extend(names.iter().cloned());
+            let allow: Vec<String> = policy.allow().iter().cloned().chain(names).collect();
+            HookResult::decided_with_policy(
+                vec![ItemDecision::UseRule; items.len()],
+                policy.with_allow(allow),
+            )
+        }
+    }
+
+    /// `<root>/tmp/link` -> `<root>/etc`, for the resolved-form tests.
+    #[cfg(unix)]
+    fn tmp_link_to_etc(root: &camino::Utf8Path) -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
+        let etc = root.join("etc");
+        std::fs::create_dir(etc.as_std_path()).unwrap();
+        std::fs::create_dir(root.join("tmp").as_std_path()).unwrap();
+        let link = root.join("tmp/link");
+        std::os::unix::fs::symlink(etc.as_std_path(), link.as_std_path()).unwrap();
+        (link, etc)
+    }
+
+    /// The resolved form must pass the allow step too: `allow =
+    /// ["/tmp/**"]` allows the declared `/tmp/link`, but not the `/etc`
+    /// it points at, so the entry is undecided, never silently allowed.
+    /// The hook is asked about the resolved form alone, the one that
+    /// needs a rule.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_prefix_does_not_unsettle_an_allow_on_the_declared_path() {
+    fn a_symlink_to_an_unallowed_target_is_not_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical_root(&tmp);
-        std::fs::create_dir(root.join("real").as_std_path()).unwrap();
-        let alias = root.join("alias");
-        std::os::unix::fs::symlink(root.join("real").as_std_path(), alias.as_std_path()).unwrap();
-        let declared = alias.join("tool");
+        let (link, etc) = tmp_link_to_etc(&root);
 
         let source = project_source();
-        let entries = entries_for(&source, &[(declared.as_str(), true)]);
-        let policy = PatchesPolicy::default().with_allow(vec![format!("{alias}/**")]);
+        let entries = entries_for(&source, &[(link.as_str(), false)]);
+        let policy = PatchesPolicy::default().with_allow(vec![format!("{root}/tmp/**")]);
+        let err = gate_task_patch_paths(&entries, policy.clone(), None, &NoVars, None).unwrap_err();
+        assert!(matches!(err, ComposeError::HookRequired { .. }), "{err}");
+
+        let hook = AllowAlways::default();
+        let (verdicts, _) =
+            gate_task_patch_paths(&entries, policy, Some(&hook), &NoVars, None).unwrap();
+        assert_eq!(*hook.0.borrow(), vec![etc.to_string()]);
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// A rule for each form, declared and resolved, allows the entry
+    /// without asking.
+    #[cfg(unix)]
+    #[test]
+    fn allowing_both_forms_allows_a_symlinked_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let (link, etc) = tmp_link_to_etc(&root);
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(link.as_str(), false)]);
+        let policy =
+            PatchesPolicy::default().with_allow(vec![format!("{root}/tmp/**"), etc.to_string()]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// With neither form allowed, the hook is asked about both, so "allow
+    /// always" records both rules and settles the entry rather than
+    /// failing the `UseRule` contract.
+    #[cfg(unix)]
+    #[test]
+    fn allow_always_records_both_forms_of_a_symlinked_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let (link, etc) = tmp_link_to_etc(&root);
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(link.as_str(), false)]);
+        let hook = AllowAlways::default();
+        let (verdicts, policy) = gate_task_patch_paths(
+            &entries,
+            PatchesPolicy::default(),
+            Some(&hook),
+            &NoVars,
+            None,
+        )
+        .unwrap();
+        assert_eq!(*hook.0.borrow(), vec![link.to_string(), etc.to_string()]);
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+        // The recorded policy settles the entry on the next run unasked.
         let (verdicts, _) = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap();
         assert_eq!(verdicts, vec![NameVerdict::Allowed]);
     }
@@ -2920,9 +3011,10 @@ mod gate_task_patch_paths {
             fn on_patch_unapproved(
                 &self,
                 _: PatchesPolicy,
-                _: &[Unapproved<'_, camino::Utf8Path>],
+                items: &[Unapproved<'_, camino::Utf8Path>],
             ) -> HookResult<PatchesPolicy> {
-                HookResult::decided(vec![ItemDecision::UseRule])
+                // One answer per form, as above.
+                HookResult::decided(vec![ItemDecision::UseRule; items.len()])
             }
         }
         let source = project_source();

@@ -1607,16 +1607,15 @@ fn decide_task_patch_path(
 
 /// One declared path's [`PathDecision`](crate::core::policy::PathDecision).
 ///
-/// The declared form decides: it is the string the daemon is handed, and
-/// on a VM-backed host the daemon resolves it in a filesystem this process
-/// cannot see. When `resolve` is set, the form the path reaches on this
-/// machine ([`resolve_existing_prefix`]) is checked too, and can only make
-/// the entry stricter: a `deny` or `ignore` on the resolved form applies,
-/// but its allow step does not. That keeps a symlink, including a
-/// symlinked parent of an entry that does not exist yet, from carrying a
-/// path past a deny on its target. It does not let this machine's view
-/// raise prompts the daemon's view would not, such as macOS's
-/// `/tmp` → `/private/tmp`.
+/// The declared form is the string the daemon is handed, so it must pass.
+/// When `resolve` is set, the form the path reaches on this machine
+/// ([`resolve_existing_prefix`]) must pass as well, allow step included:
+/// the two decisions combine, the stricter winning. So a symlink, including
+/// a symlinked parent of an entry that does not exist yet, cannot carry a
+/// path past a deny on its target, nor onto a target no rule allows. A
+/// symlinked prefix such as macOS's `/tmp` → `/private/tmp` therefore needs
+/// the resolved form allowed too; the prompt and the refusal snippet name
+/// it (see [`task_patch_forms`]).
 fn check_task_patch_path(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
@@ -1628,10 +1627,93 @@ fn check_task_patch_path(
     if !resolve || own == PathDecision::Denied {
         return own;
     }
-    match resolve_existing_prefix(path).map(|r| decide_task_patch_path(expanded, source, &r)) {
-        Some(stricter @ (PathDecision::Denied | PathDecision::Ignored)) => own.combine(stricter),
-        _ => own,
+    match resolve_existing_prefix(path) {
+        Some(resolved) => own.combine(decide_task_patch_path(expanded, source, &resolved)),
+        None => own,
     }
+}
+
+/// The forms of one declared entry the policy must each allow: the
+/// declared key as written, then, for a resolvable entry that resolves
+/// somewhere else on this machine, the resolved path. Each pairs the
+/// string a rule records with the path it is matched as.
+///
+/// An undecided entry is put to the hook once per form the policy cannot
+/// decide, so "allow always" and the non-interactive snippet record every
+/// form that needs a rule, and a `UseRule` answer can settle the entry.
+fn task_patch_forms(
+    declared: &str,
+    path: &camino::Utf8Path,
+    resolve: bool,
+) -> Vec<(String, camino::Utf8PathBuf)> {
+    let mut forms = vec![(declared.to_owned(), path.to_path_buf())];
+    if resolve && let Some(resolved) = resolve_existing_prefix(path) {
+        forms.push((resolved.to_string(), resolved));
+    }
+    forms
+}
+
+/// The [`task_patch_forms`] of an undecided entry that the policy cannot
+/// decide, the ones the hook is asked about. Never empty: should no form
+/// be undecided, the declared form is asked about rather than the entry
+/// left to be allowed unasked.
+fn undecided_task_patch_forms(
+    expanded: &ExpandedPatchesPolicy,
+    entry: &TaskPatchEntry<'_>,
+    path: &camino::Utf8Path,
+    resolve: bool,
+) -> Vec<(String, camino::Utf8PathBuf)> {
+    use crate::core::policy::PathDecision;
+    let forms: Vec<_> = task_patch_forms(entry.declared, path, resolve)
+        .into_iter()
+        .filter(|(_, at)| {
+            decide_task_patch_path(expanded, entry.source, at) == PathDecision::NeedsApproval
+        })
+        .collect();
+    if forms.is_empty() {
+        return vec![(entry.declared.to_owned(), path.to_path_buf())];
+    }
+    forms
+}
+
+/// Each entry's decision from the hook's answers about its queued forms,
+/// combined stricter-wins, plus whether any of its answers was `UseRule`.
+/// A form answered `UseRule` is decided again against the policy as the
+/// hook amended it. Entries with no queued form stay `Allowed`; the caller
+/// reads only the entries it queued.
+///
+/// # Errors
+///
+/// [`ComposeError::HookContract`] when a `UseRule` form is still undecided.
+fn decide_answered_task_patch_forms(
+    expanded: &ExpandedPatchesPolicy,
+    entries: &[TaskPatchEntry<'_>],
+    queued: &[(usize, String, camino::Utf8PathBuf)],
+    decisions: Vec<ItemDecision>,
+) -> Result<(Vec<crate::core::policy::PathDecision>, Vec<bool>), ComposeError> {
+    use crate::core::policy::PathDecision;
+    let mut decided = vec![PathDecision::Allowed; entries.len()];
+    let mut rule_used = vec![false; entries.len()];
+    for ((i, item, at), decision) in queued.iter().zip(decisions) {
+        let form = match decision {
+            ItemDecision::AllowOnce => PathDecision::Allowed,
+            ItemDecision::IgnoreOnce => PathDecision::Ignored,
+            ItemDecision::UseRule => {
+                rule_used[*i] = true;
+                match decide_task_patch_path(expanded, entries[*i].source, at) {
+                    PathDecision::NeedsApproval => {
+                        return Err(ComposeError::use_rule_undecided(
+                            HookDomain::Patch,
+                            format!("source path `{item}`"),
+                        ));
+                    }
+                    other => other,
+                }
+            }
+        };
+        decided[*i] = decided[*i].combine(form);
+    }
+    Ok((decided, rule_used))
 }
 
 /// A declared directory entry's decision: the directory's own path, then
@@ -1740,10 +1822,14 @@ fn check_task_patch_entry(
 /// An absolute entry is also checked as it resolves on this machine, and
 /// a directory entry is probed for contained files a `deny` names. Both
 /// can only make the entry stricter (see [`check_task_patch_path`] and
-/// [`check_task_patch_dir`]), so a symlink, including a symlinked parent
-/// of an entry that does not exist yet, cannot carry it past a deny on
-/// its target. On a VM-backed host this machine is not the daemon's, so
-/// the extra checks are a best-effort backstop there.
+/// [`check_task_patch_dir`]): the resolved form must pass the allow step
+/// too, so a symlink, including a symlinked parent of an entry that does
+/// not exist yet, cannot carry it past a deny on its target or onto a
+/// target no rule allows. When only the resolved form is undecided, the
+/// hook is asked about that form, so "allow always" and the refusal
+/// snippet record a rule that settles it. On a VM-backed host this
+/// machine is not the daemon's, so the extra checks are a best-effort
+/// backstop there.
 ///
 /// `~/`-rooted entries are matched as declared, with `~/` expanded against
 /// `home_fallback` the same way the policy's own `~` is. They are neither
@@ -1774,6 +1860,7 @@ pub fn gate_task_patch_paths(
     resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
     home_fallback: Option<&str>,
 ) -> Result<(Vec<NameVerdict>, PatchesPolicy), ComposeError> {
+    use crate::core::policy::PathDecision;
     // Same two policies in flight as `gate_patches`: the raw form travels
     // to and from the hook, the expanded form does the matching. Expanded
     // first so a malformed pattern surfaces before any filesystem probe.
@@ -1802,23 +1889,31 @@ pub fn gate_task_patch_paths(
     // `Ignored` and queued; pass 3 overwrites every one. The placeholder
     // is fail-closed on purpose — should a future edit ever leave one
     // unwritten, the caller drops the entry rather than mounting it.
+    // Each undecided entry queues every form the policy cannot decide,
+    // so the hook is asked about each one.
     let mut verdicts: Vec<NameVerdict> = Vec::with_capacity(entries.len());
     let mut unapproved: Vec<usize> = Vec::new();
+    let mut queued: Vec<(usize, String, camino::Utf8PathBuf)> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         let path = expand_declared(entry.declared);
-        let verdict = check_task_patch_entry(&expanded, entry, &path, resolvable(entry.declared));
-        match verdict {
-            crate::core::policy::PathDecision::Allowed => verdicts.push(NameVerdict::Allowed),
-            crate::core::policy::PathDecision::Ignored => verdicts.push(NameVerdict::Ignored),
-            crate::core::policy::PathDecision::Denied => {
+        let resolve = resolvable(entry.declared);
+        match check_task_patch_entry(&expanded, entry, &path, resolve) {
+            PathDecision::Allowed => verdicts.push(NameVerdict::Allowed),
+            PathDecision::Ignored => verdicts.push(NameVerdict::Ignored),
+            PathDecision::Denied => {
                 return Err(ComposeError::Denied {
                     what: entry.declared.to_owned(),
                     from: entry.source.clone(),
                 });
             }
-            crate::core::policy::PathDecision::NeedsApproval => {
+            PathDecision::NeedsApproval => {
                 unapproved.push(i);
                 verdicts.push(NameVerdict::Ignored);
+                queued.extend(
+                    undecided_task_patch_forms(&expanded, entry, &path, resolve)
+                        .into_iter()
+                        .map(|(item, at)| (i, item, at)),
+                );
             }
         }
     }
@@ -1831,14 +1926,15 @@ pub fn gate_task_patch_paths(
                 from: entries[i].source.clone(),
             });
         };
-        // Pass 2: prompt, with the expanded form as the user-facing item —
-        // the prompt reads better as the path the entry names on this
-        // machine, and a rule chosen for it must expand to match.
-        let view: Vec<Unapproved<'_, camino::Utf8Path>> = unapproved
+        // Pass 2: prompt, one item per undecided form. The declared form
+        // is shown as written, so a rule chosen for it expands to match
+        // as the policy's own `~` does; the resolved form is shown as the
+        // path it reaches.
+        let view: Vec<Unapproved<'_, camino::Utf8Path>> = queued
             .iter()
-            .map(|&i| Unapproved {
-                item: camino::Utf8Path::new(entries[i].declared),
-                source: entries[i].source,
+            .map(|(i, item, _)| Unapproved {
+                item: camino::Utf8Path::new(item),
+                source: entries[*i].source,
             })
             .collect();
         let (decisions, new_policy, policy_updated) = prompt_patch_hook(hooks, policy, &view)?;
@@ -1846,36 +1942,31 @@ pub fn gate_task_patch_paths(
         if policy_updated {
             expanded = policy.expand_with(resolved_vars, home_fallback)?;
         }
-        // Pass 3: apply. Only a `UseRule` answer needs the entry decided
-        // again, against the policy as the hook amended it.
-        for (&i, decision) in unapproved.iter().zip(decisions) {
+        // Pass 3: apply. An entry is the stricter of its answered forms.
+        let (decided, rule_used) =
+            decide_answered_task_patch_forms(&expanded, entries, &queued, decisions)?;
+        for &i in &unapproved {
             let entry = &entries[i];
-            verdicts[i] = match decision {
-                ItemDecision::AllowOnce => NameVerdict::Allowed,
-                ItemDecision::IgnoreOnce => NameVerdict::Ignored,
-                ItemDecision::UseRule => {
-                    let path = expand_declared(entry.declared);
-                    match check_task_patch_entry(
-                        &expanded,
-                        entry,
-                        &path,
-                        resolvable(entry.declared),
-                    ) {
-                        crate::core::policy::PathDecision::Allowed => NameVerdict::Allowed,
-                        crate::core::policy::PathDecision::Ignored => NameVerdict::Ignored,
-                        crate::core::policy::PathDecision::Denied => {
-                            return Err(ComposeError::Denied {
-                                what: entry.declared.to_owned(),
-                                from: entry.source.clone(),
-                            });
-                        }
-                        crate::core::policy::PathDecision::NeedsApproval => {
-                            return Err(ComposeError::use_rule_undecided(
-                                HookDomain::Patch,
-                                format!("source path `{}`", entry.declared),
-                            ));
-                        }
-                    }
+            let mut outcome = decided[i];
+            // An amended policy may also deny what a directory entry
+            // holds, which its forms alone do not see.
+            if rule_used[i] {
+                let path = expand_declared(entry.declared);
+                match check_task_patch_entry(&expanded, entry, &path, resolvable(entry.declared)) {
+                    PathDecision::NeedsApproval => {}
+                    stricter => outcome = outcome.combine(stricter),
+                }
+            }
+            verdicts[i] = match outcome {
+                PathDecision::Allowed => NameVerdict::Allowed,
+                // `NeedsApproval` cannot arise, since only decided forms
+                // are combined into `decided`; it fails closed regardless.
+                PathDecision::Ignored | PathDecision::NeedsApproval => NameVerdict::Ignored,
+                PathDecision::Denied => {
+                    return Err(ComposeError::Denied {
+                        what: entry.declared.to_owned(),
+                        from: entry.source.clone(),
+                    });
                 }
             };
         }

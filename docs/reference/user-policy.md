@@ -166,8 +166,10 @@ so the rules apply to the **declared path** itself:
 - `deny` on the declared path, or on any file a declared directory holds,
   stops the run.
 - For a declared absolute path, Minimal also checks the path it resolves to on
-  your machine. A symlink cannot carry the path past a `deny` on its target.
-  This includes a symlinked parent of a path that does not exist yet.
+  your machine, and `allow` must match that path too. A symlink cannot carry
+  the path past a `deny` on its target, or onto a target no rule allows. This
+  includes a symlinked parent of a path that does not exist yet. When the
+  resolved path needs a rule, the prompt and the error name it as well.
 - `ignore` on the declared path leaves that entry out. An `ignore` on a file
   inside a declared directory does not apply, because a mount cannot leave
   one file out.
