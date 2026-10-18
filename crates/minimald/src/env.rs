@@ -2710,6 +2710,92 @@ exit $rc
         }
     }
 
+    /// Runs the installed `min` helper as a script, with `PATH` prefixed by
+    /// a directory holding a `socat` stand-in that announces itself on
+    /// stderr — loud RPC detection for the main dispatch path, which runs
+    /// only when the file is executed rather than sourced. Returns `None`
+    /// when the host has no bash, matching the repo's self-skip-locally
+    /// convention.
+    fn run_min_command(rootfs: &Path, args: &str) -> Option<(String, String, i32)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = rootfs.join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(&socat, "#!/bin/sh\necho RPC-CALLED >&2\n").unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = rootfs.join("usr/bin/min");
+        let out = std::process::Command::new("bash")
+            .arg(script.to_str().unwrap())
+            .args(args.split_whitespace())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    }
+
+    /// `-h`, `--help`, and `help` at every dispatch level of the in-session
+    /// `min` helper print that level's usage and exit 0 without contacting
+    /// the daemon; a bare `min package`/`min task`/`min net` and an unknown
+    /// subcommand print usage on stderr and exit 1.
+    #[test]
+    fn help_spellings_print_usage_without_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for (args, code, stream) in [
+            ("--help", 0, "stdout"),
+            ("-h", 0, "stdout"),
+            ("help", 0, "stdout"),
+            ("package --help", 0, "stdout"),
+            ("package -h", 0, "stdout"),
+            ("package help", 0, "stdout"),
+            ("task --help", 0, "stdout"),
+            ("net --help", 0, "stdout"),
+            ("add --help", 0, "stdout"),
+            ("search --help", 0, "stdout"),
+            ("package build --help", 0, "stdout"),
+            ("package search --help", 0, "stdout"),
+            ("check --help", 0, "stdout"),
+            ("materialize --help", 0, "stdout"),
+            ("net expose --help", 0, "stdout"),
+            ("package", 1, "stderr"),
+            ("task", 1, "stderr"),
+            ("net", 1, "stderr"),
+            ("bogus", 1, "stderr"),
+        ] {
+            let Some((stdout, stderr, exit)) = run_min_command(rootfs, args) else {
+                return;
+            };
+            assert_eq!(
+                exit, code,
+                "`{args}` should exit {code}, got: {stdout} {stderr}"
+            );
+            let out = if stream == "stdout" { &stdout } else { &stderr };
+            assert!(
+                out.contains("Usage: min"),
+                "`{args}` should print usage, got: {stdout} {stderr}"
+            );
+            assert!(
+                !stdout.contains("RPC-CALLED") && !stderr.contains("RPC-CALLED"),
+                "`{args}` must not reach the daemon, got: {stdout} {stderr}"
+            );
+        }
+    }
+
     use camino::Utf8PathBuf;
     use mctx::ConfigBuilder;
     use std::io::{BufRead, BufReader};
