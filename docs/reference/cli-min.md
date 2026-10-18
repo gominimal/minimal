@@ -889,6 +889,13 @@ git remote add session min://<session>
 git push session
 ```
 
+When the workspace's worktree is clean, a push to its checked-out branch also
+checks out the new tip. That rewrites files under any process running in the
+session. When the worktree holds uncommitted changes, the branch ref still
+moves, and the push warns that it skipped the checkout. A push to any other
+branch moves only that branch's ref. The first push into an empty workspace
+checks out the first branch it carries.
+
 Only the `connect` capability is implemented: on `connect`, the helper
 opens an exec channel to `minimald` over its Unix domain socket (the same
 transport the rest of the CLI uses) and bridges git's pack-protocol
