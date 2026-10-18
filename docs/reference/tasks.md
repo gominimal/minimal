@@ -278,7 +278,9 @@ Before `min task run` or `min session run` starts the task, Minimal checks each 
 against the `[patches]` section of your [user policy](./user-policy.md#task-patches). A denied path
 stops the run, and an ignored path stays out. An uncovered path gets a prompt, which without a
 terminal stops the run instead. The daemon refuses a task that declares
-patches when the `min` that started it did not check them. Inside a session,
+patches when the `min` that started it did not check them. It also refuses
+a patch whose path, kind (`dir` or `file`) or mode differs from the one
+`min` checked. Inside a session,
 `min run` refuses a task that declares patches, since no policy check runs
 there. Run such a task from the host with `min task run`.
 

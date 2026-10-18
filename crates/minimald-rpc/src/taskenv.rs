@@ -111,15 +111,42 @@ pub fn drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<S
 /// `patch.file` keys, carried under [`TASK_PATCH_VERDICT`].
 ///
 /// Both lists hold raw declared keys. A daemon removes every `drop` key,
-/// mounts the `allow` keys that remain, and refuses the task if it
-/// declares any key the verdict does not name: a key the client never
-/// saw was never gated.
+/// mounts the declarations that remain only when `allow` names each one
+/// as checked, and refuses the task otherwise: a declaration the client
+/// never saw was never gated. An allowed entry carries its kind and mode
+/// as well as its key, because the client checks a directory differently
+/// from a file, and a declaration whose kind or mode changed since is not
+/// the one it checked.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PatchVerdict {
-    /// Declared keys the policy, or the user at its prompt, allowed.
-    pub allow: BTreeSet<String>,
+    /// Declarations the policy, or the user at its prompt, allowed.
+    pub allow: BTreeSet<AllowedPatch>,
     /// Declared keys the policy ignored, to remove before mounting.
     pub drop: BTreeSet<String>,
+}
+
+impl PatchVerdict {
+    /// Whether `allow` names the declaration at `path` with this kind and
+    /// mode.
+    #[must_use]
+    pub fn allows(&self, path: &str, is_file: bool, read_only: bool) -> bool {
+        self.allow.contains(&AllowedPatch {
+            path: path.to_string(),
+            is_file,
+            read_only,
+        })
+    }
+}
+
+/// One declaration a [`PatchVerdict`] allowed, as the client checked it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct AllowedPatch {
+    /// The declared key, verbatim.
+    pub path: String,
+    /// `true` for a `patch.file` entry, `false` for `patch.dir`.
+    pub is_file: bool,
+    /// `true` for a read-only declaration, `false` for read-write.
+    pub read_only: bool,
 }
 
 /// Encode a verdict for [`TASK_PATCH_VERDICT`].
@@ -360,7 +387,13 @@ mod tests {
     #[test]
     fn patch_verdict_round_trips() {
         let verdict = PatchVerdict {
-            allow: ["~/.claude".to_string()].into_iter().collect(),
+            allow: [AllowedPatch {
+                path: "~/.claude".to_string(),
+                is_file: false,
+                read_only: true,
+            }]
+            .into_iter()
+            .collect(),
             drop: ["/etc/secrets".to_string()].into_iter().collect(),
         };
         let mut channel = BTreeMap::new();
@@ -369,7 +402,14 @@ mod tests {
             encode_patch_verdict(&verdict).unwrap(),
         );
 
-        assert_eq!(patch_verdict_from_channel_env(&channel), Some(verdict));
+        assert_eq!(
+            patch_verdict_from_channel_env(&channel),
+            Some(verdict.clone())
+        );
+        // The allowed entry is bound to its kind and mode, not its key alone.
+        assert!(verdict.allows("~/.claude", false, true));
+        assert!(!verdict.allows("~/.claude", false, false), "a mode change");
+        assert!(!verdict.allows("~/.claude", true, true), "a kind change");
         // The carrier is not itself a task variable.
         assert!(from_channel_env(&channel).is_empty());
         // And it is not the env-drop carrier: the two stay separate.
@@ -405,7 +445,11 @@ mod tests {
 
         let huge = PatchVerdict {
             allow: (0..TASK_PATCH_VERDICT_MAX_BYTES / 8)
-                .map(|i| format!("/p/{i}"))
+                .map(|i| AllowedPatch {
+                    path: format!("/p/{i}"),
+                    is_file: true,
+                    read_only: true,
+                })
                 .collect(),
             drop: BTreeSet::new(),
         };

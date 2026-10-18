@@ -357,14 +357,15 @@ fn parse_task_args(
 /// is alive for the whole life of this tokio task, which in turn is
 /// governed by the consumer's stream.
 /// Apply the client's `[patches]` verdict to a task's declared patches:
-/// remove every dropped key, then require every key left to be one the
-/// verdict allowed.
+/// remove every dropped key, then require every declaration left to be one
+/// the verdict allowed, with the kind and mode the client checked.
 ///
 /// The daemon holds no policy, so this is the only thing standing between
 /// a project's `patch` declarations and a mount. It fails closed: a task
 /// that declares patches with no verdict (an older `min`, or a verdict
 /// this daemon could not read) is refused, and so is a key the verdict
-/// does not name, since the client never checked it. A task that
+/// does not name, or names as another kind or mode, since the client never
+/// checked that declaration. A task that
 /// declares no patches needs no verdict.
 ///
 /// # Errors
@@ -390,12 +391,21 @@ fn apply_patch_verdict(
         patch.dir.remove(key);
         patch.file.remove(key);
     }
-    if let Some(key) = patch
+    // An allowed key must also keep the kind and mode it was checked as:
+    // the client walks a directory and not a file, and a read-only entry
+    // that is now read-write would be writable, and created if missing.
+    let declared = patch
         .dir
-        .keys()
-        .chain(patch.file.keys())
-        .find(|key| !verdict.allow.contains(*key))
-    {
+        .iter()
+        .map(|(key, setting)| (key, false, setting))
+        .chain(patch.file.iter().map(|(key, setting)| (key, true, setting)));
+    if let Some((key, _, _)) = declared.into_iter().find(|(key, is_file, setting)| {
+        !verdict.allows(
+            key,
+            *is_file,
+            matches!(setting, mfile::PatchSetting::ReadOnly),
+        )
+    }) {
         return Err(format!(
             "task '{task_name}' declares the patch path `{key}`, which `min` \
              did not check against your [patches] policy, so the task did not \
@@ -434,7 +444,7 @@ pub(crate) fn refuse_in_box_patches(
 #[cfg(test)]
 mod patch_verdict_tests {
     use super::{apply_patch_verdict, refuse_in_box_patches};
-    use minimald_rpc::taskenv::PatchVerdict;
+    use minimald_rpc::taskenv::{AllowedPatch, PatchVerdict};
 
     fn patches(dirs: &[&str], files: &[&str]) -> mfile::EnvPatches {
         let mut p = mfile::EnvPatches::default();
@@ -449,9 +459,18 @@ mod patch_verdict_tests {
         p
     }
 
-    fn verdict(allow: &[&str], drop: &[&str]) -> PatchVerdict {
+    /// A verdict allowing each `(key, is_file)` read-only, the mode
+    /// [`patches`] declares.
+    fn verdict(allow: &[(&str, bool)], drop: &[&str]) -> PatchVerdict {
         PatchVerdict {
-            allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            allow: allow
+                .iter()
+                .map(|(path, is_file)| AllowedPatch {
+                    path: (*path).to_string(),
+                    is_file: *is_file,
+                    read_only: true,
+                })
+                .collect(),
             drop: drop.iter().map(|s| (*s).to_string()).collect(),
         }
     }
@@ -478,7 +497,10 @@ mod patch_verdict_tests {
     #[test]
     fn dropped_keys_go_and_allowed_keys_stay() {
         let mut p = patches(&["/opt/cache"], &["/etc/token", "~/.claude.json"]);
-        let v = verdict(&["/opt/cache", "~/.claude.json"], &["/etc/token"]);
+        let v = verdict(
+            &[("/opt/cache", false), ("~/.claude.json", true)],
+            &["/etc/token"],
+        );
         apply_patch_verdict("t", &mut p, Some(&v)).expect("every key was gated");
         assert!(p.dir.contains_key("/opt/cache"));
         assert!(p.file.contains_key("~/.claude.json"));
@@ -490,9 +512,30 @@ mod patch_verdict_tests {
     #[test]
     fn a_key_the_verdict_does_not_name_is_refused() {
         let mut p = patches(&["/opt/cache"], &["/etc/shadow"]);
-        let v = verdict(&["/opt/cache"], &[]);
+        let v = verdict(&[("/opt/cache", false)], &[]);
         let err = apply_patch_verdict("t", &mut p, Some(&v)).unwrap_err();
         assert!(err.contains("`/etc/shadow`"), "{err}");
+    }
+
+    /// A key the client allowed as a read-only file is refused once it is
+    /// declared read-write, or as a directory: the client checked neither.
+    #[test]
+    fn a_key_whose_kind_or_mode_changed_is_refused() {
+        let v = verdict(&[("/opt/tool/bin", true)], &[]);
+
+        let mut same = patches(&[], &["/opt/tool/bin"]);
+        apply_patch_verdict("t", &mut same, Some(&v)).expect("as the client checked it");
+
+        let mut writable = patches(&[], &[]);
+        writable
+            .file
+            .insert("/opt/tool/bin".to_string(), mfile::PatchSetting::ReadWrite);
+        let err = apply_patch_verdict("t", &mut writable, Some(&v)).unwrap_err();
+        assert!(err.contains("`/opt/tool/bin`"), "{err}");
+
+        let mut as_dir = patches(&["/opt/tool/bin"], &[]);
+        let err = apply_patch_verdict("t", &mut as_dir, Some(&v)).unwrap_err();
+        assert!(err.contains("`/opt/tool/bin`"), "{err}");
     }
 
     /// An in-box run refuses any declared patch, dir or file, and names

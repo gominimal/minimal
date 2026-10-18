@@ -486,12 +486,25 @@ fn resolve_task_patches(
     };
 
     // Verdicts pair with `entries` in order, each naming its raw declared
-    // key: an allowed one may mount, an ignored one the daemon removes.
+    // key: an allowed one may mount, an ignored one the daemon removes. An
+    // allowed one carries the kind and mode it was checked as, so the
+    // daemon refuses a declaration that changed either since.
     let mut out = minimald_rpc::taskenv::PatchVerdict::default();
     for (entry, verdict) in entries.iter().zip(verdicts) {
         let key = entry.declared.to_string();
         match verdict {
-            boxes::core::compose::NameVerdict::Allowed => out.allow.insert(key),
+            boxes::core::compose::NameVerdict::Allowed => {
+                let setting = if entry.is_file {
+                    &task.patch.file[entry.declared]
+                } else {
+                    &task.patch.dir[entry.declared]
+                };
+                out.allow.insert(minimald_rpc::taskenv::AllowedPatch {
+                    path: key,
+                    is_file: entry.is_file,
+                    read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
+                })
+            }
             boxes::core::compose::NameVerdict::Ignored => out.drop.insert(key),
         };
     }
@@ -2239,8 +2252,9 @@ mod tests {
         );
         assert!(verdict.drop.is_empty(), "an approved patch is not dropped");
         assert!(
-            verdict.allow.contains("/opt/tool/bin"),
-            "an approved patch is named as allowed, or the daemon refuses it"
+            verdict.allows("/opt/tool/bin", true, true),
+            "an approved patch is named as allowed, with its kind and mode, or the daemon \
+             refuses it"
         );
     }
 
