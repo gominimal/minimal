@@ -785,19 +785,12 @@ impl fmt::Display for ExposeRefusal {
                 owner,
                 pending,
             } => {
-                if *pending {
-                    write!(
-                        f,
-                        "port {port} is being published by this box ({})",
-                        owner.as_str()
-                    )
+                let state = if *pending {
+                    "is being published"
                 } else {
-                    write!(
-                        f,
-                        "port {port} is published already by this box ({})",
-                        owner.as_str()
-                    )
-                }
+                    "is published already"
+                };
+                write!(f, "port {port} {state} by this box ({})", owner.as_str())
             }
             Self::NeedsNoExposing { port, .. } => write!(
                 f,
