@@ -10889,7 +10889,7 @@ while True:
     echo "--- min ls output ---"; printf '%s\n' "${recover_ls2:-<none>}"
     fail
   fi
-  if [ "$recover_port2" = 7654 ]; then
+  if [ "$RECOVER_PIN" != 7654 ] && [ "$recover_port2" = 7654 ]; then
     echo "::error::daemon 2 ended up on the default 127.0.0.1:7654, so the port was not held when it started — the staging lost the busy default and the relocation cannot be staged (NET-025)"
     fail
   fi
