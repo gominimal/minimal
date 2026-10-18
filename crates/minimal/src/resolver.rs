@@ -4529,19 +4529,21 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
     }
 }
 
-/// The warning every session start on a VM-backed host prints when the
-/// answerer's port is held by a process no channel reaches (NET-138): this
-/// VM's names do not resolve through DNS on this machine. Printed to
-/// stderr unconditionally — the directive's "at every
-/// session start, TTY and non-TTY" — because the fact it names is the one
-/// a user relying on the names needs before the first lookup fails; the
-/// verdict printed below it says which surface the names do route
-/// through. Pure, so tests assert the wording without capturing stderr.
+/// The warning every session start prints when the answerer's port is held
+/// by a process no channel reaches (NET-138): the box names do not resolve
+/// through DNS on this machine. Printed to stderr unconditionally — the
+/// directive's "at every session start, TTY and non-TTY" — because the fact
+/// it names is the one a user relying on the names needs before the first
+/// lookup fails; the verdict printed below it says which surface the names
+/// do route through. The wording names no host kind: a VM host daemon and a
+/// native daemon report the same state, and the names it fails are the
+/// machine's either way. Pure, so tests assert the wording without
+/// capturing stderr.
 #[must_use]
 pub fn port_held_no_channel_warning(port: u16) -> String {
     format!(
-        "warning: this VM's box names do not resolve through DNS on this \
-         machine: another program holds 127.0.0.1:{port} (UDP)"
+        "warning: box names do not resolve through DNS on this machine: \
+         another program holds 127.0.0.1:{port} (UDP)"
     )
 }
 
@@ -5111,8 +5113,8 @@ mod tests {
     fn port_held_no_channel_warning_says_names_do_not_resolve() {
         assert_eq!(
             port_held_no_channel_warning(7_656),
-            "warning: this VM's box names do not resolve through DNS on this \
-             machine: another program holds 127.0.0.1:7656 (UDP)"
+            "warning: box names do not resolve through DNS on this machine: another \
+             program holds 127.0.0.1:7656 (UDP)"
         );
     }
 

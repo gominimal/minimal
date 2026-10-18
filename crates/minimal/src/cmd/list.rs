@@ -322,8 +322,10 @@ pub struct VmListing {
     pub resp: minimald_rpc::ListSessionsResponse,
     /// That VM's VM-host control socket, beside the ssh socket the listing
     /// reached it on (NET-138): the socket `cmd_ls` reads this VM's own
-    /// zone-answerer state from. `None` on the native backend, which hosts
-    /// no VM host daemon — nothing to read, so nothing is read.
+    /// zone-answerer state from. `None` on the native backend for the VMs'
+    /// own listings — no VM host daemon to read — but never for the
+    /// fallback listing, which pairs the daemon it reached with the
+    /// answerer control socket beside it, native and VM-backed alike.
     pub control_sock: Option<std::path::PathBuf>,
 }
 
@@ -429,33 +431,14 @@ async fn listings_across_vms(
         listings.push(VmListing {
             vm: selected.to_string(),
             resp: list_selected_vm(&sock).await?,
-            // The native backend reaches here with no VM host daemon to
-            // read a state from; a VM backend falls back to the selected
-            // VM's own dir, where its control socket sits.
-            control_sock: fallback_control_sock(global, &sock),
+            // The control socket the daemon this listing reached serves
+            // its answerer state on: beside the ssh socket, native and
+            // VM-backed alike — a VM host daemon and a native minimald
+            // answer the same status verb over it.
+            control_sock: super::session::control_sock_beside(&sock),
         });
     }
     Ok(listings)
-}
-
-/// The VM-host control socket the fallback listing pairs with its one entry
-/// (NET-138), keyed on the backend the daemon connection resolves through —
-/// the same rule [`hostname_proxy_vm`] states — and never on
-/// [`GlobalArgs::use_minvmd`]: the flag is how Linux asks for the VM host,
-/// while macOS reaches it with no flag at all, so a gate keyed on the flag
-/// would find no control socket for exactly the host whose every invocation
-/// is VM-backed, and the one entry `min ls` falls back to there would carry
-/// no answerer state to read. `sock` is the daemon socket the listing
-/// already resolved; the control socket sits beside it, in the same provider
-/// dir.
-#[must_use]
-pub fn fallback_control_sock(
-    global: &GlobalArgs,
-    sock: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    (super::session::daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
-        .then(|| super::session::control_sock_beside(sock))
-        .flatten()
 }
 
 /// The selected daemon's `ListSessions` reply, from its socket, gated as `min
