@@ -3291,7 +3291,11 @@ impl BoxRegistry {
             // NXDOMAIN (NET-012) as it would have once the window aged out,
             // and a restart inside the window keeps only what remains of
             // it — never an extension past [`WITHDRAWN_NAME_GRACE`] from
-            // the reload.
+            // the reload. The remainder is clamped at that bound, whatever
+            // the file says: a wall clock corrected back between the write
+            // and the reload, or a mis-stated deadline, extends nothing —
+            // and a corrupt remainder cannot overflow the instant's
+            // addition and take the daemon's start with it.
             let unix_now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs());
@@ -3302,7 +3306,9 @@ impl BoxRegistry {
             *withdrawn = read_withdrawn_names_file(&path.with_file_name(WITHDRAWN_NAMES_FILE))
                 .into_iter()
                 .filter_map(|(name, deadline)| {
-                    let remaining = deadline.saturating_sub(unix_now);
+                    let remaining = deadline
+                        .saturating_sub(unix_now)
+                        .min(WITHDRAWN_NAME_GRACE.as_secs());
                     (remaining > 0).then_some((name, now + Duration::from_secs(remaining)))
                 })
                 .collect();
@@ -10324,6 +10330,41 @@ mod tests {
             boxes::core::zone_answer::decide(&a, &restarted.zone_view()),
             boxes::core::zone_answer::Verdict::Nxdomain,
             "a deadline the reload found past restores no grace"
+        );
+    }
+
+    /// NET-128: a reloaded grace is clamped at [`WITHDRAWN_NAME_GRACE`], so
+    /// a deadline the wall clock or the file overstated — the clock
+    /// corrected back between the write and the reload, or a deadline no
+    /// clock wrote — restores a window no longer than the bound, and a
+    /// remainder no [`std::time::Instant`] could carry is trimmed instead
+    /// of panicking the daemon's start.
+    #[test]
+    fn a_restarted_daemon_clamps_a_reloaded_grace_at_its_bound() {
+        let dir = tempfile::tempdir().expect("a fresh state dir");
+        std::fs::write(
+            dir.path().join(WITHDRAWN_NAMES_FILE),
+            r#"{"version":1,"withdrawn_names":{"web":18446744073709551615}}"#,
+        )
+        .expect("a withdrawn-names file whose deadline no clock wrote");
+        let a = boxes::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
+        };
+
+        let restarted = persisted_registry(&dir);
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &restarted.zone_view()),
+            boxes::core::zone_answer::Verdict::Nodata,
+            "an overstated deadline restores a grace clamped at the bound"
+        );
+
+        restarted.advance_clock(WITHDRAWN_NAME_GRACE);
+        assert_eq!(
+            boxes::core::zone_answer::decide(&a, &restarted.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
+            "the clamped grace ages out at its bound, never past it"
         );
     }
 
