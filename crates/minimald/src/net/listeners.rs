@@ -718,7 +718,11 @@ impl ListenPlan {
     /// same port. `state_dir` is the daemon's state directory, the one the
     /// runtime expose path audits its decisions under, so both surfaces'
     /// records land in the one log.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the plan is built once per launch from facts only the launch holds; \
+                  a builder would add a type for one call site"
+    )]
     #[must_use]
     pub fn new(
         box_name: String,
@@ -2229,6 +2233,13 @@ impl WatchState {
         // close write a second `PublishFailed` the streak already wrote.
         if self.forwards.contains_key(&port) {
             self.unrecorded.insert(port);
+            // The forward still occupies the box's published address:port
+            // on the switch, so the box holds the port of record (NET-129)
+            // while it stands — another box's declared publish yields to it
+            // rather than binding onto the forward this one still holds.
+            // The re-admit records it again, idempotently, and the close
+            // whose unexpose comes down releases it.
+            self.plan.record_dynamic_hold(port);
         }
         // The failure reaches `min session policy` as a warning row for as
         // long as the box listens and the log refuses: a watcher-driven
@@ -3571,11 +3582,12 @@ mod tests {
         );
     }
 
-    /// NET-129 holds the re-admit to the fresh publish's record: a forward
-    /// whose allow could not be audited stands refused and holds nothing,
-    /// and the retry that writes the record and re-admits it records the
-    /// box as the port's holder at its published address, so a declared
-    /// publish of the port yields to it. The close releases the hold.
+    /// NET-129 holds an unaudited forward to the fresh publish's record: a
+    /// forward whose allow could not be audited and whose unwind's unexpose
+    /// failed stands refused but still occupies the port, so the box holds
+    /// it of record; the retry that writes the record re-admits it with the
+    /// hold standing, so a declared publish of the port yields to it. The
+    /// close releases the hold.
     #[tokio::test]
     async fn a_re_admitted_unaudited_forward_records_its_dynamic_hold() {
         let listener = listening_socket();
@@ -3622,7 +3634,8 @@ mod tests {
         );
 
         // Bound, unwound for the audit, and the unwind's unexpose refused:
-        // the forward stands refused, and the box holds nothing yet.
+        // the forward stands refused, and because it still occupies the
+        // box's published address:port the box holds the port of record.
         assert_eq!(
             next_served(&mut served).await.path,
             "/services/forwarder/expose"
@@ -3631,13 +3644,21 @@ mod tests {
             next_served(&mut served).await.path,
             "/services/forwarder/unexpose"
         );
-        soon(|| !gate.admits_tcp(port)).await;
+        soon(|| registry.read().unwrap().shared_port_holder(PUBLISHED, port) == Some(holder)).await;
+        assert!(
+            !gate.admits_tcp(port),
+            "the unaudited forward stays refused"
+        );
 
-        // The log heals: the retry re-admits the standing forward and
-        // records the hold, so a declared publish of the port yields.
+        // The log heals: the retry re-admits the standing forward and the
+        // hold stands through it, so a declared publish of the port yields.
         std::fs::remove_file(dir.path().join("audit")).unwrap();
         refusing_unexpose.store(false, Ordering::SeqCst);
         soon(|| gate.admits_tcp(port)).await;
+        assert!(
+            registry.read().unwrap().shared_port_holder(PUBLISHED, port) == Some(holder),
+            "the re-admitted forward's box holds its port of record"
+        );
         let collisions = registry.write().unwrap().publish_own_address(
             declared,
             "declared",
@@ -3664,6 +3685,143 @@ mod tests {
         })
         .await;
         watcher.stop().await;
+        server.abort();
+    }
+
+    /// A watcher publishing `port` under `holder` into `registry`, against
+    /// a forwarder that accepts everything and an audit log that takes
+    /// every record — the fresh publish's whole happy path (NET-129).
+    fn watcher_recording_into(
+        dir: &tempfile::TempDir,
+        port: u16,
+        registry: &Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+        holder: boxes::SessionId,
+    ) -> (
+        ListenWatcher,
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Served>,
+    ) {
+        let sock = dir.path().join("gvproxy.sock");
+        let (server, served) = spawn_forwarder(sock.clone());
+        let gate = Arc::new(BoxGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(port),
+            SwitchSubnet::default(),
+            None,
+        ));
+        let watcher = ListenWatcher::start(
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(sock),
+                gate,
+                BoxPublications::default(),
+                dir.path().to_path_buf(),
+                Some(Arc::clone(registry)),
+                holder,
+            ),
+            Leader::Resolved(std::process::id()),
+        );
+        (watcher, server, served)
+    }
+
+    /// NET-129's fresh publish: a port the box's process listens on is
+    /// published and recorded as the box's to hold at its published address,
+    /// so a declared publish of the port yields to it; the listener's close
+    /// releases the hold and hands the port to the declared publisher.
+    #[tokio::test]
+    async fn a_fresh_listen_publish_records_its_hold_and_the_close_hands_it_over() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+            "dev", false,
+        )));
+        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let declared = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let (watcher, server, mut served) = watcher_recording_into(&dir, port, &registry, holder);
+
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/expose"
+        );
+        soon(|| registry.read().unwrap().shared_port_holder(PUBLISHED, port) == Some(holder)).await;
+        let collisions = registry.write().unwrap().publish_own_address(
+            declared,
+            "declared",
+            PUBLISHED,
+            BTreeSet::from([port]),
+        );
+        assert_eq!(
+            collisions.iter().map(|c| c.port).collect::<Vec<_>>(),
+            vec![port],
+            "the declared publish yields to the listen-published port's hold"
+        );
+
+        drop(listener);
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/unexpose"
+        );
+        soon(|| {
+            registry
+                .read()
+                .unwrap()
+                .holds_shared_port(declared, PUBLISHED, port)
+        })
+        .await;
+        watcher.stop().await;
+        server.abort();
+    }
+
+    /// NET-129 on the stop path: the box stopping withdraws every forward
+    /// its watcher holds, and each withdrawal releases the port's hold, so a
+    /// declared publisher waiting on the port takes it — the stop leaves no
+    /// hold behind the forward it took down.
+    #[tokio::test]
+    async fn the_watchers_stop_hands_its_listen_holds_over() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+            "dev", false,
+        )));
+        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let declared = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let (watcher, server, mut served) = watcher_recording_into(&dir, port, &registry, holder);
+
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/expose"
+        );
+        soon(|| registry.read().unwrap().shared_port_holder(PUBLISHED, port) == Some(holder)).await;
+        let collisions = registry.write().unwrap().publish_own_address(
+            declared,
+            "declared",
+            PUBLISHED,
+            BTreeSet::from([port]),
+        );
+        assert_eq!(
+            collisions.iter().map(|c| c.port).collect::<Vec<_>>(),
+            vec![port]
+        );
+
+        // The listener is still open: only the stop takes the forward down.
+        watcher.stop().await;
+        assert_eq!(
+            next_served(&mut served).await.path,
+            "/services/forwarder/unexpose"
+        );
+        assert!(
+            registry
+                .read()
+                .unwrap()
+                .holds_shared_port(declared, PUBLISHED, port),
+            "the stop hands the listen-held port to the declared publisher"
+        );
+        drop(listener);
         server.abort();
     }
 

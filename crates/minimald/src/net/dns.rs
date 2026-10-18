@@ -560,7 +560,12 @@ pub struct HostnameRegistry {
     /// naming the port, the lowest [`SessionId`] still publishing it takes
     /// over ([`Self::hand_over`]) — the id is a UUIDv7, so that is the box
     /// created earliest — a running box before a stopped one. An entry
-    /// exists exactly while some box publishes the port at the address.
+    /// exists exactly while some box publishes the port at the address or
+    /// holds it dynamically: a listen watcher's record of a port the box's
+    /// process bound and no declaration names
+    /// ([`Self::record_dynamic_hold`]), which stands until the listener's
+    /// forward comes down ([`Self::release_dynamic_hold`]) or the box is
+    /// destroyed ([`Self::unpublish_own_address`]).
     own_holders: HashMap<(Ipv4Addr, u16), SessionId>,
     /// The published `address:port`s each box has bound a forward for
     /// (NET-129): marked when the box launches holding them
@@ -676,6 +681,14 @@ impl HostnameRegistry {
     /// registry's lock is held no longer for it.
     pub fn notify_hand_overs(&mut self, sender: tokio::sync::mpsc::UnboundedSender<PortHandOver>) {
         self.hand_overs = Some(sender);
+    }
+
+    /// The box holding `port` at `address` of record (NET-129), declared or
+    /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
+    /// also asks for a declared publish, cannot see a dynamic holder.
+    #[cfg(test)]
+    pub(crate) fn shared_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<SessionId> {
+        self.own_holders.get(&(address, port)).copied()
     }
 
     /// Whether `session_id` holds `port` at `address` now (NET-129): it
