@@ -1086,12 +1086,13 @@ impl File {
     /// Read-modify-write `minimal.toml` under an exclusive lock, so
     /// concurrent `min` commands cannot lose each other's edits.
     ///
-    /// The lock is a sidecar `<path>.lock` file held for the whole
-    /// read-edit-write sequence (a platform-specific advisory write
-    /// lock via fd-lock — `flock` on most Unix, `fcntl` on Solaris,
-    /// `LockFile` on Windows); the content is re-read **inside** the
-    /// lock, so every serialized writer sees the previous writer's
-    /// result. The write itself is atomic (temp file + rename), so a
+    /// The lock is an advisory `flock` on the file's parent directory,
+    /// held for the whole read-edit-write sequence; the content is
+    /// re-read **inside** the lock, so every serialized writer sees the
+    /// previous writer's result. Locking the directory rather than a
+    /// sidecar file leaves nothing behind in the project tree, and the
+    /// lock follows the directory's inode, so every spelling of the path
+    /// shares it. The write itself is atomic (temp file + rename), so a
     /// concurrent reader never sees a torn file and cannot write a
     /// partial view back.
     ///
@@ -1107,9 +1108,9 @@ impl File {
         E: From<Error>,
     {
         // Resolve symlinks so the lock and the atomic replace both
-        // target the canonical file: `persist` would otherwise replace
-        // the symlink entry itself, and equivalent paths could use
-        // different sidecar locks.
+        // target the real file: `persist` would otherwise replace the
+        // symlink entry itself, and a writer using the link and one
+        // using the target would lock different directories.
         let resolved;
         let path = match std::fs::canonicalize(path) {
             Ok(p) => {
@@ -1119,29 +1120,21 @@ impl File {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
             Err(e) => return Err(Error::IO("resolving", path.to_path_buf(), e).into()),
         };
-        // The sidecar deliberately lives beside the edited file rather
-        // than in an app state directory: the lock must be shared with
-        // any other writer of this exact path regardless of user or
-        // environment, it is keyed by the file's own location, and this
-        // function is static with no state-dir handle available. See the
-        // review thread on PR gominimal/minimal#2302 for the trade-offs.
-        let mut lock_path = OsString::from(path.as_os_str());
-        lock_path.push(".lock");
-        let lock_path = PathBuf::from(lock_path);
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
 
-        let mut lock = match std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
+        // A read-only descriptor is enough for `flock`, so any user who
+        // can read the directory can take the lock.
+        let mut lock = match std::fs::File::open(&parent) {
             Ok(f) => fd_lock::RwLock::new(f),
-            Err(e) => return Err(Error::IO("locking", lock_path, e).into()),
+            Err(e) => return Err(Error::IO("locking", parent, e).into()),
         };
         let _guard = match lock.write() {
             Ok(g) => g,
-            Err(e) => return Err(Error::IO("locking", lock_path, e).into()),
+            Err(e) => return Err(Error::IO("locking", parent, e).into()),
         };
 
         let content = match std::fs::read_to_string(path) {
@@ -1153,11 +1146,6 @@ impl File {
         match edit(content.as_deref())? {
             None => Ok(()),
             Some(new) => {
-                let parent = path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("."));
                 let mut builder = tempfile::Builder::new();
                 #[cfg(unix)]
                 builder.permissions(std::fs::Permissions::from_mode(0o666));
@@ -2949,23 +2937,22 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn edit_exclusively_keys_the_lock_sidecar_by_the_canonical_path() {
+    fn edit_exclusively_leaves_no_files_beside_minimal_toml() {
         let dir = tempdir().unwrap();
-        let target = dir.path().join("real.toml");
-        std::fs::write(&target, "[stack]\nname = \"base\"\n").unwrap();
-        let link = dir.path().join(MFILE_NAME);
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "[stack]\nname = \"base\"\n").unwrap();
 
-        File::edit_exclusively::<Error>(&link, |_| Ok(None)).unwrap();
+        File::edit_exclusively::<Error>(&path, |content| {
+            let mut content = content.expect("minimal.toml vanished").to_string();
+            content.push_str("k = \"v\"\n");
+            Ok(Some(content))
+        })
+        .unwrap();
 
-        assert!(
-            !dir.path().join(format!("{MFILE_NAME}.lock")).exists(),
-            "lock sidecar created at the symlink spelling"
-        );
-        assert!(
-            dir.path().join("real.toml.lock").exists(),
-            "lock sidecar not created at the canonical target"
-        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from(MFILE_NAME)]);
     }
 }
