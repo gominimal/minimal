@@ -933,7 +933,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         let render = minimald::net::classifier::GuestRender {
             tree_root,
             // The listener the deny subtree's DNS-port lookups are dstnat'd
-            // onto (NET-141): the guest's loopback answerer, which refuses
+            // onto (NET-079): the guest's loopback answerer, which refuses
             // every name outside the box zone and forwards the zone's A
             // questions to the switch gateway alone.
             answerer_address: minimald::net::guest_dns::LISTENER_ADDRESS,
@@ -954,7 +954,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
                 )
             },
         );
-        // NET-141: the guest's DNS listener, after the boot above brought the
+        // NET-079: the guest's DNS listener, after the boot above brought the
         // loopback up — its bind is on 127.0.0.1 — and after the table that
         // steers the deny subtree's lookups onto it loaded. The daemon's own
         // lookups are untouched: they are keyed by the cgroup the daemon runs

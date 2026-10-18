@@ -1,4 +1,4 @@
-//! The guest's own DNS listener (NET-141 slice 2): what a deny-all
+//! The guest's own DNS listener (NET-079 slice 2): what a deny-all
 //! host-address box's lookups meet inside a VM-backed guest.
 //!
 //! The guest classifier dstnats the deny subtree's UDP-53 lookups onto a
@@ -10,7 +10,7 @@
 //! every name outside the box zone instead: nothing outside the machine is
 //! asked. In-zone questions are refused unless every one of them is a type-A
 //! question for a name the switch's resolver answers itself
-//! ([`answered_on_the_switch`], NET-141), and those — the zone's own A
+//! ([`answered_on_the_switch`], NET-079), and those — the zone's own A
 //! records, `host.min.internal` among them — are forwarded to the switch
 //! gateway's port 53 alone (NET-003), the one resolver left to ask.
 //!
@@ -27,12 +27,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode};
+use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::RecordType;
 use tokio::net::UdpSocket;
 
 use super::SwitchSubnet;
-use super::answerer::{ANSWERER_PORT, bind_answerer};
+use super::answerer::ANSWERER_PORT;
 use super::dns_gate::answered_on_the_switch;
 
 /// The `component` field every guest listener log line carries, matching the
@@ -53,7 +53,7 @@ const DNS_PORT: u16 = 53;
 /// DNS-port lookups onto the listener this module binds, so the pair lives
 /// here, where the bind is, and the render reads it from here rather than
 /// either side guessing at the other. The port is the answerer's own
-/// (NET-141), free inside a guest where the in-VM daemon starts no
+/// (NET-079), free inside a guest where the in-VM daemon starts no
 /// box-zone answerer.
 pub const LISTENER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const LISTENER_PORT: u16 = ANSWERER_PORT;
@@ -82,14 +82,19 @@ const MAX_IN_FLIGHT_FORWARDS: usize = 256;
 pub async fn start(subnet: SwitchSubnet) {
     let addr = SocketAddr::new(LISTENER_ADDRESS.into(), LISTENER_PORT);
     let gateway = SocketAddr::new(subnet.dns_server().into(), DNS_PORT);
-    let socket = match bind_answerer(addr).await {
+    // Bound here, not through the answerer's bind: that one logs as the
+    // box-zone answerer, which a VM guest never runs, and a diag bundle
+    // must not read this listener as one.
+    let socket = match UdpSocket::bind(addr).await {
         Ok(socket) => socket,
-        Err(failure) => {
+        Err(error) => {
             tracing::error!(
                 component = COMPONENT,
-                remedy = %failure.remedy,
-                "the guest's DNS listener could not bind {addr}: {}",
-                failure.reason
+                remedy = %format!(
+                    "free the listen address; `lsof -nP -iUDP:{}` names the holder",
+                    addr.port()
+                ),
+                "the guest's DNS listener could not bind {addr}: {error}"
             );
             return;
         }
@@ -231,11 +236,22 @@ fn parse(datagram: &[u8]) -> Option<Message> {
 /// exact lowercase among them, both of which the gateway would send
 /// upstream. What is left is in-zone, and refused empty (NET-136, NET-006)
 /// unless every question is a type-A question for a name the switch answers
-/// itself (NET-141) — the zone's A records, which the listener forwards to
+/// itself (NET-079) — the zone's A records, which the listener forwards to
 /// the gateway alone.
 fn decide(query: &Message) -> Decision {
+    // Only a standard QUERY carrying at least one question is ever weighed:
+    // an UPDATE or NOTIFY whose zone section names an in-zone A, or a
+    // message with no question at all, would otherwise pass every check
+    // below vacuously and ride the one forward path with whatever it
+    // carries. Neither is a lookup, so neither is forwarded.
+    if query.metadata.op_code != OpCode::Query {
+        return Decision::Answer(ResponseCode::NotImp);
+    }
+    if query.queries.is_empty() {
+        return Decision::Answer(ResponseCode::Refused);
+    }
     let questions = || query.queries.iter();
-    // REFUSED (NET-141): answered here, so no resolver beyond the guest —
+    // REFUSED (NET-079): answered here, so no resolver beyond the guest —
     // not even the gateway's — ever sees the name.
     if questions().any(|q| !answered_on_the_switch(q.name())) {
         return Decision::Answer(ResponseCode::Refused);
@@ -355,7 +371,7 @@ async fn forward(
 mod tests {
     use std::time::Duration;
 
-    use hickory_proto::op::{Message, Metadata, ResponseCode};
+    use hickory_proto::op::{Message, Metadata, OpCode, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
     use tokio::net::UdpSocket;
 
@@ -703,7 +719,7 @@ mod tests {
         served.abort();
     }
 
-    /// The listener's zone match is the switch's own (NET-141): in-zone A
+    /// The listener's zone match is the switch's own (NET-079): in-zone A
     /// names below the apex forward, and the match is
     /// [`answered_on_the_switch`] verbatim, case included — a name whose
     /// zone suffix is not the exact lowercase form the switch answers is
@@ -725,6 +741,36 @@ mod tests {
             &cased,
             Decision::Answer(ResponseCode::Refused),
             "a zone suffix not in the exact lowercase form is refused",
+        );
+    }
+
+    /// A query with no question, and a message whose opcode is not QUERY
+    /// (an UPDATE whose zone section is an in-zone A), are never forwarded:
+    /// every per-question check would pass them vacuously, so they are
+    /// answered here instead — REFUSED and NOTIMP — and nothing they carry
+    /// reaches the gateway.
+    #[test]
+    fn questionless_and_non_query_opcodes_are_not_forwarded() {
+        assert_decision(
+            &query_of(&[]),
+            Decision::Answer(ResponseCode::Refused),
+            "a query with no question is refused, not forwarded",
+        );
+        let mut update = query_of(&[("host.min.internal.".to_string(), RecordType::A)]);
+        update.metadata.op_code = OpCode::Update;
+        assert_decision(
+            &update,
+            Decision::Answer(ResponseCode::NotImp),
+            "an UPDATE naming an in-zone A is answered NOTIMP, not forwarded",
+        );
+        // The UPDATE survives the wire round trip as an UPDATE, so the
+        // listener's own parse hands decide() exactly this message.
+        let parsed = parse(&update.to_vec().expect("the update encodes"))
+            .expect("an UPDATE is a query-type message and parses");
+        assert_decision(
+            &parsed,
+            Decision::Answer(ResponseCode::NotImp),
+            "the parsed UPDATE is answered NOTIMP, not forwarded",
         );
     }
 

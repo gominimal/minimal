@@ -618,7 +618,7 @@ cgroup_level() {
 #
 # The dstnat chain (priority dstnat, before the filter output chain)
 # retargets the deny subtree's DNS-port lookups onto the answerer's own
-# port: a deny-all box resolves through the carve-out (NET-079, NET-141)
+# port: a deny-all box resolves through the carve-out (NET-079)
 # by asking DNS's port like any resolver would, and the one destination
 # its deny rule admits is the one its lookups reach. The match carries no
 # destination address: on a guest the box asks the switch gateway, not the

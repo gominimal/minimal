@@ -1174,7 +1174,7 @@ pub struct GuestRender<'a> {
     /// The tree root this daemon itself laid out: `sandbox`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
     pub tree_root: &'a Path,
-    /// The guest's own DNS listener (NET-141): the loopback answerer the
+    /// The guest's own DNS listener (NET-079): the loopback answerer the
     /// deny subtree's DNS-port lookups are dstnat'd onto, which refuses
     /// every name outside the box zone and forwards the zone's A questions
     /// to the switch gateway alone (NET-003).
@@ -1209,7 +1209,7 @@ const TABLE_LIST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The one line the guest's render logs, with the listener's address beside
 /// it: on a VM-backed host a deny-all host-address box's lookups are dstnat'd
-/// onto the guest's own DNS listener (NET-141), which refuses every name
+/// onto the guest's own DNS listener (NET-079), which refuses every name
 /// outside the box zone and forwards the zone's A questions to the switch
 /// gateway alone.
 pub const GUEST_RESOLVER_CARVE_OUT_LINE: &str = "deny-all host-address box on VM host: resolver \
@@ -2606,7 +2606,7 @@ fn guest_bash() -> PathBuf {
 }
 
 /// The flags the guest's render passes for its resolver carve-out, spelled
-/// as the installer reads them: the guest's own DNS listener (NET-141), on
+/// as the installer reads them: the guest's own DNS listener (NET-079), on
 /// the answerer's port at the guest's loopback, so the print and install
 /// lanes render the guest's own parameters.
 #[cfg(test)]
@@ -2615,7 +2615,7 @@ const GUEST_RESOLVER_FLAGS: [&str; 4] =
 
 /// The parameters a guest's own boot renders its table with, over a
 /// stand-in mount: the guest's own DNS listener — the loopback answerer the
-/// deny subtree's lookups are steered onto (NET-141) — the ct-mark bits the
+/// deny subtree's lookups are steered onto (NET-079) — the ct-mark bits the
 /// boot classifies with, and the two source identities named by the caller
 /// — which a guest hands as two inputs even where they are the one address
 /// an un-enrolled guest has (NET-078).
@@ -5454,7 +5454,7 @@ mod tests {
         );
     }
 
-    /// NET-141's carve-out on a VM-backed host, as the guest's own render
+    /// NET-079's carve-out on a VM-backed host, as the guest's own render
     /// spells it: the deny subtree's DNS-port lookups are dstnat'd onto the
     /// guest's own DNS listener at the guest's loopback, on the answerer's
     /// port, and `deny_out` admits the reply direction and the listener —

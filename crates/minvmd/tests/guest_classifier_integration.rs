@@ -1118,7 +1118,7 @@ async fn guest_deny_all_probe_refused() {
     );
 }
 
-/// A deny-all host-address box still resolves (NET-003, NET-141): its one
+/// A deny-all host-address box still resolves (NET-003, NET-079): its one
 /// carve-out is the guest's own DNS listener, which the deny subtree's
 /// lookups are steered onto and which refuses every name outside the box
 /// zone. Four reads from inside the box:
@@ -1259,7 +1259,7 @@ async fn guest_deny_all_resolver_reachable() {
         guest
             .boot_log_lines(&["answered a lookup at the guest listener"])
             .iter()
-            .any(|line| line.contains("example.com") || line.contains("Refused")),
+            .any(|line| line.contains("example.com") && line.contains("answer=Refused")),
         "the guest's own listener never left its REFUSED verdict on the box's example.com \
          lookup\n{}",
         context(),
@@ -1647,7 +1647,7 @@ fn native_ruleset_digest() -> String {
     // switch address on the default subnet, which is what the guest's boot
     // renders with (`DEFAULT_SUBNET.daemon_ip()` in its `main`).
     let identity = switch::DEFAULT_SUBNET.daemon_ip();
-    // The guest's resolver carve-out (NET-141): the guest's own DNS
+    // The guest's resolver carve-out (NET-079): the guest's own DNS
     // listener — the answerer's port at the guest's loopback, the pair its
     // `main` renders with (`guest_dns::LISTENER_ADDRESS`/`LISTENER_PORT`,
     // pinned here as the mask above is, so a drift between the two lanes

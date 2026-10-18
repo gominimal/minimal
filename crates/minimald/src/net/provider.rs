@@ -530,7 +530,7 @@ impl Network for HostIpAddressNetwork {
             // reaches upstream except through it. A deny-all box in a guest
             // that decides per box resolves through the same address — the
             // table steers the deny subtree's lookups onto the guest's own
-            // DNS listener at that address's port 53 (NET-141), which
+            // DNS listener at that address's port 53 (NET-079), which
             // refuses every name outside the zone — and reaches none of
             // what it resolves; in a guest that decides nothing it is
             // refused before a plan is ever asked for.
@@ -1240,7 +1240,7 @@ mod tests {
         // asks ever resolves — onto the answerer's address and port, so the
         // one destination a deny-all box's connections are admitted to is
         // the one its resolver really is. The match carries no destination
-        // address (NET-141): a box asks the switch gateway like every other
+        // address (NET-079): a box asks the switch gateway like every other
         // host-address box, and the steer is the carve-out. Read off the
         // step's own `--print-ruleset` output, so what is pinned is what a
         // host loads. 53 is DNS, spelled here because the constant that
@@ -1284,14 +1284,14 @@ mod tests {
         );
     }
 
-    /// NET-141 on a VM host, with NET-003: a deny-all host-address box
+    /// NET-079 on a VM host, with NET-003: a deny-all host-address box
     /// resolves through the resolver Minimal owns for it, which on a
     /// VM-backed host is the node's DNS layer at the switch gateway, the
     /// same one every other host-address box there resolves through. In a
     /// guest that decides per box, that address is the one the guest's
     /// own table steers the deny subtree's lookups at: the dstnat rule
     /// retargets its UDP-53 datagrams onto the guest's own DNS listener
-    /// (NET-141), which forwards the zone's A questions to the gateway
+    /// (NET-079), which forwards the zone's A questions to the gateway
     /// and refuses every name outside the zone, and the deny chain admits
     /// the listener alone — the steer and the admission are one fact, so
     /// the plan's nameserver and the table's carve-out cannot drift
