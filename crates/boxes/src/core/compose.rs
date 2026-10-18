@@ -2014,6 +2014,8 @@ pub fn gate_task_patch_paths(
     };
     // Only an absolute key names a path on the daemon's filesystem that
     // this machine can look at; a `~/` key names the session's home.
+    // A `~/` entry is matched against the rules by its path only: its
+    // contents and links are not checked, because the box writes them.
     let resolvable = |declared: &str| declared.starts_with('/');
 
     // Refused before any decision, so no prompt is ever about a path whose

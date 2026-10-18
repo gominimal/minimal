@@ -167,7 +167,9 @@ so the rules apply to the **declared path** itself:
   stops the run. Minimal follows a symlink to a directory inside a declared
   directory and checks the files it reaches, since the mount exposes them.
   If a directory is too large or partly unreadable to check against your deny
-  rules, the run stops and names the reason.
+  rules, the run stops and names the reason. A `~/` entry names the
+  session's home. It is matched against your rules by its path only: its
+  contents and links are not checked, because the box writes them.
 - For a declared absolute path, Minimal also checks the path it resolves to on
   your machine, and `allow` must match that path too. A symlink cannot carry
   the path past a `deny` on its target, or onto a target no rule allows. This
