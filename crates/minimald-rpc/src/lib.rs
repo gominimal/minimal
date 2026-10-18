@@ -2003,6 +2003,13 @@ pub struct DestroySessionRequest {
     pub id: SessionId,
 }
 
+/// How a [`DestroySession`] for an id the daemon holds no record of opens:
+/// the daemon formats that refusal as this lead followed by the quoted id.
+/// The client matches on it to tell an already-destroyed session (the
+/// loser of two concurrent destroys) from a destroy that failed, so both
+/// sides read the one constant rather than each spelling the text.
+pub const UNKNOWN_SESSION_ID_LEAD: &str = "no session with ID";
+
 /// The response for a [`DestroySession`] RPC.
 ///
 /// Carries the session's failed `on_destroy` hooks, so the client can

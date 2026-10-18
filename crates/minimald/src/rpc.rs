@@ -6869,7 +6869,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            matches!(resp, Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD)),
             "expected an unknown-id error",
         );
     }

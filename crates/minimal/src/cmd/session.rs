@@ -3949,7 +3949,7 @@ pub(crate) async fn destroy_session(
             // The session being destroyed is the goal state, so report it
             // rather than failing — and under `--force` that leniency is the
             // explicitly requested behaviour. Any other error stays an error.
-            if error.contains("no session with ID") {
+            if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) {
                 let label = match name {
                     Some(name) => name.to_string(),
                     None => id.to_string(),
