@@ -1,0 +1,26 @@
+[package]
+name = "bep"
+description = "Box Egress Proxy: credential modules and the sealed envelope a box carries in place of a credential."
+rust-version.workspace = true
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+p256.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+reqwest = { workspace = true, features = ["blocking", "rustls"] }
+
+[lints]
+workspace = true
