@@ -5999,6 +5999,7 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "common",
+ "crc32c",
  "google-cloud-storage",
  "graph",
  "hex",

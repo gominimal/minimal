@@ -161,14 +161,23 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
         // An unreadable length is an error, not 0: a 0 would match an empty
         // object left by a partial upload under this name.
         let local_len = tar_file.metadata().map(|m| m.len()).map_err(Error::IO)?;
-        if self.object_present(&object, local_len).await {
-            // The object is content-addressed: the same name with the same length is
-            // the same bytes, so nothing to write. (Only a partial earlier upload
-            // differs in length.) Small identical outputs — several packages
-            // produce the same empty tarball — are the common case here, and
-            // rewriting them from parallel uploaders trips GCS's per-object
-            // mutation rate limit. Still pending: the index may not map this
-            // spec hash to it yet.
+        let local_crc32c = {
+            let f = tar_file.try_clone().map_err(Error::IO)?;
+            tokio::task::spawn_blocking(move || file_crc32c(&f))
+                .await
+                .map_err(|e| Error::IO(std::io::Error::other(e)))?
+                .map_err(Error::IO)?
+        };
+        if self.object_present(&object, local_len, local_crc32c).await {
+            // The object is content-addressed, and GCS keeps a CRC32C of every
+            // object it stores: the same name at the same length with the same
+            // checksum is the same bytes, so nothing to write. (A partial earlier
+            // upload differs in length; an object someone else put under this
+            // name differs in checksum, and is written over as it always was.)
+            // Small identical outputs — several packages produce the same empty
+            // tarball — are the common case here, and rewriting them from
+            // parallel uploaders trips GCS's per-object mutation rate limit.
+            // Still pending: the index may not map this spec hash to it yet.
             self.pending.push((spec_hash.clone(), sha256));
             return Ok(false);
         }
@@ -207,7 +216,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
                     // That write was this same content: once it has landed there is
                     // nothing left to write, and not writing spares the hot name
                     // another mutation.
-                    if self.object_present(&object, local_len).await {
+                    if self.object_present(&object, local_len, local_crc32c).await {
                         self.pending.push((spec_hash.clone(), sha256));
                         return Ok(false);
                     }
@@ -216,7 +225,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
                 // second, so the other uploader's object has very likely landed.
                 // One last look before giving up, as after every other 429.
                 Err(e) if e.http_status_code() == Some(TOO_MANY_REQUESTS) => {
-                    if self.object_present(&object, local_len).await {
+                    if self.object_present(&object, local_len, local_crc32c).await {
                         self.pending.push((spec_hash.clone(), sha256));
                         return Ok(false);
                     }
@@ -230,17 +239,21 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
         Ok(true)
     }
 
-    /// Whether the content-addressed object `object` exists at `len` bytes: the
-    /// same name at the same length is the same bytes (only a partial upload
-    /// differs in length). A read that fails reads as absent, so the caller
+    /// Whether the content-addressed object `object` exists at `len` bytes
+    /// with the CRC32C `crc32c`, which GCS computes over every object it
+    /// stores: the name alone is only a claim about the bytes (anyone who can
+    /// write the bucket can put other bytes under it, at any length), and the
+    /// local artifact is the bytes the name was derived from. A read that
+    /// fails, or an object with no checksum, reads as absent, so the caller
     /// writes.
-    async fn object_present(&self, object: &str, len: u64) -> bool {
+    async fn object_present(&self, object: &str, len: u64, crc32c: u32) -> bool {
         matches!(
             self.backend
                 .open_object(self.base.bucket.clone(), object.to_string())
                 .send()
                 .await,
             Ok(stat) if stat.object().size as u64 == len
+                && stat.object().checksums.as_ref().and_then(|c| c.crc32c) == Some(crc32c)
         )
     }
 
@@ -403,6 +416,24 @@ pub(crate) async fn fetch_gcs_index<S: StubStorage + 'static>(
     Ok((index, generation))
 }
 
+/// The CRC32C of `file`'s bytes, read from the start through a clone of its
+/// own: the clones share one offset, and the write that may follow rewinds
+/// the one it reads through.
+fn file_crc32c(file: &std::fs::File) -> std::io::Result<u32> {
+    use std::io::{Read as _, Seek as _};
+    let mut f = file.try_clone()?;
+    f.seek(std::io::SeekFrom::Start(0))?;
+    let mut crc = 0;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(crc);
+        }
+        crc = crc32c::crc32c_append(crc, &buf[..n]);
+    }
+}
+
 /// Pseudo-random jitter in `0..backoff_ms` derived from the system clock.
 /// Avoids pulling in a real RNG dep for the modest amount of randomness
 /// needed to break synchronized retry storms across concurrent writers.
@@ -515,24 +546,37 @@ mod tests {
         gcs::Error::http(404, HeaderMap::new(), bytes::Bytes::new())
     }
 
-    /// An existing object as `open_object` describes it: only its size is read.
+    /// An existing object as `open_object` describes it: its size and the
+    /// CRC32C GCS computed over its bytes are read, nothing else.
     #[derive(Debug)]
-    struct Existing(i64);
+    struct Existing {
+        size: i64,
+        crc32c: u32,
+    }
 
     impl gcs::stub::ObjectDescriptor for Existing {
         fn object(&self) -> Object {
-            Object::new().set_size(self.0)
+            Object::new()
+                .set_size(self.size)
+                .set_checksums(gcs::model::ObjectChecksums::new().set_crc32c(self.crc32c))
         }
         async fn read_range(&self, _range: gcs::model_ext::ReadRange) -> ReadObjectResponse {
-            unreachable!("the writer only reads an object's size")
+            unreachable!("the writer only reads an object's size and checksum")
         }
         fn headers(&self) -> HeaderMap {
             HeaderMap::new()
         }
     }
 
-    fn existing(size: i64) -> GcsResult<(ObjectDescriptor, Vec<ReadObjectResponse>)> {
-        Ok((ObjectDescriptor::new(Existing(size)), Vec::new()))
+    /// An object holding exactly `bytes`, as GCS would describe it.
+    fn existing(bytes: &[u8]) -> GcsResult<(ObjectDescriptor, Vec<ReadObjectResponse>)> {
+        Ok((
+            ObjectDescriptor::new(Existing {
+                size: bytes.len() as i64,
+                crc32c: crc32c::crc32c(bytes),
+            }),
+            Vec::new(),
+        ))
     }
 
     /// An artifact file with these bytes, and a second handle on it that
@@ -550,18 +594,43 @@ mod tests {
             .unwrap()
     }
 
-    /// The object already exists at the artifact's length: nothing is written,
-    /// and the spec hash still goes to the index.
+    /// The object already exists with the artifact's bytes (same length, same
+    /// CRC32C): nothing is written, and the spec hash still goes to the index.
     #[tokio::test(start_paused = true)]
-    async fn upload_skips_an_object_present_at_the_same_length() {
+    async fn upload_skips_an_object_present_with_the_same_bytes() {
         let mut mock = MockStorage::new();
         mock.expect_open_object()
             .times(1)
-            .returning(|_, _| existing(18));
+            .returning(|_, _| existing(&[7u8; 18]));
         let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(!wrote, "a present object is not written again");
+        assert_eq!(writer.pending.len(), 1);
+    }
+
+    /// An object under this name at the artifact's length but with other
+    /// bytes is not the artifact, whoever put it there: it is written over,
+    /// as every object under a name used to be. The length alone would have
+    /// let a small planted object stand for good.
+    #[tokio::test(start_paused = true)]
+    async fn upload_writes_over_an_object_of_the_same_length_but_other_bytes() {
+        let mut mock = MockStorage::new();
+        let mut seq = Sequence::new();
+        mock.expect_open_object()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| existing(&[8u8; 18]));
+        mock.expect_write_object_buffered()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_p: Payload<gcs::streaming_source::FileSource>, _, _| {
+                Ok(Object::default())
+            });
+        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let (file, _shared) = artifact(&[7u8; 18]);
+        let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
+        assert!(wrote, "an object with other bytes is written over");
         assert_eq!(writer.pending.len(), 1);
     }
 
@@ -645,12 +714,51 @@ mod tests {
         mock.expect_open_object()
             .times(1)
             .in_sequence(&mut seq)
-            .returning(|_, _| existing(18));
+            .returning(|_, _| existing(&[7u8; 18]));
         let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(!wrote, "the other uploader's write stands");
         assert_eq!(writer.pending.len(), 1);
+    }
+
+    /// Out of retries on a 429 with no object under the name by the last
+    /// look, the upload gives up with the 429: the bound on the wait for the
+    /// other uploader's write is the one 429 path that is an error, and the
+    /// caller aborts the upload session on it.
+    #[tokio::test(start_paused = true)]
+    async fn upload_out_of_retries_on_429_with_no_object_present_errors() {
+        let mut mock = MockStorage::new();
+        let mut seq = Sequence::new();
+        mock.expect_open_object()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Err(http_404_error()));
+        // Every attempt, the one past the retry budget included, and the
+        // look after each: the object never appears.
+        for _ in 0..=MAX_OBJECT_WRITE_RETRIES {
+            mock.expect_write_object_buffered()
+                .times(1)
+                .in_sequence(&mut seq)
+                .return_once(|_p: Payload<gcs::streaming_source::FileSource>, _, _| {
+                    Err(http_429_error())
+                });
+            mock.expect_open_object()
+                .times(1)
+                .in_sequence(&mut seq)
+                .returning(|_, _| Err(http_404_error()));
+        }
+        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let (file, _shared) = artifact(&[7u8; 18]);
+        let err = writer
+            .upload(&spec(), (file, [1u8; 32]))
+            .await
+            .expect_err("out of retries with no object present is an error");
+        assert!(
+            matches!(&err, Error::Backend(e) if e.http_status_code() == Some(TOO_MANY_REQUESTS)),
+            "the 429 is surfaced: {err:?}"
+        );
+        assert!(writer.pending.is_empty(), "nothing is staged for the index");
     }
 
     /// A 429 is another uploader writing this same content: when the object
@@ -672,7 +780,7 @@ mod tests {
         mock.expect_open_object()
             .times(1)
             .in_sequence(&mut seq)
-            .returning(|_, _| existing(18));
+            .returning(|_, _| existing(&[7u8; 18]));
         let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
