@@ -11,6 +11,14 @@
 //!   does not clear — holding none of the capabilities no box may hold,
 //!   `CAP_NET_RAW` first.
 //!
+//! * `proc_sys_writability_follows_the_launching_daemon` — the same open box,
+//!   one more probe: an `open()` of a root-owned sysctl file for writing. A
+//!   box whose launching daemon is root has that root as its one mapped uid,
+//!   so the launch path seals its `/proc/sys` read-only and the open must
+//!   come back `EROFS`; a box launched by an unprivileged daemon keeps it,
+//!   and the open must come back `EACCES` — DAC's refusal, which a nested
+//!   sandbox inside may still need to write past.
+//!
 //! These proofs launch a real box, which needs the unprivileged user namespace
 //! every sandbox starts by unsharing. A host that would deny it (stock Ubuntu
 //! 24.04 restricts it for unconfined processes) cannot run them at all, so they
@@ -135,6 +143,7 @@ fn announce_to_the_runner(proof: &str) {
 /// value` line per fact, parsed by the caller.
 const CAP_PROBE_C: &str = r#"
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
@@ -160,6 +169,16 @@ int main(void) {
     int stream = socket(AF_INET, SOCK_STREAM, 0);
     printf("stream_socket_errno: %d\n", stream >= 0 ? 0 : errno);
     if (stream >= 0) close(stream);
+
+    /* Whether the box's /proc/sys is writable: one open for write, no
+       O_TRUNC (the open alone is the fact; truncating a sysctl file would
+       itself be the write this probe must not do). The errno says which
+       side of the seal the box is on: EROFS on a read-only remount, EACCES
+       on DAC's refusal to an unprivileged uid, and 0 a /proc/sys this
+       proof's caller must fail on, whichever branch it expected. */
+    int sysctl = open("/proc/sys/kernel/hostname", O_WRONLY | O_CLOEXEC);
+    printf("proc_sys_open_errno: %d\n", sysctl >= 0 ? 0 : errno);
+    if (sysctl >= 0) close(sysctl);
     return 0;
 }
 "#;
@@ -462,6 +481,59 @@ async fn boxes_lack_cap_net_raw() {
         "a none box's family filter must still refuse the socket family \
          itself, seal and credentials together in the same launch"
     );
+}
+
+/// Whether the box's `/proc/sys` is writable — the sysctl seal. Every box in
+/// a VM shares the one guest kernel, and a box launched by a root daemon has
+/// that root as its one mapped uid, so the root-owned 0644 sysctl files are
+/// the box's own to write by DAC alone: a program in such a box can rewrite
+/// the machine's kernel settings (the boot-time inotify limits and dmesg
+/// restriction the guest applies) with nothing but an `open()` for write.
+/// The launch path seals exactly those boxes, remounting `/proc/sys`
+/// read-only before the credentials drop; an unprivileged daemon's box keeps
+/// its `/proc/sys` writable, because a nested sandbox inside it mounts its
+/// own procfs and may need to write there.
+///
+/// Which side this proof asserts on is decided by the uid it itself runs as
+/// — the daemon-side fact the launch path seals on: a root runner (a CI lane
+/// under `sudo`) is the one that proves the seal, expecting `EROFS` where
+/// the unsealed box opened the file; an unprivileged runner is the
+/// unprivileged daemon of the ruling, expecting `EACCES` — DAC's refusal —
+/// and proving nothing was sealed in a place that had no DAC refusal to
+/// begin with. A report of `0` fails either branch: a writable `/proc/sys`
+/// is the defect itself on the root side, and a lost DAC refusal on the
+/// other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proc_sys_writability_follows_the_launching_daemon() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
+        eprintln!(
+            "skipping proc_sys_writability_follows_the_launching_daemon: this host \
+             denies the unprivileged user namespace every sandbox starts by \
+             unsharing: {reason}"
+        );
+        return;
+    }
+    announce_to_the_runner("proc_sys_writability_follows_the_launching_daemon");
+
+    let report = box_report(NetPlan::host()).await;
+    let got = reported_errno(&report, "proc_sys_open_errno", "an open box");
+    if nix::unistd::geteuid().is_root() {
+        assert_eq!(
+            got,
+            libc::EROFS,
+            "a box launched by a root daemon must find its /proc/sys read-only: \
+             its one mapped uid is root, so without the seal the machine's \
+             sysctls are writable by DAC alone"
+        );
+    } else {
+        assert_eq!(
+            got,
+            libc::EACCES,
+            "a box launched by an unprivileged daemon keeps its /proc/sys — DAC \
+             refuses it to the box's unprivileged uid, and a nested sandbox \
+             inside may still need to write there"
+        );
+    }
 }
 
 /// What every box's report must show: the unprivileged box uid and gid, the
