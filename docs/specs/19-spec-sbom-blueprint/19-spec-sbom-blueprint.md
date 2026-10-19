@@ -5,7 +5,7 @@ owner: bryan-minimal
 epic: gominimal/inbox#582
 arch: https://github.com/gominimal/arch/blob/3dab1097cda11652ad24282969ed8dfe61d0d497/architecture.md
 arch_sha: "3dab1097cda11652ad24282969ed8dfe61d0d497"
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # SBOM — box SBOM + CycloneDX Blueprint
@@ -44,7 +44,14 @@ references no per-package document for it, which is the ordinary case for a
 package built locally or non-redistributable by policy, and the gap names
 which: `built-locally` or `non-redistributable`. SBOM-004 and SBOM-011 use
 that one definition. A document the closure references but that cannot be
-fetched is not a gap; it is SBOM-012's failure.
+fetched is not a gap; it is SBOM-012's failure. Until build-servers#185 pins
+the document digest in the closure (Non-goals), *references* is decided by
+the closure entry alone: a component whose entry maps its Build Spec Hash to
+a cache artifact digest references the document SBOM-013 names from that
+hash, and a component whose entry is `built-locally` or `non-redistributable`
+has no artifact, no document, and the gap. No probe of the cache takes part
+in that decision, so SBOM-001's determinism holds, and a referenced document
+the cache does not have (a 404 as much as a timeout) is SBOM-012's failure.
 
 A box's **posture** is what its expanded Box Spec declares it may reach,
 read, write, inherit or expose: `[network]` (mode, `[network.egress]`,
@@ -167,14 +174,21 @@ developer running agent boxes; build-infra operator; auditor.
   verify: cargo nextest run -p sbom sbom_licenses_match_attribution
 
 - **SBOM-008** THE SYSTEM SHALL record environment-variable assets by name
-  and provenance only, and SHALL never embed variable values in any
-  document.
+  and provenance only, SHALL record every other credential-bearing posture
+  field by reference — `[secrets]` as name and `source` kind, never the
+  value; `[[github_imports]]`, `[[file_imports]]`, egress destinations and
+  the `[otel]` endpoint as their location with any userinfo, token-bearing
+  query parameter or header value removed — and SHALL never embed a
+  variable value, a secret value, or a credential carried by one of those
+  fields in any document.
   tier:     T1
-  verify:   cargo nextest run -p sbom sbom_env_values_never_embedded_in_any_serializer
+  verify:   cargo nextest run -p sbom sbom_credentials_never_embedded_in_any_serializer
   property: for all compositions c, serializers s in {cdx, spdx, blueprint}:
     every environment asset in parse_s(emit_s(c)) carries only name and
-    provenance fields, for all vars v: values(v) not in ir(c), and no string
-    anywhere in parse_s(emit_s(c)) equals or contains values(v)
+    provenance fields, every secret carries only name and source kind, every
+    location field carries no userinfo and no token-bearing parameter, for
+    all credentials v in credentials(c): v not in ir(c), and no string
+    anywhere in parse_s(emit_s(c)) equals or contains v
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
@@ -243,14 +257,31 @@ developer running agent boxes; build-infra operator; auditor.
     tier:   T0
     verify: cargo nextest run -p sbom per_package_document_subject_must_match_closure
   - WHEN the document's bundle is published THE SYSTEM SHALL verify it with
-    PKV-011's checks before reading any field of the document, and IF it
-    fails THEN THE SYSTEM SHALL treat the document as unresolved (SBOM-012's
-    failure, naming the check); WHILE the producer publishes no bundle for
-    the document THE SYSTEM SHALL read the document and mark the component
-    `unverified`, as PKV marks an entry whose source has no verified bundle.
+    PKV-011's checks first, then check the subject, and only then read any
+    other field of the document, and IF the bundle fails THEN THE SYSTEM
+    SHALL treat the document as unresolved (SBOM-012's failure, naming the
+    check); WHILE the producer publishes no bundle for the document THE
+    SYSTEM SHALL read the document and mark the component `unverified`, as
+    PKV marks an entry whose source has no verified bundle.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
-    property: read(d) ⇒ (bundle(d) = ∅ ∧ unverified(component(d))) ∨ verified(bundle(d))
+    property: read(d) ⇒ (bundle(d) = ∅ ∧ unverified(component(d))) ∨ verified(bundle(d)); checks(d) = [bundle, subject, rest] in that order
+  - THE SYSTEM SHALL emit the `unverified` mark on the component in every
+    serializer — CycloneDX: a `minimal:verification` property with the value
+    `unverified`; SPDX: an annotation of the same text on the package;
+    Blueprint: `verification = "unverified"` on the component — so a reader
+    tells data read without a verified bundle from data read with one, and
+    never from the document's silence.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_unverified_mark_emitted_by_every_serializer
+    property: for all serializers s, components k: unverified(k) ⇔ marked_unverified(parse_s(emit_s(c)), k)
+  - WHERE `--require-bundles` is given THE SYSTEM SHALL treat a document
+    with no published bundle as unresolved (SBOM-012's failure, naming the
+    missing bundle) instead of reading it. Read-and-mark stays the default
+    while no producer publishes bundles (build-servers#185); whether the
+    default flips once they do is an open question below.
+    tier:   T0
+    verify: cargo nextest run -p sbom sbom_require_bundles_fails_on_an_absent_bundle
 
 - **SBOM-014** WHEN `min box list --using <pkg>[@<ver>]` filters boxes THE
   SYSTEM SHALL answer from the component set this spec's composition emits
@@ -402,12 +433,13 @@ from the spec and stay schema-TODO.
   covered by: SBOM-004
 - **Invariant:** THE SYSTEM SHALL never emit a document whose component set
   is incomplete without saying so.
-  enforced by: unresolvable components become declared gaps; unfetchable
-  references abort the emission
+  enforced by: components with no referenced document become declared
+  gaps; unfetchable references abort the emission
   covered by: SBOM-011, SBOM-012
 - **Invariant:** THE SYSTEM SHALL never attribute a per-package document to
   a component whose closure digest it does not name as its subject.
-  enforced by: the subject check before any field of the document is read
+  enforced by: the bundle check, then the subject check, before any other
+  field of the document is read (SBOM-013)
   covered by: SBOM-013
 
 ## Open questions
@@ -433,6 +465,12 @@ from the spec and stay schema-TODO.
   now; the state name follows the provenance bundle's (`bundled`) unless the
   producer rules otherwise. Settle on build-servers#185 before the first
   slice's golden fixtures.]
+- [NEEDS CLARIFICATION (MEDIUM): once build-servers#185 publishes a bundle
+  for every package, does reading an unbundled per-package document fail by
+  default (today's `--require-bundles` behaviour), with the read-and-mark
+  path behind an opt-in? Proposed: yes, in the first release after every
+  pinned closure the public registry serves carries bundles; until then a
+  fail-closed default would make every SBOM fail. Settle on build-servers#185.]
 - [NEEDS CLARIFICATION (LOW): SPDX `created` timestamp source (proposal:
   pinned commit's committer timestamp); both answers satisfy SBOM-001;
   settle in first-slice review.]
