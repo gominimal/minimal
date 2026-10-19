@@ -1,0 +1,25 @@
+[package]
+name = "bep"
+description = "Box Egress Proxy: credential modules and the sealed envelope a box carries in place of a credential."
+rust-version.workspace = true
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+chacha20poly1305 = "0.10"
+hkdf = "0.13"
+rand_core.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+
+[dev-dependencies]
+proptest.workspace = true
+reqwest = { workspace = true, features = ["blocking", "rustls"] }
+
+[lints]
+workspace = true

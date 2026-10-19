@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/args",
+    "crates/bep",
     "crates/async-dialog",
     "crates/lcache",
     "crates/rcache",

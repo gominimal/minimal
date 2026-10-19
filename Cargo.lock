@@ -418,6 +418,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bep"
+version = "0.0.1"
+dependencies = [
+ "base64 0.23.1",
+ "chacha20poly1305",
+ "hkdf",
+ "proptest",
+ "rand_core 0.6.4",
+ "reqwest",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
