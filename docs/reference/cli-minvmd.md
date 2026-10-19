@@ -55,6 +55,8 @@ An own-IP box that declares no `egress` section gets the deny-all egress default
 
 `minvmd` reads the variable only when it starts, and hands it to the guest at boot. Set it in the environment of the process that starts `minvmd`: `minvmd run`, or the first `min` command that starts the VM for you. Setting it for a later `min` command against a running VM changes nothing. To apply a change, stop `minvmd` (`minvmd stop`) and start it again with the new environment.
 
+A host-address box — the default network mode — reaches the host through the switch's host alias, `host.min.internal`, and the alias is open at the host's own service ports alone: `3000-3999`, `4200`, `5000-5999`, `8000-8999`, and `9000-9999`. Every other port through the alias is refused. To open a different set, set `MINVMD_HOST_EXPOSURE_PORTS` to a comma-separated list of ports and inclusive ranges — `8080` for one port, `3000-3999,4200` for ranges — and to close the alias at every port, set it empty. An unparseable list fails the start, naming the variable and the value. The variable is read when `minvmd` starts, like the two above.
+
 ### `status`
 
 ```
