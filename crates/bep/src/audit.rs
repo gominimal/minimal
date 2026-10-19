@@ -18,6 +18,10 @@
 //!
 //! [`AuditLog::open`] opens the file for append only, never for write or
 //! truncate, so it cannot modify or remove an existing record (BEP-041).
+//! The only bytes the log ever cuts are a torn tail: the part of a line
+//! that a failed or interrupted append left without its newline. Such bytes
+//! never formed a record. [`AuditLog::open`] also takes an exclusive lock,
+//! so a second writer on the same path cannot fork the chain.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
@@ -27,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// The audit schema every record names.
-pub const SCHEMA: &str = "min/v1";
+pub const SCHEMA: &str = "min/v1/audit";
 
 /// The identifier a record carries when the request names no member or
 /// store identifier.
@@ -189,15 +193,34 @@ pub struct AuditLog {
     path: PathBuf,
     file: File,
     head: String,
+    /// The log's length after the last complete record.
+    len: u64,
+    /// Set when a failed append left bytes the log was not able to cut.
+    poisoned: bool,
 }
 
 impl AuditLog {
     /// Opens the log at `path` for append, and creates it and its parent
     /// directory when absent. The next record chains to the log's last line.
+    ///
+    /// The call fails when `path` is a symlink, or when another `AuditLog`
+    /// holds the log open. A torn last line, which an interrupted append
+    /// left without its newline, is cut off.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("audit log {} is a symlink", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
         let mut options = OpenOptions::new();
         options.append(true).create(true);
@@ -207,8 +230,35 @@ impl AuditLog {
             options.mode(0o600);
         }
         let file = options.open(&path)?;
-        let head = head_hash(&fs::read_to_string(&path)?);
-        Ok(Self { path, file, head })
+        // One writer per log: a second one would chain to the same head.
+        file.try_lock().map_err(|err| match err {
+            fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("audit log {} is held by another writer", path.display()),
+            ),
+            fs::TryLockError::Error(err) => err,
+        })?;
+        let contents = fs::read(&path)?;
+        let complete = contents
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |n| n + 1);
+        if complete < contents.len() {
+            tracing::warn!(
+                path = %path.display(),
+                torn_bytes = contents.len() - complete,
+                "audit log ends in a torn line, cutting it off"
+            );
+            file.set_len(complete as u64)?;
+        }
+        let head = head_hash(&String::from_utf8_lossy(&contents[..complete]));
+        Ok(Self {
+            path,
+            file,
+            head,
+            len: complete as u64,
+            poisoned: false,
+        })
     }
 
     /// The log's path.
@@ -222,17 +272,44 @@ impl AuditLog {
     }
 
     /// Appends one record for `decision` and returns it. On failure the
-    /// head does not move, and one warn line names the path.
+    /// head does not move, the partial bytes are cut off, and one warn line
+    /// names the path. When the cut fails too, every later append fails.
     pub fn append(&mut self, decision: &Decision) -> io::Result<Record> {
+        if self.poisoned {
+            return Err(io::Error::other(format!(
+                "audit log {} holds a torn line, reopen it",
+                self.path.display()
+            )));
+        }
         let record = Record::from_decision(decision, &self.head);
         let line = record.to_line();
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
-        if let Err(err) = self.file.write_all(&bytes).and_then(|()| self.file.flush()) {
+        // One write call, so a short write shows as a short count.
+        let written = self.file.write(&bytes).and_then(|n| {
+            if n == bytes.len() {
+                self.file.flush()
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("short write: {n} of {} bytes", bytes.len()),
+                ))
+            }
+        });
+        if let Err(err) = written {
             tracing::warn!(path = %self.path.display(), error = %err, "audit append failed");
+            if let Err(cut) = self.file.set_len(self.len) {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %cut,
+                    "audit log keeps a torn line, later appends fail until reopen"
+                );
+                self.poisoned = true;
+            }
             return Err(err);
         }
+        self.len += bytes.len() as u64;
         self.head = line_hash(&line);
         Ok(record)
     }
@@ -318,7 +395,7 @@ mod tests {
 
         let written = lines(&dir.log());
         let first: serde_json::Value = serde_json::from_str(&written[0]).unwrap();
-        assert_eq!(first["schema"], "min/v1");
+        assert_eq!(first["schema"], "min/v1/audit");
         assert_eq!(first["kind"], "decision");
         assert_eq!(first["subject"], "box-7f3a");
         assert_eq!(first["act"], "");
@@ -392,6 +469,41 @@ mod tests {
         assert_eq!(log.head(), line_hash(&written[2]));
         // The line is the record's own serialization, byte for byte.
         assert_eq!(records[2].to_line(), written[2]);
+    }
+
+    // BEP-048: a torn tail from an interrupted append is cut off on open,
+    // so the next record starts on its own line and chains to the last
+    // complete one.
+    #[test]
+    fn audit_log_cuts_a_torn_last_line() {
+        let dir = TempDir::new();
+        let mut log = AuditLog::open(dir.log()).unwrap();
+        log.append(&admit()).unwrap();
+        let head = log.head().to_owned();
+        drop(log);
+        let mut file = OpenOptions::new().append(true).open(dir.log()).unwrap();
+        file.write_all(b"{\"schema\":\"min/v1/au").unwrap();
+        drop(file);
+
+        let mut log = AuditLog::open(dir.log()).unwrap();
+        assert_eq!(log.head(), head);
+        log.append(&off_module()).unwrap();
+        let written = lines(&dir.log());
+        assert_eq!(written.len(), 2);
+        let second: Record = serde_json::from_str(&written[1]).unwrap();
+        assert_eq!(second.previous_hash, line_hash(&written[0]));
+    }
+
+    // BEP-048: a second writer on the same log would fork the chain, so
+    // open refuses it while the first one holds the log.
+    #[test]
+    fn audit_log_refuses_a_second_writer() {
+        let dir = TempDir::new();
+        let log = AuditLog::open(dir.log()).unwrap();
+        let err = AuditLog::open(dir.log()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(log);
+        AuditLog::open(dir.log()).unwrap();
     }
 
     // BEP-041: the descriptor carries O_APPEND and no truncate, and earlier
