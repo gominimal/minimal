@@ -15,12 +15,12 @@
 //! "default_owner": ...}`. A v1 value carries exactly one member.
 //!
 //! [`open`] refuses a value sealed to another key, a value that does not
-//! decrypt, and a value bound to another box, host or module. It returns the
-//! carried context with the member. It does not compare the mode, the
-//! host-set version or the expiry. The mode is for the audit record. The
-//! caller checks the expiry with [`Context::is_expired`]. The caller admits
-//! an authority only when it is in both the carried host-set version's set
-//! and the current set.
+//! decrypt, a value bound to another box, host or module, and a value past
+//! its expiry at the clock time the caller gives. It returns the carried
+//! context with the member. It does not compare the mode or the host-set
+//! version. The mode is for the audit record. The caller admits an authority
+//! only when it is in both the carried host-set version's set and the
+//! current set.
 //!
 //! The printed form has five dot-separated segments, and the second is
 //! empty. No GitHub token form matches it: not the `ghp_`, `gho_`, `ghu_`,
@@ -79,10 +79,11 @@ pub enum Breadth {
 /// The context a sealed value carries in its protected header.
 ///
 /// Every field is authenticated: a change to one makes the value fail to
-/// open. [`open`] compares only `box_id`, `host` and `module` with the
-/// request. The caller checks `expiry` with [`Context::is_expired`], records
-/// `mode` for the audit, and admits an authority only when it is in both
-/// the `host_set_version` set and the current set.
+/// open. [`open`] compares `box_id`, `host` and `module` with the request,
+/// and refuses the value when [`Context::is_expired`] at the request's
+/// clock time. The caller records `mode` for the audit, and admits an
+/// authority only when it is in both the `host_set_version` set and the
+/// current set.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Context {
     /// The id of the box the value was minted for.
@@ -113,7 +114,7 @@ impl Context {
     }
 }
 
-/// The fields [`open`] compares with the expected binding.
+/// The request [`open`] checks a sealed value against.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Binding {
     /// The id of the box that presents the value.
@@ -122,6 +123,8 @@ pub struct Binding {
     pub host: String,
     /// The module of the upstream the request goes to.
     pub module: String,
+    /// The proxy's clock at the request, in seconds since the Unix epoch.
+    pub now: u64,
 }
 
 /// A bound field of [`Context`]. Its `Display` names the field and never
@@ -306,6 +309,10 @@ pub enum OpenError {
     /// A bound field differs from the expected binding.
     #[error("the sealed value is bound to a different {0}")]
     ContextMismatch(BoundField),
+    /// The value's expiry ([`BoundField::Expiry`]) is at or before the
+    /// request's clock time.
+    #[error("the sealed value is past its expiry")]
+    Expired,
     /// The plaintext is not a member list of exactly one member.
     #[error("the sealed value carries no member list this proxy reads")]
     BadMembers,
@@ -378,7 +385,8 @@ fn seal_plaintext(
 /// # Errors
 ///
 /// [`OpenError::ContextMismatch`] names the first of box id, host and module
-/// that differs. The other variants say the value is malformed, uses an
+/// that differs. [`OpenError::Expired`] says the expiry is at or before
+/// `expected.now`. The other variants say the value is malformed, uses an
 /// unsupported algorithm, is sealed to another key or does not decrypt, or
 /// carries no list of exactly one member with a known breadth.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
@@ -430,9 +438,9 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
             .map_err(|_| OpenError::NotOpenable)?,
     );
 
-    // Gatehouse §6.10: the box, host and module bind. The mode is for the
-    // audit, the host-set version selects the bound set, and the caller
-    // checks the expiry against its clock.
+    // Gatehouse §6.10: the box, host and module bind, and the expiry is a
+    // check against the clock. The mode is for the audit, and the host-set
+    // version selects the bound set.
     let context = header.into_context();
     for (field, carried, wanted) in [
         (BoundField::BoxId, &context.box_id, &expected.box_id),
@@ -442,6 +450,9 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
         if carried != wanted {
             return Err(OpenError::ContextMismatch(field));
         }
+    }
+    if context.is_expired(expected.now) {
+        return Err(OpenError::Expired);
     }
 
     let MemberList {
@@ -698,6 +709,7 @@ mod tests {
             box_id: context.box_id.clone(),
             host: context.host.clone(),
             module: context.module.clone(),
+            now: 0,
         }
     }
 
@@ -709,7 +721,7 @@ mod tests {
             any::<u32>(),
             prop_oneof![Just(Mode::User), Just(Mode::App)],
             any::<u64>(),
-            any::<u64>(),
+            1..=u64::MAX,
         )
             .prop_map(
                 move |(box_id, host, module, host_set_version, mode, iat, expiry)| Context {
@@ -784,17 +796,20 @@ mod tests {
             let key = ProxyKey::from_bytes(&key_bytes).unwrap();
             let sealed = seal(&key.public(), &context, &members(&credential)).unwrap();
 
-            // It opens for its own box, host and module, whatever the carried
-            // mode, host-set version and expiry, and returns the carried
-            // context and the member with its breadth.
+            // It opens for its own box, host and module before its expiry,
+            // whatever the carried mode and host-set version, and returns the
+            // carried context and the member with its breadth.
             let opened = open(&key, &sealed, &binding(&context)).unwrap();
             prop_assert_eq!(&opened.context, &context);
             prop_assert_eq!(&opened.member, &member(&credential));
             prop_assert_eq!(opened.default_owner, None);
-            prop_assert_eq!(
-                opened.context.is_expired(context.expiry),
-                true
-            );
+
+            // At or after its expiry it is refused, and the error names the
+            // expiry and carries no value.
+            let late = Binding { now: context.expiry, ..binding(&context) };
+            let err = open(&key, &sealed, &late).unwrap_err();
+            prop_assert_eq!(&err, &OpenError::Expired);
+            prop_assert_eq!(err.to_string(), "the sealed value is past its expiry");
 
             // A request from another box, host or module is refused, and the
             // error names the field and carries no value.
@@ -899,6 +914,17 @@ mod tests {
         assert!(!context.is_expired(context.expiry - 1));
         assert!(context.is_expired(context.expiry));
         assert!(context.is_expired(context.expiry + 1));
+        let sealed = seal(&key.public(), &context, &members(b"ref")).unwrap();
+        let before = Binding {
+            now: context.expiry - 1,
+            ..binding(&context)
+        };
+        assert!(open(&key, &sealed, &before).is_ok());
+        let after = Binding {
+            now: context.expiry + 1,
+            ..binding(&context)
+        };
+        assert_eq!(open(&key, &sealed, &after).unwrap_err(), OpenError::Expired);
     }
 
     #[test]
