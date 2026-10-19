@@ -31,6 +31,13 @@ const CALLBACK_PATH: &str = "/callback";
 /// How long the browser flow waits for the browser to come back.
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long one connection to the callback listener has to send its request
+/// line and headers.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a new sign-in prints on stderr about the App's installations.
+pub(crate) const INSTALL_NOTE: &str = "The token reaches only the repositories of the accounts and organizations where the Minimal GitHub App is installed.";
+
 /// Where the sign-in talks to GitHub. Tests point it at a local server.
 #[derive(Debug, Clone)]
 pub(crate) struct Endpoints {
@@ -132,6 +139,11 @@ pub(crate) async fn run_login(
         "GitHub sign-in stored in the host keychain"
     );
     writeln!(out, "Signed in to GitHub as {}.", stored.metadata.account)?;
+    if stored.new_instance {
+        // The App's installations bound what the token reaches. A first
+        // sign-in says so.
+        writeln!(err, "{INSTALL_NOTE}")?;
+    }
     Ok(stored)
 }
 
@@ -391,11 +403,29 @@ async fn browser_flow(
 
 /// Serve the callback listener until a request to the callback path carries
 /// a code with the expected state.
+///
+/// Each connection is read in its own task under [`REQUEST_READ_TIMEOUT`],
+/// so a connection that sends nothing, such as a browser's speculative
+/// connection, never holds up the callback.
 async fn await_callback(listener: &tokio::net::TcpListener, state: &str) -> anyhow::Result<String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     loop {
-        let (mut conn, _) = listener.accept().await?;
-        let Some(target) = read_request_target(&mut conn).await else {
-            continue;
+        let (mut conn, target) = tokio::select! {
+            accepted = listener.accept() => {
+                let (mut conn, _) = accepted?;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let read = tokio::time::timeout(
+                        REQUEST_READ_TIMEOUT,
+                        read_request_target(&mut conn),
+                    );
+                    if let Ok(Some(target)) = read.await {
+                        let _ = tx.send((conn, target)).await;
+                    }
+                });
+                continue;
+            }
+            Some(request) = rx.recv() => request,
         };
         let Some(query) = target
             .strip_prefix(CALLBACK_PATH)
@@ -726,7 +756,13 @@ mod tests {
             assert_eq!(redirect.path(), "/callback");
             *challenge.lock().unwrap() = Some(q["code_challenge"].clone());
             let back = format!("{}?code=the-code&state={}", q["redirect_uri"], q["state"]);
+            let port = redirect.port().expect("port");
             tokio::spawn(async move {
+                // A connection that sends nothing, as a browser's speculative
+                // connection does, must not hold up the callback.
+                let _silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("silent connection");
                 let page = reqwest::get(back).await.expect("callback");
                 assert!(page.status().is_success());
             });
@@ -780,8 +816,9 @@ mod tests {
     async fn a_sign_in_with_no_held_item_is_a_new_instance() {
         let gh = fake_github("octocat").await;
         let keychain = MemoryKeychain::default();
-        let (first, _, _) = login_with(&keychain, &gh, None, true, &no_browser).await;
+        let (first, _, err) = login_with(&keychain, &gh, None, true, &no_browser).await;
         assert!(first.new_instance);
+        assert!(err.contains(INSTALL_NOTE), "{err}");
         keychain.clear();
         let (after_logout, _, _) = login_with(&keychain, &gh, None, true, &no_browser).await;
         assert!(after_logout.new_instance);
@@ -810,13 +847,56 @@ mod tests {
             refresh_token: "ghr_old".into(),
         };
         keychain.write(&held, &old).expect("seed");
-        let (stored, _, _) = login_with(&keychain, &gh, None, true, &no_browser).await;
+        let (stored, _, err) = login_with(&keychain, &gh, None, true, &no_browser).await;
         assert!(!stored.new_instance);
+        assert!(!err.contains(INSTALL_NOTE), "{err}");
         assert_eq!(stored.metadata.instance, held.instance);
         let material = keychain.material().expect("read").expect("held");
         assert_eq!(material.access_token, ACCESS);
         assert_eq!(material.refresh_token, REFRESH);
         assert!(stored.metadata.token_expires_at > 1);
+    }
+
+    /// A keychain that refuses every read and records whether a write came.
+    #[derive(Default)]
+    struct RefusingKeychain {
+        wrote: std::sync::atomic::AtomicBool,
+    }
+
+    impl Keychain for RefusingKeychain {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            Err(signin::SignInError::Keychain {
+                action: "read the sign-in",
+                detail: "locked".into(),
+            })
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.metadata().map(|_| None)
+        }
+        fn write(&self, _: &Metadata, _: &Material) -> Result<(), signin::SignInError> {
+            self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // BEP-002: a refused read is not "no item held", so it mints no instance
+    #[tokio::test]
+    async fn re_login_with_a_refused_keychain_read_writes_nothing() {
+        let gh = fake_github("octocat").await;
+        let keychain = RefusingKeychain::default();
+        let login = Login {
+            keychain: &keychain,
+            endpoints: &gh.endpoints,
+            client_secret: None,
+            device: true,
+            open_browser: &no_browser,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let e = run_login(&login, &mut out, &mut err)
+            .await
+            .expect_err("refused read");
+        assert!(format!("{e:#}").contains("locked"), "{e:#}");
+        assert!(!keychain.wrote.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn held(token_expires_at: u64, refresh_expires_at: u64) -> MemoryKeychain {

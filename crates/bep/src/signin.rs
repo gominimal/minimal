@@ -287,8 +287,14 @@ pub fn store_sign_in(
         return Err(SignInError::Account);
     }
     // A damaged item is replaced by a new instance: no reference can be
-    // known to name it.
-    let held = keychain.metadata().ok().flatten();
+    // known to name it. Any other failure to read the item stops the
+    // sign-in before the write, so a refused read never mints a new
+    // instance over a held item.
+    let held = match keychain.metadata() {
+        Ok(held) => held,
+        Err(SignInError::Corrupt(_)) => None,
+        Err(e) => return Err(e),
+    };
     let (instance, new_instance) = match held {
         Some(held) if held.account == completed.account => (held.instance, false),
         _ => (new_instance_id()?, true),
@@ -532,21 +538,29 @@ mod host {
 mod host {
     use super::{LABEL, SERVICE, SignInError, run};
     use std::process::Command;
+    use zeroize::Zeroize as _;
 
     const SECRET_TOOL: &str = "secret-tool";
-    const META_ATTR: &str = "minimal-metadata";
+
+    /// The item's label: the fixed label, then the metadata. The item's one
+    /// attribute is `service`, so every write matches the held item's
+    /// attributes and `secret-tool store` replaces it in place.
+    fn label(metadata: &str) -> String {
+        format!("{LABEL}: {metadata}")
+    }
 
     pub(super) fn metadata() -> Result<Option<String>, SignInError> {
         let mut cmd = Command::new(SECRET_TOOL);
         cmd.args(["search", "service", SERVICE]);
-        let out = run("read the sign-in", cmd, None)?;
-        // `secret-tool search` prints `attribute.<name> = <value>` lines,
-        // and nothing when no item matches.
-        let text = String::from_utf8_lossy(&out.stdout);
-        let prefix = format!("attribute.{META_ATTR} = ");
-        let found = text
+        let mut out = run("read the sign-in", cmd, None)?;
+        // `secret-tool search` prints `label = <label>` and, on its own
+        // line, `secret = <secret>`, and nothing when no item matches. Only
+        // the label is kept, and the captured output is zeroized.
+        let prefix = format!("label = {LABEL}: ");
+        let found = String::from_utf8_lossy(&out.stdout)
             .lines()
             .find_map(|l| l.strip_prefix(&prefix).map(str::to_owned));
+        out.stdout.zeroize();
         if found.is_none() && !out.status.success() && !out.stderr.is_empty() {
             return Err(refused("read the sign-in", &out.stderr));
         }
@@ -567,20 +581,15 @@ mod host {
     }
 
     pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
-        // The Secret Service replaces the item whose `service` attribute
-        // matches only when every attribute matches, so the old item goes
-        // first.
-        let mut clear = Command::new(SECRET_TOOL);
-        clear.args(["clear", "service", SERVICE]);
-        run("write the sign-in", clear, None)?;
+        // The Secret Service replaces the item whose attributes all match.
+        // The one attribute is `service`, so the store replaces the held
+        // item in place, and a failed store leaves the held item as it was.
         let mut cmd = Command::new(SECRET_TOOL);
         cmd.args([
             "store",
-            &format!("--label={LABEL}"),
+            &format!("--label={}", label(metadata)),
             "service",
             SERVICE,
-            META_ATTR,
-            metadata,
         ]);
         let out = run("write the sign-in", cmd, Some(secret))?;
         if !out.status.success() {
