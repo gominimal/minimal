@@ -197,7 +197,7 @@ jobs:
               # pre-installed Rust toolchain on ubuntu-latest lives in
               # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
               # `rustup target add` below still resolves.
-              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+              uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -265,25 +265,25 @@ jobs:
               # checked bytes.
               run: scripts/check-zoned-links.sh target/x86_64-unknown-linux-musl/release/minzoned-linux-amd64
             - name: Upload binary (minzoned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minzoned-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minzoned-linux-amd64
                   retention-days: 7
             - name: Upload binary (mip)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: mip-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/mip-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimal-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimal-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimald)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
@@ -316,7 +316,7 @@ jobs:
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
                   echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
@@ -338,7 +338,7 @@ jobs:
               #
               # Runs BEFORE checkout: the action copies a `bc` binary into its
               # working dir, which dirty's the checkout.
-              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+              uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -395,25 +395,25 @@ jobs:
               # See the amd64 job: the gate runs again on the file that uploads.
               run: scripts/check-zoned-links.sh target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
             - name: Upload binary (minzoned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minzoned-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimal-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
                   retention-days: 7
             - name: Upload binary (mip)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: mip-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
                   retention-days: 7
             - name: Upload binary (minimald)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
@@ -435,7 +435,7 @@ jobs:
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
                   echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
@@ -660,13 +660,13 @@ jobs:
                     echo "$name: Accepted"
                   done
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-macos-arm64
                   path: target/release/minvmd-macos-arm64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
@@ -728,7 +728,7 @@ jobs:
               # One artifact, one flat file per bundle file: the release job's
               # merge-multiple download drops each beside the other
               # artifacts under its flat name.
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minzoned-macos-arm64
                   path: target/release/minzoned-flat/
@@ -767,7 +767,7 @@ jobs:
               # it, re-signs with Developer ID, and re-uploads under the final
               # `libkrun-macos-arm64` name. The release job drops any leftover
               # `temp-` artifact so the ad-hoc copy never ships.
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: temp-libkrun-macos-arm64
                   path: ${{ runner.temp }}/temp-libkrun-macos-arm64.dylib
@@ -787,7 +787,7 @@ jobs:
         needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
         steps:
             - name: Download unsigned macOS artifacts (temp)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: temp-*
                   path: ${{ runner.temp }}/unsigned
@@ -821,14 +821,14 @@ jobs:
                     codesign --verify --strict --verbose=2 "$f"
                   done
             - name: Upload signed libkrun dylib
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: libkrun-macos-arm64
                   path: ${{ runner.temp }}/signed/libkrun-macos-arm64.dylib
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload signed gvproxy (darwin-arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
@@ -896,49 +896,49 @@ jobs:
               # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: virtio-kernel-amd64
                   path: ${{ runner.temp }}/vmlinuz-amd64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload kernel (arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: virtio-kernel-arm64
                   path: ${{ runner.temp }}/vmlinuz-arm64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload rootfs (amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-rootfs-amd64
                   path: ${{ runner.temp }}/rootfs-amd64.img
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload rootfs (arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-rootfs-arm64
                   path: ${{ runner.temp }}/rootfs-arm64.img
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (linux-amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: gvproxy-linux-amd64
                   path: ${{ runner.temp }}/gvproxy-linux-amd64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (linux-arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: gvproxy-linux-arm64
                   path: ${{ runner.temp }}/gvproxy-linux-arm64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (darwin-arm64, temp/unsigned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: temp-gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/temp-gvproxy-darwin-arm64
@@ -963,12 +963,12 @@ jobs:
             - name: Install cpio
               run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cpio
             - name: Download minimald (amd64)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-amd64
                   path: prebuilt
             - name: Download minimald (arm64)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-arm64
                   path: prebuilt
@@ -983,14 +983,14 @@ jobs:
                   MINIMALD_BIN="$PWD/prebuilt/minimald-linux-arm64" \
                     ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-arm64.cpio"
             - name: Upload initramfs (amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-initramfs-amd64
                   path: ${{ runner.temp }}/initramfs-amd64.cpio
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload initramfs (arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-initramfs-arm64
                   path: ${{ runner.temp }}/initramfs-arm64.cpio
@@ -1007,7 +1007,7 @@ jobs:
             version: ${{ steps.read.outputs.version }}
         steps:
             - name: Download minimald (amd64)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-amd64
             - name: Read version from the built binary
@@ -1086,14 +1086,14 @@ jobs:
               # nightly it names the release the commits are heading toward.
               run: scripts/next-version.sh --notes "$RUNNER_TEMP/notes.md"
             - name: Upload release notes
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: release-notes
                   path: ${{ runner.temp }}/notes.md
                   if-no-files-found: error
                   retention-days: 7
             - name: Download artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
@@ -1207,13 +1207,13 @@ jobs:
               with:
                   persist-credentials: false
             - name: Download artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
                   merge-multiple: true
             - name: Download release notes
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: release-notes
                   path: ${{ runner.temp }}/notes
@@ -1267,12 +1267,12 @@ jobs:
               with:
                   persist-credentials: false
             - name: Download shipped min
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimal-linux-amd64
                   path: ${{ runner.temp }}/bin
             - name: Download shipped minimald
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-amd64
                   path: ${{ runner.temp }}/bin
@@ -1349,23 +1349,23 @@ jobs:
               # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
               # host — it ships inside the initramfs). `*-linux-amd64` is a clean
               # glob here: only darwin artifacts carry the `temp-` prefix.
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: "*-linux-amd64"
                   path: ${{ runner.temp }}/bin
                   merge-multiple: true
             - name: Download shipped guest kernel
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: virtio-kernel-amd64
                   path: ${{ runner.temp }}/guest
             - name: Download shipped guest rootfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-rootfs-amd64
                   path: ${{ runner.temp }}/guest
             - name: Download shipped guest initramfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-initramfs-amd64
                   path: ${{ runner.temp }}/guest
@@ -1428,7 +1428,7 @@ jobs:
                   sudo pkill -f __krun-vmm || true
             - name: Upload guest boot console log
               if: always()
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: smoke-linux-kvm-boot-log
                   path: ${{ runner.temp }}/cli-e2e-boot.log
@@ -1460,37 +1460,37 @@ jobs:
                   # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
             - name: Download signed CLI (min)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimal-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed minvmd
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed libkrun dylib
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: libkrun-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed gvproxy
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest kernel
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: virtio-kernel-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest rootfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-rootfs-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest initramfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-initramfs-arm64
                   path: ${{ runner.temp }}/dl
@@ -1548,7 +1548,7 @@ jobs:
                   pkill -f gvproxy 2>/dev/null || true
             - name: Upload guest boot console log
               if: always()
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: smoke-macos-boot-log
                   path: ${{ runner.temp }}/cli-e2e-boot.log
