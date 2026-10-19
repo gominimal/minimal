@@ -114,6 +114,8 @@ pub trait HeldKey {
     fn exportable(&self) -> bool;
 
     /// The raw ECDH shared secret (the x-coordinate) with `peer`.
+    /// [`seal::open_held`](crate::seal::open_held) opens a sealed value
+    /// through it, so the private half stays in the store.
     ///
     /// # Errors
     ///
@@ -629,7 +631,15 @@ mod keychain {
                 role,
                 detail: err.to_string(),
             })?;
-            let key = KeychainKey::new(role, key)?;
+            let key = match KeychainKey::new(role, key) {
+                Ok(key) => key,
+                Err(err) => {
+                    // The keychain stored the key. Remove it, so that a
+                    // failed first start leaves no key behind.
+                    drop(self.remove(role));
+                    return Err(err);
+                }
+            };
             if key.exportable() {
                 // Never keep a key the keychain lets out.
                 drop(self.remove(role));
@@ -668,7 +678,7 @@ pub(crate) mod memory {
     use zeroize::Zeroizing;
 
     use super::{HeldKey, KeyError, KeyStore, Role};
-    use crate::seal::{self, Binding, OpenError, Opened, ProxyKey, ProxyPublicKey};
+    use crate::seal::{self, Binding, OpenError, Opened, ProxyPublicKey};
 
     #[derive(Default)]
     struct Inner {
@@ -750,9 +760,7 @@ pub(crate) mod memory {
     impl MemoryKey {
         /// Opens a sealed value under this key.
         pub(crate) fn open(&self, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
-            let bytes: [u8; 32] = self.secret.to_bytes().into();
-            let key = ProxyKey::from_bytes(&bytes).ok_or(OpenError::NotOpenable)?;
-            seal::open(&key, sealed, expected)
+            seal::open_held(self, sealed, expected)
         }
     }
 
