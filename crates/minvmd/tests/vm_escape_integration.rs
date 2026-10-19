@@ -669,6 +669,7 @@ impl BoxSession {
             let req = FinalizeSessionRequest {
                 session_id,
                 report_shared_port_collisions: false,
+                report_published_address: false,
             };
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;

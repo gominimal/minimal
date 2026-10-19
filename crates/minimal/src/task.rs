@@ -883,6 +883,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         &collected_patches,
         &hook_scripts,
         finalize_hook_budget,
+        // A task's session declares no `--ingress` ports: the ephemeral
+        // box's forwards are dynamic, so there is nothing to probe.
+        &[],
     )
     .await
     {

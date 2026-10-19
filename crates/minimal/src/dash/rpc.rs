@@ -617,6 +617,7 @@ pub async fn activate(
                 // The dashboard's status line does not render the yielded
                 // ports, so it does not ask for them.
                 report_shared_port_collisions: false,
+                report_published_address: false,
             })
             .await
             .context("FinalizeSession RPC failed")?

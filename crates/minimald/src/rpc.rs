@@ -1139,6 +1139,12 @@ async fn serve_finalize_session(
                     if !req.report_shared_port_collisions {
                         response.shared_port_collisions.clear();
                     }
+                    // Same gate for the published address, for the same
+                    // reason: only a client that asked to probe the declared
+                    // host ports is answered with the address they bind on.
+                    if !req.report_published_address {
+                        response.published_address = None;
+                    }
                     Errorable::Ok(response)
                 }
                 Err(e) => Errorable::Err {

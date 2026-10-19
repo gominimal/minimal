@@ -1928,7 +1928,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // Published on the node's shared loopback address — the shared-address
     // lane this proof has always exercised — so the host connect below, to
     // 127.0.0.1:EXTERNAL, is the address the forward is bound on.
-    let exposed = apply_ingress(
+    let applied = apply_ingress(
         &control,
         std::net::Ipv4Addr::LOCALHOST,
         lease.ip,
@@ -1938,6 +1938,11 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     )
     .await
     .expect("apply ingress");
+    assert!(
+        applied.skipped.is_empty(),
+        "no port should be skipped in this proof"
+    );
+    let exposed = applied.bound;
 
     // From the host, connect to 127.0.0.1:EXTERNAL; gvproxy forwards the
     // connection into the PTask's listener over the switch. Retry until the

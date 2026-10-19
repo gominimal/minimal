@@ -395,7 +395,7 @@ async fn finish_own_ip_attach(
     // not this box's publish: tasks declare no ingress, so they never reach
     // for a published address at all.
     let published = own_address.and_then(|reporter| reporter.published_address());
-    let exposed = match (ingress, published) {
+    let exposed: Vec<PortForwarder> = match (ingress, published) {
         (Some(ingress), _) if ingress.port_mappings.is_empty() => Vec::new(),
         (Some(ingress), Some(published)) => {
             // The ports this box yields at a shared address (NET-129,
@@ -409,7 +409,26 @@ async fn finish_own_ip_attach(
             )
             .await
             {
-                Ok(exposed) => exposed,
+                Ok(applied) => {
+                    // A declared port the host already holds is the yield's
+                    // one rung down: another process, not another box, keeps
+                    // it — and the attach goes on the same way, because a box
+                    // that cannot win that bind can still serve every other
+                    // forward it declared. One warn per skipped port here,
+                    // with the session's name, so the log tail names what the
+                    // box is not forwarding alongside the binds it is.
+                    for port in &applied.skipped {
+                        tracing::warn!(
+                            port,
+                            address = %published,
+                            session = session_name,
+                            action = "host-port-in-use",
+                            "declared ingress port not bound: the host port \
+                             is already in use on this machine"
+                        );
+                    }
+                    applied.bound
+                }
                 // The failure is already said — one warn per failed bind,
                 // with the port and the reason, where the bind happened — so
                 // no aggregate line re-tells it here. The attach fails: no

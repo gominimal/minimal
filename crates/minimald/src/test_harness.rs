@@ -803,6 +803,7 @@ pub async fn create_configured_session(
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
+            report_published_address: false,
         })
         .await
     {

@@ -1634,6 +1634,12 @@ pub(crate) async fn activate_session(
             &collected_patches,
             &hook_scripts,
             finalize_hook_budget,
+            config
+                .policy
+                .ingress
+                .as_ref()
+                .map(|ingress| ingress.port_mappings.as_slice())
+                .unwrap_or_default(),
         ),
     )
     .await

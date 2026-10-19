@@ -517,6 +517,7 @@ async fn attach_from_elsewhere_during_activation_is_refused_until_the_creator_fi
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id,
             report_shared_port_collisions: false,
+            report_published_address: false,
         })
         .await
     {
@@ -2104,6 +2105,7 @@ async fn session_with_hook(
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
+            report_published_address: false,
         })
         .await
     {
@@ -2264,6 +2266,7 @@ async fn activate_hook_output_reaches_the_client() {
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
+            report_published_address: false,
         })
         .await
     {
@@ -2523,6 +2526,7 @@ async fn a_failing_activate_hook_blocks_the_session() {
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
+            report_published_address: false,
         })
         .await
     {
@@ -3419,7 +3423,9 @@ async fn finalize_session(
 
 /// [`finalize_session`] with the request's
 /// `report_shared_port_collisions` flag chosen by the caller — `false` is
-/// the request a client that predates the flag sends.
+/// the request a client that predates the flag sends. The
+/// `report_published_address` flag asks alongside: a test reading the
+/// reply's address probes declared host ports the way the CLI does.
 async fn finalize_session_asking(
     client: &mut TestClient,
     id: SessionId,
@@ -3430,6 +3436,7 @@ async fn finalize_session_asking(
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions,
+            report_published_address: report_shared_port_collisions,
         })
         .await
     {
@@ -4563,6 +4570,7 @@ async fn a_failed_activate_hook_s_publish_is_withdrawn_by_the_destroy() {
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
+            report_published_address: false,
         })
         .await
     {
@@ -5243,6 +5251,7 @@ async fn a_restored_hostname_collision_is_logged_and_skipped() {
             .call::<FinalizeSession>(&FinalizeSessionRequest {
                 session_id: id,
                 report_shared_port_collisions: false,
+                report_published_address: false,
             })
             .await
         {
@@ -5310,6 +5319,7 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() 
             .call::<FinalizeSession>(&FinalizeSessionRequest {
                 session_id: id,
                 report_shared_port_collisions: false,
+                report_published_address: false,
             })
             .await
         {

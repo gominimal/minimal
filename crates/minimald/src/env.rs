@@ -3503,6 +3503,7 @@ exit $rc
             .call::<FinalizeSession>(&FinalizeSessionRequest {
                 session_id: id,
                 report_shared_port_collisions: false,
+                report_published_address: false,
             })
             .await
             .unwrap();

@@ -2811,10 +2811,35 @@ impl BoxActor {
                 let mut record = self.record.record().await?;
                 record.status = BoxState::Active;
                 self.record.write(record.clone()).await?;
+                // The address this box publishes its ingress forwards on,
+                // read from the registry the registration above wrote — the
+                // same standing-publish read a later registration upgrades
+                // through, so it names the address the box publishes at
+                // right now, whether that is its own hand, a drawn grant,
+                // or the `127.0.0.1` interim. Filled unconditionally here;
+                // `serve_finalize_session` keeps it only for a client that
+                // asked, for the same `deny_unknown_fields` reason as the
+                // collisions list.
+                let published_address = if matches!(record.network, boxes::NetworkMode::OwnIp) {
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.hostnames
+                            .read()
+                            .expect("hostname registry lock poisoned")
+                            .published_own_address(record.id)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        None
+                    }
+                } else {
+                    None
+                };
                 Ok(minimald_rpc::FinalizeSessionResponse {
                     activate_hooks: ran,
                     package_check_skipped,
                     shared_port_collisions,
+                    published_address,
                 })
             }
             BoxState::Pending => Err(std::io::Error::new(
