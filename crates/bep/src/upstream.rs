@@ -33,6 +33,9 @@ pub struct UpstreamKey {
 #[derive(Debug)]
 pub struct Upstream<C> {
     key: UpstreamKey,
+    /// The box's epoch at checkout. [`UpstreamPool::drop_box`] moves the
+    /// epoch on, so a connection checked out before it is not taken back.
+    epoch: u64,
     /// The connection itself.
     pub conn: C,
 }
@@ -54,13 +57,30 @@ impl<C> Upstream<C> {
 /// The idle upstream connections, keyed per box and authority.
 #[derive(Debug)]
 pub struct UpstreamPool<C> {
-    idle: Mutex<HashMap<UpstreamKey, Vec<C>>>,
+    state: Mutex<PoolState<C>>,
+}
+
+#[derive(Debug)]
+struct PoolState<C> {
+    idle: HashMap<UpstreamKey, Vec<C>>,
+    /// The epoch of each box id that [`UpstreamPool::drop_box`] dropped. A
+    /// box id with no entry is at epoch 0.
+    epochs: HashMap<String, u64>,
+}
+
+impl<C> PoolState<C> {
+    fn epoch(&self, box_id: &str) -> u64 {
+        self.epochs.get(box_id).copied().unwrap_or(0)
+    }
 }
 
 impl<C> Default for UpstreamPool<C> {
     fn default() -> Self {
         Self {
-            idle: Mutex::new(HashMap::new()),
+            state: Mutex::new(PoolState {
+                idle: HashMap::new(),
+                epochs: HashMap::new(),
+            }),
         }
     }
 }
@@ -90,29 +110,34 @@ impl<C> UpstreamPool<C> {
             host: host.to_ascii_lowercase(),
             port,
         };
-        let reused = {
-            let mut idle = self.lock();
-            let conn = idle.get_mut(&key).and_then(Vec::pop);
-            if idle.get(&key).is_some_and(Vec::is_empty) {
-                idle.remove(&key);
+        let (reused, epoch) = {
+            let mut state = self.lock();
+            let epoch = state.epoch(box_id);
+            let conn = state.idle.get_mut(&key).and_then(Vec::pop);
+            if state.idle.get(&key).is_some_and(Vec::is_empty) {
+                state.idle.remove(&key);
             }
-            conn
+            (conn, epoch)
         };
         let conn = match reused {
             Some(conn) => conn,
             None => connect()?,
         };
-        Ok(Upstream { key, conn })
+        Ok(Upstream { key, epoch, conn })
     }
 
     /// Put a connection back as idle, under the box and authority it came
     /// from. The caller gives back only a connection whose last response
     /// ended cleanly. A connection the proxy closed is dropped instead.
     /// When the key already holds [`MAX_IDLE_PER_KEY`] idle connections,
-    /// the pool drops this one.
+    /// the pool drops this one. A connection checked out before
+    /// [`Self::drop_box`] ran for its box is dropped too.
     pub fn checkin(&self, upstream: Upstream<C>) {
-        let mut idle = self.lock();
-        let list = idle.entry(upstream.key).or_default();
+        let mut state = self.lock();
+        if state.epoch(&upstream.key.box_id) != upstream.epoch {
+            return;
+        }
+        let list = state.idle.entry(upstream.key).or_default();
         if list.len() < MAX_IDLE_PER_KEY {
             list.push(upstream.conn);
         }
@@ -121,29 +146,33 @@ impl<C> UpstreamPool<C> {
     /// The number of keys that hold idle connections.
     #[must_use]
     pub fn idle_keys(&self) -> usize {
-        self.lock().len()
+        self.lock().idle.len()
     }
 
     /// Drop every idle connection of `box_id`, for example when the box
-    /// ends.
+    /// ends. A connection of the box that is checked out now is dropped
+    /// when it is given back, so a later box with the same id never gets it.
     pub fn drop_box(&self, box_id: &str) {
-        self.lock().retain(|key, _| key.box_id != box_id);
+        let mut state = self.lock();
+        state.idle.retain(|key, _| key.box_id != box_id);
+        *state.epochs.entry(box_id.to_owned()).or_default() += 1;
     }
 
     /// The number of idle connections of `box_id`.
     #[must_use]
     pub fn idle_count(&self, box_id: &str) -> usize {
         self.lock()
+            .idle
             .iter()
             .filter(|(key, _)| key.box_id == box_id)
             .map(|(_, conns)| conns.len())
             .sum()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<UpstreamKey, Vec<C>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState<C>> {
         // A panic while the lock is held leaves only a list of idle
-        // connections, which stays consistent.
-        self.idle
+        // connections and the epochs, which stay consistent.
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -221,5 +250,21 @@ mod tests {
         pool.checkin(b_last);
         assert_eq!(pool.idle_count("box-b"), MAX_IDLE_PER_KEY + 1);
         assert_eq!(pool.idle_keys(), 2);
+
+        // A connection checked out when its box is dropped is not taken
+        // back, so a later box with the same id never gets it.
+        let held = pool.checkout("box-c", "github.com", 443, connect).unwrap();
+        let held_conn = held.conn;
+        pool.drop_box("box-c");
+        pool.checkin(held);
+        assert_eq!(pool.idle_count("box-c"), 0);
+        let fresh = pool.checkout("box-c", "github.com", 443, connect).unwrap();
+        assert_ne!(fresh.conn, held_conn);
+        pool.checkin(fresh);
+        assert_eq!(
+            pool.idle_count("box-c"),
+            1,
+            "the new box's connection is kept"
+        );
     }
 }
