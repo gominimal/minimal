@@ -5,8 +5,12 @@
 //! writer.
 //!
 //! A record is built from a [`Decision`] alone. A `Decision` has no field
-//! for a credential, an injected header value or a request body, so a record
-//! cannot carry one (BEP-040).
+//! for a credential, an injected header value or a request body (BEP-040).
+//! Its string fields are free text, so the type alone does not stop a
+//! caller from putting a secret in one. The proxy fills them from the box
+//! id, the request authority and the module's mapping, and never from a
+//! sealed value or a header. A charset or length check cannot tell a token
+//! from an identifier, so this module does not try.
 //!
 //! Each record carries `previous_hash`: the lowercase hex SHA-256 of the
 //! previous record's line, as UTF-8 JSON bytes without the trailing newline.
@@ -167,8 +171,8 @@ impl Record {
 
 /// The lowercase hex SHA-256 of `line`, the bytes without the trailing
 /// newline.
-pub fn line_hash(line: &str) -> String {
-    let digest = Sha256::digest(line.as_bytes());
+pub fn line_hash(line: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(line.as_ref());
     let mut out = String::with_capacity(64);
     for byte in digest {
         out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
@@ -178,13 +182,44 @@ pub fn line_hash(line: &str) -> String {
 }
 
 /// The hash the next record of the log in `contents` carries: the hash of
-/// its last line, or [`ZERO_HASH`] for an empty log.
-pub fn head_hash(contents: &str) -> String {
+/// its last line, or [`ZERO_HASH`] for an empty log. The hash covers the
+/// raw bytes of the line, so a line that is not valid UTF-8 hashes as it
+/// is on disk.
+pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
     contents
-        .lines()
+        .as_ref()
+        .split(|&b| b == b'\n')
         .rev()
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .find(|line| !line.is_empty())
         .map_or_else(|| ZERO_HASH.to_owned(), line_hash)
+}
+
+/// Fails unless `file` is a regular file and is the entry at `path` itself,
+/// not a file that a symlink at `path` leads to.
+fn ensure_own_file(path: &Path, file: &File) -> io::Result<()> {
+    let refuse = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("audit log {} {why}", path.display()),
+        ))
+    };
+    let entry = fs::symlink_metadata(path)?;
+    if entry.file_type().is_symlink() {
+        return refuse("is a symlink");
+    }
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return refuse("is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if (entry.dev(), entry.ino()) != (opened.dev(), opened.ino()) {
+            return refuse("changed while it was opened");
+        }
+    }
+    Ok(())
 }
 
 /// The audit log, open for append only.
@@ -211,17 +246,6 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("audit log {} is a symlink", path.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
         let mut options = OpenOptions::new();
         options.append(true).create(true);
         #[cfg(unix)]
@@ -230,6 +254,9 @@ impl AuditLog {
             options.mode(0o600);
         }
         let file = options.open(&path)?;
+        // Checked after the open, against the open file, so a link swapped
+        // in between a check and the open cannot slip through.
+        ensure_own_file(&path, &file)?;
         // One writer per log: a second one would chain to the same head.
         file.try_lock().map_err(|err| match err {
             fs::TryLockError::WouldBlock => io::Error::new(
@@ -251,7 +278,7 @@ impl AuditLog {
             );
             file.set_len(complete as u64)?;
         }
-        let head = head_hash(&String::from_utf8_lossy(&contents[..complete]));
+        let head = head_hash(&contents[..complete]);
         Ok(Self {
             path,
             file,
@@ -469,6 +496,20 @@ mod tests {
         assert_eq!(log.head(), line_hash(&written[2]));
         // The line is the record's own serialization, byte for byte.
         assert_eq!(records[2].to_line(), written[2]);
+        drop(log);
+
+        // A last line that is not UTF-8 chains by its raw bytes.
+        let raw = b"{\"subject\":\"\xff\xfe\"}";
+        let mut file = OpenOptions::new().append(true).open(dir.log()).unwrap();
+        file.write_all(raw).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let log = AuditLog::open(dir.log()).unwrap();
+        let expected: String = Sha256::digest(raw)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(log.head(), expected);
     }
 
     // BEP-048: a torn tail from an interrupted append is cut off on open,
@@ -550,6 +591,19 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = fs::metadata(dir.log()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(log);
+
+        // A symlink at the log's path is refused, and its target is kept.
+        #[cfg(unix)]
+        {
+            let target = dir.0.join("elsewhere");
+            fs::write(&target, b"keep\n").unwrap();
+            let link = dir.0.join("state").join("linked.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let err = AuditLog::open(&link).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(&target).unwrap(), b"keep\n");
         }
     }
 
