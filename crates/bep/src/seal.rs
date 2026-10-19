@@ -6,13 +6,15 @@
 //! §4.6), in direct mode, so the encrypted-key segment is empty. The content
 //! encryption is A256GCM.
 //!
-//! The bound context is in the JWE protected header: box id, host, module
-//! identifier, host-set version, mode, issue time, expiry and `kid`, the
+//! The bound context is in the JWE protected header, with the member names of
+//! Gatehouse §6.10: `sub` (the box id), `node_id` (the host), `upstream`
+//! (`{"module", "host_set_version"}`), `mode`, `iat`, `exp` and `kid`, the
 //! proxy key's fingerprint. A256GCM authenticates the protected header as its
 //! associated data, so a change to any byte of the context makes the value
 //! fail to open. The plaintext is the member list, as JSON:
-//! `{"members": [{"breadth": ..., "exp": ..., "credential": ...}],
-//! "default_owner": ...}`. A v1 value carries exactly one member.
+//! `{"members": [{"kind": "signin", "breadth": "full", "jws": ..., "exp"?: ...}],
+//! "default_owner"?: ...}`. A v1 value carries exactly one member, and
+//! [`open`] refuses a member of unknown `kind`.
 //!
 //! [`open`] refuses a value sealed to another key, a value that does not
 //! decrypt, a value bound to another box, host or module, and a value past
@@ -74,7 +76,14 @@ pub enum Mode {
     /// The member acts as the signed-in user.
     User,
     /// The member acts as a GitHub App installation.
-    App,
+    Installation,
+}
+
+/// What a member is. Its wire name is the member's `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberKind {
+    /// A reference to the host's GitHub sign-in (BEP-005).
+    SignIn,
 }
 
 /// How much of the module's authority a member carries.
@@ -173,24 +182,28 @@ impl fmt::Display for BoundField {
     }
 }
 
-/// One entry of the member list: its breadth, its expiry and its
-/// credential.
+/// One entry of the member list: its kind, its breadth, its signed handle
+/// and its expiry, if it has one.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Member {
+    /// The member's kind.
+    pub kind: MemberKind,
     /// The member's breadth.
     pub breadth: Breadth,
-    /// The member's expiry, in seconds since the Unix epoch.
-    pub exp: u64,
-    /// The credential or sign-in reference. Zeroed on drop.
-    pub credential: Zeroizing<Vec<u8>>,
+    /// The signed handle, a compact JWS. Zeroed on drop.
+    pub jws: Zeroizing<String>,
+    /// The member's own expiry, in seconds since the Unix epoch. [`open`]
+    /// checks it only when it is present.
+    pub exp: Option<u64>,
 }
 
 impl fmt::Debug for Member {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Member")
+            .field("kind", &self.kind)
             .field("breadth", &self.breadth)
+            .field("jws", &"<redacted>")
             .field("exp", &self.exp)
-            .field("credential", &"<redacted>")
             .finish()
     }
 }
@@ -318,8 +331,8 @@ pub enum OpenError {
     /// A bound field differs from the expected binding.
     #[error("the sealed value is bound to a different {0}")]
     ContextMismatch(BoundField),
-    /// The value's expiry ([`BoundField::Expiry`]) or the member's `exp` is
-    /// at or before the request's clock time.
+    /// The value's expiry ([`BoundField::Expiry`]), or the member's `exp`
+    /// when it has one, is at or before the request's clock time.
     #[error("the sealed value is past its expiry")]
     Expired,
     /// The plaintext is not a member list of exactly one member.
@@ -328,6 +341,9 @@ pub enum OpenError {
     /// The member's breadth is missing or not one this proxy knows.
     #[error("the sealed member has a missing or unknown breadth")]
     UnknownBreadth,
+    /// The member's kind is missing or not one this proxy knows.
+    #[error("the sealed member has a missing or unknown kind")]
+    UnknownKind,
 }
 
 /// Seals `members` to `recipient`, bound to `context`. Returns the compact
@@ -394,14 +410,14 @@ fn seal_plaintext(
 /// # Errors
 ///
 /// [`OpenError::ContextMismatch`] names the first of box id, host and module
-/// that differs. [`OpenError::Expired`] says the value's expiry or the
-/// member's `exp` is at or before `expected.now`. The other variants say the
+/// that differs. [`OpenError::Expired`] says the value's expiry, or the
+/// member's `exp` when it has one, is at or before `expected.now`. The other variants say the
 /// value is malformed, uses an unsupported algorithm, is sealed to another
 /// key or does not decrypt, or carries no list of exactly one member with a
-/// known breadth.
+/// known kind and breadth.
 ///
 /// A value that opens is not proof of who sealed it. The caller must verify
-/// the member's signed credential before it uses it. See the module docs.
+/// the member's signed handle, its `jws`, before it uses it. See the module docs.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
     let mut parts = sealed.split('.');
     let (Some(header_b64), Some(encrypted_key), Some(iv), Some(ciphertext), Some(tag), None) = (
@@ -473,9 +489,9 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
         default_owner,
     } = MemberList::from_json(&plaintext)?;
     let member = members.pop().ok_or(OpenError::BadMembers)?;
-    // The member carries its own expiry. A member past it is refused here,
+    // A member can carry its own expiry. A member past it is refused here,
     // so a caller never has to check `member.exp` itself.
-    if expected.now >= member.exp {
+    if member.exp.is_some_and(|exp| expected.now >= exp) {
         return Err(OpenError::Expired);
     }
     Ok(Opened {
@@ -567,7 +583,7 @@ impl Jwk {
     }
 }
 
-/// The JWE protected header.
+/// The JWE protected header, with the member names of Gatehouse §6.10.
 #[derive(Debug, Serialize, Deserialize)]
 struct Header {
     typ: String,
@@ -575,13 +591,21 @@ struct Header {
     enc: String,
     kid: String,
     epk: Jwk,
+    #[serde(rename = "sub")]
     box_id: String,
+    #[serde(rename = "node_id")]
     host: String,
-    module: String,
-    host_set_version: u32,
+    upstream: Upstream,
     mode: Mode,
     iat: u64,
     exp: u64,
+}
+
+/// The header's `upstream` member: the module id and its host-set version.
+#[derive(Debug, Serialize, Deserialize)]
+struct Upstream {
+    module: String,
+    host_set_version: u32,
 }
 
 impl Header {
@@ -594,8 +618,10 @@ impl Header {
             epk,
             box_id: context.box_id.clone(),
             host: context.host.clone(),
-            module: context.module.clone(),
-            host_set_version: context.host_set_version,
+            upstream: Upstream {
+                module: context.module.clone(),
+                host_set_version: context.host_set_version,
+            },
             mode: context.mode,
             iat: context.iat,
             exp: context.expiry,
@@ -606,8 +632,8 @@ impl Header {
         Context {
             box_id: self.box_id,
             host: self.host,
-            module: self.module,
-            host_set_version: self.host_set_version,
+            module: self.upstream.module,
+            host_set_version: self.upstream.host_set_version,
             mode: self.mode,
             iat: self.iat,
             expiry: self.exp,
@@ -616,7 +642,7 @@ impl Header {
     }
 }
 
-/// The member list as JSON. The credential travels as unpadded base64url.
+/// The member list as JSON.
 #[derive(Serialize, Deserialize)]
 struct WireList {
     members: Vec<WireMember>,
@@ -624,19 +650,37 @@ struct WireList {
     default_owner: Option<String>,
 }
 
-/// One member as JSON. `breadth` reads as an optional string, so a missing
-/// or unknown breadth is told apart from a malformed list.
+/// One member as JSON. `kind` and `breadth` read as optional strings, so a
+/// missing or unknown value is told apart from a malformed list.
 #[derive(Serialize, Deserialize)]
 struct WireMember {
     #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     breadth: Option<String>,
-    exp: u64,
-    credential: String,
+    jws: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    exp: Option<u64>,
 }
 
 impl Drop for WireMember {
     fn drop(&mut self) {
-        self.credential.zeroize();
+        self.jws.zeroize();
+    }
+}
+
+impl MemberKind {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::SignIn => "signin",
+        }
+    }
+
+    fn from_wire(wire: Option<&str>) -> Option<Self> {
+        match wire? {
+            "signin" => Some(Self::SignIn),
+            _ => None,
+        }
     }
 }
 
@@ -662,9 +706,10 @@ impl MemberList {
                 .members
                 .iter()
                 .map(|member| WireMember {
+                    kind: Some(member.kind.as_wire().into()),
                     breadth: Some(member.breadth.as_wire().into()),
+                    jws: member.jws.as_str().into(),
                     exp: member.exp,
-                    credential: URL_SAFE_NO_PAD.encode(member.credential.as_slice()),
                 })
                 .collect(),
             default_owner: self.default_owner.clone(),
@@ -683,16 +728,16 @@ impl MemberList {
             .members
             .iter()
             .map(|member| {
+                let kind =
+                    MemberKind::from_wire(member.kind.as_deref()).ok_or(OpenError::UnknownKind)?;
                 let breadth = Breadth::from_wire(member.breadth.as_deref())
                     .ok_or(OpenError::UnknownBreadth)?;
-                URL_SAFE_NO_PAD
-                    .decode(&member.credential)
-                    .map(|credential| Member {
-                        breadth,
-                        exp: member.exp,
-                        credential: Zeroizing::new(credential),
-                    })
-                    .map_err(|_| OpenError::BadMembers)
+                Ok(Member {
+                    kind,
+                    breadth,
+                    jws: Zeroizing::new(member.jws.clone()),
+                    exp: member.exp,
+                })
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
@@ -707,17 +752,18 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn member(credential: &[u8]) -> Member {
+    fn member(jws: &str) -> Member {
         Member {
+            kind: MemberKind::SignIn,
             breadth: Breadth::Full,
-            exp: 1_900_000_000,
-            credential: Zeroizing::new(credential.to_vec()),
+            jws: Zeroizing::new(jws.into()),
+            exp: Some(1_900_000_000),
         }
     }
 
-    fn members(credential: &[u8]) -> MemberList {
+    fn members(jws: &str) -> MemberList {
         MemberList {
-            members: vec![member(credential)],
+            members: vec![member(jws)],
             default_owner: None,
         }
     }
@@ -737,7 +783,7 @@ mod tests {
             "[a-z0-9.-]{1,40}",
             "[a-z]{1,12}",
             any::<u32>(),
-            prop_oneof![Just(Mode::User), Just(Mode::App)],
+            prop_oneof![Just(Mode::User), Just(Mode::Installation)],
             any::<u64>(),
             1..=u64::MAX,
         )
@@ -761,20 +807,19 @@ mod tests {
         let (header_b64, rest) = sealed.split_once('.').unwrap();
         let mut header: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
-        let name = match field {
-            BoundField::BoxId => "box_id",
-            BoundField::Host => "host",
-            BoundField::Module => "module",
-            BoundField::HostSetVersion => "host_set_version",
-            BoundField::Mode => "mode",
-            BoundField::Iat => "iat",
-            BoundField::Expiry => "exp",
-            BoundField::Kid => "kid",
+        let value = match field {
+            BoundField::BoxId => &mut header["sub"],
+            BoundField::Host => &mut header["node_id"],
+            BoundField::Module => &mut header["upstream"]["module"],
+            BoundField::HostSetVersion => &mut header["upstream"]["host_set_version"],
+            BoundField::Mode => &mut header["mode"],
+            BoundField::Iat => &mut header["iat"],
+            BoundField::Expiry => &mut header["exp"],
+            BoundField::Kid => &mut header["kid"],
         };
-        let value = &mut header[name];
         *value = match value.take() {
-            serde_json::Value::String(s) if s == "user" => "app".into(),
-            serde_json::Value::String(s) if s == "app" => "user".into(),
+            serde_json::Value::String(s) if s == "user" => "installation".into(),
+            serde_json::Value::String(s) if s == "installation" => "user".into(),
             serde_json::Value::String(s) => format!("{s}x").into(),
             serde_json::Value::Number(n) => (n.as_u64().unwrap() ^ 1).into(),
             other => panic!("unexpected header value {other}"),
@@ -807,19 +852,19 @@ mod tests {
                     let kid = ProxyKey::from_bytes(&b).unwrap().public().kid();
                     (Just(b), context_strategy(kid))
                 }),
-            credential in proptest::collection::vec(any::<u8>(), 0..64),
+            jws in "[A-Za-z0-9_-]{0,40}\\.[A-Za-z0-9_-]{0,40}\\.[A-Za-z0-9_-]{0,40}",
             compared in 0..COMPARED.len(),
             carried in 0..CARRIED.len(),
         ) {
             let key = ProxyKey::from_bytes(&key_bytes).unwrap();
-            let sealed = seal(&key.public(), &context, &members(&credential)).unwrap();
+            let sealed = seal(&key.public(), &context, &members(&jws)).unwrap();
 
             // It opens for its own box, host and module before its expiry,
             // whatever the carried mode and host-set version, and returns the
             // carried context and the member with its breadth.
             let opened = open(&key, &sealed, &binding(&context)).unwrap();
             prop_assert_eq!(&opened.context, &context);
-            prop_assert_eq!(&opened.member, &member(&credential));
+            prop_assert_eq!(&opened.member, &member(&jws));
             prop_assert_eq!(opened.default_owner, None);
 
             // At or after its expiry it is refused, and the error names the
@@ -878,7 +923,7 @@ mod tests {
     #[test]
     fn sealed_value_is_a_direct_compact_jwe_with_the_gatehouse_typ() {
         let key = ProxyKey::generate().unwrap();
-        let sealed = seal(&key.public(), &fixed_context(&key), &members(b"ref")).unwrap();
+        let sealed = seal(&key.public(), &fixed_context(&key), &members("h.p.s")).unwrap();
         let parts: Vec<&str> = sealed.split('.').collect();
         assert_eq!(parts.len(), 5);
         assert!(parts[1].is_empty());
@@ -897,7 +942,7 @@ mod tests {
         let other = ProxyKey::generate().unwrap();
         let context = fixed_context(&key);
         assert_eq!(
-            seal(&other.public(), &context, &members(b"ref")).unwrap_err(),
+            seal(&other.public(), &context, &members("h.p.s")).unwrap_err(),
             SealError::KidMismatch
         );
         // Sealed to `other`, relabelled with this key's kid: the agreement
@@ -906,7 +951,7 @@ mod tests {
             kid: other.public().kid(),
             ..context.clone()
         };
-        let sealed = seal(&other.public(), &to_other, &members(b"ref")).unwrap();
+        let sealed = seal(&other.public(), &to_other, &members("h.p.s")).unwrap();
         let (header_b64, rest) = sealed.split_once('.').unwrap();
         let mut header: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
@@ -932,7 +977,7 @@ mod tests {
         assert!(!context.is_expired(context.expiry - 1));
         assert!(context.is_expired(context.expiry));
         assert!(context.is_expired(context.expiry + 1));
-        let sealed = seal(&key.public(), &context, &members(b"ref")).unwrap();
+        let sealed = seal(&key.public(), &context, &members("h.p.s")).unwrap();
         let before = Binding {
             now: context.expiry - 1,
             ..binding(&context)
@@ -951,8 +996,8 @@ mod tests {
         let context = fixed_context(&key);
         let early = MemberList {
             members: vec![Member {
-                exp: context.expiry - 100,
-                ..member(b"ref")
+                exp: Some(context.expiry - 100),
+                ..member("h.p.s")
             }],
             default_owner: None,
         };
@@ -969,30 +1014,85 @@ mod tests {
         assert_eq!(open(&key, &sealed, &after).unwrap_err(), OpenError::Expired);
     }
 
+    // Gatehouse §6.10: the un-enrolled member is `{kind, breadth, jws}`, and
+    // its `exp` is optional. A member with no `exp` opens until the value's
+    // expiry.
+    #[test]
+    fn a_member_with_no_exp_opens_until_the_value_expiry() {
+        let key = ProxyKey::generate().unwrap();
+        let context = fixed_context(&key);
+        let plaintext = br#"{"members":[{"kind":"signin","breadth":"full","jws":"h.p.s"}]}"#;
+        let sealed = seal_plaintext(&key.public(), &context, plaintext).unwrap();
+        let late = Binding {
+            now: context.expiry - 1,
+            ..binding(&context)
+        };
+        let opened = open(&key, &sealed, &late).unwrap();
+        assert_eq!(
+            opened.member,
+            Member {
+                exp: None,
+                ..member("h.p.s")
+            }
+        );
+    }
+
+    #[test]
+    fn the_header_uses_the_gatehouse_member_names() {
+        let key = ProxyKey::generate().unwrap();
+        let context = Context {
+            mode: Mode::Installation,
+            ..fixed_context(&key)
+        };
+        let sealed = seal(&key.public(), &context, &members("h.p.s")).unwrap();
+        let (header_b64, _) = sealed.split_once('.').unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
+        assert_eq!(header["sub"], context.box_id.as_str());
+        assert_eq!(header["node_id"], context.host.as_str());
+        assert_eq!(header["upstream"]["module"], context.module.as_str());
+        assert_eq!(
+            header["upstream"]["host_set_version"],
+            context.host_set_version
+        );
+        assert_eq!(header["mode"], "installation");
+        for gone in ["box_id", "host", "module", "host_set_version"] {
+            assert!(header.get(gone).is_none(), "{gone} is in the header");
+        }
+    }
+
     #[test]
     fn a_list_of_other_than_one_member_or_an_unknown_breadth_is_refused() {
         let key = ProxyKey::generate().unwrap();
         let context = fixed_context(&key);
         let two = MemberList {
-            members: vec![member(b"a"), member(b"b")],
+            members: vec![member("a.b.c"), member("d.e.f")],
             default_owner: None,
         };
         assert_eq!(
             seal(&key.public(), &context, &two).unwrap_err(),
             SealError::MemberCount
         );
-        let cases: [(&[u8], OpenError); 4] = [
+        let cases: [(&[u8], OpenError); 6] = [
             (br#"{"members":[]}"#, OpenError::BadMembers),
             (
-                br#"{"members":[{"breadth":"full","exp":1,"credential":"YQ"},{"breadth":"full","exp":1,"credential":"Yg"}]}"#,
+                br#"{"members":[{"kind":"signin","breadth":"full","jws":"a.b.c"},{"kind":"signin","breadth":"full","jws":"d.e.f"}]}"#,
                 OpenError::BadMembers,
             ),
             (
-                br#"{"members":[{"exp":1,"credential":"YQ"}]}"#,
+                br#"{"members":[{"breadth":"full","jws":"a.b.c"}]}"#,
+                OpenError::UnknownKind,
+            ),
+            (
+                br#"{"members":[{"kind":"token","breadth":"full","jws":"a.b.c"}]}"#,
+                OpenError::UnknownKind,
+            ),
+            (
+                br#"{"members":[{"kind":"signin","jws":"a.b.c"}]}"#,
                 OpenError::UnknownBreadth,
             ),
             (
-                br#"{"members":[{"breadth":"repo","exp":1,"credential":"YQ"}]}"#,
+                br#"{"members":[{"kind":"signin","breadth":"repo","jws":"a.b.c"}]}"#,
                 OpenError::UnknownBreadth,
             ),
         ];
@@ -1004,7 +1104,7 @@ mod tests {
 
     #[test]
     fn debug_output_carries_no_secret() {
-        let shown = format!("{:?}", members(b"s3cr3t-value"));
+        let shown = format!("{:?}", members("s3cr3t-value"));
         assert!(!shown.contains("s3cr3t"));
     }
 
@@ -1017,7 +1117,7 @@ mod tests {
         let sealed = seal(
             &key.public(),
             &fixed_context(&key),
-            &members(b"signin-reference"),
+            &members("signin.reference.jws"),
         )
         .unwrap();
 
