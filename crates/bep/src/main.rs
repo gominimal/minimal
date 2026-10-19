@@ -96,7 +96,20 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
     // The identity file still names the old key. Publish the new one now, so
     // that a mint never seals to a deleted key. The other roles come from
     // the store, or from the old file when the store refuses them.
-    let previous = Identity::read(path).ok();
+    // BEP-060: a file that is there and not read can name a role whose key
+    // the store lost. A file written without that role makes the next start
+    // generate the key silently, so the file is left as it is.
+    let previous = match Identity::read(path) {
+        Ok(identity) => Some(identity),
+        Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            eprintln!("{err}");
+            eprintln!(
+                "The published identity was not changed, so it still names the old {role} key. Correct the problem above, then run `bep` to publish the new key."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     match Identity::after_replacement(store, role, &key, previous.as_ref()).publish(path) {
         Ok(()) => {
             tracing::info!(path = %path.display(), "published the proxy identity");

@@ -1,5 +1,10 @@
 //! The proxy's published identity (BEP-072).
 //!
+//! BEP-072 also asks for the root certificate. This file publishes the root
+//! CA's public key and fingerprint only. The proxy issues no certificate
+//! yet: the self-signed, name-constrained root comes with the task that
+//! covers BEP-013, which adds it to this file.
+//!
 //! At each start the proxy writes the public half and the fingerprint of
 //! each of its keys to a file the operator's processes read. A mint seals
 //! from that file alone: sealing is public-key work, so a mint never opens
@@ -47,7 +52,9 @@ pub struct Identity {
     /// The sealing key, which a mint seals to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealing: Option<PublishedKey>,
-    /// The root CA key.
+    /// The root CA's public key. It is not the root certificate, which
+    /// BEP-072 asks for: the task that covers BEP-013 issues that
+    /// certificate and publishes it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<PublishedKey>,
     /// The signing CA key.
@@ -106,7 +113,9 @@ impl Identity {
     /// The identity to publish after `role` was replaced by `key`.
     ///
     /// The other roles come from the store when it gives their public half,
-    /// and from `previous` when it does not. A replacement never needs the
+    /// and from `previous` when it does not. A role with neither source is
+    /// left out, with a warning. The caller passes `None` only when no
+    /// identity file exists, so the roles left out were never published. A replacement never needs the
     /// whole store to be usable, so a second refused key does not keep the
     /// old public key published (BEP-060).
     pub fn after_replacement<S: KeyStore>(
@@ -119,10 +128,15 @@ impl Identity {
             if other == role {
                 return Some(PublishedKey::of(&key.public()));
             }
-            match store.find(other) {
+            let entry = match store.find(other) {
                 Ok(Some(held)) => Some(PublishedKey::of(&held.public())),
                 _ => previous.and_then(|previous| previous.entry(other).cloned()),
+            };
+            if entry.is_none() {
+                // The next start treats this role as a first start.
+                tracing::warn!(role = %other, "no public key is known for a proxy key role, so the identity does not name it");
             }
+            entry
         };
         Self {
             sealing: entry(Role::Sealing),

@@ -117,7 +117,8 @@ pub trait HeldKey {
     ///
     /// # Errors
     ///
-    /// [`KeyError::Refused`] when the store refuses the key's use.
+    /// [`KeyError::Refused`] when the store refuses the key's use, and
+    /// [`KeyError::Store`] when the store fails for another reason.
     fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError>;
 
     /// Uses the key once, so that a store which refuses the key refuses it
@@ -125,7 +126,9 @@ pub trait HeldKey {
     ///
     /// # Errors
     ///
-    /// [`KeyError::Refused`] when the store refuses the key's use.
+    /// [`KeyError::Refused`] when the store refuses the key's use, and
+    /// [`KeyError::Store`] when the store fails for another reason, as a
+    /// locked keychain does.
     fn probe(&self) -> Result<(), KeyError>;
 }
 
@@ -240,10 +243,13 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
         match store.find(role) {
             Ok(Some(key)) => match key.probe() {
                 Ok(()) => found.push((role, Some(key))),
-                Err(err) => {
+                Err(err @ KeyError::Refused { .. }) => {
                     tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
                     refused.push(role);
                 }
+                // A locked store is not a refused key, and the replacement
+                // advice would delete a healthy key.
+                Err(err @ KeyError::Store { .. }) => return Err(StartError::Store(err)),
             },
             Ok(None) if published.contains(&role) => {
                 tracing::error!(role = %role, "the key store lost a published proxy key");
@@ -416,6 +422,21 @@ mod keychain {
         }
     }
 
+    /// Classifies an error from a use of a key. Only a code in [`DENIED`] is
+    /// a refused key. Any other code is a store failure, so a locked keychain
+    /// never gets the advice to replace a healthy key.
+    fn use_error(role: Role, err: &core_foundation::error::CFError) -> KeyError {
+        let denied = i32::try_from(err.code()).is_ok_and(|code| DENIED.contains(&code));
+        if denied {
+            refused(role, err)
+        } else {
+            KeyError::Store {
+                role,
+                detail: err.to_string(),
+            }
+        }
+    }
+
     impl KeychainKey {
         fn new(role: Role, key: SecKey) -> Result<Self, KeyError> {
             let public = key
@@ -441,11 +462,14 @@ mod keychain {
         }
 
         fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
-            let peer = public_sec_key(peer).map_err(|detail| refused(self.role, detail))?;
+            let peer = public_sec_key(peer).map_err(|detail| KeyError::Store {
+                role: self.role,
+                detail,
+            })?;
             self.key
                 .key_exchange(Algorithm::ECDHKeyExchangeStandard, &peer, 32, None)
                 .map(Zeroizing::new)
-                .map_err(|err| refused(self.role, err))
+                .map_err(|err| use_error(self.role, &err))
         }
 
         fn probe(&self) -> Result<(), KeyError> {
@@ -455,7 +479,7 @@ mod keychain {
                     .key
                     .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, b"bep key probe")
                     .map(drop)
-                    .map_err(|err| refused(self.role, err)),
+                    .map_err(|err| use_error(self.role, &err)),
             }
         }
     }
@@ -616,6 +640,7 @@ pub(crate) mod memory {
         generated: usize,
         broken: bool,
         no_generation: bool,
+        locked_use: bool,
     }
 
     #[derive(Default)]
@@ -625,6 +650,7 @@ pub(crate) mod memory {
         role: Role,
         secret: SecretKey,
         refused: bool,
+        locked: bool,
     }
 
     impl MemoryStore {
@@ -641,6 +667,12 @@ pub(crate) mod memory {
         /// Makes every later generation fail, while searches still work.
         pub(crate) fn fail_generation(&self) {
             self.0.lock().unwrap().no_generation = true;
+        }
+
+        /// Makes every later use of a found key fail as a locked keychain
+        /// does, while searches still work.
+        pub(crate) fn lock_use(&self) {
+            self.0.lock().unwrap().locked_use = true;
         }
 
         /// Stops refusing every key.
@@ -690,6 +722,9 @@ pub(crate) mod memory {
         }
 
         fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            if self.locked {
+                return Err(broken(self.role));
+            }
             if self.refused {
                 return Err(KeyError::Refused {
                     role: self.role,
@@ -726,6 +761,7 @@ pub(crate) mod memory {
                 role,
                 secret: secret.clone(),
                 refused: inner.refused.contains(&role),
+                locked: inner.locked_use,
             }))
         }
 
@@ -750,6 +786,7 @@ pub(crate) mod memory {
                 role,
                 secret,
                 refused: false,
+                locked: false,
             })
         }
 
@@ -874,6 +911,20 @@ mod tests {
         let store = MemoryStore::default();
         drop(load(&store, &[]).unwrap());
         store.break_store();
+
+        let err = load(&store, &Role::ALL).unwrap_err();
+        assert!(matches!(err, StartError::Store(_)), "{err}");
+        assert!(!err.to_string().contains("--replace-key"), "{err}");
+        assert_eq!(store.generated(), 3);
+    }
+
+    // BEP-060: a key that fails its probe because the store is locked is
+    // not a refused key, so the start gives no replacement advice.
+    #[test]
+    fn a_locked_store_at_probe_is_not_a_refused_key() {
+        let store = MemoryStore::default();
+        drop(load(&store, &[]).unwrap());
+        store.lock_use();
 
         let err = load(&store, &Role::ALL).unwrap_err();
         assert!(matches!(err, StartError::Store(_)), "{err}");
