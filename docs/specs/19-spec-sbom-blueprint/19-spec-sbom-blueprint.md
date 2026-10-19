@@ -180,7 +180,9 @@ developer running agent boxes; build-infra operator; auditor.
   resolvable through the box's pin THE SYSTEM SHALL take the component's
   build-time facts — its build closure's components and their digests, and
   the build environment — from that document, and its metadata — name,
-  version, `purl`, licenses — from the graph at the pin (minimal#700 D9);
+  version, `purl`, and licenses where the pin carries no attribution
+  manifest — from the graph at the pin (minimal#700 D9; under a sealed
+  attribution manifest SBOM-007 is the one source of licenses);
   and SHALL reference the document from the component by the tarball's
   sha256 and the statement digest SBOM-013 defines, never embed it whole.
   tier:     T0
@@ -240,6 +242,15 @@ developer running agent boxes; build-infra operator; auditor.
     (SBOM-012's failure, naming both digests), never as that component's.
     tier:   T0
     verify: cargo nextest run -p sbom per_package_document_subject_must_match_closure
+  - WHEN the document's bundle is published THE SYSTEM SHALL verify it with
+    PKV-011's checks before reading any field of the document, and IF it
+    fails THEN THE SYSTEM SHALL treat the document as unresolved (SBOM-012's
+    failure, naming the check); WHILE the producer publishes no bundle for
+    the document THE SYSTEM SHALL read the document and mark the component
+    `unverified`, as PKV marks an entry whose source has no verified bundle.
+    tier:   T1
+    verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
+    property: read(d) ⇒ (bundle(d) = ∅ ∧ unverified(component(d))) ∨ verified(bundle(d))
 
 - **SBOM-014** WHEN `min box list --using <pkg>[@<ver>]` filters boxes THE
   SYSTEM SHALL answer from the component set this spec's composition emits
