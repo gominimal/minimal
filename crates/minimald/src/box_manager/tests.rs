@@ -582,6 +582,13 @@ async fn a_resume_during_a_teardown_does_not_bring_the_session_up() {
     let resumed = mngr.resume_active_sessions().await.unwrap();
     assert_eq!(resumed, 0, "a session being torn down is not resumed");
     assert!(
+        mngr.get_composition(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down has no composition to read, as it has no record"
+    );
+    assert!(
         !destroy.is_finished(),
         "the destroy hook should still be running"
     );

@@ -1483,8 +1483,16 @@ impl BoxManager {
                 r.handle(async move { Ok::<_, BoxManagerError>(n) }).await;
             }
             ManagerMessage::GetComposition(pred, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 r.handle(async {
                     Ok::<_, BoxManagerError>(match self.store.find(pred.into()).await? {
+                        // Gone, as to `GetRecord`: one answer per session
+                        // across the read RPCs during its teardown.
+                        Some(handle) if tearing_down.contains(handle.id()) => None,
                         Some(handle) => handle.load_composition().await?,
                         None => None,
                     })
