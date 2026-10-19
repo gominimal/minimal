@@ -601,19 +601,38 @@ fn in_box_range(address: Ipv4Addr) -> bool {
     first <= address && address <= last
 }
 
+/// Whether the host can bind the address itself. Linux routes the whole
+/// 127.0.0.0/8, but macOS answers only the addresses lo0 carries, so a box
+/// hand there is dead until the range aliases are installed: nothing listens
+/// at an address the host cannot bind. A bind to port 0 never clashes with a
+/// real listener, and TCP is the surface a box hand actually serves.
+fn loopback_bindable(address: Ipv4Addr) -> bool {
+    std::net::TcpListener::bind((address, 0)).is_ok()
+}
+
 impl AddressBook {
-    /// [`Self::allocate_at`], now.
+    /// [`Self::allocate_at`], now, with the host's own loopback binding
+    /// measured live.
     fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
-        self.allocate_at(node, name, Instant::now())
+        self.allocate_at(node, name, Instant::now(), loopback_bindable)
     }
 
     /// The address `name` of `node` holds, or the lowest free one whose
-    /// quarantine has passed by `now`, recorded against them. Idempotent
-    /// per box; a box re-registered inside its old address's quarantine
-    /// gets that address back. When every free address is still
-    /// quarantined, the allocation fails naming when the first one frees —
-    /// it never hands an address out early.
-    fn allocate_at(&mut self, node: &str, name: &str, now: Instant) -> Result<Ipv4Addr, String> {
+    /// quarantine has passed by `now` and which `bindable` accepts,
+    /// recorded against them. Idempotent per box; a box re-registered
+    /// inside its old address's quarantine gets that address back. When
+    /// every free address is still quarantined, the allocation fails
+    /// naming when the first one frees — it never hands an address out
+    /// early. An address the host cannot bind is never handed out: the
+    /// caller gets the 127.0.0.1 interim instead, so a name it publishes
+    /// always answers where something listens.
+    fn allocate_at(
+        &mut self,
+        node: &str,
+        name: &str,
+        now: Instant,
+        bindable: impl Fn(Ipv4Addr) -> bool,
+    ) -> Result<Ipv4Addr, String> {
         if let Some((address, _)) = self
             .held
             .iter()
@@ -668,6 +687,9 @@ impl AddressBook {
                 ),
             });
         };
+        if !bindable(free) {
+            return Ok(Ipv4Addr::LOCALHOST);
+        }
         self.released.remove(&free);
         self.held.insert(free, holder);
         Ok(free)
@@ -2770,7 +2792,10 @@ impl AnswererStatus {
             while let Ok(command) = commands.recv() {
                 match command {
                     HandoverCommand::Allocate { name, reply } => {
-                        let answer = book.allocate(&node, &box_zone_name(&name));
+                        let answer =
+                            book.allocate_at(&node, &box_zone_name(&name), Instant::now(), |_| {
+                                true
+                            });
                         match hold_reply() {
                             Some(gate) => {
                                 std::thread::spawn(move || {
@@ -5781,8 +5806,8 @@ mod tests {
         );
         let t0 = Instant::now();
         let mut book = AddressBook::default();
-        let a = book.allocate_at("node-a", "a", t0).expect(".2");
-        let b = book.allocate_at("node-a", "b", t0).expect(".3");
+        let a = book.allocate_at("node-a", "a", t0, |_| true).expect(".2");
+        let b = book.allocate_at("node-a", "b", t0, |_| true).expect(".3");
         assert_eq!(
             (a, b),
             (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 3))
@@ -5792,7 +5817,7 @@ mod tests {
         assert_eq!(book.release_at("node-a", "a", t0), Some(a));
         let inside = (t0 + ttl).checked_sub(Duration::from_millis(1)).unwrap();
         let c = book
-            .allocate_at("node-b", "c", inside)
+            .allocate_at("node-b", "c", inside, |_| true)
             .expect("a fresh address");
         assert_eq!(
             c,
@@ -5812,12 +5837,12 @@ mod tests {
         );
         let after_a = t0 + ttl;
         assert_eq!(
-            book.allocate_at("node-b", "d", after_a),
+            book.allocate_at("node-b", "d", after_a, |_| true),
             Ok(a),
             "the lowest address whose quarantine has passed"
         );
         let e = book
-            .allocate_at("node-b", "e", after_a)
+            .allocate_at("node-b", "e", after_a, |_| true)
             .expect("the next fresh one");
         assert_eq!(
             e,
@@ -5828,7 +5853,7 @@ mod tests {
         // The box that held a quarantined address may take it back.
         assert_eq!(book.release_at("node-a", "b", after_a), Some(b));
         assert_eq!(
-            book.allocate_at("node-a", "b", after_a),
+            book.allocate_at("node-a", "b", after_a, |_| true),
             Ok(b),
             "a box re-registered gets its own address back"
         );
@@ -5838,21 +5863,83 @@ mod tests {
         let mut full = AddressBook::default();
         let (first, last) = switch::box_loopback_interior();
         for (index, _) in (u32::from(first)..=u32::from(last)).enumerate() {
-            full.allocate_at("node-a", &format!("box{index}"), t0)
+            full.allocate_at("node-a", &format!("box{index}"), t0, |_| true)
                 .expect("the range holds it");
         }
         let freed = full.release_at("node-a", "box0", t0).expect("box0 held .2");
         let refused = full
-            .allocate_at("node-b", "late", t0 + Duration::from_secs(10))
+            .allocate_at("node-b", "late", t0 + Duration::from_secs(10), |_| true)
             .expect_err("nothing is free outside the quarantine");
         assert!(
             refused.contains("released in the last 15 s") && refused.contains("frees in 5 s"),
             "the refusal names the quarantine and the wait: {refused}"
         );
         assert_eq!(
-            full.allocate_at("node-b", "late", t0 + ttl),
+            full.allocate_at("node-b", "late", t0 + ttl, |_| true),
             Ok(freed),
             "once the TTL has passed the address is handed out"
+        );
+    }
+
+    /// A host that cannot bind the box range is never handed a dead
+    /// address: the allocation answers the 127.0.0.1 interim instead and
+    /// records nothing, so the hand never collides with a later one and a
+    /// re-ask redraws. Driven on an injected bindability probe, no sleeps.
+    #[test]
+    fn an_unbindable_host_is_handed_the_interim_and_the_book_stays_empty() {
+        let now = Instant::now();
+        let mut book = AddressBook::default();
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, |_| false),
+            Ok(Ipv4Addr::LOCALHOST),
+            "a host that cannot bind the range gets the interim"
+        );
+        assert!(
+            book.held.is_empty() && book.released.is_empty(),
+            "the interim hand records nothing"
+        );
+        for name in ["api", "db", "worker"] {
+            assert_eq!(
+                book.allocate_at("node-a", name, now, |_| false),
+                Ok(Ipv4Addr::LOCALHOST),
+                "every box of an unbindable host shares the interim"
+            );
+        }
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, |_| false),
+            Ok(Ipv4Addr::LOCALHOST),
+            "the interim hand is idempotent per box"
+        );
+        assert!(
+            book.held.is_empty() && book.released.is_empty(),
+            "repeated interim hands never exhaust or quarantine"
+        );
+    }
+
+    /// The interim hand is only a stand-in: once the host can bind the
+    /// range again — the aliases have arrived — the next allocation hands
+    /// a range address and keeps handing the same one, so the box upgrades
+    /// without a rename.
+    #[test]
+    fn a_host_that_becomes_bindable_hands_out_range_addresses_again() {
+        let now = Instant::now();
+        let mut book = AddressBook::default();
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, |_| false),
+            Ok(Ipv4Addr::LOCALHOST),
+            "before the aliases arrive the interim stands in"
+        );
+        let upgraded = book
+            .allocate_at("node-a", "web", now, |_| true)
+            .expect("the range answers once the host binds it");
+        assert!(
+            in_box_range(upgraded),
+            "the upgrade hands an address out of the range: {upgraded}"
+        );
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, |_| true),
+            Ok(upgraded),
+            "a re-ask hands back the recorded address"
         );
     }
 
