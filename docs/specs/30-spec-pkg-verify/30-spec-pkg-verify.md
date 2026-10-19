@@ -5,7 +5,7 @@ owner: bryan-minimal
 epic: gominimal/inbox#721
 arch: https://github.com/gominimal/arch/blob/3dab1097cda11652ad24282969ed8dfe61d0d497/architecture.md
 arch_sha: "3dab1097cda11652ad24282969ed8dfe61d0d497"
-updated: 2026-10-17
+updated: 2026-10-19
 ---
 
 # PKV — Package verification — `min pkg verify`, fail-closed pulls, and a Sigstore bundle on every artifact
@@ -112,7 +112,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   verify:   cargo nextest run -p verify mldsa65_known_answer_and_negative_vectors
   property: ∀(pk, m, sig) ∈ negative_vectors. verify(pk, m, sig) = reject
 
-- **PKV-008** WHEN both required signatures verify THE SYSTEM SHALL decode the statement and accept it only if `_type` is the in-toto Statement v1, `predicateType` is SLSA Provenance v1, some `subject[]` carries `digest.sha256` equal to the locally recomputed tarball hash and `digest.minimal_spec_hash` equal to the Build Spec Hash, `predicate.runDetails.builder.id` equals the trust root's builder identity, and `externalParameters.{repo, package, arch}` equal the caller's expectations; `externalParameters.commit` is reported and asserted only WHERE `--source-commit` is given.
+- **PKV-008** WHEN the envelope is accepted under PKV-006 THE SYSTEM SHALL decode the statement and accept it only if `_type` is the in-toto Statement v1, `predicateType` is SLSA Provenance v1, some `subject[]` carries `digest.sha256` equal to the locally recomputed tarball hash and `digest.minimal_spec_hash` equal to the Build Spec Hash, `predicate.runDetails.builder.id` equals the trust root's builder identity, and `externalParameters.{repo, package, arch}` equal the caller's expectations; `externalParameters.commit` is reported and asserted only WHERE `--source-commit` is given.
   tier:     T1
   verify:   cargo nextest run -p verify statement_subject_binding_and_expectations
   property: accept(stmt, art) ⇒ ∃s ∈ stmt.subject. s.sha256 == sha256(art) ∧ s.minimal_spec_hash == spec_hash(art)
@@ -164,6 +164,9 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   verify:   cargo nextest run -p verify wellknown_root_fetch_verify_version_floor
   property: accept(root_fetched) ⇒ version(root_fetched) ≥ max(version(root_vendored), high_water) ∧ (version(root_fetched) = version(root_vendored) ⇒ digest(root_fetched) = digest(root_vendored)) ∧ (version(root_fetched) = high_water ⇒ digest(root_fetched) = high_water_digest) ∧ (high_water', high_water_digest') = (version(root_fetched), digest(root_fetched))
 
+  - THE SYSTEM SHALL keep the high-water mark in the Box Host's state directory (`<state>/trust-root/high-water.json`: version, digest, the time the root was accepted), written by the daemon alone with mode 0600 under the daemon's user, and no `min` caller or box can write it; a missing mark starts at the vendored root's version and digest, and a mark that does not parse or whose digest is not of the length the format gives is read as corrupt: THE SYSTEM SHALL exit 6 with `trust root: high-water mark unreadable` naming the file and the remediation (remove it to start again at the vendored root), never reset it on its own. A party that can write that directory holds the daemon's user, and with it the daemon's binary; the mark adds no trust beyond that user, and claims none.
+    tier:   T0
+    verify: cargo nextest run -p verify high_water_mark_missing_starts_at_vendored_corrupt_fails_closed
 - **PKV-016** WHEN the producer publishes a Sigstore bundle for the artifact's provenance statement THE SYSTEM SHALL verify it with the same four checks as the index bundle, bind its subject digest to the locally recomputed tarball hash, and report it as `artifact bundle`; WHILE the trust root marks that plane optional THE SYSTEM SHALL report an absent bundle as `absent`, and WHERE `--require-bundle` is given or the plane is marked required THE SYSTEM SHALL treat absence as `fail`.
   tier:     T1
   verify:   cargo nextest run -p verify artifact_bundle_verified_when_present_absent_policy
