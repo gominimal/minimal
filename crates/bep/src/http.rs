@@ -309,6 +309,11 @@ pub fn parse_request(buf: &[u8]) -> Result<Parse<Request>, CloseReason> {
     let Some(host) = values(&headers, "host").next() else {
         return Err(CloseReason::Malformed("missing_host"));
     };
+    // RFC 9112 §3.2: Host is `uri-host [ ":" port ]`. A value that is not a
+    // plain host and port can be read one way here and another upstream.
+    if !is_host_authority(host) {
+        return Err(CloseReason::Malformed("invalid_host"));
+    }
     if let Some((scheme, authority)) = absolute_form_authority(target.as_bytes())
         && !same_authority(scheme, authority, host)
     {
@@ -808,6 +813,45 @@ fn same_authority(scheme: &str, authority: &[u8], host: &[u8]) -> bool {
         a.to_ascii_lowercase()
     };
     !authority.contains(&b'@') && !authority.is_empty() && normal(authority) == normal(host)
+}
+
+/// Whether a Host value is a host with an optional port: a name or IPv4
+/// address of letters, digits, `-`, `.`, `_` and `~`, or a bracketed IPv6
+/// literal, then `:` and 1 to 5 digits up to 65535. An empty value, user
+/// info, a path, a comma or a space never match.
+fn is_host_authority(value: &[u8]) -> bool {
+    let port = if value.first() == Some(&b'[') {
+        let Some(close) = value.iter().position(|&b| b == b']') else {
+            return false;
+        };
+        let literal = &value[1..close];
+        if literal.is_empty()
+            || !literal
+                .iter()
+                .all(|&b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return false;
+        }
+        &value[close + 1..]
+    } else {
+        let end = value.iter().position(|&b| b == b':').unwrap_or(value.len());
+        let host = &value[..end];
+        if host.is_empty()
+            || !host
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+        {
+            return false;
+        }
+        &value[end..]
+    };
+    match port {
+        [] => true,
+        [b':', digits @ ..] => {
+            digits.len() <= 5 && parse_length(digits).is_some_and(|p| p <= 65535)
+        }
+        _ => false,
+    }
 }
 
 /// Remove an `h2c` upgrade, its `Connection` tokens and `HTTP2-Settings`
@@ -1339,8 +1383,8 @@ mod tests {
         for raw in [
             &b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n"[..],
             b"GET https://a.example:8443/x HTTP/1.1\r\nHost: a.example\r\n\r\n",
-            b"GET http://u@a.example/ HTTP/1.1\r\nHost: u@a.example\r\n\r\n",
-            b"GET http:///x HTTP/1.1\r\nHost: \r\n\r\n",
+            b"GET http://u@a.example/ HTTP/1.1\r\nHost: u.example\r\n\r\n",
+            b"GET http:///x HTTP/1.1\r\nHost: a.example\r\n\r\n",
         ] {
             assert_eq!(
                 parse_request(raw),
@@ -1355,6 +1399,44 @@ mod tests {
             b"GET http://a.example HTTP/1.1\r\nHost: a.example:80\r\n\r\n",
         ] {
             parse_ok(raw);
+        }
+    }
+
+    // Host must be a host with an optional port, and nothing else.
+    #[test]
+    fn host_must_be_a_host_and_port() {
+        for host in [
+            "",
+            "a b",
+            "a,b",
+            "a/b",
+            "u@a.example",
+            "a.example:",
+            "a.example:x",
+            "a.example:65536",
+            "a.example:443:443",
+            "[::1",
+            "[]",
+            "[::1]x",
+            "[::1]:",
+            ":443",
+        ] {
+            let raw = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert_eq!(
+                parse_request(raw.as_bytes()),
+                Err(CloseReason::Malformed("invalid_host")),
+                "{host:?}"
+            );
+        }
+        for host in [
+            "github.com",
+            "a.example:8443",
+            "127.0.0.1:65535",
+            "[::1]",
+            "[2001:db8::1]:443",
+            "a_b-c~d",
+        ] {
+            parse_ok(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes());
         }
     }
 
