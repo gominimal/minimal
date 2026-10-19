@@ -138,6 +138,21 @@ case "${1:-}" in
         [ $# -gt 0 ] || set -- bash zsh fish
         for _s in "$@"; do comp_install "$_s"; done
         ;;
+    version)
+        # The post-swap probe contract: client line always, server line only
+        # when a daemon answers. $HOME/minver.client / minver.server override
+        # the reported versions (default: matching, so ordinary scenarios
+        # stop nothing); an empty minver.server means "no daemon answered".
+        if [ -s "$HOME/minver.client" ]; then
+            _vc="$(cat "$HOME/minver.client")"
+        else
+            _vc=v1
+        fi
+        printf 'Client: minimal %s\n' "$_vc"
+        if [ -s "$HOME/minver.server" ]; then
+            printf 'Server: minimald %s\n' "$(cat "$HOME/minver.server")"
+        fi
+        ;;
     ls)          printf 'session-alpha  running\n' ;;
     stop)
         printf '%s\n' "$*" >>"$HOME/stop.calls"
@@ -2021,6 +2036,146 @@ case_uninstall() {
     want_ok "dump kept when no zsh completions were installed (R9.4)" \
         grep -q '# untouched user cache' "$HUD/.zcompdump"
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
+
+    # --- Uninstall vs a running daemon --------------------------------------
+    # The uninstall walk deletes `min` itself, so the daemon must be stopped
+    # before it, while the `min` that matches the daemon is still on disk. A
+    # daemon left running through an uninstall+reinstall keeps serving the old
+    # build and every daemon-backed command on the fresh install then hits a
+    # version skew. Same escalation as the upgrade swap: graceful stop, a
+    # consent question when sessions are live, --force-stop after.
+
+    # Live sessions: the installer lists them and asks; answering yes stops the
+    # daemon and the uninstall completes.
+    HU10="$root/hu10"; mkdir -p "$HU10"
+    run u10_install "$HU10"
+    check 0 "$rc" "daemon-uninstall: seed install exits 0"
+    : >"$HU10/sessions.live"
+    rm -f "$HU10/stop.calls"
+    printf 'y\n' >"$root/tty-yes10"
+    TTY_FILE="$root/tty-yes10"
+    run u10_live "$HU10" --uninstall
+    TTY_FILE=
+    check 0 "$rc" "uninstall with a live daemon exits 0"
+    want_ok "the running sessions are listed" grep -q "session-alpha" "$OUT"
+    want_ok "the user is asked before sessions die" grep -q "Continue?" "$OUT"
+    want_ok "the graceful stop is tried first" grep -qx "stop" "$HU10/stop.calls"
+    want_ok "confirmation escalates to --force" grep -qx "stop --force" "$HU10/stop.calls"
+    want_err "uninstall removed minimald" test -e "$HU10/bin/minimald"
+    want_err "uninstall removed the record" test -e "$HU10/xdg-state/minimal/installed"
+
+    # Declining leaves everything exactly as it was: nothing removed, daemon
+    # still up, record intact.
+    HU11="$root/hu11"; mkdir -p "$HU11"
+    run u11_install "$HU11"
+    : >"$HU11/sessions.live"
+    rm -f "$HU11/stop.calls"
+    printf 'n\n' >"$root/tty-no11"
+    TTY_FILE="$root/tty-no11"
+    run u11_decline "$HU11" --uninstall
+    TTY_FILE=
+    check 1 "$rc" "declining aborts the uninstall"
+    want_ok "the abort reports nothing was removed" grep -q "nothing was removed" "$OUT"
+    want_err "declining never force-stops" grep -qx "stop --force" "$HU11/stop.calls"
+    want_ok "the record survives the abort" test -f "$HU11/xdg-state/minimal/installed"
+    want_ok "the binaries survive the abort" test -f "$HU11/bin/minimald"
+
+    # No terminal to ask on: abort naming the escape hatch, remove nothing.
+    HU12="$root/hu12"; mkdir -p "$HU12"
+    run u12_install "$HU12"
+    : >"$HU12/sessions.live"
+    rm -f "$HU12/stop.calls"
+    run u12_notty "$HU12" --uninstall
+    check 1 "$rc" "an unconfirmable uninstall aborts"
+    want_ok "the abort names the escape hatch" grep -q -- "--force-stop" "$OUT"
+    want_err "nothing is asked without a terminal" grep -q "Continue?" "$OUT"
+    want_ok "the record survives the abort" test -f "$HU12/xdg-state/minimal/installed"
+
+    # --force-stop skips the question and the graceful stop entirely.
+    HU13="$root/hu13"; mkdir -p "$HU13"
+    run u13_install "$HU13"
+    : >"$HU13/sessions.live"
+    rm -f "$HU13/stop.calls"
+    run u13_force "$HU13" --uninstall --force-stop
+    check 0 "$rc" "uninstall --force-stop exits 0"
+    want_err "--force-stop asks nothing" grep -q "Continue?" "$OUT"
+    want_err "--force-stop skips the graceful stop" grep -qx "stop" "$HU13/stop.calls"
+    want_ok "--force-stop force-stops" grep -qx "stop --force" "$HU13/stop.calls"
+    want_err "uninstall removed the binaries" test -e "$HU13/bin/minimald"
+
+    # --dry-run announces the stop and stops nothing.
+    HU14="$root/hu14"; mkdir -p "$HU14"
+    run u14_install "$HU14"
+    : >"$HU14/sessions.live"
+    rm -f "$HU14/stop.calls"
+    run u14_dry "$HU14" --uninstall --dry-run
+    check 0 "$rc" "uninstall --dry-run with a live daemon exits 0"
+    want_ok "dry-run announces the stop" grep -q "would stop the running daemon" "$OUT"
+    want_err "dry-run stops nothing" test -e "$HU14/stop.calls"
+    want_ok "dry-run keeps minimald" test -f "$HU14/bin/minimald"
+
+    # A daemon with no sessions stops gracefully on a plain uninstall: no
+    # question, no --force.
+    HU15="$root/hu15"; mkdir -p "$HU15"
+    run u15_install "$HU15"
+    rm -f "$HU15/stop.calls"
+    run u15_plain "$HU15" --uninstall
+    check 0 "$rc" "plain uninstall with an idle daemon exits 0"
+    want_ok "an idle daemon is stopped gracefully" grep -qx "stop" "$HU15/stop.calls"
+    want_err "an idle daemon is never asked about" grep -q "Continue?" "$OUT"
+    want_err "an idle daemon is never force-stopped" grep -qx "stop --force" "$HU15/stop.calls"
+    want_err "uninstall removed minimald" test -e "$HU15/bin/minimald"
+
+    # --- Uninstall, then reinstall: the post-swap stale-daemon probe ----------
+    # The uninstall stops the daemon it finds, but nothing stops the user from
+    # having an old-build daemon running again by the time they reinstall
+    # (started by hand, autospawned from a stale PATH). That reinstall has no
+    # `min` on disk at its first swap, so the pre-swap stop sees nothing; the
+    # post-swap probe — the installed `min` comparing its version against the
+    # answering daemon's — is what must catch it. minver.server seeds the
+    # daemon side of the mock `min version`; no file means no daemon answers.
+    HU16="$root/hu16"; mkdir -p "$HU16"
+    run u16_install "$HU16"
+    check 0 "$rc" "stale-daemon: seed install exits 0"
+    run u16_uninstall "$HU16" --uninstall
+    check 0 "$rc" "stale-daemon: uninstall exits 0"
+    printf 'v9\n' >"$HU16/minver.server"      # an old-build daemon answers
+    rm -f "$HU16/stop.calls"
+    run u16_reinstall "$HU16"
+    check 0 "$rc" "reinstall over a stale daemon exits 0"
+    want_ok "the stale daemon is reported" \
+        grep -q "stopping a daemon still running from build v9" "$OUT"
+    want_ok "the stale daemon is force-stopped" grep -qx "stop --force" "$HU16/stop.calls"
+
+    # Matching versions: the probe runs (a component was re-placed) but stops
+    # nothing and says nothing — the pre-swap stop already handled the daemon.
+    HU17="$root/hu17"; mkdir -p "$HU17"
+    run u17_install "$HU17"
+    check 0 "$rc" "matching-daemon: seed install exits 0"
+    printf 'stale\n' >"$HU17/bin/minimald"    # force a re-placement, so the probe runs
+    printf 'v1\n' >"$HU17/minver.server"      # a daemon of this build answers
+    rm -f "$HU17/stop.calls"
+    run u17_upgrade "$HU17"
+    check 0 "$rc" "upgrade with a matching daemon exits 0"
+    want_ok "the pre-swap stop still ran" grep -qx "stop" "$HU17/stop.calls"
+    want_err "a matching daemon is never force-stopped" \
+        grep -qx "stop --force" "$HU17/stop.calls"
+    want_err "a matching daemon is never reported" \
+        grep -q "stopping a daemon still running" "$OUT"
+
+    # An unreachable daemon (no minver.server) answers nothing: the probe stays
+    # silent, the pre-swap stop is all that ran.
+    HU18="$root/hu18"; mkdir -p "$HU18"
+    run u18_install "$HU18"
+    check 0 "$rc" "unreachable-daemon: seed install exits 0"
+    printf 'stale\n' >"$HU18/bin/minimald"    # force a component re-placement
+    rm -f "$HU18/stop.calls"
+    run u18_upgrade "$HU18"
+    check 0 "$rc" "upgrade over an unreachable daemon exits 0"
+    want_ok "the pre-swap stop still ran" grep -qx "stop" "$HU18/stop.calls"
+    want_err "an unreachable daemon is not asked about" grep -q "Continue?" "$OUT"
+    want_err "no version probe fires without a server line" \
+        grep -q "stopping a daemon still running" "$OUT"
 }
 
 case_gvproxy_rename_migration() {
