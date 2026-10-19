@@ -93,6 +93,8 @@ tracing-subscriber.workspace = true
 # upload or delete puts a bundle or delete token on the wire.
 url.workspace = true
 version.workspace = true
+# Wipes the raw token reply `min auth login` reads from GitHub.
+zeroize.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
 # the client helpers (sock/lifecycle) and calls no krun code, so it must not

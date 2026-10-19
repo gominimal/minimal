@@ -14,6 +14,7 @@ use bep::signin::{self, Completed, Flow, HostKeychain, Keychain, Material, Stand
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use zeroize::Zeroize as _;
 
 use crate::{AuthLoginArgs, GlobalArgs};
 
@@ -251,11 +252,13 @@ struct User {
     login: String,
 }
 
-async fn post_form<T: serde::de::DeserializeOwned>(
+/// Send one form POST and read the whole reply. An error here is a network
+/// error or a timeout: the request or its reply did not get through.
+async fn send_form(
     http: &reqwest::Client,
     url: &str,
     form: &[(&str, &str)],
-) -> anyhow::Result<T> {
+) -> reqwest::Result<(reqwest::StatusCode, String)> {
     let body = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(form)
         .finish();
@@ -268,15 +271,63 @@ async fn post_form<T: serde::de::DeserializeOwned>(
         )
         .body(body)
         .send()
+        .await?;
+    let status = reply.status();
+    Ok((status, reply.text().await?))
+}
+
+/// Parse a reply, then zeroize its text: a token endpoint's reply holds the
+/// raw token pair.
+fn parse_reply<T: serde::de::DeserializeOwned>(mut text: String) -> serde_json_lenient::Result<T> {
+    let parsed = serde_json_lenient::from_str(&text);
+    text.zeroize();
+    parsed
+}
+
+async fn post_form<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    form: &[(&str, &str)],
+) -> anyhow::Result<T> {
+    let (status, mut text) = send_form(http, url, form)
         .await
         .with_context(|| format!("could not reach {url}"))?;
-    let status = reply.status();
-    let text = reply.text().await.unwrap_or_default();
     if !status.is_success() {
+        text.zeroize();
         bail!("GitHub refused the sign-in request to {url} ({status})");
     }
-    serde_json_lenient::from_str(&text)
-        .with_context(|| format!("GitHub answered {url} with an unexpected reply"))
+    parse_reply(text).with_context(|| format!("GitHub answered {url} with an unexpected reply"))
+}
+
+/// One poll of the device flow's token endpoint. `None` is a transient
+/// failure: a network error, a timeout or a 5xx. The poll loop retries it
+/// while the code is live.
+async fn poll_device_token(
+    http: &reqwest::Client,
+    url: &str,
+    form: &[(&str, &str)],
+) -> anyhow::Result<Option<TokenReply>> {
+    let (status, mut text) = match send_form(http, url, form).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::warn!(error = %e, "a device-flow poll did not reach GitHub; retrying");
+            return Ok(None);
+        }
+    };
+    if status.is_server_error() {
+        text.zeroize();
+        tracing::warn!(%status, "GitHub failed a device-flow poll; retrying");
+        return Ok(None);
+    }
+    // A 4xx that carries an OAuth `error` goes to the caller's handling of
+    // that error, as a 200 with one does.
+    match parse_reply::<TokenReply>(text) {
+        Ok(reply) if status.is_success() || reply.error.is_some() => Ok(Some(reply)),
+        Ok(_) | Err(_) if !status.is_success() => {
+            bail!("GitHub refused the sign-in request to {url} ({status})")
+        }
+        Ok(_) | Err(_) => bail!("GitHub answered {url} with an unexpected reply"),
+    }
 }
 
 /// The OAuth device flow (BEP-001).
@@ -306,7 +357,7 @@ async fn device_flow(
             );
         }
         tokio::time::sleep(interval).await;
-        let reply: TokenReply = post_form(
+        let Some(reply) = poll_device_token(
             http,
             &token_url,
             &[
@@ -315,7 +366,10 @@ async fn device_flow(
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ],
         )
-        .await?;
+        .await?
+        else {
+            continue;
+        };
         match reply.error.as_deref() {
             None => return reply.into_token(),
             Some("authorization_pending") => {}
@@ -446,7 +500,7 @@ async fn await_callback(listener: &tokio::net::TcpListener, state: &str) -> anyh
             respond(
                 &mut conn,
                 "200 OK",
-                "Signed in to GitHub. You can close this tab and go back to the terminal.",
+                "Return to the terminal to finish signing in.",
             )
             .await;
             return Ok(code);
@@ -563,9 +617,24 @@ mod tests {
         challenge: Arc<Mutex<Option<String>>>,
     }
 
+    /// How the fake GitHub answers the device flow's polls.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Script {
+        /// `authorization_pending` once, then the token.
+        Pending,
+        /// A connection reset, then a 502, then the token.
+        Flaky,
+        /// `authorization_pending` once, then a token in an unexpected form.
+        OddToken,
+    }
+
     /// A local stand-in for github.com and api.github.com. The device flow
     /// answers `authorization_pending` once, then a token.
     async fn fake_github(account: &'static str) -> FakeGitHub {
+        fake_github_scripted(account, Script::Pending).await
+    }
+
+    async fn fake_github_scripted(account: &'static str, script: Script) -> FakeGitHub {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
@@ -591,8 +660,14 @@ mod tests {
                         .map(|(_, v)| v.clone())
                         .unwrap_or_default()
                 };
+                let access = if script == Script::OddToken {
+                    "ghu_odd token"
+                } else {
+                    ACCESS
+                };
+                let mut status = "200 OK";
                 let token = format!(
-                    r#"{{"access_token":"{ACCESS}","expires_in":28800,"refresh_token":"{REFRESH}","refresh_token_expires_in":15897600,"token_type":"bearer","scope":""}}"#
+                    r#"{{"access_token":"{access}","expires_in":28800,"refresh_token":"{REFRESH}","refresh_token_expires_in":15897600,"token_type":"bearer","scope":""}}"#
                 );
                 let reply = match path.as_str() {
                     "/login/device/code" => {
@@ -602,10 +677,23 @@ mod tests {
                     "/login/oauth/access_token" if field("grant_type").ends_with("device_code") => {
                         assert_eq!(field("device_code"), "dc-1");
                         polls += 1;
-                        if polls == 1 {
-                            r#"{"error":"authorization_pending"}"#.to_owned()
-                        } else {
-                            token
+                        match (script, polls) {
+                            (Script::Flaky, 1) => {
+                                // Reset the connection: a zero linger
+                                // makes the close send an RST.
+                                #[allow(deprecated)]
+                                conn.set_linger(Some(Duration::ZERO)).expect("linger");
+                                drop(conn);
+                                continue;
+                            }
+                            (Script::Flaky, 2) => {
+                                status = "502 Bad Gateway";
+                                "<html>bad gateway</html>".to_owned()
+                            }
+                            (Script::Pending | Script::OddToken, 1) => {
+                                r#"{"error":"authorization_pending"}"#.to_owned()
+                            }
+                            _ => token,
                         }
                     }
                     "/login/oauth/access_token" => {
@@ -620,13 +708,13 @@ mod tests {
                         }
                     }
                     "/user" => {
-                        assert!(headers.contains(&format!("bearer {}", ACCESS.to_lowercase())));
+                        assert!(headers.contains(&format!("bearer {}", access.to_lowercase())));
                         format!(r#"{{"login":"{account}","id":1}}"#)
                     }
                     other => panic!("unexpected request to {other}"),
                 };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.len()
                 );
                 conn.write_all(head.as_bytes()).await.expect("write");
@@ -736,6 +824,56 @@ mod tests {
             .count();
         assert_eq!(polls, 2);
         assert!(!out.contains(ACCESS) && !err.contains(ACCESS));
+    }
+
+    fn device_polls(gh: &FakeGitHub) -> usize {
+        gh.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains("device_code=dc-1"))
+            .count()
+    }
+
+    // BEP-001: a reset connection and a 5xx during the poll do not end the
+    // sign-in while the code is live.
+    #[tokio::test]
+    async fn auth_login_device_poll_retries_transient_failures() {
+        let gh = fake_github_scripted("octocat", Script::Flaky).await;
+        let keychain = MemoryKeychain::default();
+        let (stored, out, _) = login_with(&keychain, &gh, None, true, &no_browser).await;
+        assert_eq!(out, "Signed in to GitHub as octocat.\n");
+        assert_eq!(stored.metadata.account, "octocat");
+        assert_eq!(device_polls(&gh), 3);
+        assert!(keychain.raw().is_some());
+    }
+
+    // BEP-002: a token the item cannot store saves nothing, and the held
+    // sign-in stays as it was.
+    #[tokio::test]
+    async fn auth_login_with_an_odd_token_keeps_the_held_item() {
+        let keychain = MemoryKeychain::default();
+        let gh = fake_github("octocat").await;
+        login_with(&keychain, &gh, None, true, &no_browser).await;
+        let before = keychain.raw();
+        let odd = fake_github_scripted("octocat", Script::OddToken).await;
+        let login = Login {
+            keychain: &keychain,
+            endpoints: &odd.endpoints,
+            client_secret: None,
+            device: true,
+            open_browser: &no_browser,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let e = run_login(&login, &mut out, &mut err)
+            .await
+            .expect_err("an odd token is refused");
+        let text = format!("{e:#}");
+        assert!(text.contains("unexpected form"), "{text}");
+        assert!(text.contains("nothing was saved"), "{text}");
+        assert!(!text.contains("damaged"), "{text}");
+        assert!(out.is_empty());
+        assert_eq!(keychain.raw(), before);
     }
 
     // BEP-001, the browser flow

@@ -4073,6 +4073,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "url",
  "version",
+ "zeroize",
 ]
 
 [[package]]
