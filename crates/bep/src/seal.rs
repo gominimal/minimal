@@ -150,8 +150,15 @@ pub struct Binding {
     pub now: u64,
 }
 
-/// A bound field of [`Context`]. Its `Display` names the field and never
-/// carries a value, so a log line can say which field differed.
+/// A field of [`Context`] that [`open`] compares with the expected
+/// [`Binding`]. Its `Display` names the field and never carries a value, so
+/// a log line can say which field differed.
+///
+/// Only the box id, host and module are compared (Gatehouse §6.10). The
+/// expiry is a clock check, reported as [`OpenError::Expired`]. The mode,
+/// host-set version, issue time and key id are carried in the authenticated
+/// header: a change to one of them breaks the tag, and [`open`] reports it
+/// as [`OpenError::NotOpenable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BoundField {
     /// [`Context::box_id`].
@@ -160,16 +167,6 @@ pub enum BoundField {
     Host,
     /// [`Context::module`].
     Module,
-    /// [`Context::host_set_version`].
-    HostSetVersion,
-    /// [`Context::mode`].
-    Mode,
-    /// [`Context::iat`].
-    Iat,
-    /// [`Context::expiry`].
-    Expiry,
-    /// [`Context::kid`].
-    Kid,
 }
 
 impl fmt::Display for BoundField {
@@ -178,11 +175,6 @@ impl fmt::Display for BoundField {
             Self::BoxId => "box id",
             Self::Host => "host",
             Self::Module => "module",
-            Self::HostSetVersion => "host-set version",
-            Self::Mode => "mode",
-            Self::Iat => "issue time",
-            Self::Expiry => "expiry",
-            Self::Kid => "key id",
         })
     }
 }
@@ -336,7 +328,7 @@ pub enum OpenError {
     /// A bound field differs from the expected binding.
     #[error("the sealed value is bound to a different {0}")]
     ContextMismatch(BoundField),
-    /// The value's expiry ([`BoundField::Expiry`]), or the member's `exp`
+    /// The value's expiry ([`Context::expiry`]), or the member's `exp`
     /// when it has one, is at or before the request's clock time.
     #[error("the sealed value is past its expiry")]
     Expired,
@@ -809,21 +801,33 @@ mod tests {
             )
     }
 
+    /// A member of the protected header that the authenticated context
+    /// carries.
+    #[derive(Debug, Clone, Copy)]
+    enum HeaderField {
+        BoxId,
+        Host,
+        Module,
+        HostSetVersion,
+        Mode,
+        Iat,
+        Expiry,
+    }
+
     /// Rewrites one field of the sealed value's protected header and keeps
     /// every other byte.
-    fn rewrite_header(sealed: &str, field: BoundField) -> String {
+    fn rewrite_header(sealed: &str, field: HeaderField) -> String {
         let (header_b64, rest) = sealed.split_once('.').unwrap();
         let mut header: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
         let value = match field {
-            BoundField::BoxId => &mut header["sub"],
-            BoundField::Host => &mut header["node_id"],
-            BoundField::Module => &mut header["upstream"]["module"],
-            BoundField::HostSetVersion => &mut header["upstream"]["host_set_version"],
-            BoundField::Mode => &mut header["mode"],
-            BoundField::Iat => &mut header["iat"],
-            BoundField::Expiry => &mut header["exp"],
-            BoundField::Kid => &mut header["kid"],
+            HeaderField::BoxId => &mut header["sub"],
+            HeaderField::Host => &mut header["node_id"],
+            HeaderField::Module => &mut header["upstream"]["module"],
+            HeaderField::HostSetVersion => &mut header["upstream"]["host_set_version"],
+            HeaderField::Mode => &mut header["mode"],
+            HeaderField::Iat => &mut header["iat"],
+            HeaderField::Expiry => &mut header["exp"],
         };
         *value = match value.take() {
             serde_json::Value::String(s) if s == "user" => "installation".into(),
@@ -838,14 +842,14 @@ mod tests {
 
     const COMPARED: [BoundField; 3] = [BoundField::BoxId, BoundField::Host, BoundField::Module];
 
-    const CARRIED: [BoundField; 7] = [
-        BoundField::BoxId,
-        BoundField::Host,
-        BoundField::Module,
-        BoundField::HostSetVersion,
-        BoundField::Mode,
-        BoundField::Iat,
-        BoundField::Expiry,
+    const CARRIED: [HeaderField; 7] = [
+        HeaderField::BoxId,
+        HeaderField::Host,
+        HeaderField::Module,
+        HeaderField::HostSetVersion,
+        HeaderField::Mode,
+        HeaderField::Iat,
+        HeaderField::Expiry,
     ];
 
     // BEP-006: the box id, host, module, host-set version, mode and expiry
@@ -889,7 +893,7 @@ mod tests {
             match field {
                 BoundField::BoxId => other.box_id.push('x'),
                 BoundField::Host => other.host.push('x'),
-                _ => other.module.push('x'),
+                BoundField::Module => other.module.push('x'),
             }
             let err = open(&key, &sealed, &other).unwrap_err();
             prop_assert_eq!(&err, &OpenError::ContextMismatch(field));
