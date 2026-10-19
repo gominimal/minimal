@@ -183,8 +183,15 @@ impl<K: HeldKey> ProxyKeys<K> {
 /// Why the proxy did not start.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StartError {
-    /// The store holds these keys and refused them.
-    Refused(Vec<Role>),
+    /// The store refused these keys, or no longer holds keys that the proxy
+    /// published before.
+    Unusable {
+        /// The keys the store holds and refused.
+        refused: Vec<Role>,
+        /// The keys the published identity names and the store does not
+        /// hold.
+        missing: Vec<Role>,
+    },
     /// The store did not generate a missing key.
     Store(KeyError),
 }
@@ -192,18 +199,20 @@ pub enum StartError {
 impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // BEP-060: the wording is fixed by the task's diagnostics line.
-            Self::Refused(roles) => {
-                for (i, role) in roles.iter().enumerate() {
-                    if i > 0 {
-                        writeln!(f)?;
-                    }
-                    write!(
-                        f,
+            Self::Unusable { refused, missing } => {
+                let mut lines = Vec::new();
+                // BEP-060: the wording is fixed by the task's diagnostics line.
+                for role in refused {
+                    lines.push(format!(
                         "The keychain refused the proxy its {role} key. Run `bep --replace-key {role}` to make a new one; boxes created before then must be re-created."
-                    )?;
+                    ));
                 }
-                Ok(())
+                for role in missing {
+                    lines.push(format!(
+                        "The keychain no longer holds the proxy's {role} key. Run `bep --replace-key {role}` to make a new one. Boxes created before then must be re-created."
+                    ));
+                }
+                f.write_str(&lines.join("\n"))
             }
             Self::Store(err) => write!(f, "The proxy did not start: {err}."),
         }
@@ -212,31 +221,35 @@ impl fmt::Display for StartError {
 
 /// Loads the proxy's keys at start (BEP-059, BEP-060).
 ///
-/// A key the store holds is used as it is. A key the store does not hold is
-/// generated, which happens on the first start. A key the store holds and
-/// refuses is never replaced here.
+/// `published` holds the roles that the proxy's published identity names.
+/// The proxy made a key for each of them before. A key the store holds is
+/// used as it is. A key the store does not hold is generated only when
+/// `published` does not name its role, which happens on the first start. A
+/// key the store holds and refuses, or a published key the store lost, is
+/// never replaced here.
 ///
 /// # Errors
 ///
-/// [`StartError::Refused`] with the role of each refused key, or
+/// [`StartError::Unusable`] with the role of each refused or lost key, or
 /// [`StartError::Store`] when a missing key was not generated.
-pub fn load<S: KeyStore>(store: &S) -> Result<ProxyKeys<S::Key>, StartError> {
+pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::Key>, StartError> {
     let mut refused = Vec::new();
+    let mut missing = Vec::new();
     let mut found = Vec::new();
     for role in Role::ALL {
         match store.find(role) {
             Ok(Some(key)) => match key.probe() {
-                Ok(()) => found.push(key),
+                Ok(()) => found.push((role, Some(key))),
                 Err(err) => {
                     tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
                     refused.push(role);
                 }
             },
-            Ok(None) => {
-                let key = store.generate(role).map_err(StartError::Store)?;
-                tracing::info!(role = %role, fingerprint = %key.public().kid(), "generated a proxy key");
-                found.push(key);
+            Ok(None) if published.contains(&role) => {
+                tracing::error!(role = %role, "the key store lost a published proxy key");
+                missing.push(role);
             }
+            Ok(None) => found.push((role, None)),
             Err(err @ KeyError::Refused { .. }) => {
                 tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
                 refused.push(role);
@@ -244,10 +257,24 @@ pub fn load<S: KeyStore>(store: &S) -> Result<ProxyKeys<S::Key>, StartError> {
             Err(err @ KeyError::Store { .. }) => return Err(StartError::Store(err)),
         }
     }
-    if !refused.is_empty() {
-        return Err(StartError::Refused(refused));
+    if !refused.is_empty() || !missing.is_empty() {
+        return Err(StartError::Unusable { refused, missing });
     }
-    let mut keys = found.into_iter();
+    // Generate only after every role is known to be usable, so a start that
+    // refuses leaves the store as it was.
+    let mut keys = Vec::with_capacity(found.len());
+    for (role, key) in found {
+        let key = match key {
+            Some(key) => key,
+            None => {
+                let key = store.generate(role).map_err(StartError::Store)?;
+                tracing::info!(role = %role, fingerprint = %key.public().kid(), "generated a proxy key");
+                key
+            }
+        };
+        keys.push(key);
+    }
+    let mut keys = keys.into_iter();
     let (Some(sealing), Some(root), Some(signing), None) =
         (keys.next(), keys.next(), keys.next(), keys.next())
     else {
@@ -282,6 +309,9 @@ pub enum ReplaceError {
 /// The old key is removed before the new key is generated, so no value
 /// sealed to an old sealing key opens after this returns. The store holds
 /// one key under a role's label, so the new key cannot be generated first.
+/// When the generation fails, the published identity still names the role,
+/// so the next start refuses and names this command again. It never
+/// generates the key silently.
 ///
 /// # Errors
 ///
@@ -585,6 +615,7 @@ pub(crate) mod memory {
         refused: HashSet<Role>,
         generated: usize,
         broken: bool,
+        no_generation: bool,
     }
 
     #[derive(Default)]
@@ -605,6 +636,16 @@ pub(crate) mod memory {
         /// keychain does.
         pub(crate) fn break_store(&self) {
             self.0.lock().unwrap().broken = true;
+        }
+
+        /// Makes every later generation fail, while searches still work.
+        pub(crate) fn fail_generation(&self) {
+            self.0.lock().unwrap().no_generation = true;
+        }
+
+        /// Stops refusing every key.
+        pub(crate) fn clear_refusals(&self) {
+            self.0.lock().unwrap().refused.clear();
         }
 
         pub(crate) fn generated(&self) -> usize {
@@ -689,9 +730,11 @@ pub(crate) mod memory {
         }
 
         fn generate(&self, role: Role) -> Result<MemoryKey, KeyError> {
-            if self.0.lock().unwrap().broken {
+            let inner = self.0.lock().unwrap();
+            if inner.broken || inner.no_generation {
                 return Err(broken(role));
             }
+            drop(inner);
             let secret = loop {
                 let mut bytes = Zeroizing::new([0u8; 32]);
                 getrandom::fill(bytes.as_mut()).expect("random source");
@@ -726,7 +769,7 @@ mod tests {
     #[test]
     fn keys_never_regenerated_on_restart() {
         let store = MemoryStore::default();
-        let first = load(&store).unwrap();
+        let first = load(&store, &[]).unwrap();
         assert_eq!(store.generated(), 3);
         let kids: Vec<String> = Role::ALL
             .iter()
@@ -735,7 +778,7 @@ mod tests {
         drop(first);
 
         for _ in 0..3 {
-            let again = load(&store).unwrap();
+            let again = load(&store, &Role::ALL).unwrap();
             let again_kids: Vec<String> = Role::ALL
                 .iter()
                 .map(|role| again.get(*role).public().kid())
@@ -746,7 +789,7 @@ mod tests {
 
         // A refused key is not replaced on restart either.
         store.refuse(Role::Sealing);
-        assert!(load(&store).is_err());
+        assert!(load(&store, &Role::ALL).is_err());
         assert_eq!(store.generated(), 3, "a refused key was regenerated");
     }
 
@@ -754,12 +797,18 @@ mod tests {
     #[test]
     fn refused_key_names_the_replacement_command() {
         let store = MemoryStore::default();
-        drop(load(&store).unwrap());
+        drop(load(&store, &[]).unwrap());
         store.refuse(Role::Sealing);
         store.refuse(Role::Signing);
 
-        let err = load(&store).unwrap_err();
-        assert_eq!(err, StartError::Refused(vec![Role::Sealing, Role::Signing]));
+        let err = load(&store, &Role::ALL).unwrap_err();
+        assert_eq!(
+            err,
+            StartError::Unusable {
+                refused: vec![Role::Sealing, Role::Signing],
+                missing: vec![],
+            }
+        );
         assert_eq!(
             err.to_string(),
             "The keychain refused the proxy its sealing key. Run `bep --replace-key sealing` to make a new one; boxes created before then must be re-created.\n\
@@ -769,16 +818,64 @@ mod tests {
         // The named command is the way out.
         replace(&store, "sealing".parse().unwrap()).unwrap();
         replace(&store, "signing".parse().unwrap()).unwrap();
-        assert!(load(&store).is_ok());
+        assert!(load(&store, &Role::ALL).is_ok());
+    }
+
+    // BEP-060: a later start never makes a published key again.
+    #[test]
+    fn a_published_key_the_store_lost_refuses_the_start() {
+        let store = MemoryStore::default();
+        drop(load(&store, &[]).unwrap());
+        store.remove(Role::Root).unwrap();
+        store.refuse(Role::Signing);
+
+        let err = load(&store, &Role::ALL).unwrap_err();
+        assert_eq!(
+            err,
+            StartError::Unusable {
+                refused: vec![Role::Signing],
+                missing: vec![Role::Root],
+            }
+        );
+        assert!(
+            err.to_string()
+                .contains("no longer holds the proxy's root key. Run `bep --replace-key root`"),
+            "{err}"
+        );
+        assert_eq!(store.generated(), 3, "a lost key was made again");
+
+        // A role the identity does not name is a first start for that key.
+        store.clear_refusals();
+        assert!(load(&store, &[Role::Sealing]).is_ok());
+        assert_eq!(store.generated(), 4);
+    }
+
+    // BEP-060: a replacement that removed the old key and made no new one.
+    #[test]
+    fn a_failed_replacement_refuses_the_next_start() {
+        let store = MemoryStore::default();
+        drop(load(&store, &[]).unwrap());
+        store.fail_generation();
+        assert!(matches!(
+            replace(&store, Role::Sealing),
+            Err(ReplaceError::Generate(_))
+        ));
+
+        let err = load(&store, &Role::ALL).unwrap_err();
+        assert!(
+            err.to_string().contains("`bep --replace-key sealing`"),
+            "{err}"
+        );
+        assert_eq!(store.generated(), 3);
     }
 
     #[test]
     fn a_store_failure_is_not_a_refused_key() {
         let store = MemoryStore::default();
-        drop(load(&store).unwrap());
+        drop(load(&store, &[]).unwrap());
         store.break_store();
 
-        let err = load(&store).unwrap_err();
+        let err = load(&store, &Role::ALL).unwrap_err();
         assert!(matches!(err, StartError::Store(_)), "{err}");
         assert!(!err.to_string().contains("--replace-key"), "{err}");
         assert_eq!(store.generated(), 3);
@@ -787,7 +884,7 @@ mod tests {
     #[test]
     fn a_failed_generation_reports_the_old_key_removed() {
         let store = MemoryStore::default();
-        drop(load(&store).unwrap());
+        drop(load(&store, &[]).unwrap());
         store.break_store();
 
         let err = replace(&store, Role::Sealing).unwrap_err();

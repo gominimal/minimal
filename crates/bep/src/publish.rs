@@ -20,7 +20,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{HeldKey, ProxyKeys, Role};
+use crate::keys::{HeldKey, KeyStore, ProxyKeys, Role};
 use crate::seal::{self, Context, MemberList, ProxyPublicKey, SealError};
 
 /// One published key.
@@ -63,14 +63,22 @@ pub enum PublishError {
         "The proxy's published identity has no usable {0} key. Start `bep` to publish it again."
     )]
     NotAKey(Role),
-    /// Users other than the file's owner can change it, so it can name a
-    /// key that is not the proxy's.
+    /// Another user owns the file or can change it, so it can name a key
+    /// that is not the proxy's.
     #[error(
-        "The proxy's published identity at {0} can be changed by other users. Start `bep` to publish it again."
+        "The proxy's published identity at {0} can be changed by another user, so it is not used. Delete it, then start `bep` to publish it again."
     )]
     Writable(PathBuf),
+    /// Other users can change the directory that holds the file, so they can
+    /// put another file in its place.
+    #[error(
+        "Other users can change the directory {0}, so the proxy's published identity in it is not used. Give a file in a directory that only you can change, with `bep --identity <PATH>`."
+    )]
+    OpenDirectory(PathBuf),
     /// The file is not a published identity.
-    #[error("The proxy's published identity at {0} is not valid JSON.")]
+    #[error(
+        "The proxy's published identity at {0} is not valid JSON. Delete it, then start `bep` to publish it again."
+    )]
     Malformed(PathBuf),
     /// The file was not read or written.
     #[error("The proxy's published identity at {path} was not accessed: {source}")]
@@ -93,6 +101,44 @@ impl Identity {
             root: Some(PublishedKey::of(&keys.root.public())),
             signing: Some(PublishedKey::of(&keys.signing.public())),
         }
+    }
+
+    /// The identity to publish after `role` was replaced by `key`.
+    ///
+    /// The other roles come from the store when it gives their public half,
+    /// and from `previous` when it does not. A replacement never needs the
+    /// whole store to be usable, so a second refused key does not keep the
+    /// old public key published (BEP-060).
+    pub fn after_replacement<S: KeyStore>(
+        store: &S,
+        role: Role,
+        key: &S::Key,
+        previous: Option<&Self>,
+    ) -> Self {
+        let entry = |other: Role| {
+            if other == role {
+                return Some(PublishedKey::of(&key.public()));
+            }
+            match store.find(other) {
+                Ok(Some(held)) => Some(PublishedKey::of(&held.public())),
+                _ => previous.and_then(|previous| previous.entry(other).cloned()),
+            }
+        };
+        Self {
+            sealing: entry(Role::Sealing),
+            root: entry(Role::Root),
+            signing: entry(Role::Signing),
+        }
+    }
+
+    /// The roles this identity has an entry for. The proxy made a key for
+    /// each of them before.
+    #[must_use]
+    pub fn roles(&self) -> Vec<Role> {
+        Role::ALL
+            .into_iter()
+            .filter(|role| self.entry(*role).is_some())
+            .collect()
     }
 
     fn entry(&self, role: Role) -> Option<&PublishedKey> {
@@ -143,6 +189,7 @@ impl Identity {
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
             builder.create(dir).map_err(io)?;
+            check_dir(dir)?;
         }
         let json = serde_json::to_vec_pretty(self).map_err(|err| io(err.into()))?;
         let staged = path.with_extension("json.new");
@@ -167,8 +214,9 @@ impl Identity {
     /// # Errors
     ///
     /// [`PublishError::Io`] when the file is not read,
-    /// [`PublishError::Writable`] when users other than its owner can change
-    /// it, and [`PublishError::Malformed`] when it is not a published
+    /// [`PublishError::Writable`] when another user owns it or can change
+    /// it, [`PublishError::OpenDirectory`] when other users can change its
+    /// directory, and [`PublishError::Malformed`] when it is not a published
     /// identity.
     pub fn read(path: &Path) -> Result<Self, PublishError> {
         let io = |source| PublishError::Io {
@@ -178,11 +226,14 @@ impl Identity {
         let mut file = std::fs::File::open(path).map_err(io)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = file.metadata().map_err(io)?.permissions().mode();
-            if mode & 0o022 != 0 {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = file.metadata().map_err(io)?;
+            if meta.mode() & 0o022 != 0 || meta.uid() != euid() {
                 return Err(PublishError::Writable(path.to_owned()));
             }
+        }
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            check_dir(dir)?;
         }
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut file, &mut bytes).map_err(io)?;
@@ -200,6 +251,33 @@ impl Identity {
         let key = self.key(Role::Sealing)?;
         Ok(seal::seal(&key, context, members)?)
     }
+}
+
+#[cfg(unix)]
+fn euid() -> u32 {
+    // SAFETY: `geteuid` takes no argument and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Refuses a directory that other users can change, unless its sticky bit
+/// keeps them from replacing a file they do not own.
+fn check_dir(dir: &Path) -> Result<(), PublishError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(dir).map_err(|source| PublishError::Io {
+            path: dir.to_owned(),
+            source,
+        })?;
+        let sticky = meta.mode() & 0o1000 != 0;
+        let others_write = meta.mode() & 0o022 != 0;
+        if (others_write && !sticky) || (meta.uid() != euid() && meta.uid() != 0) {
+            return Err(PublishError::OpenDirectory(dir.to_owned()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -278,7 +356,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/identity.json");
         let store = MemoryStore::default();
-        let keys = load(&store).unwrap();
+        let keys = load(&store, &[]).unwrap();
         Identity::of(&keys).publish(&path).unwrap();
 
         assert!(!keys.signing.exportable());
@@ -295,13 +373,13 @@ mod tests {
         let path = dir.path().join("identity.json");
         let store = MemoryStore::default();
 
-        let first = load(&store).unwrap();
+        let first = load(&store, &[]).unwrap();
         Identity::of(&first).publish(&path).unwrap();
         let before = Identity::read(&path).unwrap();
         drop(first);
 
         // A restart loads the same keys, and publishes the same identity.
-        let second = load(&store).unwrap();
+        let second = load(&store, &Role::ALL).unwrap();
         Identity::of(&second).publish(&path).unwrap();
         let after = Identity::read(&path).unwrap();
         for role in [Role::Sealing, Role::Root] {
@@ -317,7 +395,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.json");
         let store = MemoryStore::default();
-        let keys = load(&store).unwrap();
+        let keys = load(&store, &[]).unwrap();
         Identity::of(&keys).publish(&path).unwrap();
 
         // The mint reads the file only.
@@ -336,7 +414,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/identity.json");
-        let keys = load(&MemoryStore::default()).unwrap();
+        let keys = load(&MemoryStore::default(), &[]).unwrap();
         let identity = Identity::of(&keys);
         // A link in place of the staged file is not followed.
         std::fs::create_dir(dir.path().join("bep")).unwrap();
@@ -361,13 +439,59 @@ mod tests {
         let fresh = dir.path().join("new/dir/identity.json");
         identity.publish(&fresh).unwrap();
         assert_eq!(mode(fresh.parent().unwrap()), 0o700);
+
+        // A directory that other users can change is refused, for reads and
+        // for writes. Its sticky bit makes it safe again.
+        let bep_dir = dir.path().join("bep");
+        std::fs::set_permissions(&bep_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            Identity::read(&path),
+            Err(PublishError::OpenDirectory(_))
+        ));
+        assert!(matches!(
+            identity.publish(&path),
+            Err(PublishError::OpenDirectory(_))
+        ));
+        std::fs::set_permissions(&bep_dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(Identity::read(&path).unwrap(), identity);
+    }
+
+    // BEP-060: a second refused key does not keep the old key published.
+    #[test]
+    fn a_replacement_publishes_the_new_key_beside_a_refused_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let store = MemoryStore::default();
+        let keys = load(&store, &[]).unwrap();
+        let before = Identity::of(&keys);
+        before.publish(&path).unwrap();
+        drop(keys);
+
+        store.refuse(Role::Signing);
+        store.remove(Role::Root).unwrap();
+        let new = replace(&store, Role::Sealing).unwrap();
+        let previous = Identity::read(&path).ok();
+        let after = Identity::after_replacement(&store, Role::Sealing, &new, previous.as_ref());
+        after.publish(&path).unwrap();
+
+        let published = Identity::read(&path).unwrap();
+        assert_eq!(published.key(Role::Sealing).unwrap(), new.public());
+        assert_eq!(published.signing, before.signing);
+        // A role the store lost stays published, so the next start refuses
+        // and does not make it again silently.
+        assert_eq!(published.root, before.root);
+        assert_eq!(published.roles(), Role::ALL.to_vec());
+
+        // With no previous file, the store alone gives the other roles.
+        let alone = Identity::after_replacement(&store, Role::Sealing, &new, None);
+        assert_eq!(alone.roles(), vec![Role::Sealing, Role::Signing]);
     }
 
     // BEP-072
     #[test]
     fn a_published_identity_carrying_no_key_is_refused_by_role() {
         let store = MemoryStore::default();
-        let keys = load(&store).unwrap();
+        let keys = load(&store, &[]).unwrap();
         let good = Identity::of(&keys);
         let ctx = context(&good);
 
@@ -414,7 +538,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.json");
         let store = MemoryStore::default();
-        let keys = load(&store).unwrap();
+        let keys = load(&store, &[]).unwrap();
         Identity::of(&keys).publish(&path).unwrap();
         let published = Identity::read(&path).unwrap();
         let sealed = published.seal(&context(&published), &members()).unwrap();
@@ -425,7 +549,7 @@ mod tests {
         assert_ne!(new.public().kid(), published.sealing.unwrap().kid);
         assert!(replacement_report(Role::Sealing).contains("Re-create"));
 
-        let restarted = load(&store).unwrap();
+        let restarted = load(&store, &Role::ALL).unwrap();
         assert_eq!(
             restarted.sealing.open(&sealed, &binding()).unwrap_err(),
             OpenError::NotOpenable
