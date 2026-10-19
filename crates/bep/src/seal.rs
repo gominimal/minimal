@@ -68,6 +68,11 @@ const IV_LEN: usize = 12;
 /// The length of an A256GCM tag.
 const TAG_LEN: usize = 16;
 
+/// The longest sealed value [`open`] reads. A box sends the value, so
+/// [`open`] refuses a longer one before it decodes anything. One member with
+/// a signed handle is far below this.
+pub const MAX_SEALED_LEN: usize = 16 * 1024;
+
 /// The mode a member acts in. The proxy records it for the audit and does
 /// not refuse on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -316,8 +321,8 @@ pub enum SealError {
 /// envelope or the expected binding.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OpenError {
-    /// The value is not a compact JWE, or a segment or the header does not
-    /// decode.
+    /// The value is not a compact JWE, is longer than [`MAX_SEALED_LEN`], or
+    /// a segment or the header does not decode.
     #[error("the value is not a sealed value")]
     Malformed,
     /// The header's `typ`, `alg`, `enc` or key is not one this proxy reads.
@@ -412,13 +417,16 @@ fn seal_plaintext(
 /// [`OpenError::ContextMismatch`] names the first of box id, host and module
 /// that differs. [`OpenError::Expired`] says the value's expiry, or the
 /// member's `exp` when it has one, is at or before `expected.now`. The other variants say the
-/// value is malformed, uses an unsupported algorithm, is sealed to another
+/// value is malformed or longer than [`MAX_SEALED_LEN`], uses an unsupported algorithm, is sealed to another
 /// key or does not decrypt, or carries no list of exactly one member with a
 /// known kind and breadth.
 ///
 /// A value that opens is not proof of who sealed it. The caller must verify
 /// the member's signed handle, its `jws`, before it uses it. See the module docs.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
+    if sealed.len() > MAX_SEALED_LEN {
+        return Err(OpenError::Malformed);
+    }
     let mut parts = sealed.split('.');
     let (Some(header_b64), Some(encrypted_key), Some(iv), Some(ciphertext), Some(tag), None) = (
         parts.next(),
@@ -1012,6 +1020,17 @@ mod tests {
             ..binding(&context)
         };
         assert_eq!(open(&key, &sealed, &after).unwrap_err(), OpenError::Expired);
+    }
+
+    #[test]
+    fn a_value_longer_than_the_cap_is_refused_before_decoding() {
+        let key = ProxyKey::generate().unwrap();
+        let context = fixed_context(&key);
+        let long = "a".repeat(MAX_SEALED_LEN + 1);
+        assert_eq!(
+            open(&key, &long, &binding(&context)).unwrap_err(),
+            OpenError::Malformed
+        );
     }
 
     // Gatehouse §6.10: the un-enrolled member is `{kind, breadth, jws}`, and
