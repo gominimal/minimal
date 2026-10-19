@@ -316,8 +316,15 @@ impl<C: Channel> Sandbox<C> {
                         }
                         config::SandboxMapped::FileCopy(p) => {
                             let dest = b.join(p.file_name().unwrap());
-                            fs::copy(p, &dest)
-                                .map_err(|e| Error::IO("copying input file", dest, e))?;
+                            if !copy_input_file(p, &dest)
+                                .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
+                            {
+                                tracing::warn!(
+                                    "Not copying {} => {}, already exists",
+                                    p.display(),
+                                    dest.display()
+                                );
+                            }
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,
@@ -2737,6 +2744,28 @@ fn booted_with_systemd() -> bool {
         .unwrap_or_default()
 }
 
+/// Copy `src` to `dest` as a new file with `src`'s permission bits. Returns
+/// `false`, touching nothing, when `dest` already exists: two inputs with one
+/// basename keep the first, as a hardlinked `File` input does. `fs::copy`
+/// would truncate an existing `dest`, and a `dest` hardlinked in from a mapped
+/// directory shares its inode with that directory's source, so the copy would
+/// have rewritten the source in place.
+fn copy_input_file(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    let mut out = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut input = fs::File::open(src)?;
+    std::io::copy(&mut input, &mut out)?;
+    out.set_permissions(input.metadata()?.permissions())?;
+    Ok(true)
+}
+
 fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
     common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
 }
@@ -3735,6 +3764,38 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copied input is a new file with the source's bytes and mode.
+    #[test]
+    fn copy_input_file_copies_bytes_and_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.tar.gz");
+        fs::write(&src, b"payload").unwrap();
+        fs::set_permissions(&src, Permissions::from_mode(0o640)).unwrap();
+        let dest = tmp.path().join("dest.tar.gz");
+        assert!(copy_input_file(&src, &dest).unwrap());
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    /// An existing destination is left alone, even one that is a hardlink to
+    /// another file: `fs::copy` would truncate it and so rewrite that file.
+    #[test]
+    fn copy_input_file_never_writes_through_an_existing_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("cached-from-a-dep");
+        fs::write(&shared, b"shared bytes").unwrap();
+        let dest = tmp.path().join("build-dest");
+        fs::hard_link(&shared, &dest).unwrap();
+        let src = tmp.path().join("other-source");
+        fs::write(&src, b"other").unwrap();
+        assert!(!copy_input_file(&src, &dest).unwrap());
+        assert_eq!(fs::read(&shared).unwrap(), b"shared bytes");
+        assert_eq!(fs::read(&dest).unwrap(), b"shared bytes");
+    }
     use config::{Config, SandboxMapped};
 
     /// The daemon's AppArmor remedy names the install step for the
