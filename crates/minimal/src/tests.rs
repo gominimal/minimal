@@ -288,11 +288,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::session_record_by = ungated",
             // The dashboard's activation is the same multi-step mutation as
             // `cmd_session`'s, so it carries the same gate on its own create.
-            // Its two discovery probes stay open on purpose: they list a skewed
-            // VM precisely so an operator still sees its boxes (see `dash::rpc`).
+            // Its two discovery connections are gated too: the dashboard opens
+            // on the same terms `min ls` does (see `dash::rpc`).
             "dash/rpc.rs::activate = gated",
-            "dash/rpc.rs::connect_missing = ungated",
-            "dash/rpc.rs::discover = ungated",
+            "dash/rpc.rs::connect_missing = gated",
+            "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to

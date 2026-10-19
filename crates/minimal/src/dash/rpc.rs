@@ -138,34 +138,41 @@ fn push_candidate(candidates: &mut Vec<(String, PathBuf)>, label: String, sock: 
 /// Probe both known socket paths and connect to each reachable daemon.
 /// Sockets that don't exist are skipped without a connect attempt, so
 /// discovery never pays the connect-retry delay for a down provider.
-pub async fn discover(minimal_dir: Option<&Path>) -> Vec<Provider> {
+///
+/// Each connection is version-gated like `min ls`'s: the dashboard's create
+/// path (`activate`) is a multi-step mutation, and opening on a skewed pair
+/// is refused before the TUI takes over the terminal. The override var
+/// downgrades each refusal to a warning, as everywhere else.
+pub async fn discover(minimal_dir: Option<&Path>) -> Result<Vec<Provider>, anyhow::Error> {
     let mut providers = Vec::new();
     for (label, sock) in probe_candidates(minimal_dir) {
         if !sock.exists() {
             continue;
         }
-        // Deliberately not version-gated: the dashboard is read-only until the
-        // user acts, it renders each provider's version in the sidebar, and a
-        // skewed daemon is precisely when an operator needs to see (and be able
-        // to destroy) the sessions on it. The one multi-step mutation the TUI
-        // drives, `activate`, gates on its own connection instead.
-        match Client::connect(&sock).await {
-            Ok(client) => providers.push(Provider {
+        let mut client = match Client::connect(&sock).await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(provider = label, error = %e, "socket present but daemon unreachable");
+                continue;
+            }
+        };
+        match minimal_client::ensure_version_match(&mut client).await {
+            Ok(()) => providers.push(Provider {
                 label,
                 sock,
                 client,
             }),
-            Err(e) => {
-                tracing::warn!(provider = label, error = %e, "socket present but daemon unreachable");
-            }
+            Err(e) => return Err(e.context(format!("provider {label}"))),
         }
     }
-    providers
+    Ok(providers)
 }
 
 /// Connect to any canonical provider not already served, so a daemon that
 /// (re)appears mid-run joins the dashboard. Each attempt is bounded by
-/// [`CONNECT_TIMEOUT`] so a wedged acceptor can't stall the UI loop.
+/// [`CONNECT_TIMEOUT`] so a wedged acceptor can't stall the UI loop. A
+/// provider whose build is skewed is skipped with a warning rather than
+/// joined, but never fails the loop for the providers already listed.
 pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<&Path>) {
     for (label, sock) in probe_candidates(minimal_dir) {
         if providers.iter().any(|p| p.label == label || p.sock == sock) {
@@ -174,24 +181,31 @@ pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<
         if !sock.exists() {
             continue;
         }
-        // Deliberately not version-gated, for the same reason as `discover`:
-        // a provider that reappears mid-run must still be listable.
-        match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(&sock)).await {
-            Ok(Ok(client)) => {
-                tracing::info!(provider = label, "provider connected");
-                providers.push(Provider {
-                    label,
-                    sock,
-                    client,
-                });
-            }
+        let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(&sock)).await {
+            Ok(Ok(client)) => client,
             Ok(Err(e)) => {
                 tracing::debug!(provider = label, error = %e, "provider reconnect failed");
+                continue;
             }
             Err(_) => {
                 tracing::debug!(provider = label, "provider reconnect timed out");
+                continue;
             }
+        };
+        // Version-gated like `discover`, but a skewed provider that appears
+        // mid-run must not kill the dashboard the other providers are still
+        // serving, so the refusal skips it — the warning it logged is the
+        // operator's cue to `min stop --force` and reopen.
+        if let Err(e) = minimal_client::ensure_version_match(&mut client).await {
+            tracing::warn!(provider = label, error = %e, "provider build is skewed");
+            continue;
         }
+        tracing::info!(provider = label, "provider connected");
+        providers.push(Provider {
+            label,
+            sock,
+            client,
+        });
     }
 }
 
@@ -1482,21 +1496,21 @@ mod tests {
 #[cfg(test)]
 mod version_gate_tests {
     /// The dashboard opens three daemon connections, and #1251's gate reached
-    /// none of them. Only `activate` runs a multi-step mutation, so only it is
-    /// gated; the two discovery connections stay open on purpose and must say
-    /// so, since a reader who finds an ungated connect has no other way to tell
-    /// an audited decision from an oversight.
+    /// none of them. `activate` and the two discovery connections are all
+    /// gated now — the dashboard opens on the same terms `min ls` does, and a
+    /// provider that reappears mid-run with a skewed build joins only under
+    /// the override.
     ///
     /// Asserted as an inventory rather than a count, so adding, removing, or
     /// reclassifying a connection fails here and forces the same judgement.
     #[test]
-    fn only_the_activation_path_is_version_gated() {
+    fn every_dashboard_connection_is_version_gated() {
         assert_eq!(
             connect_site_inventory(),
             [
                 "activate = gated",
-                "connect_missing = ungated (explained)",
-                "discover = ungated (explained)",
+                "connect_missing = gated",
+                "discover = gated",
             ]
         );
     }
