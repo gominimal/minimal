@@ -496,6 +496,107 @@ async fn a_slow_destroy_does_not_hold_the_mainloop() {
     );
 }
 
+/// Shutdown waits out a teardown in flight: the destroy runs on a task of
+/// its own, and its hook and record delete end before the state volume
+/// is quiesced, so neither races the unmount. The hook sleeps, so a
+/// shutdown that did not wait would return in milliseconds with the
+/// destroy still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_a_teardown_in_flight() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    until_claimed(&mngr, id).await;
+    let started = std::time::Instant::now();
+    mngr.shutdown(false)
+        .await
+        .expect("a teardown in flight does not refuse an unforced shutdown");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "shutdown returned before the destroy hook could have ended"
+    );
+    // The destroy answered before shutdown returned: its result is
+    // already in, so the join does not wait.
+    let hook_failures = tokio::time::timeout(std::time::Duration::from_millis(500), destroy)
+        .await
+        .expect("shutdown returned with the teardown still running")
+        .unwrap()
+        .unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+}
+
+/// A resume during a teardown brings up nothing for it: the record is
+/// still there (it outlives the actor by the teardown's length) and has
+/// no actor in `running`, which is what resume looks for, but the
+/// session is being destroyed, not idle. Without the tearing-down check a
+/// resume mid-teardown started a second actor on the record the first
+/// was about to delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_during_a_teardown_does_not_bring_the_session_up() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    until_claimed(&mngr, id).await;
+    let resumed = mngr.resume_active_sessions().await.unwrap();
+    assert_eq!(resumed, 0, "a session being torn down is not resumed");
+    assert!(
+        !destroy.is_finished(),
+        "the destroy hook should still be running"
+    );
+
+    let hook_failures = destroy.await.unwrap().unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone after the destroy, not resurrected by the resume"
+    );
+}
+
 /// A session being torn down is gone to everyone else: a second destroy
 /// in the window is refused, a resolve finds nothing, and the
 /// `on_destroy` hook runs once. With the teardown off the mainloop the
