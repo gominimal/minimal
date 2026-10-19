@@ -719,14 +719,17 @@ PY
 }
 
 nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the spec's bound
-    local wf="$root/.github/workflows/nightly-tests.yml"
-    [ -f "$wf" ] || { echo "skip - no nightly workflow in this tree"; return; }
+    local wf="$root/.github/workflows/metrics.yml" nightly="$root/.github/workflows/nightly-tests.yml"
+    [ -f "$wf" ] || { echo "skip - no metrics workflow in this tree"; return; }
     local budget
     budget="$(awk '/^  metrics:$/{p=1} p && /timeout-minutes:/{print $2; exit}' "$wf")"
     [ "$budget" = "120" ] && ok "the metrics job declares timeout-minutes 120" || bad "metrics job timeout: '$budget'"
-    awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$wf" | grep -q 'continue-on-error: true' && ok "the job is non-blocking" || bad "metrics job blocks"
-    awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$wf" | grep -q 'publish-snapshot.sh' && ok "the job publishes through the script" || bad "no publish step"
-    awk '/^  notify:$/{p=1} p' "$wf" | grep -q 'needs:.*metrics' && bad "notify depends on metrics (it must not while non-blocking)" || ok "notify does not depend on metrics"
+    awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'continue-on-error: true' && ok "the job is non-blocking" || bad "metrics job blocks"
+    awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'publish-snapshot.sh' && ok "the job publishes through the script" || bad "no publish step"
+    grep -q '^  workflow_dispatch:' "$wf" && grep -q '^  workflow_call:' "$wf" && ok "the workflow runs alone and when called" || bad "metrics.yml lacks workflow_dispatch or workflow_call"
+    [ -f "$nightly" ] || { echo "skip - no nightly workflow in this tree"; return; }
+    awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$nightly" | grep -q 'uses: ./.github/workflows/metrics.yml' && ok "the nightly calls metrics.yml" || bad "nightly-tests does not call metrics.yml"
+    awk '/^  notify:$/{p=1} p' "$nightly" | grep -q 'needs:.*metrics' && bad "notify depends on metrics (it must not while non-blocking)" || ok "notify does not depend on metrics"
 }
 
 summary_is_appended_for_a_snapshot() {   # the nightly's glance: summary.md beside the snapshot, appended to the step summary
