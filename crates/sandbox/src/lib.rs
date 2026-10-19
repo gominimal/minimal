@@ -4375,6 +4375,23 @@ ff02::2\tip6-allrouters
         );
     }
 
+    /// A build that fails after its directory was created leaves nothing
+    /// behind: `Sandbox::new` rejecting a file in the rootfs comes after
+    /// `Config::build` made the directory and its synth config.
+    #[tokio::test]
+    async fn a_failed_build_removes_its_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("sandboxes");
+        std::fs::create_dir(&base).unwrap();
+        let result = Config::new("test-cleanup")
+            .with_add_rootfs(SandboxMapped::File(tmp.path().join("phantom.txt")))
+            .build(&base, ())
+            .await;
+        assert!(matches!(result, Err(Error::MappedFile(_))), "{result:?}");
+        let left: Vec<_> = std::fs::read_dir(&base).unwrap().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
     /// When no explicit `state_dir` is configured, `Sandbox::new` derives it
     /// as `base_dir/state`. The caller relies on this to bind-mount `/state`
     /// into the container at the correct host path.
