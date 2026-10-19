@@ -94,6 +94,15 @@ const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r
 /// guest-egress / session bring-up indefinitely.
 const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a gated vsock attach waits after the relay starts before its first
+/// frame — the lease announcement — leaves toward the switch. gvproxy's
+/// `/connect` handler hijacks the stream after reading the upgrade request,
+/// and a hijack discards whatever bytes already sit in its read buffer, so
+/// the announcement must not be written into the stream before the hijack
+/// can take it; this delay puts it safely past the hijack on the relay's
+/// clock, short enough to stay within the row's resume bound.
+const ATTACH_ANNOUNCE_DELAY: Duration = Duration::from_millis(100);
+
 /// `struct ifreq` reduced to the two fields `TUNSETIFF` reads, padded to the
 /// kernel's `sizeof(struct ifreq)` (40 bytes on every LP64 Linux target) so the
 /// kernel's `copy_from_user` never reads past the allocation.
@@ -398,8 +407,19 @@ impl Drop for SwitchRelay {
 /// deprecated host-alias literal it notices (NET-004); the daemon relay ignores
 /// it.
 ///
-/// Spawns two background tasks — tap→switch and switch→tap — and returns a
-/// [`SwitchRelay`] handle whose lifetime keeps the attachment alive.
+/// Spawns the relay's two background tasks — tap→switch and switch→tap — and
+/// returns a [`SwitchRelay`] handle whose lifetime keeps the attachment alive.
+///
+/// This attach never announces the lease ([`announce_lease`]), gated or not.
+/// The local control socket is DM2's, whose box tap the sandbox builds in its
+/// own namespace with a kernel-chosen MAC (`provider::tap_mechanism`), not the
+/// lease's derived one. gvproxy's NIC spoofs, so it treats every ARP target as
+/// local and learns the sender of a gratuitous ARP: an announcement at the
+/// derived MAC would point the gateway's neighbour entry for the lease at a
+/// MAC the box does not wear, and every reply the gateway sends the box (its
+/// DNS answers among them) would be dropped by the box's kernel until the
+/// entry re-resolved. DM2 has no host-side row for the announcement to carry
+/// either (NET-138 is minvmd's).
 ///
 /// # Errors
 ///
@@ -415,11 +435,8 @@ pub async fn attach_to_switch(
 ) -> io::Result<SwitchRelay> {
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
-    if gate.is_some() {
-        announce_lease(&mut sock, lease).await?;
-    }
     let (sock_rx, sock_tx) = sock.into_split();
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, false, lease, subnet)
 }
 
 /// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (DM1/3/4) and
@@ -431,6 +448,11 @@ pub async fn attach_to_switch(
 /// `krun_add_vsock_port2(.., listen = false)`). This is the same HyperKit-framed
 /// raw-L2 relay as [`attach_to_switch`] — the shuttle is *not* a second TCP/IP
 /// stack — so exactly one gVisor stack (the host gvproxy) sits in the path.
+///
+/// A gated attach here announces the lease as its relay's first frame
+/// ([`announce_lease`], NET-138): this transport's box tap is the one the
+/// daemon configures itself ([`tap_netns_commands`]), which wears the lease's
+/// derived MAC, so the announcement tells the switch the truth.
 ///
 /// # Errors
 ///
@@ -445,12 +467,10 @@ pub async fn attach_to_switch_vsock(
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
-    let mut sock = connect_switch_vsock(cid, port).await?;
-    if gate.is_some() {
-        announce_lease(&mut sock, lease).await?;
-    }
+    let sock = connect_switch_vsock(cid, port).await?;
+    let announce = gate.is_some();
     let (sock_rx, sock_tx) = tokio::io::split(sock);
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, announce, lease, subnet)
 }
 
 /// A gratuitous ARP announcing `lease` from its own MAC
@@ -479,8 +499,9 @@ fn gratuitous_arp(lease: Ipv4Addr) -> Vec<u8> {
     frame
 }
 
-/// Writes one gratuitous ARP for `lease` onto a box relay's switch
-/// connection, framed as every relayed frame is, before the relay starts.
+/// Sends one gratuitous ARP for `lease` as a gated relay's first frame —
+/// [`ATTACH_ANNOUNCE_DELAY`] after the relay starts — onto the relay's
+/// shared switch write half.
 ///
 /// The host-side gate counts a box's row carried only once a frame from the
 /// box's address crosses it (minvmd's `BoxTable::carry`), and the tap's
@@ -488,17 +509,27 @@ fn gratuitous_arp(lease: Ipv4Addr) -> Vec<u8> {
 /// link-up. A box whose host runs idle — a resumed box's host, launched
 /// with no client — would otherwise leave a reloaded row awaiting its first
 /// frame until its resume bound withdrew it, its name and ingress with it
-/// (NET-138). The announcement is that first frame, sent at every box
+/// (NET-138). The announcement is that first frame, sent at every gated vsock
 /// attach.
-async fn announce_lease<W>(sock: &mut W, lease: Ipv4Addr) -> io::Result<()>
+///
+/// The delay is the point: gvproxy hijacks the `/connect` stream after the
+/// upgrade and discards whatever bytes already sit in its read buffer, so
+/// writing the announcement into the handshake would lose it and desync the
+/// framing. Sent here instead — after the relay owns the stream — it is the
+/// relay's first frame, past the hijack on the relay's clock.
+///
+/// Runs as its own task: it holds the lock only for its one write, so the
+/// relay's egress leg never waits on it.
+async fn announce_lease<W>(sock: Arc<AsyncMutex<W>>, lease: Ipv4Addr) -> io::Result<()>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + Send + 'static,
 {
+    tokio::time::sleep(ATTACH_ANNOUNCE_DELAY).await;
     let frame = gratuitous_arp(lease);
     let mut framed = Vec::with_capacity(2 + frame.len());
     framed.extend_from_slice(&(frame.len() as u16).to_le_bytes());
     framed.extend_from_slice(&frame);
-    sock.write_all(&framed).await
+    sock.lock().await.write_all(&framed).await
 }
 
 /// Attaches the guest's **root** namespace tap — the daemon's own, which
@@ -599,6 +630,7 @@ where
         sock_rx,
         sock_tx,
         None,
+        false,
         Some(node_dns),
         lease,
         subnet,
@@ -617,11 +649,16 @@ where
 /// the DM1/3/4 vsock path ([`attach_to_switch_vsock`]); the relay loops are
 /// transport-agnostic (`AsyncRead`/`AsyncWrite`), so only the connect step
 /// differs.
+///
+/// `announce` says whether this relay's first frame is the lease announcement
+/// ([`announce_lease`]): true for a gated vsock attach, false for the daemon's
+/// own relay and anything else.
 fn spawn_relay<R, W>(
     tap_fd: OwnedFd,
     sock_rx: R,
     sock_tx: W,
     gate: Option<Arc<BoxGate>>,
+    announce: bool,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay>
@@ -629,17 +666,22 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
-    spawn_relay_with(tap_fd, sock_rx, sock_tx, gate, None, lease, subnet)
+    spawn_relay_with(
+        tap_fd, sock_rx, sock_tx, gate, announce, None, lease, subnet,
+    )
 }
 
 /// [`spawn_relay`], with the node's DNS layer the daemon's own relay carries
 /// ([`spawn_node_relay`]); `None` for every other relay, whose DNS gate, if
-/// any, is its session gate's own.
+/// any, is its session gate's own. `announce` is [`spawn_relay`]'s — whether
+/// the relay's first frame is the lease announcement.
+#[allow(clippy::too_many_arguments)]
 fn spawn_relay_with<R, W>(
     tap_fd: OwnedFd,
     sock_rx: R,
     sock_tx: W,
     gate: Option<Arc<BoxGate>>,
+    announce: bool,
     node_dns: Option<DnsGate>,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
@@ -720,6 +762,13 @@ where
         crate::traced::spawn(write_box_resets(box_resets_rx, Arc::clone(&tap)))
     });
     let switch_to_tap = crate::traced::spawn(relay_switch_to_tap(sock_rx, tap, gate.clone()));
+    // A gated vsock attach announces its lease as its relay's first frame — the
+    // delay carries it past gvproxy's `/connect` hijack, and the row it
+    // carries is NET-138's. Discarded like every fire-and-forget writer the
+    // relay owns: it ends with its one write.
+    if announce {
+        crate::traced::spawn(announce_lease(Arc::clone(&sock_tx), lease));
+    }
     Ok(SwitchRelay {
         tap_to_switch,
         switch_to_tap,
@@ -3885,6 +3934,7 @@ pub(crate) mod tests {
                 sock_rx,
                 sock_tx,
                 Some(gate),
+                false,
                 lease,
                 SwitchSubnet::default(),
             ),
@@ -5970,14 +6020,16 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
-    /// NET-138: a box's attach announces its lease before any frame of the
-    /// box's own, so an idle box — a resumed box's host, launched with no
-    /// client — still reaches the host-side gate with a frame from its
-    /// address, the one thing that carries its row. The announcement is a
-    /// gratuitous ARP from the lease at the lease's own MAC, admitted by
-    /// the lease check; the daemon's own, ungated attach announces nothing.
+    /// The local-socket attach — DM2's, whose box tap wears a kernel-chosen
+    /// MAC — speaks only the `/connect` upgrade and never announces the
+    /// lease, gated or not: gvproxy hijacks the stream and discards whatever
+    /// already sits in its read buffer, and an announcement at the lease's
+    /// derived MAC would teach gvproxy's spoofing gateway a MAC the box does
+    /// not wear, so the gateway's replies — a deny-all box's switch-resolver
+    /// answers among them (NET-074) — would never reach the box. The read
+    /// runs past the announcement delay, so a late announcement fails it.
     #[tokio::test]
-    async fn a_box_attach_announces_its_lease_before_any_box_frame() {
+    async fn a_local_socket_attach_speaks_only_the_upgrade_and_never_announces() {
         let lease = Ipv4Addr::new(100, 64, 0, 9);
         let dir = tempfile::TempDir::new().expect("a temp dir");
         let api_sock = dir.path().join("gvproxy.sock");
@@ -6014,15 +6066,77 @@ pub(crate) mod tests {
             let mut head = vec![0u8; CONNECT_REQUEST.len()];
             switch.read_exact(&mut head).await.expect("the upgrade");
             assert_eq!(head, CONNECT_REQUEST, "the upgrade comes first");
+            let mut byte = [0u8; 1];
+            let after = tokio::time::timeout(
+                ATTACH_ANNOUNCE_DELAY + Duration::from_millis(300),
+                switch.read_exact(&mut byte),
+            )
+            .await;
+            assert!(
+                after.is_err(),
+                "nothing follows the upgrade on a local-socket attach (gated: {gated})"
+            );
+        }
+    }
+
+    /// NET-138: a relay told to announce — a gated vsock attach, whose tap
+    /// wears the lease's derived MAC — sends nothing inside its start delay,
+    /// which carries it past gvproxy's `/connect` hijack, and its first frame
+    /// is then the lease announcement: a gratuitous ARP from the lease at the
+    /// lease's own MAC, admitted by the lease check, so an idle box — a
+    /// resumed box's host, launched with no client — still reaches the
+    /// host-side gate with a frame from its address, the one thing that
+    /// carries its row. A relay not told to announce sends nothing.
+    #[tokio::test]
+    async fn an_announcing_relay_s_first_frame_is_the_lease_announcement() {
+        let lease = Ipv4Addr::new(100, 64, 0, 9);
+        for announce in [true, false] {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `socketpair` with a valid domain/type either returns -1
+            // (checked) or fills `fds` with two fresh descriptors.
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+            // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor
+            // just returned by socketpair.
+            let tap_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: as above; held so the tap side stays open and idle.
+            let _box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+            let (relay_end, mut switch) = UnixStream::pair().expect("a stream pair");
+            let (sock_rx, sock_tx) = relay_end.into_split();
+            let gate = Arc::new(BoxGate::for_session(
+                lease.to_string(),
+                lease,
+                &boxes::BoxPolicy::default(),
+                SwitchSubnet::default(),
+                None,
+            ));
+            let _relay = spawn_relay(
+                tap_fd,
+                sock_rx,
+                sock_tx,
+                Some(gate),
+                announce,
+                lease,
+                SwitchSubnet::default(),
+            )
+            .expect("the relay starts");
+
             let mut len_buf = [0u8; 2];
-            let read =
-                tokio::time::timeout(Duration::from_millis(300), switch.read_exact(&mut len_buf))
+            let early =
+                tokio::time::timeout(Duration::from_millis(50), switch.read_exact(&mut len_buf))
                     .await;
-            if !gated {
-                assert!(read.is_err(), "the daemon's own attach announces nothing");
+            assert!(early.is_err(), "nothing leaves inside the start delay");
+            let read = tokio::time::timeout(
+                ATTACH_ANNOUNCE_DELAY + Duration::from_millis(900),
+                switch.read_exact(&mut len_buf),
+            )
+            .await;
+            if !announce {
+                assert!(read.is_err(), "a relay not told to announce sends nothing");
                 continue;
             }
-            read.expect("a box's attach speaks without any box frame")
+            read.expect("the relay's first frame")
                 .expect("the announcement's length");
             let mut frame = vec![0u8; u16::from_le_bytes(len_buf) as usize];
             switch
