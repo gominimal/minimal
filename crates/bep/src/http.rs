@@ -24,7 +24,9 @@
 //! chunked framing from the box and writes canonical chunks upstream. Raw
 //! chunked bytes from the box never reach the upstream. [`forward_requests`]
 //! is the request half of one box connection: it forwards heads and bodies
-//! until the connection closes, and it logs the rule that closed it.
+//! until the connection closes, and it logs the rule that closed it. It
+//! stops at a request that switches protocol (`Upgrade` or `CONNECT`), and
+//! it never parses the bytes after that request as HTTP.
 //!
 //! The canonical form is: `METHOD SP target SP HTTP/1.1 CRLF`, then one
 //! `name: value CRLF` line for each header, in the order received, with the
@@ -94,6 +96,13 @@ impl Request {
         out.extend_from_slice(b" HTTP/1.1\r\n");
         write_headers(&mut out, &self.headers);
         out
+    }
+
+    /// Whether the request asks to leave HTTP/1.1: the `CONNECT` method, or
+    /// an `Upgrade` header that the h2c strip left.
+    #[must_use]
+    pub fn switches_protocol(&self) -> bool {
+        self.method == "CONNECT" || self.headers.iter().any(|h| h.name == "upgrade")
     }
 
     /// The values of every header named `name`, in order.
@@ -188,6 +197,17 @@ pub enum CloseReason {
     ClientClosed,
     /// The read or the write failed.
     Io(io::ErrorKind),
+    /// The request asked to leave HTTP/1.1, with an `Upgrade` header or the
+    /// `CONNECT` method. The request half stops parsing, because the bytes
+    /// after the switch are not HTTP. `rest` holds the bytes already read
+    /// after the request. The caller relays `rest` and the rest of the box's
+    /// bytes unparsed only when the upstream accepts the switch: `101` to an
+    /// upgrade, or `2xx` to a `CONNECT`. Otherwise it closes the connection.
+    /// It never gives this upstream connection back to the pool.
+    ProtocolSwitch {
+        /// The bytes read from the box after the request.
+        rest: Vec<u8>,
+    },
 }
 
 impl CloseReason {
@@ -214,6 +234,7 @@ impl CloseReason {
             Self::BodyEof => "eof_before_body_end",
             Self::ClientClosed => "client_closed",
             Self::Io(_) => "io_error",
+            Self::ProtocolSwitch { .. } => "protocol_switch_requested",
         }
     }
 }
@@ -467,6 +488,10 @@ pub fn relay_request_body<R: Read, W: Write>(
 /// until the connection closes. This is the request half of the
 /// connection. The responses go back to the box on the other half.
 ///
+/// After a request that switches protocol, the loop stops and returns
+/// [`CloseReason::ProtocolSwitch`] with the bytes it read after the
+/// request. It never parses those bytes as HTTP.
+///
 /// Writes one debug log line for the close, with the box id and
 /// [`CloseReason::rule`], and returns the reason.
 pub fn forward_requests<R: Read, W: Write>(
@@ -481,10 +506,14 @@ pub fn forward_requests<R: Read, W: Write>(
             Ok(forwarded) => forwarded,
             Err(reason) => break reason,
         };
+        let switches = forwarded.request.switches_protocol();
         pending = match relay_request_body(forwarded, client, upstream) {
             Ok(rest) => rest,
             Err(reason) => break reason,
         };
+        if switches {
+            break CloseReason::ProtocolSwitch { rest: pending };
+        }
     };
     tracing::debug!(box_id, rule = reason.rule(), "box connection closed");
     reason
@@ -755,6 +784,15 @@ fn framing(headers: &[Header]) -> Result<BodyFraming, CloseReason> {
     if has_length_header && has_te {
         return ambiguous(Ambiguity::ContentLengthWithTransferEncoding);
     }
+    // The canonical head carries the value as received. An empty list
+    // element, as in `5,` or `chunked,`, then reaches the upstream, which
+    // can read it in a different way from this check. Refuse it.
+    if has_empty_element(headers, "content-length") {
+        return ambiguous(Ambiguity::InvalidContentLength);
+    }
+    if has_empty_element(headers, "transfer-encoding") {
+        return ambiguous(Ambiguity::TransferCodingNotFinalChunked);
+    }
     if has_te {
         let codings: Vec<&[u8]> = list_elements(values(headers, "transfer-encoding")).collect();
         return match codings.as_slice() {
@@ -894,6 +932,11 @@ fn values<'a>(headers: &'a [Header], name: &'a str) -> impl Iterator<Item = &'a 
         .iter()
         .filter(move |h| h.name == name)
         .map(|h| h.value.as_slice())
+}
+
+/// Whether a value of a header named `name` holds an empty list element.
+fn has_empty_element(headers: &[Header], name: &str) -> bool {
+    values(headers, name).any(|v| v.split(|&b| b == b',').any(|e| trim_ows(e).is_empty()))
 }
 
 /// The non-empty elements of comma-separated list values, trimmed.
@@ -1125,6 +1168,8 @@ mod tests {
             Just(FramingLine::Length("5, 6".to_owned())),
             Just(FramingLine::Length("+5".to_owned())),
             Just(FramingLine::Length("0x5".to_owned())),
+            Just(FramingLine::Length("5,".to_owned())),
+            Just(FramingLine::Length(", 5".to_owned())),
             Just(FramingLine::Te("chunked")),
             Just(FramingLine::Te("Chunked")),
             Just(FramingLine::Te("gzip")),
@@ -1132,6 +1177,8 @@ mod tests {
             Just(FramingLine::Te("chunked, gzip")),
             Just(FramingLine::Te("chunked, chunked")),
             Just(FramingLine::Te("identity")),
+            Just(FramingLine::Te("chunked,")),
+            Just(FramingLine::Te(", chunked")),
             Just(FramingLine::Fold),
         ]
     }
@@ -1270,6 +1317,33 @@ mod tests {
         let mut audit = Vec::new();
         let reason = forward_requests("box-a", &mut Trickle(input), &mut upstream, &mut audit);
         (reason, upstream, audit)
+    }
+
+    // BEP-077: the loop stops at a protocol switch, and the bytes after the
+    // request are never parsed as HTTP.
+    #[test]
+    fn protocol_switch_stops_the_request_loop() {
+        let frames: &[u8] = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
+        for head in [
+            &b"GET /ws HTTP/1.1\r\nHost: github.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"[..],
+            &b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"[..],
+        ] {
+            let input = [head, frames].concat();
+            let mut client = &input[..];
+            let mut upstream = Vec::new();
+            let mut audit = Vec::new();
+            let reason = forward_requests("box-a", &mut client, &mut upstream, &mut audit);
+            assert_eq!(reason.rule(), "protocol_switch_requested");
+            let CloseReason::ProtocolSwitch { rest } = reason else {
+                panic!("{reason:?}");
+            };
+            assert_eq!([&rest[..], client].concat(), frames);
+            let Parse::Complete { head: request, .. } = parse_request(head).unwrap() else {
+                panic!("the head is complete");
+            };
+            assert_eq!(upstream, request.serialize());
+            assert!(audit.is_empty());
+        }
     }
 
     // BEP-077: a Content-Length body goes upstream as exactly that many

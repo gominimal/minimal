@@ -18,6 +18,12 @@ use std::sync::Mutex;
 /// connection given back above this cap is dropped.
 pub const MAX_IDLE_PER_KEY: usize = 8;
 
+/// The most idle connections the pool keeps for one box, over every
+/// authority. A box that reaches many authorities then cannot hold the host
+/// process's file descriptors and starve the other boxes. A connection given
+/// back above this cap is dropped.
+pub const MAX_IDLE_PER_BOX: usize = 32;
+
 /// The key of an idle list: one box and one upstream authority.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UpstreamKey {
@@ -146,11 +152,22 @@ impl<C> UpstreamPool<C> {
     /// from. The caller gives back only a connection whose last response
     /// ended cleanly. A connection the proxy closed is dropped instead.
     /// When the key already holds [`MAX_IDLE_PER_KEY`] idle connections,
-    /// the pool drops this one. A connection checked out before
+    /// the pool drops this one. When the box already holds
+    /// [`MAX_IDLE_PER_BOX`] idle connections over all its keys, the pool
+    /// drops this one too. A connection checked out before
     /// [`Self::drop_box`] ran for its box is dropped too.
     pub fn checkin(&self, upstream: Upstream<C>) {
         let mut state = self.lock();
         if state.generations.get(&upstream.key.box_id) != Some(&upstream.generation) {
+            return;
+        }
+        let box_idle: usize = state
+            .idle
+            .iter()
+            .filter(|(key, _)| key.box_id == upstream.key.box_id)
+            .map(|(_, conns)| conns.len())
+            .sum();
+        if box_idle >= MAX_IDLE_PER_BOX {
             return;
         }
         let list = state.idle.entry(upstream.key).or_default();
@@ -272,6 +289,21 @@ mod tests {
         }
         pool.checkin(b_last);
         assert_eq!(pool.idle_count("box-b"), MAX_IDLE_PER_KEY + 1);
+        assert_eq!(pool.idle_keys(), 2);
+
+        // The pool keeps at most MAX_IDLE_PER_BOX idle connections per box,
+        // over all its authorities.
+        let spread: Vec<_> = (0..=MAX_IDLE_PER_BOX)
+            .map(|i| {
+                let host = format!("h{}.example", i / MAX_IDLE_PER_KEY);
+                pool.checkout("box-d", &host, 443, connect).unwrap()
+            })
+            .collect();
+        for upstream in spread {
+            pool.checkin(upstream);
+        }
+        assert_eq!(pool.idle_count("box-d"), MAX_IDLE_PER_BOX);
+        pool.drop_box("box-d");
         assert_eq!(pool.idle_keys(), 2);
 
         // A connection checked out when its box is dropped is not taken
