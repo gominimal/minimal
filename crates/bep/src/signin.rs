@@ -235,8 +235,24 @@ pub enum SignInError {
         detail: String,
     },
     /// The item is present but a field does not parse.
-    #[error("the GitHub sign-in item in the host keychain is damaged ({0})")]
+    #[error(
+        "The GitHub sign-in in the host keychain is damaged ({0}). Run `min auth login` to replace it."
+    )]
     Corrupt(&'static str),
+    /// GitHub returned a token in characters the item does not store. The
+    /// check runs before the write, so the held item is unchanged.
+    #[error(
+        "GitHub returned a token in an unexpected form, so nothing was saved. Any sign-in held before is unchanged."
+    )]
+    Token,
+    /// The host keychain's command-line tool is not installed.
+    #[error("The host keychain tool `{tool}` is not installed. {install}")]
+    MissingTool {
+        /// The tool, as this program runs it.
+        tool: &'static str,
+        /// What to install, and what to run after it.
+        install: &'static str,
+    },
     /// The host has no random source.
     #[error("no random source for the sign-in instance identifier")]
     Random,
@@ -377,7 +393,7 @@ fn valid_token(token: &str) -> bool {
 /// The secret as the item stores it: `v1 <token> <refresh token>`.
 fn encode_secret(material: &Material) -> Result<String, SignInError> {
     if !valid_token(&material.access_token) || !valid_token(&material.refresh_token) {
-        return Err(SignInError::Corrupt("material"));
+        return Err(SignInError::Token);
     }
     Ok(format!(
         "{METADATA_VERSION} {} {}",
@@ -400,6 +416,18 @@ fn decode_secret(secret: &str) -> Result<Material, SignInError> {
     }
 }
 
+/// Decode the secret a keychain tool printed, then zeroize the captured
+/// output. The returned [`Material`] is the one copy that remains, and it
+/// zeroizes itself on drop.
+fn decode_captured(stdout: &mut Vec<u8>) -> Result<Material, SignInError> {
+    // `from_utf8` borrows the buffer, so the decode makes no copy of it.
+    let decoded = std::str::from_utf8(stdout)
+        .map_err(|_| SignInError::Corrupt("material"))
+        .and_then(|s| decode_secret(s.trim()));
+    stdout.zeroize();
+    decoded
+}
+
 /// The host keychain of this machine: the login keychain through
 /// `/usr/bin/security` on macOS, the Secret Service through `secret-tool`
 /// elsewhere. Both keep the material out of every file this program writes.
@@ -412,7 +440,7 @@ impl Keychain for HostKeychain {
     }
 
     fn material(&self) -> Result<Option<Material>, SignInError> {
-        host::secret()?.map(|s| decode_secret(&s)).transpose()
+        host::material()
     }
 
     fn write(&self, metadata: &Metadata, material: &Material) -> Result<(), SignInError> {
@@ -445,7 +473,16 @@ fn run(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| refused(e.to_string()))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            SignInError::MissingTool {
+                tool: host::TOOL,
+                install: host::INSTALL,
+            }
+        } else {
+            refused(e.to_string())
+        }
+    })?;
     if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
         pipe.write_all(input.as_bytes())
             .map_err(|e| refused(e.to_string()))?;
@@ -455,10 +492,14 @@ fn run(
 
 #[cfg(target_os = "macos")]
 mod host {
-    use super::{ITEM_ACCOUNT, LABEL, SERVICE, SignInError, run};
+    use super::{ITEM_ACCOUNT, LABEL, Material, SERVICE, SignInError, decode_captured, run};
     use std::process::Command;
+    use zeroize::Zeroize as _;
 
     const SECURITY: &str = "/usr/bin/security";
+    pub(super) const TOOL: &str = SECURITY;
+    pub(super) const INSTALL: &str =
+        "It is part of macOS. Restore it with a macOS reinstall, then run `min auth login` again.";
     /// `security` exits 44 when no item matches.
     const NOT_FOUND: i32 = 44;
 
@@ -480,7 +521,7 @@ mod host {
         }))
     }
 
-    pub(super) fn secret() -> Result<Option<String>, SignInError> {
+    pub(super) fn material() -> Result<Option<Material>, SignInError> {
         let mut cmd = Command::new(SECURITY);
         cmd.args([
             "find-generic-password",
@@ -490,21 +531,23 @@ mod host {
             ITEM_ACCOUNT,
             "-w",
         ]);
-        let out = run("read the sign-in", cmd, None)?;
+        let mut out = run("read the sign-in", cmd, None)?;
         if out.status.code() == Some(NOT_FOUND) {
+            out.stdout.zeroize();
             return Ok(None);
         }
         if !out.status.success() {
+            out.stdout.zeroize();
             return Err(refused("read the sign-in", &out.stderr));
         }
-        Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+        decode_captured(&mut out.stdout).map(Some)
     }
 
     pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
         // `-U` updates the item in place when it exists. `-w` as the last
         // argument with no value reads the password from the terminal, so
         // the secret goes on `security -i`'s stdin, never on a command line.
-        let line = format!(
+        let mut line = format!(
             "add-generic-password -U -s {SERVICE} -a {ITEM_ACCOUNT} -l {} -j {} -w {}\n",
             quote(LABEL),
             quote(metadata),
@@ -515,7 +558,9 @@ mod host {
         // letters, digits, `=`, `_`, `-`, `.` and spaces.
         let mut cmd = Command::new(SECURITY);
         cmd.arg("-i");
-        let out = run("write the sign-in", cmd, Some(&line))?;
+        let out = run("write the sign-in", cmd, Some(&line));
+        line.zeroize();
+        let out = out?;
         if !out.status.success() {
             return Err(refused("write the sign-in", &out.stderr));
         }
@@ -536,11 +581,13 @@ mod host {
 
 #[cfg(not(target_os = "macos"))]
 mod host {
-    use super::{LABEL, SERVICE, SignInError, run};
+    use super::{LABEL, Material, SERVICE, SignInError, decode_captured, run};
     use std::process::Command;
     use zeroize::Zeroize as _;
 
     const SECRET_TOOL: &str = "secret-tool";
+    pub(super) const TOOL: &str = SECRET_TOOL;
+    pub(super) const INSTALL: &str = "Install it (the `libsecret-tools` package on Debian and Ubuntu, `libsecret` on Fedora and Arch), then run `min auth login` again.";
 
     /// The item's label: the fixed label, then the metadata. The item's one
     /// attribute is `service`, so every write matches the held item's
@@ -567,17 +614,18 @@ mod host {
         Ok(found)
     }
 
-    pub(super) fn secret() -> Result<Option<String>, SignInError> {
+    pub(super) fn material() -> Result<Option<Material>, SignInError> {
         let mut cmd = Command::new(SECRET_TOOL);
         cmd.args(["lookup", "service", SERVICE]);
-        let out = run("read the sign-in", cmd, None)?;
+        let mut out = run("read the sign-in", cmd, None)?;
         if !out.status.success() {
+            out.stdout.zeroize();
             if out.stderr.is_empty() {
                 return Ok(None);
             }
             return Err(refused("read the sign-in", &out.stderr));
         }
-        Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+        decode_captured(&mut out.stdout).map(Some)
     }
 
     pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
