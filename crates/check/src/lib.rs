@@ -270,9 +270,9 @@ impl CheckCache {
             (bsr, lib_path.to_path_buf()),
             || -> Result<Arc<HashSet<String>>, anyhow::Error> {
                 let full_path = dep_path.join(lib_path);
-                let data = map_output(&full_path)
+                let data = open_output(&full_path)
                     .map_err(|e| anyhow!("reading library {}: {e}", full_path.display()))?;
-                let elf = object::File::parse(&*data)
+                let elf = object::File::parse(&data)
                     .map_err(|e| anyhow!("parsing {}: {e}", full_path.display()))?;
 
                 // `exports()` is a lazy iterator that reports per-export parse
@@ -315,9 +315,9 @@ impl CheckCache {
 
                 if likely_glibc_stub_lib {
                     let libc_path = dep_path.join("usr/lib/libc.so.6");
-                    let data = map_output(&libc_path)
+                    let data = open_output(&libc_path)
                         .map_err(|e| anyhow!("reading libc {}: {e}", libc_path.display()))?;
-                    let libc = object::File::parse(&*data)
+                    let libc = object::File::parse(&data)
                         .map_err(|e| anyhow!("parsing {}: {e}", libc_path.display()))?;
                     for s in libc.dynamic_symbols() {
                         let name = s.name().map_err(|e| {
@@ -333,49 +333,32 @@ impl CheckCache {
     }
 }
 
+/// Open an artifact file for `object`'s parsers, which read only the ranges
+/// they need (the header and the tables they walk) through the cache.
+/// `fs::read` pulled in every byte: a full-catalog check sweep reads every
+/// artifact of every package on both arches, which on a host with a cold page
+/// cache made the sweep disk-bound (build-servers#210: 4x slower per package
+/// than warm, and >90% of check time spent waiting).
+///
+/// Not `mmap`: these files are hardlinked into build sandboxes, and a build
+/// writing through such a link (`cp` or `>` onto it) truncates the shared
+/// inode, which turns a mapped read past the new end into SIGBUS for the whole
+/// process. A read past the end here is a short read and a parse error for
+/// that one file. On a cold sweep of 39 GiB of artifacts (20 threads): read
+/// whole 112–123 s / 19 GiB from disk; mmap with MADV_RANDOM 25–26 s /
+/// 1.8 GiB; this 24–27 s / 2.0 GiB, and warm 0.6 s against mmap's 3 s.
+pub(crate) fn open_output(path: &Path) -> std::io::Result<object::read::ReadCache<std::fs::File>> {
+    let f = std::fs::File::open(path)?;
+    // The parsers jump between the header and a few tables; default readahead
+    // pulls in a window behind every read (cold: 39 s / 2.4 GiB without this).
+    // Advisory, so a refusal is ignored.
+    #[cfg(target_os = "linux")]
+    let _ = nix::fcntl::posix_fadvise(&f, 0, 0, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_RANDOM);
+    Ok(object::read::ReadCache::new(f))
+}
+
 /// Parameters that remain constant across all checkers within a single
 /// [`run_checks`] invocation.
-/// A file's bytes for ELF/archive parsing, mapped rather than read.
-///
-/// `object`'s parsers touch the header and the tables they walk, so a mapped
-/// file costs those pages; `fs::read` pulled in every byte. A full-catalog check
-/// sweep reads every artifact of every package on both arches, which on a host
-/// with a cold page cache made the sweep disk-bound (build-servers#210: 4x
-/// slower per package than warm, and >90% of check time spent waiting).
-pub(crate) enum OutputBytes {
-    Mapped(memmap2::Mmap),
-    /// `mmap` refuses a zero-length mapping; an empty file is simply empty.
-    Empty,
-}
-
-impl std::ops::Deref for OutputBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            OutputBytes::Mapped(m) => m,
-            OutputBytes::Empty => &[],
-        }
-    }
-}
-
-/// Map `path` read-only (see [`OutputBytes`]).
-pub(crate) fn map_output(path: &Path) -> std::io::Result<OutputBytes> {
-    let f = std::fs::File::open(path)?;
-    if f.metadata()?.len() == 0 {
-        return Ok(OutputBytes::Empty);
-    }
-    // SAFETY: the mapped files are committed cache entries (and the outputs of
-    // the build being checked), which nothing rewrites in place while a check
-    // runs; the mapping is read-only and dropped before the check returns.
-    let map = unsafe { memmap2::Mmap::map(&f)? };
-    // The parsers jump between the header and a few tables; default readahead
-    // pulls in a window behind every fault. On a cold sweep of 39 GiB of
-    // artifacts: read whole 123 s / 19 GiB from disk, mapped 48 s / 6.3 GiB,
-    // mapped + random 26 s / 1.8 GiB. Advisory, so a refusal is ignored.
-    let _ = map.advise(memmap2::Advice::Random);
-    Ok(OutputBytes::Mapped(map))
-}
-
 #[derive(Clone)]
 pub struct CheckCtx {
     pub filter_names: Vec<String>,
@@ -1505,5 +1488,27 @@ mod tests {
 
         assert_eq!(seen.len(), 2, "expected one check per object, got {seen:?}");
         std::fs::remove_dir_all(&dir).expect("cleanup test tmp dir");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod open_output_tests {
+    /// An artifact truncated while a check holds it open (a build writing
+    /// through a hardlink can do that) is a parse error for that file. With a
+    /// shared mapping, the read past the new end was SIGBUS for the process,
+    /// and this test would kill the test runner.
+    #[test]
+    fn a_file_truncated_under_the_reader_is_an_error_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let data = super::open_output(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64)
+            .unwrap();
+        assert!(object::File::parse(&data).is_err());
     }
 }
