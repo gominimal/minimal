@@ -2,8 +2,9 @@
 //!
 //! BEP-072 also asks for the root certificate. This file publishes the root
 //! CA's public key and fingerprint only. The proxy issues no certificate
-//! yet: the self-signed, name-constrained root comes with the task that
-//! covers BEP-013, which adds it to this file.
+//! yet. The self-signed, name-constrained root certificate is deferred to
+//! <https://github.com/gominimal/minimal/issues/2437>, which adds it to this
+//! file.
 //!
 //! At each start the proxy writes the public half and the fingerprint of
 //! each of its keys to a file the operator's processes read. A mint seals
@@ -53,8 +54,9 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealing: Option<PublishedKey>,
     /// The root CA's public key. It is not the root certificate, which
-    /// BEP-072 asks for: the task that covers BEP-013 issues that
-    /// certificate and publishes it here.
+    /// BEP-072 asks for. The issuance of that certificate is deferred to
+    /// <https://github.com/gominimal/minimal/issues/2437>, which publishes
+    /// it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<PublishedKey>,
     /// The signing CA key.
