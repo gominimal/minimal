@@ -11,7 +11,8 @@
 //! id, the request authority and the module's mapping, and never from a
 //! sealed value or a header. A charset or length check cannot tell a token
 //! from an identifier, so this module does not try. It does cut each field
-//! to [`MAX_FIELD_BYTES`], so no one field can make a record large.
+//! to [`MAX_FIELD_BYTES`], so no one field can make a record large. A cut
+//! field ends in [`CUT_MARKER`] and the hash of the full value.
 //!
 //! Each record carries `previous_hash`: the lowercase hex SHA-256 of the
 //! previous record's line, as UTF-8 JSON bytes without the trailing newline.
@@ -50,13 +51,27 @@ pub const MODULE_UNMAPPED: &str = "module_unmapped";
 /// authority cannot make one record arbitrarily large.
 pub const MAX_FIELD_BYTES: usize = 512;
 
-/// `value`, cut to at most [`MAX_FIELD_BYTES`] at a character boundary.
+/// What a cut field ends in, before the hex SHA-256 of the full value.
+pub const CUT_MARKER: &str = "…sha256:";
+
+/// `value` when it fits in [`MAX_FIELD_BYTES`]. A longer value is cut at a
+/// character boundary and ends in [`CUT_MARKER`] and the hex SHA-256 of the
+/// full value, so the record shows the cut and two long values with the
+/// same prefix stay distinct. The result is never longer than the bound.
 fn bounded(value: &str) -> String {
-    let mut end = value.len().min(MAX_FIELD_BYTES);
+    if value.len() <= MAX_FIELD_BYTES {
+        return value.to_owned();
+    }
+    let digest = line_hash(value);
+    let mut end = MAX_FIELD_BYTES - CUT_MARKER.len() - digest.len();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    value[..end].to_owned()
+    let mut out = String::with_capacity(MAX_FIELD_BYTES);
+    out.push_str(&value[..end]);
+    out.push_str(CUT_MARKER);
+    out.push_str(&digest);
+    out
 }
 
 /// The `previous_hash` of the first record of a log.
@@ -237,6 +252,37 @@ fn ensure_own_file(path: &Path, file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// The bytes of the file that `file` holds open, read through a second,
+/// read-only handle on the same file and not through `path`. An entry that
+/// is swapped in at `path` after the open cannot supply the head hash.
+fn read_opened(path: &Path, file: &File) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    // `/proc/self/fd/N` leads to the open file itself, whatever is at
+    // `path` now. Elsewhere the path is opened again, and the device and
+    // inode check below refuses a different file.
+    #[cfg(target_os = "linux")]
+    let mut reader = {
+        use std::os::fd::AsRawFd as _;
+        File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut reader = File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (held, read) = (file.metadata()?, reader.metadata()?);
+        if (held.dev(), held.ino()) != (read.dev(), read.ino()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit log {} changed while it was opened", path.display()),
+            ));
+        }
+    }
+    let mut contents = Vec::new();
+    reader.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
 /// The audit log, open for append only.
 #[derive(Debug)]
 pub struct AuditLog {
@@ -300,7 +346,7 @@ impl AuditLog {
             ),
             fs::TryLockError::Error(err) => err,
         })?;
-        let contents = fs::read(&path)?;
+        let contents = read_opened(&path, &file)?;
         let complete = contents
             .iter()
             .rposition(|&b| b == b'\n')
@@ -476,9 +522,29 @@ mod tests {
             ..admit()
         };
         let record = Record::from_decision(&long, ZERO_HASH);
-        assert_eq!(record.upstream.len(), MAX_FIELD_BYTES);
-        assert!(record.upstream.chars().all(|c| c == 'é'));
-        assert_eq!(record.identifier.len(), MAX_FIELD_BYTES);
+        assert!(record.upstream.len() <= MAX_FIELD_BYTES);
+        let (kept, digest) = record.upstream.split_once(CUT_MARKER).unwrap();
+        assert!(!kept.is_empty() && kept.chars().all(|c| c == 'é'));
+        assert_eq!(digest, line_hash(&long.authority));
+        assert!(record.identifier.len() <= MAX_FIELD_BYTES);
+        assert!(record.identifier.ends_with(&format!(
+            "{CUT_MARKER}{}",
+            line_hash(long.identifier.as_ref().unwrap())
+        )));
+        // Two long values with the same prefix give distinct records.
+        let other = Decision {
+            identifier: Some(format!("{}y", "x".repeat(MAX_FIELD_BYTES * 4))),
+            ..long.clone()
+        };
+        let other = Record::from_decision(&other, ZERO_HASH);
+        assert_ne!(other.identifier, record.identifier);
+        // A value at the bound is kept whole, with no marker.
+        let exact = Decision {
+            authority: "a".repeat(MAX_FIELD_BYTES),
+            ..admit()
+        };
+        let exact = Record::from_decision(&exact, ZERO_HASH);
+        assert_eq!(exact.upstream, "a".repeat(MAX_FIELD_BYTES));
 
         let second: serde_json::Value = serde_json::from_str(&written[1]).unwrap();
         assert_eq!(second["upstream"], "example.com:443");
