@@ -12,4 +12,5 @@
 //! opens.
 
 pub mod module;
+pub mod redeem;
 pub mod seal;
