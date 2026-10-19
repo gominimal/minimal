@@ -6,6 +6,9 @@
 //! set (BEP-006), so a change to the set is a new version. A member sealed
 //! under an old version still opens. The proxy admits it for an authority
 //! only when the authority is in both the bound set and the current set.
+//!
+//! This file carries no deny set. The fixed deny set that the root's name
+//! constraints subtract lands with the leaf-certificate work (BEP-013).
 
 use std::fmt;
 

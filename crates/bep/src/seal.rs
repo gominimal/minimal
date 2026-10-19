@@ -22,6 +22,15 @@
 //! only when it is in both the carried host-set version's set and the
 //! current set.
 //!
+//! The envelope gives confidentiality and binding, not origin. [`seal`]
+//! needs only the public key, so any holder of that key, a box included, can
+//! seal a value that [`open`] accepts. So an opened member carries no
+//! authority of its own. In v1 its credential is a sign-in reference, a
+//! handle signed under the client's local key (BEP-005). The caller must
+//! verify that signature, the handle's expiry and its upstream set before it
+//! uses the credential (BEP-064). A forged envelope then carries nothing
+//! that the caller admits.
+//!
 //! The printed form has five dot-separated segments, and the second is
 //! empty. No GitHub token form matches it: not the `ghp_`, `gho_`, `ghu_`,
 //! `ghs_`, `ghr_` or `github_pat_` prefixes, not 40 hex digits, and not a
@@ -386,9 +395,13 @@ fn seal_plaintext(
 ///
 /// [`OpenError::ContextMismatch`] names the first of box id, host and module
 /// that differs. [`OpenError::Expired`] says the value's expiry or the
-/// member's `exp` is at or before `expected.now`. The other variants say the value is malformed, uses an
-/// unsupported algorithm, is sealed to another key or does not decrypt, or
-/// carries no list of exactly one member with a known breadth.
+/// member's `exp` is at or before `expected.now`. The other variants say the
+/// value is malformed, uses an unsupported algorithm, is sealed to another
+/// key or does not decrypt, or carries no list of exactly one member with a
+/// known breadth.
+///
+/// A value that opens is not proof of who sealed it. The caller must verify
+/// the member's signed credential before it uses it. See the module docs.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
     let mut parts = sealed.split('.');
     let (Some(header_b64), Some(encrypted_key), Some(iv), Some(ciphertext), Some(tag), None) = (
