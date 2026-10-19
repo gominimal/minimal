@@ -33,9 +33,10 @@ pub struct UpstreamKey {
 #[derive(Debug)]
 pub struct Upstream<C> {
     key: UpstreamKey,
-    /// The box's epoch at checkout. [`UpstreamPool::drop_box`] moves the
-    /// epoch on, so a connection checked out before it is not taken back.
-    epoch: u64,
+    /// The box's generation at checkout. [`UpstreamPool::drop_box`] ends
+    /// the generation, so a connection checked out before it is not taken
+    /// back.
+    generation: u64,
     /// The connection itself.
     pub conn: C,
 }
@@ -63,14 +64,24 @@ pub struct UpstreamPool<C> {
 #[derive(Debug)]
 struct PoolState<C> {
     idle: HashMap<UpstreamKey, Vec<C>>,
-    /// The epoch of each box id that [`UpstreamPool::drop_box`] dropped. A
-    /// box id with no entry is at epoch 0.
-    epochs: HashMap<String, u64>,
+    /// The current generation of each box id that checked out a connection
+    /// and was not dropped since. [`UpstreamPool::drop_box`] removes the
+    /// entry, so the map holds only the box ids still in use.
+    generations: HashMap<String, u64>,
+    /// The next generation to give out. A generation is never given out
+    /// twice, so a box id used again after a drop gets a new one.
+    next_generation: u64,
 }
 
 impl<C> PoolState<C> {
-    fn epoch(&self, box_id: &str) -> u64 {
-        self.epochs.get(box_id).copied().unwrap_or(0)
+    fn generation(&mut self, box_id: &str) -> u64 {
+        if let Some(&generation) = self.generations.get(box_id) {
+            return generation;
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.generations.insert(box_id.to_owned(), generation);
+        generation
     }
 }
 
@@ -79,7 +90,8 @@ impl<C> Default for UpstreamPool<C> {
         Self {
             state: Mutex::new(PoolState {
                 idle: HashMap::new(),
-                epochs: HashMap::new(),
+                generations: HashMap::new(),
+                next_generation: 0,
             }),
         }
     }
@@ -110,20 +122,24 @@ impl<C> UpstreamPool<C> {
             host: host.to_ascii_lowercase(),
             port,
         };
-        let (reused, epoch) = {
+        let (reused, generation) = {
             let mut state = self.lock();
-            let epoch = state.epoch(box_id);
+            let generation = state.generation(box_id);
             let conn = state.idle.get_mut(&key).and_then(Vec::pop);
             if state.idle.get(&key).is_some_and(Vec::is_empty) {
                 state.idle.remove(&key);
             }
-            (conn, epoch)
+            (conn, generation)
         };
         let conn = match reused {
             Some(conn) => conn,
             None => connect()?,
         };
-        Ok(Upstream { key, epoch, conn })
+        Ok(Upstream {
+            key,
+            generation,
+            conn,
+        })
     }
 
     /// Put a connection back as idle, under the box and authority it came
@@ -134,7 +150,7 @@ impl<C> UpstreamPool<C> {
     /// [`Self::drop_box`] ran for its box is dropped too.
     pub fn checkin(&self, upstream: Upstream<C>) {
         let mut state = self.lock();
-        if state.epoch(&upstream.key.box_id) != upstream.epoch {
+        if state.generations.get(&upstream.key.box_id) != Some(&upstream.generation) {
             return;
         }
         let list = state.idle.entry(upstream.key).or_default();
@@ -155,7 +171,14 @@ impl<C> UpstreamPool<C> {
     pub fn drop_box(&self, box_id: &str) {
         let mut state = self.lock();
         state.idle.retain(|key, _| key.box_id != box_id);
-        *state.epochs.entry(box_id.to_owned()).or_default() += 1;
+        state.generations.remove(box_id);
+    }
+
+    /// The number of box ids the pool tracks: those that checked out a
+    /// connection and were not dropped since.
+    #[must_use]
+    pub fn tracked_boxes(&self) -> usize {
+        self.lock().generations.len()
     }
 
     /// The number of idle connections of `box_id`.
@@ -171,7 +194,7 @@ impl<C> UpstreamPool<C> {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PoolState<C>> {
         // A panic while the lock is held leaves only a list of idle
-        // connections and the epochs, which stay consistent.
+        // connections and the generations, which stay consistent.
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -266,5 +289,12 @@ mod tests {
             1,
             "the new box's connection is kept"
         );
+
+        // A dropped box leaves nothing behind in the pool.
+        pool.drop_box("box-b");
+        pool.drop_box("box-c");
+        pool.drop_box("box-never-used");
+        assert_eq!(pool.tracked_boxes(), 0);
+        assert_eq!(pool.idle_keys(), 0);
     }
 }
