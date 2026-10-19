@@ -130,7 +130,8 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
 /// publishes their public halves again.
 fn start<S: KeyStore>(store: &S, path: &Path) -> Result<(), String> {
     // BEP-060: a role the identity names had a key before, so the start
-    // refuses when the store lost it. No file is a first start.
+    // refuses when the store lost it. With no file, `keys::load` still
+    // refuses a lost key when the store holds a key for another role.
     let published = match Identity::read(path) {
         Ok(identity) => identity.roles(),
         Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {

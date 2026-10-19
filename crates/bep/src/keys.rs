@@ -226,9 +226,9 @@ impl fmt::Display for StartError {
 ///
 /// `published` holds the roles that the proxy's published identity names.
 /// The proxy made a key for each of them before. A key the store holds is
-/// used as it is. A key the store does not hold is generated only when
-/// `published` does not name its role, which happens on the first start. A
-/// key the store holds and refuses, or a published key the store lost, is
+/// used as it is. A key the store does not hold is generated only on a first
+/// start: `published` does not name its role, and the store holds no key for
+/// any role. A key the store holds and refuses, or a key the store lost, is
 /// never replaced here.
 ///
 /// # Errors
@@ -262,6 +262,20 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
             }
             Err(err @ KeyError::Store { .. }) => return Err(StartError::Store(err)),
         }
+    }
+    // BEP-060: a first start finds no key at all. When the store holds a key
+    // for another role, a key it does not hold was made before and lost,
+    // whatever the published identity says. The identity file can be
+    // absent, at another path, or written again without the role.
+    let holds_any = !refused.is_empty() || found.iter().any(|(_, key)| key.is_some());
+    if holds_any {
+        for (role, key) in &found {
+            if key.is_none() && !published.contains(role) {
+                tracing::error!(role = %role, "the key store lost a proxy key that it made before");
+                missing.push(*role);
+            }
+        }
+        missing.sort();
     }
     if !refused.is_empty() || !missing.is_empty() {
         return Err(StartError::Unusable { refused, missing });
@@ -881,10 +895,45 @@ mod tests {
         );
         assert_eq!(store.generated(), 3, "a lost key was made again");
 
-        // A role the identity does not name is a first start for that key.
+        // The store holds the other keys, so a root key that the identity
+        // does not name was lost too. It is never made again silently.
         store.clear_refusals();
-        assert!(load(&store, &[Role::Sealing]).is_ok());
-        assert_eq!(store.generated(), 4);
+        let err = load(&store, &[Role::Sealing]).unwrap_err();
+        assert_eq!(
+            err,
+            StartError::Unusable {
+                refused: vec![],
+                missing: vec![Role::Root],
+            }
+        );
+        assert_eq!(store.generated(), 3, "a lost key was made again");
+
+        // With no identity file at all, the start refuses the same way.
+        assert_eq!(load(&store, &[]).unwrap_err(), err);
+        assert_eq!(store.generated(), 3, "a lost key was made again");
+    }
+
+    // BEP-060: a failed replacement and a deleted identity file do not make
+    // the lost key again.
+    #[test]
+    fn a_lost_key_with_no_identity_file_refuses_the_start() {
+        let store = MemoryStore::default();
+        drop(load(&store, &[]).unwrap());
+        store.fail_generation();
+        assert!(matches!(
+            replace(&store, Role::Sealing),
+            Err(ReplaceError::Generate(_))
+        ));
+
+        let err = load(&store, &[]).unwrap_err();
+        assert_eq!(
+            err,
+            StartError::Unusable {
+                refused: vec![],
+                missing: vec![Role::Sealing],
+            }
+        );
+        assert_eq!(store.generated(), 3);
     }
 
     // BEP-060: a replacement that removed the old key and made no new one.
