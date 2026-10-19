@@ -1731,9 +1731,12 @@ pub enum ResumeError {
         asked_box_id: BoxId,
     },
     /// The answerer handed the name another published address than the
-    /// one the box was created with: the box's address moved while it had
-    /// no row, and a row at the old one would answer for an address the
-    /// box no longer holds.
+    /// one the box was created with, and a live row answers with the
+    /// creation's: the box cannot take an address another box's row
+    /// publishes back, and a row at the old one would answer for an
+    /// address the box no longer holds. When no row holds the creation's
+    /// address the resume is re-homed instead ([`BoxRegistry::resume_client_box`]),
+    /// so this refusal is only ever the live row's.
     #[error(
         "box {name:?} was created at loopback address {held}, but the answerer now holds \
          {allocated} for it"
@@ -3133,7 +3136,10 @@ impl BoxRegistry {
     /// persisted ([`SwitchAddressBook`]). A creation whose addresses the
     /// book will not give — an address outside the run, or one an earlier
     /// entry took — is dropped and said as a warn line; one whose row
-    /// cannot be published is kept dormant, its addresses reserved.
+    /// cannot be published is kept dormant, its addresses reserved. A
+    /// creation at a loopback address an earlier entry already holds is
+    /// dropped the same way, named with the box that holds it: two creations
+    /// at one address would each answer for it when they resume.
     ///
     /// The file is written after every change to the creations: mode 0600,
     /// written to a temporary file and renamed over the last
@@ -3166,12 +3172,29 @@ impl BoxRegistry {
             *self.unconfirmed_holds() = held.keys().map(|name| (name.clone(), now)).collect();
         }
         self.persisted_at = Some(Arc::new(path));
+        let mut held_loopbacks = std::collections::BTreeMap::new();
         for mut creation in loaded {
             let key = canonical_box_name(&creation.name);
             if self.creations().contains_key(&key) {
                 tracing::warn!(
                     box = %creation.name,
                     "the persisted box registry names a box twice; reloading the first only"
+                );
+                continue;
+            }
+            // A loopback address is one creation's while its creation is
+            // kept: the file is only ever written by this registry, but a
+            // second creation at the same address — from an interrupted
+            // moment or an older run — would put two boxes at it, and the
+            // one that resumes second would find its address held by the
+            // first, as a duplicate switch address would.
+            if let Some(holder) = held_loopbacks.get(&creation.loopback_address) {
+                tracing::warn!(
+                    box = %creation.name,
+                    held = %holder,
+                    held_loopback = %creation.loopback_address,
+                    "the persisted box registry holds a loopback address twice; \
+                     reloading the first box only"
                 );
                 continue;
             }
@@ -3189,6 +3212,7 @@ impl BoxRegistry {
             if creation.standing {
                 creation.standing = self.reinstate(&creation, now);
             }
+            held_loopbacks.insert(creation.loopback_address, creation.name.clone());
             self.creations().insert(key, creation);
         }
         self.persist();
@@ -3264,6 +3288,22 @@ impl BoxRegistry {
         self.creations
             .lock()
             .expect("the creations' lock is never held across a panic")
+    }
+
+    /// The zone rows of every dormant creation — its name under the zone,
+    /// and the loopback address it was created with, unanswerable until its
+    /// box resumes ([`Self::resume_client_box`]). The rows the table itself
+    /// publishes ([`Self::zone_view`]) hold only what stands: a creation
+    /// whose row was withdrawn is invisible to them, so a restarted
+    /// answerer's book would not know its address is taken and could hand
+    /// it to a new box — the address this fold keeps claimed.
+    #[must_use]
+    pub fn dormant_creation_rows(&self) -> Vec<(String, Ipv4Addr)> {
+        self.creations()
+            .values()
+            .filter(|creation| !creation.standing)
+            .map(|creation| (zone_name(&creation.name), creation.loopback_address))
+            .collect()
     }
 
     /// Writes the creations to the persisted file, when this registry
@@ -4455,8 +4495,11 @@ impl BoxRegistry {
     /// creation's row is published at its own switch address and task
     /// addresses, which the creation kept reserved while it was dormant
     /// ([`Creation`]), and at the published loopback address the answerer
-    /// holds for the name now, `allocated_loopback`, which must be the one
-    /// the box was created with. The creation is found by `box_id` when
+    /// holds for the name now, `allocated_loopback` — the creation's own
+    /// when it still is, and when the answerer holds another and no live
+    /// row answers with the creation's, the answerer's: the creation is
+    /// re-homed to it, as a box whose address was handed on while its row
+    /// was gone may otherwise never resume. The creation is found by `box_id` when
     /// the resume names one, so a session renamed since still resumes it. The reinstated row is awaiting, under its original id: no
     /// grace runs until a relay that carried it ends, and a row no relay
     /// carries — neither its box nor any of its task rows — within
@@ -4505,12 +4548,33 @@ impl BoxRegistry {
             return Ok(Arc::clone(record));
         }
         drop(rows);
+        let mut creation = creation;
         if allocated_loopback != creation.loopback_address {
-            return Err(ResumeError::LoopbackMoved {
-                name: name.to_string(),
-                held: creation.loopback_address,
-                allocated: allocated_loopback,
-            });
+            // The address moved while the box had no row. It is another
+            // live row's now — a row that answers with it — only when a
+            // record holds it: then the box cannot take it back, as before.
+            let rows = self
+                .rows
+                .read()
+                .expect("the row lock is never held across a panic, so it cannot be poisoned");
+            let taken = rows
+                .values()
+                .filter(|record| !record.is_task_row() && record.box_id() != creation.id())
+                .any(|record| record.loopback_addr() == creation.loopback_address);
+            if taken {
+                return Err(ResumeError::LoopbackMoved {
+                    name: name.to_string(),
+                    held: creation.loopback_address,
+                    allocated: allocated_loopback,
+                });
+            }
+            tracing::info!(
+                box = %name,
+                from = %creation.loopback_address,
+                to = %allocated_loopback,
+                "no row holds the creation's loopback address; resuming at the answerer's"
+            );
+            creation.loopback_address = allocated_loopback;
         }
         let mut addrs = revocation_addrs(creation.switch_address, creation.loopback_address);
         addrs.extend(creation.task_addresses.iter().map(|addr| addr.octets()));
@@ -7263,6 +7327,34 @@ mod tests {
         }
     }
 
+    /// A registry file an older run could have written twice — one creation
+    /// parked on a loopback an earlier line already holds — is reloaded
+    /// with only the first box at that address: the later line is set
+    /// aside, because a loopback held twice cannot serve two boxes and the
+    /// earlier registration is the one the answerer's own address book
+    /// would hand back.
+    #[test]
+    fn a_registry_file_holding_one_loopback_twice_reloads_the_first_box_only() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let before = persisted_registry(&dir);
+        let api = before
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for the box");
+        let _web = before
+            .register_client_box_at(client_spec("web"), api.loopback_addr())
+            .expect("a second box parks itself on the first box's address");
+
+        let after = persisted_registry(&dir);
+        let reloaded = after
+            .row_by_name("api")
+            .expect("the first box at the address is reloaded");
+        assert_eq!(reloaded.loopback_addr(), api.loopback_addr());
+        assert!(
+            after.row_by_name("web").is_none(),
+            "the second box at the address is dropped"
+        );
+    }
+
     /// NET-138: a creator resumes its box's row once the row was withdrawn
     /// after its grace — the same id, the same addresses, reinstated from
     /// the host's own record of the registration and awaiting its box's
@@ -7336,6 +7428,87 @@ mod tests {
 
         let again = resume(web.switch_addr(), None).expect("a standing row resumes as it is");
         assert!(Arc::ptr_eq(&again, &resumed), "the standing row itself");
+    }
+
+    /// NET-138: a resume of a creation whose loopback no live row holds —
+    /// a daemon restarted since its detach may have handed that address to
+    /// no one — takes the loopback the fresh run allocated for it and
+    /// persists the re-homed pair, so the box keeps its identity and its
+    /// creator's record matches the row it stands on.
+    #[test]
+    fn a_resume_of_a_creation_whose_loopback_is_unheld_takes_the_allocated_one() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(registry.row_by_name("web").is_none(), "the row is gone");
+
+        let allocated = Ipv4Addr::new(127, 0, 64, 200);
+        let claim = registry.begin_registration("web");
+        let resumed = registry
+            .resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                allocated,
+                claim.generation(),
+            )
+            .expect("an unheld loopback is re-homed, not refused");
+        assert_eq!(resumed.loopback_addr(), allocated);
+        assert_eq!(resumed.switch_addr(), web.switch_addr());
+        assert_eq!(resumed.box_id(), web.box_id());
+        assert_eq!(
+            persisted_registry(&dir)
+                .row_by_name("web")
+                .expect("the resumed row is persisted")
+                .loopback_addr(),
+            allocated,
+            "the re-homed pair is what a later reload reads"
+        );
+    }
+
+    /// NET-138: a resume of a creation whose loopback a live row now holds
+    /// is refused, changing nothing — the answerer's allocation cannot
+    /// take an address already standing on another box, and the refusal is
+    /// only ever the live row's, never the dormant creation's own.
+    #[test]
+    fn a_resume_of_a_creation_whose_loopback_a_row_holds_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(registry.row_by_name("web").is_none(), "the row is gone");
+        registry
+            .register_client_box_at(client_spec("peer"), web.loopback_addr())
+            .expect("a fresh box takes the dormant creation's address");
+
+        let allocated = Ipv4Addr::new(127, 0, 64, 200);
+        let claim = registry.begin_registration("web");
+        assert_eq!(
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                allocated,
+                claim.generation(),
+            ),
+            Err(ResumeError::LoopbackMoved {
+                name: "web".to_string(),
+                held: web.loopback_addr(),
+                allocated,
+            })
+        );
+        assert!(registry.row_by_name("web").is_none(), "nothing stands");
+        assert!(
+            registry.row_by_name("peer").is_some(),
+            "the row holding the address is untouched"
+        );
     }
 
     /// NET-138: a dormant creation holds its name — a registration under
