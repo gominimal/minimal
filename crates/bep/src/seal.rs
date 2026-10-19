@@ -11,14 +11,16 @@
 //! proxy key's fingerprint. A256GCM authenticates the protected header as its
 //! associated data, so a change to any byte of the context makes the value
 //! fail to open. The plaintext is the member list, as JSON:
-//! `{"members": [...], "default_owner": ...}`. Each member carries its
-//! breadth there.
+//! `{"members": [{"breadth": ..., "exp": ..., "credential": ...}],
+//! "default_owner": ...}`. A v1 value carries exactly one member.
 //!
 //! [`open`] refuses a value sealed to another key, a value that does not
 //! decrypt, and a value bound to another box, host or module. It returns the
-//! carried context. The mode is for the audit record, the host-set version
-//! selects the bound host set, and the caller checks the expiry against its
-//! clock.
+//! carried context with the member. It does not compare the mode, the
+//! host-set version or the expiry. The mode is for the audit record. The
+//! caller checks the expiry with [`Context::is_expired`]. The caller admits
+//! an authority only when it is in both the carried host-set version's set
+//! and the current set.
 //!
 //! The printed form has five dot-separated segments, and the second is
 //! empty. No GitHub token form matches it: not the `ghp_`, `gho_`, `ghu_`,
@@ -75,6 +77,12 @@ pub enum Breadth {
 }
 
 /// The context a sealed value carries in its protected header.
+///
+/// Every field is authenticated: a change to one makes the value fail to
+/// open. [`open`] compares only `box_id`, `host` and `module` with the
+/// request. The caller checks `expiry` with [`Context::is_expired`], records
+/// `mode` for the audit, and admits an authority only when it is in both
+/// the `host_set_version` set and the current set.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Context {
     /// The id of the box the value was minted for.
@@ -94,6 +102,15 @@ pub struct Context {
     /// The fingerprint of the proxy key the value is sealed to, as
     /// [`ProxyPublicKey::kid`] gives it.
     pub kid: String,
+}
+
+impl Context {
+    /// Whether the value is expired at `now`, in seconds since the Unix
+    /// epoch.
+    #[must_use]
+    pub fn is_expired(&self, now: u64) -> bool {
+        now >= self.expiry
+    }
 }
 
 /// The fields [`open`] compares with the expected binding.
@@ -144,25 +161,29 @@ impl fmt::Display for BoundField {
     }
 }
 
-/// One sealed member: its breadth and its secret.
+/// One entry of the member list: its breadth, its expiry and its
+/// credential.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Member {
     /// The member's breadth.
     pub breadth: Breadth,
-    /// The member's secret bytes. Zeroed on drop.
-    pub secret: Zeroizing<Vec<u8>>,
+    /// The member's expiry, in seconds since the Unix epoch.
+    pub exp: u64,
+    /// The credential or sign-in reference. Zeroed on drop.
+    pub credential: Zeroizing<Vec<u8>>,
 }
 
 impl fmt::Debug for Member {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Member")
             .field("breadth", &self.breadth)
-            .field("secret", &"<redacted>")
+            .field("exp", &self.exp)
+            .field("credential", &"<redacted>")
             .finish()
     }
 }
 
-/// The sealed plaintext: the member list. A v1 GitHub value carries one
+/// The sealed plaintext: the member list. A v1 value carries exactly one
 /// member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberList {
@@ -172,13 +193,15 @@ pub struct MemberList {
     pub default_owner: Option<String>,
 }
 
-/// What [`open`] returns: the carried context and the member list.
+/// What [`open`] returns: the carried context and the member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
     /// The context from the protected header.
     pub context: Context,
-    /// The decrypted member list.
-    pub members: MemberList,
+    /// The one member of the decrypted list.
+    pub member: Member,
+    /// The list's default owner, if any.
+    pub default_owner: Option<String>,
 }
 
 /// This host's proxy key: the static P-256 secret that opens sealed values.
@@ -253,9 +276,9 @@ pub enum SealError {
     /// The context's `kid` is not the fingerprint of the recipient key.
     #[error("the key id in the context is not the recipient key's fingerprint")]
     KidMismatch,
-    /// The member list is empty.
-    #[error("the member list is empty")]
-    NoMembers,
+    /// The member list does not hold exactly one member.
+    #[error("the member list does not hold exactly one member")]
+    MemberCount,
     /// The operating system's random source failed.
     #[error("the random source failed")]
     Random,
@@ -275,19 +298,20 @@ pub enum OpenError {
     /// The header's `typ`, `alg`, `enc` or key is not one this proxy reads.
     #[error("the sealed value uses an unsupported type or algorithm")]
     Unsupported,
-    /// The `kid` is not this proxy key's fingerprint.
-    #[error("the sealed value is sealed to another proxy key")]
-    OtherKey,
-    /// The value does not decrypt under this proxy key: a byte of the header
-    /// or the ciphertext changed.
+    /// The `kid` is not this proxy key's fingerprint, or the value does not
+    /// decrypt under this proxy key because a byte of the header or the
+    /// ciphertext changed.
     #[error("the sealed value does not open under this host's proxy key")]
     NotOpenable,
     /// A bound field differs from the expected binding.
     #[error("the sealed value is bound to a different {0}")]
     ContextMismatch(BoundField),
-    /// The plaintext is not a member list this proxy reads.
+    /// The plaintext is not a member list of exactly one member.
     #[error("the sealed value carries no member list this proxy reads")]
     BadMembers,
+    /// The member's breadth is missing or not one this proxy knows.
+    #[error("the sealed member has a missing or unknown breadth")]
+    UnknownBreadth,
 }
 
 /// Seals `members` to `recipient`, bound to `context`. Returns the compact
@@ -296,7 +320,8 @@ pub enum OpenError {
 /// # Errors
 ///
 /// [`SealError`] when `context.kid` is not the recipient's fingerprint, the
-/// list is empty, the random source fails or the cipher refuses.
+/// list does not hold exactly one member, the random source fails or the
+/// cipher refuses.
 pub fn seal(
     recipient: &ProxyPublicKey,
     context: &Context,
@@ -305,10 +330,18 @@ pub fn seal(
     if context.kid != recipient.kid() {
         return Err(SealError::KidMismatch);
     }
-    if members.members.is_empty() {
-        return Err(SealError::NoMembers);
+    if members.members.len() != 1 {
+        return Err(SealError::MemberCount);
     }
+    seal_plaintext(recipient, context, &members.to_json()?)
+}
 
+/// Seals `plaintext` to `recipient` with `context` in the protected header.
+fn seal_plaintext(
+    recipient: &ProxyPublicKey,
+    context: &Context,
+    plaintext: &[u8],
+) -> Result<String, SealError> {
     let ephemeral = random_secret()?;
     let header = Header::new(context, Jwk::of(&ephemeral.public_key()));
     let header_json = serde_json::to_vec(&header).map_err(|_| SealError::Encrypt)?;
@@ -320,12 +353,11 @@ pub fn seal(
     let mut iv = [0u8; IV_LEN];
     getrandom::fill(&mut iv).map_err(|_| SealError::Random)?;
 
-    let plaintext = members.to_json()?;
     let mut sealed = cipher
         .encrypt(
             &Nonce::from(iv),
             Payload {
-                msg: &plaintext,
+                msg: plaintext,
                 aad: header_b64.as_bytes(),
             },
         )
@@ -347,8 +379,8 @@ pub fn seal(
 ///
 /// [`OpenError::ContextMismatch`] names the first of box id, host and module
 /// that differs. The other variants say the value is malformed, uses an
-/// unsupported algorithm, is sealed to another key, does not decrypt, or
-/// carries no readable member list.
+/// unsupported algorithm, is sealed to another key or does not decrypt, or
+/// carries no list of exactly one member with a known breadth.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
     let mut parts = sealed.split('.');
     let (Some(header_b64), Some(encrypted_key), Some(iv), Some(ciphertext), Some(tag), None) = (
@@ -370,9 +402,9 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
     if header.typ != TYP || header.alg != ALG || header.enc != ENC {
         return Err(OpenError::Unsupported);
     }
-    let public = key.public();
-    if header.kid != public.kid() {
-        return Err(OpenError::OtherKey);
+    // A value sealed to another key is refused before any decryption.
+    if header.kid != key.public().kid() {
+        return Err(OpenError::NotOpenable);
     }
     let ephemeral = header.epk.to_public_key().ok_or(OpenError::Unsupported)?;
 
@@ -412,8 +444,16 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
         }
     }
 
-    let members = MemberList::from_json(&plaintext)?;
-    Ok(Opened { context, members })
+    let MemberList {
+        mut members,
+        default_owner,
+    } = MemberList::from_json(&plaintext)?;
+    let member = members.pop().ok_or(OpenError::BadMembers)?;
+    Ok(Opened {
+        context,
+        member,
+        default_owner,
+    })
 }
 
 fn decode(segment: &str) -> Result<Vec<u8>, OpenError> {
@@ -547,7 +587,7 @@ impl Header {
     }
 }
 
-/// The member list as JSON. The secret travels as unpadded base64url.
+/// The member list as JSON. The credential travels as unpadded base64url.
 #[derive(Serialize, Deserialize)]
 struct WireList {
     members: Vec<WireMember>,
@@ -555,15 +595,34 @@ struct WireList {
     default_owner: Option<String>,
 }
 
+/// One member as JSON. `breadth` reads as an optional string, so a missing
+/// or unknown breadth is told apart from a malformed list.
 #[derive(Serialize, Deserialize)]
 struct WireMember {
-    breadth: Breadth,
-    secret: String,
+    #[serde(default)]
+    breadth: Option<String>,
+    exp: u64,
+    credential: String,
 }
 
 impl Drop for WireMember {
     fn drop(&mut self) {
-        self.secret.zeroize();
+        self.credential.zeroize();
+    }
+}
+
+impl Breadth {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+        }
+    }
+
+    fn from_wire(wire: Option<&str>) -> Option<Self> {
+        match wire? {
+            "full" => Some(Self::Full),
+            _ => None,
+        }
     }
 }
 
@@ -574,8 +633,9 @@ impl MemberList {
                 .members
                 .iter()
                 .map(|member| WireMember {
-                    breadth: member.breadth,
-                    secret: URL_SAFE_NO_PAD.encode(member.secret.as_slice()),
+                    breadth: Some(member.breadth.as_wire().into()),
+                    exp: member.exp,
+                    credential: URL_SAFE_NO_PAD.encode(member.credential.as_slice()),
                 })
                 .collect(),
             default_owner: self.default_owner.clone(),
@@ -587,18 +647,21 @@ impl MemberList {
 
     fn from_json(json: &[u8]) -> Result<Self, OpenError> {
         let wire: WireList = serde_json::from_slice(json).map_err(|_| OpenError::BadMembers)?;
-        if wire.members.is_empty() {
+        if wire.members.len() != 1 {
             return Err(OpenError::BadMembers);
         }
         let members = wire
             .members
             .iter()
             .map(|member| {
+                let breadth = Breadth::from_wire(member.breadth.as_deref())
+                    .ok_or(OpenError::UnknownBreadth)?;
                 URL_SAFE_NO_PAD
-                    .decode(&member.secret)
-                    .map(|secret| Member {
-                        breadth: member.breadth,
-                        secret: Zeroizing::new(secret),
+                    .decode(&member.credential)
+                    .map(|credential| Member {
+                        breadth,
+                        exp: member.exp,
+                        credential: Zeroizing::new(credential),
                     })
                     .map_err(|_| OpenError::BadMembers)
             })
@@ -615,12 +678,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn members(secret: &[u8]) -> MemberList {
+    fn member(credential: &[u8]) -> Member {
+        Member {
+            breadth: Breadth::Full,
+            exp: 1_900_000_000,
+            credential: Zeroizing::new(credential.to_vec()),
+        }
+    }
+
+    fn members(credential: &[u8]) -> MemberList {
         MemberList {
-            members: vec![Member {
-                breadth: Breadth::Full,
-                secret: Zeroizing::new(secret.to_vec()),
-            }],
+            members: vec![member(credential)],
             default_owner: None,
         }
     }
@@ -709,18 +777,24 @@ mod tests {
                     let kid = ProxyKey::from_bytes(&b).unwrap().public().kid();
                     (Just(b), context_strategy(kid))
                 }),
-            secret in proptest::collection::vec(any::<u8>(), 0..64),
+            credential in proptest::collection::vec(any::<u8>(), 0..64),
             compared in 0..COMPARED.len(),
             carried in 0..CARRIED.len(),
         ) {
             let key = ProxyKey::from_bytes(&key_bytes).unwrap();
-            let sealed = seal(&key.public(), &context, &members(&secret)).unwrap();
+            let sealed = seal(&key.public(), &context, &members(&credential)).unwrap();
 
-            // It opens for its own box, host and module, and returns the
-            // carried context and the member list with its breadth.
+            // It opens for its own box, host and module, whatever the carried
+            // mode, host-set version and expiry, and returns the carried
+            // context and the member with its breadth.
             let opened = open(&key, &sealed, &binding(&context)).unwrap();
             prop_assert_eq!(&opened.context, &context);
-            prop_assert_eq!(&opened.members, &members(&secret));
+            prop_assert_eq!(&opened.member, &member(&credential));
+            prop_assert_eq!(opened.default_owner, None);
+            prop_assert_eq!(
+                opened.context.is_expired(context.expiry),
+                true
+            );
 
             // A request from another box, host or module is refused, and the
             // error names the field and carries no value.
@@ -738,7 +812,8 @@ mod tests {
                 format!("the sealed value is bound to a different {field}")
             );
 
-            // A rewrite of any carried field breaks the tag.
+            // A rewrite of any carried field breaks the tag, and is never
+            // reported as a mismatch of a named field.
             let forged = rewrite_header(&sealed, CARRIED[carried]);
             prop_assert_eq!(
                 open(&key, &forged, &binding(&context)).unwrap_err(),
@@ -749,7 +824,7 @@ mod tests {
             let other_key = ProxyKey::generate().unwrap();
             prop_assert_eq!(
                 open(&other_key, &sealed, &binding(&context)).unwrap_err(),
-                OpenError::OtherKey
+                OpenError::NotOpenable
             );
         }
     }
@@ -815,6 +890,48 @@ mod tests {
             open(&key, "ghp_notours", &binding(&context)).unwrap_err(),
             OpenError::Malformed
         );
+    }
+
+    #[test]
+    fn expiry_is_a_clock_check() {
+        let key = ProxyKey::generate().unwrap();
+        let context = fixed_context(&key);
+        assert!(!context.is_expired(context.expiry - 1));
+        assert!(context.is_expired(context.expiry));
+        assert!(context.is_expired(context.expiry + 1));
+    }
+
+    #[test]
+    fn a_list_of_other_than_one_member_or_an_unknown_breadth_is_refused() {
+        let key = ProxyKey::generate().unwrap();
+        let context = fixed_context(&key);
+        let two = MemberList {
+            members: vec![member(b"a"), member(b"b")],
+            default_owner: None,
+        };
+        assert_eq!(
+            seal(&key.public(), &context, &two).unwrap_err(),
+            SealError::MemberCount
+        );
+        let cases: [(&[u8], OpenError); 4] = [
+            (br#"{"members":[]}"#, OpenError::BadMembers),
+            (
+                br#"{"members":[{"breadth":"full","exp":1,"credential":"YQ"},{"breadth":"full","exp":1,"credential":"Yg"}]}"#,
+                OpenError::BadMembers,
+            ),
+            (
+                br#"{"members":[{"exp":1,"credential":"YQ"}]}"#,
+                OpenError::UnknownBreadth,
+            ),
+            (
+                br#"{"members":[{"breadth":"repo","exp":1,"credential":"YQ"}]}"#,
+                OpenError::UnknownBreadth,
+            ),
+        ];
+        for (plaintext, want) in cases {
+            let sealed = seal_plaintext(&key.public(), &context, plaintext).unwrap();
+            assert_eq!(open(&key, &sealed, &binding(&context)).unwrap_err(), want);
+        }
     }
 
     #[test]
