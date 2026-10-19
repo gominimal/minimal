@@ -9,6 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 mod error;
 pub use error::Error;
@@ -21,6 +22,21 @@ use serde::{Deserializer, Serializer};
 pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
+
+/// Overrides how many seconds an edit of `minimal.toml` waits for another
+/// command's lock before it fails.
+const MFILE_LOCK_TIMEOUT_ENV: &str = "MINIMAL_MFILE_LOCK_TIMEOUT_SECS";
+
+/// How long [`File::edit_exclusively`] waits for the lock: 60 s, or the
+/// whole seconds in [`MFILE_LOCK_TIMEOUT_ENV`]. An edit holds the lock only
+/// for a read and a write, so a longer wait means a stuck holder.
+fn mfile_lock_timeout() -> Duration {
+    env::var(MFILE_LOCK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
 
 /// A value from serde that can either be a string, or an array of strings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1106,27 +1122,28 @@ impl File {
     /// Read-modify-write `minimal.toml` under an exclusive lock, so
     /// concurrent `min` commands cannot lose each other's edits.
     ///
-    /// The lock is an advisory `flock` on a file in the per-user Minimal
-    /// state directory (`<state>/minimal/mfile-locks/`), named by a hash of
-    /// the file's canonical path. Nothing is left in the project tree, and
-    /// every spelling of the path (relative, absolute, through a symlink)
-    /// shares one lock. It is held for the whole read-edit-write sequence;
-    /// the content is re-read **inside** the lock, so every serialized
-    /// writer sees the previous writer's result. The write itself is
-    /// atomic (temp file + rename), so a concurrent reader never sees a
-    /// torn file and cannot write a partial view back.
+    /// The lock is an advisory `flock` on the directory that holds the
+    /// file's canonical path. Every process that edits the file shares it,
+    /// whatever its `HOME`, and every spelling of the path (relative,
+    /// absolute, through a symlink) resolves to one directory. Nothing is
+    /// written into the project tree. It is held for the whole
+    /// read-edit-write sequence; the content is re-read **inside** the
+    /// lock, so every serialized writer sees the previous writer's result.
+    /// The write itself is atomic (temp file + rename), so a concurrent
+    /// reader never sees a torn file and cannot write a partial view back.
     ///
-    /// The lock is best-effort. The edit runs unlocked after one warning,
-    /// still with the atomic write, when the lock cannot be had: the state
-    /// directory cannot be resolved (no `HOME`), the lock directory or lock
-    /// file cannot be created or opened (a read-only or unwritable state
-    /// directory, as in a daemon whose `HOME` is `/`), or the filesystem
-    /// does not support `flock`. Errors reading or writing `path` itself
-    /// still fail the edit. The lock only excludes processes that share the
-    /// state directory,
-    /// so an edit made inside a session VM does not exclude one made on
-    /// the host. The rename keeps the file's mode, but not its owner, ACLs
-    /// or extended attributes.
+    /// Where the filesystem refuses a `flock` on a directory (NFS), the
+    /// lock is a file in the per-user Minimal state directory
+    /// (`<state>/minimal/mfile-locks/`), named by a hash of the canonical
+    /// path. That lock only excludes processes that share the state
+    /// directory. The lock is best-effort. The edit runs unlocked after one
+    /// warning, still with the atomic write, when neither lock can be had.
+    /// Errors reading or writing `path` itself still fail the edit. A wait
+    /// for the lock that outlasts 60 s (or `MINIMAL_MFILE_LOCK_TIMEOUT_SECS`)
+    /// fails the edit, so a stuck holder cannot block it forever. An edit
+    /// made inside a session VM does not exclude one made on the host. The
+    /// rename keeps the file's mode, but not its owner, ACLs or extended
+    /// attributes.
     ///
     /// The `edit` closure receives the current content (`None` if the
     /// file does not exist yet) and returns `Ok(Some(new))` to write,
@@ -1141,7 +1158,7 @@ impl File {
     {
         let lock_dir = paths::try_minimal_state_dir()
             .map(|state| AsRef::<Path>::as_ref(&state).join("mfile-locks"));
-        Self::edit_exclusively_in(lock_dir.as_deref(), path, edit)
+        Self::edit_exclusively_in(lock_dir.as_deref(), mfile_lock_timeout(), path, edit)
     }
 
     /// [`File::edit_exclusively`] with the lock directory passed in, so
@@ -1149,6 +1166,7 @@ impl File {
     /// state directory could not be resolved, and the edit runs unlocked.
     fn edit_exclusively_in<E>(
         lock_dir: Option<&Path>,
+        timeout: Duration,
         path: &Path,
         edit: impl FnOnce(Option<&str>) -> Result<Option<String>, E>,
     ) -> Result<(), E>
@@ -1199,17 +1217,7 @@ impl File {
             .unwrap_or_else(|| PathBuf::from("."));
 
         // Held until this function returns, so across the write below.
-        let _lock = match lock_dir {
-            Some(lock_dir) => Self::lock_for(lock_dir, path)?,
-            None => {
-                tracing::warn!(
-                    "cannot find the Minimal state directory (is HOME set?); editing {} without \
-                     the lock",
-                    path.display()
-                );
-                None
-            }
-        };
+        let _lock = Self::lock_for(lock_dir, path, timeout)?;
 
         let content = match std::fs::read_to_string(path) {
             Ok(s) => Some(s),
@@ -1260,12 +1268,49 @@ impl File {
     }
 
     /// Takes the exclusive lock for the canonical `path`, saying so on
-    /// stderr before it waits for another process to release it. `None`
-    /// means the lock cannot be had, because the lock directory or file
-    /// cannot be created or opened (a read-only or unwritable state
-    /// directory) or the filesystem does not support `flock`; it warns once
-    /// and the caller edits unlocked.
-    fn lock_for(lock_dir: &Path, path: &Path) -> Result<Option<std::fs::File>, Error> {
+    /// stderr before it waits for another process to release it.
+    ///
+    /// The lock is a `flock` on the directory that holds `path`, so every
+    /// process that edits the file shares it, whatever its `HOME`. Where
+    /// the filesystem refuses a `flock` on a directory (NFS answers
+    /// `EBADF`), the lock falls back to a file in `lock_dir`, named by a
+    /// hash of `path`. `None` means neither lock can be had: it warns once
+    /// and the caller edits unlocked. A wait longer than `timeout` fails,
+    /// so a stuck holder cannot block an edit forever.
+    fn lock_for(
+        lock_dir: Option<&Path>,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Option<std::fs::File>, Error> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match std::fs::File::open(parent) {
+            Ok(dir) => match Self::wait_for_lock(&dir, path, timeout) {
+                Ok(()) => return Ok(Some(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(Error::IO("locking", path.to_path_buf(), e));
+                }
+                Err(e) => tracing::debug!(
+                    "cannot lock directory {} ({e}); using the state-directory lock",
+                    parent.display()
+                ),
+            },
+            Err(e) => tracing::debug!(
+                "cannot open directory {} ({e}); using the state-directory lock",
+                parent.display()
+            ),
+        }
+
+        let Some(lock_dir) = lock_dir else {
+            tracing::warn!(
+                "cannot find the Minimal state directory (is HOME set?); editing {} without \
+                 the lock",
+                path.display()
+            );
+            return Ok(None);
+        };
         use sha2::Digest as _;
         let digest = sha2::Sha256::digest(path.as_os_str().as_bytes());
         let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
@@ -1297,19 +1342,11 @@ impl File {
             }
         };
 
-        let locked = match file.try_lock() {
-            Ok(()) => Ok(()),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                eprintln!(
-                    "waiting for another command to finish editing {}",
-                    path.display()
-                );
-                file.lock()
-            }
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
-        };
-        match locked {
+        match Self::wait_for_lock(&file, path, timeout) {
             Ok(()) => Ok(Some(file)),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(Error::IO("locking", path.to_path_buf(), e))
+            }
             Err(e)
                 if matches!(
                     e.raw_os_error(),
@@ -1324,6 +1361,42 @@ impl File {
                 Ok(None)
             }
             Err(e) => Err(Error::IO("locking", lock_path, e)),
+        }
+    }
+
+    /// Takes `file`'s exclusive `flock`, polling with backoff. It says once
+    /// on stderr that it waits for `path`, and gives up with
+    /// [`std::io::ErrorKind::TimedOut`] after `timeout`.
+    fn wait_for_lock(file: &std::fs::File, path: &Path, timeout: Duration) -> std::io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(10);
+        let mut said = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+            if !said {
+                eprintln!(
+                    "waiting for another command to finish editing {}",
+                    path.display()
+                );
+                said = true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "another command kept this file locked for {}s. Stop that command and \
+                         run this one again, or set {MFILE_LOCK_TIMEOUT_ENV} to wait longer",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(backoff.min(deadline - now));
+            backoff = (backoff * 2).min(Duration::from_secs(1));
         }
     }
 
@@ -2965,11 +3038,13 @@ mod tests {
     /// own temp path, so tests do not contend.
     static TEST_LOCK_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempdir().unwrap());
 
+    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
     fn edit_in_test(
         path: &Path,
         edit: impl FnOnce(Option<&str>) -> Result<Option<String>, Error>,
     ) -> Result<(), Error> {
-        File::edit_exclusively_in(Some(TEST_LOCK_DIR.path()), path, edit)
+        File::edit_exclusively_in(Some(TEST_LOCK_DIR.path()), TEST_TIMEOUT, path, edit)
     }
 
     #[test]
@@ -3090,9 +3165,13 @@ mod tests {
         let link = dir.path().join("link.toml");
         std::os::unix::fs::symlink(&path, &link).unwrap();
 
-        let held = File::lock_for(TEST_LOCK_DIR.path(), &std::fs::canonicalize(&path).unwrap())
-            .unwrap()
-            .expect("flock is supported on the test filesystem");
+        let held = File::lock_for(
+            Some(TEST_LOCK_DIR.path()),
+            &std::fs::canonicalize(&path).unwrap(),
+            TEST_TIMEOUT,
+        )
+        .unwrap()
+        .expect("flock is supported on the test filesystem");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -3245,7 +3324,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join(MFILE_NAME);
 
-        File::edit_exclusively_in::<Error>(lock_dir, &path, |content| {
+        File::edit_exclusively_in::<Error>(lock_dir, TEST_TIMEOUT, &path, |content| {
             assert!(content.is_none());
             Ok(Some("k = \"v\"\n".to_string()))
         })
@@ -3255,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_exclusively_runs_unlocked_when_the_lock_dir_cannot_be_created() {
+    fn edit_exclusively_lands_when_the_lock_dir_cannot_be_created() {
         // A lock directory beneath a regular file cannot be created, even
         // by root (ENOTDIR), like a state dir on a read-only filesystem.
         let state = tempdir().unwrap();
@@ -3265,7 +3344,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_exclusively_runs_unlocked_when_the_lock_dir_is_read_only() {
+    fn edit_exclusively_lands_when_the_lock_dir_is_read_only() {
         // An existing read-only lock directory: the lock file cannot be
         // opened (EACCES), unless the test runs as root, which locks.
         let state = tempdir().unwrap();
@@ -3277,8 +3356,62 @@ mod tests {
     }
 
     #[test]
-    fn edit_exclusively_runs_unlocked_without_a_state_dir() {
+    fn edit_exclusively_lands_without_a_state_dir() {
         assert_edit_lands_with_lock_dir(None);
+    }
+
+    #[test]
+    fn edit_exclusively_excludes_editors_with_different_state_dirs() {
+        // minimald and a CLI with another HOME resolve different state
+        // directories. The directory lock still makes them exclude.
+        let dir = tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap().join(MFILE_NAME);
+        let other_state = tempdir().unwrap();
+        let _held = File::lock_for(Some(other_state.path()), &path, TEST_TIMEOUT)
+            .unwrap()
+            .expect("flock is supported on the test filesystem");
+
+        let err = File::edit_exclusively_in::<Error>(
+            Some(TEST_LOCK_DIR.path()),
+            Duration::from_millis(200),
+            &path,
+            |_| Ok(Some("k = \"v\"\n".to_string())),
+        )
+        .unwrap_err();
+        assert!(
+            !path.exists(),
+            "the edit ran while another holder had the lock"
+        );
+        assert!(
+            err.to_string().contains(MFILE_LOCK_TIMEOUT_ENV),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn edit_exclusively_gives_up_when_the_holder_never_releases() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = 1\n").unwrap();
+        let _held = File::lock_for(
+            Some(TEST_LOCK_DIR.path()),
+            &std::fs::canonicalize(&path).unwrap(),
+            TEST_TIMEOUT,
+        )
+        .unwrap()
+        .expect("flock is supported on the test filesystem");
+
+        let start = Instant::now();
+        let err = File::edit_exclusively_in::<Error>(
+            Some(TEST_LOCK_DIR.path()),
+            Duration::from_millis(200),
+            &path,
+            |_| Ok(Some("k = 2\n".to_string())),
+        )
+        .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(matches!(err, Error::IO("locking", ..)), "error: {err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 1\n");
     }
 
     #[test]
@@ -3288,7 +3421,7 @@ mod tests {
         std::fs::write(&blocker, "").unwrap();
         let path = blocker.join(MFILE_NAME);
 
-        let err = File::edit_exclusively_in::<Error>(None, &path, |_| {
+        let err = File::edit_exclusively_in::<Error>(None, TEST_TIMEOUT, &path, |_| {
             Ok(Some("k = \"v\"\n".to_string()))
         })
         .unwrap_err();
