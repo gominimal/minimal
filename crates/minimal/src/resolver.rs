@@ -4571,11 +4571,14 @@ fn reply_answers_host_row(reply: &Message) -> bool {
         })
 }
 
-/// `min ls`'s DNS SERVICE line on a VM-backed host (NET-138): the line
-/// that says who answers this VM's box names, as the status read reported
-/// it: this VM's host daemon when it holds the port, another VM host
-/// daemon when this one's table is registered with it, or the installed
-/// DNS service (NET-122's host service) when that holds the port. The
+/// `min ls`'s DNS SERVICE line from a control socket's status read
+/// (NET-138) — a VM host daemon's, or a native minimald's, which answers
+/// the same verb — printed when the listing's daemon reports no answerer
+/// port of its own: the line that says who answers this VM's box names,
+/// as the status read reported it: this VM's host daemon when it holds the
+/// port, another VM host daemon when this one's table is registered with
+/// it, or the installed DNS service (NET-122's host service) when that
+/// holds the port. The
 /// fourth arm is the one that must not claim an answer: a port held by a
 /// process no channel reaches means this VM's names are not answered, and
 /// the line says that instead. `None` for the pre-acquisition state —
@@ -4594,9 +4597,11 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
         ZoneAnswererStatus::ManagerHeld { port } => Some(format!(
             "Minimal's DNS service answers this VM's box names on 127.0.0.1:{port} (UDP)"
         )),
+        // Worded with no host kind, like [`port_held_no_channel_warning`]:
+        // a native minimald reports this state over the same control
+        // socket, and `min ls` prints it for that host too.
         ZoneAnswererStatus::PortHeldNoChannel { port } => Some(format!(
-            "this VM's box names are not answered: another program holds \
-             127.0.0.1:{port} (UDP)"
+            "box names are not answered: another program holds 127.0.0.1:{port} (UDP)"
         )),
         // The status that carries the hostname proxy's terminal publish
         // failure says nothing about the zone answerer, so the answerer
@@ -4608,8 +4613,9 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
     }
 }
 
-/// The live surface on a VM-backed host, from the reply the VM host
-/// daemon's control socket answered — `min ls`'s form. The no-channel state
+/// The live surface from the reply a control socket answered — the VM host
+/// daemon's, or a native minimald's beside its ssh socket, which answers
+/// the same status verb — `min ls`'s form. The no-channel state
 /// settles the proxy by the status's own word, without paying the
 /// detection or the liveness query: the port is no daemon's answerer, so
 /// the two reads could only misreport native. The two decided states read
@@ -4740,19 +4746,21 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
     }
 }
 
-/// The warning every session start on a VM-backed host prints when the
-/// answerer's port is held by a process no channel reaches (NET-138): this
-/// VM's names do not resolve through DNS on this machine. Printed to
-/// stderr unconditionally — the directive's "at every
-/// session start, TTY and non-TTY" — because the fact it names is the one
-/// a user relying on the names needs before the first lookup fails; the
-/// verdict printed below it says which surface the names do route
-/// through. Pure, so tests assert the wording without capturing stderr.
+/// The warning every session start prints when the answerer's port is held
+/// by a process no channel reaches (NET-138): the box names do not resolve
+/// through DNS on this machine. Printed to stderr unconditionally — the
+/// directive's "at every session start, TTY and non-TTY" — because the fact
+/// it names is the one a user relying on the names needs before the first
+/// lookup fails; the verdict printed below it says which surface the names
+/// do route through. The wording names no host kind: a VM host daemon and a
+/// native daemon report the same state, and the names it fails are the
+/// machine's either way. Pure, so tests assert the wording without
+/// capturing stderr.
 #[must_use]
 pub fn port_held_no_channel_warning(port: u16) -> String {
     format!(
-        "warning: this VM's box names do not resolve through DNS on this \
-         machine: another program holds 127.0.0.1:{port} (UDP)"
+        "warning: box names do not resolve through DNS on this machine: \
+         another program holds 127.0.0.1:{port} (UDP)"
     )
 }
 
@@ -5269,8 +5277,7 @@ mod tests {
             .expect("the no-channel state prints its line");
         assert_eq!(
             line,
-            "this VM's box names are not answered: another program holds \
-             127.0.0.1:7656 (UDP)"
+            "box names are not answered: another program holds 127.0.0.1:7656 (UDP)"
         );
         assert!(
             !line.contains("answers") && !line.contains("answering"),
@@ -5324,8 +5331,8 @@ mod tests {
     fn port_held_no_channel_warning_says_names_do_not_resolve() {
         assert_eq!(
             port_held_no_channel_warning(7_656),
-            "warning: this VM's box names do not resolve through DNS on this \
-             machine: another program holds 127.0.0.1:7656 (UDP)"
+            "warning: box names do not resolve through DNS on this machine: another \
+             program holds 127.0.0.1:7656 (UDP)"
         );
     }
 
