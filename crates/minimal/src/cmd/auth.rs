@@ -962,7 +962,7 @@ mod tests {
     #[test]
     fn base64url_matches_rfc_7636_example() {
         // RFC 7636 appendix B.
-        let verifier = "dBjftJeZ4CVP-mJ92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         assert_eq!(
             base64url(&Sha256::digest(verifier.as_bytes())),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
