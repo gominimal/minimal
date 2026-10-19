@@ -1075,14 +1075,22 @@ impl<S: Exec> ExecTask<S> {
 
         let stream = self.exec.exec(self.session.clone());
         let mngr = self.serv.sessions_manager().await;
-        let exit_status = bridge_noting_shutdown(
+        let exit_status = bridge_noting_reason(
             self.channel_id,
             stream,
             &mut stdin_rx,
             &mut w,
             &mut e,
             client_lost_rx,
-            || mngr.is_shutting_down(),
+            || {
+                if mngr.is_shutting_down() {
+                    Some(SHUTDOWN_NOTICE)
+                } else if self.session.is_destroying() {
+                    Some(DESTROYED_NOTICE)
+                } else {
+                    None
+                }
+            },
         )
         .await;
 
@@ -1102,21 +1110,27 @@ impl<S: Exec> ExecTask<S> {
 /// client is told why its command stopped rather than handed a bare 137.
 const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
 
-/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
-/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+/// The line an exec the session's destroy ended leaves on stderr, for the
+/// same reason: the client is told why its command stopped, not handed a
+/// bare 137 with nothing on the wire to explain it.
+const DESTROYED_NOTICE: &[u8] = b"the session was destroyed; the command was stopped\n";
+
+/// Runs [`bridge`] and, when the caller's reason closure names one, writes
+/// that notice to `e` before returning the exit status.
 ///
-/// `shutting_down` is asked once the bridge returns. It reads the sessions
-/// manager's shutdown state, which is set before the manager stops any box,
-/// rather than the server's shutdown token, which is cancelled only after the
-/// manager is done and so after the command is already gone.
-async fn bridge_noting_shutdown<S, P, R, W, E>(
+/// `notice` is asked once the bridge returns. The caller decides the
+/// reason — a daemon shutdown or the session's destroy — by checking the
+/// sessions manager's shutdown state, which is set before the manager stops
+/// any box, and the session handle's destroy state, which is set before the
+/// destroy stops the host; both before the command is already gone.
+async fn bridge_noting_reason<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
     client_lost: watch::Receiver<bool>,
-    shutting_down: impl FnOnce() -> bool,
+    notice: impl FnOnce() -> Option<&'static [u8]>,
 ) -> u32
 where
     P: Process,
@@ -1126,8 +1140,8 @@ where
     E: AsyncWrite + Unpin,
 {
     let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
-    if shutting_down() {
-        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    if let Some(notice) = notice() {
+        let _ = e.write_all(notice).await;
     }
     exit_status
 }
@@ -2879,7 +2893,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
-    use super::{bridge, bridge_noting_shutdown};
+    use super::{DESTROYED_NOTICE, SHUTDOWN_NOTICE, bridge, bridge_noting_reason};
 
     /// A never-firing client-loss signal for tests that exercise the
     /// bridge without modelling a disconnect.
@@ -3746,14 +3760,20 @@ mod tests {
             let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
             let bridge_task = crate::traced::spawn(async move {
-                let exit = bridge_noting_shutdown(
+                let exit = bridge_noting_reason(
                     "test",
                     process,
                     &mut bridge_stdin,
                     &mut bridge_stdout,
                     &mut bridge_stderr,
                     client_lost(),
-                    || shutting_down,
+                    || {
+                        if shutting_down {
+                            Some(SHUTDOWN_NOTICE)
+                        } else {
+                            None
+                        }
+                    },
                 )
                 .await;
                 (exit, bridge_stderr)
@@ -3780,6 +3800,75 @@ mod tests {
                 err,
                 expected,
                 "shutting down: {shutting_down}; stderr was {:?}",
+                String::from_utf8_lossy(&err),
+            );
+        }
+    }
+
+    /// An exec the session's destroy ends is told why the same way: the
+    /// notice lands on stderr after whatever the command itself wrote
+    /// there, and the command's own status still passes through. One that
+    /// ends for another reason gets no notice.
+    #[tokio::test]
+    async fn an_exec_ended_by_destroy_writes_the_notice_to_stderr() {
+        for destroying in [true, false] {
+            let (
+                process,
+                MockEndpoints {
+                    stdin_reader: _stdin_reader,
+                    stdout_writer,
+                    mut stderr_writer,
+                    ctrl,
+                },
+            ) = build_mock();
+
+            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+            drop(closed_stdin_w);
+            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+            let bridge_task = crate::traced::spawn(async move {
+                let exit = bridge_noting_reason(
+                    "test",
+                    process,
+                    &mut bridge_stdin,
+                    &mut bridge_stdout,
+                    &mut bridge_stderr,
+                    client_lost(),
+                    || {
+                        if destroying {
+                            Some(DESTROYED_NOTICE)
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .await;
+                (exit, bridge_stderr)
+            });
+
+            stderr_writer.write_all(b"err!").await.unwrap();
+            drop(stderr_writer);
+            drop(stdout_writer);
+            // What a box killed by the destroy's host teardown reports:
+            // 128 + SIGKILL.
+            ctrl.signal_exit(137).await;
+
+            let (exit, bridge_stderr) = bridge_task.await.unwrap();
+            assert_eq!(exit, 137, "the command's own status passes through");
+            drop(bridge_stderr);
+
+            let mut err = Vec::new();
+            client_stderr.read_to_end(&mut err).await.unwrap();
+            let expected: &[u8] = if destroying {
+                b"err!the session was destroyed; the command was stopped\n"
+            } else {
+                b"err!"
+            };
+            assert_eq!(
+                err,
+                expected,
+                "destroying: {destroying}; stderr was {:?}",
                 String::from_utf8_lossy(&err),
             );
         }

@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 mod helpers;
 // The per-message span names: a file of its own, because the daemon's refusal guard scans this
@@ -1015,6 +1016,11 @@ pub struct BoxActor {
     /// the session.
     weak_self: WeakBoxHandle,
 
+    /// Cancelled once a destroy of this session proceeds, before the destroy
+    /// stops the host. Shared with every [`BoxHandle`], so a command the
+    /// destroy ends can tell (see [`BoxHandle::is_destroying`]).
+    destroying: CancellationToken,
+
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
@@ -1122,6 +1128,7 @@ impl BoxActor {
         receiver: crate::traced::Receiver<BoxMessage>,
         inner: BoxInner,
         weak_self: WeakBoxHandle,
+        destroying: CancellationToken,
     ) -> Self {
         let BoxActorConfig {
             minimal_state_dir,
@@ -1154,6 +1161,7 @@ impl BoxActor {
             creator,
             manager,
             weak_self,
+            destroying,
             // No host yet; the first launch sets this. `Interactive` is the
             // conservative default — it is the one value that never licenses
             // a respawn.
@@ -1257,6 +1265,7 @@ impl BoxActor {
         };
 
         let (sender, receiver) = crate::traced::channel(8);
+        let destroying = CancellationToken::new();
         // One line per session start (NET-074/NET-076/NET-077): the rollout
         // phase this build ships, the daemon's opt-out state, and the
         // effective egress they leave this box with. The declaration
@@ -1299,8 +1308,8 @@ impl BoxActor {
         }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
-        let weak_self = WeakBoxHandle(sender.downgrade());
-        let actor = Self::assemble(conf, receiver, inner, weak_self);
+        let weak_self = WeakBoxHandle(sender.downgrade(), destroying.clone());
+        let actor = Self::assemble(conf, receiver, inner, weak_self, destroying.clone());
 
         // Register the PTask hostname before the actor goes live, so the
         // route exists by the time the caller can observe the session
@@ -1326,7 +1335,7 @@ impl BoxActor {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(BoxHandle(sender))
+        Ok(BoxHandle(sender, destroying))
     }
 
     /// Register this session's PTask hostname (R3.1/R3.6). A HostNet PTask's
@@ -2180,6 +2189,10 @@ impl BoxActor {
                 let _ = r.send(());
             }
             BoxMessage::Destroy(r) => {
+                // Cancelled before anything the destroy does: a command the
+                // destroy ends must be able to see why it stopped (the host
+                // teardown below is what ends it), so the token is set first.
+                self.destroying.cancel();
                 // Before `stop_running`: a destroy hook runs *inside* the
                 // session, so the sandbox it joins has to still exist — or
                 // be minted, which is what this does when the session's
@@ -5822,13 +5835,21 @@ impl BoxActor {
 
 /// The handle to the session.
 #[derive(Debug, Clone)]
-pub struct BoxHandle(crate::traced::Sender<BoxMessage>);
+pub struct BoxHandle(crate::traced::Sender<BoxMessage>, CancellationToken);
 
 impl BoxHandle {
     /// Returns a non-owning handle to this session.
     #[must_use]
     pub fn downgrade(&self) -> WeakBoxHandle {
-        WeakBoxHandle(self.0.downgrade())
+        WeakBoxHandle(self.0.downgrade(), self.1.clone())
+    }
+
+    /// Whether this session is being destroyed: set before the destroy
+    /// stops the host, so a command the destroy ends can still see why
+    /// when it returns.
+    #[must_use]
+    pub fn is_destroying(&self) -> bool {
+        self.1.is_cancelled()
     }
 
     /// The session's composition, if it has one. See
@@ -6482,14 +6503,14 @@ impl BoxHandle {
 
 /// A non-owning handle to the [`BoxActor`] actor.
 #[derive(Debug, Clone)]
-pub struct WeakBoxHandle(crate::traced::WeakSender<BoxMessage>);
+pub struct WeakBoxHandle(crate::traced::WeakSender<BoxMessage>, CancellationToken);
 
 impl WeakBoxHandle {
     /// Promotes to a strong [`BoxHandle`], or `None` if the session actor
     /// has already shut down (all strong senders dropped).
     #[must_use]
     pub fn upgrade(&self) -> Option<BoxHandle> {
-        Some(BoxHandle(self.0.upgrade()?))
+        Some(BoxHandle(self.0.upgrade()?, self.1.clone()))
     }
 
     /// A dangling handle whose actor is already gone (`upgrade` always yields
@@ -6502,7 +6523,7 @@ impl WeakBoxHandle {
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
-        Self(weak)
+        Self(weak, CancellationToken::new())
     }
 
     /// A handle to a stand-in "actor" that answers each expose request with
@@ -6540,7 +6561,7 @@ impl WeakBoxHandle {
                 }
             }
         });
-        Self(weak)
+        Self(weak, CancellationToken::new())
     }
 }
 
