@@ -19,6 +19,13 @@
 //! (BEP-074). On the response side, [`relay_response_head`] removes every
 //! `Alt-Svc` header (BEP-076).
 //!
+//! [`relay_request_body`] relays the body under the framing that the parsed
+//! head declares. It copies exactly `Content-Length` bytes, or it parses the
+//! chunked framing from the box and writes canonical chunks upstream. Raw
+//! chunked bytes from the box never reach the upstream. [`forward_requests`]
+//! is the request half of one box connection: it forwards heads and bodies
+//! until the connection closes, and it logs the rule that closed it.
+//!
 //! The canonical form is: `METHOD SP target SP HTTP/1.1 CRLF`, then one
 //! `name: value CRLF` line for each header, in the order received, with the
 //! name in lowercase and the value with no leading or trailing whitespace,
@@ -35,6 +42,9 @@ pub const MAX_HEAD_LEN: usize = 64 * 1024;
 
 /// The audit marker of a request refused for its framing (BEP-077).
 pub const FRAMING_AMBIGUOUS: &str = "framing_ambiguous";
+
+/// The longest chunk-size line or trailer line the proxy reads, in bytes.
+pub const MAX_CHUNK_LINE_LEN: usize = 4096;
 
 /// The request line of the HTTP/2 preface.
 const H2_PREFACE_LINE: &[u8] = b"PRI * HTTP/2.0";
@@ -138,6 +148,10 @@ pub enum Ambiguity {
     ObsoleteLineFold,
     /// A transfer coding other than one final `chunked`.
     TransferCodingNotFinalChunked,
+    /// A `Connection` option that names `Content-Length` or
+    /// `Transfer-Encoding`. A later hop that honours it removes the framing
+    /// header and reads the body in a different way.
+    ConnectionNamesFramingHeader,
 }
 
 impl Ambiguity {
@@ -150,6 +164,7 @@ impl Ambiguity {
             Self::InvalidContentLength => "invalid_content_length",
             Self::ObsoleteLineFold => "obsolete_line_fold",
             Self::TransferCodingNotFinalChunked => "transfer_coding_not_final_chunked",
+            Self::ConnectionNamesFramingHeader => "connection_names_framing_header",
         }
     }
 }
@@ -167,6 +182,10 @@ pub enum CloseReason {
     HeadTooLarge,
     /// The peer closed the connection before the head was complete.
     Eof,
+    /// The box closed the connection before the body was complete.
+    BodyEof,
+    /// The box closed the connection cleanly, between two requests.
+    ClientClosed,
     /// The read or the write failed.
     Io(io::ErrorKind),
 }
@@ -192,6 +211,8 @@ impl CloseReason {
             Self::Malformed(rule) => rule,
             Self::HeadTooLarge => "head_too_large",
             Self::Eof => "eof_before_head_end",
+            Self::BodyEof => "eof_before_body_end",
+            Self::ClientClosed => "client_closed",
             Self::Io(_) => "io_error",
         }
     }
@@ -282,6 +303,20 @@ pub fn parse_request(buf: &[u8]) -> Result<Parse<Request>, CloseReason> {
         return Err(CloseReason::Malformed("duplicate_host"));
     }
     let body = framing(&headers)?;
+    // RFC 9112 §3.2: an HTTP/1.1 request carries exactly one Host. An
+    // absolute-form target names the authority too, and the two must agree,
+    // so that the upstream and the policy see one authority.
+    let Some(host) = values(&headers, "host").next() else {
+        return Err(CloseReason::Malformed("missing_host"));
+    };
+    if let Some((scheme, authority)) = absolute_form_authority(target.as_bytes())
+        && !same_authority(scheme, authority, host)
+    {
+        return Err(CloseReason::Malformed("target_host_mismatch"));
+    }
+    if list_elements(values(&headers, "connection")).any(|t| t.eq_ignore_ascii_case(b"host")) {
+        return Err(CloseReason::Malformed("connection_names_host"));
+    }
     let mut request = Request {
         method,
         target,
@@ -308,6 +343,9 @@ pub fn parse_response(buf: &[u8]) -> Result<Parse<Response>, CloseReason> {
     let first = lines.next().unwrap_or(Ok(&[]))?;
     let (minor_version, status, reason) = parse_status_line(first)?;
     let headers = parse_headers(lines)?;
+    // The same framing rules as for a request, so that a hostile upstream
+    // cannot desync the box's connection.
+    framing(&headers)?;
     Ok(Parse::Complete {
         head: Response {
             minor_version,
@@ -335,7 +373,18 @@ pub fn forward_request_head<R: Read, W: Write>(
     upstream: &mut W,
     audit: &mut dyn AuditSink,
 ) -> Result<Forwarded, CloseReason> {
-    let result = read_head(client, parse_request).and_then(|(request, rest)| {
+    forward_head(box_id, Vec::new(), client, upstream, audit)
+}
+
+/// [`forward_request_head`], with `pending` bytes already read from the box.
+fn forward_head<R: Read, W: Write>(
+    box_id: &str,
+    pending: Vec<u8>,
+    client: &mut R,
+    upstream: &mut W,
+    audit: &mut dyn AuditSink,
+) -> Result<Forwarded, CloseReason> {
+    let result = read_head(pending, client, parse_request).and_then(|(request, rest)| {
         upstream
             .write_all(&request.serialize())
             .map_err(|e| CloseReason::Io(e.kind()))?;
@@ -365,7 +414,7 @@ pub fn relay_response_head<R: Read, W: Write>(
     upstream: &mut R,
     client: &mut W,
 ) -> Result<(Response, Vec<u8>), CloseReason> {
-    let (mut response, rest) = read_head(upstream, parse_response)?;
+    let (mut response, rest) = read_head(Vec::new(), upstream, parse_response)?;
     response.strip_alt_svc();
     client
         .write_all(&response.serialize())
@@ -373,17 +422,199 @@ pub fn relay_response_head<R: Read, W: Write>(
     Ok((response, rest))
 }
 
+/// Relay the body of a forwarded request from `client` to `upstream`, under
+/// the framing that its parsed head declares.
+///
+/// A `Content-Length` body is copied as exactly that many bytes, starting
+/// with [`Forwarded::rest`]. A chunked body is parsed chunk by chunk, and
+/// each chunk goes upstream in the canonical form `size-in-hex CRLF data
+/// CRLF`. Chunk extensions and trailer fields are dropped, and the body ends
+/// with `0 CRLF CRLF`.
+///
+/// Returns the bytes read after the body: the start of the next request.
+///
+/// On an error, part of the body can already be upstream. The caller then
+/// drops both connections, and never gives the upstream one back.
+///
+/// # Errors
+///
+/// Returns the [`CloseReason`] when the proxy must close the connection.
+pub fn relay_request_body<R: Read, W: Write>(
+    forwarded: Forwarded,
+    client: &mut R,
+    upstream: &mut W,
+) -> Result<Vec<u8>, CloseReason> {
+    let mut input = BodyInput {
+        buf: forwarded.rest,
+        pos: 0,
+        reader: client,
+    };
+    match forwarded.request.body {
+        BodyFraming::None => {}
+        BodyFraming::ContentLength(n) => input.copy(n, upstream)?,
+        BodyFraming::Chunked => relay_chunked(&mut input, upstream)?,
+    }
+    upstream.flush().map_err(|e| CloseReason::Io(e.kind()))?;
+    Ok(input.buf.split_off(input.pos))
+}
+
+/// Forward the requests of one box connection to `upstream`, head and body,
+/// until the connection closes. This is the request half of the
+/// connection. The responses go back to the box on the other half.
+///
+/// Writes one debug log line for the close, with the box id and
+/// [`CloseReason::rule`], and returns the reason.
+pub fn forward_requests<R: Read, W: Write>(
+    box_id: &str,
+    client: &mut R,
+    upstream: &mut W,
+    audit: &mut dyn AuditSink,
+) -> CloseReason {
+    let mut pending = Vec::new();
+    let reason = loop {
+        let forwarded = match forward_head(box_id, pending, client, upstream, audit) {
+            Ok(forwarded) => forwarded,
+            Err(reason) => break reason,
+        };
+        pending = match relay_request_body(forwarded, client, upstream) {
+            Ok(rest) => rest,
+            Err(reason) => break reason,
+        };
+    };
+    tracing::debug!(box_id, rule = reason.rule(), "box connection closed");
+    reason
+}
+
+/// The bytes of a body: those already read, then the reader.
+struct BodyInput<'r, R> {
+    buf: Vec<u8>,
+    pos: usize,
+    reader: &'r mut R,
+}
+
+impl<R: Read> BodyInput<'_, R> {
+    /// Read more bytes into the buffer.
+    fn fill(&mut self) -> Result<(), CloseReason> {
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let mut chunk = [0u8; 8192];
+        loop {
+            match self.reader.read(&mut chunk) {
+                Ok(0) => return Err(CloseReason::BodyEof),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    return Ok(());
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(CloseReason::Io(e.kind())),
+            }
+        }
+    }
+
+    /// Copy exactly `n` bytes to `out`.
+    fn copy<W: Write>(&mut self, mut n: u64, out: &mut W) -> Result<(), CloseReason> {
+        while n > 0 {
+            if self.pos == self.buf.len() {
+                self.fill()?;
+            }
+            let available = &self.buf[self.pos..];
+            let take = usize::try_from(n).map_or(available.len(), |n| n.min(available.len()));
+            out.write_all(&available[..take])
+                .map_err(|e| CloseReason::Io(e.kind()))?;
+            self.pos += take;
+            n -= take as u64;
+        }
+        Ok(())
+    }
+
+    /// One line, without its CRLF. A bare CR or a bare LF is malformed.
+    fn line(&mut self) -> Result<Vec<u8>, CloseReason> {
+        loop {
+            let available = &self.buf[self.pos..];
+            if let Some(end) = available.windows(2).position(|w| w == b"\r\n") {
+                let line = available[..end].to_vec();
+                self.pos += end + 2;
+                if line.iter().any(|&b| b == b'\r' || b == b'\n') {
+                    return Err(CloseReason::Malformed("bare_cr_or_lf"));
+                }
+                return Ok(line);
+            }
+            if available.len() > MAX_CHUNK_LINE_LEN {
+                return Err(CloseReason::Malformed("chunk_line_too_long"));
+            }
+            self.fill()?;
+        }
+    }
+}
+
+/// Parse a chunked body from `input`, and write it canonically to
+/// `upstream` (RFC 9112 §7.1).
+fn relay_chunked<R: Read, W: Write>(
+    input: &mut BodyInput<'_, R>,
+    upstream: &mut W,
+) -> Result<(), CloseReason> {
+    let io_err = |e: io::Error| CloseReason::Io(e.kind());
+    loop {
+        let size = parse_chunk_size(&input.line()?)?;
+        if size == 0 {
+            break;
+        }
+        upstream
+            .write_all(format!("{size:x}\r\n").as_bytes())
+            .map_err(io_err)?;
+        input.copy(size, upstream)?;
+        if !input.line()?.is_empty() {
+            return Err(CloseReason::Malformed("chunk_data_crlf"));
+        }
+        upstream.write_all(b"\r\n").map_err(io_err)?;
+    }
+    // The trailer section is read to its end and dropped.
+    let mut trailer_len = 0;
+    loop {
+        let line = input.line()?;
+        if line.is_empty() {
+            break;
+        }
+        trailer_len += line.len() + 2;
+        if trailer_len > MAX_HEAD_LEN {
+            return Err(CloseReason::Malformed("trailer_too_large"));
+        }
+    }
+    upstream.write_all(b"0\r\n\r\n").map_err(io_err)
+}
+
+/// The size of a chunk-size line: hex digits, then an optional extension
+/// after `;`, which is dropped.
+fn parse_chunk_size(line: &[u8]) -> Result<u64, CloseReason> {
+    let malformed = CloseReason::Malformed("chunk_size");
+    let (digits, extension) = match line.iter().position(|&b| b == b';') {
+        Some(semi) => (&line[..semi], &line[semi + 1..]),
+        None => (line, &[][..]),
+    };
+    if !extension.iter().all(|&b| is_field_byte(b)) {
+        return Err(malformed);
+    }
+    if digits.is_empty() || digits.len() > 16 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(malformed);
+    }
+    // The digits are ASCII hex, from the check above.
+    u64::from_str_radix(&String::from_utf8_lossy(digits), 16).map_err(|_| malformed)
+}
+
 fn read_head<R: Read, T>(
+    mut buf: Vec<u8>,
     reader: &mut R,
     parse: fn(&[u8]) -> Result<Parse<T>, CloseReason>,
 ) -> Result<(T, Vec<u8>), CloseReason> {
-    let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     loop {
         if let Parse::Complete { head, head_len } = parse(&buf)? {
             return Ok((head, buf.split_off(head_len)));
         }
         let n = match reader.read(&mut chunk) {
+            Ok(0) if buf.is_empty() => return Err(CloseReason::ClientClosed),
             Ok(0) => return Err(CloseReason::Eof),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -510,6 +741,12 @@ fn framing(headers: &[Header]) -> Result<BodyFraming, CloseReason> {
     let lengths: Vec<&[u8]> = list_elements(values(headers, "content-length")).collect();
     let has_length_header = headers.iter().any(|h| h.name == "content-length");
     let has_te = headers.iter().any(|h| h.name == "transfer-encoding");
+    let names_framing = list_elements(values(headers, "connection")).any(|t| {
+        t.eq_ignore_ascii_case(b"content-length") || t.eq_ignore_ascii_case(b"transfer-encoding")
+    });
+    if names_framing {
+        return ambiguous(Ambiguity::ConnectionNamesFramingHeader);
+    }
     if has_length_header && has_te {
         return ambiguous(Ambiguity::ContentLengthWithTransferEncoding);
     }
@@ -543,6 +780,34 @@ fn parse_length(digits: &[u8]) -> Option<u64> {
     digits.iter().try_fold(0u64, |acc, &d| {
         acc.checked_mul(10)?.checked_add(u64::from(d - b'0'))
     })
+}
+
+/// The scheme and authority of an absolute-form target, `scheme://authority`.
+fn absolute_form_authority(target: &[u8]) -> Option<(&'static str, &[u8])> {
+    let (scheme, rest) = if target.len() > 7 && target[..7].eq_ignore_ascii_case(b"http://") {
+        ("http", &target[7..])
+    } else if target.len() > 8 && target[..8].eq_ignore_ascii_case(b"https://") {
+        ("https", &target[8..])
+    } else {
+        return None;
+    };
+    let end = rest
+        .iter()
+        .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    Some((scheme, &rest[..end]))
+}
+
+/// Whether an absolute-form authority and a Host value name the same
+/// authority. Case does not count, and the scheme's default port equals no
+/// port. An authority with user info never matches.
+fn same_authority(scheme: &str, authority: &[u8], host: &[u8]) -> bool {
+    let default_port: &[u8] = if scheme == "https" { b":443" } else { b":80" };
+    let normal = |a: &[u8]| -> Vec<u8> {
+        let a = a.strip_suffix(default_port).unwrap_or(a);
+        a.to_ascii_lowercase()
+    };
+    !authority.contains(&b'@') && !authority.is_empty() && normal(authority) == normal(host)
 }
 
 /// Remove an `h2c` upgrade, its `Connection` tokens and `HTTP2-Settings`
@@ -941,5 +1206,178 @@ mod tests {
             parse_request(&vec![b'a'; MAX_HEAD_LEN]),
             Err(CloseReason::HeadTooLarge)
         );
+    }
+
+    /// A reader that returns at most three bytes at a time, so that every
+    /// boundary falls inside a read.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.len().min(buf.len()).min(3);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    fn forward_all(input: &[u8]) -> (CloseReason, Vec<u8>, Vec<AuditEvent>) {
+        let mut upstream = Vec::new();
+        let mut audit = Vec::new();
+        let reason = forward_requests("box-a", &mut Trickle(input), &mut upstream, &mut audit);
+        (reason, upstream, audit)
+    }
+
+    // BEP-077: a Content-Length body goes upstream as exactly that many
+    // bytes, and the bytes after it are the next request.
+    #[test]
+    fn content_length_body_is_relayed_exactly() {
+        let (reason, upstream, audit) = forward_all(
+            b"POST /a HTTP/1.1\r\nHost: github.com\r\nContent-Length:  11\r\n\r\nhello worldGET /b HTTP/1.1\r\nHOST: github.com\r\n\r\n",
+        );
+        assert_eq!(reason, CloseReason::ClientClosed);
+        assert_eq!(reason.rule(), "client_closed");
+        assert_eq!(
+            String::from_utf8(upstream).unwrap(),
+            "POST /a HTTP/1.1\r\nhost: github.com\r\ncontent-length: 11\r\n\r\nhello world\
+             GET /b HTTP/1.1\r\nhost: github.com\r\n\r\n"
+        );
+        assert!(audit.is_empty());
+    }
+
+    // BEP-077: a chunked body is parsed and written upstream as canonical
+    // chunks. The box's chunk bytes never go upstream as they are.
+    #[test]
+    fn chunked_body_is_reframed() {
+        let (reason, upstream, _) = forward_all(
+            b"POST /a HTTP/1.1\r\nHost: github.com\r\nTransfer-Encoding: Chunked\r\n\r\n\
+              005;name=value\r\nhello\r\nA\r\n0123456789\r\n0000;last\r\nX-Trailer: t\r\n\r\n\
+              GET /b HTTP/1.1\r\nHost: github.com\r\n\r\n",
+        );
+        assert_eq!(reason, CloseReason::ClientClosed);
+        assert_eq!(
+            String::from_utf8(upstream).unwrap(),
+            "POST /a HTTP/1.1\r\nhost: github.com\r\ntransfer-encoding: Chunked\r\n\r\n\
+             5\r\nhello\r\na\r\n0123456789\r\n0\r\n\r\n\
+             GET /b HTTP/1.1\r\nhost: github.com\r\n\r\n"
+        );
+
+        let head = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for (body, rule) in [
+            ("5\r\nhelloXX\r\n0\r\n\r\n", "chunk_data_crlf"),
+            ("zz\r\n", "chunk_size"),
+            (" 5\r\nhello\r\n0\r\n\r\n", "chunk_size"),
+            ("-1\r\n", "chunk_size"),
+            ("11111111111111111\r\n", "chunk_size"),
+            ("5\nhello\r\n0\r\n\r\n", "bare_cr_or_lf"),
+        ] {
+            let (reason, upstream, _) = forward_all(format!("{head}{body}").as_bytes());
+            assert_eq!(reason.rule(), rule, "{body:?}");
+            assert!(!String::from_utf8_lossy(&upstream).contains(body));
+        }
+        let long = format!("{head}{}", "1".repeat(MAX_CHUNK_LINE_LEN + 8));
+        assert_eq!(forward_all(long.as_bytes()).0.rule(), "chunk_line_too_long");
+    }
+
+    // A box that closes mid-body closes the connection with its own rule.
+    // The caller drops the upstream connection, so the partial body ends
+    // nothing that a later request reuses.
+    #[test]
+    fn client_closing_mid_body_closes() {
+        let (reason, upstream, _) =
+            forward_all(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc");
+        assert_eq!(reason, CloseReason::BodyEof);
+        assert_eq!(reason.rule(), "eof_before_body_end");
+        assert!(upstream.ends_with(b"\r\n\r\nabc"));
+
+        for body in ["5\r\nhel", "5\r\nhello\r\n", "0\r\nX-T: a\r\n", "5"] {
+            let input =
+                format!("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            assert_eq!(
+                forward_all(input.as_bytes()).0,
+                CloseReason::BodyEof,
+                "{body:?}"
+            );
+        }
+
+        assert_eq!(
+            forward_all(b"GET / HTTP/1.1\r\nHost: a\r\n").0,
+            CloseReason::Eof
+        );
+    }
+
+    // A Connection option that names a framing header is ambiguous framing,
+    // and one that names Host is refused too.
+    #[test]
+    fn connection_naming_framing_header_is_refused() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nConnection: keep-alive, Content-Length\r\n\r\n"[..],
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: transfer-encoding\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: content-length\r\n\r\n",
+        ] {
+            assert_eq!(
+                parse_request(raw),
+                Err(CloseReason::FramingAmbiguous(
+                    Ambiguity::ConnectionNamesFramingHeader
+                ))
+            );
+        }
+        assert_eq!(
+            parse_request(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: Host\r\n\r\n"),
+            Err(CloseReason::Malformed("connection_names_host"))
+        );
+    }
+
+    // One Host is required, and an absolute-form target must name the same
+    // authority.
+    #[test]
+    fn host_and_absolute_target_must_agree() {
+        assert_eq!(
+            parse_request(b"GET / HTTP/1.1\r\nX: y\r\n\r\n"),
+            Err(CloseReason::Malformed("missing_host"))
+        );
+        for raw in [
+            &b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n"[..],
+            b"GET https://a.example:8443/x HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"GET http://u@a.example/ HTTP/1.1\r\nHost: u@a.example\r\n\r\n",
+            b"GET http:///x HTTP/1.1\r\nHost: \r\n\r\n",
+        ] {
+            assert_eq!(
+                parse_request(raw),
+                Err(CloseReason::Malformed("target_host_mismatch")),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        for raw in [
+            &b"GET http://A.example/x HTTP/1.1\r\nHost: a.EXAMPLE\r\n\r\n"[..],
+            b"GET https://a.example:443?q HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"GET http://a.example HTTP/1.1\r\nHost: a.example:80\r\n\r\n",
+        ] {
+            parse_ok(raw);
+        }
+    }
+
+    // A response with ambiguous framing is refused before any byte of it
+    // reaches the box.
+    #[test]
+    fn ambiguous_response_framing_is_refused() {
+        for (raw, rule) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                Ambiguity::ContentLengthWithTransferEncoding,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n",
+                Ambiguity::DuplicateContentLength,
+            ),
+        ] {
+            let mut client = Vec::new();
+            assert_eq!(
+                relay_response_head(&mut &raw[..], &mut client).unwrap_err(),
+                CloseReason::FramingAmbiguous(rule)
+            );
+            assert!(client.is_empty());
+        }
     }
 }
