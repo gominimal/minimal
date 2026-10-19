@@ -186,20 +186,25 @@ developer running agent boxes; build-infra operator; auditor.
   value; `[[github_imports]]`, `[[file_imports]]`, egress destinations and
   the `[otel]` endpoint as a location reduced to scheme, host, port and
   path (an allowlist of parts: no userinfo, no query, no fragment, no
-  header, whatever a parameter is called) — SHALL apply the same reduction
-  to every location in the build-closure and build-environment facts taken
-  from a per-package document (SBOM-009), and SHALL never embed a variable
-  value, a secret value, or a credential carried by one of those fields in
-  any document.
+  header, whatever a parameter is called) — SHALL copy from a per-package
+  document (SBOM-009) only an allowlist of fields: a build-closure
+  component's name, version, `purl` and digests, and a build-environment
+  tool's name and version, with every location among them reduced the same
+  way and no other field of the document (annotations, command lines,
+  environment values, free text of any kind) ever copied, bundled or not
+  — and SHALL never embed a variable value, a secret value, or a credential
+  carried by one of those fields in any document.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_credentials_never_embedded_in_any_serializer
   property: for all compositions c, serializers s in {cdx, spdx, blueprint}:
     every environment asset in parse_s(emit_s(c)) carries only name and
     provenance fields, every secret carries only name and source kind, every
     location field (the posture's and the imported documents' alike) is of
-    the form scheme://host[:port]/path, for all credentials v in
-    credentials(c): v not in ir(c), and no string anywhere in
-    parse_s(emit_s(c)) equals or contains v
+    the form scheme://host[:port]/path, fields(imported(d)) ⊆ {name, version,
+    purl, digests, tool name, tool version} for every document d, for all
+    credentials v in credentials(c) ∪ planted(d): v not in ir(c), and no
+    string anywhere in parse_s(emit_s(c)) equals or contains v
+  - verify: cargo nextest run -p sbom sbom_credential_planted_in_a_per_package_document_never_emitted
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
@@ -284,7 +289,9 @@ developer running agent boxes; build-infra operator; auditor.
     mark the component `unverified`, as PKV marks an entry whose source has
     no verified bundle, and print one diagnostic to stderr per emission that
     names each such component and build-servers#185 as the reason, so the
-    interim is never silent. This path ends by itself: the first pin that
+    interim is never silent; the document's fields reach the composition
+    only through SBOM-008's allowlist, as a bundled document's do. This
+    path ends by itself: the first pin that
     records bundles for its documents takes the path above for them, with no
     flag and no release step.
     tier:   T1
