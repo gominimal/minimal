@@ -16,17 +16,7 @@ use tokio::{
 };
 
 use crate::Error;
-
-/// A references to a [Deliverable] within [State].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeliverableRef(Index);
-
-impl DeliverableRef {
-    // Returns the inner index. DO NOT USE unless you know what you are doing.
-    pub(crate) fn inner_idx(&self) -> usize {
-        self.0.into_raw_parts().0
-    }
-}
+use crate::traits::DeliverableRef;
 
 /// Variants of [Deliverable].
 #[derive(Debug, Clone, PartialEq, Eq)]

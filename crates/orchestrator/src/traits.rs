@@ -1,10 +1,22 @@
 use common::SpecHash;
+use generational_arena::Index;
 use graph::{BuildSpecRef, SubsetInput};
 use lcache::{DirCacheEntry, EntryMeta, LocalDir, PendingDir};
 
-use super::state::DeliverableRef;
 use super::{SharedHandle, StateHandle};
 use crate::Error;
+
+/// A references to a [Deliverable](super::state::Deliverable) within
+/// [State](super::state::State).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliverableRef(pub(crate) Index);
+
+impl DeliverableRef {
+    // Returns the inner index. DO NOT USE unless you know what you are doing.
+    pub(crate) fn inner_idx(&self) -> usize {
+        self.0.into_raw_parts().0
+    }
+}
 
 /// A structure describing a constructed deliverable. For instance, this might
 /// be a PendingDir for local builds.

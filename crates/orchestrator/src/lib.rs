@@ -23,12 +23,10 @@ mod render;
 pub use render::{BuildLine, BuildLineKind, BuildRenderer};
 
 mod state;
-pub use state::{
-    Deliverable, DeliverableInner, DeliverableRef, DeliverableState, State, StateHandle,
-};
+pub use state::{Deliverable, DeliverableInner, DeliverableState, State, StateHandle};
 
 mod traits;
-pub use traits::{Artifact, Backend};
+pub use traits::{Artifact, Backend, DeliverableRef};
 
 mod error;
 pub use error::Error;
