@@ -160,12 +160,18 @@ developer running agent boxes; build-infra operator; auditor.
     verify: cargo nextest run -p sbom blueprint_axes_carry_enforcement_label
     property: for all axes x in emit_bp(c): label(x) == enforcement(section(x))
   - THE SYSTEM SHALL emit the Blueprint from the box's stored expanded spec
-    (BOX-068) and SHALL carry the spec's posture-projection digest (BOX-071)
-    as a document property, so a Blueprint binds to the posture Gatehouse
-    admitted the box under.
+    (BOX-068) and SHALL carry two digests as document properties: the
+    spec's posture-projection digest (BOX-071), which binds the projected
+    axes — network, bep, the registry pin, loadout mode, pty, lifetime,
+    nesting and secret grants — to the posture Gatehouse admitted the box
+    under, and the sha256 of the stored expanded spec's canonical bytes,
+    which binds every other axis the Blueprint emits (file imports and
+    exports, GitHub imports, variables, volumes, `[otel]`, `[machine]`) to
+    the spec the box runs under; the Blueprint names which axes each digest
+    covers, so neither is read as proving more than it does.
     tier:   T1
-    verify: cargo nextest run -p sbom blueprint_carries_posture_digest
-    property: posture_digest(emit_bp(c)) == projection_digest(expanded_spec(c))
+    verify: cargo nextest run -p sbom blueprint_carries_posture_and_spec_digests
+    property: posture_digest(emit_bp(c)) == projection_digest(expanded_spec(c)) ∧ spec_digest(emit_bp(c)) == sha256(canonical(expanded_spec(c)))
 
 - **SBOM-007** WHEN a box SBOM is emitted under a pin whose commit
   carries a sealed attribution manifest THE SYSTEM SHALL emit component
@@ -177,18 +183,22 @@ developer running agent boxes; build-infra operator; auditor.
   and provenance only, SHALL record every other credential-bearing posture
   field by reference — `[secrets]` as name and `source` kind, never the
   value; `[[github_imports]]`, `[[file_imports]]`, egress destinations and
-  the `[otel]` endpoint as their location with any userinfo, token-bearing
-  query parameter or header value removed — and SHALL never embed a
-  variable value, a secret value, or a credential carried by one of those
-  fields in any document.
+  the `[otel]` endpoint as a location reduced to scheme, host, port and
+  path (an allowlist of parts: no userinfo, no query, no fragment, no
+  header, whatever a parameter is called) — SHALL apply the same reduction
+  to every location in the build-closure and build-environment facts taken
+  from a per-package document (SBOM-009), and SHALL never embed a variable
+  value, a secret value, or a credential carried by one of those fields in
+  any document.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_credentials_never_embedded_in_any_serializer
   property: for all compositions c, serializers s in {cdx, spdx, blueprint}:
     every environment asset in parse_s(emit_s(c)) carries only name and
     provenance fields, every secret carries only name and source kind, every
-    location field carries no userinfo and no token-bearing parameter, for
-    all credentials v in credentials(c): v not in ir(c), and no string
-    anywhere in parse_s(emit_s(c)) equals or contains v
+    location field (the posture's and the imported documents' alike) is of
+    the form scheme://host[:port]/path, for all credentials v in
+    credentials(c): v not in ir(c), and no string anywhere in
+    parse_s(emit_s(c)) equals or contains v
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
@@ -279,6 +289,18 @@ developer running agent boxes; build-infra operator; auditor.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_without_a_pinned_bundle_is_marked_and_diagnosed
     property: ¬pin_records_bundle(d) ⇒ read(d) ∧ unverified(component(d)) ∧ stderr names (component(d), "build-servers#185")
+  - A document that carries any `unverified` component is not evidence:
+    its build facts for those components are whatever the cache's writer
+    put under a correct subject. THE SYSTEM SHALL mark such a document at
+    the top level in every serializer (CycloneDX: a `minimal:verification`
+    property with the value `partial` on the metadata; SPDX: the same
+    annotation on the document; Blueprint: `verification = "partial"`), and
+    the architecture's policy surfaces (Gatehouse admission, `min pkg
+    verify`'s evidence) SHALL NOT accept a `partial` document as evidence;
+    `--require-bundles` is how a reader obtains one that is.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_with_unverified_components_is_marked_partial_at_the_top_level
+    property: (∃k: unverified(k)) ⇔ marked_partial(parse_s(emit_s(c))) for every serializer s
   - THE SYSTEM SHALL emit the `unverified` mark on the component in every
     serializer — CycloneDX: a `minimal:verification` property with the value
     `unverified`; SPDX: an annotation of the same text on the package;
@@ -298,7 +320,11 @@ developer running agent boxes; build-infra operator; auditor.
 
 - **SBOM-014** WHEN `min box list --using <pkg>[@<ver>]` filters boxes THE
   SYSTEM SHALL answer from the component set this spec's composition emits
-  for each box (SBOM-005), so the list and the box's SBOM never disagree.
+  for each box (SBOM-005), so the list and the box's SBOM never disagree;
+  that set is the pinned closure's package list, read from the pin alone,
+  so the list fetches no per-package document and needs no network, and a
+  box whose pinned closure cannot be read is listed with that reason in
+  place of its match, never failing the list for the other boxes.
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_using_answers_from_the_sbom_components
 
@@ -449,6 +475,11 @@ from the spec and stay schema-TODO.
   enforced by: components with no referenced document become declared
   gaps; unfetchable references abort the emission
   covered by: SBOM-011, SBOM-012
+- **Invariant:** THE SYSTEM SHALL never present a document that holds any
+  unverified component as evidence.
+  enforced by: the top-level `partial` mark in every serializer; policy
+  surfaces refuse a `partial` document; `--require-bundles` for evidence
+  covered by: SBOM-013
 - **Invariant:** THE SYSTEM SHALL never attribute a per-package document to
   a component whose closure digest it does not name as its subject.
   enforced by: the bundle check, then the subject check, before any other
