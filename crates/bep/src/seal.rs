@@ -309,8 +309,8 @@ pub enum OpenError {
     /// A bound field differs from the expected binding.
     #[error("the sealed value is bound to a different {0}")]
     ContextMismatch(BoundField),
-    /// The value's expiry ([`BoundField::Expiry`]) is at or before the
-    /// request's clock time.
+    /// The value's expiry ([`BoundField::Expiry`]) or the member's `exp` is
+    /// at or before the request's clock time.
     #[error("the sealed value is past its expiry")]
     Expired,
     /// The plaintext is not a member list of exactly one member.
@@ -385,8 +385,8 @@ fn seal_plaintext(
 /// # Errors
 ///
 /// [`OpenError::ContextMismatch`] names the first of box id, host and module
-/// that differs. [`OpenError::Expired`] says the expiry is at or before
-/// `expected.now`. The other variants say the value is malformed, uses an
+/// that differs. [`OpenError::Expired`] says the value's expiry or the
+/// member's `exp` is at or before `expected.now`. The other variants say the value is malformed, uses an
 /// unsupported algorithm, is sealed to another key or does not decrypt, or
 /// carries no list of exactly one member with a known breadth.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
@@ -460,6 +460,11 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
         default_owner,
     } = MemberList::from_json(&plaintext)?;
     let member = members.pop().ok_or(OpenError::BadMembers)?;
+    // The member carries its own expiry. A member past it is refused here,
+    // so a caller never has to check `member.exp` itself.
+    if expected.now >= member.exp {
+        return Err(OpenError::Expired);
+    }
     Ok(Opened {
         context,
         member,
@@ -922,6 +927,30 @@ mod tests {
         assert!(open(&key, &sealed, &before).is_ok());
         let after = Binding {
             now: context.expiry + 1,
+            ..binding(&context)
+        };
+        assert_eq!(open(&key, &sealed, &after).unwrap_err(), OpenError::Expired);
+    }
+
+    #[test]
+    fn a_member_past_its_own_exp_is_refused() {
+        let key = ProxyKey::generate().unwrap();
+        let context = fixed_context(&key);
+        let early = MemberList {
+            members: vec![Member {
+                exp: context.expiry - 100,
+                ..member(b"ref")
+            }],
+            default_owner: None,
+        };
+        let sealed = seal(&key.public(), &context, &early).unwrap();
+        let before = Binding {
+            now: context.expiry - 101,
+            ..binding(&context)
+        };
+        assert!(open(&key, &sealed, &before).is_ok());
+        let after = Binding {
+            now: context.expiry - 100,
             ..binding(&context)
         };
         assert_eq!(open(&key, &sealed, &after).unwrap_err(), OpenError::Expired);
