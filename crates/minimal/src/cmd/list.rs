@@ -376,10 +376,9 @@ async fn listings_across_vms(
     let mut listings = Vec::new();
     for vm in vms {
         // The selected VM gets the gate `min ls` has always applied
-        // (`connect_daemon`'s); the others are listable ungated, for the same
-        // reason the dashboard lists them ungated — a listing is read-only,
-        // and a skewed VM is precisely one whose boxes an operator still
-        // needs to see.
+        // (`connect_daemon`'s); the others are listable ungated — a listing is
+        // read-only, and a skewed VM is precisely one whose boxes an
+        // operator still needs to see.
         let gate = vm.vm == selected;
         // A VM that is not running hosts no boxes: an absent socket is "no
         // boxes here", not a fault. The selected VM is exempt even so — it is
