@@ -11,5 +11,7 @@
 //! and the current set. A member sealed under an old host-set version still
 //! opens.
 
+pub mod keys;
 pub mod module;
+pub mod publish;
 pub mod seal;
