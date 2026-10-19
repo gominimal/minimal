@@ -1076,18 +1076,6 @@ impl BoxManager {
     /// session, so until then the name of a session `min ls` lists as active
     /// answers NXDOMAIN and the proxy has no route for it.
     ///
-    /// A resumed box with an own address its VM handed it
-    /// (`record.box_addresses`) also gets its host launched, detached from
-    /// this resume and unattached to any client: the host's launch is what
-    /// attaches the box's shuttle, whose lease announcement — a gratuitous
-    /// ARP from the box's address, the one frame an idle box sends — marks
-    /// the box's host-side row carried (minvmd's `BoxTable::carry`), and
-    /// the attach binds its declared ingress forwards — so the box's
-    /// published name keeps answering and its ingress binds without waiting
-    /// for a client's first exec or attach.
-    /// The row a reloaded host registry reinstated awaits this first frame
-    /// under its resume bound, which the VM's cold boot must fit inside.
-    ///
     /// Resuming through [`BoxActor::run`] keeps one registration path, with
     /// its collision rules and its rule never to wait on the range verdict.
     /// It is idempotent: a session already in `running` is skipped, and a
@@ -1163,36 +1151,6 @@ impl BoxManager {
             }
             match BoxActor::run(self.session_config(handle)).await {
                 Ok(session) => {
-                    // An own-address box's host is what carries its shuttle,
-                    // and with the shuttle the row's first frame — the lease
-                    // announcement its attach sends (`net::switch`), the frame
-                    // that stands the reloaded row and binds the declared
-                    // ingress. Launched detached from this resume and never
-                    // attached to a client, so the next attach or exec finds
-                    // it and reuses it, as an exec-minted host is reused.
-                    if matches!(record.network, boxes::NetworkMode::OwnIp)
-                        && record.box_addresses.is_some()
-                    {
-                        let session = session.clone();
-                        let username = record.username.clone().unwrap_or_else(|| "user".into());
-                        crate::traced::spawn_detached(
-                            tracing::info_span!(
-                                parent: None,
-                                "resume_own_ip_host",
-                                session_id = %session_id
-                            ),
-                            async move {
-                                if let Err(error) = session.ensure_host(username).await {
-                                    tracing::warn!(
-                                        %error,
-                                        "resume: could not launch the own-address \
-                                         box's host; its ingress binds at its \
-                                         first exec or attach",
-                                    );
-                                }
-                            },
-                        );
-                    }
                     self.running.insert(session_id, session);
                     resumed += 1;
                 }
