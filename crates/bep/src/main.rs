@@ -3,12 +3,13 @@
 //! At start it loads the proxy's keys from the host keychain and publishes
 //! their public halves (BEP-059, BEP-072). `bep --replace-key <role>` is the
 //! operator's command that replaces a key (BEP-060). It reads no file, so it
-//! works when the proxy itself does not start.
+//! works when the proxy itself does not start. After the replacement it
+//! publishes the new public key, so a mint stops sealing to the old one.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bep::keys::{self, KeyStore, Role};
+use bep::keys::{self, KeyStore, ReplaceError, Role};
 use bep::publish::Identity;
 use clap::Parser;
 
@@ -55,37 +56,62 @@ fn main() -> ExitCode {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn run<S: KeyStore>(store: &S, args: &Args) -> ExitCode {
     if let Some(role) = args.replace_key {
-        return match keys::replace(store, role) {
-            Ok(_) => {
-                println!("{}", keys::replacement_report(role));
+        match keys::replace(store, role) {
+            Ok(_) => println!("{}", keys::replacement_report(role)),
+            Err(ReplaceError::Remove(err)) => {
+                eprintln!("The {role} key was not replaced. The old key is still in use: {err}.");
+                return ExitCode::FAILURE;
+            }
+            Err(ReplaceError::Generate(err)) => {
+                eprintln!(
+                    "The old {role} key was deleted, but no new key was made: {err}. Run `bep --replace-key {role}` again."
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        // The identity file still names the old key. Publish the new one now,
+        // so that a mint never seals to a deleted key.
+        return match publish(store, args) {
+            Ok(path) => {
+                println!("Published the new public key to {}.", path.display());
                 ExitCode::SUCCESS
             }
             Err(err) => {
-                eprintln!("The {role} key was not replaced: {err}.");
+                eprintln!("{err}");
+                eprintln!(
+                    "The published identity still names the old {role} key. Run `bep` to publish the new one."
+                );
                 ExitCode::FAILURE
             }
         };
     }
 
-    let loaded = match keys::load(store) {
-        Ok(loaded) => loaded,
+    match publish(store, args) {
+        Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-    };
-    let Some(path) = args.identity.clone().or_else(default_identity_path) else {
-        eprintln!(
-            "bep did not find your home directory. Give the file with `bep --identity <PATH>`."
-        );
-        return ExitCode::FAILURE;
-    };
-    if let Err(err) = Identity::of(&loaded).publish(&path) {
-        eprintln!("{err}");
-        return ExitCode::FAILURE;
     }
+}
+
+/// Loads the keys and publishes their public halves. Returns the file it
+/// wrote, or the text to print.
+fn publish<S: KeyStore>(store: &S, args: &Args) -> Result<PathBuf, String> {
+    let loaded = keys::load(store).map_err(|err| err.to_string())?;
+    let path = args
+        .identity
+        .clone()
+        .or_else(default_identity_path)
+        .ok_or_else(|| {
+            "bep did not find your home directory. Give the file with `bep --identity <PATH>`."
+                .to_owned()
+        })?;
+    Identity::of(&loaded)
+        .publish(&path)
+        .map_err(|err| err.to_string())?;
     tracing::info!(path = %path.display(), "published the proxy identity");
-    ExitCode::SUCCESS
+    Ok(path)
 }
 
 fn default_identity_path() -> Option<PathBuf> {

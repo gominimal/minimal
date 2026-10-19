@@ -237,10 +237,11 @@ pub fn load<S: KeyStore>(store: &S) -> Result<ProxyKeys<S::Key>, StartError> {
                 tracing::info!(role = %role, fingerprint = %key.public().kid(), "generated a proxy key");
                 found.push(key);
             }
-            Err(err) => {
+            Err(err @ KeyError::Refused { .. }) => {
                 tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
                 refused.push(role);
             }
+            Err(err @ KeyError::Store { .. }) => return Err(StartError::Store(err)),
         }
     }
     if !refused.is_empty() {
@@ -265,18 +266,37 @@ pub fn load<S: KeyStore>(store: &S) -> Result<ProxyKeys<S::Key>, StartError> {
     })
 }
 
+/// Why [`replace`] did not replace a key.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReplaceError {
+    /// The old key was not removed, so the store still holds it.
+    #[error("{0}")]
+    Remove(KeyError),
+    /// The old key was removed, and no new key was generated.
+    #[error("{0}")]
+    Generate(KeyError),
+}
+
 /// Replaces the key held for `role`: the operator's command (BEP-060).
 ///
 /// The old key is removed before the new key is generated, so no value
-/// sealed to an old sealing key opens after this returns.
+/// sealed to an old sealing key opens after this returns. The store holds
+/// one key under a role's label, so the new key cannot be generated first.
 ///
 /// # Errors
 ///
-/// [`KeyError`] when the store does not remove the old key or generate the
-/// new one.
-pub fn replace<S: KeyStore>(store: &S, role: Role) -> Result<S::Key, KeyError> {
-    store.remove(role)?;
-    let key = store.generate(role)?;
+/// [`ReplaceError::Remove`] when the store keeps the old key, and
+/// [`ReplaceError::Generate`] when the old key is gone and no new key was
+/// generated.
+pub fn replace<S: KeyStore>(store: &S, role: Role) -> Result<S::Key, ReplaceError> {
+    store.remove(role).map_err(ReplaceError::Remove)?;
+    let key = match store.generate(role) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(role = %role, error = %err, "removed a proxy key and generated no new key");
+            return Err(ReplaceError::Generate(err));
+        }
+    };
     tracing::warn!(role = %role, fingerprint = %key.public().kid(), "replaced a proxy key");
     Ok(key)
 }
@@ -328,6 +348,10 @@ mod keychain {
         // `security-framework-sys` does not declare this attribute.
         static kSecAttrIsExtractable: CFStringRef;
     }
+
+    /// The search codes that mean the keychain denies this program the key:
+    /// `errSecAuthFailed`, `errSecNoAccessForItem` and `errSecUserCanceled`.
+    const DENIED: [i32; 3] = [-25293, -25243, -128];
 
     /// The login keychain.
     #[derive(Debug, Default, Clone, Copy)]
@@ -454,15 +478,26 @@ mod keychain {
                 .search();
             match found {
                 Err(err) if err.code() == errSecItemNotFound => Ok(None),
-                Err(err) => Err(refused(role, err)),
-                Ok(results) => results
-                    .into_iter()
-                    .find_map(|result| match result {
-                        SearchResult::Ref(Reference::Key(key)) => Some(key),
-                        _ => None,
-                    })
-                    .map(|key| KeychainKey::new(role, key))
-                    .transpose(),
+                // Only a real access denial is a refused key. A locked
+                // keychain or a session with no UI is not, and the
+                // replacement advice would delete a healthy key.
+                Err(err) if DENIED.contains(&err.code()) => Err(refused(role, err)),
+                Err(err) => Err(KeyError::Store {
+                    role,
+                    detail: err.to_string(),
+                }),
+                Ok(results) => match results.into_iter().next() {
+                    None => Ok(None),
+                    Some(SearchResult::Ref(Reference::Key(key))) => {
+                        KeychainKey::new(role, key).map(Some)
+                    }
+                    // An item holds the label, so never generate a second
+                    // key beside it.
+                    Some(_) => Err(KeyError::Store {
+                        role,
+                        detail: "the keychain item under the key's label is not a key".to_owned(),
+                    }),
+                },
             }
         }
 
@@ -549,6 +584,7 @@ pub(crate) mod memory {
         keys: HashMap<Role, SecretKey>,
         refused: HashSet<Role>,
         generated: usize,
+        broken: bool,
     }
 
     #[derive(Default)]
@@ -563,6 +599,12 @@ pub(crate) mod memory {
     impl MemoryStore {
         pub(crate) fn refuse(&self, role: Role) {
             self.0.lock().unwrap().refused.insert(role);
+        }
+
+        /// Makes the store fail every search and generation, as a locked
+        /// keychain does.
+        pub(crate) fn break_store(&self) {
+            self.0.lock().unwrap().broken = true;
         }
 
         pub(crate) fn generated(&self) -> usize {
@@ -624,11 +666,21 @@ pub(crate) mod memory {
         }
     }
 
+    fn broken(role: Role) -> KeyError {
+        KeyError::Store {
+            role,
+            detail: "the keychain is locked".into(),
+        }
+    }
+
     impl KeyStore for MemoryStore {
         type Key = MemoryKey;
 
         fn find(&self, role: Role) -> Result<Option<MemoryKey>, KeyError> {
             let inner = self.0.lock().unwrap();
+            if inner.broken {
+                return Err(broken(role));
+            }
             Ok(inner.keys.get(&role).map(|secret| MemoryKey {
                 role,
                 secret: secret.clone(),
@@ -637,6 +689,9 @@ pub(crate) mod memory {
         }
 
         fn generate(&self, role: Role) -> Result<MemoryKey, KeyError> {
+            if self.0.lock().unwrap().broken {
+                return Err(broken(role));
+            }
             let secret = loop {
                 let mut bytes = Zeroizing::new([0u8; 32]);
                 getrandom::fill(bytes.as_mut()).expect("random source");
@@ -715,6 +770,28 @@ mod tests {
         replace(&store, "sealing".parse().unwrap()).unwrap();
         replace(&store, "signing".parse().unwrap()).unwrap();
         assert!(load(&store).is_ok());
+    }
+
+    #[test]
+    fn a_store_failure_is_not_a_refused_key() {
+        let store = MemoryStore::default();
+        drop(load(&store).unwrap());
+        store.break_store();
+
+        let err = load(&store).unwrap_err();
+        assert!(matches!(err, StartError::Store(_)), "{err}");
+        assert!(!err.to_string().contains("--replace-key"), "{err}");
+        assert_eq!(store.generated(), 3);
+    }
+
+    #[test]
+    fn a_failed_generation_reports_the_old_key_removed() {
+        let store = MemoryStore::default();
+        drop(load(&store).unwrap());
+        store.break_store();
+
+        let err = replace(&store, Role::Sealing).unwrap_err();
+        assert!(matches!(err, ReplaceError::Generate(_)), "{err}");
     }
 
     #[test]

@@ -63,6 +63,12 @@ pub enum PublishError {
         "The proxy's published identity has no usable {0} key. Start `bep` to publish it again."
     )]
     NotAKey(Role),
+    /// Users other than the file's owner can change it, so it can name a
+    /// key that is not the proxy's.
+    #[error(
+        "The proxy's published identity at {0} can be changed by other users. Start `bep` to publish it again."
+    )]
+    Writable(PathBuf),
     /// The file is not a published identity.
     #[error("The proxy's published identity at {0} is not valid JSON.")]
     Malformed(PathBuf),
@@ -119,6 +125,10 @@ impl Identity {
 
     /// Writes the identity to `path`, replacing the file whole.
     ///
+    /// The file decides which key a mint seals to, so only its owner can
+    /// change it. A new directory is created mode 0700 and the file is mode
+    /// 0600. The staged file is created new, so it never follows a link.
+    ///
     /// # Errors
     ///
     /// [`PublishError::Io`] when the file is not written.
@@ -127,12 +137,28 @@ impl Identity {
             path: path.to_owned(),
             source,
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).map_err(io)?;
         }
         let json = serde_json::to_vec_pretty(self).map_err(|err| io(err.into()))?;
         let staged = path.with_extension("json.new");
-        std::fs::write(&staged, json).map_err(io)?;
+        // A staged file left by a stopped write, or a link put in its place.
+        match std::fs::remove_file(&staged) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io(err)),
+            _ => {}
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&staged).map_err(io)?;
+        io::Write::write_all(&mut file, &json).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
         std::fs::rename(&staged, path).map_err(io)
     }
 
@@ -140,13 +166,26 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// [`PublishError::Io`] when the file is not read, and
-    /// [`PublishError::Malformed`] when it is not a published identity.
+    /// [`PublishError::Io`] when the file is not read,
+    /// [`PublishError::Writable`] when users other than its owner can change
+    /// it, and [`PublishError::Malformed`] when it is not a published
+    /// identity.
     pub fn read(path: &Path) -> Result<Self, PublishError> {
-        let bytes = std::fs::read(path).map_err(|source| PublishError::Io {
+        let io = |source| PublishError::Io {
             path: path.to_owned(),
             source,
-        })?;
+        };
+        let mut file = std::fs::File::open(path).map_err(io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = file.metadata().map_err(io)?.permissions().mode();
+            if mode & 0o022 != 0 {
+                return Err(PublishError::Writable(path.to_owned()));
+            }
+        }
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut file, &mut bytes).map_err(io)?;
         serde_json::from_slice(&bytes).map_err(|_| PublishError::Malformed(path.to_owned()))
     }
 
@@ -288,6 +327,40 @@ mod tests {
         let opened = keys.sealing.open(&sealed, &binding()).unwrap();
         assert_eq!(opened.member.jws.as_str(), "signed.handle.jws");
         assert_eq!(opened.context.kid, keys.sealing.public().kid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_identity_file_is_the_owners_alone() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let keys = load(&MemoryStore::default()).unwrap();
+        let identity = Identity::of(&keys);
+        // A link in place of the staged file is not followed.
+        std::fs::create_dir(dir.path().join("bep")).unwrap();
+        let target = dir.path().join("elsewhere");
+        symlink(&target, path.with_extension("json.new")).unwrap();
+        identity.publish(&path).unwrap();
+        assert!(!target.exists());
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(Identity::read(&path).unwrap(), identity);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(
+            Identity::read(&path),
+            Err(PublishError::Writable(_))
+        ));
+        // Publishing again repairs it.
+        identity.publish(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        let fresh = dir.path().join("new/dir/identity.json");
+        identity.publish(&fresh).unwrap();
+        assert_eq!(mode(fresh.parent().unwrap()), 0o700);
     }
 
     // BEP-072
