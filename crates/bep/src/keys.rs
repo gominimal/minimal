@@ -283,14 +283,21 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
     // Generate only after every role is known to be usable, so a start that
     // refuses leaves the store as it was.
     let mut keys = Vec::with_capacity(found.len());
+    let mut generated = Vec::new();
     for (role, key) in found {
         let key = match key {
             Some(key) => key,
-            None => {
-                let key = store.generate(role).map_err(StartError::Store)?;
-                tracing::info!(role = %role, fingerprint = %key.public().kid(), "generated a proxy key");
-                key
-            }
+            None => match store.generate(role) {
+                Ok(key) => {
+                    tracing::info!(role = %role, fingerprint = %key.public().kid(), "generated a proxy key");
+                    generated.push(role);
+                    key
+                }
+                Err(err) => {
+                    roll_back(store, &generated);
+                    return Err(StartError::Store(err));
+                }
+            },
         };
         keys.push(key);
     }
@@ -322,6 +329,22 @@ pub enum ReplaceError {
     /// The old key was removed, and no new key was generated.
     #[error("{0}")]
     Generate(KeyError),
+}
+
+/// Removes the keys that a failed first start generated. The next start
+/// then finds no key, and is a first start again. Without this, it finds
+/// some roles and not others, and refuses them as lost keys.
+fn roll_back<S: KeyStore>(store: &S, generated: &[Role]) {
+    for role in generated {
+        match store.remove(*role) {
+            Ok(()) => {
+                tracing::warn!(role = %role, "removed a proxy key that a failed first start generated")
+            }
+            Err(err) => {
+                tracing::error!(role = %role, error = %err, "did not remove a proxy key that a failed first start generated")
+            }
+        }
+    }
 }
 
 /// Replaces the key held for `role`: the operator's command (BEP-060).
@@ -654,6 +677,7 @@ pub(crate) mod memory {
         generated: usize,
         broken: bool,
         no_generation: bool,
+        no_generation_of: Option<Role>,
         locked_use: bool,
     }
 
@@ -681,6 +705,17 @@ pub(crate) mod memory {
         /// Makes every later generation fail, while searches still work.
         pub(crate) fn fail_generation(&self) {
             self.0.lock().unwrap().no_generation = true;
+        }
+
+        /// Makes every later generation for `role` fail, while the other
+        /// roles still generate.
+        pub(crate) fn fail_generation_of(&self, role: Role) {
+            self.0.lock().unwrap().no_generation_of = Some(role);
+        }
+
+        /// Lets every role generate again.
+        pub(crate) fn clear_generation_failure(&self) {
+            self.0.lock().unwrap().no_generation_of = None;
         }
 
         /// Makes every later use of a found key fail as a locked keychain
@@ -781,7 +816,7 @@ pub(crate) mod memory {
 
         fn generate(&self, role: Role) -> Result<MemoryKey, KeyError> {
             let inner = self.0.lock().unwrap();
-            if inner.broken || inner.no_generation {
+            if inner.broken || inner.no_generation || inner.no_generation_of == Some(role) {
                 return Err(broken(role));
             }
             drop(inner);
@@ -979,6 +1014,25 @@ mod tests {
         assert!(matches!(err, StartError::Store(_)), "{err}");
         assert!(!err.to_string().contains("--replace-key"), "{err}");
         assert_eq!(store.generated(), 3);
+    }
+
+    // BEP-060: a first start that generates one key and fails on the next
+    // leaves no key, so the next start is a first start and not a lost key.
+    #[test]
+    fn keys_never_regenerated_on_restart_after_a_failed_first_start() {
+        let store = MemoryStore::default();
+        store.fail_generation_of(Role::Root);
+        let err = load(&store, &[]).unwrap_err();
+        assert!(matches!(err, StartError::Store(_)), "{err}");
+        for role in Role::ALL {
+            assert!(store.find(role).unwrap().is_none(), "{role}");
+        }
+
+        store.clear_generation_failure();
+        let keys = load(&store, &[]).unwrap();
+        for role in Role::ALL {
+            assert_eq!(keys.get(role).role(), role);
+        }
     }
 
     #[test]
