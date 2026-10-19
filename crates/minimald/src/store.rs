@@ -396,6 +396,8 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             attrs: Default::default(),
         }
     }

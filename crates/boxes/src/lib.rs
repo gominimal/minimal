@@ -1256,6 +1256,17 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bound_ports: BTreeSet<SocketAddrV4>,
 
+    /// Set on a box minted for a single `min task run` before the run's
+    /// task starts, so the box dies with its run even if the daemon that
+    /// accepted it does not (NET-131): a restart's resume destroys a
+    /// marked box instead of bringing it back, which is the same teardown
+    /// a finished run's own box-end takes. Daemon-owned, like
+    /// [`Self::host_ip_enforcement`]: only the run-accepting daemon
+    /// writes it, and only the resume reads it. Defaults to `false` for
+    /// every record that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
@@ -1483,6 +1494,8 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             attrs: BTreeMap::new(),
         }
     }
@@ -1519,6 +1532,38 @@ mod tests {
         }"#;
         let r: Record = serde_json_lenient::from_str(json).expect("record must load");
         assert!(!r.hooks_enabled);
+    }
+
+    /// A record written before `ends_with_run` existed loads unmarked:
+    /// the run-owned teardown must not claim a pre-existing session's
+    /// box, so an absent field reads as `false`, never as `true`.
+    #[test]
+    fn record_predating_ends_with_run_defaults_to_plain() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("legacy record must still load");
+        assert!(!r.ends_with_run);
+    }
+
+    /// An explicit `ends_with_run: true` survives deserialization rather
+    /// than being dropped by the default.
+    #[test]
+    fn record_honours_explicit_ends_with_run() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "ends_with_run": true,
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("record must load");
+        assert!(r.ends_with_run);
     }
 
     /// NET-134: the session policy gains a box's declaration of a
