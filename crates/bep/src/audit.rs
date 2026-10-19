@@ -10,7 +10,8 @@
 //! caller from putting a secret in one. The proxy fills them from the box
 //! id, the request authority and the module's mapping, and never from a
 //! sealed value or a header. A charset or length check cannot tell a token
-//! from an identifier, so this module does not try.
+//! from an identifier, so this module does not try. It does cut each field
+//! to [`MAX_FIELD_BYTES`], so no one field can make a record large.
 //!
 //! Each record carries `previous_hash`: the lowercase hex SHA-256 of the
 //! previous record's line, as UTF-8 JSON bytes without the trailing newline.
@@ -43,6 +44,20 @@ pub const NONE: &str = "none";
 
 /// The resource and permission a record carries when the module maps none.
 pub const MODULE_UNMAPPED: &str = "module_unmapped";
+
+/// The most bytes a record keeps of one string field. A longer value is
+/// cut at a character boundary, so a box that controls the request
+/// authority cannot make one record arbitrarily large.
+pub const MAX_FIELD_BYTES: usize = 512;
+
+/// `value`, cut to at most [`MAX_FIELD_BYTES`] at a character boundary.
+fn bounded(value: &str) -> String {
+    let mut end = value.len().min(MAX_FIELD_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
 
 /// The `previous_hash` of the first record of a log.
 pub const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -140,24 +155,24 @@ impl Record {
             Mapping::Mapped {
                 resource,
                 permission,
-            } => (resource.clone(), permission.clone()),
+            } => (bounded(resource), bounded(permission)),
             Mapping::ModuleUnmapped => (MODULE_UNMAPPED.to_owned(), MODULE_UNMAPPED.to_owned()),
         };
         Self {
             schema: SCHEMA.to_owned(),
             kind: decision.kind,
-            subject: decision.box_id.clone(),
+            subject: bounded(&decision.box_id),
             act: String::new(),
             txn: String::new(),
-            upstream: decision.authority.clone(),
+            upstream: bounded(&decision.authority),
             identifier: decision
                 .identifier
-                .clone()
-                .unwrap_or_else(|| NONE.to_owned()),
+                .as_deref()
+                .map_or_else(|| NONE.to_owned(), bounded),
             resource,
             permission,
             decision: decision.outcome,
-            marker: decision.marker.clone(),
+            marker: decision.marker.as_deref().map(bounded),
             previous_hash: previous_hash.to_owned(),
         }
     }
@@ -245,6 +260,26 @@ impl AuditLog {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        // Refused before the open as well, so a symlink's target is never
+        // created and a FIFO never blocks the open. The check after the
+        // open still catches an entry swapped in between the two.
+        match fs::symlink_metadata(&path) {
+            Ok(entry) if entry.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("audit log {} is a symlink", path.display()),
+                ));
+            }
+            Ok(entry) if !entry.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("audit log {} is not a regular file", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
         let mut options = OpenOptions::new();
         options.append(true).create(true);
@@ -434,6 +469,17 @@ mod tests {
         assert_eq!(first["decision"], "admit");
         assert!(first["marker"].is_null());
 
+        // A long free-text field is cut to its bound at a char boundary.
+        let long = Decision {
+            authority: "é".repeat(MAX_FIELD_BYTES),
+            identifier: Some("x".repeat(MAX_FIELD_BYTES * 4)),
+            ..admit()
+        };
+        let record = Record::from_decision(&long, ZERO_HASH);
+        assert_eq!(record.upstream.len(), MAX_FIELD_BYTES);
+        assert!(record.upstream.chars().all(|c| c == 'é'));
+        assert_eq!(record.identifier.len(), MAX_FIELD_BYTES);
+
         let second: serde_json::Value = serde_json::from_str(&written[1]).unwrap();
         assert_eq!(second["upstream"], "example.com:443");
         assert_eq!(second["identifier"], "none");
@@ -604,6 +650,20 @@ mod tests {
             let err = AuditLog::open(&link).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+
+            // A dangling symlink is refused, and its target is not created.
+            let missing = dir.0.join("missing");
+            let dangling = dir.0.join("state").join("dangling.jsonl");
+            std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+            let err = AuditLog::open(&dangling).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(!missing.exists(), "open created the symlink's target");
+
+            // A directory at the path is not a regular file.
+            let not_file = dir.0.join("state").join("dir.jsonl");
+            fs::create_dir(&not_file).unwrap();
+            let err = AuditLog::open(&not_file).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
     }
 
