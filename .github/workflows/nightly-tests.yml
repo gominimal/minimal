@@ -452,98 +452,14 @@ jobs:
     uses: ./.github/workflows/ci-macos.yml
 
   metrics:
-    # Architectural-health snapshot (docs/specs/30-spec-quality-metrics): `just
-    # metrics` runs every collector, the dashboard renders from the history,
-    # both ship as the `metrics` artifact, the snapshot's summary.md lands on
-    # the run's summary page, and the snapshot is pushed to the
-    # orphan `metrics-data` branch, never to main (AGENTS.md: nothing commits
-    # to main outside a reviewed PR; the gate reads its baseline from that
-    # ref). Non-blocking while it beds in: read it in the run, promote into
-    # `notify` like the stress step once a week of snapshots says it is quiet.
-    runs-on: ubuntu-latest
-    # Coverage is a cold instrumented workspace build plus the suite; the
-    # module graphs load every crate through rust-analyzer; mutants test one
-    # shard. The spec's bound (QM-N02) is this value.
-    timeout-minutes: 120
-    continue-on-error: true
+    # Architectural-health snapshot, defined in metrics.yml so it can also be
+    # dispatched alone. Non-blocking: its job is continue-on-error inside the
+    # called workflow, and `notify` does not need it.
     permissions:
-      # Pushing to metrics-data. The publish script's refspec names that
-      # branch on both sides, so this cannot reach main.
+      # Pushing to metrics-data; a called workflow cannot hold a permission
+      # its caller withheld.
       contents: write
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      # The mutation run's share of the job: coverage is a cold instrumented
-      # build of the workspace and the module graphs load every crate, so
-      # the rest of the budget is theirs.
-      MINIMAL_METRICS_MUTANTS_BUDGET_SECS: "1500"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # The publish step pushes with the job token; hotspots walk the
-          # history, so no shallow clone.
-          persist-credentials: true
-          fetch-depth: 0
-      - name: Setup Rust (protoc + cache)
-        uses: ./.github/actions/setup-rust
-        with:
-          # Clippy here runs with lint flags `just clippy` never passes and
-          # coverage builds instrumented, so nothing in this job shares an
-          # artifact with another job class.
-          shared-key: metrics
-      - name: Install just and cargo-binstall
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: just,cargo-binstall
-      - name: Install llvm-tools-preview
-        run: rustup component add llvm-tools-preview
-      - name: Install the pinned metrics tools
-        run: just metrics-tools
-      - name: Install the experimental tools (best effort)
-        # rustqual and cargo-anatomy compile from crates.io (no prebuilt
-        # binaries); a failed install leaves their blocks not measured, which
-        # the snapshot says, rather than failing the run.
-        run: scripts/metrics/install-tools.sh --experimental || echo "experimental tools not installed; recorded as not measured"
-      - name: Fetch the snapshot history
-        # Missing on the first run; the dashboard then renders this run alone.
-        run: |
-          set -euo pipefail
-          mkdir -p .scratch/metrics/history
-          if git fetch --quiet origin metrics-data; then
-            git --work-tree=.scratch/metrics checkout FETCH_HEAD -- history
-            git reset --quiet -- history
-          fi
-      - name: Snapshot
-        # Exit 2 is a failed gate and 3 an incomplete snapshot; both still
-        # write the file, and both are worth the artifact. Anything else is
-        # the job failing.
-        run: |
-          set -euo pipefail
-          status=0
-          just metrics full || status=$?
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          case "$status" in 0|2|3) ;; *) exit "$status" ;; esac
-        id: snapshot
-      - name: Dashboard
-        if: always()
-        run: |
-          set -euo pipefail
-          cp .scratch/metrics/full/snapshot.json ".scratch/metrics/history/$(date -u +%Y-%m-%d)-$(git rev-parse --short=7 HEAD).json"
-          just metrics-dashboard
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: always()
-        with:
-          name: metrics
-          path: |
-            .scratch/metrics/full/
-            .scratch/metrics/dashboard/
-          if-no-files-found: error
-          retention-days: 30
-      - name: Publish the snapshot to metrics-data
-        # Scheduled and manual runs on main only; a complete snapshot only
-        # (exit 3 says a collector did not run, and a history with holes in it
-        # ratchets against nothing).
-        if: github.ref == 'refs/heads/main' && steps.snapshot.outputs.status != '3'
-        run: scripts/metrics/publish-snapshot.sh .scratch/metrics/full/snapshot.json
+    uses: ./.github/workflows/metrics.yml
 
   notify:
     # File (or update) a tracking issue when a BLOCKING nightly job fails, so

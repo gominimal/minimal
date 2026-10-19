@@ -362,7 +362,8 @@ Nightly failures should notify (issue-on-failure or Slack), not just rot in the 
 - **Hygiene** — the `hygiene` job (`continue-on-error`); `zizmor`'s pin policy and the
   documented finding ignores live in `.github/zizmor.yml`, `actionlint`'s runner-label
   allowlist in `.github/actionlint.yaml`.
-- **Quality metrics** — the `metrics` job (`continue-on-error`) runs `just metrics`, renders
+- **Quality metrics** — the `metrics` job (`continue-on-error`), defined in `metrics.yml`
+  so it can also be dispatched alone, runs `just metrics`, renders
   the dashboard, uploads both as the `metrics` artifact, and pushes the snapshot to the
   orphan `metrics-data` branch with `scripts/metrics/publish-snapshot.sh`; it never writes
   to main. `metrics/README.md` describes the snapshot and the gates.

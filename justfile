@@ -337,7 +337,7 @@ clippy-strict BASE="":
 # graphs), `static` does not. On macOS the compiling collectors take the darwin
 # crate pair and the snapshot is marked darwin. Exit 2 is a failed gate, 3 an
 # incomplete snapshot; neither reads as clean.
-# CI: nightly-tests.yml `metrics` (proposed; see docs/ci-strategy.md §6).
+# CI: metrics.yml, dispatched alone or called by nightly-tests.yml (see docs/ci-strategy.md §6).
 #
 # Install the metrics tools at their pinned versions (scripts/metrics/install-tools.sh).
 metrics-tools:

@@ -322,8 +322,9 @@ history for the harness lives under `scripts/metrics/testdata/history/`.
 
 ## The nightly run
 
-The `metrics` job in `.github/workflows/nightly-tests.yml` runs `just
-metrics`, renders the dashboard from the fetched history plus the new
+The `metrics` job in `.github/workflows/metrics.yml` runs every night,
+called by `nightly-tests.yml`, and on demand by dispatching `metrics.yml`
+alone. It runs `just metrics`, renders the dashboard from the fetched history plus the new
 snapshot, uploads both as the `metrics` artifact, and on main hands the
 snapshot to `scripts/metrics/publish-snapshot.sh`. That script fetches the
 `metrics-data` branch (creating it as an orphan the first time), adds
