@@ -2189,10 +2189,6 @@ impl BoxActor {
                 let _ = r.send(());
             }
             BoxMessage::Destroy(r) => {
-                // Cancelled before anything the destroy does: a command the
-                // destroy ends must be able to see why it stopped (the host
-                // teardown below is what ends it), so the token is set first.
-                self.destroying.cancel();
                 // Before `stop_running`: a destroy hook runs *inside* the
                 // session, so the sandbox it joins has to still exist — or
                 // be minted, which is what this does when the session's
@@ -2213,6 +2209,12 @@ impl BoxActor {
                         line
                     })
                     .collect();
+                // Cancelled immediately before `stop_running`, which is what
+                // ends the session's commands, so a command that ends there
+                // can see why. Not before the hooks: they can take seconds,
+                // and a command that finishes on its own meanwhile was not
+                // stopped by the destroy.
+                self.destroying.cancel();
                 self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
@@ -5844,8 +5846,8 @@ impl BoxHandle {
         WeakBoxHandle(self.0.downgrade(), self.1.clone())
     }
 
-    /// Whether this session is being destroyed: set before the destroy
-    /// stops the host, so a command the destroy ends can still see why
+    /// Whether this session is being destroyed: set after the destroy
+    /// hooks and immediately before the destroy stops the host, so a command the destroy ends can still see why
     /// when it returns.
     #[must_use]
     pub fn is_destroying(&self) -> bool {

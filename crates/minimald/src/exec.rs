@@ -60,6 +60,11 @@ use crate::{
 pub trait Exec: Send + 'static {
     type Process: Process;
 
+    /// Whether a destroy of the box ends this exec's process. True for a
+    /// process inside the box, which the destroy's host teardown stops.
+    /// False for a process on the daemon's host, which outlives it.
+    const ENDED_BY_BOX_DESTROY: bool = true;
+
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>>;
 }
 
@@ -806,6 +811,10 @@ pub struct TokioExec {
 impl Exec for TokioExec {
     type Process = TokioProcess;
 
+    // The process runs on the daemon's host, not in the box, so the
+    // destroy's host teardown does not stop it.
+    const ENDED_BY_BOX_DESTROY: bool = false;
+
     fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
@@ -1085,7 +1094,7 @@ impl<S: Exec> ExecTask<S> {
             || {
                 if mngr.is_shutting_down() {
                     Some(SHUTDOWN_NOTICE)
-                } else if self.session.is_destroying() {
+                } else if S::ENDED_BY_BOX_DESTROY && self.session.is_destroying() {
                     Some(DESTROYED_NOTICE)
                 } else {
                     None
@@ -1115,10 +1124,20 @@ const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stop
 /// bare 137 with nothing on the wire to explain it.
 const DESTROYED_NOTICE: &[u8] = b"the session was destroyed; the command was stopped\n";
 
-/// Runs [`bridge`] and, when the caller's reason closure names one, writes
-/// that notice to `e` before returning the exit status.
+/// The lowest exit status that is kill-shaped: `128 + signo` is how a
+/// signal-terminated command reports, in the shell convention.
+const KILLED_STATUS_MIN: u32 = 128;
+
+/// Runs [`bridge`] and, when the command ended with a kill-shaped status
+/// and the caller's reason closure names a reason, writes that notice to
+/// `e` before returning the exit status.
 ///
-/// `notice` is asked once the bridge returns. The caller decides the
+/// A kill-shaped status is 128 or more: the shell convention for a signal
+/// (`128 + signo`). A command that exits on its own with a lower status
+/// during a shutdown or a destroy was not stopped, so it gets no notice.
+///
+/// `notice` is asked once the bridge returns, and only for a kill-shaped
+/// status. The caller decides the
 /// reason — a daemon shutdown or the session's destroy — by checking the
 /// sessions manager's shutdown state, which is set before the manager stops
 /// any box, and the session handle's destroy state, which is set before the
@@ -1140,7 +1159,9 @@ where
     E: AsyncWrite + Unpin,
 {
     let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
-    if let Some(notice) = notice() {
+    if exit_status >= KILLED_STATUS_MIN
+        && let Some(notice) = notice()
+    {
         let _ = e.write_all(notice).await;
     }
     exit_status
@@ -3869,6 +3890,75 @@ mod tests {
                 err,
                 expected,
                 "destroying: {destroying}; stderr was {:?}",
+                String::from_utf8_lossy(&err),
+            );
+        }
+    }
+
+    /// A command that exits on its own during a shutdown or a destroy was
+    /// not stopped by it, so it gets no notice: only a kill-shaped status
+    /// (128 or more) does. Its own status still passes through.
+    #[tokio::test]
+    async fn an_exec_that_exits_on_its_own_gets_no_notice() {
+        for (status, noticed) in [
+            (0, false),
+            (1, false),
+            (127, false),
+            (128, true),
+            (143, true),
+        ] {
+            let (
+                process,
+                MockEndpoints {
+                    stdin_reader: _stdin_reader,
+                    stdout_writer,
+                    mut stderr_writer,
+                    ctrl,
+                },
+            ) = build_mock();
+
+            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+            drop(closed_stdin_w);
+            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+            let bridge_task = crate::traced::spawn(async move {
+                let exit = bridge_noting_reason(
+                    "test",
+                    process,
+                    &mut bridge_stdin,
+                    &mut bridge_stdout,
+                    &mut bridge_stderr,
+                    client_lost(),
+                    || Some(DESTROYED_NOTICE),
+                )
+                .await;
+                (exit, bridge_stderr)
+            });
+
+            stderr_writer.write_all(b"err!").await.unwrap();
+            drop(stderr_writer);
+            drop(stdout_writer);
+            ctrl.signal_exit(status).await;
+
+            let (exit, bridge_stderr) = bridge_task.await.unwrap();
+            assert_eq!(
+                exit, status as u32,
+                "the command's own status passes through"
+            );
+            drop(bridge_stderr);
+
+            let mut err = Vec::new();
+            client_stderr.read_to_end(&mut err).await.unwrap();
+            let expected: &[u8] = if noticed {
+                b"err!the session was destroyed; the command was stopped\n"
+            } else {
+                b"err!"
+            };
+            assert_eq!(
+                err,
+                expected,
+                "status: {status}; stderr was {:?}",
                 String::from_utf8_lossy(&err),
             );
         }
