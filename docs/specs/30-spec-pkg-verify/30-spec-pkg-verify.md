@@ -184,7 +184,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - IF the artifact's Build Spec Hash is not in the verified index THEN THE SYSTEM SHALL treat it as a cache miss and build locally, as today, raising no verify error.
     tier:   T0
     verify: cargo nextest run -p rcache materialize_miss_builds_locally_under_verification
-  - THE SYSTEM SHALL cache the index-bundle result per registry pin for the client's lifetime and SHALL not cache per-artifact results.
+  - THE SYSTEM SHALL cache the index-bundle result per registry pin only while the Sigstore trust-root metadata it was verified under is unexpired (PKV-021), re-running the index check at the next materialization after that, and SHALL not cache per-artifact results. The Box Host is long-lived, so a cache bounded by its lifetime would freeze a freshness verdict past the metadata's expiry.
     tier:   T0
     verify: cargo nextest run -p rcache materialize_caches_index_result_not_artifact_results
   - IF verification is disabled for a source THEN THE SYSTEM SHALL check only the hash against the index for artifacts from that source, as today, and SHALL mark them `unverified`; verification of every other source is unchanged.
@@ -199,6 +199,10 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   tier:     T0
   verify:   cargo nextest run -p minimal verify_default_on_per_source_off_doctor_reports
 
+- **PKV-020** THE SYSTEM SHALL document, per artifact type, the object names, the trust-root entries and the exact `cosign` or verifier command that reproduces each check, with a worked example on a live commit, and SHALL ship those commands as a `scripts/` entry with a `justfile` recipe that the nightly lane discovers by convention (`.github/workflows/` is frozen here); the daily run against the registry head lives beside the producer's `verify-signing` job in gominimal/build-servers.
+  tier:     T0
+  verify:   cargo nextest run -p verify docs_commands_match_scripts
+
 - **PKV-021** THE SYSTEM SHALL take the Fulcio, Rekor and TSA keys from Sigstore's TUF-distributed trust root, bootstrapped by the TUF root metadata vendored into the `min` release: WHEN the TUF repository is reachable THE SYSTEM SHALL update its metadata under the TUF client rules before verifying, and WHEN it is not THE SYSTEM SHALL use the last metadata it verified while that metadata has not expired, reporting the time of the last update as `detail` on the `index` check.
   tier:     T1
   verify:   cargo nextest run -p verify sigstore_trust_root_tuf_update_and_offline_use
@@ -206,10 +210,6 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - IF the TUF metadata cannot be updated and the last verified metadata has expired THEN THE SYSTEM SHALL exit 6 with `index: sigstore trust root expired` and the expiry time.
     tier:   T0
     verify: cargo nextest run -p verify sigstore_trust_root_expired_offline_exits_6
-
-- **PKV-020** THE SYSTEM SHALL document, per artifact type, the object names, the trust-root entries and the exact `cosign` or verifier command that reproduces each check, with a worked example on a live commit, and SHALL ship those commands as a `scripts/` entry with a `justfile` recipe that the nightly lane discovers by convention (`.github/workflows/` is frozen here); the daily run against the registry head lives beside the producer's `verify-signing` job in gominimal/build-servers.
-  tier:     T0
-  verify:   cargo nextest run -p verify docs_commands_match_scripts
 
 ## Non-goals
 
