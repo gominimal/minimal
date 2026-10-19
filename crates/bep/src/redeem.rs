@@ -21,13 +21,15 @@
 //!    in the `host_ip` cohort passes only when the named box is a live
 //!    `host_ip` box of this host. The admission then says
 //!    [`Attributed::Cohort`], and the audit records it `cohort_attributed`.
+//!    A value that [`crate::seal::open`] refuses as bound to another box id
+//!    is [`Unsealed::OtherBox`], and this check refuses it too.
 //!
 //! The other redemption checks (host sets, egress, request authority,
 //! expiry and revocation) are not in this module yet.
 
 use std::fmt;
 
-use crate::seal::{Breadth, Mode, OpenError, Opened};
+use crate::seal::{BoundField, Breadth, Mode, OpenError, Opened};
 
 /// What the shell found when it opened the sealed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,12 @@ pub enum Unsealed<B> {
     /// proxy does not recognise. [`crate::seal::open`] reports this without
     /// the value's context, so no box id comes with it.
     Unbounded,
+    /// The value decrypted, but it names a box other than the one the shell
+    /// bound the open to. [`crate::seal::open`] reports this as
+    /// [`OpenError::ContextMismatch`] with [`BoundField::BoxId`], before it
+    /// reads the member, so no bounds come with it. [`decide`] refuses it
+    /// at the attribution check (BEP-020).
+    OtherBox,
     /// The value decrypted.
     Opened {
         /// The box the value names.
@@ -55,7 +63,15 @@ impl Unsealed<String> {
     /// another key, or one that does not decrypt, gives
     /// [`Unsealed::Undecryptable`]. A member with a missing or unknown
     /// breadth gives [`Unsealed::Unbounded`], so [`decide`] refuses it as
-    /// [`Check::UnboundedMember`].
+    /// [`Check::UnboundedMember`]. A value bound to another box id gives
+    /// [`Unsealed::OtherBox`], so [`decide`] refuses it as
+    /// [`Check::CrossBox`], or as [`Check::NoLiveBox`] when the source
+    /// resolves to no live box.
+    ///
+    /// The shell binds the open to the box id that the source resolves to.
+    /// For an [`Attribution::OwnIp`] source, that is the sending box, so a
+    /// value from another `own_ip` box comes back as
+    /// [`Unsealed::OtherBox`].
     ///
     /// # Errors
     ///
@@ -74,6 +90,7 @@ impl Unsealed<String> {
             }),
             Err(OpenError::NotOpenable | OpenError::Unsupported) => Ok(Self::Undecryptable),
             Err(OpenError::UnknownBreadth) => Ok(Self::Unbounded),
+            Err(OpenError::ContextMismatch(BoundField::BoxId)) => Ok(Self::OtherBox),
             Err(other) => Err(other),
         }
     }
@@ -108,7 +125,16 @@ pub struct Redemption<B> {
     pub unsealed: Unsealed<B>,
     /// The box the connection's source resolves to.
     pub attribution: Attribution<B>,
-    /// Whether the box the value names is a live `host_ip` box of this host.
+    /// Whether the box the value names is a live box of this host behind
+    /// the cohort's shared address.
+    ///
+    /// That is a live `host_ip` box. Until the per-box attachment facts
+    /// (NET-132, NET-133) are built, every VM-hosted box, `own_ip` included,
+    /// sends from one shared attachment. In that interim the shell gives
+    /// such a source as [`Attribution::HostIpCohort`]. It sets this field
+    /// when the named box is any live VM-hosted box of this host. The
+    /// admission is then audited `cohort_attributed`, and the cross-box
+    /// refusal does not hold between those boxes (Gatehouse §6.10).
     pub named_box_in_cohort: bool,
 }
 
@@ -178,6 +204,15 @@ pub fn decide<B: PartialEq>(redemption: &Redemption<B>) -> Decision {
     let (box_id, bounds) = match &redemption.unsealed {
         Unsealed::Undecryptable => return Decision::Refuse(Check::Undecryptable),
         Unsealed::Unbounded => return Decision::Refuse(Check::UnboundedMember),
+        // BEP-020: open refused the value as bound to another box id. The
+        // bounds are unknown, so the attribution check is the first that
+        // can fail.
+        Unsealed::OtherBox => {
+            return Decision::Refuse(match redemption.attribution {
+                Attribution::NoLiveBox => Check::NoLiveBox,
+                Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::CrossBox,
+            });
+        }
         Unsealed::Opened { box_id, bounds } => (box_id, bounds),
     };
     // BEP-058: a member with no mode or no recognised breadth is refused.
@@ -384,6 +419,39 @@ mod tests {
         }
     }
 
+    /// BEP-020: `seal::open` refuses a value from another `own_ip` box as
+    /// `ContextMismatch(BoxId)`, after it decrypts. The shell maps that to
+    /// `OtherBox`, and the refusal names `cross_box`.
+    #[test]
+    fn from_open_other_box_is_refused_as_cross_box() {
+        let Some(key) = key([7; 32]) else {
+            panic!("a valid key");
+        };
+        let sealed = sealed_to(&key, "box-a", "host-a", Mode::User);
+        let binding = Binding {
+            box_id: "box-b".into(),
+            host: "host-a".into(),
+            module: "github".into(),
+            now: 1_500,
+        };
+        let unsealed =
+            Unsealed::from_open(open(&key, &sealed, &binding)).expect("a decryption fact");
+        assert_eq!(unsealed, Unsealed::OtherBox);
+        for (attribution, check) in [
+            (Attribution::NoLiveBox, Check::NoLiveBox),
+            (Attribution::OwnIp("box-b".to_owned()), Check::CrossBox),
+            (Attribution::HostIpCohort, Check::CrossBox),
+        ] {
+            let decision = decide(&Redemption {
+                unsealed: unsealed.clone(),
+                attribution,
+                named_box_in_cohort: true,
+            });
+            assert_eq!(decision, Decision::Refuse(check));
+        }
+        assert_eq!(Check::CrossBox.marker(), "cross_box");
+    }
+
     #[test]
     fn markers_name_each_check() {
         let markers = [
@@ -430,9 +498,10 @@ mod kani_proofs {
     }
 
     fn any_unsealed() -> Unsealed<u8> {
-        match kani::any::<u8>() % 3 {
+        match kani::any::<u8>() % 4 {
             0 => Unsealed::Undecryptable,
             1 => Unsealed::Unbounded,
+            2 => Unsealed::OtherBox,
             _ => Unsealed::Opened {
                 box_id: kani::any(),
                 bounds: any_bounds(),
@@ -474,7 +543,16 @@ mod kani_proofs {
     #[kani::proof]
     fn kani_redeem_refuses_misattributed() {
         let r = any_redemption();
-        if let Decision::Admit { .. } = decide(&r) {
+        let decision = decide(&r);
+        if matches!(r.unsealed, Unsealed::OtherBox) {
+            let check = if matches!(r.attribution, Attribution::NoLiveBox) {
+                Check::NoLiveBox
+            } else {
+                Check::CrossBox
+            };
+            assert_eq!(decision, Decision::Refuse(check));
+        }
+        if let Decision::Admit { .. } = decision {
             let Unsealed::Opened { box_id, .. } = r.unsealed else {
                 panic!("admitted an undecryptable value");
             };
