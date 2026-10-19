@@ -1013,8 +1013,24 @@ pub(crate) fn session_rpc_failed(rpc: SessionRpc, error: anyhow::Error) -> anyho
         tracing::debug!(rpc = rpc.name(), error = %format!("{error:#}"), "refused: the daemon is shutting down");
         return anyhow::anyhow!(rpc.shutdown_race_message());
     }
-    error.context(format!("{} RPC failed", rpc.name()))
+    error.context(format!("{} RPC failed", rpc.display_name()))
 }
+
+// The client's refusal test compares against text assembled from the
+// authoritative `minimald-rpc` constants (`SessionRpc::name` defers to the
+// same `OneshotSshRpc::NAME` values `oneshot_rpc_within`'s `bail!` uses),
+// so a rename or prefix change in the wire contract breaks the equality
+// loudly here — at compile time for the name, at test time for the
+// assembled string — instead of silently failing to match and letting the
+// raw RPC chain resurface. A structured refusal code (a field carried
+// alongside the payload) was considered and declined: the oneshot RPC
+// wire carries only the daemon's stderr text — no refusal field, no
+// error-code channel — so exact text is the whole contract this
+// boundary has. The match is accordingly total equality on the
+// client's own rendering of this RPC's daemon-side failure, never a
+// suffix or substring scan of the chain, so an unrelated error that
+// merely ends with the refusal phrase is never reworded and never
+// masks its real cause.
 
 /// The exact error `minimal_client`'s oneshot RPC raises when the daemon
 /// refuses `rpc` because it is shutting down: the client's daemon-side
@@ -1022,8 +1038,7 @@ pub(crate) fn session_rpc_failed(rpc: SessionRpc, error: anyhow::Error) -> anyho
 /// [`minimald_rpc::SHUTDOWN_REFUSAL`].
 fn shutdown_refusal_text(rpc: SessionRpc) -> String {
     format!(
-        "{}{} RPC failed on the daemon side: Internal error: {}",
-        minimald_rpc::RPC_SUBSYSTEM_PREFIX,
+        "{} RPC failed on the daemon side: Internal error: {}",
         rpc.name(),
         minimald_rpc::SHUTDOWN_REFUSAL
     )
@@ -1041,11 +1056,31 @@ pub(crate) enum SessionRpc {
 }
 
 impl SessionRpc {
+    /// The wire name of this RPC, from the same
+    /// [`minimald_rpc::OneshotSshRpc::NAME`] constant the client's
+    /// `oneshot_rpc_within` uses in its `bail!`, so the refusal match in
+    /// [`shutdown_refusal_text`] cannot drift from what the client
+    /// actually sends: an RPC renamed in `minimald-rpc` breaks the match
+    /// here loudly, not silently.
     fn name(self) -> &'static str {
         match self {
-            SessionRpc::CreateSession => "CreateSession",
-            SessionRpc::ConfigureLoadout => "ConfigureLoadout",
+            SessionRpc::CreateSession => {
+                <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME
+            }
+            SessionRpc::ConfigureLoadout => {
+                <minimald_rpc::ConfigureLoadout as minimald_rpc::OneshotSshRpc>::NAME
+            }
         }
+    }
+
+    /// The bare name for user-facing wrapping (`"… RPC failed"`), which
+    /// omits the subsystem prefix the wire name carries. Derived from
+    /// [`SessionRpc::name`], so a rename reaches the copy too and the
+    /// tests that pin it fail rather than let stale text ship.
+    fn display_name(self) -> &'static str {
+        self.name()
+            .strip_prefix(minimald_rpc::RPC_SUBSYSTEM_PREFIX)
+            .unwrap_or(self.name())
     }
 
     /// What [`session_rpc_failed`] prints for an activation that lost the
@@ -1074,11 +1109,14 @@ mod tests {
     /// refusal reaches the client as the daemon-side stderr text, wrapped in
     /// the transport failure, so the test builds that chain and checks the
     /// mapping keys on the refusal marker rather than the wrapping. A refused
-    /// `CreateSession` created nothing.
+    /// `CreateSession` created nothing. The input is assembled from the same
+    /// `OneshotSshRpc::NAME` constant `oneshot_rpc_within`'s `bail!` uses, so
+    /// a wire-contract rename fails here instead of drifting silently.
     #[test]
     fn a_shutdown_raced_create_names_the_lost_race() {
         let raw = anyhow::anyhow!(
-            "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {}",
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME,
             minimald_rpc::SHUTDOWN_REFUSAL
         );
         let error = session_rpc_failed(SessionRpc::CreateSession, raw);
@@ -1099,7 +1137,8 @@ mod tests {
     #[test]
     fn a_shutdown_raced_configure_says_the_session_was_not_started() {
         let raw = anyhow::anyhow!(
-            "minimald-v1-ConfigureLoadout RPC failed on the daemon side: Internal error: {}",
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::ConfigureLoadout as minimald_rpc::OneshotSshRpc>::NAME,
             minimald_rpc::SHUTDOWN_REFUSAL
         );
         let error = session_rpc_failed(SessionRpc::ConfigureLoadout, raw);
@@ -1125,14 +1164,16 @@ mod tests {
         assert_eq!(error.to_string(), "CreateSession RPC failed");
 
         let other_rpc = anyhow::anyhow!(
-            "minimald-v1-ConfigureLoadout RPC failed on the daemon side: Internal error: {}",
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::ConfigureLoadout as minimald_rpc::OneshotSshRpc>::NAME,
             minimald_rpc::SHUTDOWN_REFUSAL
         );
         let error = session_rpc_failed(SessionRpc::CreateSession, other_rpc);
         assert_eq!(error.to_string(), "CreateSession RPC failed");
 
         let wrapped = anyhow::anyhow!(
-            "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {}",
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME,
             minimald_rpc::SHUTDOWN_REFUSAL
         )
         .context("something else failed");
@@ -1145,8 +1186,9 @@ mod tests {
     #[test]
     fn the_shutdown_marker_inside_other_text_is_not_the_refusal() {
         let raw = anyhow::anyhow!(
-            "minimald-v1-CreateSession RPC failed on the daemon side: Internal error: {} \
+            "{} RPC failed on the daemon side: Internal error: {} \
              was not expected here",
+            <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME,
             minimald_rpc::SHUTDOWN_REFUSAL
         );
         let error = session_rpc_failed(SessionRpc::CreateSession, raw);
