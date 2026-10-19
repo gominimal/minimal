@@ -110,6 +110,59 @@ async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
     assert_eq!(names["state"], "waiting", "{stdout}");
 }
 
+/// A daemon whose answerer port is held by a process no channel reaches is
+/// the one fact its status verb names, and the names item's cause is that
+/// fact — not the no-daemon text a fallback listing with no control socket
+/// collapses to. The fallback listing pairs the daemon it reached with the
+/// control socket beside its ssh socket on either backend, so the read the
+/// cause keys on works against a native minimald the same as against a VM
+/// host daemon.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn finalize_install_names_item_names_the_held_port_a_reachable_daemon_reports() {
+    let (daemon, args) = common::setup().await;
+    // The control socket beside the daemon's ssh socket, answering the
+    // status verb with the one fact this test is about: the port is held,
+    // no channel behind it.
+    let sock = minimal_client::resolve_socket_path(args.minimal_dir.as_deref(), false).unwrap();
+    let status = minimald_rpc::BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 },
+        proxy_down: None,
+    });
+    answering_control_sock(
+        &sock.parent().unwrap().join("control.sock"),
+        serde_json_lenient::to_string(&status).unwrap(),
+    );
+    let out = run_min(&args, &["finalize-install", "--show", "--json"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unfinished host exits 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the whole report reaches a piped stdout ({e}): {stdout:?}"));
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+    let cause = names["cause"].as_str().unwrap_or_default();
+    assert!(
+        cause.contains("another program holds 127.0.0.1:7656"),
+        "the cause names the held port the daemon reported, not the \
+         no-daemon text: {cause}"
+    );
+    assert!(
+        !cause.contains("no daemon is reachable"),
+        "a reachable daemon's report is not the no-daemon cause: {cause}"
+    );
+    drop(daemon);
+}
+
 /// A daemon that accepts and never answers must not hang `--show`: the
 /// installer probes `min finalize-install --show --script` from a shell
 /// with no timeout of its own. The names item's daemon read is one bounded
@@ -3932,7 +3985,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
     assert!(
-        held_ls.contains("DNS SERVICE:     this VM's box names are not answered"),
+        held_ls.contains("DNS SERVICE:     box names are not answered"),
         "a port held by a process no channel reaches is not an answered zone: {held_ls}"
     );
     assert!(
@@ -5035,7 +5088,8 @@ async fn activate_own_ip_on_vm_host<G>(
 
 /// A box control socket that answers every request with `reply`, one line
 /// per connection.
-fn answering_control_sock(path: &std::path::Path, reply: &'static str) {
+fn answering_control_sock(path: &std::path::Path, reply: impl Into<String>) {
+    let reply = reply.into();
     let listener = tokio::net::UnixListener::bind(path).unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {

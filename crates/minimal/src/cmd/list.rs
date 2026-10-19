@@ -322,8 +322,10 @@ pub struct VmListing {
     pub resp: minimald_rpc::ListSessionsResponse,
     /// That VM's VM-host control socket, beside the ssh socket the listing
     /// reached it on (NET-138): the socket `cmd_ls` reads this VM's own
-    /// zone-answerer state from. `None` on the native backend, which hosts
-    /// no VM host daemon — nothing to read, so nothing is read.
+    /// zone-answerer state from. `None` on the native backend for the VMs'
+    /// own listings — no VM host daemon to read — but never for the
+    /// fallback listing, which pairs the daemon it reached with the
+    /// answerer control socket beside it, native and VM-backed alike.
     pub control_sock: Option<std::path::PathBuf>,
 }
 
@@ -374,10 +376,9 @@ async fn listings_across_vms(
     let mut listings = Vec::new();
     for vm in vms {
         // The selected VM gets the gate `min ls` has always applied
-        // (`connect_daemon`'s); the others are listable ungated, for the same
-        // reason the dashboard lists them ungated — a listing is read-only,
-        // and a skewed VM is precisely one whose boxes an operator still
-        // needs to see.
+        // (`connect_daemon`'s); the others are listable ungated — a listing is
+        // read-only, and a skewed VM is precisely one whose boxes an
+        // operator still needs to see.
         let gate = vm.vm == selected;
         // A VM that is not running hosts no boxes: an absent socket is "no
         // boxes here", not a fault. The selected VM is exempt even so — it is
@@ -429,33 +430,14 @@ async fn listings_across_vms(
         listings.push(VmListing {
             vm: selected.to_string(),
             resp: list_selected_vm(&sock).await?,
-            // The native backend reaches here with no VM host daemon to
-            // read a state from; a VM backend falls back to the selected
-            // VM's own dir, where its control socket sits.
-            control_sock: fallback_control_sock(global, &sock),
+            // The control socket the daemon this listing reached serves
+            // its answerer state on: beside the ssh socket, native and
+            // VM-backed alike — a VM host daemon and a native minimald
+            // answer the same status verb over it.
+            control_sock: super::session::control_sock_beside(&sock),
         });
     }
     Ok(listings)
-}
-
-/// The VM-host control socket the fallback listing pairs with its one entry
-/// (NET-138), keyed on the backend the daemon connection resolves through —
-/// the same rule [`hostname_proxy_vm`] states — and never on
-/// [`GlobalArgs::use_minvmd`]: the flag is how Linux asks for the VM host,
-/// while macOS reaches it with no flag at all, so a gate keyed on the flag
-/// would find no control socket for exactly the host whose every invocation
-/// is VM-backed, and the one entry `min ls` falls back to there would carry
-/// no answerer state to read. `sock` is the daemon socket the listing
-/// already resolved; the control socket sits beside it, in the same provider
-/// dir.
-#[must_use]
-pub fn fallback_control_sock(
-    global: &GlobalArgs,
-    sock: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    (super::session::daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
-        .then(|| super::session::control_sock_beside(sock))
-        .flatten()
 }
 
 /// The selected daemon's `ListSessions` reply, from its socket, gated as `min
@@ -594,10 +576,12 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // the VM host daemon's — every VM's in-VM daemon starts none, so each
     // reply reports no answerer and the facts come from the host. Each
     // listed VM's status is read over its own minvmd control socket, beside
-    // the ssh socket the listing reached it on, never through the in-VM
-    // daemon (a guest relaying a host fact is forgeable from inside the
-    // escape boundary), and the liveness proof is this CLI's own A query at
-    // the port that read named. The status decides that VM's own verdict
+    // the ssh socket the listing reached it on; a native minimald answers
+    // the same status verb on its own control socket beside its ssh socket,
+    // so the native fallback listing reads it the same way. Never through
+    // the in-VM daemon (a guest relaying a host fact is forgeable from
+    // inside the escape boundary), and the liveness proof is this CLI's own
+    // A query at the port that read named. The status decides that VM's own verdict
     // and its own `DNS SERVICE` row — a VM whose minvmd holds the port
     // is named there, and a sibling registered with another daemon says
     // who holds it, so no row speaks with another VM's state. Read in the
@@ -628,9 +612,19 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // One verdict per VM from that VM's own status, over the verdict its
     // daemon's report would have decided: the read that cannot be made —
     // no control socket, the deadline, a daemon that predates the verb —
-    // keeps the silence a daemon-report verdict is, for that VM alone.
+    // keeps the silence a daemon-report verdict is, for that VM alone. A
+    // listing whose own daemon reports an answerer port — a native
+    // minimald, whose control socket the fallback listing reads too —
+    // keeps the daemon-report verdict above, the precedence its
+    // `DNS SERVICE` row prints with: its answerer is that daemon's own
+    // report, and the status read would only pay the list's detection a
+    // second time and swap the daemon's bound report for a liveness query
+    // keyed on the VM host's row.
     for (index, reply) in vm_answerers.iter().enumerate() {
         if let Some(reply) = reply
+            && listings
+                .get(index)
+                .is_some_and(|listing| listing.resp.zone_answerer_port.is_none())
             && let Some(slot) = surfaces.get_mut(index)
         {
             *slot = crate::resolver::vm_host_name_surface(reply.clone()).await;

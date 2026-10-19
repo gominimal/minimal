@@ -907,7 +907,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         anyhow::bail!("min dash requires an interactive terminal on stdin and stdout");
     }
 
-    let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await;
+    // Gated before the terminal is taken over, so a skewed daemon refuses the
+    // dashboard the same way it refuses `min ls` — plain message, terminal
+    // untouched.
+    let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await?;
     let contribution = opts.contribution.clone();
     let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());

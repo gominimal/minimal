@@ -83,7 +83,10 @@ pub(crate) fn vm_host_control_sock(
 /// The control socket beside an ssh socket a client already resolved (T66's
 /// rule, one definition for every caller): the VM host daemon serves both
 /// from the same provider dir, so the socket a listing or an activation
-/// reached a VM on is the one to find that VM's control socket beside.
+/// reached a VM on is the one to find that VM's control socket beside. A
+/// native minimald serves its answerer control socket (`minimald`'s
+/// `rpc::ANSWERER_CONTROL_SOCK_FILE`, the same file name) beside its ssh
+/// socket too, answering the same status verb.
 pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::path::PathBuf> {
     ssh_sock
         .parent()
@@ -182,9 +185,11 @@ pub(crate) async fn vm_host_answerer_status(
 
 /// [`vm_host_answerer_status`]'s read over one control socket the caller
 /// resolved itself: the same bounded read, the same silence rules, over any
-/// VM host daemon's socket — `min ls` reads each listed VM's own state
-/// beside the ssh socket its listing reached that VM on (NET-057's
-/// enumeration), so the socket is the caller's to name.
+/// VM host daemon's socket or a native minimald's answerer control socket,
+/// which answers the same status verb — `min ls` reads each listed VM's own
+/// state beside the ssh socket its listing reached that VM on (NET-057's
+/// enumeration), and the native fallback listing's beside its daemon's, so
+/// the socket is the caller's to name.
 pub(crate) async fn vm_host_answerer_status_at(
     sock_path: Option<std::path::PathBuf>,
 ) -> Option<minimald_rpc::AnswererStatusReply> {
