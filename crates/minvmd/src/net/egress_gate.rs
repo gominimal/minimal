@@ -16555,6 +16555,56 @@ mod tests {
         }
     }
 
+    /// NET-138, at the gate: a row reloaded from the persisted registry
+    /// awaits its box's first frame under the resume bound, and the
+    /// gratuitous ARP the guest's relay sends at every box attach — the one
+    /// frame an idle box, a resumed box's host with no client, ever sends —
+    /// is that frame: admitted, carried, and the row stands past
+    /// [`RESUME_ATTACH_BOUND`](crate::box_registry::RESUME_ATTACH_BOUND).
+    #[tokio::test]
+    async fn an_idle_reloaded_box_s_attach_announce_stands_its_row_past_the_bound() {
+        use crate::box_registry::{
+            ClientBoxSpec, DETACH_SWEEP_INTERVAL, REGISTRY_FILE, RESUME_ATTACH_BOUND,
+        };
+        let dir = TempDir::new().expect("a temp dir");
+        let path = dir.path().join(REGISTRY_FILE);
+        let web = BoxRegistry::new(SUBNET)
+            .persisting_to(path.clone())
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: vec![8080],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the box");
+        let addr = web.switch_addr().octets();
+
+        // The VM restarted: the registry reloads the row, awaiting its box.
+        let registry = BoxRegistry::new(SUBNET).persisting_to(path);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let clock = registry.clone();
+        let mut h = gate_over(registry).await;
+
+        // The box's host launches with no client: its relay's announcement
+        // is the only frame it sends.
+        let announce = arp_frame(addr);
+        send_frame(&mut h.guest, &announce).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            announce,
+            "the announcement reaches the switch"
+        );
+
+        clock.advance_clock(RESUME_ATTACH_BOUND);
+        tokio::time::sleep(DETACH_SWEEP_INTERVAL * 2 + Duration::from_millis(200)).await;
+        assert!(
+            h.table.by_source(addr).is_some(),
+            "the announced row stands past its resume bound with no client traffic"
+        );
+    }
+
     /// The row is withdrawn on the ingress-wins interleaving too: the switch
     /// closes its side while the guest is still on the connection, so the
     /// ingress leg ends first and the egress leg is dropped un-drained. The

@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-09-23
+updated: 2026-10-18
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -228,6 +228,10 @@ Steering and the interception CA
 - **BEP-012** WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_proxy_env_and_no_proxy_are_set
+  - WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_proxy_env_sets_node_use_env_proxy
+    <!-- Node's built-in `fetch` ignores `HTTPS_PROXY` unless this variable is set, so a Node client that uses it connects directly and its handle reaches the upstream unsubstituted; measured in docs/spikes/2026-10-20-sealed-handle-bearer-clients.md; Node reads the variable from v22.21.0 on the 22.x line and from v24.0.0, and an older Node ignores it: under `dns` or `both` steering the box resolver still sends its credentialed names to the proxy, and under `proxy_env` alone it connects directly and the upstream refuses the unsubstituted handle, so a box that runs an older Node client uses `both` -->
 
 - **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains through the host's one signing CA to the host root CA, whose name constraints equal the union of the configured modules' host sets and the authorities the operator's `[secret-store-rules]` register, less the fixed deny set.
   tier:     T1
@@ -692,9 +696,43 @@ Setting secrets
   tier:     T0
   verify:   cargo nextest run -p bep replaced_secret_is_injected_on_next_request
 
+- **BEP-079** WHEN `min secret set <id>` is run with `--upstream <authority>` and an injection form, `--header <name>` with an optional `--prefix <text>` or `--basic-auth <field>`, or with `--preset <name>` THE SYSTEM SHALL write the `[secret-store-rules]` rule for `<id>` with those fields and no consent `action` to the user-level client configuration, replacing any rule for `<id>` there.
+  tier:     T0
+  verify:   cargo nextest run -p minimal secret_set_writes_user_level_store_rule
+  <!-- the rule is client-owned (BEP-037), so the verb writes the one file the operator owns; consent stays a hand-set field -->
+  - THE SYSTEM SHALL write store rules from `min secret set` to the user-level client configuration alone, and to no project `minimal.toml` and no organization configuration.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_writes_no_project_or_org_config
+  - THE SYSTEM SHALL resolve `--preset anthropic` to `api.anthropic.com` with header `Authorization` and prefix `Bearer `, `--preset anthropic-api-key` to `api.anthropic.com` with header `x-api-key` and no prefix, `--preset linear` to `mcp.linear.app` with header `Authorization` and prefix `Bearer `, `--preset sentry` to `mcp.sentry.dev` with header `Authorization` and prefix `Sentry-Bearer `, and `--preset cloudflare` to `mcp.cloudflare.com` with header `Authorization` and prefix `Bearer `.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_presets_resolve_to_their_rules
+    <!-- fixed-token upstreams only; an upstream whose client signs in through OAuth with expiring tokens needs a module (Non-goals); `anthropic` fits a box that sets `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_AUTH_TOKEN`, and `anthropic-api-key` fits one that sets `ANTHROPIC_API_KEY`, which Claude Code sends in `x-api-key` (docs/spikes/2026-10-20-sealed-handle-bearer-clients.md) -->
+  - IF `--preset` does not name a built-in preset THEN THE SYSTEM SHALL refuse the command before reading the value and print the preset names it knows.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_unknown_preset_lists_known_ones
+  - IF the configuration reader refuses the rule that `min secret set` writes (BEP-034) THEN THE SYSTEM SHALL refuse the command, naming what the rule names, before reading the value and before writing the item or the rule.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_refuses_deny_set_rule_before_reading_value
+  - WHEN `min secret set <id>` replaces a rule for `<id>` whose fields differ, with a terminal attached and without `--yes`, THE SYSTEM SHALL show the current and the new fields and replace the rule only on confirmation.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_shows_rule_change_and_asks
+  - IF `min secret set <id>` replaces a rule whose fields differ, with no terminal attached and without `--yes`, THEN THE SYSTEM SHALL refuse the command, write neither the item nor the rule, and name `--yes` as the way to accept the change.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_rule_change_without_tty_needs_yes
+  - WHERE the command carries `--yes` THE SYSTEM SHALL replace a rule whose fields differ without asking.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_yes_replaces_rule_without_asking
+  - IF storing the item or writing the rule fails THEN THE SYSTEM SHALL restore the other to its state before the command and report which step failed.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_partial_failure_restores_both
+  - WHEN `min secret set <id>` is run with no rule flag THE SYSTEM SHALL store the value and leave any rule for `<id>` unchanged.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_without_rule_flags_leaves_rule_unchanged
+
 ## Non-goals
 
 - Caching public artifacts through the proxy: a separate story, not yet filed.
+- Presets for Slack, Google Drive, Notion and other services whose clients sign in through OAuth with tokens that expire. A stored secret stops working when its token expires. Each such service needs a module with a sign-in flow and renewal at the proxy, as the GitHub module has, and follows the Anthropic and MCP module epics.
 - Anthropic and MCP upstream modules; 1Password, LastPass, Linux Secret Service, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster).
 - The Gatehouse-hosted proxy, the enrolled `gateway` helper, the tenant secret store and the revocation feed: [GHI](https://github.com/gominimal/gatehouse/pull/1), Gatehouse §6.10, §6.11, §8.6. With a Gatehouse configured, `min` delegates sign-in, minting and sealing to it; nothing here forecloses that and the envelope is the same.
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
@@ -925,6 +963,16 @@ form and refuses the tenant-store one. Without the verb an item created outside
 prompts on the host and a store reference is unusable from an unattended box.
 Replacing an item is rotation: the proxy reads per request (BEP-033), so no
 restart is needed.
+`min secret set` also writes the rule when it gets one (BEP-079). One command
+then stores a key and says where the proxy sends it. The alternative was a
+rule the operator edits by hand. We set it aside because a missing or mistyped
+rule leaves a stored key that no box can use. The verb writes only the
+user-level configuration. The organization configuration is not the
+operator's, and the proxy ignores a project rule (BEP-037). Presets cover only
+services that take a fixed token. A service that signs in through OAuth needs a
+renewal that no stored value can give. Anthropic has two presets because Claude
+Code sends an API key and a token in different headers. With one preset, one
+of the two travels in a header the proxy never fills.
 
 **Prior art.** The `docs/spec-credential-lane` branch's policy gate, resolver
 seam, `min session credentials` review surface and the "tasks stop mapping

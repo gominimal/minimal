@@ -348,7 +348,7 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
     let entry = model.entry(key);
 
     // Two-column field layout, per the spec's mock:
-    //   project  ~/src/api    net   OwnIp
+    //   project  ~/src/api    net   own_ip
     //   user     chroma       idle  12s
     //   title    vim: …
     //   bells    ●2 (last 3m)
@@ -386,7 +386,7 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
     ];
     let net = detail
         .and_then(|d| d.record.as_ref())
-        .map(|r| format!("{:?}", r.network))
+        .map(|r| r.network.word().to_string())
         .unwrap_or_else(|| "?".to_string());
     // The Info section is four rows tall: runtime facts first, then the
     // git context fills the right column's spare rows.
