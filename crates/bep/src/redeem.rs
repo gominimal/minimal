@@ -61,7 +61,9 @@ impl Unsealed<String> {
     ///
     /// A value that opens gives [`Unsealed::Opened`]. A value sealed to
     /// another key, or one that does not decrypt, gives
-    /// [`Unsealed::Undecryptable`]. A member with a missing or unknown
+    /// [`Unsealed::Undecryptable`]. Only [`OpenError::NotOpenable`] says
+    /// that. [`OpenError::Unsupported`] says the header's type, algorithm or
+    /// key is not one this proxy reads, so it comes back unchanged. A member with a missing or unknown
     /// breadth gives [`Unsealed::Unbounded`], so [`decide`] refuses it as
     /// [`Check::UnboundedMember`]. A value bound to another box id gives
     /// [`Unsealed::OtherBox`], so [`decide`] refuses it as
@@ -72,6 +74,15 @@ impl Unsealed<String> {
     /// For an [`Attribution::OwnIp`] source, that is the sending box, so a
     /// value from another `own_ip` box comes back as
     /// [`Unsealed::OtherBox`].
+    ///
+    /// An [`Attribution::HostIpCohort`] source resolves to no single box.
+    /// [`crate::seal`] has no call that reads the value's box id before the
+    /// open. So the shell binds the open to each live box of the cohort in
+    /// turn, and keeps the first result that is not [`Unsealed::OtherBox`].
+    /// That box is in the cohort, so the shell sets
+    /// [`Redemption::named_box_in_cohort`]. When every live box of the
+    /// cohort gives [`Unsealed::OtherBox`], the shell gives that, and
+    /// [`decide`] refuses it as [`Check::CrossBox`].
     ///
     /// # Errors
     ///
@@ -88,7 +99,7 @@ impl Unsealed<String> {
                     breadth: Some(opened.member.breadth),
                 },
             }),
-            Err(OpenError::NotOpenable | OpenError::Unsupported) => Ok(Self::Undecryptable),
+            Err(OpenError::NotOpenable) => Ok(Self::Undecryptable),
             Err(OpenError::UnknownBreadth) => Ok(Self::Unbounded),
             Err(OpenError::ContextMismatch(BoundField::BoxId)) => Ok(Self::OtherBox),
             Err(other) => Err(other),
@@ -114,7 +125,9 @@ pub enum Attribution<B> {
     /// The source is the own address of this live `own_ip` box.
     OwnIp(B),
     /// The source is the shared address of this host's live `host_ip`
-    /// boxes. It does not say which one.
+    /// boxes. It does not say which one. On an un-enrolled node, until
+    /// NET-132 and NET-133 are built, every VM-hosted box and the host shell
+    /// send from this address (see [`Redemption::named_box_in_cohort`]).
     HostIpCohort,
 }
 
@@ -128,13 +141,18 @@ pub struct Redemption<B> {
     /// Whether the box the value names is a live box of this host behind
     /// the cohort's shared address.
     ///
-    /// That is a live `host_ip` box. Until the per-box attachment facts
-    /// (NET-132, NET-133) are built, every VM-hosted box, `own_ip` included,
-    /// sends from one shared attachment. In that interim the shell gives
-    /// such a source as [`Attribution::HostIpCohort`]. It sets this field
-    /// when the named box is any live VM-hosted box of this host. The
-    /// admission is then audited `cohort_attributed`, and the cross-box
-    /// refusal does not hold between those boxes (Gatehouse §6.10).
+    /// On an enrolled node, the shell sets this field only when the named
+    /// box is a live `host_ip` box of this host. Cross-box redemption
+    /// between `own_ip` boxes is then always refused.
+    ///
+    /// An un-enrolled node has an interim, until the per-box attachment
+    /// facts (NET-132, NET-133) are built. Every VM-hosted box, `own_ip`
+    /// included, and the host shell send from one shared attachment. The
+    /// shell gives such a source as [`Attribution::HostIpCohort`]. It sets
+    /// this field when the named box is any live VM-hosted box of this
+    /// host. The admission is then audited `cohort_attributed`. The
+    /// cross-box and host-shell refusals do not hold in that interim. The
+    /// spec records this as a residual risk (T28, Gatehouse §6.10).
     pub named_box_in_cohort: bool,
 }
 
@@ -450,6 +468,66 @@ mod tests {
             assert_eq!(decision, Decision::Refuse(check));
         }
         assert_eq!(Check::CrossBox.marker(), "cross_box");
+    }
+
+    /// BEP-020, BEP-028: a cohort source names no single box, so the shell
+    /// binds the open to each live cohort box in turn. The value opens for
+    /// the box it names, and the decision admits it as `Cohort`. Bound to
+    /// another cohort box, it is `OtherBox`, refused as `cross_box`.
+    #[test]
+    fn cohort_open_bound_to_named_box_is_admitted_as_cohort() {
+        let Some(key) = key([9; 32]) else {
+            panic!("a valid key");
+        };
+        let sealed = sealed_to(&key, "box-a", "host-a", Mode::User);
+        let bind = |box_id: &str| Binding {
+            box_id: box_id.into(),
+            host: "host-a".into(),
+            module: "github".into(),
+            now: 1_500,
+        };
+        let mut admitted = None;
+        for live in ["box-b", "box-a"] {
+            let unsealed =
+                Unsealed::from_open(open(&key, &sealed, &bind(live))).expect("a decryption fact");
+            if unsealed == Unsealed::OtherBox {
+                let decision = decide(&Redemption {
+                    unsealed,
+                    attribution: Attribution::HostIpCohort,
+                    named_box_in_cohort: true,
+                });
+                assert_eq!(decision, Decision::Refuse(Check::CrossBox));
+                continue;
+            }
+            admitted = Some(decide(&Redemption {
+                unsealed,
+                attribution: Attribution::HostIpCohort,
+                named_box_in_cohort: true,
+            }));
+            break;
+        }
+        assert_eq!(
+            admitted,
+            Some(Decision::Admit {
+                attributed: Attributed::Cohort,
+                mode: Mode::User,
+                breadth: Breadth::Full,
+            })
+        );
+    }
+
+    /// An unsupported header is not a value sealed to another key, so the
+    /// shell gets the error back and the marker never says `undecryptable`.
+    #[test]
+    fn from_open_unsupported_comes_back_unchanged() {
+        assert_eq!(
+            Unsealed::<String>::from_open(Err(OpenError::Unsupported)),
+            Err(OpenError::Unsupported)
+        );
+        assert_eq!(
+            Unsealed::<String>::from_open(Err(OpenError::NotOpenable)),
+            Ok(Unsealed::Undecryptable)
+        );
     }
 
     #[test]
