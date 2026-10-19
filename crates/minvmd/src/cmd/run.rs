@@ -97,6 +97,38 @@ pub fn run(
     }
 }
 
+/// Reap a stale gvproxy left by a killed supervisor before the node proxy
+/// port is drawn, and hand the resolved pair to the spawn block.
+///
+/// A SIGKILLed or aborted supervisor leaves its gvproxy alive — the pidfd
+/// stop paths are clean-stop-only and gvproxy holds no alive lock — and the
+/// leftover keeps the hostname proxy's default port bound. Reaping only
+/// after the draw (at the gvproxy spawn, as before) is too late: the draw
+/// sees the default port refused and hands the proxy an ephemeral one.
+///
+/// Runs only when a gvproxy binary is installed; the reaper's match is
+/// exact argv tokens — argv[0] is the gvproxy binary and `-listen` names
+/// this VM's switch socket. The supervisor's alive lock (held by the time
+/// this is called) rules out a live same-instance supervisor, so a match
+/// owned by a live minvmd fails the start rather than spawning a duplicate
+/// switch. The caller is the synchronous supervisor thread, not a tokio
+/// worker, so the reap's bounded wait may block it.
+///
+/// The socket dir and stale-socket cleanup stay at the spawn block, next
+/// to the bind they guard; the resolved pair is returned so the spawn
+/// block does not resolve twice.
+#[cfg(minvmd_libkrun)]
+fn reap_stale_gvproxy_before_port_draw() -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)>
+{
+    let binary = crate::image::resolve_gvproxy_path();
+    if !binary.exists() {
+        return Ok((binary, None));
+    }
+    let switch_sock = crate::net::resolve_switch_sock().context("resolving switch socket")?;
+    crate::net::reap_stale_gvproxy(&binary, &switch_sock).context("reaping a stale gvproxy")?;
+    Ok((binary, Some(switch_sock)))
+}
+
 #[cfg(minvmd_libkrun)]
 fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredSpan) -> Result<()> {
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
@@ -550,6 +582,12 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // the kernel, and the kernel releases it when this supervisor stops,
     // exits or crashes — never a pid file, never a stale entry to clean.
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
+    // A stale gvproxy from a killed supervisor still holds the hostname
+    // proxy's default port bound, so the reaper runs before the port draw:
+    // drawing first would hand the proxy an ephemeral port for no reason.
+    // The reaper's own guard still fails the start when the matching
+    // gvproxy belongs to a live minvmd.
+    let (gvproxy_binary, switch_sock) = reap_stale_gvproxy_before_port_draw()?;
     let mut node_port =
         assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
     boxes
@@ -734,24 +772,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // lanes that exercise only the vsock bridge) we warn and boot without
     // egress rather than failing the VM — the daemon then has no network, the
     // pre-existing behaviour.
-    let _gvproxy = match crate::image::resolve_gvproxy_path() {
-        binary if binary.exists() => {
-            let switch_sock =
-                crate::net::resolve_switch_sock().context("resolving switch socket")?;
+    // The reaper above decided whether the binary is installed: a switch
+    // socket comes back only when it is, so the decision is made once.
+    let _gvproxy = match (gvproxy_binary, switch_sock) {
+        (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
-            // A crashed supervisor (SIGKILL, abort) leaves its gvproxy alive:
-            // the pidfd stop paths are clean-stop-only and gvproxy holds no
-            // alive lock, so nothing reaps it. Unlinking the stale socket
-            // below would let the fresh gvproxy bind while the leftover still
-            // holds the host-side forwards. Kill it first — matched on exact
-            // argv tokens: argv[0] is the gvproxy binary and `-listen` names
-            // this VM's switch socket. This supervisor's alive lock rules out
-            // a live same-instance supervisor, so a match owned by a live
-            // minvmd fails the start rather than spawning a duplicate switch.
-            // This thread is the synchronous supervisor thread, not a tokio
-            // worker, so the reap's bounded wait may block it.
-            crate::net::reap_stale_gvproxy(&binary, &switch_sock)
-                .context("reaping a stale gvproxy")?;
+            // The stale gvproxy of a killed supervisor was reaped above,
+            // before the node proxy port was drawn, so it can no longer
+            // hold the hostname proxy's default port; this block only
+            // clears the sockets it left behind. The reaper's argv match
+            // and live-minvmd guard are the reaper's own (above).
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             // The gate binds the socket beside the switch socket, so a stale
@@ -878,7 +908,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 }
             }
         }
-        binary if crate::cmd::own_ip_requested() => {
+        (binary, None) if crate::cmd::own_ip_requested() => {
             // An own-IP VM cannot work without the switch: fail loudly rather
             // than booting a session that silently has no network.
             bail!(
@@ -887,7 +917,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 binary.display()
             );
         }
-        binary => {
+        (binary, None) => {
             // Non-own-IP boots (e.g. the boot/session e2e lanes) tolerate a
             // missing gvproxy: warn and boot without guest egress.
             tracing::warn!(
@@ -1967,14 +1997,27 @@ fn port_holder(_port: u16) -> Option<(u32, String)> {
 /// two VMs and a native daemon can all want the default proxy port, so a boot
 /// that landed elsewhere says so here, in the supervisor's own log, rather
 /// than leaving a hostname surface that never answered to be found there.
+/// A preferred port refused because something holds it names that holder's
+/// pid and executable, so the log says which leftover owns the bind the
+/// boot moved off.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn log_node_port_assignment(surface: &str, assigned: &NodePortAssignment) {
+    // The holder is looked up only for the bind-refused skip: any other skip
+    // (loopback answering, reserved by another VM) is not a holder question,
+    // and a configured port never reaches here — its refusal fails the
+    // start naming the holder already.
+    let holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
+        .then(|| port_holder(assigned.preferred))
+        .flatten()
+        .map(|(_, holder)| holder)
+        .unwrap_or_default();
     tracing::info!(
         surface,
         preferred = assigned.preferred,
         handed = assigned.port,
         configured = assigned.configured,
         skip_reason = assigned.skipped.unwrap_or(""),
+        port_holder = %holder,
         "assigned the node port"
     );
 }
@@ -3394,6 +3437,33 @@ mod tests {
             None,
             "a start that failed on something else lifts nothing"
         );
+    }
+
+    /// A preferred port something holds is skipped with `bind refused`, and
+    /// the same draw hands it back once the holder releases it. This pins
+    /// only the draw's half of the reap-before-draw fix: the order of the
+    /// reap and the draw in `run_foreground` needs a real VM, so only the
+    /// e2e lanes check it.
+    #[test]
+    fn node_port_draw_skips_a_held_preferred_port_and_hands_it_back_once_released() {
+        // The preferred port: hold it on the loopback the TCP probe
+        // addresses, so the first draw sees it refused.
+        let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let default = stale.local_addr().unwrap().port();
+        let ports = tempfile::tempdir().expect("a test reservation dir");
+        let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
+        assert_eq!(drawn_before.preferred, default);
+        assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
+        assert_ne!(
+            drawn_before.port, default,
+            "the held default is not handed to the proxy"
+        );
+
+        // Release the holder, and the same draw hands the port back.
+        drop(stale);
+        let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+        assert_eq!(drawn_after.port, default);
+        assert_eq!(drawn_after.skipped, None);
     }
 
     /// The holder lookup names the pid of a listener in another process —
