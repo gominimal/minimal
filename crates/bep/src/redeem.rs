@@ -35,6 +35,10 @@ pub enum Unsealed<B> {
     /// The value does not decrypt under this host's proxy key. This includes
     /// a value sealed to another host's key.
     Undecryptable,
+    /// The value decrypted, but its member carries no `breadth` or one this
+    /// proxy does not recognise. [`crate::seal::open`] reports this without
+    /// the value's context, so no box id comes with it.
+    Unbounded,
     /// The value decrypted.
     Opened {
         /// The box the value names.
@@ -49,12 +53,16 @@ impl Unsealed<String> {
     ///
     /// A value that opens gives [`Unsealed::Opened`]. A value sealed to
     /// another key, or one that does not decrypt, gives
-    /// [`Unsealed::Undecryptable`].
+    /// [`Unsealed::Undecryptable`]. A member with a missing or unknown
+    /// breadth gives [`Unsealed::Unbounded`], so [`decide`] refuses it as
+    /// [`Check::UnboundedMember`].
     ///
     /// # Errors
     ///
     /// Every other [`OpenError`] comes back unchanged. Those refusals belong
     /// to checks this module does not make, and the shell refuses on them.
+    /// A header with no `mode` does not parse, so it is
+    /// [`OpenError::Malformed`] before any decryption.
     pub fn from_open(result: Result<Opened, OpenError>) -> Result<Self, OpenError> {
         match result {
             Ok(opened) => Ok(Self::Opened {
@@ -65,6 +73,7 @@ impl Unsealed<String> {
                 },
             }),
             Err(OpenError::NotOpenable | OpenError::Unsupported) => Ok(Self::Undecryptable),
+            Err(OpenError::UnknownBreadth) => Ok(Self::Unbounded),
             Err(other) => Err(other),
         }
     }
@@ -166,8 +175,10 @@ pub enum Decision {
 #[must_use]
 pub fn decide<B: PartialEq>(redemption: &Redemption<B>) -> Decision {
     // BEP-019: only a value this host's key opens is redeemed.
-    let Unsealed::Opened { box_id, bounds } = &redemption.unsealed else {
-        return Decision::Refuse(Check::Undecryptable);
+    let (box_id, bounds) = match &redemption.unsealed {
+        Unsealed::Undecryptable => return Decision::Refuse(Check::Undecryptable),
+        Unsealed::Unbounded => return Decision::Refuse(Check::UnboundedMember),
+        Unsealed::Opened { box_id, bounds } => (box_id, bounds),
     };
     // BEP-058: a member with no mode or no recognised breadth is refused.
     let (Some(mode), Some(breadth)) = (bounds.mode, bounds.breadth) else {
@@ -346,6 +357,33 @@ mod tests {
         }
     }
 
+    /// BEP-058: `seal::open` refuses a member with a missing or unknown
+    /// breadth as `UnknownBreadth`, after it decrypts. The shell maps that to
+    /// `Unbounded`, and the refusal names `unbounded_member`, from every
+    /// source.
+    #[test]
+    fn from_open_unknown_breadth_is_refused_as_unbounded_member() {
+        let unsealed =
+            Unsealed::from_open(Err(OpenError::UnknownBreadth)).expect("a decryption fact");
+        assert_eq!(unsealed, Unsealed::Unbounded);
+        for attribution in [
+            Attribution::NoLiveBox,
+            Attribution::OwnIp("a".to_owned()),
+            Attribution::HostIpCohort,
+        ] {
+            let decision = decide(&Redemption {
+                unsealed: unsealed.clone(),
+                attribution,
+                named_box_in_cohort: true,
+            });
+            assert_eq!(decision, Decision::Refuse(Check::UnboundedMember));
+            let Decision::Refuse(check) = decision else {
+                unreachable!()
+            };
+            assert_eq!(check.marker(), "unbounded_member");
+        }
+    }
+
     #[test]
     fn markers_name_each_check() {
         let markers = [
@@ -392,13 +430,13 @@ mod kani_proofs {
     }
 
     fn any_unsealed() -> Unsealed<u8> {
-        if kani::any() {
-            Unsealed::Undecryptable
-        } else {
-            Unsealed::Opened {
+        match kani::any::<u8>() % 3 {
+            0 => Unsealed::Undecryptable,
+            1 => Unsealed::Unbounded,
+            _ => Unsealed::Opened {
                 box_id: kani::any(),
                 bounds: any_bounds(),
-            }
+            },
         }
     }
 
@@ -453,10 +491,16 @@ mod kani_proofs {
     fn kani_redeem_refuses_unbounded_member() {
         let r = any_redemption();
         let decision = decide(&r);
-        if let Unsealed::Opened { bounds, .. } = r.unsealed {
-            if bounds.mode.is_none() || bounds.breadth.is_none() {
+        match r.unsealed {
+            Unsealed::Unbounded => {
                 assert_eq!(decision, Decision::Refuse(Check::UnboundedMember));
             }
+            Unsealed::Opened { bounds, .. }
+                if bounds.mode.is_none() || bounds.breadth.is_none() =>
+            {
+                assert_eq!(decision, Decision::Refuse(Check::UnboundedMember));
+            }
+            _ => {}
         }
     }
 }
