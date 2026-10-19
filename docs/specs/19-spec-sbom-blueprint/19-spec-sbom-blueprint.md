@@ -49,7 +49,11 @@ the document digest in the closure (Non-goals), *references* is decided by
 the closure entry alone: a component whose entry maps its Build Spec Hash to
 a cache artifact digest references the document SBOM-013 names from that
 hash, and a component whose entry is `built-locally` or `non-redistributable`
-has no artifact, no document, and the gap. No probe of the cache takes part
+has no artifact, no document, and the gap. Those are the only two kinds of
+entry a sealed closure holds; a package present in the environment with no
+closure entry, or an entry of any other state, is neither a digest nor a
+gap: the pin does not account for the package, and the emission is
+SBOM-012's failure, exit code 6, naming the package. No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds, and a referenced document
 the cache does not have (a 404 as much as a timeout) is SBOM-012's failure.
 
@@ -133,7 +137,8 @@ developer running agent boxes; build-infra operator; auditor.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_digest_or_gap_total
   property: for all components k: has_sha256(k) xor has_digest_gap(k),
-    and has_sha256(k) implies resolves(sha256(k), closure(pin))
+    and has_sha256(k) implies resolves(sha256(k), closure(pin)); for all
+    packages k of the environment: k ∉ closure(pin) ⇒ not emitted ∧ exit = 6
 
 - **SBOM-005** THE SYSTEM SHALL include every package present in the
   environment as a component, with launcher-injected packages carrying
@@ -482,6 +487,15 @@ from the spec and stay schema-TODO.
   enforced by: components with no referenced document become declared
   gaps; unfetchable references abort the emission
   covered by: SBOM-011, SBOM-012
+- **Trust boundary:** until build-servers#185 pins the document digest, the
+  Registry Build Cache's writer is a trust boundary of this spec: an
+  unbundled per-package document's facts are that writer's claim, bound to
+  the tarball by subject digest alone and to no author. The spec's
+  controls on that boundary are the `unverified` and `partial` marks, the
+  stderr diagnostic, SBOM-008's allowlist of copied fields, and
+  `--require-bundles`; a gate that consumes a box document as evidence
+  SHALL refuse a `partial` one, and the boundary closes per document as the
+  pin records bundles (SBOM-013).
 - **Invariant:** THE SYSTEM SHALL never present a document that holds any
   unverified component as evidence.
   enforced by: the top-level `partial` mark in every serializer, which a
