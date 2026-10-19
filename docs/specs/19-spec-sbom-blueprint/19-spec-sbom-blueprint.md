@@ -222,13 +222,14 @@ developer running agent boxes; build-infra operator; auditor.
     closure(pin(e))) implies k in components(emit(e)) and has_digest_gap(k)
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
-  cannot be fetched THEN THE SYSTEM SHALL fail naming the pin, the
-  unresolved object, and the remediation, never emitting a document whose
-  component set is silently incomplete.
+  cannot be fetched THEN THE SYSTEM SHALL fail with exit code 6 naming the
+  pin, the unresolved object, and the remediation, never emitting a document
+  whose component set is silently incomplete.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_unfetchable_reference_fails_loudly
   property: for all attempts a: unfetchable_reference(a) implies not
-    emitted(a) and error(a) names (pin, unresolved object, remediation)
+    emitted(a) and exit(a) = 6 and error(a) names (pin, unresolved object,
+    remediation)
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
@@ -253,19 +254,31 @@ developer running agent boxes; build-infra operator; auditor.
     statement_bytes(bundle(d)) where the bundle exists
   - IF the statement's subject digest differs from the closure's entry for
     the component THEN THE SYSTEM SHALL treat the document as unresolved
-    (SBOM-012's failure, naming both digests), never as that component's.
+    (SBOM-012's failure, exit code 6, naming both digests), never as that
+    component's.
     tier:   T0
     verify: cargo nextest run -p sbom per_package_document_subject_must_match_closure
-  - WHEN the document's bundle is published THE SYSTEM SHALL verify it with
-    PKV-011's checks first, then check the subject, and only then read any
-    other field of the document, and IF the bundle fails THEN THE SYSTEM
-    SHALL treat the document as unresolved (SBOM-012's failure, naming the
-    check); WHILE the producer publishes no bundle for the document THE
-    SYSTEM SHALL read the document and mark the component `unverified`, as
-    PKV marks an entry whose source has no verified bundle.
+  - WHEN the pin records a bundle for the document (its state in the sealed
+    map, PKV-017's) THE SYSTEM SHALL verify the bundle with PKV-011's checks
+    first, then check the subject, and only then read any other field of the
+    document; IF the bundle fails or cannot be fetched THEN THE SYSTEM SHALL
+    treat the document as unresolved (SBOM-012's failure, exit code 6, naming
+    the check or the missing bundle), and never read it. The pin decides, so
+    SBOM-001 holds: the same pin always takes the same path.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
-    property: read(d) ⇒ (bundle(d) = ∅ ∧ unverified(component(d))) ∨ verified(bundle(d)); checks(d) = [bundle, subject, rest] in that order
+    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
+  - WHILE the pin records no bundle for the document (the producer has not
+    published one: build-servers#185) THE SYSTEM SHALL read the document,
+    mark the component `unverified`, as PKV marks an entry whose source has
+    no verified bundle, and print one diagnostic to stderr per emission that
+    names each such component and build-servers#185 as the reason, so the
+    interim is never silent. This path ends by itself: the first pin that
+    records bundles for its documents takes the path above for them, with no
+    flag and no release step.
+    tier:   T1
+    verify: cargo nextest run -p sbom per_package_document_without_a_pinned_bundle_is_marked_and_diagnosed
+    property: ¬pin_records_bundle(d) ⇒ read(d) ∧ unverified(component(d)) ∧ stderr names (component(d), "build-servers#185")
   - THE SYSTEM SHALL emit the `unverified` mark on the component in every
     serializer — CycloneDX: a `minimal:verification` property with the value
     `unverified`; SPDX: an annotation of the same text on the package;
@@ -276,10 +289,10 @@ developer running agent boxes; build-infra operator; auditor.
     verify: cargo nextest run -p sbom sbom_unverified_mark_emitted_by_every_serializer
     property: for all serializers s, components k: unverified(k) ⇔ marked_unverified(parse_s(emit_s(c)), k)
   - WHERE `--require-bundles` is given THE SYSTEM SHALL treat a document
-    with no published bundle as unresolved (SBOM-012's failure, naming the
-    missing bundle) instead of reading it. Read-and-mark stays the default
-    while no producer publishes bundles (build-servers#185); whether the
-    default flips once they do is an open question below.
+    the pin records no bundle for as unresolved (SBOM-012's failure, exit
+    code 6, naming the missing bundle) instead of reading it: the strict
+    side of the interim, for a reader that wants no `unverified` component
+    at all.
     tier:   T0
     verify: cargo nextest run -p sbom sbom_require_bundles_fails_on_an_absent_bundle
 
@@ -465,12 +478,6 @@ from the spec and stay schema-TODO.
   now; the state name follows the provenance bundle's (`bundled`) unless the
   producer rules otherwise. Settle on build-servers#185 before the first
   slice's golden fixtures.]
-- [NEEDS CLARIFICATION (MEDIUM): once build-servers#185 publishes a bundle
-  for every package, does reading an unbundled per-package document fail by
-  default (today's `--require-bundles` behaviour), with the read-and-mark
-  path behind an opt-in? Proposed: yes, in the first release after every
-  pinned closure the public registry serves carries bundles; until then a
-  fail-closed default would make every SBOM fail. Settle on build-servers#185.]
 - [NEEDS CLARIFICATION (LOW): SPDX `created` timestamp source (proposal:
   pinned commit's committer timestamp); both answers satisfy SBOM-001;
   settle in first-slice review.]
