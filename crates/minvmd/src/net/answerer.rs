@@ -606,15 +606,39 @@ fn in_box_range(address: Ipv4Addr) -> bool {
 /// hand there is dead until the range aliases are installed: nothing listens
 /// at an address the host cannot bind. A bind to port 0 never clashes with a
 /// real listener, and TCP is the surface a box hand actually serves.
-fn loopback_bindable(address: Ipv4Addr) -> bool {
-    std::net::TcpListener::bind((address, 0)).is_ok()
+///
+/// Only `EADDRNOTAVAIL` means the range is not aliased (`Ok(false)`). Any
+/// other bind error (EMFILE, ENOBUFS, EACCES) says nothing about the range,
+/// so it comes back as the error rather than as an unbindable range.
+fn loopback_bindable(address: Ipv4Addr) -> io::Result<bool> {
+    match std::net::TcpListener::bind((address, 0)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => {
+            tracing::warn!(
+                component = COMPONENT,
+                %address,
+                %error,
+                "this host cannot bind the box address range; the box gets the 127.0.0.1 interim"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
+
+/// The probe [`AddressBook::allocate`] runs. Unit tests run on hosts that
+/// may lack the range aliases (macOS without lo0 aliases), so they take a
+/// probe that always binds; the tests of the interim inject their own.
+#[cfg(not(test))]
+const HOST_BIND_PROBE: fn(Ipv4Addr) -> io::Result<bool> = loopback_bindable;
+#[cfg(test)]
+const HOST_BIND_PROBE: fn(Ipv4Addr) -> io::Result<bool> = |_| Ok(true);
 
 impl AddressBook {
     /// [`Self::allocate_at`], now, with the host's own loopback binding
     /// measured live.
     fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
-        self.allocate_at(node, name, Instant::now(), loopback_bindable)
+        self.allocate_at(node, name, Instant::now(), HOST_BIND_PROBE)
     }
 
     /// The address `name` of `node` holds, or the lowest free one whose
@@ -623,15 +647,18 @@ impl AddressBook {
     /// inside its old address's quarantine gets that address back. When
     /// every free address is still quarantined, the allocation fails
     /// naming when the first one frees — it never hands an address out
-    /// early. An address the host cannot bind is never handed out: the
-    /// caller gets the 127.0.0.1 interim instead, so a name it publishes
-    /// always answers where something listens.
+    /// early. A fresh address the host cannot bind is never handed out:
+    /// the caller gets the 127.0.0.1 interim instead, recorded nowhere, so
+    /// a name it publishes always answers where something listens. A box's
+    /// own address, held or quarantined, comes back without the probe, so
+    /// its address never moves under it. A probe that fails for any reason
+    /// other than an unaliased range refuses the allocation.
     fn allocate_at(
         &mut self,
         node: &str,
         name: &str,
         now: Instant,
-        bindable: impl Fn(Ipv4Addr) -> bool,
+        bindable: impl Fn(Ipv4Addr) -> io::Result<bool>,
     ) -> Result<Ipv4Addr, String> {
         if let Some((address, _)) = self
             .held
@@ -687,8 +714,16 @@ impl AddressBook {
                 ),
             });
         };
-        if !bindable(free) {
-            return Ok(Ipv4Addr::LOCALHOST);
+        if own.is_none() {
+            match bindable(free) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ipv4Addr::LOCALHOST),
+                Err(error) => {
+                    return Err(format!(
+                        "this host could not check that it can listen on {free}: {error}"
+                    ));
+                }
+            }
         }
         self.released.remove(&free);
         self.held.insert(free, holder);
@@ -2779,7 +2814,7 @@ impl AnswererStatus {
                     HandoverCommand::Allocate { name, reply } => {
                         let answer =
                             book.allocate_at(&node, &box_zone_name(&name), Instant::now(), |_| {
-                                true
+                                Ok(true)
                             });
                         match hold_reply() {
                             Some(gate) => {
@@ -5791,8 +5826,12 @@ mod tests {
         );
         let t0 = Instant::now();
         let mut book = AddressBook::default();
-        let a = book.allocate_at("node-a", "a", t0, |_| true).expect(".2");
-        let b = book.allocate_at("node-a", "b", t0, |_| true).expect(".3");
+        let a = book
+            .allocate_at("node-a", "a", t0, |_| Ok(true))
+            .expect(".2");
+        let b = book
+            .allocate_at("node-a", "b", t0, |_| Ok(true))
+            .expect(".3");
         assert_eq!(
             (a, b),
             (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 3))
@@ -5802,7 +5841,7 @@ mod tests {
         assert_eq!(book.release_at("node-a", "a", t0), Some(a));
         let inside = (t0 + ttl).checked_sub(Duration::from_millis(1)).unwrap();
         let c = book
-            .allocate_at("node-b", "c", inside, |_| true)
+            .allocate_at("node-b", "c", inside, |_| Ok(true))
             .expect("a fresh address");
         assert_eq!(
             c,
@@ -5822,12 +5861,12 @@ mod tests {
         );
         let after_a = t0 + ttl;
         assert_eq!(
-            book.allocate_at("node-b", "d", after_a, |_| true),
+            book.allocate_at("node-b", "d", after_a, |_| Ok(true)),
             Ok(a),
             "the lowest address whose quarantine has passed"
         );
         let e = book
-            .allocate_at("node-b", "e", after_a, |_| true)
+            .allocate_at("node-b", "e", after_a, |_| Ok(true))
             .expect("the next fresh one");
         assert_eq!(
             e,
@@ -5838,7 +5877,7 @@ mod tests {
         // The box that held a quarantined address may take it back.
         assert_eq!(book.release_at("node-a", "b", after_a), Some(b));
         assert_eq!(
-            book.allocate_at("node-a", "b", after_a, |_| true),
+            book.allocate_at("node-a", "b", after_a, |_| Ok(true)),
             Ok(b),
             "a box re-registered gets its own address back"
         );
@@ -5848,19 +5887,19 @@ mod tests {
         let mut full = AddressBook::default();
         let (first, last) = switch::box_loopback_interior();
         for (index, _) in (u32::from(first)..=u32::from(last)).enumerate() {
-            full.allocate_at("node-a", &format!("box{index}"), t0, |_| true)
+            full.allocate_at("node-a", &format!("box{index}"), t0, |_| Ok(true))
                 .expect("the range holds it");
         }
         let freed = full.release_at("node-a", "box0", t0).expect("box0 held .2");
         let refused = full
-            .allocate_at("node-b", "late", t0 + Duration::from_secs(10), |_| true)
+            .allocate_at("node-b", "late", t0 + Duration::from_secs(10), |_| Ok(true))
             .expect_err("nothing is free outside the quarantine");
         assert!(
             refused.contains("released in the last 15 s") && refused.contains("frees in 5 s"),
             "the refusal names the quarantine and the wait: {refused}"
         );
         assert_eq!(
-            full.allocate_at("node-b", "late", t0 + ttl, |_| true),
+            full.allocate_at("node-b", "late", t0 + ttl, |_| Ok(true)),
             Ok(freed),
             "once the TTL has passed the address is handed out"
         );
@@ -5875,7 +5914,7 @@ mod tests {
         let now = Instant::now();
         let mut book = AddressBook::default();
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| false),
+            book.allocate_at("node-a", "web", now, |_| Ok(false)),
             Ok(Ipv4Addr::LOCALHOST),
             "a host that cannot bind the range gets the interim"
         );
@@ -5885,13 +5924,13 @@ mod tests {
         );
         for name in ["api", "db", "worker"] {
             assert_eq!(
-                book.allocate_at("node-a", name, now, |_| false),
+                book.allocate_at("node-a", name, now, |_| Ok(false)),
                 Ok(Ipv4Addr::LOCALHOST),
                 "every box of an unbindable host shares the interim"
             );
         }
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| false),
+            book.allocate_at("node-a", "web", now, |_| Ok(false)),
             Ok(Ipv4Addr::LOCALHOST),
             "the interim hand is idempotent per box"
         );
@@ -5902,30 +5941,79 @@ mod tests {
     }
 
     /// The interim hand is only a stand-in: once the host can bind the
-    /// range again — the aliases have arrived — the next allocation hands
-    /// a range address and keeps handing the same one, so the box upgrades
-    /// without a rename.
+    /// range again (the aliases have arrived) the next allocation hands a
+    /// range address and keeps handing the same one. A box created at the
+    /// interim keeps 127.0.0.1 across a resume: the resume does not ask the
+    /// book (`control::resume_reply`).
     #[test]
     fn a_host_that_becomes_bindable_hands_out_range_addresses_again() {
         let now = Instant::now();
         let mut book = AddressBook::default();
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| false),
+            book.allocate_at("node-a", "web", now, |_| Ok(false)),
             Ok(Ipv4Addr::LOCALHOST),
             "before the aliases arrive the interim stands in"
         );
         let upgraded = book
-            .allocate_at("node-a", "web", now, |_| true)
+            .allocate_at("node-a", "web", now, |_| Ok(true))
             .expect("the range answers once the host binds it");
         assert!(
             in_box_range(upgraded),
             "the upgrade hands an address out of the range: {upgraded}"
         );
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| true),
+            book.allocate_at("node-a", "web", now, |_| Ok(true)),
             Ok(upgraded),
             "a re-ask hands back the recorded address"
         );
+    }
+
+    /// A box's own address comes back without the probe: one it holds, and
+    /// one it released inside the quarantine, even when the host has since
+    /// lost the range. Its address never moves under it.
+    #[test]
+    fn a_box_gets_its_own_address_back_without_the_probe() {
+        let t0 = Instant::now();
+        let mut book = AddressBook::default();
+        let web = book
+            .allocate_at("node-a", "web", t0, |_| Ok(true))
+            .expect("the range binds");
+        assert_eq!(
+            book.allocate_at("node-a", "web", t0, |_| Ok(false)),
+            Ok(web),
+            "a held address is handed back as it stands"
+        );
+        assert_eq!(book.release_at("node-a", "web", t0), Some(web));
+        assert_eq!(
+            book.allocate_at("node-a", "web", t0, |_| Ok(false)),
+            Ok(web),
+            "a quarantined own address is handed back too"
+        );
+    }
+
+    /// A probe that fails for a reason other than an unaliased range
+    /// refuses the allocation and names the error, rather than moving the
+    /// box to the shared 127.0.0.1. Nothing is recorded.
+    #[test]
+    fn a_probe_error_refuses_the_allocation() {
+        let mut book = AddressBook::default();
+        let refused = book
+            .allocate_at("node-a", "web", Instant::now(), |_| {
+                Err(io::Error::from_raw_os_error(libc::EMFILE))
+            })
+            .expect_err("a probe error is not an unbindable range");
+        assert!(
+            refused.contains("could not check that it can listen on 127.0.64.2"),
+            "the refusal names the address it probed: {refused}"
+        );
+        assert!(book.held.is_empty() && book.released.is_empty());
+    }
+
+    /// The live probe binds 127.0.0.1 on every host, so it answers
+    /// `Ok(true)` there: the classifier never reads a bind as a refusal.
+    #[test]
+    fn the_live_probe_binds_the_interim() {
+        assert!(matches!(loopback_bindable(Ipv4Addr::LOCALHOST), Ok(true)));
     }
 
     /// Box addresses are host-global (design §7.1): the answerer hands

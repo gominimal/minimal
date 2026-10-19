@@ -1092,9 +1092,19 @@ fn resume_reply(
         Err(error) => return refused(error),
     };
     let claim = boxes.begin_registration(&name);
-    let allocated = match allocate_box_address(answerer, &name) {
-        Ok(allocated) => allocated,
-        Err(reply) => return reply,
+    // A box created at the 127.0.0.1 interim (the host could not bind the
+    // box range then) keeps it: the answerer records no address for it, so
+    // asking it now would hand a range address once the host binds the
+    // range, and the resume would refuse it as moved. `resumable` checked
+    // the presented address against the creation's.
+    let interim = request.loopback_address == std::net::Ipv4Addr::LOCALHOST;
+    let allocated = if interim {
+        std::net::Ipv4Addr::LOCALHOST
+    } else {
+        match allocate_box_address(answerer, &name) {
+            Ok(allocated) => allocated,
+            Err(reply) => return reply,
+        }
     };
     order.apply(move || {
         match boxes.resume_client_box(
@@ -1112,9 +1122,10 @@ fn resume_reply(
                 task_addresses: record.task_addrs().to_vec(),
             }),
             Err(error) => {
-                let released = boxes.release_unless_owned(&claim, || {
-                    answerer.release_address(&name);
-                });
+                let released = !interim
+                    && boxes.release_unless_owned(&claim, || {
+                        answerer.release_address(&name);
+                    });
                 tracing::info!(
                     address_released = released,
                     box = %name,
