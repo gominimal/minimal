@@ -606,6 +606,7 @@ dependencies = [
  "indoc",
  "nutype",
  "paths",
+ "proptest",
  "serde",
  "serde_json_lenient",
  "tempfile",
