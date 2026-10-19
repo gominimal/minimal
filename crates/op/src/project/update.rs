@@ -3,7 +3,7 @@
 
 use anyhow::anyhow;
 use mfile::LinkConfig;
-use toml_edit::{DocumentMut, value};
+use toml_edit::{DocumentMut, Item, TableLike, Value, value};
 
 use super::{ProjectEnv, ProjectOp};
 use crate::Error;
@@ -62,15 +62,15 @@ impl ProjectOp for UpdateProject {
                 Some(LinkConfig::Dir { .. }) | None => None,
             };
 
-        // Preserve index alignment with the on-disk `[[upstream.sideload]]`
-        // array: non-git / branchless sideloads stay as `None`.
-        let sideloads: Vec<Option<(String, String, Option<String>)>> = mfile
+        // Each git sideload with a tracking branch, as read before the lock.
+        // The write below finds each one again by identity, not by index.
+        let sideloads: Vec<(String, String, Option<String>)> = mfile
             .upstream
             .as_ref()
             .map(|u| u.sideloads())
             .unwrap_or_default()
             .iter()
-            .map(|s| match s.link() {
+            .filter_map(|s| match s.link() {
                 LinkConfig::Git {
                     repo,
                     branch: Some(branch),
@@ -85,74 +85,204 @@ impl ProjectOp for UpdateProject {
         env.update_checkouts()?;
 
         // If a tracking branch is specified for the upstream, check out its head.
-        let new_up_rev = if let Some((repo, Some(b), commit)) = &upstream {
-            let new_git_ref = env.checkout_branch(repo, b)?;
-            (Some(&new_git_ref) != commit.as_ref()).then_some(new_git_ref)
-        } else {
-            None
+        let upstream_pin = match upstream {
+            Some((repo, Some(branch), from)) => {
+                let to = env.checkout_branch(&repo, &branch)?;
+                (Some(&to) != from.as_ref()).then_some(RevChange {
+                    repo,
+                    branch,
+                    from,
+                    to,
+                })
+            }
+            _ => None,
         };
 
         // Update all the sideloads, if present.
-        let sideload_updates = sideloads
-            .iter()
-            .map(|s| match s {
-                Some((repo, branch, locked_commit)) => {
-                    let new_git_ref = env.checkout_branch(repo, branch)?;
-                    Ok((Some(&new_git_ref) != locked_commit.as_ref()).then_some(new_git_ref))
-                }
-                None => Ok(None),
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-
-        let mut report = UpdateReport::default();
+        let mut sideload_pins = Vec::new();
+        for (repo, branch, from) in sideloads {
+            let to = env.checkout_branch(&repo, &branch)?;
+            if Some(&to) != from.as_ref() {
+                sideload_pins.push(RevChange {
+                    repo,
+                    branch,
+                    from,
+                    to,
+                });
+            }
+        }
 
         // If theres a minimal file on disk with at least one new rev, write the
         // revs to the minimal file.
         let Some(p) = mfile_path else {
-            return Ok(report);
+            return Ok(UpdateReport::default());
         };
+        if upstream_pin.is_none() && sideload_pins.is_empty() {
+            return Ok(UpdateReport::default());
+        }
 
-        // The whole read-edit-write runs under `File::edit_exclusively`'s
-        // lock (with an atomic replace), so a concurrent `min` command can neither lose
-        // our re-pin nor have its own edit lost by us.
+        // The checkouts above run outside the lock, because they fetch over
+        // the network. So another command can edit `minimal.toml` between
+        // the snapshot and this write. The re-read under the lock is the
+        // truth: each pin lands only on a link that still names the same
+        // repo, branch and old commit, wherever that link now sits.
+        let mut report = UpdateReport::default();
         mfile::File::edit_exclusively::<anyhow::Error>(&p, |content| {
             let toml =
                 content.ok_or_else(|| anyhow!("reading {} for update: not found", p.display()))?;
             let mut doc = toml.parse::<DocumentMut>().map_err(anyhow::Error::from)?;
-
-            if new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()) {
-                if let Some(new_rev) = new_up_rev {
-                    doc["upstream"]["locked_commit"] = value(new_rev.clone());
-                    // `new_up_rev` is only set when the upstream has a tracking branch.
-                    let (repo, branch, from) = upstream.expect("upstream present for new rev");
-                    report.upstream = Some(RevChange {
-                        repo,
-                        branch: branch.expect("tracking branch present for new rev"),
-                        from,
-                        to: new_rev,
-                    });
-                }
-
-                for (i, rev) in sideload_updates.into_iter().enumerate() {
-                    if let Some(new_rev) = rev {
-                        if let Some((repo, branch, from)) = &sideloads[i] {
-                            report.sideloads.push(RevChange {
-                                repo: repo.clone(),
-                                branch: branch.clone(),
-                                from: from.clone(),
-                                to: new_rev.clone(),
-                            });
-                        }
-                        doc["upstream"]["sideload"][i]["locked_commit"] = value(new_rev);
-                    }
-                }
-
-                Ok(Some(doc.to_string()))
-            } else {
-                Ok(None)
-            }
+            report = apply_pins(&mut doc, upstream_pin, sideload_pins);
+            Ok(
+                (report.upstream.is_some() || !report.sideloads.is_empty())
+                    .then(|| doc.to_string()),
+            )
         })?;
 
         Ok(report)
+    }
+}
+
+/// Writes each pin into `doc` on the link that still matches it: the same
+/// `repo`, `branch` and old `locked_commit`. A pin whose link changed or
+/// went away since the snapshot is dropped. Returns the pins that landed.
+fn apply_pins(
+    doc: &mut DocumentMut,
+    upstream: Option<RevChange>,
+    sideloads: Vec<RevChange>,
+) -> UpdateReport {
+    let mut report = UpdateReport::default();
+    let Some(up) = doc.get_mut("upstream") else {
+        return report;
+    };
+    if let Some(pin) = upstream
+        && up.as_table_like_mut().is_some_and(|t| repin(t, &pin))
+    {
+        report.upstream = Some(pin);
+    }
+    let mut links: Vec<&mut dyn TableLike> = match up.get_mut("sideload") {
+        Some(Item::ArrayOfTables(a)) => a.iter_mut().map(|t| t as &mut dyn TableLike).collect(),
+        Some(Item::Value(Value::Array(a))) => a
+            .iter_mut()
+            .filter_map(Value::as_inline_table_mut)
+            .map(|t| t as &mut dyn TableLike)
+            .collect(),
+        _ => Vec::new(),
+    };
+    for pin in sideloads {
+        let mut landed = false;
+        for link in links.iter_mut() {
+            landed |= repin(*link, &pin);
+        }
+        if landed {
+            report.sideloads.push(pin);
+        }
+    }
+    report
+}
+
+/// Sets `locked_commit` to `pin.to` when `link` still names the pin's repo,
+/// branch and old commit.
+fn repin(link: &mut dyn TableLike, pin: &RevChange) -> bool {
+    let field = |k: &str| link.get(k).and_then(Item::as_str).map(str::to_owned);
+    if field("repo").as_deref() != Some(pin.repo.as_str())
+        || field("branch").as_deref() != Some(pin.branch.as_str())
+        || field("locked_commit") != pin.from
+    {
+        return false;
+    }
+    link.insert("locked_commit", value(pin.to.clone()));
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pin(repo: &str, from: Option<&str>, to: &str) -> RevChange {
+        RevChange {
+            repo: repo.into(),
+            branch: "main".into(),
+            from: from.map(Into::into),
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn apply_pins_finds_a_sideload_that_moved() {
+        // The snapshot saw `a` then `b`. A concurrent edit put `c` first.
+        let mut doc = r#"
+[upstream]
+repo = "up"
+branch = "main"
+locked_commit = "u0"
+
+[[upstream.sideload]]
+repo = "c"
+branch = "main"
+locked_commit = "c0"
+
+[[upstream.sideload]]
+repo = "a"
+branch = "main"
+locked_commit = "a0"
+
+[[upstream.sideload]]
+repo = "b"
+branch = "main"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let report = apply_pins(
+            &mut doc,
+            Some(pin("up", Some("u0"), "u1")),
+            vec![pin("a", Some("a0"), "a1"), pin("b", None, "b1")],
+        );
+        let up = &doc["upstream"];
+        assert_eq!(up["locked_commit"].as_str(), Some("u1"));
+        let sl = up["sideload"].as_array_of_tables().unwrap();
+        let commits: Vec<_> = sl
+            .iter()
+            .map(|t| t.get("locked_commit").and_then(Item::as_str))
+            .collect();
+        assert_eq!(commits, [Some("c0"), Some("a1"), Some("b1")]);
+        assert!(report.upstream.is_some());
+        assert_eq!(report.sideloads.len(), 2);
+    }
+
+    #[test]
+    fn apply_pins_drops_a_pin_whose_link_changed_or_went_away() {
+        let mut doc = r#"
+[upstream]
+repo = "up"
+branch = "main"
+locked_commit = "other"
+sideload = [{ repo = "a", branch = "main", locked_commit = "a0" }]
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let before = doc.to_string();
+        let report = apply_pins(
+            &mut doc,
+            Some(pin("up", Some("u0"), "u1")),
+            vec![pin("gone", Some("g0"), "g1")],
+        );
+        assert_eq!(doc.to_string(), before);
+        assert!(report.upstream.is_none());
+        assert!(report.sideloads.is_empty());
+
+        let report = apply_pins(&mut doc, None, vec![pin("a", Some("a0"), "a1")]);
+        assert_eq!(report.sideloads.len(), 1);
+        assert_eq!(
+            doc["upstream"]["sideload"][0]["locked_commit"].as_str(),
+            Some("a1")
+        );
+    }
+
+    #[test]
+    fn apply_pins_without_an_upstream_table_changes_nothing() {
+        let mut doc = "[tasks]\n".parse::<DocumentMut>().unwrap();
+        let report = apply_pins(&mut doc, Some(pin("up", None, "u1")), Vec::new());
+        assert!(report.upstream.is_none());
+        assert_eq!(doc.to_string(), "[tasks]\n");
     }
 }
