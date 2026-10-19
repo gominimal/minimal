@@ -554,6 +554,7 @@ impl BoxSession {
                     // activation sends. This session only runs execs, so it
                     // declares no hooks either way.
                     hooks_enabled: true,
+                    ends_with_run: false,
                     attrs: Default::default(),
                 },
                 must_match_version: None,

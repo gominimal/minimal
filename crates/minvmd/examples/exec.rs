@@ -175,6 +175,7 @@ async fn run_session_exec(
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
+                ends_with_run: false,
                 attrs: Default::default(),
             },
             // The guest daemon is built from this same tree by the harness, so

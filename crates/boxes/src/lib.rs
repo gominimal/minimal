@@ -1256,14 +1256,14 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bound_ports: BTreeSet<SocketAddrV4>,
 
-    /// Set on a box minted for a single `min task run` before the run's
-    /// task starts, so the box dies with its run even if the daemon that
-    /// accepted it does not (NET-131): a restart's resume destroys a
-    /// marked box instead of bringing it back, which is the same teardown
-    /// a finished run's own box-end takes. Daemon-owned, like
-    /// [`Self::host_ip_enforcement`]: only the run-accepting daemon
-    /// writes it, and only the resume reads it. Defaults to `false` for
-    /// every record that predates the field.
+    /// Set on a box created for a single `min task run` without `--keep`,
+    /// so the box dies with its run even if the daemon that accepted it
+    /// does not (NET-131): a restart's resume destroys a marked box
+    /// instead of bringing it back, which is the same teardown a finished
+    /// run's own box-end takes. Written once, by the create that mints the
+    /// record (the client's `BoxConfig::ends_with_run`), and read only by
+    /// the resume. Defaults to `false` for every record that predates the
+    /// field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ends_with_run: bool,
 

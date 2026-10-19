@@ -743,6 +743,7 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             box_id: None,
             box_addresses: None,
             hooks_enabled: true,
+            ends_with_run: false,
             attrs: Default::default(),
         },
         // No assertion: the harness's client *is* this daemon's build, and

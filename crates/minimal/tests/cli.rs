@@ -4500,6 +4500,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         box_id: None,
         box_addresses: None,
         hooks_enabled: true,
+        ends_with_run: false,
         attrs: Default::default(),
     };
 
@@ -4576,6 +4577,7 @@ async fn create_session_with(
         box_id: None,
         box_addresses: None,
         hooks_enabled: true,
+        ends_with_run: false,
         attrs: Default::default(),
     };
 

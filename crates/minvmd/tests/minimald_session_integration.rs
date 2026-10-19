@@ -290,6 +290,7 @@ async fn run_session_exec(
                 // activation sends. This session only runs an exec, so
                 // it declares no hooks either way.
                 hooks_enabled: true,
+                ends_with_run: false,
                 attrs: Default::default(),
             },
             // The guest daemon is built from this same tree by the harness, so

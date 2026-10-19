@@ -526,6 +526,7 @@ async fn create_toolchain_session(
             box_id: Some(box_id),
             box_addresses: Some(addresses),
             hooks_enabled: true,
+            ends_with_run: false,
             attrs: Default::default(),
         },
         must_match_version: None,

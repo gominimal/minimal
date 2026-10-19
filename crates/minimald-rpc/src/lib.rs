@@ -491,6 +491,14 @@ pub struct BoxConfig {
     /// so a client that predates the field gets hooks, not silence.
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
+    /// Whether the box ends with the one `min task run` it is created for
+    /// (NET-131): set by a run without `--keep`, and persisted onto the
+    /// record as [`boxes::Record::ends_with_run`] by the create itself, so
+    /// a daemon restart at any point after the create destroys the box
+    /// rather than resuming it. Defaults to `false`, which is every other
+    /// create and every client that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
     /// session's record. The daemon writes none of its own: NET-079's
     /// per-box enforcement is a daemon-owned launch record, carried on the
@@ -3200,6 +3208,7 @@ mod tests {
                 // default, so a fixture using it would round-trip green
                 // even if the field never reached the wire.
                 hooks_enabled: false,
+                ends_with_run: false,
                 attrs: [("color".to_string(), "blue".to_string())]
                     .into_iter()
                     .collect(),

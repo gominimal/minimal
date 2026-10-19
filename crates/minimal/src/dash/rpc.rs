@@ -514,6 +514,7 @@ pub async fn activate(
         // has no `--no-hooks` of its own, and a session created here
         // is attachable later like any other.
         hooks_enabled: true,
+        ends_with_run: false,
         attrs: Default::default(),
     };
     let undeclared_own_ip = config.network == NetworkMode::OwnIp && config.policy.egress.is_none();
@@ -951,6 +952,7 @@ mod tests {
             box_id: None,
             box_addresses: None,
             hooks_enabled: true,
+            ends_with_run: false,
             attrs: Default::default(),
         }
     }

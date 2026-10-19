@@ -120,7 +120,10 @@ fn build_record(
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
-        ends_with_run: false,
+        // Written by the create itself, never later: a box that ends with
+        // its run is marked from its first record, so no restart can land
+        // in a window where it reads as a plain session (NET-131).
+        ends_with_run: config.ends_with_run,
         attrs: config.attrs,
     };
     record
@@ -167,13 +170,6 @@ struct CreateSessionMsg {
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
-    /// Mark a session's box as ending with its run (NET-131): written
-    /// before the run's task starts, read by the restart resume, so a
-    /// daemon that dies mid-run leaves a box the resume destroys rather
-    /// than one it brings back. Answers whether the mark was persisted
-    /// — a mark that could not be persisted is the run's caller's signal
-    /// to proceed as before, not a reason to refuse the run.
-    MarkRunOwned(SessionId, Responder<()>),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
@@ -219,7 +215,6 @@ impl ManagerMessage {
         match self {
             Self::List(..) => "List",
             Self::GetRecord(..) => "GetRecord",
-            Self::MarkRunOwned(..) => "MarkRunOwned",
             Self::GetSession(..) => "GetSession",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
@@ -1145,28 +1140,52 @@ impl BoxManager {
                     continue;
                 }
             };
-            // A run-owned box dies with its run even when the daemon did
-            // not (NET-131): the mark was persisted before the run's task
-            // started, so a daemon death mid-run leaves it set. Destroying
-            // here is the same teardown a finished run's own box-end takes,
-            // so the box's `on_destroy` hooks run and its record is
-            // removed rather than the run resuming as if it owned nothing.
-            // The status and network filter below never sees it: a run box
-            // can hold any status the run's launch left it in.
+            // A box that ends with its run dies with it even when the
+            // daemon did not (NET-131): the create marked the record, so a
+            // daemon death at any point after the create leaves the mark
+            // set. Destroying here is the same teardown a finished run's
+            // own box-end takes, so the box's `on_destroy` hooks run and
+            // its record is removed. The status and network filter below
+            // never sees it: a run box can hold any status the run's
+            // launch left it in.
+            //
+            // The actor comes up without registering the box's name, so
+            // it never takes over a name another box routes. The hooks
+            // run off the manager's message handling: each can take up to
+            // its timeout, and daemon startup and every queued RPC must
+            // not wait on them.
             if record.ends_with_run {
                 tracing::info!(
                     session_id = %session_id,
                     session_name = record.name.as_deref().unwrap_or("<anonymous>"),
                     "resume: destroying the box its run ended (run-owned), not resuming it",
                 );
-                if let Err(error) = self.destroy_session_record(session_id, handle).await {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        %error,
-                        "resume: destroying the run-owned box failed; leaving its \
-                         record as it stands",
-                    );
-                }
+                let actor = self.start_box_teardown(session_id, &handle, false).await;
+                crate::traced::spawn_detached(
+                    tracing::info_span!(
+                        parent: None,
+                        "resume_run_owned_teardown",
+                        session_id = %session_id
+                    ),
+                    async move {
+                        match Self::finish_box_teardown(actor, handle).await {
+                            Ok(hook_failures) => {
+                                for failure in hook_failures {
+                                    tracing::warn!(
+                                        %failure,
+                                        "resume: an on_destroy hook of the run-owned \
+                                         box failed; the box is destroyed anyway",
+                                    );
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "resume: destroying the run-owned box failed; \
+                                 leaving its record as it stands",
+                            ),
+                        }
+                    },
+                );
                 continue;
             }
             if !matches!(record.status, boxes::BoxState::Active)
@@ -1244,9 +1263,10 @@ impl BoxManager {
         Ok(resumed)
     }
 
-    /// Tears a session's record down through its actor, then removes the
-    /// record — the `DeleteSession` path, shared with the resume's
-    /// run-owned teardown so both end a box exactly one way.
+    /// Tears a box down through its actor, then removes its record: the
+    /// `DeleteSession` path. The resume's teardown of a box that ends with
+    /// its run takes the same two halves, [`Self::start_box_teardown`] and
+    /// [`Self::finish_box_teardown`], so both end a box exactly one way.
     ///
     /// Teardown belongs to the actor, so an idle session gets one brought
     /// up rather than having its record deleted out from under it. That
@@ -1257,31 +1277,58 @@ impl BoxManager {
     ///
     /// Spawning is cheap: the actor reads its record and composition, and
     /// only mints a sandbox if there are destroy hooks to run in one.
-    async fn destroy_session_record(
+    async fn destroy_box_record(
         &mut self,
         id: SessionId,
         handle: BoxRecordHandle,
     ) -> Result<Vec<String>, BoxManagerError> {
-        let actor = match self.running.remove(&id) {
-            Some(hnd) => Some(hnd),
-            None => match BoxActor::run(self.session_config(handle.clone())).await {
-                Ok(hnd) => Some(hnd),
-                // A record the actor refuses to come up on — a
-                // restart-orphaned `Materializing` one is the known case —
-                // must still be destroyable, so fall through to deleting
-                // it directly. A session that cannot be torn down is worse
-                // than one torn down without its hooks.
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %id,
-                        error = %e,
-                        "could not start the session to run its destroy hooks; \
-                         removing its record without them",
-                    );
-                    None
-                }
-            },
-        };
+        let actor = self.start_box_teardown(id, &handle, true).await;
+        Self::finish_box_teardown(actor, handle).await
+    }
+
+    /// The manager's half of a teardown: takes the box's running actor out
+    /// of `running`, or brings one up from its record. `None` when the
+    /// actor refuses to come up, and the record is then removed without
+    /// its hooks. `registers_name` is the bring-up's
+    /// [`BoxActorConfig::registers_name`]: `false` for the resume's
+    /// teardown, whose actor must not take over another box's name.
+    async fn start_box_teardown(
+        &mut self,
+        id: SessionId,
+        handle: &BoxRecordHandle,
+        registers_name: bool,
+    ) -> Option<BoxHandle> {
+        if let Some(hnd) = self.running.remove(&id) {
+            return Some(hnd);
+        }
+        let mut config = self.session_config(handle.clone());
+        config.registers_name = registers_name;
+        match BoxActor::run(config).await {
+            Ok(hnd) => Some(hnd),
+            // A record the actor refuses to come up on — a
+            // restart-orphaned `Materializing` one is the known case —
+            // must still be destroyable, so fall through to deleting it
+            // directly. A box that cannot be torn down is worse than one
+            // torn down without its hooks.
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "could not start the session to run its destroy hooks; \
+                     removing its record without them",
+                );
+                None
+            }
+        }
+    }
+
+    /// The half of a teardown that waits on the box's `on_destroy` hooks.
+    /// It holds nothing of the manager's, so the resume can run it off the
+    /// manager's own message handling. Answers the hook failures.
+    async fn finish_box_teardown(
+        actor: Option<BoxHandle>,
+        handle: BoxRecordHandle,
+    ) -> Result<Vec<String>, BoxManagerError> {
         match actor {
             Some(hnd) => {
                 let hook_failures = hnd.destroy().await?;
@@ -1317,6 +1364,7 @@ impl BoxManager {
             manager: self.weak_self.clone(),
             deny_all_opt_out: self.deny_all_opt_out,
             creator: None,
+            registers_name: true,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -1463,32 +1511,6 @@ impl BoxManager {
                 })
                 .await;
             }
-            // Persists the run-owned mark on the record, before the run's
-            // task starts: a mark written after the task could not survive
-            // a daemon death that lands between the two.
-            ManagerMessage::MarkRunOwned(id, r) => {
-                r.handle(async {
-                    let handle =
-                        self.store
-                            .find(RecordPredicate::Id(id))
-                            .await?
-                            .ok_or_else(|| {
-                                BoxManagerError::new(
-                                    NotFound,
-                                    format!(
-                                        "{} `{}`",
-                                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
-                                        id.as_ref()
-                                    ),
-                                )
-                            })?;
-                    let mut record = handle.record().await?;
-                    record.ends_with_run = true;
-                    handle.write(record).await?;
-                    Ok(())
-                })
-                .await;
-            }
             #[cfg(target_os = "linux")]
             ManagerMessage::ResumeActive(r) => {
                 r.handle(self.resume_active_sessions()).await;
@@ -1600,7 +1622,7 @@ impl BoxManager {
                                     ),
                                 )
                             })?;
-                    self.destroy_session_record(id, handle).await
+                    self.destroy_box_record(id, handle).await
                 })
                 .await
             }
@@ -1952,22 +1974,6 @@ impl BoxManagerHandle {
         recv.await.expect("corresponding sessions manager is dead")
     }
 
-    /// Persists the run-owned mark on a session's record (NET-131):
-    /// written before the run's task starts, read by the restart resume,
-    /// so a daemon that dies mid-run leaves a box the resume destroys
-    /// rather than one it resumes. The run's caller warns and proceeds
-    /// on `Err` — an unmarkable box keeps the pre-mark behaviour, which
-    /// strands at worst the one box, never the run.
-    pub async fn mark_run_owned(&self, id: SessionId) -> Result<(), BoxManagerError> {
-        let (send, recv) = Responder::channel();
-        // Ignore send errors - the recv will also fail.
-        let _ = self
-            .sender
-            .send(ManagerMessage::MarkRunOwned(id, send))
-            .await;
-        recv.await.expect("corresponding sessions manager is dead")
-    }
-
     /// Creates a session from the given config, returning its allocated id.
     /// The session comes up live but unconfigured — [`configure_loadout`]
     /// against the returned id composes its loadout and finalizes it.
@@ -2237,6 +2243,7 @@ pub(crate) mod tests {
             box_id: None,
             box_addresses: None,
             hooks_enabled: true,
+            ends_with_run: false,
             attrs: Default::default(),
         }
     }
@@ -2462,6 +2469,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// `sample_config` for a box created for a `min task run` without
+    /// `--keep`: marked to end with its run from its create.
+    fn run_owned_config() -> minimald_rpc::BoxConfig {
+        let mut config = sample_config();
+        config.ends_with_run = true;
+        config
+    }
+
+    /// Waits for the resume's detached teardown of `id` to remove its
+    /// record. The resume returns before the teardown ends, by design.
+    async fn wait_for_record_gone(mngr: &BoxManagerHandle, id: SessionId) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while mngr
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the run-owned box's record should be gone after the resume"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// A box marked run-owned is destroyed by the restart's resume, not
     /// resumed: the run it was minted for is over the moment the daemon
     /// that accepted it died, and bringing the box back would strand it
@@ -2476,7 +2509,7 @@ pub(crate) mod tests {
         let (state, cache, mngr) = manager().await;
         let id = create_active_session_contributing(
             &mngr,
-            sample_config(),
+            run_owned_config(),
             WireContribution {
                 lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
                     hook: boxes::wire::primitives::WireLifecycleHook {
@@ -2494,7 +2527,6 @@ pub(crate) mod tests {
             },
         )
         .await;
-        mngr.mark_run_owned(id).await.unwrap();
 
         // A second manager over the same store: a daemon restart's view,
         // holding a box whose run died with the first daemon.
@@ -2505,17 +2537,10 @@ pub(crate) mod tests {
             resumed, 0,
             "a run-owned box must not be resumed by a restart",
         );
+        wait_for_record_gone(&restarted, id).await;
         assert!(
             marker.exists(),
             "destroying the run-owned box on resume skipped its on_destroy hook",
-        );
-        assert!(
-            restarted
-                .get_record(BoxKeyPredicate::Id(id))
-                .await
-                .unwrap()
-                .is_none(),
-            "the run-owned box's record should be gone after the resume"
         );
         assert_eq!(
             restarted.running_count().await,
@@ -2530,24 +2555,16 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_still_resumes_a_plain_session_beside_a_run_owned_one() {
         let (state, cache, mngr) = manager().await;
-        let marked = create_active_session(&mngr).await;
+        let marked = create_active_session_with(&mngr, run_owned_config()).await;
         let mut keeper_config = sample_config();
         keeper_config.name = Some("keeper".to_string());
         let keeper = create_active_session_with(&mngr, keeper_config).await;
-        mngr.mark_run_owned(marked).await.unwrap();
 
         let restarted = manager_over(state.path(), cache.path()).await;
         let resumed = restarted.resume_active_sessions().await.unwrap();
 
         assert_eq!(resumed, 1, "exactly the plain session should resume");
-        assert!(
-            restarted
-                .get_record(BoxKeyPredicate::Id(marked))
-                .await
-                .unwrap()
-                .is_none(),
-            "the run-owned box should be destroyed by the resume"
-        );
+        wait_for_record_gone(&restarted, marked).await;
         assert!(
             restarted
                 .get_record(BoxKeyPredicate::Id(keeper))
@@ -2563,24 +2580,79 @@ pub(crate) mod tests {
         );
     }
 
-    /// The run-owned mark lands on the persisted record, so it is
-    /// readable from a manager that never wrote it — the restart's.
+    /// The create writes the run-owned mark on the record itself, so the
+    /// mark is there before any task starts, and a fresh manager over the
+    /// same store (a restart's) reads it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mark_run_owned_persists_on_the_record() {
-        let (state, _cache, mngr) = manager().await;
-        let id = create_active_session(&mngr).await;
+    async fn create_persists_the_run_owned_mark_on_the_record() {
+        let (state, cache, mngr) = manager().await;
+        let marked = create_active_session_with(&mngr, run_owned_config()).await;
+        let mut plain_config = sample_config();
+        plain_config.name = Some("plain".to_string());
+        let plain = create_active_session_with(&mngr, plain_config).await;
 
-        mngr.mark_run_owned(id).await.unwrap();
-
-        let restarted = manager_over(state.path(), _cache.path()).await;
-        let record = restarted
-            .get_record(BoxKeyPredicate::Id(id))
-            .await
-            .unwrap()
-            .expect("the record must survive the mark");
+        let restarted = manager_over(state.path(), cache.path()).await;
+        let read = |id| {
+            let restarted = &restarted;
+            async move {
+                restarted
+                    .get_record(BoxKeyPredicate::Id(id))
+                    .await
+                    .unwrap()
+                    .expect("the record must survive the create")
+            }
+        };
         assert!(
-            record.ends_with_run,
-            "the mark must be readable from a fresh manager over the same store",
+            read(marked).await.ends_with_run,
+            "a run-owned create must mark its record",
+        );
+        assert!(
+            !read(plain).await.ends_with_run,
+            "a plain create must leave its record unmarked",
+        );
+    }
+
+    /// The resume's teardown of a run-owned box leaves alone the route of
+    /// a box with the same name that the same resume brought back. Both
+    /// boxes are unnamed, with projects that share the basename "app", so
+    /// both derive the registry name "app". The plain box is the older
+    /// one, so the resume registers its route first.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_teardown_keeps_the_route_of_a_same_named_box() {
+        let (state, cache, mngr) = manager().await;
+        let plain_project = TempDir::new().unwrap();
+        let plain_dir = plain_project.path().join("app");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        let run_project = TempDir::new().unwrap();
+        let run_dir = run_project.path().join("app");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let mut config = sample_config();
+        config.name = None;
+        config.network = boxes::NetworkMode::HostNet;
+        config.project_path = HostAbsPath::try_new(plain_dir.to_str().unwrap()).unwrap();
+        let plain = create_active_session_with(&mngr, config).await;
+
+        let mut config = run_owned_config();
+        config.name = None;
+        config.network = boxes::NetworkMode::HostNet;
+        config.project_path = HostAbsPath::try_new(run_dir.to_str().unwrap()).unwrap();
+        let marked = create_active_session_with(&mngr, config).await;
+
+        let restarted = manager_over(state.path(), cache.path()).await;
+        let resumed = restarted.resume_active_sessions().await.unwrap();
+        assert_eq!(resumed, 1, "exactly the plain box should resume");
+        wait_for_record_gone(&restarted, marked).await;
+
+        assert!(
+            restarted
+                .hostnames()
+                .read()
+                .expect("registry lock")
+                .name_held_by(plain, "app"),
+            "the run-owned box's teardown must not take over or withdraw \
+             the resumed box's route",
         );
     }
 

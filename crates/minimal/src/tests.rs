@@ -2687,6 +2687,7 @@ async fn create_box_on(
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
+                ends_with_run: false,
                 attrs: Default::default(),
             },
             must_match_version: minimal_client::version_assertion(),

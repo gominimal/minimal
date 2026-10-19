@@ -679,6 +679,7 @@ pub(crate) async fn activate_session(
         box_id: None,
         box_addresses: None,
         hooks_enabled: !args.no_hooks,
+        ends_with_run: false,
         attrs: Default::default(),
     };
 

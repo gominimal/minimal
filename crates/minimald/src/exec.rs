@@ -1874,19 +1874,6 @@ pub(crate) async fn handle_exec(
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
             let span = span.clone();
             session.channel_success(id)?;
-            // Persist the run-owned mark before the task starts, so a
-            // daemon death mid-run leaves a box the restart resume
-            // destroys rather than one it brings back (NET-131). A mark
-            // that cannot be persisted downgrades to the pre-mark
-            // behaviour — the box strands, the run does not.
-            if owns_box && let Err(e) = mngr.mark_run_owned(session_id).await {
-                tracing::warn!(
-                    %session_id,
-                    error = %e,
-                    "could not mark the box as run-owned; it will not be reaped \
-                     if the daemon dies mid-run",
-                );
-            }
             spawn(tracing::Instrument::instrument(
                 async move {
                     // `ExecTask::run` consumes the server handle; the box's end

@@ -662,6 +662,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // its own; a `--keep` session is attachable later, so its hooks
         // should behave like any other session's.
         hooks_enabled: true,
+        // The box ends with this run unless `--keep` retains it: marked at
+        // create, so a daemon restart before or during the run destroys it
+        // rather than resuming it (NET-131).
+        ends_with_run: !args.keep,
         attrs: Default::default(),
     };
 
