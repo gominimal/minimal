@@ -562,6 +562,58 @@ fn refuse_ingress_off_own_ip(
     Ok(())
 }
 
+/// The box's credentialed-upstream declaration: the `--credentialed-upstream`
+/// flag, or any `[session.network.bep]` setting or `[session.secrets]` grant
+/// in the project's `minimal.toml` (NET-134, BEP-016). The settings ride the
+/// declaration. A project file that does not load declares nothing here; the
+/// upload path reports a broken file before the create.
+fn credentialed_upstream_for(
+    flag: bool,
+    project: &camino::Utf8Path,
+) -> Option<boxes::CredentialedUpstream> {
+    let session = mfile::File::from_dir_recursive(project.as_std_path())
+        .ok()
+        .and_then(|file| file.session);
+    let (bep, secrets) = session.map_or_else(Default::default, |session| {
+        (
+            session.network.and_then(|n| n.bep).unwrap_or_default(),
+            session.secrets,
+        )
+    });
+    let declared = flag || !bep.is_empty() || !secrets.is_empty();
+    declared.then_some(boxes::CredentialedUpstream { bep, secrets })
+}
+
+/// Refuses a box spec whose grants the box or this host cannot honour, and
+/// prints the warnings of one it accepts. The refusal ends the run with
+/// exit 3 (`main.rs`). Every host today is un-enrolled and has no box-zone
+/// resolver.
+fn refuse_unhonourable_grants(
+    network: boxes::NetworkMode,
+    policy: &boxes::BoxPolicy,
+) -> Result<(), anyhow::Error> {
+    use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
+    let Some(upstream) = &policy.credentialed_upstream else {
+        return Ok(());
+    };
+    let hosts: Vec<&str> = bep::module::GITHUB
+        .hosts
+        .iter()
+        .map(|authority| authority.host)
+        .collect();
+    let spec = ActivationSpec {
+        network,
+        egress: policy.egress.as_ref(),
+        bep: &upstream.bep,
+        secrets: &upstream.secrets,
+    };
+    let plan = check_activation(&spec, HostFacts::LOCAL, &hosts)?;
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -575,7 +627,6 @@ pub(crate) async fn activate_session(
     // A static mapping needs an own-IP box too: only it has a published
     // address a static forwarder could apply to.
     refuse_ingress_off_own_ip(args.network, !args.ingress.is_empty())?;
-    ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -647,10 +698,13 @@ pub(crate) async fn activate_session(
         // a box that did not ask for a credentialed upstream keeps every
         // frame it sends to the proxy's address refused at the host-side
         // gate, whatever its egress rules say.
-        credentialed_upstream: args
-            .credentialed_upstream
-            .then(boxes::CredentialedUpstream::default),
+        credentialed_upstream: credentialed_upstream_for(args.credentialed_upstream, &utf8_path),
     };
+
+    // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
+    // refused here, before the daemon starts and before anything is created.
+    refuse_unhonourable_grants(args.network.into(), &policy)?;
+    ensure_daemon(global)?;
 
     // A session with no `--name` still deserves a typable handle, so mint
     // `<dir-basename>-<4 hex>` client-side; without it `min ls`, the attach
@@ -4726,6 +4780,67 @@ mod tests {
     }
 
     const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// BEP-008/009/017: a project whose `minimal.toml` declares a GitHub
+    /// grant the box cannot honour is refused with exit 3 before the create.
+    /// The activation stops before it starts the daemon: the state
+    /// directory stays empty, so nothing was spawned or created. The
+    /// refusal names each GitHub host the egress omits.
+    #[tokio::test]
+    async fn activation_refuses_grant_before_create_with_exit_3() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.network.bep]\nsteering = \"proxy_env\"\n\n\
+             [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+             scopes = [\"github:user-token\"]\n",
+        )
+        .expect("write minimal.toml");
+        let state = tempfile::tempdir().expect("state dir");
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("grant-box".into()),
+            path: Some(project.path().to_string_lossy().into_owned()),
+            sync: None,
+            network: CliNetworkMode::OwnIp,
+            ingress: Vec::new(),
+            dynamic_ingress: None,
+            dynamic_range: None,
+            allow_subnets: Vec::new(),
+            allow_dns_hosts: vec!["github.com".into(), "api.github.com".into()],
+            allow_protocols: Vec::new(),
+            deny_subnets: Vec::new(),
+            deny_all_egress: false,
+            credentialed_upstream: false,
+            loadout: Vec::new(),
+            no_loadouts: true,
+            no_hooks: true,
+            no_prompt: true,
+            attach: false,
+        };
+        let err = activate_session(&global, args, false)
+            .await
+            .expect_err("the grant box is refused");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
+        assert_eq!(
+            refused.to_string(),
+            "This box declares a GitHub grant, but its egress does not allow: \
+             uploads.github.com, codeload.github.com. Add them to egress.allow_dns_hosts."
+        );
+        assert!(
+            std::fs::read_dir(state.path())
+                .expect("state dir")
+                .next()
+                .is_none(),
+            "nothing was spawned or created before the refusal"
+        );
+    }
 
     /// An ask create stands on a VM-backed host (NET-045): T94's refusal is
     /// gone, and the registration hands the host row the ask stance — as it

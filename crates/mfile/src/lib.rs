@@ -482,10 +482,27 @@ pub struct Session {
     /// client's loadout).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
+    /// `[session.network]`: the box's network settings this file owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<SessionNetwork>,
+    /// `[session.secrets.<VAR>]`: the credential grants, by the environment
+    /// variable each one lands in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: boxes::core::bep::SecretGrants,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
+}
+
+/// The `[session.network]` table. Today it holds the Box Egress Proxy
+/// settings only.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionNetwork {
+    /// `[session.network.bep]`: steering, `proxy_env`, `no_proxy`, `quic443`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bep: Option<boxes::core::bep::BepSettings>,
 }
 
 // No `impl Eq for Session`: the `extra: HashMap<String, toml::Value>`
@@ -517,6 +534,10 @@ impl Session {
             vars_lenient,
             patches,
             lifecycle_hooks,
+            // Proxy settings and grants are box policy, not composition
+            // primitives: the client carries them on the box's policy.
+            network: _,
+            secrets: _,
             extra: _,
         } = self;
         packages.is_empty()

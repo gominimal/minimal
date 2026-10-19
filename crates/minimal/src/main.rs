@@ -190,13 +190,18 @@ async fn run() -> ExitCode {
 }
 
 /// The exit code a failed run ends with, from the architecture's reserved
-/// codes ("Exit codes"): 7 when the VM host could not be reached to
-/// register or resume an own-address box's row (provider/host
+/// codes ("Exit codes"): 3 when the activation refused the box spec
+/// (`boxes::core::bep::ActivationRefused`), 7 when the VM host could not
+/// be reached to register or resume an own-address box's row (provider/host
 /// unreachable, #1790), 8 when the host refused the registration for want
 /// of addresses (insufficient resources), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
+    // BEP-008/009/010/017/056: a box spec refused at activation.
+    if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
+        return refused.exit_code();
+    }
     if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
         .is_some()
     {
@@ -805,6 +810,26 @@ mod tests {
             MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
             MachineModeAnswer::Quiet => panic!("a refusal is an error object"),
         }
+    }
+
+    /// BEP-008: a box spec the activation refused ends the run with exit 3,
+    /// through the context the activation adds over it, and the message
+    /// names each missing host. `cmd::session`'s test of the same name
+    /// proves the refusal comes before the create.
+    #[test]
+    fn activation_refuses_grant_before_create_with_exit_3() {
+        let refused = boxes::core::bep::ActivationRefused {
+            refusals: vec![boxes::core::bep::BepRefusal::HostsOutsideEgress {
+                missing: vec!["uploads.github.com".into(), "codeload.github.com".into()],
+            }],
+        };
+        let e = anyhow::Error::new(refused).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+        let text = format!("{:#}", e.root_cause());
+        assert!(
+            text.contains("does not allow: uploads.github.com, codeload.github.com."),
+            "{text}"
+        );
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so
