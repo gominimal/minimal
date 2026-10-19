@@ -300,7 +300,7 @@ pub async fn run_task(
             .container(planned.plan())
             .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
         let mut cmd = env
-            .command(&container, &inv.executable, inv.args.iter())
+            .invocation_command(&container, inv)
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
         let mut child = cmd
             .spawn()

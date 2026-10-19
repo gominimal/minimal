@@ -992,7 +992,7 @@ pub struct DestroyArgs {
     /// Destroy all sessions
     #[arg(long)]
     pub all: bool,
-    /// Skip the destroy confirmation
+    /// Skip the destroy confirmation, and treat a session that is already destroyed as success
     #[arg(long, short)]
     pub force: bool,
 }

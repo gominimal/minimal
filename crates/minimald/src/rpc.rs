@@ -1048,7 +1048,11 @@ async fn serve_configure_loadout(
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
                 return Ok(Errorable::Err {
-                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
                 });
             };
             Ok(match h.configure_loadout(req.contribution).await {
@@ -1119,7 +1123,11 @@ async fn serve_finalize_session(
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
                 return Ok(Errorable::Err {
-                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
                 });
             };
             Ok(match h.finalize().await {
@@ -1160,7 +1168,11 @@ async fn serve_rename_session(
                 {
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("no session with ID `{}`", req.id.as_ref()),
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
                     )),
                     Some(h) => h.rename(req.new_name).await,
                 }
@@ -1373,7 +1385,11 @@ async fn serve_abort_session(
                 {
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("no session with ID `{}`", req.id.as_ref()),
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
                     )),
                     Some(h) => h.abort().await,
                 }
@@ -6801,7 +6817,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            matches!(resp, Errorable::Err { error } if error.contains(minimald_rpc::UNKNOWN_SESSION_ID_LEAD)),
             "expected an unknown-id error",
         );
     }
@@ -6869,7 +6885,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            matches!(resp, Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD)),
             "expected an unknown-id error",
         );
     }

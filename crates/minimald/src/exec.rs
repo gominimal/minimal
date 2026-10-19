@@ -484,7 +484,7 @@ async fn task_producer(
                     .container(planned.plan())
                     .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 let mut cmd = env
-                    .command(&container, &inv.executable, inv.args.iter())
+                    .invocation_command(&container, &inv)
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
                 if let Some(dir) = &start_dir {
                     cmd.current_dir(dir);
@@ -2503,6 +2503,19 @@ async fn handle_git_receive(
                 WORK_TREE=$(dirname "$GIT_DIR_ABS")
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
+                # The branch currently checked out in the worktree, and
+                # whether HEAD resolves to a commit (`born`). The first push
+                # into a fresh workspace has no commit on HEAD, so the first
+                # pushed branch that checks out cleanly populates the
+                # worktree and becomes HEAD. After that, a push to any branch
+                # other than the checked-out one must not move HEAD or touch
+                # the worktree. post-receive runs after the refs moved, so a
+                # first push that includes HEAD's own branch already reads as
+                # born, and that branch is the one checked out.
+                cur=$(g symbolic-ref -q HEAD)
+                born=
+                detached_moved=
+                g rev-parse -q --verify HEAD >/dev/null && born=yes
 
                 zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
@@ -2513,6 +2526,18 @@ async fn handle_git_receive(
                     [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
 
+                    # A push to a branch that is not the one checked out
+                    # leaves HEAD and the worktree alone: the ref itself has
+                    # already moved in receive-pack, so there is nothing more
+                    # to do. Only on the still-unborn first push does the
+                    # hook check out the first arriving branch.
+                    # A detached HEAD (`cur` empty) matches no branch, so
+                    # every push lands here; note it for the message below.
+                    if [ "$ref" != "$cur" ] && [ -n "$born" ]; then
+                        [ -z "$cur" ] && detached_moved=yes
+                        continue
+                    fi
+
                     if [ "$old" = "$zero" ]; then
                         # Previously-unborn branch: nothing tracked, so tracked
                         # dirtiness cannot exist — but uploaded/untracked files
@@ -2521,7 +2546,12 @@ async fn handle_git_receive(
                         # pushed tip and checks it out; WITHOUT -f, git refuses
                         # to overwrite untracked files (its stderr names them),
                         # and we surface the skip like the dirty case below.
-                        if ! g checkout -q -B "$branch" "$new"; then
+                        if g checkout -q -B "$branch" "$new"; then
+                            # HEAD is born now: later refs in this same push
+                            # are other branches and must not move it.
+                            cur=$ref
+                            born=yes
+                        else
                             echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
                         fi
                         continue
@@ -2536,7 +2566,13 @@ async fn handle_git_receive(
                         continue
                     fi
                     g checkout -qf "$branch"
-                done"#
+                done
+
+                # A detached HEAD stays detached, as with plain git; say so
+                # once, so the pusher knows the worktree did not change.
+                if [ -n "$detached_moved" ]; then
+                    echo "remote worktree HEAD is detached; moved refs without checking out (run git switch <branch> in the session)" >&2
+                fi"#
                     .as_bytes(),
             )
             .await

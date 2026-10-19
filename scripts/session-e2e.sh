@@ -2678,7 +2678,7 @@ proof_host_ip_deny_all() {
     echo "surfaces: the answerer above, and the hostname proxy on 127.0.0.1:$hida_proxy_port — the two listeners this box's connections meet below"
 
     # ---- the resolver Minimal owns for this box: the plan's answerer
-    # address is all /etc/resolv.conf can name (the table retargets its
+    # address is all /etc/resolv.conf can name (the table steers its
     # DNS-port lookups onto the answerer's own port, the one port the deny
     # chain admits), and nothing else is left in the box's resolver file —
     # the host's own first nameserver, printed beside it, is not this box's.
@@ -2698,7 +2698,7 @@ proof_host_ip_deny_all() {
 
     # ---- the box's own connections, each printed with its verdict. First
     # its own name: the lookup must answer through the answerer (its only
-    # resolver, reached through the table's DNS retarget), and the connect
+    # resolver, reached through the table's DNS steer), and the connect
     # must then be refused — a deny-all box serves what reaches it, but
     # opens nothing. Port 9 is the discard port, an address with nothing
     # listening, so the connect alone is what this beat reads.
@@ -2718,7 +2718,7 @@ proof_host_ip_deny_all() {
       fail
     fi
     hida_tail="$(printf '%s\n' "$hida_err" | tail -n1)"
-    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS retarget) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
+    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS steer) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
 
     # A name outside the box zone: the answerer is authoritative for the
     # box zone and refuses everything else, and the box has no other

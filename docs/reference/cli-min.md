@@ -288,7 +288,9 @@ min session destroy [--all] [-f|--force] [SESSION]
 ```
 
 Destroys a session and ends its processes. `--all` destroys all sessions.
-`-f/--force` skips the confirmation.
+`-f/--force` skips the confirmation. Under `-f`, if another destroy removed
+the session first, the command reports the session as already destroyed and
+succeeds. Without `-f`, the command fails and names the session.
 
 Before it destroys one session, the command asks for confirmation if the
 session holds uncommitted changes or commits that no remote has. It also asks
@@ -892,6 +894,16 @@ fetch from it directly:
 git remote add session min://<session>
 git push session
 ```
+
+When the workspace's worktree is clean, a push to its checked-out branch also
+checks out the new tip. That rewrites files under any process running in the
+session. When the worktree holds uncommitted changes, the branch ref still
+moves, and the push warns that it skipped the checkout. A push to any other
+branch moves only that branch's ref. A push into a worktree with a detached
+HEAD moves only the refs and warns that it skipped the checkout. HEAD stays
+detached. The first push into an empty workspace checks out the branch that
+the fresh repository's HEAD already names, if the push includes it.
+Otherwise it checks out the first pushed branch.
 
 Only the `connect` capability is implemented: on `connect`, the helper
 opens an exec channel to `minimald` over its Unix domain socket (the same
