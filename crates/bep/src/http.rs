@@ -276,6 +276,11 @@ pub fn parse_request(buf: &[u8]) -> Result<Parse<Request>, CloseReason> {
     }
     let (method, target) = parse_request_line(first)?;
     let headers = parse_headers(lines)?;
+    // RFC 9112 §3.2: a request with more than one Host field is invalid. Two
+    // hosts leave the authority that the proxy checks open to doubt.
+    if headers.iter().filter(|h| h.name == "host").count() > 1 {
+        return Err(CloseReason::Malformed("duplicate_host"));
+    }
     let body = framing(&headers)?;
     let mut request = Request {
         method,
@@ -924,6 +929,8 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost : a\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: a\rb\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: a\nX: b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nhost: b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n",
         ] {
             let reason = parse_request(raw).unwrap_err();
             assert!(matches!(reason, CloseReason::Malformed(_)), "{reason:?}");
