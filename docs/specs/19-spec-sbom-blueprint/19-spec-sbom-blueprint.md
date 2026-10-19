@@ -162,8 +162,9 @@ developer running agent boxes; build-infra operator; auditor.
   - THE SYSTEM SHALL emit the Blueprint from the box's stored expanded spec
     (BOX-068) and SHALL carry two digests as document properties: the
     spec's posture-projection digest (BOX-071), which binds the projected
-    axes — network, bep, the registry pin, loadout mode, pty, lifetime,
-    nesting and secret grants — to the posture Gatehouse admitted the box
+    axes — the Box Type (name, source, root), network, bep, the registry
+    pin, loadout mode, pty, lifetime, nesting and secret grants — to the
+    posture Gatehouse admitted the box
     under, and the sha256 of the stored expanded spec's canonical bytes,
     which binds every other axis the Blueprint emits (file imports and
     exports, GitHub imports, variables, volumes, `[otel]`, `[machine]`) to
@@ -294,9 +295,8 @@ developer running agent boxes; build-infra operator; auditor.
     put under a correct subject. THE SYSTEM SHALL mark such a document at
     the top level in every serializer (CycloneDX: a `minimal:verification`
     property with the value `partial` on the metadata; SPDX: the same
-    annotation on the document; Blueprint: `verification = "partial"`), and
-    the architecture's policy surfaces (Gatehouse admission, `min pkg
-    verify`'s evidence) SHALL NOT accept a `partial` document as evidence;
+    annotation on the document; Blueprint: `verification = "partial"`), so
+    a consumer that needs evidence can refuse it on the mark alone;
     `--require-bundles` is how a reader obtains one that is.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_with_unverified_components_is_marked_partial_at_the_top_level
@@ -477,8 +477,8 @@ from the spec and stay schema-TODO.
   covered by: SBOM-011, SBOM-012
 - **Invariant:** THE SYSTEM SHALL never present a document that holds any
   unverified component as evidence.
-  enforced by: the top-level `partial` mark in every serializer; policy
-  surfaces refuse a `partial` document; `--require-bundles` for evidence
+  enforced by: the top-level `partial` mark in every serializer, which a
+  consumer that needs evidence refuses on; `--require-bundles` for evidence
   covered by: SBOM-013
 - **Invariant:** THE SYSTEM SHALL never attribute a per-package document to
   a component whose closure digest it does not name as its subject.
