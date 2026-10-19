@@ -8,13 +8,14 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+aes-gcm = "0.11"
 base64.workspace = true
-chacha20poly1305 = "0.10"
-hkdf = "0.13"
-rand_core.workspace = true
+getrandom = "0.3"
+p256 = { version = "0.14", features = ["ecdh"] }
+serde = { workspace = true }
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
 
 [dev-dependencies]

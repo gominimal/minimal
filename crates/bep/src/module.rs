@@ -1,10 +1,11 @@
 //! Credential modules: the upstream authorities a module's credential is good
-//! for, and the names no module can ever claim.
+//! for.
 //!
 //! The GitHub module's v1 host set is Gatehouse §6.10's (Module host sets).
 //! A sealed member binds the module's identifier and the version of its host
-//! set (BEP-006), so a change to the set is a new version and members sealed
-//! under the old one stop opening against the new one.
+//! set (BEP-006), so a change to the set is a new version. A member sealed
+//! under an old version still opens. The proxy admits it for an authority
+//! only when the authority is in both the bound set and the current set.
 
 use std::fmt;
 
@@ -71,29 +72,6 @@ pub const GITHUB: Module = Module {
     ],
 };
 
-/// The fixed deny set: DNS subtrees that no module host set and no
-/// registered store authority can bring under the host root CA's name
-/// constraints (BEP-013). Each entry denies the name itself and every name
-/// below it.
-///
-/// They are the local and private namespaces: loopback, mDNS, the
-/// home-network zone and the `.internal` zone, which holds the box-local
-/// `min.internal` zone and cloud metadata names.
-pub const DENY_SET: &[&str] = &["localhost", "local", "home.arpa", "internal"];
-
-/// Whether `host` is in the fixed deny set: equal to an entry or below one.
-/// The match ignores ASCII case and one trailing dot.
-#[must_use]
-pub fn is_denied(host: &str) -> bool {
-    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    DENY_SET.iter().any(|zone| {
-        host == *zone
-            || host
-                .strip_suffix(zone)
-                .is_some_and(|rest| rest.ends_with('.'))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,16 +94,5 @@ mod tests {
             host: "api.github.com",
             port: 80
         }));
-    }
-
-    #[test]
-    fn deny_set_covers_zones_and_their_subtrees_only() {
-        assert!(is_denied("localhost"));
-        assert!(is_denied("host.min.internal."));
-        assert!(is_denied("Metadata.Google.Internal"));
-        assert!(is_denied("printer.local"));
-        assert!(!is_denied("notlocal"));
-        assert!(!is_denied("internal.example.com"));
-        assert!(GITHUB.hosts.iter().all(|a| !is_denied(a.host)));
     }
 }

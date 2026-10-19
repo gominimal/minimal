@@ -421,15 +421,16 @@ dependencies = [
 name = "bep"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "base64 0.23.1",
- "chacha20poly1305",
- "hkdf",
+ "getrandom 0.3.4",
+ "p256",
  "proptest",
- "rand_core 0.6.4",
  "reqwest",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.21",
- "x25519-dalek",
  "zeroize",
 ]
 
