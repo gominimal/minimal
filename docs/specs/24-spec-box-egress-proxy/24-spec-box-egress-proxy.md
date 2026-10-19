@@ -231,7 +231,7 @@ Steering and the interception CA
   - WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_proxy_env_sets_node_use_env_proxy
-    <!-- Node's built-in `fetch` ignores `HTTPS_PROXY` unless this variable is set, so a Node client that uses it connects directly and its handle reaches the upstream unsubstituted; measured in docs/spikes/2026-10-20-sealed-handle-bearer-clients.md -->
+    <!-- Node's built-in `fetch` ignores `HTTPS_PROXY` unless this variable is set, so a Node client that uses it connects directly and its handle reaches the upstream unsubstituted; measured in docs/spikes/2026-10-20-sealed-handle-bearer-clients.md; Node reads the variable from v22.21.0 on the 22.x line and from v24.0.0, and an older Node ignores it: under `dns` or `both` steering the box resolver still sends its credentialed names to the proxy, and under `proxy_env` alone it connects directly and the upstream refuses the unsubstituted handle, so a box that runs an older Node client uses `both` -->
 
 - **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains through the host's one signing CA to the host root CA, whose name constraints equal the union of the configured modules' host sets and the authorities the operator's `[secret-store-rules]` register, less the fixed deny set.
   tier:     T1
