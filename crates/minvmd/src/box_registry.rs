@@ -70,7 +70,6 @@ use boxes::{DynamicIngress, EgressPolicy, IpProto};
 use switch::SwitchSubnet;
 
 use crate::bep_attach::BoxId;
-use crate::net::answerer::canonical_box_name;
 
 /// The per-row cap on runtime-admitted ports (NET-138): the row's
 /// runtime-published set answers to this bound, so a report storm cannot
@@ -1620,7 +1619,7 @@ pub enum AllocationError {
     WithdrawnWhileAllocating,
     /// The name folds to one a live row already holds: the answerer keys
     /// an address by the name's canonical form
-    /// ([`crate::net::answerer::canonical_box_name`]), so two rows under
+    /// ([`canonical_box_name`]), so two rows under
     /// folded-equal names would share one published address — one box, one
     /// address, one row. The registration is refused before any address is
     /// spent, and names the spelling the live row holds.
@@ -4178,7 +4177,7 @@ impl BoxRegistry {
     /// The name a live row or a kept creation holds that `name` folds to,
     /// in its own spelling, or `None` when none folds to it. The answerer
     /// allocates a published address by the name's canonical form
-    /// ([`crate::net::answerer::canonical_box_name`]), so two live rows
+    /// ([`canonical_box_name`]), so two live rows
     /// under folded-equal names would share one address; this is the check
     /// that keeps the live set one row per folded name. A dormant creation
     /// holds its name too ([`Creation`]): its creator may still resume it,
@@ -4868,7 +4867,7 @@ impl BoxRegistry {
     /// the row with the greatest id, because every id is a UUIDv7 this
     /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
     /// orders those by creation within a process. The name is matched in
-    /// its canonical form ([`crate::net::answerer::canonical_box_name`]):
+    /// its canonical form ([`canonical_box_name`]):
     /// the answerer keys the box's published address by that form, so the
     /// row table and the address hold one box to a folded-equal name.
     #[must_use]
@@ -5361,6 +5360,21 @@ fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
 /// row's name passes through exactly as the declaration spelled it.
 fn zone_name(name: &str) -> String {
     format!("{name}.{}", zone_answer::ZONE_APEX)
+}
+
+/// The one form a box's registry name is compared in wherever it keys the
+/// box's published address: the answerer's allocations and releases
+/// ([`crate::net::answerer::box_zone_name`]), the box registry's in-flight
+/// registrations ([`BoxRegistry::begin_registration`]), and its
+/// live rows — the row table's name lookups
+/// ([`BoxRegistry::row_by_name`]), a client
+/// registration's name-collision refusal
+/// ([`AllocationError::NameAlreadyHeld`]), and a
+/// client withdrawal's name proof. Names are DNS labels, so the fold is
+/// ASCII lower-case: "Web" and "web" are one box to the answerer, and must
+/// be one to everything its hold is checked against.
+pub(crate) fn canonical_box_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// Whether `addr` is one an A answer in the box zone may carry (NET-127):
