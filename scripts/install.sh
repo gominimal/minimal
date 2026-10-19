@@ -873,13 +873,16 @@ confirm_force_stop() {
     esac
 }
 
+# daemon_stop_consent records that this run may end live sessions: the user
+# passed --force-stop, or answered yes on the terminal. The post-swap stop
+# reads it, so it never forces a stop the user did not agree to.
 daemon_stop_tried=0
-daemon_stop_ran=0
+daemon_stop_consent=0
 stop_running_daemon() {
     [ "$daemon_stop_tried" -eq 0 ] || return 0
     daemon_stop_tried=1
+    [ "$force_stop" -eq 0 ] || daemon_stop_consent=1
     [ -x "$bindir/min" ] || return 0
-    daemon_stop_ran=1
 
     if [ "$force_stop" -eq 0 ]; then
         # Stopped gracefully (or there was nothing to stop): done, no --force.
@@ -887,7 +890,10 @@ stop_running_daemon() {
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*) confirm_force_stop || return 1 ;;
+            *"$sessions_live_msg"*)
+                confirm_force_stop || return 1
+                daemon_stop_consent=1
+                ;;
         esac
         # Any other failure falls through to the force stop, silent as before.
     fi
@@ -988,6 +994,65 @@ awk -v o="$os" -v a="$arch" \
 records="$tmpdir/installed"
 : >"$records"
 installed=0 skipped=0
+
+# The pre-swap stop used the OLD `min`, the one that matched the daemon. Two
+# ways leave a daemon of the old build running after the swap anyway:
+#
+# - An install can START with no `min` on disk (a fresh prefix over a leftover
+#   socket, or an uninstall whose walk kept a modified `min` that a later
+#   --force removed). Then nothing above stopped anything.
+# - An attached client autospawns a replacement daemon the moment the pre-swap
+#   stop ends, and that window spans every swap after the first. The daemon it
+#   spawns serves the old version from the binaries the run is replacing.
+#
+# Either way every daemon-backed command on the new install then speaks to it
+# across a version skew. So once the swaps are done, probe with the NEW `min`
+# and stop only a daemon whose version differs from it. `min version` never
+# autospawns. It reports the client and, when a daemon answers, its version
+# too. Matching versions or no answer stop nothing and say nothing, so an
+# ordinary install, an up-to-date rerun, and a daemon respawned from the new
+# binaries are all left alone.
+#
+# A session can open in a respawned daemon while the run is still going (a
+# `min new`, an unattended job), and R5.5 never ends a session unasked. So the
+# stop is graceful unless this run already holds consent: --force-stop, or a
+# yes to the pre-swap question. A graceful stop refused for live sessions
+# leaves the daemon running and says what to do; it never asks again here,
+# because a rerun of the installer replaces nothing and so stops nothing.
+stale_stop_tried=0
+stop_stale_daemon() {
+    [ "$stale_stop_tried" -eq 0 ] || return 0
+    stale_stop_tried=1
+    [ -x "$bindir/min" ] || return 0
+    _vout="$("$bindir/min" version 2>&1 </dev/null)" || _vout=
+    _cv="$(printf '%s\n' "$_vout" | sed -n 's/^Client: minimal //p')"
+    _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
+    [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ] || return 0
+    say "stopping a daemon still running from build $_sv"
+    if [ "$daemon_stop_consent" -eq 0 ]; then
+        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+            return 0
+        fi
+        case "$_stop_out" in
+            *"$sessions_live_msg"*)
+                say "the daemon has active sessions, so it is still running build $_sv."
+                say "run 'min stop' after those sessions end, or 'min stop --force' to end them now."
+                return 0
+                ;;
+        esac
+        # Any other failure falls through to the force stop, as the pre-swap
+        # stop does: no live sessions were reported, so none are at risk.
+    fi
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+}
+
+# Set once the pre-swap stop has run and the first executable is about to be
+# replaced. From then on a `die` (a failed download or checksum on a later
+# component) must still run the post-swap stop below: an attached client can
+# already have respawned the daemon from the half-replaced binaries. The EXIT
+# trap does that.
+daemon_stop_ran=0
+trap 'if [ "$daemon_stop_ran" -eq 1 ]; then stop_stale_daemon; fi; rm -rf "$tmpdir"' EXIT
 
 # No field ever contains whitespace, so default IFS splitting is exact.
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
@@ -1105,6 +1170,7 @@ while read -r comp _ _ _ want kind dest src; do
                 rm -f "$tmp"
                 die "aborted: no executables were replaced, the daemon is still running"
             }
+            daemon_stop_ran=1
             ;;
     esac
 
@@ -1119,36 +1185,9 @@ while read -r comp _ _ _ want kind dest src; do
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
 
-# The pre-swap stop used the OLD `min` — the one that matched the daemon.
-# But an install can also START with no `min` on disk (a fresh prefix over a
-# leftover socket, or an uninstall whose walk kept a modified `min` that a
-# later --force removed), and then nothing above stopped anything: the daemon
-# from the previous build is still up, and every daemon-backed command on the
-# fresh install now speaks to it across a version skew. Probe with the NEW
-# `min` and stop what it finds mismatched — deliberately silent when the
-# versions match or no daemon answers, so an ordinary install or an
-# up-to-date rerun stops nothing. `min version` never autospawns; it reports
-# the client and, when a daemon answers, its version too.
-if [ "$installed" -gt 0 ] && [ -x "$bindir/min" ]; then
-    _vout="$("$bindir/min" version 2>&1 </dev/null)" || _vout=
-    _cv="$(printf '%s\n' "$_vout" | sed -n 's/^Client: minimal //p')"
-    _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
-    if [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ]; then
-        say "stopping a daemon still running from build $_sv"
-        "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
-    fi
-fi
-
-# An attached client autospawns a replacement daemon the moment the old one
-# stops, and that window spans every swap after the first: the stop above
-# happened before the files changed, so a daemon respawned mid-run serves the
-# old version from the replaced binaries. Once every swap is done, stop it
-# again so the daemon the user is left with — if any — is the one just
-# installed. The pre-swap stop already ended or got consent for the live
-# sessions, and a mid-run respawn holds none, so this one goes straight to
-# --force. Best-effort, like the silent path above.
-if [ "$daemon_stop_ran" -eq 1 ]; then
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+# The post-swap stop: stop_stale_daemon, defined above the loop.
+if [ "$installed" -gt 0 ]; then
+    stop_stale_daemon
 fi
 
 # --- Generated shell-init files and completions ----------------------------

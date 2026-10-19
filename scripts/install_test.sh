@@ -151,6 +151,14 @@ case "${1:-}" in
         printf 'Client: minimal %s\n' "$_vc"
         if [ -s "$HOME/minver.server" ]; then
             printf 'Server: minimald %s\n' "$(cat "$HOME/minver.server")"
+        elif [ -f "$HOME/daemon.running" ]; then
+            # A modelled daemon (see `stop` below) answers with this build
+            # when it serves the minimald on disk, and an older one otherwise.
+            if cmp -s "$HOME/daemon.running" "$HOME/bin/minimald"; then
+                printf 'Server: minimald %s\n' "$_vc"
+            else
+                printf 'Server: minimald old\n'
+            fi
         fi
         ;;
     ls)          printf 'session-alpha  running\n' ;;
@@ -170,6 +178,9 @@ case "${1:-}" in
         [ "${2:-}" = "--force" ] && rm -f "$HOME/sessions.live"
         if [ -f "$HOME/daemon.reconnect" ] && [ -f "$HOME/bin/minimald" ]; then
             cat "$HOME/bin/minimald" >"$HOME/daemon.running"
+            # $HOME/respawn.sessions: the client opens a session in the
+            # respawned daemon, as a `min new` during the install would.
+            if [ -f "$HOME/respawn.sessions" ]; then : >"$HOME/sessions.live"; fi
         fi
         ;;
     finalize-install)
@@ -1449,17 +1460,16 @@ case_daemon_stop() {
     # min that is on disk now — an older build than the manifest's, still
     # runnable, still able to reach the daemon it started. With no sessions
     # running the graceful stop succeeds, so nothing is forced and nothing is
-    # asked. The post-swap stop (see the reconnect scenario below) then closes
-    # the respawn window with one more --force stop from the just-installed
-    # min, so the whole run is exactly: graceful stop, then that force stop.
+    # asked. No daemon answers the post-swap version probe here, so the
+    # graceful stop is the only one.
     printf 'stale\n' >"$H8/bin/minimald"
     write_min_stub "$H8/bin/min" "previous release"
     run daemonupgrade "$H8"
     check 0 "$rc" "upgrade exits 0"
     want_ok "upgrade runs min stop (R5.5)" test -f "$H8/stop.calls"
-    check "stop
-stop --force" "$(cat "$H8/stop.calls")" \
-        "graceful stop before the swap, one --force stop after it (R5.5)"
+    check "stop" "$(cat "$H8/stop.calls")" "stop is called once, gracefully (R5.5)"
+    want_err "a graceful stop is never escalated to --force (R5.5)" \
+        grep -qx "stop --force" "$H8/stop.calls"
     want_err "no sessions means no question (R5.5)" grep -q "Continue?" "$OUT"
 
     # Replacing only a data component must NOT stop the daemon: data files (the
@@ -1608,6 +1618,51 @@ stop --force" "$(cat "$HL7/stop.calls")" \
     check "$h_minimald" "$(hash_file "$HL7/daemon.running")" \
         "the daemon the run leaves is the one just installed (R5.5)"
     check "$h_minimald" "$(hash_file "$HL7/bin/minimald")" "the upgrade still completes (R5.5)"
+
+    # A session opened in the respawned daemon while the run is still going
+    # (a `min new`, an unattended job) is never ended unasked. Without
+    # --force-stop or a yes on the terminal, the closing stop is graceful.
+    # Refused for live sessions, it leaves the old-build daemon running and
+    # tells the user how to stop it, and the upgrade itself still succeeds.
+    HL8="$root/hl8"; mkdir -p "$HL8"
+    stage_live_upgrade "$HL8" liverespawnsession
+    rm -f "$HL8/sessions.live"
+    printf 'stale\n' >"$HL8/daemon.running"
+    : >"$HL8/daemon.reconnect"
+    : >"$HL8/respawn.sessions"
+    run liverespawnsession "$HL8"
+    check 0 "$rc" "an upgrade with a session opened mid-run exits 0 (R5.5)"
+    check "stop
+stop" "$(cat "$HL8/stop.calls")" \
+        "graceful stop before the swap, graceful closing stop, no --force (R5.5)"
+    want_ok "the session opened mid-run survives (R5.5)" test -f "$HL8/sessions.live"
+    want_ok "the user is told how to stop the old daemon (R5.5)" \
+        grep -q "min stop --force" "$OUT"
+    want_err "the closing stop asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+    check "$h_minimald" "$(hash_file "$HL8/bin/minimald")" "the upgrade still completes (R5.5)"
+
+    # A download that fails after the first swap still runs the closing stop,
+    # from the EXIT trap, so the daemon a client respawned from the
+    # half-replaced binaries does not outlive the failed run.
+    # minimald is swapped first (the pre-swap stop runs there and the client
+    # respawns from the old minimald), then minvmd fails its checksum.
+    HL9="$root/hl9"; mkdir -p "$HL9"
+    stage_live_upgrade "$HL9" livediemidrun
+    rm -f "$HL9/sessions.live"
+    printf 'stale\n' >"$HL9/bin/minvmd"
+    printf 'stale\n' >"$HL9/daemon.running"
+    : >"$HL9/daemon.reconnect"
+    awk '$1=="minvmd" && $2=="linux" {$5="deadbeef"} {print}' "$root/good-components" \
+        >"$mock/versions/v1/components"
+    run livediemidrun "$HL9"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    check 1 "$rc" "a checksum failure after the first swap exits non-zero (R5.3)"
+    want_ok "the failure is named" grep -q "checksum mismatch for minvmd" "$OUT"
+    check "stop
+stop" "$(cat "$HL9/stop.calls")" \
+        "the failed run still takes the closing stop (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL9/daemon.running")" \
+        "the daemon the failed run leaves serves the minimald it installed (R5.5)"
 }
 
 case_shell_integration() {
@@ -2185,7 +2240,9 @@ case_uninstall() {
     check 0 "$rc" "reinstall over a stale daemon exits 0"
     want_ok "the stale daemon is reported" \
         grep -q "stopping a daemon still running from build v9" "$OUT"
-    want_ok "the stale daemon is force-stopped" grep -qx "stop --force" "$HU16/stop.calls"
+    want_ok "the stale daemon is stopped gracefully" grep -qx "stop" "$HU16/stop.calls"
+    want_err "nothing consented, so the stale daemon is never force-stopped" \
+        grep -qx "stop --force" "$HU16/stop.calls"
 
     # Matching versions: the probe runs (a component was re-placed) but stops
     # nothing and says nothing — the pre-swap stop already handled the daemon.
