@@ -115,6 +115,8 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
+    /// Sign in to GitHub, and show the sign-in that boxes use
+    Auth(AuthArgs),
     /// Print that there is nothing to mint
     ///
     /// The HTTPS reverse proxy this verb once served is retired, so it
@@ -1116,6 +1118,33 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Sign in to GitHub and keep the sign-in in the host keychain
+    ///
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
+    /// Show whether you are signed in to GitHub, and when the token expires
+    ///
+    /// Never prints the token.
+    Status,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Sign in with a code entered at github.com, not in this browser
+    #[arg(long)]
+    pub device: bool,
 }
 
 /// Arguments for `min login`.

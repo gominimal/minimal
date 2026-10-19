@@ -68,6 +68,8 @@ russh.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
+# The GitHub sign-in item `min auth` writes and reads (`bep::signin`).
+bep = { path = "../bep" }
 boxes.workspace = true
 # The reserved local range the resolver advisory's bind probe reads. Owned by
 # the zero-dependency `switch` crate — the same constant the daemon's DNS zone

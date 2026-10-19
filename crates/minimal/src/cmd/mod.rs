@@ -18,6 +18,7 @@ use minimal_client::{ensure_version_match, ensure_version_reported, version_asse
 use crate::*;
 
 mod admin;
+mod auth;
 mod finalize_install;
 mod list;
 mod net;
@@ -30,6 +31,7 @@ mod session;
 pub(crate) use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
+pub use auth::{cmd_auth_login, cmd_auth_status};
 pub use finalize_install::*;
 pub use list::*;
 pub use net::*;
@@ -236,6 +238,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
+        Some(Command::Auth(AuthArgs { command })) => match command {
+            AuthCommand::Login(args) => cmd_auth_login(&cli.global_args, args).await,
+            AuthCommand::Status => cmd_auth_status(&cli.global_args),
+        },
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
         }
