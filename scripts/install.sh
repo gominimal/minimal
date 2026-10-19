@@ -950,10 +950,12 @@ confirm_force_stop() {
 }
 
 daemon_stop_tried=0
+daemon_stop_ran=0
 stop_running_daemon() {
     [ "$daemon_stop_tried" -eq 0 ] || return 0
     daemon_stop_tried=1
     [ -x "$bindir/min" ] || return 0
+    daemon_stop_ran=1
 
     if [ "$force_stop" -eq 0 ]; then
         # Stopped gracefully (or there was nothing to stop): done, no --force.
@@ -1097,6 +1099,18 @@ while read -r comp _ _ _ want kind dest src; do
     # written by earlier installer versions.
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
+
+# An attached client autospawns a replacement daemon the moment the old one
+# stops, and that window spans every swap after the first: the stop above
+# happened before the files changed, so a daemon respawned mid-run serves the
+# old version from the replaced binaries. Once every swap is done, stop it
+# again so the daemon the user is left with — if any — is the one just
+# installed. The pre-swap stop already ended or got consent for the live
+# sessions, and a mid-run respawn holds none, so this one goes straight to
+# --force. Best-effort, like the silent path above.
+if [ "$daemon_stop_ran" -eq 1 ]; then
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+fi
 
 # --- Generated shell-init files and completions ----------------------------
 

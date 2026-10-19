@@ -145,6 +145,17 @@ case "${1:-}" in
             echo "daemon has active sessions; pass --force to shut down anyway" >&2
             exit 1
         fi
+        # A daemon that stops is gone; --force takes its live sessions with
+        # it. $HOME/daemon.running carries the daemon binary the running
+        # daemon serves from, and a $HOME/daemon.reconnect client autospawns
+        # a replacement daemon from whatever is on disk the moment the
+        # previous one stops — a respawn holds no live sessions of its own,
+        # and serves from the binaries present at the moment it spawns.
+        rm -f "$HOME/daemon.running"
+        [ "${2:-}" = "--force" ] && rm -f "$HOME/sessions.live"
+        if [ -f "$HOME/daemon.reconnect" ] && [ -f "$HOME/bin/minimald" ]; then
+            cat "$HOME/bin/minimald" >"$HOME/daemon.running"
+        fi
         ;;
     finalize-install)
         # Every invocation is recorded, arguments and all, in $HOME/finalize.calls.
@@ -1419,18 +1430,21 @@ case_daemon_stop() {
     check 0 "$rc" "up-to-date rerun exits 0"
     want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
 
-    # An upgrade (two components stale) stops the daemon exactly once, before the
-    # swap, via the min that is on disk now — an older build than the manifest's,
-    # still runnable, still able to reach the daemon it started. With no sessions
-    # running the graceful stop succeeds, so nothing is forced and nothing is asked.
+    # An upgrade (two components stale) stops the daemon before the swap via the
+    # min that is on disk now — an older build than the manifest's, still
+    # runnable, still able to reach the daemon it started. With no sessions
+    # running the graceful stop succeeds, so nothing is forced and nothing is
+    # asked. The post-swap stop (see the reconnect scenario below) then closes
+    # the respawn window with one more --force stop from the just-installed
+    # min, so the whole run is exactly: graceful stop, then that force stop.
     printf 'stale\n' >"$H8/bin/minimald"
     write_min_stub "$H8/bin/min" "previous release"
     run daemonupgrade "$H8"
     check 0 "$rc" "upgrade exits 0"
     want_ok "upgrade runs min stop (R5.5)" test -f "$H8/stop.calls"
-    check "stop" "$(cat "$H8/stop.calls")" "stop is called once, gracefully (R5.5)"
-    want_err "a graceful stop is never escalated to --force (R5.5)" \
-        grep -qx "stop --force" "$H8/stop.calls"
+    check "stop
+stop --force" "$(cat "$H8/stop.calls")" \
+        "graceful stop before the swap, one --force stop after it (R5.5)"
     want_err "no sessions means no question (R5.5)" grep -q "Continue?" "$OUT"
 
     # Replacing only a data component must NOT stop the daemon: data files (the
@@ -1553,6 +1567,32 @@ EOF
     check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
     want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
     want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$HL6/stop.calls"
+
+    # A daemon respawned mid-run serves the old version from the replaced
+    # binaries: the stop above happened before the first swap, and an attached
+    # client autospawns a replacement daemon within that window. The installer
+    # must stop again once every swap is done, so the daemon the run leaves —
+    # if any — is the one it just installed. The respawned daemon holds no
+    # live sessions of its own, so the closing stop is a --force one, already
+    # consented to by the pre-swap answer. A client that reconnects after the
+    # last stop respawns the daemon from the NEW binaries, which is the
+    # version the run just installed — the acceptable end state.
+    HL7="$root/hl7"; mkdir -p "$HL7"
+    stage_live_upgrade "$HL7" livereconnect
+    printf 'stale\n' >"$HL7/daemon.running"
+    : >"$HL7/daemon.reconnect"
+    printf 'y\n' >"$root/tty-yes7"
+    TTY_FILE="$root/tty-yes7"
+    run livereconnect "$HL7"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade with a respawning client exits 0 (R5.5)"
+    check "stop
+stop --force
+stop --force" "$(cat "$HL7/stop.calls")" \
+        "graceful stop, consented force stop, then the closing force stop (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL7/daemon.running")" \
+        "the daemon the run leaves is the one just installed (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL7/bin/minimald")" "the upgrade still completes (R5.5)"
 }
 
 case_shell_integration() {
