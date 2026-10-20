@@ -125,6 +125,9 @@ pub(crate) async fn run_login(
         account,
         flow,
         material: Material {
+            // The write stores the metadata's instance, which
+            // `store_sign_in` picks.
+            instance: String::new(),
             access_token: token.access_token,
             refresh_token: token.refresh_token,
         },
@@ -985,6 +988,15 @@ mod tests {
         let (switched, _, _) = login_with(&keychain, &other, None, true, &no_browser).await;
         assert!(switched.new_instance);
         assert_ne!(switched.metadata.instance, after_logout.metadata.instance);
+        // The token item names its own instance: the new one, never the
+        // instance of the item it replaced.
+        let material = keychain.material().expect("read").expect("held");
+        assert_eq!(material.instance, switched.metadata.instance);
+        let secret = keychain.item(SERVICE).expect("token item");
+        assert!(secret.contains(&switched.metadata.instance), "token item");
+        assert!(!secret.contains(&after_logout.metadata.instance));
+        let meta = keychain.metadata().expect("read").expect("held");
+        assert_eq!(material.instance, meta.instance);
     }
 
     // BEP-002: the same account replaces the material in place
@@ -1000,6 +1012,7 @@ mod tests {
             refresh_expires_at: 2,
         };
         let old = Material {
+            instance: String::new(),
             access_token: "ghu_old".into(),
             refresh_token: "ghr_old".into(),
         };
@@ -1066,6 +1079,7 @@ mod tests {
             refresh_expires_at,
         };
         let material = Material {
+            instance: String::new(),
             access_token: ACCESS.into(),
             refresh_token: REFRESH.into(),
         };

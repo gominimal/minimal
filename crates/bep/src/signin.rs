@@ -2,10 +2,18 @@
 //! sign-in's token and refresh material (BEP-002), and its instance
 //! identifier.
 //!
-//! The item has two parts. The secret is the token and the refresh token.
-//! The metadata is the account, the instance identifier, the flow and the
-//! two expiry times. The metadata holds no token, so `min auth status` reads
-//! it without reading the secret (BEP-004).
+//! The item has two parts. The secret is the instance identifier, the token
+//! and the refresh token. The metadata is the account, the instance
+//! identifier, the flow and the two expiry times. The metadata is a
+//! token-free copy for `min auth status`, which reads it without reading the
+//! secret (BEP-004).
+//!
+//! The token item under [`SERVICE`] carries its own instance identifier, so
+//! the item a reference resolves names its own instance. On Linux the two
+//! parts are two stores, and they are not atomic. A torn write (token stored,
+//! metadata store failed) therefore cannot put a new account's token under
+//! an instance that an outstanding reference binds: the token names the new
+//! instance, not the old one.
 //!
 //! Each backend keeps the metadata where a read of it returns no token:
 //!
@@ -13,8 +21,9 @@
 //!   its password and the metadata as its comment. `security
 //!   find-generic-password` without `-w` prints the comment and no password.
 //! - Linux and other hosts: the Secret Service holds two items. The item
-//!   under [`SERVICE`] holds the secret. A second item under
-//!   [`META_SERVICE`] holds the encoded metadata as its secret and no token.
+//!   under [`SERVICE`] holds the secret, with the instance identifier. A
+//!   second item under [`META_SERVICE`] holds the encoded metadata as its
+//!   secret and no token.
 //!   `secret-tool lookup` on [`META_SERVICE`] reads the metadata only.
 //!
 //! The instance identifier names one sign-in. A sign-in while no item is
@@ -83,9 +92,13 @@ impl fmt::Display for Flow {
     }
 }
 
-/// The token and refresh material of a sign-in. Debug output redacts both.
+/// The token and refresh material of a sign-in. Debug output redacts all of
+/// it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Material {
+    /// The instance identifier the token item carries. A read fills it from
+    /// the item. A write ignores it and stores the metadata's identifier.
+    pub instance: String,
     /// The GitHub user token.
     pub access_token: String,
     /// The GitHub refresh token.
@@ -415,7 +428,7 @@ impl Keychain for MemoryKeychain {
     }
 
     fn write(&self, metadata: &Metadata, material: &Material) -> Result<(), SignInError> {
-        let secret = encode_secret(material)?;
+        let secret = encode_secret(metadata, material)?;
         self.store(SERVICE, secret)?;
         self.store(META_SERVICE, metadata.encode())
     }
@@ -429,24 +442,33 @@ fn valid_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-/// The secret as the item stores it: `v1 <token> <refresh token>`.
-fn encode_secret(material: &Material) -> Result<String, SignInError> {
+/// The secret as the item stores it:
+/// `v1 <instance> <token> <refresh token>`. The instance is the metadata's,
+/// so the token item names the instance it belongs to.
+fn encode_secret(metadata: &Metadata, material: &Material) -> Result<String, SignInError> {
     if !valid_token(&material.access_token) || !valid_token(&material.refresh_token) {
         return Err(SignInError::Token);
     }
     Ok(format!(
-        "{METADATA_VERSION} {} {}",
-        material.access_token, material.refresh_token
+        "{METADATA_VERSION} {} {} {}",
+        metadata.instance, material.access_token, material.refresh_token
     ))
 }
 
 fn decode_secret(secret: &str) -> Result<Material, SignInError> {
     let mut parts = secret.split_whitespace();
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(METADATA_VERSION), Some(access), Some(refresh), None)
-            if valid_token(access) && valid_token(refresh) =>
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some(METADATA_VERSION), Some(instance), Some(access), Some(refresh), None)
+            if valid_instance(instance) && valid_token(access) && valid_token(refresh) =>
         {
             Ok(Material {
+                instance: instance.to_owned(),
                 access_token: access.to_owned(),
                 refresh_token: refresh.to_owned(),
             })
@@ -483,7 +505,7 @@ impl Keychain for HostKeychain {
     }
 
     fn write(&self, metadata: &Metadata, material: &Material) -> Result<(), SignInError> {
-        let mut secret = encode_secret(material)?;
+        let mut secret = encode_secret(metadata, material)?;
         let result = host::write(&metadata.encode(), &secret);
         secret.zeroize();
         result?;
@@ -667,7 +689,9 @@ mod host {
     pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
         // A failed secret store leaves both held items as they were. A
         // failed metadata store after it leaves the old metadata, and the
-        // read-back in `HostKeychain::write` reports the failed write.
+        // read-back in `HostKeychain::write` reports the failed write. The
+        // stored secret names its own new instance, so no reference bound
+        // to the old instance resolves the new token.
         store(LABEL, SERVICE, secret)?;
         store(META_LABEL, META_SERVICE, metadata)
     }
