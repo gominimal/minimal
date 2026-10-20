@@ -500,6 +500,9 @@ pub struct FrameSummary {
     /// [`DNS_PORT`], so the missing port fails the resolver carve-out
     /// closed rather than opening it.
     dst_port: u16,
+    /// Whether the frame is an IPv4 fragment after the first: a non-zero
+    /// fragment offset, a frame that carries no L4 header of its own.
+    later_fragment: bool,
 }
 
 impl FrameSummary {
@@ -535,6 +538,15 @@ impl FrameSummary {
     pub fn destination_port(&self) -> u16 {
         self.dst_port
     }
+
+    /// Whether the frame is an IPv4 fragment after the first: its fragment
+    /// offset is non-zero, so it carries no L4 header and its
+    /// [`destination_port`](Self::destination_port) reads `0`. The first
+    /// fragment carried the ports for the whole datagram.
+    #[must_use]
+    pub fn is_later_fragment(&self) -> bool {
+        self.later_fragment
+    }
 }
 
 /// Extracts the verdict's inputs from one Ethernet II frame. Pure and
@@ -549,6 +561,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
         dst: None,
         proto: None,
         dst_port: 0,
+        later_fragment: false,
     };
     if frame.len() < ETH_HDR {
         return none(FrameFamily::Truncated);
@@ -582,6 +595,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
                 dst: None,
                 proto: None,
                 dst_port: 0,
+                later_fragment: false,
             };
         }
         ETHERTYPE_IPV6 => return none(FrameFamily::Ipv6),
@@ -610,6 +624,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
         dst: Some([ip[16], ip[17], ip[18], ip[19]]),
         proto: Some(ip[9]),
         dst_port,
+        later_fragment: frag_offset != 0,
     }
 }
 
