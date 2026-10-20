@@ -223,15 +223,22 @@ developer running agent boxes; build-infra operator; auditor.
     property: for all axes x in emit_bp(c): label(x) == enforcement(section(x))
   - THE SYSTEM SHALL emit the Blueprint from the box's stored expanded spec
     (BOX-068) and SHALL carry two digests as document properties: the
-    spec's posture-projection digest (BOX-071), which binds the projected
-    axes — the Box Type (name, source, root), network, bep, the registry
-    pin, loadout mode, pty, lifetime, nesting and secret grants — to the
-    posture Gatehouse admitted the box
-    under, and the sha256 of the stored expanded spec's canonical bytes,
-    which binds every other axis the Blueprint emits (file imports and
-    exports, GitHub imports, variables, volumes, `[otel]`, `[machine]`) to
-    the spec the box runs under; the Blueprint names which axes each digest
-    covers, so neither is read as proving more than it does.
+    spec's posture-projection digest (BOX-071), which binds exactly the
+    §6.3.2 field set — `type.name`, `type.source`, `type.root` and
+    `type.registry`; `network.mode`, `egress_dns` (the spec's
+    `egress.allow_dns_hosts`), `egress_subnets` (`egress.allow_subnets`),
+    `egress_deny_subnets` (`egress.deny_subnets`), `ingress_ports` and
+    `quic443`; `bep.steering`; `registry_pinned` and `registry_commit`;
+    `loadout_mode`; `pty_enabled`; `lifetime`; the `[nesting]` bounds; and
+    `secret_grants` — to the posture Gatehouse admitted the box under, and
+    the sha256 of the stored expanded spec's canonical bytes, which binds
+    every other field the Blueprint emits (`egress.allow_protocols` and
+    `dynamic_ingress`, which BOX-071 projects nowhere; the rest of
+    `[network.bep]`; `[secrets]` beyond the grants; variables; file imports
+    and exports; GitHub imports; volumes; `[execution]`, `[io]`, `[otel]`,
+    `[machine]`) to the spec the box runs under; the Blueprint names which
+    fields each digest covers, so neither is read as proving more than it
+    does.
     tier:   T1
     verify: cargo nextest run -p sbom blueprint_carries_posture_and_spec_digests
     property: posture_digest(emit_bp(c)) == projection_digest(expanded_spec(c)) ∧ spec_digest(emit_bp(c)) == sha256(canonical(expanded_spec(c)))
