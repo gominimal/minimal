@@ -39,13 +39,14 @@ A document for a box is a **composition**, not a re-derivation: the
 **per-package document** published beside the package's artifact (SBOM-013
 names it) is the unit, and a box's document is an envelope of
 composition-level facts over references to those units, resolved through the
-box's pin. A component has a **digest gap** when the pinned closure
-references no per-package document for it, which is the ordinary case for a
-package built locally or non-redistributable by policy, and the gap names
-which: `built-locally`, `non-redistributable`, or `outside-pin` — a
-package for which the box's stored expanded spec records a non-upstream
-registry, which the gap names. SBOM-004 and SBOM-011 use that one
-definition. A document the closure references but that cannot be
+box's pin. A component has a **digest gap** when its closure entry's state
+is `built-locally` or `non-redistributable` (the ordinary case for a
+package built locally or non-redistributable by policy), or when the box's
+stored expanded spec records a non-upstream registry for it, `outside-pin`,
+which the gap names; the gap names which of the three. A component with an
+`artifact` entry has a digest, whether or not a per-package document
+exists for it (SBOM-013 decides what its facts are). SBOM-004 and SBOM-011
+use that one definition. A document the closure references but that cannot be
 fetched is not a gap; it is SBOM-012's failure. Until build-servers#185 pins
 the document digest in the closure (Non-goals), *references* is decided by
 the closure entry alone: a component whose entry maps its Build Spec Hash to
@@ -101,7 +102,11 @@ BEP). The Blueprint carries that label per axis (SBOM-006).
 **First slice:** publish emits a per-package document for one catalog
 package under SBOM-013's names, beside its artifact; a fixture box then emits
 validated CycloneDX 1.5 and minimal-valid SPDX 2.3 over it, byte-stable
-across regenerations. CycloneDX 1.5 is the SBOM format because it is the one
+across regenerations against a fixture cache whose document bytes are
+fixed (the slice's guarantee is SBOM-001's unconditional one over that
+fixture; in production, while the pin records no bundle, SBOM-001's interim
+sub-bullet is the guarantee, and the slice's output carries the `partial`
+mark and the `no-bundle` reason). CycloneDX 1.5 is the SBOM format because it is the one
 scanners read today; the 2.0 draft is used for the Blueprint only.
 
 ## Users and stories
