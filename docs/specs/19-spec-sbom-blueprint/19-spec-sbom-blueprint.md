@@ -367,11 +367,14 @@ developer running agent boxes; build-infra operator; auditor.
     treat the document as unresolved (SBOM-012's failure, exit code 6,
     naming the check or the missing bundle), and never read it; IF the
     bundle's host cannot be reached THEN THE SYSTEM SHALL fail with exit
-    code 7 naming the host, as SBOM-012 does for any object. The pin
-    decides, so SBOM-001 holds: the same pin always takes the same path.
+    code 7 naming the host, as SBOM-012 does for any object; IF the cache
+    refuses the bundle request for authentication or authorization THEN THE
+    SYSTEM SHALL fail with exit code 5 naming the pin, the bundle and the
+    host. The pin decides, so SBOM-001 holds: the same pin always takes the
+    same path.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
-    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (unreachable(bundle(d)) ⇒ exit = 7) ∧ (¬unreachable(bundle(d)) ∧ ¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
+    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (unreachable(bundle(d)) ⇒ exit = 7) ∧ (refused(bundle(d)) ⇒ exit = 5) ∧ (¬unreachable(bundle(d)) ∧ ¬refused(bundle(d)) ∧ ¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
   - WHILE the pin records no bundle for the document, IF the cache holds no
     document beside the artifact (the producer has published none:
     build-servers#185 not landed, which is every package today) THEN THE
