@@ -367,9 +367,20 @@ pub fn parse_request(buf: &[u8]) -> Result<Parse<Request>, CloseReason> {
 
 /// Parse one response head from the start of `buf`.
 ///
+/// The response gets the same strict framing rules as a request, on
+/// purpose. A hostile upstream must not desync the box's connection, and
+/// the proxy reads no response framing that it cannot check. So a
+/// response that HTTP/1.1 permits but that these rules refuse closes the
+/// connection as framing ambiguous. Examples are `Transfer-Encoding:
+/// gzip, chunked`, a repeated equal `Content-Length`, or a `Connection`
+/// option that names a framing header. The framing result is not kept:
+/// the head parser does not know the request method, so the caller
+/// decides the body of a reply to `HEAD` or of a `1xx`, `204` or `304`.
+///
 /// # Errors
 ///
-/// Returns the [`CloseReason`] when the head breaks the grammar.
+/// Returns the [`CloseReason`] when the head breaks the grammar or the
+/// framing rules.
 pub fn parse_response(buf: &[u8]) -> Result<Parse<Response>, CloseReason> {
     let Some(head_len) = head_end(buf)? else {
         return Ok(Parse::Partial);
@@ -423,6 +434,9 @@ fn forward_head<R: Read, W: Write>(
         upstream
             .write_all(&request.serialize())
             .map_err(|e| CloseReason::Io(e.kind()))?;
+        // Flush now: the box can hold its body until the upstream answers
+        // `Expect: 100-continue`, so the head must not wait in a buffer.
+        upstream.flush().map_err(|e| CloseReason::Io(e.kind()))?;
         Ok(Forwarded { request, rest })
     });
     if let Err(reason) = &result
@@ -1449,6 +1463,20 @@ mod tests {
             "POST /x HTTP/1.1\r\nhost: github.com\r\nexpect: 100-continue\r\ncontent-length: 3\r\n\r\n"
         );
         assert!(audit.is_empty());
+    }
+
+    // The head is flushed before the loop reads the body, so a buffered
+    // upstream writer cannot hold it while the box waits for `100 Continue`.
+    #[test]
+    fn expect_continue_head_is_flushed_before_the_body() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: github.com\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+        let mut client: &[u8] = raw;
+        let mut upstream = io::BufWriter::new(Vec::new());
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        forward_request_head("box-a", &mut client, &mut upstream, &mut audit)
+            .expect("an unambiguous head is forwarded");
+        assert!(upstream.buffer().is_empty());
+        assert!(upstream.get_ref().starts_with(b"POST /x HTTP/1.1\r\n"));
     }
 
     #[test]
