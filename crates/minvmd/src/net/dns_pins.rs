@@ -112,7 +112,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use switch::SwitchSubnet;
 
 use crate::box_registry::{BoxRecord, BoxTable};
-use crate::net::egress_gate::DropLimiter;
+use crate::net::drop_limiter::DropLimiter;
 
 /// Ethernet II header length: destination MAC (6) + source MAC (6) +
 /// `EtherType` (2).
@@ -1386,7 +1386,7 @@ pub(crate) mod tests {
 
     use super::{DnsPins, IPPROTO_TCP, TCP_FIN, deny_all_refusal, udp_datagram};
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
-    use crate::net::egress_gate::DropLimiter;
+    use crate::net::drop_limiter::DropLimiter;
 
     /// The address plan every registry below is built for — the same plan the
     /// rows were compiled against and the table's entries are keyed within.
