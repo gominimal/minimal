@@ -98,6 +98,7 @@ use minimald_rpc::ZoneAnswererStatus;
 use serde::{Deserialize, Serialize};
 
 use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
+use switch::loopback::RangeProbe;
 
 use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
 
@@ -582,12 +583,29 @@ struct AddressHolder {
 /// answer TTL the zone serves: until it passes, a host resolver may still
 /// hold the old name's answer, and a client connecting by it must not reach
 /// a different box. Only the box that held it may take it back early.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AddressBook {
     held: BTreeMap<Ipv4Addr, AddressHolder>,
     /// Released addresses still inside their quarantine: who held each and
     /// when it was released.
     released: BTreeMap<Ipv4Addr, (AddressHolder, Instant)>,
+    /// The probe [`Self::allocate`] runs over the box range before it hands
+    /// a fresh address: [`switch::loopback::probe`] in production.
+    range_probe: fn() -> RangeProbe,
+    /// Whether the last probe read the box range absent: the interim
+    /// episode its warning is logged once for.
+    range_absent: bool,
+}
+
+impl Default for AddressBook {
+    fn default() -> Self {
+        Self {
+            held: BTreeMap::new(),
+            released: BTreeMap::new(),
+            range_probe: HOST_RANGE_PROBE,
+            range_absent: false,
+        }
+    }
 }
 
 /// How long a released box address stays out of allocation: the positive
@@ -601,64 +619,44 @@ fn in_box_range(address: Ipv4Addr) -> bool {
     first <= address && address <= last
 }
 
-/// Whether the host can bind the address itself. Linux routes the whole
-/// 127.0.0.0/8, but macOS answers only the addresses lo0 carries, so a box
-/// hand there is dead until the range aliases are installed: nothing listens
-/// at an address the host cannot bind. A bind to port 0 never clashes with a
-/// real listener, and TCP is the surface a box hand actually serves.
-///
-/// Only `EADDRNOTAVAIL` means the range is not aliased (`Ok(false)`). Any
-/// other bind error (EMFILE, ENOBUFS, EACCES) says nothing about the range,
-/// so it comes back as the error rather than as an unbindable range.
-fn loopback_bindable(address: Ipv4Addr) -> io::Result<bool> {
-    match std::net::TcpListener::bind((address, 0)) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => {
-            tracing::warn!(
-                component = COMPONENT,
-                %address,
-                %error,
-                "this host cannot bind the box address range; the box gets the 127.0.0.1 interim"
-            );
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// The probe [`AddressBook::allocate`] runs. Unit tests run on hosts that
-/// may lack the range aliases (macOS without lo0 aliases), so they take a
-/// probe that always binds; the tests of the interim inject their own.
+/// The range probe a default [`AddressBook`] runs. Unit tests run on hosts
+/// that may lack the range aliases (macOS without the lo0 aliases), so their
+/// books read the range present; the tests of the interim inject their own.
 #[cfg(not(test))]
-const HOST_BIND_PROBE: fn(Ipv4Addr) -> io::Result<bool> = loopback_bindable;
+const HOST_RANGE_PROBE: fn() -> RangeProbe = switch::loopback::probe;
 #[cfg(test)]
-const HOST_BIND_PROBE: fn(Ipv4Addr) -> io::Result<bool> = |_| Ok(true);
+const HOST_RANGE_PROBE: fn() -> RangeProbe = || RangeProbe {
+    bound: 1,
+    probed: 1,
+    first_failure: None,
+};
 
 impl AddressBook {
-    /// [`Self::allocate_at`], now, with the host's own loopback binding
-    /// measured live.
+    /// [`Self::allocate_at`], now, with the book's own range probe.
     fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
-        self.allocate_at(node, name, Instant::now(), HOST_BIND_PROBE)
+        let probe = self.range_probe;
+        self.allocate_at(node, name, Instant::now(), probe)
     }
 
     /// The address `name` of `node` holds, or the lowest free one whose
-    /// quarantine has passed by `now` and which `bindable` accepts,
-    /// recorded against them. Idempotent per box; a box re-registered
+    /// quarantine has passed by `now`, recorded against them. Idempotent per box; a box re-registered
     /// inside its old address's quarantine gets that address back. When
     /// every free address is still quarantined, the allocation fails
     /// naming when the first one frees — it never hands an address out
-    /// early. A fresh address the host cannot bind is never handed out:
-    /// the caller gets the 127.0.0.1 interim instead, recorded nowhere, so
-    /// a name it publishes always answers where something listens. A box's
-    /// own address, held or quarantined, comes back without the probe, so
-    /// its address never moves under it. A probe that fails for any reason
-    /// other than an unaliased range refuses the allocation.
+    /// early. A fresh address is handed out only when `range_probe` reads
+    /// the whole box range present (NET-123): a range the host carries
+    /// none or only part of hands the caller the 127.0.0.1 interim
+    /// instead, recorded nowhere, so a name it publishes always answers
+    /// where something listens. A box's own address, held or quarantined,
+    /// comes back without the probe, so its address never moves under it.
+    /// A probe refused for any reason other than an absent address refuses
+    /// the allocation.
     fn allocate_at(
         &mut self,
         node: &str,
         name: &str,
         now: Instant,
-        bindable: impl Fn(Ipv4Addr) -> io::Result<bool>,
+        range_probe: impl FnOnce() -> RangeProbe,
     ) -> Result<Ipv4Addr, String> {
         if let Some((address, _)) = self
             .held
@@ -715,14 +713,35 @@ impl AddressBook {
             });
         };
         if own.is_none() {
-            match bindable(free) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Ipv4Addr::LOCALHOST),
-                Err(error) => {
+            let probe = range_probe();
+            if !probe.present() {
+                if let Some((address, kind)) = probe.first_failure
+                    && kind != io::ErrorKind::AddrNotAvailable
+                {
                     return Err(format!(
-                        "this host could not check that it can listen on {free}: {error}"
+                        "this host could not check that it can listen on the box range: \
+                         {address} refused the bind ({kind:?})"
                     ));
                 }
+                if !self.range_absent {
+                    tracing::warn!(
+                        component = COMPONENT,
+                        probe = %probe.summary(),
+                        "this host cannot bind the whole box address range; boxes get the \
+                         127.0.0.1 interim until the range aliases are installed"
+                    );
+                    self.range_absent = true;
+                }
+                return Ok(Ipv4Addr::LOCALHOST);
+            }
+            if self.range_absent {
+                tracing::info!(
+                    component = COMPONENT,
+                    probe = %probe.summary(),
+                    "this host binds the whole box address range again; new boxes get \
+                     addresses out of it"
+                );
+                self.range_absent = false;
             }
         }
         self.released.remove(&free);
@@ -2801,8 +2820,26 @@ impl AnswererStatus {
     #[must_use]
     pub fn allocating_for_tests_with(
         node: &str,
+        hold_reply: impl FnMut() -> Option<std::sync::mpsc::Receiver<()>> + Send + 'static,
+        on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
+    ) -> Self {
+        Self::allocating_for_tests_probed(node, hold_reply, on_release, || RangeProbe {
+            bound: 1,
+            probed: 1,
+            first_failure: None,
+        })
+    }
+
+    /// [`Self::allocating_for_tests_with`] whose book reads the box range
+    /// with `range_probe` before each fresh address, so a test can stand in
+    /// for a host that lacks the range aliases, or gains them mid-test.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn allocating_for_tests_probed(
+        node: &str,
         mut hold_reply: impl FnMut() -> Option<std::sync::mpsc::Receiver<()>> + Send + 'static,
         mut on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
+        mut range_probe: impl FnMut() -> RangeProbe + Send + 'static,
     ) -> Self {
         let status = Self::starting();
         let commands = status.attach_commands();
@@ -2812,10 +2849,12 @@ impl AnswererStatus {
             while let Ok(command) = commands.recv() {
                 match command {
                     HandoverCommand::Allocate { name, reply } => {
-                        let answer =
-                            book.allocate_at(&node, &box_zone_name(&name), Instant::now(), |_| {
-                                Ok(true)
-                            });
+                        let answer = book.allocate_at(
+                            &node,
+                            &box_zone_name(&name),
+                            Instant::now(),
+                            &mut range_probe,
+                        );
                         match hold_reply() {
                             Some(gate) => {
                                 std::thread::spawn(move || {
@@ -5827,10 +5866,10 @@ mod tests {
         let t0 = Instant::now();
         let mut book = AddressBook::default();
         let a = book
-            .allocate_at("node-a", "a", t0, |_| Ok(true))
+            .allocate_at("node-a", "a", t0, range_present)
             .expect(".2");
         let b = book
-            .allocate_at("node-a", "b", t0, |_| Ok(true))
+            .allocate_at("node-a", "b", t0, range_present)
             .expect(".3");
         assert_eq!(
             (a, b),
@@ -5841,7 +5880,7 @@ mod tests {
         assert_eq!(book.release_at("node-a", "a", t0), Some(a));
         let inside = (t0 + ttl).checked_sub(Duration::from_millis(1)).unwrap();
         let c = book
-            .allocate_at("node-b", "c", inside, |_| Ok(true))
+            .allocate_at("node-b", "c", inside, range_present)
             .expect("a fresh address");
         assert_eq!(
             c,
@@ -5861,12 +5900,12 @@ mod tests {
         );
         let after_a = t0 + ttl;
         assert_eq!(
-            book.allocate_at("node-b", "d", after_a, |_| Ok(true)),
+            book.allocate_at("node-b", "d", after_a, range_present),
             Ok(a),
             "the lowest address whose quarantine has passed"
         );
         let e = book
-            .allocate_at("node-b", "e", after_a, |_| Ok(true))
+            .allocate_at("node-b", "e", after_a, range_present)
             .expect("the next fresh one");
         assert_eq!(
             e,
@@ -5877,7 +5916,7 @@ mod tests {
         // The box that held a quarantined address may take it back.
         assert_eq!(book.release_at("node-a", "b", after_a), Some(b));
         assert_eq!(
-            book.allocate_at("node-a", "b", after_a, |_| Ok(true)),
+            book.allocate_at("node-a", "b", after_a, range_present),
             Ok(b),
             "a box re-registered gets its own address back"
         );
@@ -5887,19 +5926,24 @@ mod tests {
         let mut full = AddressBook::default();
         let (first, last) = switch::box_loopback_interior();
         for (index, _) in (u32::from(first)..=u32::from(last)).enumerate() {
-            full.allocate_at("node-a", &format!("box{index}"), t0, |_| Ok(true))
+            full.allocate_at("node-a", &format!("box{index}"), t0, range_present)
                 .expect("the range holds it");
         }
         let freed = full.release_at("node-a", "box0", t0).expect("box0 held .2");
         let refused = full
-            .allocate_at("node-b", "late", t0 + Duration::from_secs(10), |_| Ok(true))
+            .allocate_at(
+                "node-b",
+                "late",
+                t0 + Duration::from_secs(10),
+                range_present,
+            )
             .expect_err("nothing is free outside the quarantine");
         assert!(
             refused.contains("released in the last 15 s") && refused.contains("frees in 5 s"),
             "the refusal names the quarantine and the wait: {refused}"
         );
         assert_eq!(
-            full.allocate_at("node-b", "late", t0 + ttl, |_| Ok(true)),
+            full.allocate_at("node-b", "late", t0 + ttl, range_present),
             Ok(freed),
             "once the TTL has passed the address is handed out"
         );
@@ -5914,7 +5958,7 @@ mod tests {
         let now = Instant::now();
         let mut book = AddressBook::default();
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| Ok(false)),
+            book.allocate_at("node-a", "web", now, range_absent),
             Ok(Ipv4Addr::LOCALHOST),
             "a host that cannot bind the range gets the interim"
         );
@@ -5924,13 +5968,13 @@ mod tests {
         );
         for name in ["api", "db", "worker"] {
             assert_eq!(
-                book.allocate_at("node-a", name, now, |_| Ok(false)),
+                book.allocate_at("node-a", name, now, range_absent),
                 Ok(Ipv4Addr::LOCALHOST),
                 "every box of an unbindable host shares the interim"
             );
         }
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| Ok(false)),
+            book.allocate_at("node-a", "web", now, range_absent),
             Ok(Ipv4Addr::LOCALHOST),
             "the interim hand is idempotent per box"
         );
@@ -5940,32 +5984,70 @@ mod tests {
         );
     }
 
-    /// The interim hand is only a stand-in: once the host can bind the
-    /// range again (the aliases have arrived) the next allocation hands a
-    /// range address and keeps handing the same one. A box created at the
-    /// interim keeps 127.0.0.1 across a resume: the resume does not ask the
-    /// book (`control::resume_reply`).
+    /// The box range as a host whose `lo0` carries every alias reads it.
+    fn range_present() -> RangeProbe {
+        switch::loopback::probe_over(switch::loopback::range_hosts(), |_| Ok(()))
+    }
+
+    /// The box range as a host whose `lo0` carries none of the aliases (a
+    /// stock macOS before `min finalize-install`) reads it.
+    fn range_absent() -> RangeProbe {
+        switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+            Err(io::ErrorKind::AddrNotAvailable.into())
+        })
+    }
+
+    /// The interim hand is only a stand-in for a box created while the
+    /// host lacks the range: once the host binds the range again (the
+    /// aliases have arrived) a NEW box gets a range address. The box created
+    /// at the interim keeps 127.0.0.1: its resume never asks the book
+    /// (`control::resume_reply`, proved by
+    /// `control::tests::an_interim_box_keeps_the_interim_across_a_resume`).
     #[test]
     fn a_host_that_becomes_bindable_hands_out_range_addresses_again() {
         let now = Instant::now();
         let mut book = AddressBook::default();
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| Ok(false)),
+            book.allocate_at("node-a", "web", now, range_absent),
             Ok(Ipv4Addr::LOCALHOST),
             "before the aliases arrive the interim stands in"
         );
-        let upgraded = book
-            .allocate_at("node-a", "web", now, |_| Ok(true))
+        let api = book
+            .allocate_at("node-a", "api", now, range_present)
             .expect("the range answers once the host binds it");
         assert!(
-            in_box_range(upgraded),
-            "the upgrade hands an address out of the range: {upgraded}"
+            in_box_range(api),
+            "a new box gets an address out of the range: {api}"
         );
         assert_eq!(
-            book.allocate_at("node-a", "web", now, |_| Ok(true)),
-            Ok(upgraded),
+            book.allocate_at("node-a", "api", now, range_absent),
+            Ok(api),
             "a re-ask hands back the recorded address"
         );
+    }
+
+    /// The probe's verdict is whole-range (`switch::loopback`): a host
+    /// that carries only some of the aliases reads absent and hands the
+    /// interim, even when the address the book would pick is one it carries,
+    /// consistent with `min list` advising `min finalize-install`.
+    #[test]
+    fn a_partial_alias_set_is_handed_the_interim() {
+        let mut book = AddressBook::default();
+        let partial = || {
+            switch::loopback::probe_over(switch::loopback::range_hosts(), |address| {
+                if address.octets()[3] < 128 {
+                    Ok(())
+                } else {
+                    Err(io::ErrorKind::AddrNotAvailable.into())
+                }
+            })
+        };
+        assert_eq!(
+            book.allocate_at("node-a", "web", Instant::now(), partial),
+            Ok(Ipv4Addr::LOCALHOST),
+            "a partial alias set reads as absent"
+        );
+        assert!(book.held.is_empty() && book.released.is_empty());
     }
 
     /// A box's own address comes back without the probe: one it holds, and
@@ -5976,44 +6058,53 @@ mod tests {
         let t0 = Instant::now();
         let mut book = AddressBook::default();
         let web = book
-            .allocate_at("node-a", "web", t0, |_| Ok(true))
+            .allocate_at("node-a", "web", t0, range_present)
             .expect("the range binds");
         assert_eq!(
-            book.allocate_at("node-a", "web", t0, |_| Ok(false)),
+            book.allocate_at("node-a", "web", t0, range_absent),
             Ok(web),
             "a held address is handed back as it stands"
         );
         assert_eq!(book.release_at("node-a", "web", t0), Some(web));
         assert_eq!(
-            book.allocate_at("node-a", "web", t0, |_| Ok(false)),
+            book.allocate_at("node-a", "web", t0, range_absent),
             Ok(web),
             "a quarantined own address is handed back too"
         );
     }
 
-    /// A probe that fails for a reason other than an unaliased range
-    /// refuses the allocation and names the error, rather than moving the
-    /// box to the shared 127.0.0.1. Nothing is recorded.
+    /// A probe refused for a reason other than an absent address refuses
+    /// the allocation and names the refusal, rather than moving the box to
+    /// the shared 127.0.0.1. Nothing is recorded.
     #[test]
     fn a_probe_error_refuses_the_allocation() {
         let mut book = AddressBook::default();
         let refused = book
-            .allocate_at("node-a", "web", Instant::now(), |_| {
-                Err(io::Error::from_raw_os_error(libc::EMFILE))
+            .allocate_at("node-a", "web", Instant::now(), || {
+                switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                })
             })
-            .expect_err("a probe error is not an unbindable range");
+            .expect_err("a probe error is not an absent range");
         assert!(
-            refused.contains("could not check that it can listen on 127.0.64.2"),
-            "the refusal names the address it probed: {refused}"
+            refused.contains("could not check that it can listen on the box range")
+                && refused.contains("127.0.64.1 refused the bind (PermissionDenied)"),
+            "the refusal names the address the probe was refused at: {refused}"
         );
         assert!(book.held.is_empty() && book.released.is_empty());
     }
 
-    /// The live probe binds 127.0.0.1 on every host, so it answers
-    /// `Ok(true)` there: the classifier never reads a bind as a refusal.
+    /// A default book reads the range with the probe it was built with.
+    /// Under test that probe reads the range present, so the service-path
+    /// tests hand distinct range addresses on hosts without the aliases.
     #[test]
-    fn the_live_probe_binds_the_interim() {
-        assert!(matches!(loopback_bindable(Ipv4Addr::LOCALHOST), Ok(true)));
+    fn a_default_book_allocates_through_its_own_probe() {
+        let mut book = AddressBook::default();
+        assert!(in_box_range(
+            book.allocate("node-a", "web").expect("present")
+        ));
+        book.range_probe = range_absent;
+        assert_eq!(book.allocate("node-a", "api"), Ok(Ipv4Addr::LOCALHOST));
     }
 
     /// Box addresses are host-global (design §7.1): the answerer hands

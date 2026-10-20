@@ -4621,6 +4621,95 @@ mod tests {
         );
     }
 
+    /// A box created while the host lacked the box range was handed the
+    /// 127.0.0.1 interim, and keeps it: once the aliases are installed and
+    /// its row is withdrawn, its creator's resume reinstates it at
+    /// 127.0.0.1 rather than refusing it as moved, while a new box gets an
+    /// address out of the range.
+    #[test]
+    fn an_interim_box_keeps_the_interim_across_a_resume() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let aliased = Arc::new(AtomicBool::new(false));
+        let probed = Arc::clone(&aliased);
+        let answerer = AnswererStatus::allocating_for_tests_probed(
+            "control-test-node",
+            || None,
+            |_, _| {},
+            move || {
+                let present = probed.load(Ordering::SeqCst);
+                switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                    if present {
+                        Ok(())
+                    } else {
+                        Err(std::io::ErrorKind::AddrNotAvailable.into())
+                    }
+                })
+            },
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let request = |name: &str| RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: 0,
+        };
+        let web = handed(register(&sock_path, &request("web")).expect("registered"));
+        assert_eq!(
+            web.loopback_address,
+            Ipv4Addr::LOCALHOST,
+            "a host without the range hands the interim"
+        );
+
+        aliased.store(true, Ordering::SeqCst);
+        assert!(
+            boxes.withdraw(web.switch_address).is_some(),
+            "the row is withdrawn, its creation dormant"
+        );
+        let resumed = handed(
+            control(
+                &sock_path,
+                &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                    name: "web".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id: Some(web.box_id),
+                }),
+            )
+            .expect("the resume is answered"),
+        );
+        assert_eq!(
+            (resumed.box_id, resumed.loopback_address),
+            (web.box_id, Ipv4Addr::LOCALHOST),
+            "the interim box resumes at its own 127.0.0.1"
+        );
+
+        let api = handed(register(&sock_path, &request("api")).expect("registered"));
+        assert!(
+            api.loopback_address != Ipv4Addr::LOCALHOST,
+            "a new box gets a range address once the host binds the range: {}",
+            api.loopback_address
+        );
+    }
+
     /// The doors are the verb's access control (NET-138): the read-only row
     /// verb is refused on the in-VM daemon's channel and an admit report is
     /// refused on the host's socket — each refusal naming the door that
