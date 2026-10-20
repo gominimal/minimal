@@ -507,19 +507,16 @@ fn read<R: Rules + ?Sized>(
     };
     // An authority that does not parse is in no rule.
     let upstream = parse_authorities(&claims.upstream);
+    let upstream_parsed = upstream.is_some();
     let handle = Handle {
-        verified: verified.is_ok() && upstream.is_some(),
+        verified: verified.is_ok() && upstream_parsed,
         bound: claims.sub == origin.box_id && claims.node_id == origin.host,
         exp: claims.exp,
         upstream: upstream.unwrap_or_default(),
         inject: claims.inject.clone(),
         rule,
     };
-    let outcome = match (verified, handle.check(now)) {
-        (Err(error), _) => error.to_string(),
-        (Ok(()), Err(invalid)) => invalid.to_string(),
-        (Ok(()), Ok(())) => "valid".to_owned(),
-    };
+    let outcome = outcome(verified, upstream_parsed, handle.check(now));
     // The store and identifier can come from a handle that did not verify,
     // so they are logged escaped.
     tracing::debug!(
@@ -532,6 +529,25 @@ fn read<R: Rules + ?Sized>(
         identifier: Some(claims.identifier()),
         jti: Some(claims.jti),
         handle,
+    }
+}
+
+/// The outcome that the debug line names for one handle.
+///
+/// A handle whose signature verifies but whose `upstream` does not parse is
+/// refused through `verified`, so [`Handle::check`] gives
+/// [`Invalid::Signature`]. The log names `unparsed_upstream` for it, so the
+/// line gives the real cause.
+fn outcome(
+    verified: Result<(), VerifyError>,
+    upstream_parsed: bool,
+    check: Result<(), Invalid>,
+) -> String {
+    match (verified, check) {
+        (Err(error), _) => error.to_string(),
+        (Ok(()), _) if !upstream_parsed => "unparsed_upstream".to_owned(),
+        (Ok(()), Err(invalid)) => invalid.to_string(),
+        (Ok(()), Ok(())) => "valid".to_owned(),
     }
 }
 
@@ -579,6 +595,16 @@ pub fn read_opened<R: Rules + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparsed_upstream_is_logged_apart_from_the_signature() {
+        assert_eq!(
+            outcome(Ok(()), false, Err(Invalid::Signature)),
+            "unparsed_upstream"
+        );
+        assert_eq!(outcome(Ok(()), true, Err(Invalid::Expired)), "expired");
+        assert_eq!(outcome(Ok(()), true, Ok(())), "valid");
+    }
     use crate::module::GITHUB;
     use crate::redeem::{
         Attribution, Bounds, Check, Decision, Redemption, RequestAuthority, Unsealed, decide,
