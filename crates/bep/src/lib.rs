@@ -12,5 +12,7 @@
 //! opens.
 
 pub mod audit;
+pub mod keys;
 pub mod module;
+pub mod publish;
 pub mod seal;
