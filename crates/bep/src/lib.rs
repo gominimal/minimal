@@ -12,6 +12,8 @@
 //! opens.
 
 pub mod http;
+pub mod keys;
 pub mod module;
+pub mod publish;
 pub mod seal;
 pub mod upstream;
