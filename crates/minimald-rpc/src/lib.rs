@@ -1667,6 +1667,34 @@ pub struct CreateSessionRequest {
     pub must_match_version: Option<String>,
 }
 
+impl CreateSessionRequest {
+    /// A create request for a box named `name` over `project_path`, with
+    /// the given network mode and policy. Everything else takes the value
+    /// a plain create sends: no handed addresses or box id, no task
+    /// addresses, hooks on, no attrs, and no version assertion.
+    pub fn new(
+        name: impl Into<String>,
+        project_path: paths::HostAbsPath,
+        network: NetworkMode,
+        policy: BoxPolicy,
+    ) -> Self {
+        Self {
+            config: BoxConfig {
+                name: Some(name.into()),
+                project_path,
+                network,
+                policy,
+                task_addresses: Vec::new(),
+                box_id: None,
+                box_addresses: None,
+                hooks_enabled: default_hooks_enabled(),
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        }
+    }
+}
+
 /// The response for a [`CreateSession`] RPC: the allocated session.
 ///
 /// The session's loadout is not composed yet — the returned id is

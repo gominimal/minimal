@@ -496,6 +496,37 @@ fn create_session_request_round_trips() {
     assert_eq!(round_trip(&req), req);
 }
 
+/// The one constructor every daemon-side create goes through: it fills
+/// each field it does not take with the value a plain create sends, and
+/// the request it builds survives the wire unchanged.
+#[test]
+fn create_request_constructor_round_trips() {
+    let req = CreateSessionRequest::new(
+        "my-session",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::OwnIp,
+        BoxPolicy::default(),
+    );
+    assert_eq!(
+        req,
+        CreateSessionRequest {
+            config: BoxConfig {
+                name: Some("my-session".into()),
+                project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+                network: NetworkMode::OwnIp,
+                policy: BoxPolicy::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
+                box_addresses: None,
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        }
+    );
+    assert_eq!(round_trip(&req), req);
+}
+
 /// A client that predates `must_match_version` sends no such field, and
 /// the daemon must read that as "assert nothing" rather than fail to
 /// decode the request. `CreateSessionRequest` is deliberately *not*
