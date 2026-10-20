@@ -2,9 +2,9 @@ use common::SpecHash;
 use graph::{BuildSpecRef, SubsetInput};
 use lcache::{DirCacheEntry, EntryMeta, LocalDir, PendingDir};
 
-use super::state::DeliverableRef;
 use super::{SharedHandle, StateHandle};
 use crate::Error;
+use crate::ids::DeliverableRef;
 
 /// A structure describing a constructed deliverable. For instance, this might
 /// be a PendingDir for local builds.
