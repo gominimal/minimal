@@ -126,13 +126,25 @@ pub enum GrantMode {
     Installation,
 }
 
+/// Where a grant's value comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantSource {
+    /// The credential broker. Only a broker grant makes a credentialed
+    /// upstream.
+    Broker,
+    /// A copy of a variable from the client's environment. It makes no
+    /// credentialed upstream.
+    ClientEnv,
+}
+
 /// One `[secrets.<VAR>]` grant.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretGrant {
-    /// Where the value comes from, for example `broker`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    /// Where the value comes from. Required: a grant with no source, or an
+    /// unknown one, does not parse.
+    pub source: GrantSource,
     /// The scopes the grant asks for, for example `github:user-token`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
@@ -142,11 +154,18 @@ pub struct SecretGrant {
 }
 
 impl SecretGrant {
-    /// Whether this grant is a GitHub grant: one of its scopes is a
+    /// Whether this grant makes a credentialed upstream: its source is the
+    /// broker.
+    #[must_use]
+    pub fn is_credentialed(&self) -> bool {
+        self.source == GrantSource::Broker
+    }
+
+    /// Whether this grant is a GitHub grant: a broker grant with a
     /// `github:` scope.
     #[must_use]
     pub fn is_github(&self) -> bool {
-        self.scopes.iter().any(|scope| scope.starts_with("github:"))
+        self.is_credentialed() && self.scopes.iter().any(|scope| scope.starts_with("github:"))
     }
 }
 
@@ -186,10 +205,10 @@ pub struct ActivationSpec<'a> {
 
 impl ActivationSpec<'_> {
     /// Whether the spec declares a credentialed upstream: at least one
-    /// grant.
+    /// broker grant. A `client_env` grant makes none.
     #[must_use]
     pub fn has_credentialed_upstream(&self) -> bool {
-        !self.secrets.is_empty()
+        self.secrets.values().any(SecretGrant::is_credentialed)
     }
 
     fn github_grants(&self) -> impl Iterator<Item = &str> {
@@ -372,7 +391,12 @@ pub fn refusals(
     // BEP-009: a grant in a box with no network reaches nothing.
     if spec.network == NetworkMode::NoNet && spec.has_credentialed_upstream() {
         out.push(BepRefusal::NoNetworkWithGrant {
-            grants: spec.secrets.keys().cloned().collect(),
+            grants: spec
+                .secrets
+                .iter()
+                .filter(|(_, grant)| grant.is_credentialed())
+                .map(|(name, _)| name.clone())
+                .collect(),
         });
     }
 
@@ -476,7 +500,7 @@ mod tests {
 
     fn github_grant(mode: Option<GrantMode>) -> SecretGrant {
         SecretGrant {
-            source: Some("broker".into()),
+            source: GrantSource::Broker,
             scopes: vec!["github:user-token".into()],
             mode,
         }
@@ -526,6 +550,22 @@ mod tests {
         ]
     }
 
+    fn any_source() -> impl Strategy<Value = GrantSource> {
+        prop_oneof![Just(GrantSource::Broker), Just(GrantSource::ClientEnv)]
+    }
+
+    /// Grants that all copy a client variable: no credentialed upstream.
+    fn client_env_grants() -> impl Strategy<Value = SecretGrants> {
+        prop::collection::btree_map(
+            "[A-Z]{1,6}",
+            any_grant().prop_map(|grant| SecretGrant {
+                source: GrantSource::ClientEnv,
+                ..grant
+            }),
+            1..3,
+        )
+    }
+
     fn any_grant() -> impl Strategy<Value = SecretGrant> {
         (
             prop::collection::vec(
@@ -537,9 +577,10 @@ mod tests {
                 0..3,
             ),
             any_mode(),
+            any_source(),
         )
-            .prop_map(|(scopes, mode)| SecretGrant {
-                source: Some("broker".into()),
+            .prop_map(|(scopes, mode, source)| SecretGrant {
+                source,
                 scopes,
                 mode,
             })
@@ -631,42 +672,73 @@ mod tests {
         }
 
         /// BEP-009: the refusal fires iff the network mode is `none` and at
-        /// least one grant is declared.
+        /// least one broker grant is declared. It names the broker grants
+        /// only.
         #[test]
         fn prop_none_mode_with_grant_is_exit_3(
             network in any_network(),
             egress in any_egress(),
             bep in any_bep(),
             secrets in any_grants(),
+            client in client_env_grants(),
             host in any_host(),
         ) {
-            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
-            let expected = network == NetworkMode::NoNet && !secrets.is_empty();
-            let fired = refusals(&spec, host, GITHUB_HOSTS)
+            // A `client_env` grant in a `none` box is legal.
+            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
+            let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
                 .iter()
                 .any(|r| matches!(r, BepRefusal::NoNetworkWithGrant { .. }));
-            prop_assert_eq!(fired, expected);
+            prop_assert!(!client_fired);
+
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let broker: Vec<String> = secrets
+                .iter()
+                .filter(|(_, g)| g.source == GrantSource::Broker)
+                .map(|(name, _)| name.clone())
+                .collect();
+            let expected = network == NetworkMode::NoNet && !broker.is_empty();
+            let named = refusals(&spec, host, GITHUB_HOSTS).into_iter().find_map(|r| match r {
+                BepRefusal::NoNetworkWithGrant { grants } => Some(grants),
+                _ => None,
+            });
+            prop_assert_eq!(named.is_some(), expected);
+            if let Some(grants) = named {
+                prop_assert_eq!(grants, broker);
+            }
             if expected {
                 let refused = check_activation(&spec, host, GITHUB_HOSTS).expect_err("refused");
                 prop_assert_eq!(refused.exit_code(), 3);
             }
         }
 
-        /// BEP-017: with no box-zone resolver and a declared grant, the
-        /// refusal fires iff the resolved steering is `dns` or `both`.
+        /// BEP-017: with no box-zone resolver, the refusal fires iff a
+        /// broker grant is declared and the resolved steering is `dns` or
+        /// `both`. Grants that are all `client_env` never fire it.
         #[test]
         fn prop_dns_steering_without_resolver_is_exit_3(
             network in any_network(),
             egress in any_egress(),
             bep in any_bep(),
             secrets in any_grants(),
+            client in client_env_grants(),
             enrolled in any::<bool>(),
         ) {
-            prop_assume!(!secrets.is_empty());
             let host = HostFacts { enrolled, box_zone_resolver: false };
+
+            let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
+            let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
+                .iter()
+                .any(|r| matches!(r, BepRefusal::NoResolver { .. }));
+            prop_assert!(!client_fired);
+            if !(bep.steering == Some(Steering::Off) && bep.proxy_env) {
+                let plan = check_activation(&client_spec, host, GITHUB_HOSTS);
+                prop_assert!(plan.is_ok_and(|plan| !plan.inject_ca));
+            }
+
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
             let resolved = bep.steering.unwrap_or(Steering::Dns);
-            let expected = matches!(resolved, Steering::Dns | Steering::Both);
+            let expected = secrets.values().any(|g| g.source == GrantSource::Broker)
+                && matches!(resolved, Steering::Dns | Steering::Both);
             let fired = refusals(&spec, host, GITHUB_HOSTS)
                 .iter()
                 .any(|r| matches!(r, BepRefusal::NoResolver { .. }));
@@ -821,8 +893,22 @@ mod tests {
     #[test]
     fn unknown_grant_field_is_refused() {
         let err = toml::from_str::<SecretGrant>(
-            "scopes = [\"github:user-token\"]\nmdoe = \"installation\"",
+            "source = \"broker\"\nscopes = [\"github:user-token\"]\nmdoe = \"installation\"",
         );
         assert!(err.is_err());
+    }
+
+    /// The source is required and closed: a grant with no source, or an
+    /// unknown one, does not parse.
+    #[test]
+    fn grant_source_is_required_and_known() {
+        assert!(toml::from_str::<SecretGrant>("scopes = [\"github:user-token\"]").is_err());
+        assert!(toml::from_str::<SecretGrant>("source = \"vault\"").is_err());
+        let grant: SecretGrant = toml::from_str("source = \"client_env\"").expect("parses");
+        assert_eq!(grant.source, GrantSource::ClientEnv);
+        let grant: SecretGrant =
+            toml::from_str("source = \"broker\"\nscopes = [\"github:user-token\"]")
+                .expect("parses");
+        assert!(grant.is_credentialed() && grant.is_github());
     }
 }
