@@ -51,20 +51,6 @@ pub fn user_policy_path(global: &GlobalArgs) -> PathBuf {
 /// and it applies to every user of this machine.
 pub const ORGANIZATION_CONFIG_PATH: &str = "/etc/minimal/config.toml";
 
-/// The `[secrets]` table of a client `config.toml`. Only this table is read
-/// here, so the other sections stay with their own readers.
-#[derive(Debug, Default, serde::Deserialize)]
-struct ClientSecretsFile {
-    #[serde(default)]
-    secrets: ClientSecrets,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct ClientSecrets {
-    #[serde(default)]
-    acknowledge_full_breadth_unenrolled: bool,
-}
-
 /// Whether the user or the organization client configuration sets
 /// `[secrets] acknowledge_full_breadth_unenrolled = true` (BEP-057).
 /// A missing file sets nothing. A project file is never read here.
@@ -85,18 +71,38 @@ pub fn full_breadth_acknowledged(global: &GlobalArgs) -> Result<bool, anyhow::Er
 /// A file that exists but is not read or does not parse, naming its path.
 pub fn acknowledged_in(paths: &[PathBuf]) -> Result<bool, anyhow::Error> {
     for path in paths {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(anyhow::anyhow!("Cannot read {}: {err}", path.display()));
-            }
-        };
-        let file: ClientSecretsFile = toml::from_str(&text)
-            .map_err(|err| anyhow::anyhow!("{} does not parse: {err}", path.display()))?;
-        if file.secrets.acknowledge_full_breadth_unenrolled {
+        let config = boxes::client::config::read_config_or_default(path)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if config.secrets.acknowledge_full_breadth_unenrolled {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BEP-057: the `[secrets]` table the refusal text names parses through
+    /// the client configuration reader, so `min session` still starts, and
+    /// the acknowledgement reads as set.
+    #[test]
+    fn secrets_table_reads_through_client_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("minimal");
+        std::fs::create_dir_all(&config_dir).expect("mkdir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[secrets]\nacknowledge_full_breadth_unenrolled = true\n",
+        )
+        .expect("write config.toml");
+        let global = GlobalArgs {
+            config_dir: Some(dir.path().to_path_buf()),
+            ..GlobalArgs::default()
+        };
+        let config = read_client_config(&global).expect("config.toml parses");
+        assert!(config.secrets.acknowledge_full_breadth_unenrolled);
+        assert!(full_breadth_acknowledged(&global).expect("reads"));
+    }
 }

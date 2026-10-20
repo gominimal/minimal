@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use boxes::core::bep::{
-    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, HostFacts, Quic443, SecretGrant,
-    SecretGrants, refusals,
+    ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
+    SecretGrant, SecretGrants, Steering, refusals,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
@@ -55,6 +55,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     }
 
     // BEP-057: every host is un-enrolled today.
+    // Interim: only BEP-057 is previewed here; the full exit-3 set is gominimal/minimal#2445.
     let host = HostFacts {
         full_breadth_acknowledged: inputs.acknowledged,
         ..HostFacts::LOCAL
@@ -77,6 +78,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     match inputs.root_fingerprint {
         // The proxy issues no root certificate yet, so this is the key's
         // RFC 7638 thumbprint, not a certificate fingerprint. The label says so.
+        // Interim: the root key's RFC 7638 thumbprint until the root certificate exists (#2437); the certificate fingerprint is gominimal/minimal#2446.
         Some(fingerprint) => writeln!(out, "root CA  key thumbprint SHA256:{fingerprint}")?,
         None => writeln!(
             out,
@@ -120,6 +122,23 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
 
     let steering = inputs.bep.resolved_steering();
     writeln!(out, "steering  {}", steering.word())?;
+    // Networking §5.4: steering `off` with a GitHub grant is a warning, not
+    // a refusal, so the exit stays 0.
+    if steering == Steering::Off {
+        let grants: Vec<String> = inputs
+            .secrets
+            .iter()
+            .filter(|(_, grant)| grant.is_github())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !grants.is_empty() {
+            writeln!(
+                out,
+                "warning  {}",
+                BepWarning::SteeringOffWithGrant { grants }
+            )?;
+        }
+    }
     if !inputs.quic443.unwrap_or_default().blocks(true, steering) {
         writeln!(out, "quic443  allowed (HTTP/3 bypasses the proxy)")?;
     }
@@ -201,7 +220,7 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxes::core::bep::{GrantSource, Steering};
+    use boxes::core::bep::GrantSource;
 
     const HOSTS: &[&str] = &[
         "github.com",
@@ -291,6 +310,25 @@ mod tests {
             none,
             "This project declares no broker secret, so its box does not use the proxy.\n"
         );
+
+        // Networking §5.4: steering `off` with a GitHub grant writes one
+        // warning row after the `steering` row, and still renders.
+        let off = BepSettings {
+            steering: Some(Steering::Off),
+            ..BepSettings::default()
+        };
+        let text = rendered(&secrets, &off, None, false).expect("renders with a warning");
+        let warning = BepWarning::SteeringOffWithGrant {
+            grants: vec!["GH_TOKEN".into()],
+        };
+        assert!(
+            text.contains(&format!("steering  off\nwarning  {warning}\n")),
+            "{text}"
+        );
+        assert_eq!(text.matches("warning  ").count(), 1, "{text}");
+        // `proxy_env` writes no warning.
+        let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
+        assert!(!text.contains("warning  "), "{text}");
     }
 
     /// BEP-038: a `full` member is marked `full` beside its declared scope.
