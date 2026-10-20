@@ -7714,7 +7714,7 @@ mod tests {
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
             ..EgressPolicy::default()
         });
-        spec.credentialed_upstream = Some(boxes::CredentialedUpstream {});
+        spec.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
         spec.dynamic_ingress = Some(DynamicIngress::Allow);
         spec.dynamic_allowed_range = Some((9000, 9100));
         let web = registry
