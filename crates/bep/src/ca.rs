@@ -217,6 +217,9 @@ pub enum CaError {
     /// A name is not a DNS name that a certificate can carry.
     #[error("{0} is not a DNS name")]
     InvalidName(String),
+    /// The signing CA expired, so a leaf it signs would not validate.
+    #[error("the proxy signing CA expired at {0}, so the proxy issues no leaf certificate")]
+    SigningExpired(OffsetDateTime),
     /// The certificate encoding failed.
     #[error("the certificate was not issued: {0}")]
     Certificate(rcgen::Error),
@@ -374,8 +377,10 @@ impl<'k, K: CaKey> Ca<'k, K> {
     ///
     /// # Errors
     ///
-    /// [`CaError::OutsideUnion`] when `hostname` is not in the union, and
-    /// [`CaError::Key`] when the store refuses the signing CA key.
+    /// [`CaError::OutsideUnion`] when `hostname` is not in the union,
+    /// [`CaError::SigningExpired`] when `now` is at or past the signing CA
+    /// expiry, and [`CaError::Key`] when the store refuses the signing CA
+    /// key.
     pub fn issue_leaf(&self, hostname: &str, now: SystemTime) -> Result<Leaf, CaError> {
         if !self.union.contains(hostname) {
             tracing::warn!(
@@ -395,6 +400,11 @@ impl<'k, K: CaKey> Ca<'k, K> {
 
     /// Signs a leaf for `hostname` with no union check.
     fn sign_leaf(&self, hostname: &str, now: SystemTime) -> Result<Leaf, CaError> {
+        let expiry = self.signing_params.not_after;
+        if OffsetDateTime::from(now) >= expiry {
+            tracing::warn!(hostname, %expiry, "refused a leaf certificate: the signing CA expired");
+            return Err(CaError::SigningExpired(expiry));
+        }
         let name = rcgen::string::Ia5String::try_from(hostname)
             .map_err(|_| CaError::InvalidName(hostname.to_owned()))?;
         let key =
@@ -856,6 +866,8 @@ mod tests {
             .issue_leaf(host, now() + SIGNING_VALIDITY - Duration::from_secs(DAY))
             .unwrap();
         assert_eq!(not_after(&late.chain[0]), not_after(ca.signing()));
+        let expired = ca.issue_leaf(host, now() + SIGNING_VALIDITY);
+        assert!(matches!(expired, Err(CaError::SigningExpired(_))));
     }
 
     #[test]
