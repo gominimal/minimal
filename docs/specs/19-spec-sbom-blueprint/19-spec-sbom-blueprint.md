@@ -74,7 +74,10 @@ with no closure entry, or any package whose entry is of any other state
 (whatever registry is recorded for it: the entry decides first, and an
 entry the closure format does not define is a broken pin), is neither a
 digest nor a gap: the pin does not account for the package, and the
-emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe of the cache takes part
+emission is SBOM-012's failure, exit code 6, naming the package (AT2:
+the architecture's threat model entry "Artifact substitution in the cache
+or CDN", whose mitigation is that verification fails closed; every later
+"AT2" here is that entry). No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds. A referenced document is
 **absent** when the cache answers an authoritative not-found for its name;
 every other failure to fetch it is **unfetchable** and is SBOM-012's
@@ -169,7 +172,7 @@ developer running agent boxes; build-infra operator; auditor.
     bundle binds the bytes and the property above holds unconditionally.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_replaced_document_changes_only_its_component_and_digest
-    property: bytes(a) ≠ bytes(b) ⇒ R ≠ ∅ ∧ diff(a, b) ⊆ ⋃{component(d) : d ∈ R}, where R = {d : ¬pin_records_bundle(d) ∧ read_digest_a(d) ≠ read_digest_b(d)} and a document absent on one emission reads as digest ∅
+    property: bytes(a) ≠ bytes(b) ⇒ R ≠ ∅ ∧ diff(a, b) ⊆ ⋃{component(d) : d ∈ R} ∪ {serial, namespace} (the content-derived identifiers SBOM-001 derives, which follow any component change), where R = {d : ¬pin_records_bundle(d) ∧ read_digest_a(d) ≠ read_digest_b(d)} and a document absent on one emission reads as digest ∅
 
 - **SBOM-002** WHEN a document is emitted as CycloneDX THE SYSTEM SHALL
   produce output that validates against the vendored CycloneDX 1.5 schema.
