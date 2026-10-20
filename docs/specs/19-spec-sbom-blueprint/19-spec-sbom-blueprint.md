@@ -409,7 +409,7 @@ developer running agent boxes; build-infra operator; auditor.
     path above for them, with no flag and no release step.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_without_a_pinned_bundle_is_marked_and_diagnosed
-    property: ¬pin_records_bundle(d) ∧ ¬absent(d) ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185")
+    property: ¬pin_records_bundle(d) ∧ fetched(d) ∧ subject_matches(d) ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185"), where fetched(d) is a document the cache returned (neither absent nor unfetchable, unreachable or refused) and subject_matches(d) is SBOM-013's subject check
   - A document that carries any `unverified` component is not evidence:
     its build facts for those components are whatever the cache's writer
     put under a correct subject. THE SYSTEM SHALL mark such a document at
