@@ -541,11 +541,12 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the host alias, which
 /// is default-deny at every port for a box row (design §7.1, NET-062) when
 /// `refuse_host_alias` says so, and for the node row's frames too outside
-/// the host exposures `host_exposure` carries — the inclusive port ranges a
-/// host's own listener surface answers on, the alias's one opening, the
-/// same list the guest-side verdict holds for its own alias arm; the fabric
-/// plane
-/// outside `own_block`, the subnet the gate's rows live in — a frame to a
+/// the host exposures `host_exposure` carries — the inclusive port ranges
+/// the deployment configured, empty unless it named ports, matched against
+/// `transport_port`, the TCP or UDP destination port, `None` for any other
+/// frame. Box rows stay refused at a configured exposure too: the design
+/// holds an exposure as local reach under the box's egress rules, and that
+/// reach is not built yet. The fabric plane outside `own_block`, the subnet the gate's rows live in — a frame to a
 /// sibling or to the daemon inside the node's own block is local reach,
 /// decided by the row's CIDR rules and the target's ingress, never by this
 /// rule, and the gateway inside it is the control-surface rule's; or RFC
@@ -569,15 +570,14 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// the default network mode), and those reach the host alias as own-block
 /// local reach until the in-force baseline, which names the alias as its
 /// registry and cache endpoint, decides the node plane instead. Announced,
-/// that reach is scoped: the alias is opened at the host exposures alone —
-/// the host's own dev-services plane — and a node-row frame to any other
-/// port through the alias is this rule's drop, the same scoping the
-/// box-row refusal names as default-deny. This mirrors the shared verdict,
+/// that reach is scoped: the alias is opened at the configured host
+/// exposures alone, and a node-row frame to any other port, or with no TCP
+/// or UDP port, is this rule's drop. This mirrors the shared verdict,
 /// whose own-address refusal is attached to box relays only, never to the
 /// daemon relay.
 fn infrastructure_destination(
     dst: [u8; 4],
-    dst_port: u16,
+    transport_port: Option<u16>,
     own_block: SwitchSubnet,
     allow: Option<&[Ipv4Cidr]>,
     refuse_host_alias: bool,
@@ -591,16 +591,15 @@ fn infrastructure_destination(
     // the host only through a declared exposure, never by addressing the
     // alias directly, so the alias is refused under this rule at every port
     // whatever the row's rules would say about it. The node row's frames
-    // — the host-address boxes the interim row carries — reach the same
-    // opening the host itself exposes over the alias (NET-062's third
-    // opening), and no other port: the exposures scope the alias for every
-    // row, and a frame with no readable port fails the opening closed.
-    let exposed = |port: u16| {
+    // — the host-address boxes the interim row carries — reach the alias at
+    // the configured host exposures alone, and only over TCP or UDP: a frame
+    // with no transport port (ICMP reads as port 0) fails the opening closed.
+    let exposed = transport_port.is_some_and(|port| {
         host_exposure
             .iter()
             .any(|&(lo, hi)| lo <= port && port <= hi)
-    };
-    if dst == own_block.host_alias().octets() && (refuse_host_alias || !exposed(dst_port)) {
+    });
+    if dst == own_block.host_alias().octets() && (refuse_host_alias || !exposed) {
         return true;
     }
     let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
@@ -5407,15 +5406,22 @@ fn gate_verdict(
     // boxes' frames, whose `host.min.internal` resolves to the alias, and
     // keeps own-block local reach to it until the in-force baseline (which
     // returned above) decides the node plane. Announced, that reach is
-    // scoped by the baseline's host exposures — the ports the host itself
-    // exposes over the alias — which the arm below reads for every row:
-    // the box rows' refusal stands at every port, and the node row's
-    // outside the exposures.
+    // scoped by the baseline's configured host exposures, which the arm
+    // below reads for every row: the box rows' refusal stands at every
+    // port, and the node row's outside the exposures. The scoping holds only
+    // while the baseline is announced: in force, the arm above returns first
+    // and the baseline's registry and cache entries admit the alias at every
+    // port, a gap the in-force phase still has to close.
     let box_row = src != table.subnet().daemon_ip().octets();
+    let transport_port = matches!(
+        summary.protocol(),
+        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
+    )
+    .then(|| summary.destination_port());
     if let Some(dst) = summary.destination()
         && infrastructure_destination(
             dst,
-            summary.destination_port(),
+            transport_port,
             table.subnet(),
             record.egress().allow_subnets(),
             box_row,
@@ -15189,17 +15195,18 @@ mod tests {
     }
 
     /// The host alias's default-deny is a box row's alone, and the node
-    /// row's reach through it is scoped by the host exposures (design
-    /// §7.1, NET-062). Announced, the interim node row at the daemon's
-    /// address carries the frames of every box sharing the guest root
-    /// namespace — a host-address box, the default network mode, whose
-    /// `host.min.internal` resolves to the alias — so a node-plane frame
-    /// to the alias is own-block local reach the row admits at the exposed
-    /// ports alone and the infrastructure drop at every other port, while
-    /// the same frames from a box lease, even an allow-all one, are the
-    /// infrastructure drop whatever the port. A deployment that clears the
-    /// exposure list closes the alias outright: the node row's frame is
-    /// refused at an exposed port too.
+    /// row's reach through it is scoped by the configured host exposures
+    /// (design §7.1, NET-062). Announced, the interim node row at the
+    /// daemon's address carries the frames of every box sharing the guest
+    /// root namespace — a host-address box, the default network mode, whose
+    /// `host.min.internal` resolves to the alias. The built-in baseline
+    /// carries no exposure, so the alias is closed at every port until a
+    /// deployment names ports; with a list, a node-plane TCP or UDP frame to
+    /// the alias is own-block local reach the row admits inside the list's
+    /// ranges, edges included, and the infrastructure drop outside them,
+    /// while an ICMP frame, which carries no port, is refused even by a list
+    /// spanning every port. The same frames from a box lease, even an
+    /// allow-all one, are the infrastructure drop whatever the port.
     #[test]
     fn host_alias_refused_for_box_rows_and_scoped_by_the_exposures_for_the_node_row() {
         let registry = BoxRegistry::new(SUBNET);
@@ -15209,15 +15216,16 @@ mod tests {
                 .with_admitted_ports([8080]),
         );
         let table = registry.table();
-        let baseline = NodePlaneBaseline::built_in(SUBNET);
-        assert_eq!(baseline.phase(), NodeBaselinePhase::Announced);
+        let built_in = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(built_in.phase(), NodeBaselinePhase::Announced);
         let pins = dns_pins::DnsPins::new(SUBNET);
         let summarize = boxes::core::egress::summarize;
         let alias = SUBNET.host_alias().octets();
+        let node = SUBNET.daemon_ip().octets();
 
-        let verdict = |src: [u8; 4], port: u16, baseline: &NodePlaneBaseline| {
+        let verdict = |src: [u8; 4], proto: u8, port: u16, baseline: &NodePlaneBaseline| {
             gate_verdict(
-                &summarize(&ipv4_frame(src, 6, alias, port)),
+                &summarize(&ipv4_frame(src, proto, alias, port)),
                 None,
                 &table,
                 baseline,
@@ -15225,36 +15233,45 @@ mod tests {
                 &ReplyTables::new(),
             )
         };
+        let refused = |result: Result<GateAdmit, GateDrop>| matches!(result, Err(GateDrop::Infrastructure { dst, .. }) if dst == alias);
 
-        // 8080 sits inside the built-in exposures (8000-8999); 18081 does
-        // not.
-        assert_eq!(
-            verdict(SUBNET.daemon_ip().octets(), 8080, &baseline),
-            Ok(GateAdmit::Row),
-            "the announced node row keeps own-block reach to the host alias at an exposed port"
-        );
         assert!(
-            matches!(
-                verdict(SUBNET.daemon_ip().octets(), 18081, &baseline),
-                Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
-            ),
+            refused(verdict(node, 6, 8080, &built_in)),
+            "with no configured exposure the alias is closed to the node row at every port"
+        );
+
+        let exposed = built_in
+            .clone()
+            .with_host_exposure(vec![(3000, 3999), (8080, 8080)]);
+        assert!(
+            refused(verdict(node, 6, 2999, &exposed)),
+            "the port below a range's low edge is the infrastructure drop"
+        );
+        for port in [3000, 3999, 8080] {
+            assert_eq!(
+                verdict(node, 6, port, &exposed),
+                Ok(GateAdmit::Row),
+                "the node row reaches the host alias at exposed port {port}"
+            );
+        }
+        assert!(
+            refused(verdict(node, 6, 18081, &exposed)),
             "the node row's frame to the host alias outside the exposures is the infrastructure drop"
         );
+        assert_eq!(
+            verdict(node, 17, 8080, &exposed),
+            Ok(GateAdmit::Row),
+            "a UDP frame reaches the host alias at an exposed port"
+        );
         assert!(
-            matches!(
-                verdict(LEASE, 8080, &baseline),
-                Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
-            ),
+            refused(verdict(LEASE, 6, 8080, &exposed)),
             "a box row's frame to the host alias is the infrastructure drop at an exposed port"
         );
 
-        let cleared = baseline.with_host_exposure(vec![]);
+        let every_port = built_in.with_host_exposure(vec![(0, u16::MAX)]);
         assert!(
-            matches!(
-                verdict(SUBNET.daemon_ip().octets(), 8080, &cleared),
-                Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
-            ),
-            "a cleared exposure list refuses the node row's alias reach at every port"
+            refused(verdict(node, 1, 0, &every_port)),
+            "an ICMP frame carries no port and never matches an exposure"
         );
     }
 

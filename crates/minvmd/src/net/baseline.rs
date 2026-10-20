@@ -154,42 +154,44 @@ impl NodeBaselinePhase {
 /// the tests pin both of its arms, so the flip is one line and nothing else.
 pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::Announced;
 
-/// The host-exposure port list the baseline ships: the ranges the design
-/// holds for a host's own dev-services plane (design §7.1) — the ports a
-/// host's own listener surface answers on and the alias's node-row opening
-/// is scoped to, the same opening the host exposes over the alias guest-side
-/// (NET-062's third opening). Every other port is refused through the alias
-/// for every row.
-pub(crate) const DEFAULT_HOST_EXPOSURE_PORTS: [(u16, u16); 5] = [
-    (3000, 3999),
-    (4200, 4200),
-    (5000, 5999),
-    (8000, 8999),
-    (9000, 9999),
-];
-
 /// The environment variable the daemon's host-exposure port list is read
-/// from, once, at VM start — the same read-at-start shape the hostname
-/// proxy port and the egress-default opt-out carry.
+/// from, each time the daemon starts the VM's network — from the daemon's
+/// own environment, so a change takes a daemon restart, the same shape the
+/// hostname proxy port and the egress-default opt-out carry.
 pub(crate) const HOST_EXPOSURE_PORTS_ENV: &str = "MINVMD_HOST_EXPOSURE_PORTS";
 
 /// The host-exposure port list the daemon starts with, as the deployment
-/// spelled it: absent, the built-in list; set but empty, a host alias with
-/// no opening at all — the list cleared, refused at every port for every
-/// row. The list is comma-separated, each term a port (`4200`) or an
-/// inclusive range (`3000-3999`); a term that is neither, or a range whose
-/// low end sits above its high end, fails the start, the variable naming
-/// the term as it was read.
+/// spelled it. The design holds the alias default-deny except explicitly
+/// configured host exposures (design §7.1), so absent or empty, the list is
+/// empty and the alias is refused at every port for every row. The list is
+/// comma-separated, each term a port (`4200`) or an inclusive range
+/// (`3000-3999`), port 0 excluded; a term that is neither, a reversed range,
+/// or a value that is not Unicode fails the start, the error naming the term
+/// and the fix.
 pub(crate) fn host_exposure_ports_from_env() -> io::Result<Vec<(u16, u16)>> {
-    host_exposure_ports_from_raw(std::env::var(HOST_EXPOSURE_PORTS_ENV).ok().as_deref())
+    match std::env::var(HOST_EXPOSURE_PORTS_ENV) {
+        Ok(raw) => host_exposure_ports_from_raw(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => host_exposure_ports_from_raw(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::other(format!(
+            "{HOST_EXPOSURE_PORTS_ENV} is not valid Unicode. {HOST_EXPOSURE_FIX}"
+        ))),
+    }
 }
 
+/// The correction every parse error ends with.
+const HOST_EXPOSURE_FIX: &str = "Set it to ports and ranges such as 8080,3000-3999, \
+     or set it empty to close host.min.internal.";
+
 /// Parses one deployment's spelling of the host-exposure port list: every
-/// term a port or an inclusive range, whitespace trimmed, an empty list a
-/// cleared one — the alias's openings none — rather than the built-in's.
+/// term a port or an inclusive range from 1 to 65535, whitespace trimmed;
+/// absent or empty, no exposure at all.
 fn host_exposure_ports_from_raw(raw: Option<&str>) -> io::Result<Vec<(u16, u16)>> {
     let Some(raw) = raw else {
-        return Ok(DEFAULT_HOST_EXPOSURE_PORTS.to_vec());
+        return Ok(Vec::new());
+    };
+    let port = |text: &str, term: &str| match text.trim().parse::<u16>() {
+        Ok(0) | Err(_) => Err(bad_host_exposure_term(term)),
+        Ok(port) => Ok(port),
     };
     raw.split(',')
         .filter(|term| !term.trim().is_empty())
@@ -197,35 +199,28 @@ fn host_exposure_ports_from_raw(raw: Option<&str>) -> io::Result<Vec<(u16, u16)>
             let term = term.trim();
             match term.split_once('-') {
                 Some((lo, hi)) => {
-                    let lo = lo
-                        .trim()
-                        .parse::<u16>()
-                        .map_err(|_| bad_host_exposure_ports(raw, term))?;
-                    let hi = hi
-                        .trim()
-                        .parse::<u16>()
-                        .map_err(|_| bad_host_exposure_ports(raw, term))?;
+                    let (lo, hi) = (port(lo, term)?, port(hi, term)?);
                     if lo <= hi {
                         Ok((lo, hi))
                     } else {
-                        Err(bad_host_exposure_ports(raw, term))
+                        Err(io::Error::other(format!(
+                            "{HOST_EXPOSURE_PORTS_ENV}: `{term}` is a reversed range; write it \
+                             low-high, as `{hi}-{lo}`. {HOST_EXPOSURE_FIX}"
+                        )))
                     }
                 }
-                None => term
-                    .parse::<u16>()
-                    .map(|port| (port, port))
-                    .map_err(|_| bad_host_exposure_ports(raw, term)),
+                None => port(term, term).map(|port| (port, port)),
             }
         })
         .collect()
 }
 
-/// The start-failing error for one unparseable term: the variable the list
-/// was read from, and the list as it was read, so a mis-set environment
-/// names its own correction.
-fn bad_host_exposure_ports(raw: &str, term: &str) -> io::Error {
+/// The start-failing error for one unparseable term: the variable, the term
+/// as it was read, and the correction.
+fn bad_host_exposure_term(term: &str) -> io::Error {
     io::Error::other(format!(
-        "{HOST_EXPOSURE_PORTS_ENV}={raw}: `{term}` is neither a port nor a port range"
+        "{HOST_EXPOSURE_PORTS_ENV}: `{term}` is not a port from 1 to 65535 or a low-high port \
+         range. {HOST_EXPOSURE_FIX}"
     ))
 }
 
@@ -250,12 +245,13 @@ pub struct NodePlaneBaseline {
     /// The posture the gate decides the set under: the shipped constant,
     /// until the store-surface configuration flips it.
     phase: NodeBaselinePhase,
-    /// The host exposures over the alias (NET-062's third opening), as
-    /// inclusive port ranges: the ports the node row still reaches the
-    /// host alias at while the baseline is announced, the opening every
-    /// other port is refused through the alias for. The guest-side verdict
-    /// holds the same list as its own alias arm's; this is the host-side
-    /// gate's copy.
+    /// The configured host exposures over the alias, as inclusive port
+    /// ranges: the ports the node row still reaches the host alias at while
+    /// the baseline is announced, every other port refused through the
+    /// alias. Empty unless the deployment names ports. The host-side gate
+    /// alone reads it: the guest-side verdict's own alias list starts empty
+    /// and nothing in the run path fills it, so own-address boxes stay
+    /// refused at every port.
     host_exposure: Vec<(u16, u16)>,
 }
 
@@ -336,14 +332,14 @@ impl NodePlaneBaseline {
 
     /// The host exposures over the alias this gate carries: the inclusive
     /// port ranges the announced node row still reaches the host alias at,
-    /// the same list the guest-side verdict's own alias arm holds.
+    /// empty unless the deployment configured ports.
     #[must_use]
     pub(crate) fn host_exposure_ports(&self) -> &[(u16, u16)] {
         &self.host_exposure
     }
 
-    /// Points the host exposures at `ports`, replacing the built-in: a host
-    /// widens or clears its own exposure surface, and a cleared list is an
+    /// Points the host exposures at `ports`, replacing the current list: a
+    /// host names or clears its own exposure surface, and a cleared list is an
     /// alias with no opening — refused at every port for every row — not
     /// an absent arm. The compiled set is untouched: the list scopes the
     /// alias alone.
@@ -438,7 +434,7 @@ impl NodePlaneBaseline {
 
     /// Assembles the set from its parts: the categories carried, and the
     /// addresses the compiled rules are keyed to. The host exposures start
-    /// at the built-in list; the deployment's spelling replaces them in
+    /// empty, the alias closed; the deployment's spelling replaces them in
     /// the run path's builder.
     fn from_entries(node_addr: [u8; 4], resolver: [u8; 4], entries: Vec<BaselineEntry>) -> Self {
         Self {
@@ -447,7 +443,7 @@ impl NodePlaneBaseline {
             rules: Self::compile_rules(&entries, resolver, node_addr),
             entries,
             phase: NODE_BASELINE_PHASE,
-            host_exposure: DEFAULT_HOST_EXPOSURE_PORTS.to_vec(),
+            host_exposure: Vec::new(),
         }
     }
 
@@ -471,8 +467,8 @@ impl NodePlaneBaseline {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaselineCategory, BaselineEntry, DEFAULT_HOST_EXPOSURE_PORTS, HOST_EXPOSURE_PORTS_ENV,
-        NodePlaneBaseline, host_exposure_ports_from_raw,
+        BaselineCategory, BaselineEntry, HOST_EXPOSURE_PORTS_ENV, NodePlaneBaseline,
+        host_exposure_ports_from_raw,
     };
     use boxes::core::egress::{FrameVerdict, summarize, verdict};
     use std::net::Ipv4Addr;
@@ -653,17 +649,16 @@ mod tests {
         }
     }
 
-    /// The host-exposure list the baseline ships, and the deployment's
-    /// spelling of its replacement: absent, the built-in ranges; set but
-    /// empty, a cleared list — the alias with no opening; and every term a
-    /// port or an inclusive range, an undecodable one a surfaced error
-    /// naming the variable and the value.
+    /// The deployment's spelling of the host-exposure list: absent or
+    /// empty, no exposure — the alias closed; every term a port or an
+    /// inclusive range from 1 to 65535; an undecodable term, port 0, or a
+    /// reversed range a surfaced error naming the variable, the term and
+    /// the fix.
     #[test]
     fn host_exposure_ports_read_from_the_environment() {
-        assert_eq!(
-            host_exposure_ports_from_raw(None).unwrap(),
-            DEFAULT_HOST_EXPOSURE_PORTS.to_vec(),
-            "an unset variable is the built-in list of ranges"
+        assert!(
+            host_exposure_ports_from_raw(None).unwrap().is_empty(),
+            "an unset variable is no exposure: the alias stays closed"
         );
         assert_eq!(
             host_exposure_ports_from_raw(Some("8080")).unwrap(),
@@ -677,42 +672,57 @@ mod tests {
         );
         assert!(
             host_exposure_ports_from_raw(Some("")).unwrap().is_empty(),
-            "a set-but-empty list is a cleared one, not the built-in's"
+            "a set-but-empty list is no exposure"
         );
         let garbage = host_exposure_ports_from_raw(Some("8080:nope"))
             .expect_err("an undecodable term is a surfaced error")
             .to_string();
         assert!(
-            garbage.contains(HOST_EXPOSURE_PORTS_ENV) && garbage.contains("8080:nope"),
-            "an undecodable term names the variable and the value, got: {garbage}"
+            garbage.contains(HOST_EXPOSURE_PORTS_ENV)
+                && garbage.contains("`8080:nope` is not a port")
+                && garbage.contains("set it empty to close host.min.internal"),
+            "an undecodable term names the variable, the term and the fix, got: {garbage}"
         );
+        for zero in ["0", "0-65535"] {
+            let error = host_exposure_ports_from_raw(Some(zero))
+                .expect_err("port 0 is refused")
+                .to_string();
+            assert!(
+                error.contains(&format!("`{zero}` is not a port")),
+                "port 0 names the term, got: {error}"
+            );
+        }
+        let reversed = host_exposure_ports_from_raw(Some("4000-3000"))
+            .expect_err("a reversed range is not an inclusive one")
+            .to_string();
         assert!(
-            host_exposure_ports_from_raw(Some("4000-3000")).is_err(),
-            "a reversed range is not an inclusive one"
+            reversed.contains("`4000-3000` is a reversed range")
+                && reversed.contains("`3000-4000`")
+                && !reversed.contains("is not a port"),
+            "a reversed range gets its own message, got: {reversed}"
         );
     }
 
-    /// The baseline carries the list the deployment spelled, and the
-    /// built-in's until a spelling replaces it: the builder replaces
-    /// rather than merges, and a cleared list reaches the accessor empty.
+    /// The baseline carries no exposure until the deployment's spelling
+    /// replaces the list: the builder replaces rather than merges, and a
+    /// cleared list reaches the accessor empty.
     #[test]
     fn baseline_carries_the_configured_host_exposures() {
         let built_in = NodePlaneBaseline::built_in(SUBNET);
-        assert_eq!(
-            built_in.host_exposure_ports(),
-            DEFAULT_HOST_EXPOSURE_PORTS,
-            "the built-in enumeration carries the built-in host exposures"
+        assert!(
+            built_in.host_exposure_ports().is_empty(),
+            "the built-in enumeration carries no host exposure"
         );
-        let re_exposed = built_in.clone().with_host_exposure(vec![(8080, 8080)]);
+        let re_exposed = built_in.with_host_exposure(vec![(8080, 8080)]);
         assert_eq!(
             re_exposed.host_exposure_ports(),
             &[(8080, 8080)],
-            "the builder replaces the built-in list within itself"
+            "the builder sets the list"
         );
-        let cleared = built_in.with_host_exposure(vec![]);
+        let cleared = re_exposed.with_host_exposure(vec![]);
         assert!(
             cleared.host_exposure_ports().is_empty(),
-            "a cleared list is carried empty, not restored to the built-in's"
+            "a cleared list is carried empty"
         );
     }
 }
