@@ -42,18 +42,22 @@ composition-level facts over references to those units, resolved through the
 box's pin. A component has a **digest gap** when the pinned closure
 references no per-package document for it, which is the ordinary case for a
 package built locally or non-redistributable by policy, and the gap names
-which: `built-locally` or `non-redistributable`. SBOM-004 and SBOM-011 use
-that one definition. A document the closure references but that cannot be
+which: `built-locally`, `non-redistributable`, or `outside-pin` — the
+loadout package an `open` box took from a registry other than its
+`[upstream]` (architecture: Loadout Mode), which names that registry.
+SBOM-004 and SBOM-011 use that one definition. A document the closure references but that cannot be
 fetched is not a gap; it is SBOM-012's failure. Until build-servers#185 pins
 the document digest in the closure (Non-goals), *references* is decided by
 the closure entry alone: a component whose entry maps its Build Spec Hash to
 a cache artifact digest references the document SBOM-013 names from that
 hash, and a component whose entry is `built-locally` or `non-redistributable`
-has no artifact, no document, and the gap. Those are the only two kinds of
-entry a sealed closure holds; a package present in the environment with no
-closure entry, or an entry of any other state, is neither a digest nor a
-gap: the pin does not account for the package, and the emission is
-SBOM-012's failure, exit code 6, naming the package. No probe of the cache takes part
+has no artifact, no document, and the gap; an `open` box's loadout package
+from another registry has no entry in this pin by design, and carries the
+`outside-pin` gap. Those are the only kinds a package can be. A package from
+the box's `[upstream]` registry with no closure entry, or an entry of any
+other state, is neither a digest nor a gap: the pin does not account for
+the package, and the emission is SBOM-012's failure, exit code 6, naming
+the package. No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds, and a referenced document
 the cache does not have (a 404 as much as a timeout) is SBOM-012's failure.
 
@@ -132,13 +136,15 @@ developer running agent boxes; build-infra operator; auditor.
 - **SBOM-004** THE SYSTEM SHALL attach to every component either an
   artifact digest resolvable through the signed closure object, or its
   digest gap (Context: the closure references no per-package document for
-  it, `built-locally` or `non-redistributable`) — never neither and never
-  both.
+  it, `built-locally` or `non-redistributable`, or the package is an `open`
+  box's loadout package from another registry, `outside-pin`) — never
+  neither and never both.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_digest_or_gap_total
   property: for all components k: has_sha256(k) xor has_digest_gap(k),
     and has_sha256(k) implies resolves(sha256(k), closure(pin)); for all
-    packages k of the environment: k ∉ closure(pin) ⇒ not emitted ∧ exit = 6
+    packages k from the box's upstream registry: k ∉ closure(pin) ⇒ not
+    emitted ∧ exit = 6
 
 - **SBOM-005** THE SYSTEM SHALL include every package present in the
   environment as a component, with launcher-injected packages carrying
@@ -233,14 +239,19 @@ developer running agent boxes; build-infra operator; auditor.
 
 - **SBOM-011** IF a component has no per-package document referenced by
   the pinned closure — a declared gap: `built-locally` or
-  `non-redistributable` — THEN THE SYSTEM SHALL emit that component
+  `non-redistributable`, or `outside-pin` for an `open` box's loadout
+  package from another registry — THEN THE SYSTEM SHALL emit that component
   carrying that digest gap, never omitting it. (A document the closure
   *does* reference but that cannot be fetched is not a gap; it is
-  SBOM-012's failure.)
+  SBOM-012's failure; an upstream package with no entry at all is
+  SBOM-004's exit 6, not a gap.)
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_unreferenced_component_carries_its_gap
   property: for all environments e, k in packages(e): unreferenced(k,
-    closure(pin(e))) implies k in components(emit(e)) and has_digest_gap(k)
+    closure(pin(e))) implies k in components(emit(e)) and has_digest_gap(k),
+    where unreferenced(k, c) ⇔ entry(c, k) ∈ {built-locally,
+    non-redistributable} ∨ (k is a loadout package of an open box from a
+    registry other than the upstream)
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
   cannot be fetched THEN THE SYSTEM SHALL fail with exit code 6 naming the
@@ -309,7 +320,9 @@ developer running agent boxes; build-infra operator; auditor.
     property with the value `partial` on the metadata; SPDX: the same
     annotation on the document; Blueprint: `verification = "partial"`), so
     a consumer that needs evidence can refuse it on the mark alone;
-    `--require-bundles` is how a reader obtains one that is.
+    the emitter's `require_bundles` option is how a reader obtains one that
+    is (the CLI flag that sets it follows the command arch#66 settles, Open
+    questions).
     tier:   T1
     verify: cargo nextest run -p sbom sbom_with_unverified_components_is_marked_partial_at_the_top_level
     property: (∃k: unverified(k)) ⇔ marked_partial(parse_s(emit_s(c))) for every serializer s
@@ -322,7 +335,7 @@ developer running agent boxes; build-infra operator; auditor.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_unverified_mark_emitted_by_every_serializer
     property: for all serializers s, components k: unverified(k) ⇔ marked_unverified(parse_s(emit_s(c)), k)
-  - WHERE `--require-bundles` is given THE SYSTEM SHALL treat a document
+  - WHERE the emitter's `require_bundles` option is set THE SYSTEM SHALL treat a document
     the pin records no bundle for as unresolved (SBOM-012's failure, exit
     code 6, naming the missing bundle) instead of reading it: the strict
     side of the interim, for a reader that wants no `unverified` component
@@ -332,11 +345,15 @@ developer running agent boxes; build-infra operator; auditor.
 
 - **SBOM-014** WHEN `min box list --using <pkg>[@<ver>]` filters boxes THE
   SYSTEM SHALL answer from the component set this spec's composition emits
-  for each box (SBOM-005), so the list and the box's SBOM never disagree;
-  that set is the pinned closure's package list, read from the pin alone,
-  so the list fetches no per-package document and needs no network, and a
-  box whose pinned closure cannot be read is listed with that reason in
-  place of its match, never failing the list for the other boxes.
+  for each box (SBOM-005: every package present in the environment, the
+  launcher-injected and an `open` box's loadout packages included), so the
+  list and the box's SBOM never disagree; that set is read from the pin's
+  closure and the box's stored expanded spec (its loadout entries and the
+  launcher's additions, BOX-068) alone, so the list fetches no per-package
+  document and needs no network. A box whose pinned closure cannot be read,
+  or whose upstream package has no closure entry (the case its SBOM exits 6
+  on, SBOM-004), is listed with that reason in place of its match, never
+  failing the list for the other boxes.
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_using_answers_from_the_sbom_components
 
@@ -493,13 +510,13 @@ from the spec and stay schema-TODO.
   the tarball by subject digest alone and to no author. The spec's
   controls on that boundary are the `unverified` and `partial` marks, the
   stderr diagnostic, SBOM-008's allowlist of copied fields, and
-  `--require-bundles`; a gate that consumes a box document as evidence
+  the `require_bundles` option; a gate that consumes a box document as evidence
   SHALL refuse a `partial` one, and the boundary closes per document as the
   pin records bundles (SBOM-013).
 - **Invariant:** THE SYSTEM SHALL never present a document that holds any
   unverified component as evidence.
   enforced by: the top-level `partial` mark in every serializer, which a
-  consumer that needs evidence refuses on; `--require-bundles` for evidence
+  consumer that needs evidence refuses on; `require_bundles` for evidence
   covered by: SBOM-013
 - **Invariant:** THE SYSTEM SHALL never attribute a per-package document to
   a component whose closure digest it does not name as its subject.
