@@ -938,7 +938,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-125** WHEN a lookup asks for a name in the box zone that no box or node holds THE SYSTEM SHALL answer NXDOMAIN.
   tier:     T0
   verify:   cargo nextest run -p minimald unknown_in_zone_name_is_nxdomain
-  <!-- S1b-2b; design §7.1; event-driven; NET-012 is the destroyed-box case -->
+  <!-- S1b-2b; design §7.1; event-driven; NET-012 is the destroyed-box case; a box kept dormant for a resume still holds its name, so NET-143's window is not this case -->
 
 - **NET-126** THE SYSTEM SHALL answer box-zone lookups with a TTL of at most 15 seconds.
   tier:     T0
@@ -954,10 +954,11 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald stopped_shared_address_box_is_nodata
   <!-- S1b-2b; design §7.1; state-driven; the host-address lane and the macOS interim; the name stays in-zone, so no name-wide negative caching -->
-  - WHEN a box's row is withdrawn at its detachment bound THE SYSTEM SHALL answer its name NODATA for a bounded window after the withdrawal, and SHALL answer NXDOMAIN once that window and any row or hold behind the name are gone.
-    tier:   T0
-    verify: cargo nextest run -p minvmd the_zone_view_holds_a_withdrawn_name_nodata_for_its_grace
-    <!-- state-driven; macOS's resolver caches an NXDOMAIN name-wide for minutes, past the SOA negative TTL the answer carries, so a box that comes back after a VM restart stays unresolvable on the host; a NODATA answer ages out at that TTL; the window is the registry's withdrawn-name grace, and an explicit withdrawal or destroy clears it, keeping NET-012's destroyed-box NXDOMAIN immediate -->
+
+- **NET-143** WHILE a box's row is withdrawn at its detachment bound and the box is kept for a resume THE SYSTEM SHALL answer a lookup of its name from this machine NODATA for at most 300 seconds after the withdrawal.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd the_zone_view_holds_a_withdrawn_name_nodata_for_its_grace
+  <!-- design §7.1 (answer semantics: a name in the zone answers NODATA, never NXDOMAIN, because negative caching is name-wide; the dormant creation keeps the box, so its name is in the zone); state-driven; the window covers the VM-restart gap, and its 300 s is the resume bound's VM-cold-boot estimate; NET-125 holds, because the kept box holds the name, and a row that keeps no box opens no window; NET-012 holds, because a destroy ends the window at once, and a registration or a resume of the name ends it too; the window is this node's own answer, never a row it publishes to a shared answerer, so a live box of the same name on another node answers its address; that the macOS resolver caches an NXDOMAIN name-wide past the SOA negative TTL is reported, not measured, and the host-resolver measurement is still owed -->
 
 - **NET-129** WHEN a host-address box is published THE SYSTEM SHALL answer its name with its node's published host-loopback address at the box's own port numbers.
   tier:     T0
