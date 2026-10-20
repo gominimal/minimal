@@ -512,12 +512,15 @@ fn reap_scoped_per_checkout() {
             .expect("running the reap script")
     };
     let recorded = || std::fs::read_to_string(&log).unwrap_or_default();
-    let root = checkout.display().to_string();
+    // The checkout path as the script quotes it into its patterns: a tempdir
+    // path carries a `.`, and the pattern is a regex.
+    let root = ere_quote(&checkout.display().to_string());
 
     // Bare invocation: every VM this checkout spawned is in reach — the
     // default VM's and any named VM's, whose cmdlines carry only an appended
     // `--vm <name>` — and every pattern is pinned to this checkout's path, so
-    // a parallel checkout's VMs (or the system's gvproxy) are not.
+    // a parallel checkout's VMs (or the system's gvproxy) are not. Every
+    // signal is SIGKILL: a VM in `krun_start_enter` ignores SIGTERM.
     let out = run_reap(&[]);
     assert!(
         out.status.success(),
@@ -537,10 +540,10 @@ fn reap_scoped_per_checkout() {
         );
     }
     for expected in [
-        format!("pkill -f {root}/.*minvmd"),
-        format!("pkill -f {root}/.*gvproxy"),
-        format!("sudo -n pkill -f {root}/.*minvmd"),
-        format!("sudo -n pkill -f {root}/.*gvproxy"),
+        format!("pkill -9 -f {root}/.*minvmd"),
+        format!("pkill -9 -f {root}/.*gvproxy"),
+        format!("sudo -n pkill -9 -f {root}/.*minvmd"),
+        format!("sudo -n pkill -9 -f {root}/.*gvproxy"),
     ] {
         assert!(
             lines.lines().any(|l| l == expected),
@@ -581,10 +584,10 @@ fn reap_scoped_per_checkout() {
     );
     let lines = recorded();
     for expected in [
-        format!("pkill -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
-        format!("sudo -n pkill -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
-        format!("pkill -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
-        format!("sudo -n pkill -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
+        format!("pkill -9 -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
+        format!("sudo -n pkill -9 -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
+        format!("pkill -9 -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
+        format!("sudo -n pkill -9 -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
     ] {
         assert!(
             lines.lines().any(|l| l == expected),
@@ -614,6 +617,54 @@ fn reap_scoped_per_checkout() {
         "the usage error must say how to call the script: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // `--root <DIR>` pins every pattern to DIR instead of the checkout (CI's
+    // testbed and fetched gvproxy run from `$RUNNER_TEMP`), quoted the same
+    // way; a trailing slash does not change the match.
+    std::fs::remove_file(&log).unwrap();
+    let elsewhere = tmp.path().join("runner.temp+1");
+    let out = run_reap(&["--root", &format!("{}/", elsewhere.display())]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines = recorded();
+    let other = ere_quote(&elsewhere.display().to_string());
+    for expected in [
+        format!("pkill -9 -f {other}/.*minvmd"),
+        format!("pkill -9 -f {other}/.*gvproxy"),
+        format!("sudo -n pkill -9 -f {other}/.*minvmd"),
+        format!("sudo -n pkill -9 -f {other}/.*gvproxy"),
+    ] {
+        assert!(
+            lines.lines().any(|l| l == expected),
+            "missing pattern {expected:?} in:\n{lines}"
+        );
+    }
+    assert!(
+        !lines.contains(&root),
+        "`--root` must replace the checkout path, not add to it: {lines}"
+    );
+
+    // `--root /` would strip to an empty root and match every minvmd and
+    // gvproxy on the machine: refused before anything is signalled.
+    std::fs::remove_file(&log).unwrap();
+    let out = run_reap(&["--root", "/"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(recorded(), "", "a refused `--root /` must signal nothing");
+}
+
+/// `s` as an ERE literal, escaping what the reap script's `ere_quote` does.
+fn ere_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "[]\\.*^+|(){}?$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Mark `path` executable (0700): the stub commands and the copied script must
