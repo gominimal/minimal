@@ -64,8 +64,8 @@ Nothing in the pipeline reads the branch name. The draft release and the tag
 point at the commit.
 
 Keep the branch. It carries the fixes that go into the release while `main`
-moves on, and a hotfix cuts the next version from it. Step 9 deletes the
-private pointer from step 5 and nothing else.
+moves on, and a hotfix cuts the next version from it. Step 8 says what to do
+with it after the release.
 
 ### 3. Rehearse the release run
 
@@ -156,16 +156,48 @@ its own `release/vX.Y.Z` branch. The 0.7.0 pass ran on 2026-10-14 against
 
 ### 8. Forward port the release branch
 
-The fixes that landed on `release/X.Y.Z` are not on `main`. Open a pull
-request that brings them back and land it. `main` moves while a release is
-out, so a port that waits costs more than one that does not.
+The fixes that landed on `release/X.Y.Z` are not on `main` yet. `main`
+moves while a release is out, so a port that waits costs more than one that
+does not.
 
-### 9. Clean up
+The promotion created the tag on GitHub, so fetch it first. `--force`
+replaces a stale local tag of the same name. If the release commit is
+already on `main`, there is nothing to port:
 
-Delete the private pointer that you wrote in step 5.
+```sh
+git fetch --force origin main tag vX.Y.Z
+git merge-base --is-ancestor vX.Y.Z origin/main && echo "already on main"
+```
+
+List the branch commits that have no identical patch on `main`:
+
+```sh
+git cherry -v origin/main vX.Y.Z | grep '^+'
+```
+
+The list holds the version bumps, and also each cherry-pick whose conflicts
+someone resolved by hand. Find the `main` PR for each fix in the list. If a
+fix has no PR on `main`, open a PR that brings it to `main` and land it.
+
+Then merge the tag back into `main`. The version of every `main` build comes
+from `git describe`, which finds only tags that the commit descends from. The
+release notes and `just check-version` find the previous release the same
+way. Without the merge, they all keep counting from the previous release.
+
+The merge uses the `ours` strategy, which keeps the tree of `main` and
+records only the history. It drops any change on the branch that `main`
+lacks, so merge only after `main` has every fix in the list:
+
+```sh
+git switch -c chore/merge-back-X.Y.Z origin/main
+git merge -s ours vX.Y.Z -m "Merge tag 'vX.Y.Z' into main"
+```
+
+Push the branch, open a PR, and merge it with **Create a merge commit**. The
+other merge buttons drop the link to the tag.
 
 Keep the branch from step 2. A hotfix lands on it, bumps `package.version`,
-and goes out through steps 3 to 6 as the next version.
+and goes out through steps 3 to 8 as the next version.
 
 ### Roll back
 

@@ -16,17 +16,7 @@ use tokio::{
 };
 
 use crate::Error;
-
-/// A references to a [Deliverable] within [State].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeliverableRef(Index);
-
-impl DeliverableRef {
-    // Returns the inner index. DO NOT USE unless you know what you are doing.
-    pub(crate) fn inner_idx(&self) -> usize {
-        self.0.into_raw_parts().0
-    }
-}
+use crate::ids::DeliverableRef;
 
 /// Variants of [Deliverable].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,10 +163,10 @@ impl<B: super::Backend> StateInner<B> {
     }
 
     fn get(&self, dr: &DeliverableRef) -> Option<&Deliverable<B>> {
-        self.deliverables.get(dr.0)
+        self.deliverables.get(dr.index())
     }
     fn get_mut(&mut self, dr: &DeliverableRef) -> Option<&mut Deliverable<B>> {
-        self.deliverables.get_mut(dr.0)
+        self.deliverables.get_mut(dr.index())
     }
 
     fn insert(&mut self, phase_idx: Option<usize>, di: DeliverableInner) -> DeliverableRef {
@@ -185,7 +175,7 @@ impl<B: super::Backend> StateInner<B> {
             DeliverableInner::CacheFill { bsr, spec_hash: _ } => (Some(*bsr), None, None),
             DeliverableInner::Subset { subset, .. } => (None, None, Some(subset.clone())),
         };
-        let dr = DeliverableRef(self.deliverables.insert(Deliverable {
+        let dr = DeliverableRef::new(self.deliverables.insert(Deliverable {
             inner: di,
             state: DeliverableState::Pending,
             depended_on_by: 0,
@@ -250,20 +240,20 @@ impl<B: super::Backend> StateInner<B> {
                     let deps_satisfied = match &d.inner {
                         DeliverableInner::CacheFill { .. } => true,
                         DeliverableInner::Subset { build, .. } => matches!(
-                            self.deliverables.get(build.0).unwrap().state,
+                            self.deliverables.get(build.index()).unwrap().state,
                             DeliverableState::Complete(_)
                         ),
                         DeliverableInner::Build { dependencies, .. } => {
                             dependencies.iter().all(|dr| {
                                 matches!(
-                                    self.deliverables.get(dr.0).unwrap().state,
+                                    self.deliverables.get(dr.index()).unwrap().state,
                                     DeliverableState::Complete(_)
                                 )
                             })
                         }
                     };
                     if deps_satisfied {
-                        Some((DeliverableRef(idx), d))
+                        Some((DeliverableRef::new(idx), d))
                     } else {
                         None
                     }
@@ -518,11 +508,11 @@ impl<B: super::Backend> State<B> {
             match &d.inner {
                 DeliverableInner::Build { dependencies, .. } => {
                     for dep in dependencies {
-                        reverse_deps.entry(dep.0).or_default().insert(idx);
+                        reverse_deps.entry(dep.index()).or_default().insert(idx);
                     }
                 }
                 DeliverableInner::Subset { build, .. } => {
-                    reverse_deps.entry(build.0).or_default().insert(idx);
+                    reverse_deps.entry(build.index()).or_default().insert(idx);
                 }
                 DeliverableInner::CacheFill { .. } => {}
             }

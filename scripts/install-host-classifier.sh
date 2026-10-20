@@ -19,7 +19,7 @@
 # Usage:
 #   sudo scripts/install-host-classifier.sh [--user NAME|UID] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
-#         [--gateway-resolver ADDR] [--ct-mark-mask 0x30000000]
+#         [--ct-mark-mask 0x30000000]
 #         [--cohort-address ADDR --node-plane-address ADDR]
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
@@ -111,8 +111,6 @@ readonly MASK_RECORD_PREFIX=ct-mark-mask-
 # The resolver carve-out the loaded table admits, recorded beside the
 # marker as "$CARVE_OUT_RECORD_PREFIX<address>-<port>" so the daemon can
 # refuse a deny-all box whose carve-out no longer names its live answerer.
-# A table rendered with --gateway-resolver carves out the node's DNS layer
-# at the gateway, not an answerer, and records none.
 readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
 
@@ -152,16 +150,6 @@ tree_root=$DEFAULT_TREE_ROOT
 # carve-out is by address and port, never loopback-wide).
 answerer_address=127.0.0.1
 answerer_port=7656
-# --gateway-resolver ADDR renders the carve-out a VM-backed guest needs
-# instead of the answerer's: the resolver Minimal owns for a box there is
-# the node's DNS layer at the switch gateway (NET-003), which every box's
-# lookups reach on DNS's own port, so deny_out admits ADDR on port 53 over
-# UDP and TCP (a truncated answer retries over TCP) and nothing is
-# retargeted, because the box already asks the address the rule admits.
-# The address and port, never the address alone: the gateway is also the
-# switch's control surface, and the carve-out is the resolver, not it.
-gateway_resolver=
-answerer_given=
 # The cohort's and the node plane's source identities (NET-078). They are
 # this host's to know, not the script's to guess: the SNAT rules are
 # rendered only when the addresses were given, and the two go together —
@@ -196,7 +184,6 @@ while [ $# -gt 0 ]; do
         --answerer-address)
             [ $# -ge 2 ] || die "--answerer-address needs an address"
             answerer_address=$2
-            answerer_given=1
             shift 2
             ;;
         --answerer-port)
@@ -205,7 +192,6 @@ while [ $# -gt 0 ]; do
                 die "--answerer-port needs a numeric port, got: $2" ;;
             esac
             answerer_port=$2
-            answerer_given=1
             shift 2
             ;;
         --cohort-address)
@@ -221,11 +207,6 @@ while [ $# -gt 0 ]; do
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
-            shift 2
-            ;;
-        --gateway-resolver)
-            [ $# -ge 2 ] || die "--gateway-resolver needs an address"
-            gateway_resolver=$2
             shift 2
             ;;
         --uninstall) mode=uninstall; shift ;;
@@ -253,12 +234,6 @@ while [ $# -gt 0 ]; do
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
-
-# A render whose carve-out is the gateway's resolver has no answerer to
-# name, so a call that names one asked for two carve-outs at once.
-if [ -n "$gateway_resolver" ] && [ -n "$answerer_given" ]; then
-    die "--gateway-resolver carves out the gateway's resolver, not an answerer: drop --answerer-address and --answerer-port"
-fi
 
 # The account the tree is delegated to, and the one whose boxes it is:
 # --user wins, else the account that ran sudo, else there is no default worth
@@ -642,12 +617,13 @@ cgroup_level() {
 # things — and leaves the previous table standing when it dies.
 #
 # The dstnat chain (priority dstnat, before the filter output chain)
-# retargets the deny subtree's DNS-port lookups on the answerer's address
-# onto the answerer's own port: a deny-all box resolves through the
-# answerer (NET-079) by asking DNS's port like any resolver would, and the
-# one destination its deny rule admits is the one its lookups reach. A
-# render with --gateway-resolver has no dstnat chain: the box's lookups
-# already go to the gateway's port 53, the destination deny_out admits.
+# retargets the deny subtree's DNS-port lookups onto the answerer's own
+# port: a deny-all box resolves through the carve-out (NET-079)
+# by asking DNS's port like any resolver would, and the one destination
+# its deny rule admits is the one its lookups reach. The match carries no
+# destination address: on a guest the box asks the switch gateway, not the
+# answerer, and the retarget is what steers the lookup onto the listener
+# that answers it.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -694,19 +670,13 @@ render_ruleset() {
         ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
         ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
     fi
-    if [ -n "$gateway_resolver" ]; then
-        carve_out_rule="
-        ip daddr $gateway_resolver udp dport 53 accept
-        ip daddr $gateway_resolver tcp dport 53 accept"
-    else
-        carve_out_rule="
+    carve_out_rule="
         ip daddr $answerer_address udp dport $answerer_port accept"
-        dstnat_chain="
+    dstnat_chain="
     chain dstnat {
         type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
+        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" udp dport 53 dnat ip to $answerer_address:$answerer_port
     }"
-    fi
     cat <<RULES
 add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
@@ -1062,12 +1032,10 @@ note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over
 # at. The record is written first and the marker last, so the marker is
 # the commit point: it is never there without the mask beside it, and a
 # daemon that reads it also reads the one value the table classifies by.
-if [ -z "$gateway_resolver" ]; then
-    carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
-    mkdir "$carve_out_record" 2>/dev/null ||
-        [ -d "$carve_out_record" ] ||
-        die "cannot record the table's resolver carve-out at $carve_out_record"
-fi
+carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
+mkdir "$carve_out_record" 2>/dev/null ||
+    [ -d "$carve_out_record" ] ||
+    die "cannot record the table's resolver carve-out at $carve_out_record"
 mask_record="$tree_root/$MASK_RECORD_PREFIX$mask_hex"
 mkdir "$mask_record" 2>/dev/null ||
     [ -d "$mask_record" ] ||
@@ -1078,18 +1046,10 @@ mkdir "$tree_root/$TABLE_MARKER" 2>/dev/null ||
 
 note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
-if [ -n "$gateway_resolver" ]; then
-    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the node's DNS layer at $gateway_resolver:53"
-else
-    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
-fi
+note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
-if [ -n "$gateway_resolver" ]; then
-    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the gateway's resolver at $gateway_resolver:53 over udp and tcp, and the refusal is active, never a silent drop"
-else
-    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
-fi
+note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
 if [ -n "$cohort_address" ]; then
     note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
 else

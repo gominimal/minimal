@@ -279,6 +279,7 @@ pub(crate) fn login_nothing_to_mint_line() -> &'static str {
 /// spinner template look alive instead of stuck at zero — makes it
 /// easier to eyeball the animation next to realistic template
 /// content.
+#[cfg(debug_assertions)]
 pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow::Error> {
     use std::time::Duration;
     let bar = client::add_spinner_bar("Spinner demo");

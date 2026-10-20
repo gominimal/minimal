@@ -277,7 +277,7 @@ async fn serve_get_session_record(
 /// Stand-in for `session_name` on the lifecycle records when the session
 /// carries no user-assigned name. `BoxConfig::name` is `None` for an
 /// anonymous session, and an absent field reads like a logging bug.
-const ANONYMOUS_SESSION: &str = "<anonymous>";
+pub(crate) const ANONYMOUS_SESSION: &str = "<anonymous>";
 
 /// The egress rule counts a session config parses to, one per egress field.
 /// Logged beside the record the daemon stores at session start, they are the
@@ -1048,7 +1048,11 @@ async fn serve_configure_loadout(
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
                 return Ok(Errorable::Err {
-                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
                 });
             };
             Ok(match h.configure_loadout(req.contribution).await {
@@ -1119,7 +1123,11 @@ async fn serve_finalize_session(
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
                 return Ok(Errorable::Err {
-                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
                 });
             };
             Ok(match h.finalize().await {
@@ -1160,7 +1168,11 @@ async fn serve_rename_session(
                 {
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("no session with ID `{}`", req.id.as_ref()),
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
                     )),
                     Some(h) => h.rename(req.new_name).await,
                 }
@@ -1373,7 +1385,11 @@ async fn serve_abort_session(
                 {
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("no session with ID `{}`", req.id.as_ref()),
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
                     )),
                     Some(h) => h.abort().await,
                 }
@@ -4742,7 +4758,7 @@ mod tests {
             assert!(
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
-                        && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains(&format!("session_name=\"{name}\""))
                         && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
@@ -6801,7 +6817,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            matches!(resp, Errorable::Err { error } if error.contains(minimald_rpc::UNKNOWN_SESSION_ID_LEAD)),
             "expected an unknown-id error",
         );
     }
@@ -6869,7 +6885,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            matches!(resp, Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD)),
             "expected an unknown-id error",
         );
     }
@@ -7066,12 +7082,35 @@ mod tests {
             .await;
         assert_eq!(resp, ShutdownResponse::ShuttingDown);
 
-        // ...and, being in shutdown, refuses to hand out sessions afterwards.
-        assert!(
-            mngr.get_session(BoxKeyPredicate::Id(session_id))
-                .await
-                .is_err(),
-            "a forced shutdown should leave the manager rejecting session work",
+        // ...and, being in shutdown, refuses to hand out sessions afterwards,
+        // with the refusal text the client matches on.
+        let refused = mngr
+            .get_session(BoxKeyPredicate::Id(session_id))
+            .await
+            .expect_err("a forced shutdown should leave the manager rejecting session work");
+        assert_eq!(refused.to_string(), minimald_rpc::SHUTDOWN_REFUSAL);
+
+        // The same refusal reaches a client's `CreateSession` as the stderr
+        // text the client-side match keys on, exactly.
+        let mut channel = client.open_subsystem(CreateSession::NAME, &[]).await;
+        let body = serde_json_lenient::to_vec(&crate::test_harness::create_session_req(
+            "after-shutdown",
+            "/tmp",
+        ))
+        .expect("request serializes");
+        channel.data_bytes(body).await.unwrap();
+        channel.eof().await.unwrap();
+        let mut err_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                err_buf.extend_from_slice(&data);
+            }
+        }
+        let stderr = String::from_utf8_lossy(&err_buf);
+        assert_eq!(
+            stderr,
+            format!("Internal error: {}", minimald_rpc::SHUTDOWN_REFUSAL),
+            "a create refused in shutdown should carry exactly the refusal",
         );
     }
 

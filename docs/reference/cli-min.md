@@ -102,7 +102,7 @@ the current directory).
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
 | `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it its own IP address so `--ingress` can publish ports. An `own_ip` box with no egress flags reaches no external address by default (see below). The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
-| `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them, `ask` asks the attached person, and `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. A VM-backed host refuses `allow` and `ask` before it creates the box, until the host side can admit a publish the box requests ([gominimal/minimal#1897](https://github.com/gominimal/minimal/issues/1897)). Every macOS host is VM-backed |
+| `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them. `ask` asks the attached person about a `min net expose`. With nobody attached, `ask` refuses the request at once. `ask` never publishes a listen. `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. On a VM-backed host the create registers the stance and range with the VM host daemon. That daemon admits each publish the box requests against that grant. It admits an `ask` publish only on a yes the host records. Every macOS host is VM-backed |
 | `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
@@ -288,7 +288,9 @@ min session destroy [--all] [-f|--force] [SESSION]
 ```
 
 Destroys a session and ends its processes. `--all` destroys all sessions.
-`-f/--force` skips the confirmation.
+`-f/--force` skips the confirmation. Under `-f`, if another destroy removed
+the session first, the command reports the session as already destroyed and
+succeeds. Without `-f`, the command fails and names the session.
 
 Before it destroys one session, the command asks for confirmation if the
 session holds uncommitted changes or commits that no remote has. It also asks
@@ -624,7 +626,11 @@ or a classifier tree installed another way stays, with a note. It also removes t
 service and its program copy, the resolver hook, and on macOS the local range
 unit. On macOS the program copy is the app bundle, and `--undo` also removes
 the bare program and the range script that an earlier release installed.
-The local range addresses on macOS stay on the loopback until the next boot.
+On macOS the local range addresses come off the loopback too, and `--undo`
+removes the resolver file's directory when it holds nothing else. While a VM
+is running, the addresses stay and a note says so: stop every VM, then run
+`--undo` again. The check counts any `minvmd` process on the host, so end one
+that `min stop` leaves behind too.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
 
@@ -888,6 +894,16 @@ fetch from it directly:
 git remote add session min://<session>
 git push session
 ```
+
+When the workspace's worktree is clean, a push to its checked-out branch also
+checks out the new tip. That rewrites files under any process running in the
+session. When the worktree holds uncommitted changes, the branch ref still
+moves, and the push warns that it skipped the checkout. A push to any other
+branch moves only that branch's ref. A push into a worktree with a detached
+HEAD moves only the refs and warns that it skipped the checkout. HEAD stays
+detached. The first push into an empty workspace checks out the branch that
+the fresh repository's HEAD already names, if the push includes it.
+Otherwise it checks out the first pushed branch.
 
 Only the `connect` capability is implemented: on `connect`, the helper
 opens an exec channel to `minimald` over its Unix domain socket (the same

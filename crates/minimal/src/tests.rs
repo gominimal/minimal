@@ -259,6 +259,17 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a product path: the destroy-race test's own connection to
+            // the harness daemon. The destroy it drives sends no gated RPC —
+            // the race's loser just reports what the daemon said — so the
+            // harness connection carries no gate to record.
+            "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/boxes/vm_host.rs::session_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -275,19 +286,13 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
-            // A read-only lookup around an attach the gated `cmd_attach`
-            // already made: it reads the box's pair before, and asks whether
-            // the session is gone after, to withdraw its row or release a
-            // `host_ip` name hold, and which live session holds a name a
-            // re-hold took over; it builds nothing a skew could half-make.
-            "cmd/session.rs::session_record_by = ungated",
             // The dashboard's activation is the same multi-step mutation as
             // `cmd_session`'s, so it carries the same gate on its own create.
-            // Its two discovery probes stay open on purpose: they list a skewed
-            // VM precisely so an operator still sees its boxes (see `dash::rpc`).
+            // Its two discovery connections are gated too: the dashboard opens
+            // on the same terms `min ls` does (see `dash::rpc`).
             "dash/rpc.rs::activate = gated",
-            "dash/rpc.rs::connect_missing = ungated",
-            "dash/rpc.rs::discover = ungated",
+            "dash/rpc.rs::connect_missing = gated",
+            "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -312,7 +317,7 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/session.rs::activate_session = asserts",
+            "cmd/boxes/create.rs::activate_session = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             "task.rs::cmd_task_run = asserts",
@@ -335,7 +340,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_session"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -1207,6 +1212,20 @@ fn setup_zed_is_hidden() {
     assert!(!session.find_subcommand("attach").unwrap().is_hide_set());
 }
 
+/// The `spin` demo exists only in debug builds: clap's typo tips draw
+/// candidates from hidden subcommands too, so hiding it is not enough
+/// to keep it out of release output.
+#[cfg(not(debug_assertions))]
+#[test]
+fn spin_absent_in_release() {
+    use clap::CommandFactory as _;
+    let cli = Cli::command();
+    assert!(
+        cli.find_subcommand("spin").is_none(),
+        "spin must not exist in release builds"
+    );
+}
+
 /// `--raw` and `--json` select mutually exclusive output formats, so
 /// passing both must be rejected rather than silently letting one win.
 #[test]
@@ -1759,7 +1778,7 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 2),
+        ("src/cmd/boxes/create.rs", "activate_session", 2),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
@@ -1790,7 +1809,7 @@ fn both_creators_share_the_composition_failure_message() {
 fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_session"),
         ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "cmd_task_run"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
@@ -1821,43 +1840,67 @@ fn daemon_refusals_print_without_rpc_names() {
     // no log-only RPC name left to exempt. The RPC names stay legitimate
     // in type paths and comments, which the scan does not read. A literal
     // is tracked across lines — the refusals are wrapped with `\` — so a
-    // continuation line with no quote of its own is still read.
-    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/box_actor.rs"))
-        .expect("readable daemon source");
-    let mut in_literal = false;
-    for (number, line) in daemon.lines().enumerate() {
-        if !in_literal && line.trim_start().starts_with("//") {
-            continue;
+    // continuation line with no quote of its own is still read. The
+    // module is `box_actor.rs` and its `box_actor/` files. `kind.rs` holds
+    // span names, not refusals, and `tests.rs` is the module's tests.
+    let actor_dir = manifest.join("../minimald/src/box_actor");
+    let mut sources = vec![manifest.join("../minimald/src/box_actor.rs")];
+    for entry in std::fs::read_dir(&actor_dir).expect("readable daemon module dir") {
+        let path = entry.expect("readable dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".rs") && name != "kind.rs" && name != "tests.rs" {
+            sources.push(path);
         }
-        let in_string = in_literal || line.contains('"');
-        // Toggle on every unescaped quote, so the state at the line's end
-        // says whether the next line continues a literal.
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => in_literal = !in_literal,
-                _ => {}
+    }
+    assert!(
+        sources.len() > 1,
+        "the daemon's session module files moved; update this scan"
+    );
+    for source in sources {
+        let shown = source
+            .strip_prefix(manifest.join(".."))
+            .unwrap_or(&source)
+            .display()
+            .to_string();
+        let daemon = std::fs::read_to_string(&source).expect("readable daemon source");
+        let mut in_literal = false;
+        for (number, line) in daemon.lines().enumerate() {
+            if !in_literal && line.trim_start().starts_with("//") {
+                continue;
             }
-        }
-        if !in_string {
-            continue;
-        }
-        for rpc in [
-            "CreateSession",
-            "ConfigureLoadout",
-            "SubmitVerdict",
-            "FinalizeSession",
-            "RenameSession",
-            "WorkspacePatchesTarZst",
-        ] {
-            assert!(
-                !line.contains(rpc),
-                "minimald/src/box_actor.rs:{}: a string names the {rpc} RPC: {line}",
-                number + 1
-            );
+            let in_string = in_literal || line.contains('"');
+            // Toggle on every unescaped quote, so the state at the line's end
+            // says whether the next line continues a literal.
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_literal = !in_literal,
+                    _ => {}
+                }
+            }
+            if !in_string {
+                continue;
+            }
+            for rpc in [
+                "CreateSession",
+                "ConfigureLoadout",
+                "SubmitVerdict",
+                "FinalizeSession",
+                "RenameSession",
+                "WorkspacePatchesTarZst",
+            ] {
+                assert!(
+                    !line.contains(rpc),
+                    "{shown}:{}: a string names the {rpc} RPC: {line}",
+                    number + 1
+                );
+            }
         }
     }
 }
@@ -3099,50 +3142,6 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
         elapsed < std::time::Duration::from_secs(1),
         "a stopped VM's stale socket must not charge the listing its \
          connect-retry window ({elapsed:?})"
-    );
-}
-
-/// The fallback listing's control-sock gate keys on the backend the daemon
-/// connection resolves through, never on `use_minvmd()` — the same rule every
-/// other VM-backed gate keys on: the flag is how Linux asks for the VM host,
-/// while macOS reaches it with no flag at all, so a gate keyed on the flag
-/// would find no control socket for exactly the host whose every invocation
-/// is VM-backed, and the one entry `min ls` falls back to there would carry
-/// no answerer state to read.
-#[test]
-fn fallback_listing_control_sock_keys_on_provider_kind() {
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let sock = state.path().join("ssh.sock");
-    // The unflagged invocation resolves through the platform's default
-    // backend, so the expectation is that backend's — `client_provider_kind`'s
-    // own reading, whatever host this runs on: on Linux the native backend
-    // hosts no VM host daemon, while macOS has no native backend at all and
-    // every invocation is minvmd-backed, flag or no flag.
-    let unflagged = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-    assert_eq!(
-        fallback_control_sock(&unflagged, &sock).is_some(),
-        client::client_provider_kind(false) == paths::ProviderKind::Minvmd,
-        "an unflagged fallback carries a control socket exactly when the \
-         backend it resolves through is minvmd"
-    );
-    // `--provider local-minvmd` asks for the VM host whatever the platform's
-    // default backend is, so the fallback always resolves the control socket
-    // beside the daemon socket it just listed through.
-    let control = fallback_control_sock(&vm_globals(state.path(), None), &sock)
-        .expect("`--provider local-minvmd` always resolves a control socket");
-    assert_eq!(
-        control,
-        sock.parent()
-            .unwrap()
-            .join(minvmd::control::CONTROL_SOCK_FILE),
-        "the control socket sits beside the daemon socket the listing resolved"
     );
 }
 

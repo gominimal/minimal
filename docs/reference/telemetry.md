@@ -15,7 +15,7 @@ nothing and writes nothing, and the process has no telemetry thread or
 connection.
 
 The requirements behind this page are in
-[spec 25](../specs/25-spec-telemetry/25-spec-telemetry.md).
+[spec 25](https://github.com/gominimal/minimal/blob/main/docs/specs/25-spec-telemetry/25-spec-telemetry.md).
 
 ## Turning it on
 
