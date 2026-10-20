@@ -263,7 +263,6 @@ impl<'a> AskWatch<'a> {
 
     /// The subscription's socket, for a poll beside the terminal.
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
-        use std::os::fd::AsFd as _;
         self.subscription.get_ref().as_fd()
     }
 

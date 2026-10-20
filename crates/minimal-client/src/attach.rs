@@ -9,13 +9,7 @@
 use std::path::Path;
 
 use crate::HANDSHAKE_TIMEOUT;
-// AskWatch is deliberately NOT re-exported here. CodeRabbit asked to
-// `pub use crate::ask_dialog::AskWatch` to keep the historical
-// `attach::AskWatch` path, but minimal-client is an in-workspace crate,
-// nothing names that path, and `ask_dialog` is a `pub mod`, so the public
-// path is `minimal_client::ask_dialog::AskWatch`. The re-export was
-// withdrawn by the reviewer (PR #2341); restoring it would re-couple the
-// two modules this refactor split apart.
+// `AskWatch` is not re-exported here: that would re-couple the two modules.
 use crate::ask_dialog::{AskDialogEnd, AskWatch, is_dismissal_of, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
