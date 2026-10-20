@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
-use sandbox2::{
+use boxes::{NetworkMode, SessionId};
+use sandbox::{
     AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Resolver,
     Spawned, TapSpec,
 };
-use sessions::{NetworkMode, SessionId};
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;
@@ -63,6 +63,11 @@ struct RuntimeIngressState {
     /// switch may already have handed to another box.
     detached: bool,
     forwards: Vec<LiveIngressForward>,
+    /// The declared ports' forwards bound for this spawn after its attach
+    /// (NET-129): a shared-address port the box took over while it ran.
+    /// They deliver to the spawn's lease as its attach's own forwards do,
+    /// and come down with it the same way.
+    handed: Vec<crate::net::policy::PortForwarder>,
 }
 
 /// The ports a box published at runtime with its own `min net expose`
@@ -115,6 +120,50 @@ impl RuntimeIngress {
         }
         state.forwards.push(live);
         Ok(())
+    }
+
+    /// Records a declared port's forward bound after the attach, at a
+    /// shared-address port's hand-over (NET-129). Refused, handing the
+    /// forward back for the caller to release, when the spawn it delivers
+    /// to has ended.
+    pub(crate) fn record_handed(
+        &self,
+        forwarder: crate::net::policy::PortForwarder,
+    ) -> Result<(), crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        if state.detached {
+            return Err(forwarder);
+        }
+        state.handed.push(forwarder);
+        Ok(())
+    }
+
+    /// Whether the forward `mapping` declares at `published` is held as one
+    /// bound at a hand-over.
+    pub(crate) fn holds_handed(
+        &self,
+        published: std::net::Ipv4Addr,
+        mapping: &boxes::PortMapping,
+    ) -> bool {
+        self.state()
+            .handed
+            .iter()
+            .any(|forwarder| forwarder.is_forward_of(published, mapping))
+    }
+
+    /// The box stopped: takes the forwards bound at a hand-over, for the
+    /// session actor to release as declared forwards are.
+    pub(crate) fn take_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
+        std::mem::take(&mut self.state().handed)
+    }
+
+    /// The spawn ended: takes the forwards bound at a hand-over, for the
+    /// guard to release beside the ones its attach bound, and refuses new
+    /// ones until the next attach.
+    pub(crate) fn detach_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        state.detached = true;
+        std::mem::take(&mut state.handed)
     }
 
     /// A spawn attached: its lease is the box's switch address from here on.
@@ -186,6 +235,13 @@ impl OwnAddressReporter {
     /// teardown.
     pub(crate) fn runtime_ingress(&self) -> RuntimeIngress {
         self.runtime_ingress.clone()
+    }
+
+    /// The registry this reporter reports to, for the listen watcher's
+    /// dynamic-port records and releases (NET-129): a watcher holding this
+    /// handle needs no other path to the registry.
+    pub(crate) fn registry(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
+        Arc::clone(&self.registry)
     }
 
     /// Reports `lease` — with the box's ingress declaration as an
@@ -303,9 +359,9 @@ pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<sessions::SessionPolicy>,
+    policy: Option<boxes::BoxPolicy>,
     own_address: Option<OwnAddressReporter>,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
     decision: Option<crate::net::classifier::Decision>,
 ) -> Arc<dyn Network> {
     match mode {
@@ -332,7 +388,7 @@ pub(crate) fn network_for(
             task_slots: None,
             reserved: std::sync::Mutex::new(None),
         }),
-        _ => Arc::new(sandbox2::NoNet),
+        _ => Arc::new(sandbox::NoNet),
     }
 }
 
@@ -348,7 +404,7 @@ pub(crate) fn task_network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    policy: Option<sessions::SessionPolicy>,
+    policy: Option<boxes::BoxPolicy>,
     task_addresses: Vec<std::net::Ipv4Addr>,
 ) -> Arc<dyn Network> {
     match mode {
@@ -366,7 +422,7 @@ pub(crate) fn task_network_for(
 }
 
 /// A host-address box: it shares the daemon host's network namespace, so its
-/// plan is the sandbox layer's [`sandbox2::HostNet`] — except on a VM host,
+/// plan is the sandbox layer's [`sandbox::HostNet`] — except on a VM host,
 /// where the namespace it shares is the *guest's* and the host's own resolver
 /// is unreachable from it. There the plan points the resolver at the node's
 /// DNS layer — the switch gateway, whose static `min.internal.` zone carries
@@ -385,7 +441,7 @@ struct HostIpAddressNetwork {
     /// (NET-079) — the deny subtree when the declaration admits no
     /// destination. Decided before the box's first process exists, like the
     /// leaf itself, because the plan is built before the spawn.
-    verdict: sandbox2::config::Verdict,
+    verdict: sandbox::config::Verdict,
     /// The verdict decision this launch read before it reserved the plan
     /// (NET-079) — carried in by the launch that builds the plan, so the
     /// plan follows its own launch's reading and never a concurrent
@@ -411,7 +467,7 @@ impl std::fmt::Debug for HostIpAddressNetwork {
 ///
 /// Pure over the declaration, so the verdict a box's plan is built around is
 /// pinned beside the plan it decides.
-fn host_address_verdict(declaration: Option<&sessions::EgressPolicy>) -> sandbox2::config::Verdict {
+fn host_address_verdict(declaration: Option<&boxes::EgressPolicy>) -> sandbox::config::Verdict {
     crate::net::classifier::verdict_of(declaration)
 }
 
@@ -439,7 +495,7 @@ impl Network for HostIpAddressNetwork {
                 // one the rule admits and the host's resolver hook names
                 // with its `port` directive (NET-122, design §7.1), and it
                 // stays the answerer's own, not the plan's.
-                if self.verdict == sandbox2::config::Verdict::Deny {
+                if self.verdict == sandbox::config::Verdict::Deny {
                     // Over a table that decides per box, the carve-out it
                     // loaded must name the answerer actually serving: a
                     // stale target, or no answerer at all, refuses the box
@@ -466,7 +522,7 @@ impl Network for HostIpAddressNetwork {
                 // Native host: the namespace the box shares is the host's own,
                 // so the sandbox layer's plan answers `host.min.internal` from
                 // `/etc/hosts` at the host's loopback.
-                return sandbox2::HostNet.plan().await;
+                return sandbox::HostNet.plan().await;
             }
             // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
             // box shares is the guest's loopback, not the host's, and the host
@@ -479,11 +535,12 @@ impl Network for HostIpAddressNetwork {
             // through the daemon's own relay, which carries the node's DNS
             // layer ([`crate::net::switch::spawn_node_relay`]), so nothing
             // reaches upstream except through it. A deny-all box in a guest
-            // that decides per box resolves through the same address, the
-            // one carve-out the guest's table admits (the gateway on port 53
-            // over UDP and TCP, NET-079), and reaches none of what it
-            // resolves; in a guest that decides nothing it is refused before
-            // a plan is ever asked for.
+            // that decides per box resolves through the same address — the
+            // table steers the deny subtree's lookups onto the guest's own
+            // DNS listener at that address's port 53 (NET-079), which
+            // refuses every name outside the zone — and reaches none of
+            // what it resolves; in a guest that decides nothing it is
+            // refused before a plan is ever asked for.
             let ns = { self.switch.lock().await.subnet().dns_server() };
             Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![ns])))
         })
@@ -556,8 +613,8 @@ async fn privileged_tap(
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "the PTask's network namespace is gone before its tap was made \
-                 ({netns} does not exist); the sandbox did not survive its spawn"
+                "the box's sandbox exited before its network could be set up \
+                 ({netns} does not exist)"
             ),
         ));
     }
@@ -593,7 +650,7 @@ struct OwnIpNetwork {
     /// Registered as the PTask's `*.min.internal` hostname on attach (R3.1).
     identity: String,
     /// The launch's whole session policy, carried into the relay gate.
-    policy: Option<sessions::SessionPolicy>,
+    policy: Option<boxes::BoxPolicy>,
     /// The registry handle the lease is reported through on attach, so the
     /// box's proxy route exists exactly while the lease does (NET-001). `None`
     /// for a task launch, which owns no proxy route.
@@ -605,7 +662,7 @@ struct OwnIpNetwork {
     /// loopback address the host side names the box by. `None` for a launch
     /// the activating client did not register, which draws on a native
     /// switch and is refused on one the VM host owns (NET-138).
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
     /// For a task launch ([`task_network_for`]), the task addresses the VM
     /// host registered with the session's box (NET-138): the PTask attaches
     /// at the first one no task run holds. `None` for a box's own launch.
@@ -691,10 +748,10 @@ impl Network for OwnIpNetwork {
                         // capability is missing separates a kernel-config
                         // problem from a policy one.
                         let tun = std::path::Path::new("/dev/net/tun").exists();
-                        let userns = sandbox2::user_namespaces_restriction()
+                        let userns = sandbox::user_namespaces_restriction()
                             .map_or_else(|| "available".to_string(), |r| r.to_string());
                         return Err(NetworkError::new(std::io::Error::other(format!(
-                            "own-IP sandbox produced no in-namespace tap fd \
+                            "the box's sandbox could not create its network device \
                              (/dev/net/tun present: {tun}; user namespaces: {userns})"
                         ))));
                     };
@@ -1087,8 +1144,8 @@ mod tests {
     async fn carve_out_targets_live_answerer_bind_in_the_box_plan() {
         use crate::net::classifier::{Decision, clear_live_answerer, set_live_answerer};
 
-        let deny_all = Some(sessions::SessionPolicy::new(
-            Some(sessions::EgressPolicy::deny_all()),
+        let deny_all = Some(boxes::BoxPolicy::new(
+            Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
         let native = Arc::new(Mutex::new(SwitchClient::new(
@@ -1127,7 +1184,7 @@ mod tests {
         let stale = plan(deny_all.clone()).plan().await;
         let refusal = stale.expect_err("a carve-out naming another bind is stale");
         assert!(
-            refusal.to_string().contains("stale carve-out"),
+            refusal.to_string().contains("its name lookups would fail"),
             "the plan refuses the box as a stale carve-out: {refusal}"
         );
 
@@ -1152,8 +1209,8 @@ mod tests {
     /// a box in the guest's namespace has no reach into.
     #[tokio::test]
     async fn host_ip_box_resolves_through_answerer() {
-        let deny_all = Some(sessions::SessionPolicy::new(
-            Some(sessions::EgressPolicy::deny_all()),
+        let deny_all = Some(boxes::BoxPolicy::new(
+            Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
         let native = Arc::new(Mutex::new(SwitchClient::new(
@@ -1185,20 +1242,21 @@ mod tests {
         );
 
         // The carve-out the table itself enforces for that resolver: the
-        // installer's rendered table retargets the deny subtree's DNS
+        // installer's rendered table steers the deny subtree's DNS
         // lookups — the one port a box cannot be refused on, or nothing it
         // asks ever resolves — onto the answerer's address and port, so the
         // one destination a deny-all box's connections are admitted to is
-        // the one its resolver really is. Read off the step's own
-        // `--print-ruleset` output, so what is pinned is what a host loads.
-        // 53 is DNS, spelled here because the constant that owns it
-        // (`dns_gate::DNS_PORT`) is private to its module.
+        // the one its resolver really is. The match carries no destination
+        // address (NET-079): a box asks the switch gateway like every other
+        // host-address box, and the steer is the carve-out. Read off the
+        // step's own `--print-ruleset` output, so what is pinned is what a
+        // host loads. 53 is DNS, spelled here because the constant that
+        // owns it (`dns_gate::DNS_PORT`) is private to its module.
         let ruleset = crate::net::classifier::rendered_ruleset();
         let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
         let dnat = format!(
             "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" \
-             ip daddr {} udp dport 53 dnat ip to {}:{}",
-            crate::net::classifier::ANSWERER_ADDRESS,
+             udp dport 53 dnat ip to {}:{}",
             crate::net::classifier::ANSWERER_ADDRESS,
             crate::net::answerer::ANSWERER_PORT,
         );
@@ -1233,26 +1291,30 @@ mod tests {
         );
     }
 
-    /// NET-079 on a VM host, with NET-003: a deny-all host-address box resolves
-    /// through the resolver Minimal owns for it, which on a VM-backed host is
-    /// the node's DNS layer at the switch gateway, the same one every other
-    /// host-address box there resolves through. In a guest that decides per
-    /// box, that resolver is the one carve-out the guest's own table admits:
-    /// the plan's nameserver is the address the deny chain admits on port 53,
-    /// over UDP and over TCP, so the carve-out the table enforces and the
-    /// resolver the plan names are one fact. A guest that decided nothing (a
-    /// boot whose check or load failed, a table gone behind its marker, a
-    /// probe that read no refusal) gives the plan the same resolver; such a
-    /// guest refuses the deny-all box at launch anyway. The decision is a
-    /// parameter the launch passes in, so no reading of another launch can
-    /// move the box's resolver, and a box that is not deny-all resolves
+    /// NET-079 on a VM host, with NET-003: a deny-all host-address box
+    /// resolves through the resolver Minimal owns for it, which on a
+    /// VM-backed host is the node's DNS layer at the switch gateway, the
+    /// same one every other host-address box there resolves through. In a
+    /// guest that decides per box, that address is the one the guest's
+    /// own table steers the deny subtree's lookups at: the dstnat rule
+    /// retargets its UDP-53 datagrams onto the guest's own DNS listener
+    /// (NET-079), which forwards the zone's A questions to the gateway
+    /// and refuses every name outside the zone, and the deny chain admits
+    /// the listener alone — the steer and the admission are one fact, so
+    /// the plan's nameserver and the table's carve-out cannot drift
+    /// apart. A guest that decided nothing (a boot whose check or load
+    /// failed, a table gone behind its marker, a probe that read no
+    /// refusal) gives the plan the same resolver; such a guest refuses
+    /// the deny-all box at launch anyway. The decision is a parameter
+    /// the launch passes in, so no reading of another launch can move
+    /// the box's resolver, and a box that is not deny-all resolves
     /// through the same layer.
     #[tokio::test]
     async fn guest_deny_all_box_resolves_through_answerer_once_decided() {
         use crate::net::classifier::{Cause, Decision};
 
-        let deny_all = Some(sessions::SessionPolicy::new(
-            Some(sessions::EgressPolicy::deny_all()),
+        let deny_all = Some(boxes::BoxPolicy::new(
+            Some(boxes::EgressPolicy::deny_all()),
             None,
         ));
         let switch = counting_switch();
@@ -1282,24 +1344,42 @@ mod tests {
              node's DNS layer at the gateway"
         );
 
-        // And that resolver is the one carve-out the guest's table admits, on
-        // DNS's port over both transports a lookup travels.
+        // And that address is the one the guest's own table steers the deny
+        // subtree's lookups at: the dstnat rule retargets its UDP-53
+        // datagrams onto the guest's own DNS listener, and the deny chain
+        // admits the listener alone — the listener the box's lookups are
+        // steered onto, at the port the plan's nameserver answers at.
         let guest_ip = std::net::IpAddr::V4(subnet.daemon_ip());
         let ruleset = String::from_utf8(crate::net::classifier::guest_ruleset(guest_ip, guest_ip))
             .expect("the guest's render is text");
         let deny_out = crate::net::classifier::chain_rules(&ruleset, "deny_out");
+        let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
         let Resolver::Nameservers(nameservers) = decided.resolver() else {
             panic!("the plan names its nameservers: {:?}", decided.resolver());
         };
-        for nameserver in nameservers {
-            for transport in ["udp", "tcp"] {
-                let carve_out = format!("ip daddr {nameserver} {transport} dport 53 accept");
-                assert!(
-                    deny_out.contains(&carve_out.as_str()),
-                    "the guest's table admits the plan's nameserver {nameserver} on \
-                     {transport} 53: {deny_out:?}"
-                );
-            }
+        let listener_addr = crate::net::guest_dns::LISTENER_ADDRESS;
+        let listener_port = crate::net::guest_dns::LISTENER_PORT;
+        let steer = format!(
+            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" udp dport 53 dnat ip to \
+             {listener_addr}:{listener_port}"
+        );
+        assert_eq!(
+            dstnat,
+            [steer.as_str()],
+            "the guest's table steers the deny subtree's lookups onto the listener the \
+             plan's nameserver {nameservers:?} answers at: {dstnat:?}"
+        );
+        let listener = format!("ip daddr {listener_addr} udp dport {listener_port} accept");
+        assert!(
+            deny_out.contains(&listener.as_str()),
+            "the guest's table admits the listener the deny subtree's lookups are steered \
+             onto: {deny_out:?}"
+        );
+        for rule in deny_out.iter().filter(|rule| rule.ends_with("accept")) {
+            assert!(
+                rule.contains("ct direction reply") || rule == &listener,
+                "the listener and the reply direction are the whole carve-out: {deny_out:?}"
+            );
         }
 
         // Undecided, unread, and read again after a decided launch: the same
@@ -1347,19 +1427,19 @@ mod tests {
     fn host_ip_box_cannot_leave_its_cgroup() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
-        let cohort = root.join(sandbox2::classifier::BOXES_DIR);
-        let deny = cohort.join(sandbox2::config::DENY_DIR);
-        let allow = cohort.join(sandbox2::config::ALLOW_DIR);
+        let cohort = root.join(sandbox::classifier::BOXES_DIR);
+        let deny = cohort.join(sandbox::config::DENY_DIR);
+        let allow = cohort.join(sandbox::config::ALLOW_DIR);
 
         for (declaration, expected, why) in [
             (
-                Some(sessions::EgressPolicy::deny_all()),
-                sandbox2::config::Verdict::Deny,
+                Some(boxes::EgressPolicy::deny_all()),
+                sandbox::config::Verdict::Deny,
                 "a deny-all box",
             ),
             (
                 None,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 "a box with no egress section",
             ),
         ] {
@@ -1367,7 +1447,7 @@ mod tests {
             // in — the same selection the launch's own placement makes.
             let verdict = host_address_verdict(declaration.as_ref());
             assert_eq!(verdict, expected, "{why} is classified by its declaration");
-            let leaf = sandbox2::config::ClassifierLeaf::under(root, "a session", verdict);
+            let leaf = sandbox::config::ClassifierLeaf::under(root, "a session", verdict);
             assert_eq!(
                 leaf.dir().parent().and_then(std::path::Path::parent),
                 Some(cohort.as_path()),
@@ -1378,8 +1458,8 @@ mod tests {
             assert_eq!(
                 leaf.dir().parent(),
                 Some(match verdict {
-                    sandbox2::config::Verdict::Deny => deny.as_path(),
-                    sandbox2::config::Verdict::Allow => allow.as_path(),
+                    sandbox::config::Verdict::Deny => deny.as_path(),
+                    sandbox::config::Verdict::Allow => allow.as_path(),
                 }),
                 "{why}'s leaf is in the subtree its verdict picked"
             );
@@ -1396,16 +1476,16 @@ mod tests {
         // deny-all box's leaf is in the deny subtree and no other box's is in
         // it, the same arithmetic the refusing rule and the cohort's source
         // identity are keyed on.
-        let deny_all = sandbox2::config::ClassifierLeaf::under(
+        let deny_all = sandbox::config::ClassifierLeaf::under(
             root,
             "a session",
-            sandbox2::config::Verdict::Deny,
+            sandbox::config::Verdict::Deny,
         );
         assert_eq!(
             deny_all.relative_dir(),
-            std::path::PathBuf::from(sandbox2::classifier::BOXES_DIR)
-                .join(sandbox2::config::DENY_DIR)
-                .join(sandbox2::classifier::sanitize_box_id("a session")),
+            std::path::PathBuf::from(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::DENY_DIR)
+                .join(sandbox::classifier::sanitize_box_id("a session")),
             "the leaf's in-box spelling keeps the whole subtree path"
         );
     }
@@ -1431,7 +1511,7 @@ mod tests {
         assert_eq!(plan.resolver(), &Resolver::Host);
         assert_eq!(plan.hosts().len(), 1, "one static entry for the host");
         let entry = &plan.hosts()[0];
-        assert_eq!(entry.name, sandbox2::HOST_MIN_INTERNAL);
+        assert_eq!(entry.name, sandbox::HOST_MIN_INTERNAL);
         assert_eq!(
             entry.address,
             std::net::Ipv4Addr::LOCALHOST,

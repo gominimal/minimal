@@ -83,8 +83,8 @@ orchestrator.workspace = true
 op.workspace = true
 ot.workspace = true
 paths.workspace = true
-sandbox2.workspace = true
-sessions.workspace = true
+sandbox.workspace = true
+boxes.workspace = true
 switch.workspace = true
 stdlib.workspace = true
 version.workspace = true
@@ -96,7 +96,7 @@ libc.workspace = true
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
 # lets the wedged-host probe's deadline elapse in virtual time.
 tokio = { workspace = true, features = ["test-util"] }
-# Parity test in `sessions/composables.rs` compares `SetupForPackages` output
+# Parity test in `box_manager/composables.rs` compares `SetupForPackages` output
 # to the composition-only path from a nickel-declared BuildSpec.
 decode.workspace = true
 indoc.workspace = true
@@ -109,10 +109,17 @@ proptest.workspace = true
 # state; tests that hold or read them (NET-079, `net/classifier.rs`) mark
 # themselves serial so no two of them race one set of listeners.
 serial_test.workspace = true
+# An in-memory span exporter under the harness daemon's subscriber, so a
+# test can see what a request exports (`exec.rs`: an opted-out request
+# exports nothing) without a collector or the process-wide tracer.
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock.workspace = true
+vsock.workspace = true
 
 [lints]
 workspace = true

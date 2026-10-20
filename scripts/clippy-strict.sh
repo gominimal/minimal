@@ -249,7 +249,7 @@ for raw in open(out_path, encoding="utf-8", errors="replace"):
     if body.get("level") not in ("warning", "error"):
         continue
     code = (body.get("code") or {}).get("code") or ""
-    # The crate's own lints (e.g. pedantic in `paths` and `sessions`) are
+    # The crate's own lints (e.g. pedantic in `paths` and `boxes`) are
     # already enforced repo-wide by `just clippy`; this gate owns only the
     # stricter set, and --all-targets would otherwise report each diagnostic
     # once per compilation unit.

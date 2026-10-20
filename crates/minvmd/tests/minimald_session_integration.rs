@@ -277,11 +277,11 @@ async fn run_session_exec(
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let req = CreateSessionRequest {
-            config: minimald_rpc::SessionConfig {
+            config: minimald_rpc::BoxConfig {
                 name: Some(format!("minvmd-e2e-{uniq:x}")),
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
-                network: sessions::NetworkMode::default(),
+                network: boxes::NetworkMode::default(),
                 policy: Default::default(),
                 task_addresses: Vec::new(),
                 box_id: None,

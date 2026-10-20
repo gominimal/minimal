@@ -28,8 +28,8 @@ use russh::ChannelMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use minimald_rpc::{
-    ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSessionRequest, CreateSessionResponse,
-    Errorable, FinalizeSessionRequest, FinalizeSessionResponse, SessionConfig,
+    BoxConfig, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSessionRequest,
+    CreateSessionResponse, Errorable, FinalizeSessionRequest, FinalizeSessionResponse,
 };
 
 /// SSH subsystem for the CreateSession RPC (mirrors minimald's
@@ -165,11 +165,11 @@ async fn run_session_exec(
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let req = CreateSessionRequest {
-            config: SessionConfig {
+            config: BoxConfig {
                 name: Some(format!("minvmd-demo-{uniq:x}")),
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
-                network: sessions::NetworkMode::default(),
+                network: boxes::NetworkMode::default(),
                 policy: Default::default(),
                 task_addresses: Vec::new(),
                 box_id: None,

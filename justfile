@@ -33,11 +33,11 @@ native-dir   := scratch / "native-state"
 # The workspace doesn't compile natively on macOS (minimald/lcache/mctx are
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
-scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
-# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+scope      := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "--workspace" }
+# The strict gate's scope on macOS: the same crates `clippy` and `test` already
 # use, because the Linux-only crates do not build there. The script reports any
 # changed crate this leaves out, so the scope is never silently narrower.
-strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
+strict-scope := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -101,7 +101,7 @@ libkrun-static:
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
     @mkdir -p {{scratch}}
-    @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
+    @scripts/fetch-gvproxy.sh {{gvproxy}}
 
 # Cross-compile minimald → initramfs /init.
 initramfs:
@@ -169,6 +169,16 @@ zoned-link-check: zoned-build
 app-icon:
     scripts/build-app-icon.sh
 
+# The bundle is unsigned: only the release workflow signs it. It lands under
+# target/app-bundle, not beside `min`, so a debug `min` keeps installing the
+# bare program until the bundle is copied beside it on purpose
+# (`cp -R target/app-bundle/Minimal.app target/debug/`).
+#
+# Assemble the unsigned macOS app bundle minzoned ships in.
+[macos]
+app-bundle: zoned-build
+    scripts/build-app-bundle.sh assemble target/debug/minzoned target/app-bundle/Minimal.app
+
 # Build the `min` CLI.
 minimal-cli:
     cargo build -p minimal --locked
@@ -194,36 +204,8 @@ minimald-build:
 dist-build target:
     scripts/dist-build.sh {{quote(target)}}
 
-# Build the .deb/.rpm/.apk packages for a staged semver release from the
-# installer bucket via the pinned nfpm (fetched + sha256-verified by the
-# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
-# infra repo, not here. (The release workflow builds them from its own
-# artifacts instead — ARTIFACTS_DIR mode — before the row is staged.)
-#
-# The semver row must exist: every versioned release build stages one;
-# releases up to and including 0.5.3 need scripts/backfill-version-row.sh
-# first. Linux-only for the same host-check reason as dist-build: the script
-# downloads static musl ELFs and runs the downloaded `min` to generate
-# completions.
-[linux]
-pkg-nfpm pkgver:
-    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
-
-# Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
-# throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
-# accepts and records the exact version, every shipped path exists, the
-# binaries run on the box's libc, and an uninstall round-trip cleans up. This
-# is the pre-publish ritual from the review feedback — run it before staging a
-# tag; the CI-native container smoke is a separate, follow-up lane. Distrobox
-# drives everything (no apx, no raw podman — see the script header); boxes are
-# removed even on failure unless --keep-boxes is passed through.
-# Linux-only: needs distrobox and a container engine on the host.
-[linux]
-pkg-smoke pkgdir="dist" *args:
-    scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
-
-# Restage an already-shipped release under its semver so the command above can
-# see it (the one-time fix for releases staged before the semver-row
+# Restage an already-shipped release under its semver so `install.sh --version`
+# can find it (the one-time fix for releases staged before the semver-row
 # convention, e.g. `just backfill-version-row abc12345 0.5.3`).
 [linux]
 backfill-version-row sha version:
@@ -278,6 +260,16 @@ reap:
 # Review a guest-kernel bump (`just kernel-review 6.12.43 6.12.94`). Needs `gh`.
 kernel-review *args:
     scripts/kernel-bump-review.sh {{args}}
+
+# Not a CI gate: the report queries GitHub, kernel.org and Alpine. Lag never
+# fails; the checks do: duplicated pins that disagree, a pin that no longer
+# resolves to exactly one value, and a vendor lock file missing from the
+# inventory (`--check`, or `--check --offline` for the local-only subset,
+# which `just test-shell` runs against this tree). The pin inventory is the
+# PINS table in scripts/deps-freshness.sh. Needs `gh` and `jq`.
+# Report non-Rust dependency pins against upstream (`just deps-freshness [--check]`).
+deps-freshness *args:
+    scripts/deps-freshness.sh {{args}}
 
 # ── CI-parity gates ──────────────────────────────────────────────────────────
 
@@ -367,7 +359,7 @@ miri:
     cargo +nightly miri test -p switch
 
 # Kani bounded-verification harnesses over the pure security cores
-# (rcache index_file parse, sessions PathDecision lattice). See
+# (rcache index_file parse, boxes PathDecision lattice). See
 # scripts/kani.sh for install + the 0.68.0 pin rationale. #1109.
 kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup")
     ./scripts/kani.sh
@@ -404,9 +396,13 @@ fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked"
     [ -f "fuzz/{{target}}.dict" ] && dict="-dict=fuzz/{{target}}.dict"
     cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 $dict {{args}}
 
+# Extra arguments go to nextest positionally, so a filterset like
+# `-E 'not binary(/_integration$/)'` stays one word (the macOS lane's unit step).
+#
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
-test: _nextest
-    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
+[positional-arguments]
+test *args: _nextest
+    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail "$@"
 
 # The tight loop while writing one test. Output is shown, so a test that prints
 # a measurement is readable without remembering `--no-capture`, and
@@ -425,10 +421,18 @@ test-one filter *args: _nextest
 doctest:
     cargo test {{scope}} --doc --locked
 
-# Regenerate the minimal-tui insta snapshots after an intentional render change;
+# CI: the macOS unit job stages this archive for the mini's hypervisor tier, so
+# the archived package set is whatever `scope` names, never a second list.
+#
+# Archive this host's test binaries for replay elsewhere (`just test-archive out.tar.zst`).
+[positional-arguments]
+test-archive file: _nextest
+    cargo nextest archive {{scope}} --locked --archive-file "$1"
+
+# Regenerate the `dash` insta snapshots after an intentional render change;
 # `just test` fails until these are updated. Review the diff, then `just test` to verify.
 test-snap-update:
-    INSTA_UPDATE=always cargo test -p minimal-tui --test snapshots --locked
+    INSTA_UPDATE=always cargo test -p minimal --test dash_snapshots --locked
 
 # The old `cargo test -- --include-ignored` pre-PR surface; the env-gated
 # VM/netns harnesses self-skip here (`just test-vm` runs those for real).
@@ -612,13 +616,11 @@ test-promote-gate:
 check-version:
     scripts/next-version.sh --check
 
-# Run every scripts/*_test.sh harness in one go (the release/publishing logic:
-# semver resolution, version assertion, staged-version lookup, the packaging
-# renderer, and the AUR/brew publishers against fixture remotes). No network,
-# no credentials, no gcloud — the harnesses stub or fixture everything. CI runs
-# the same set through crates/common/tests/shell_harnesses.rs (part of
-# `just test`), which discovers them by convention so a new harness is never
-# forgotten.
+# Run every scripts/*_test.sh harness in one go (the release and installer
+# logic). No network, no credentials, no gcloud — the harnesses stub or
+# fixture everything. CI runs the same set through
+# crates/common/tests/shell_harnesses.rs (part of `just test`), which
+# discovers them by convention so a new harness is never forgotten.
 test-shell:
     #!/usr/bin/env bash
     set -euo pipefail

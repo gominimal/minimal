@@ -21,6 +21,9 @@ version.workspace = true
 # root-owned copy, and a dylib it resolved through an rpath into a
 # user-writable dir would hand that copy to whoever can write there.
 minvmd = { path = "../minvmd", default-features = false }
+# The reserved local range the `reserve-local-range` verb applies on macOS: the
+# same constant `min` and the daemon probe.
+switch.workspace = true
 
 [lints]
 workspace = true

@@ -86,6 +86,8 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Box subcommands: show what a box will get
+    Box(BoxArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
@@ -115,6 +117,8 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
+    /// Sign in to GitHub, and show the sign-in that boxes use
+    Auth(AuthArgs),
     /// Print that there is nothing to mint
     ///
     /// The HTTPS reverse proxy this verb once served is retired, so it
@@ -153,7 +157,8 @@ pub enum Command {
     /// Draws the same build-hold-fade spinner used by the file-upload
     /// phases of `min session activate` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
-    /// on Ctrl-C, whichever comes first.
+    /// on Ctrl-C, whichever comes first. Debug builds only.
+    #[cfg(debug_assertions)]
     #[command(hide = true)]
     Spin(SpinArgs),
     /// Print the privileged command that installs this host's resolver,
@@ -393,6 +398,27 @@ impl std::fmt::Display for OutputWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("failed to write the document to stdout")
     }
+}
+
+#[derive(Debug, Args)]
+pub struct BoxArgs {
+    #[command(subcommand)]
+    pub command: BoxCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BoxCommand {
+    /// Show how a project's box reaches GitHub through the local proxy:
+    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// the steering mode and the UDP 443 stance
+    Spec(BoxSpecArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BoxSpecArgs {
+    /// The project directory whose minimal.toml declares the box
+    /// (default: --repo-dir, or the current directory)
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -640,8 +666,9 @@ pub struct ActivateArgs {
     /// Network mode for the session: `none` gives the session no network
     /// (every socket it opens to a destination outside itself fails),
     /// `host_ip` shares the host's network namespace (the default), and
-    /// `own_ip` gives the session an IP of its own on the host's switch, so
-    /// `--ingress` can publish ports.
+    /// `own_ip` gives the session its own IP address, so `--ingress` can
+    /// publish ports; unless the host opts out, an `own_ip` session with
+    /// no egress rules can reach no external address.
     ///
     /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
     /// accepted, but each prints a one-line hint naming the current spelling.
@@ -656,23 +683,20 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
-    /// How dynamic ingress requests from inside this box are decided
-    /// (NET-043): `allow` publishes a port the box asks to expose (or
-    /// listens on inside `--dynamic-range`), `ask` routes the request to
-    /// the attached human, `deny` — like an unset flag — refuses every
-    /// one. Requires `--network own_ip`; the flags are the interim source
-    /// of the Box Spec `[network]` block's `dynamic_ingress` setting.
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Requires `--network own_ip`.
     #[arg(
         long = "dynamic-ingress",
         value_name = "allow|ask|deny",
         value_parser = parse_dynamic_ingress_mode
     )]
-    pub dynamic_ingress: Option<sessions::DynamicIngress>,
-    /// Inclusive port range `lo-hi` (both ends included) within which
-    /// `--dynamic-ingress allow` accepts dynamic ingress requests; outside
-    /// it a request is refused with the out-of-range error. Only meaningful
-    /// beside `--dynamic-ingress`, so the range-without-mode spelling is
-    /// rejected rather than read as a deliberate allow.
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`; a
+    /// request outside it is refused. Requires `--dynamic-ingress`.
     #[arg(
         long = "dynamic-range",
         value_name = "LO-HI",
@@ -680,45 +704,45 @@ pub struct ActivateArgs {
         requires = "dynamic_ingress"
     )]
     pub dynamic_range: Option<(u16, u16)>,
-    /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
-    /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
-    /// an own-address (`--network own_ip`) or host-address
-    /// (`--network host_ip`) box; a none box rejects the whole egress
-    /// declaration.
+    /// Allow outbound traffic to this destination subnet, in CIDR form,
+    /// e.g. `10.0.0.0/8`. Repeatable. Once any egress flag is given, an
+    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
+    /// allows nothing, unless the host opts out: `--allow-dns-hosts
+    /// github.com` alone reaches no address directly, and `--allow-subnets
+    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
+    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
+    /// enforces these rules: a `host_ip` box is refused at creation or, on
+    /// a host that cannot filter it, runs with the rules unenforced.
+    /// `--network none` rejects every egress flag. `min session policy`
+    /// shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
-    /// Allowed destination DNS hostnames (`egress.allow_dns_hosts`), e.g.
-    /// `github.com`. Repeatable; unset means allow-all hosts.
+    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
+    /// Repeatable. Given without `--allow-subnets`, the box reaches the
+    /// named hosts by name and no address directly; see `--allow-subnets`.
     #[arg(long = "allow-dns-hosts", value_name = "HOST")]
     pub allow_dns_hosts: Vec<String>,
-    /// Allowed outbound transport protocols (`egress.allow_protocols`):
-    /// tcp, udp, or icmp. Repeatable; unset means allow all protocols.
+    /// Allow this outbound transport protocol: tcp, udp, or icmp.
+    /// Repeatable; unset allows every protocol. Narrows what the other
+    /// allow flags admit and admits nothing on its own.
     #[arg(long = "allow-protocols", value_name = "PROTO")]
     pub allow_protocols: Vec<String>,
-    /// Denied destination subnets in CIDR form (`egress.deny_subnets`),
-    /// subtracted from the allowed set. Repeatable; unset means nothing is
-    /// denied.
+    /// Deny outbound traffic to this destination subnet, in CIDR form,
+    /// subtracted from what the allow flags admit. Repeatable; unset
+    /// denies nothing.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address. The
-    /// section this writes is the deny-all shape — every allow list present
-    /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
-    /// — a declaration, not the default: on a host-address box the host's
-    /// classifier decides it per box (NET-079), while a box that declares no
-    /// egress at all gets the default NET-074 sets: deny-all for an own-ip
-    /// box, unless the host opts out. Valid wherever the egress rule flags
-    /// are; conflicts with every one of them, because deny-all admits no
-    /// exceptions.
+    /// Declare deny-all egress: the box reaches no external address.
+    /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
+    /// Unless the host opts out, a `--network own_ip` box with no egress
+    /// rules already gets this by default. With `--network host_ip` it is
+    /// enforced only on a host that can filter each box.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
-    /// Declare a credentialed upstream for this box (NET-134): the Box
-    /// Egress Proxy's listener becomes the box's infrastructure, reachable
-    /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
-    /// frame this box sends to the proxy's address is dropped — by the VM
-    /// host's egress gate on a VM-backed host, by the relay's own
-    /// `egress-uncredentialed-proxy-destination` drop on a native one. The
-    /// steering the proxy applies and the credentials it redeems are the
-    /// proxy document's; this declares the lane, nothing more.
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped. Takes effect only with
+    /// `--network own_ip`.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
@@ -774,10 +798,10 @@ pub enum SyncMode {
     None,
 }
 
-/// CLI surface for [`sessions::NetworkMode`]. Parsed by hand in
+/// CLI surface for [`boxes::NetworkMode`]. Parsed by hand in
 /// [`parse_network_mode`] rather than derived from a `ValueEnum`: the hand
 /// parser is what accepts the legacy hyphenated spellings with a rename hint,
-/// which a derived enum cannot, and it keeps the `sessions` crate free of a
+/// which a derived enum cannot, and it keeps the `boxes` crate free of a
 /// clap dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliNetworkMode {
@@ -825,23 +849,23 @@ pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
     ))
 }
 
-impl From<CliNetworkMode> for sessions::NetworkMode {
+impl From<CliNetworkMode> for boxes::NetworkMode {
     fn from(m: CliNetworkMode) -> Self {
         match m {
-            CliNetworkMode::NoNet => sessions::NetworkMode::NoNet,
-            CliNetworkMode::HostNet => sessions::NetworkMode::HostNet,
-            CliNetworkMode::OwnIp => sessions::NetworkMode::OwnIp,
+            CliNetworkMode::NoNet => boxes::NetworkMode::NoNet,
+            CliNetworkMode::HostNet => boxes::NetworkMode::HostNet,
+            CliNetworkMode::OwnIp => boxes::NetworkMode::OwnIp,
         }
     }
 }
 
-/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`sessions::PortMapping`].
+/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`boxes::PortMapping`].
 /// PROTO defaults to tcp; only tcp/udp are accepted (gvproxy's static forwarder
 /// exposes no other transport).
-pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, anyhow::Error> {
+pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<boxes::PortMapping, anyhow::Error> {
     let (ports, proto) = match spec.split_once('/') {
         Some((ports, proto)) => (ports, parse_ingress_proto(proto)?),
-        None => (spec, sessions::IpProto::Tcp),
+        None => (spec, boxes::IpProto::Tcp),
     };
     let (ext, int) = ports
         .split_once(':')
@@ -857,17 +881,17 @@ pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping,
             "ingress '{spec}': internal port 0 is reserved — choose an internal port >= 1"
         );
     }
-    Ok(sessions::PortMapping {
+    Ok(boxes::PortMapping {
         external_port,
         internal_port,
         proto,
     })
 }
 
-pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+pub(crate) fn parse_ingress_proto(proto: &str) -> Result<boxes::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
-        "tcp" => Ok(sessions::IpProto::Tcp),
-        "udp" => Ok(sessions::IpProto::Udp),
+        "tcp" => Ok(boxes::IpProto::Tcp),
+        "udp" => Ok(boxes::IpProto::Udp),
         other => Err(anyhow::anyhow!(
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
         )),
@@ -875,7 +899,7 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
 }
 
 /// Parse a `--dynamic-ingress <allow|ask|deny>` value (NET-043) into the
-/// [`sessions::DynamicIngress`] stance the create request carries. The
+/// [`boxes::DynamicIngress`] stance the create request carries. The
 /// snake_case spellings are the record's own — the same words
 /// `min session policy` prints back — so what a person types to create the
 /// box is what they read from it later. `deny` parses the same as an unset
@@ -883,11 +907,11 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
 /// them as, but spelling it is still meaningful — it makes the ingress
 /// declaration, so `min session policy` shows the resolved row rather than
 /// no ingress block at all.
-pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicIngress, String> {
+pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngress, String> {
     match raw {
-        "allow" => Ok(sessions::DynamicIngress::Allow),
-        "deny" => Ok(sessions::DynamicIngress::Deny),
-        "ask" => Ok(sessions::DynamicIngress::Ask),
+        "allow" => Ok(boxes::DynamicIngress::Allow),
+        "deny" => Ok(boxes::DynamicIngress::Deny),
+        "ask" => Ok(boxes::DynamicIngress::Ask),
         other => Err(format!(
             "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
         )),
@@ -898,7 +922,7 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicI
 /// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
 /// A malformed value (no `-`, a non-numeric end, a port outside u16), an
 /// inverted one (`hi` below `lo`), or a privileged one (`lo` below
-/// [`sessions::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
+/// [`boxes::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
 /// rather than a daemon-side refusal after the box's directory exists: the
 /// user sees what they typed named in the error, with no half-created
 /// session behind it.
@@ -921,24 +945,24 @@ pub(crate) fn parse_dynamic_range(raw: &str) -> Result<(u16, u16), String> {
     }
     // The launch check's own bound and wording (`validate_policy`), so a
     // privileged range is refused here, at the flag, in the same words.
-    if lo < sessions::MIN_DYNAMIC_INGRESS_PORT {
+    if lo < boxes::MIN_DYNAMIC_INGRESS_PORT {
         return Err(format!(
             "dynamic range '{raw}': {}",
-            sessions::PolicyError::PrivilegedDynamicRange { lo }
+            boxes::PolicyError::PrivilegedDynamicRange { lo }
         ));
     }
     Ok((lo, hi))
 }
 
-/// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
+/// Parse an `--allow-protocols <PROTO>` spec into an [`boxes::IpProto`].
 /// Egress rules name any transport the policy type carries, so unlike the
 /// ingress parser (whose vocabulary is gvproxy's static forwarder's), icmp is
 /// accepted here.
-pub(crate) fn parse_egress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+pub(crate) fn parse_egress_proto(proto: &str) -> Result<boxes::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
-        "tcp" => Ok(sessions::IpProto::Tcp),
-        "udp" => Ok(sessions::IpProto::Udp),
-        "icmp" => Ok(sessions::IpProto::Icmp),
+        "tcp" => Ok(boxes::IpProto::Tcp),
+        "udp" => Ok(boxes::IpProto::Udp),
+        "icmp" => Ok(boxes::IpProto::Icmp),
         other => Err(anyhow::anyhow!(
             "egress: unsupported protocol '{other}' (use tcp, udp, or icmp)"
         )),
@@ -993,7 +1017,7 @@ pub struct DestroyArgs {
     /// Destroy all sessions
     #[arg(long)]
     pub all: bool,
-    /// Skip the destroy confirmation
+    /// Skip the destroy confirmation, and treat a session that is already destroyed as success
     #[arg(long, short)]
     pub force: bool,
 }
@@ -1103,6 +1127,7 @@ pub struct AddKind {
 #[derive(Debug, Args)]
 pub struct UpdateArgs {}
 
+#[cfg(debug_assertions)]
 #[derive(Debug, Args)]
 pub struct SpinArgs {
     /// How long to keep the spinner visible before auto-exiting.
@@ -1116,6 +1141,33 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Sign in to GitHub and keep the sign-in in the host keychain
+    ///
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
+    /// Show whether you are signed in to GitHub, and when the token expires
+    ///
+    /// Never prints the token.
+    Status,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Sign in with a code entered at github.com, not in this browser
+    #[arg(long)]
+    pub device: bool,
 }
 
 /// Arguments for `min login`.

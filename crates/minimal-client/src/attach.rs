@@ -9,7 +9,14 @@
 use std::path::Path;
 
 use crate::HANDSHAKE_TIMEOUT;
-use crate::ask_dialog::{AskDialogEnd, render_ask_dialog};
+// AskWatch is deliberately NOT re-exported here. CodeRabbit asked to
+// `pub use crate::ask_dialog::AskWatch` to keep the historical
+// `attach::AskWatch` path, but minimal-client is an in-workspace crate,
+// nothing names that path, and `ask_dialog` is a `pub mod`, so the public
+// path is `minimal_client::ask_dialog::AskWatch`. The re-export was
+// withdrawn by the reviewer (PR #2341); restoring it would re-couple the
+// two modules this refactor split apart.
+use crate::ask_dialog::{AskDialogEnd, AskWatch, is_dismissal_of, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
 
@@ -21,7 +28,7 @@ const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
 const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 
 /// Read and validate the session-key config, returning the resolved
-/// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
+/// [`boxes::keys::SessionKeys`] to negotiate at attach. A missing config
 /// file yields the shipped defaults; a present-but-invalid one (e.g. a
 /// termios-special leader) surfaces its error loudly so the user fixes the
 /// config rather than silently attaching with the wrong chord.
@@ -31,9 +38,9 @@ const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 /// those.
 pub fn resolve_session_keys(
     config_dir: Option<&Path>,
-) -> Result<sessions::keys::SessionKeys, anyhow::Error> {
+) -> Result<boxes::keys::SessionKeys, anyhow::Error> {
     let cfg_path = paths::minimal_config_dir_with_override(config_dir).join("config.toml");
-    let cfg = sessions::client::config::read_config_or_default(&cfg_path)
+    let cfg = boxes::client::config::read_config_or_default(&cfg_path)
         .map_err(|e| anyhow::anyhow!("reading session-keys config {cfg_path:?}: {e}"))?;
     cfg.session_keys
         .to_session_keys()
@@ -101,9 +108,9 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// for non-interactive exec channels, which have no detach.
 pub fn attach_command(
     sock: &Path,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     wire: Option<&str>,
-    session_keys: Option<&sessions::keys::SessionKeys>,
+    session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
@@ -126,6 +133,16 @@ pub fn attach_command(
     // always-present `/bin/sh` rather than inherit the user's interactive shell.
     ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string());
+    // The CLI's trace context, as the native client sends it on every channel
+    // (`send_trace_context`): without it a `min session exec` / `run` /
+    // `attach` reached the daemon with no parent and its `exec` span began a
+    // trace of its own. With telemetry off the opt-out marker goes instead,
+    // and no `TRACEPARENT`. The daemon reads either from the channel config,
+    // not the session env (neither is in the `AcceptEnv` allowlist and
+    // neither reaches the box).
+    let (trace_var, trace_value) = trace_env();
+    ssh.env(trace_var, trace_value);
+    ssh.args(["-o", &format!("SendEnv={trace_var}")]);
     ssh.args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
@@ -157,28 +174,25 @@ pub fn attach_command(
     // paired with its `env` set above. Only the interactive attach path sends
     // these — exec/task channels pass `None`.
     if let Some(keys) = session_keys {
-        ssh.env(sessions::keys::LEADER_ENV, keys.leader.as_config_str())
+        ssh.env(boxes::keys::LEADER_ENV, keys.leader.as_config_str())
+            .env(boxes::keys::DETACH_KEY_ENV, keys.detach_key.as_config_str())
             .env(
-                sessions::keys::DETACH_KEY_ENV,
-                keys.detach_key.as_config_str(),
-            )
-            .env(
-                sessions::keys::FORWARD_KEY_ENV,
+                boxes::keys::FORWARD_KEY_ENV,
                 keys.forward_key.as_config_str(),
             )
             .env(
-                sessions::keys::BELL_ENV,
+                boxes::keys::BELL_ENV,
                 if keys.bell_on_leader { "1" } else { "0" },
             )
             .args([
                 "-o",
-                &format!("SendEnv={}", sessions::keys::LEADER_ENV),
+                &format!("SendEnv={}", boxes::keys::LEADER_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::DETACH_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::DETACH_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::FORWARD_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::FORWARD_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::BELL_ENV),
+                &format!("SendEnv={}", boxes::keys::BELL_ENV),
             ]);
     }
 
@@ -313,72 +327,6 @@ pub struct HostAsks {
     held: std::collections::VecDeque<String>,
 }
 
-/// A dialog's view of the subscription while it is up: whether the host
-/// has taken its ask away. Every other line read here is held, in order,
-/// for the serving loop.
-pub struct AskWatch<'a> {
-    ask_id: minimald_rpc::AskId,
-    subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
-    held: &'a mut std::collections::VecDeque<String>,
-}
-
-impl<'a> AskWatch<'a> {
-    pub(crate) fn new(
-        ask_id: minimald_rpc::AskId,
-        subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
-        held: &'a mut std::collections::VecDeque<String>,
-    ) -> Self {
-        Self {
-            ask_id,
-            subscription,
-            held,
-        }
-    }
-
-    /// The subscription's socket, for a poll beside the terminal.
-    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd as _;
-        self.subscription.get_ref().as_fd()
-    }
-
-    /// Whether bytes already read off the socket are waiting: a poll of
-    /// the socket would not see them.
-    pub(crate) fn has_buffered(&self) -> bool {
-        !self.subscription.buffer().is_empty()
-    }
-
-    /// Read one line. `true` when it ends this dialog: the dismissal of
-    /// this ask, or the subscription ending, after which nothing this
-    /// attach records could count. Any other line is held.
-    pub(crate) fn take_line(&mut self) -> bool {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        match self.subscription.read_line(&mut line) {
-            Ok(0) | Err(_) => return true,
-            Ok(_) => {}
-        }
-        if is_dismissal_of(&line, self.ask_id) {
-            return true;
-        }
-        self.held.push_back(line);
-        false
-    }
-
-    /// Block until the host dismisses this ask or the subscription ends:
-    /// a dialog that never answers.
-    pub fn wait_dismissed(&mut self) {
-        while !self.take_line() {}
-    }
-}
-
-/// Whether `line` is the host's dismissal of `ask_id`.
-fn is_dismissal_of(line: &str, ask_id: minimald_rpc::AskId) -> bool {
-    matches!(
-        serde_json_lenient::from_str(line.trim()),
-        Ok(minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }) if id == ask_id
-    )
-}
-
 /// The terminal side of the ask dialog: the relay's suspend and resume, as
 /// a trait so the serving loop is testable without a pty.
 pub trait AskTerminal {
@@ -494,7 +442,7 @@ fn host_control_within(
 pub fn hold_box_name_beside(
     ssh_sock: &Path,
     box_name: &str,
-    session_id: Option<sessions::SessionId>,
+    session_id: Option<boxes::SessionId>,
     hold: bool,
 ) {
     let Some(control_sock) = ssh_sock
@@ -551,7 +499,7 @@ pub fn hold_box_name_beside(
 pub fn withdraw_box_row_at(
     control_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let request = minimald_rpc::BoxControlRequest::Withdraw(minimald_rpc::WithdrawBoxRequest {
@@ -593,7 +541,7 @@ pub fn withdraw_box_row_at(
 pub fn withdraw_box_row_beside(
     ssh_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(control_sock) = ssh_sock
@@ -631,7 +579,7 @@ pub fn withdraw_box_row_beside(
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) -> anyhow::Result<bool> {
     let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
@@ -868,11 +816,7 @@ impl HostAsks {
 /// The one line a late answer prints: how the ask it answered had already
 /// ended, as the VM host daemon recorded it.
 #[must_use]
-pub fn late_answer_line(
-    port: u16,
-    proto: sessions::IpProto,
-    end: minimald_rpc::AskLateEnd,
-) -> String {
+pub fn late_answer_line(port: u16, proto: boxes::IpProto, end: minimald_rpc::AskLateEnd) -> String {
     match end {
         minimald_rpc::AskLateEnd::Allowed => {
             format!("ask {port}/{proto} was already allowed by another attach")
@@ -953,6 +897,18 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
     Ok(wire)
 }
 
+/// The one trace variable the ssh child carries to the daemon: the
+/// process's `TRACEPARENT`, or the opt-out marker when telemetry is off
+/// ([`crate::telemetry_opted_out`]).
+pub(crate) fn trace_env() -> (&'static str, String) {
+    use minimald_rpc::trace::{OTEL_ENV, OTEL_OFF, TRACEPARENT_ENV};
+    if crate::telemetry_opted_out() {
+        (OTEL_ENV, OTEL_OFF.to_owned())
+    } else {
+        (TRACEPARENT_ENV, crate::trace_context().traceparent())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,7 +945,7 @@ mod tests {
             }
             seen
         });
-        let id = sessions::SessionId::nil();
+        let id = boxes::SessionId::nil();
         hold_box_name_beside(&ssh_sock, "web", Some(id), false);
         hold_box_name_beside(&ssh_sock, "api", Some(id), true);
         let seen = server.join().unwrap();
@@ -1011,7 +967,7 @@ mod tests {
     #[test]
     fn late_answer_line_names_the_real_end() {
         use minimald_rpc::{AskCancelCause, AskLateEnd};
-        let tcp = sessions::IpProto::Tcp;
+        let tcp = boxes::IpProto::Tcp;
         assert_eq!(
             late_answer_line(3000, tcp, AskLateEnd::Allowed),
             "ask 3000/tcp was already allowed by another attach"
@@ -1035,7 +991,7 @@ mod tests {
     #[test]
     fn attach_command_targets_the_provider_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1054,7 +1010,7 @@ mod tests {
     #[test]
     fn exec_path_keeps_inherited_stdio() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1074,8 +1030,8 @@ mod tests {
     #[test]
     fn attach_command_bounds_the_handshake() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let interactive = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
-        let exec = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let interactive = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
 
         let args = |cmd: &std::process::Command| -> Vec<String> {
             cmd.get_args()
@@ -1117,7 +1073,7 @@ mod tests {
     #[test]
     fn attach_command_targets_a_named_vm_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1133,7 +1089,7 @@ mod tests {
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
         let wire = remote_command(&["min".to_string(), "run".to_string(), "test".to_string()]);
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref(), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), wire.as_deref(), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1233,8 +1189,8 @@ mod tests {
     #[test]
     fn attach_command_negotiates_session_keys_when_given() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let keys = sessions::keys::SessionKeys::default();
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, Some(&keys)).unwrap();
+        let keys = boxes::keys::SessionKeys::default();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, Some(&keys)).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -1248,19 +1204,19 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            env.get(sessions::keys::LEADER_ENV).map(String::as_str),
+            env.get(boxes::keys::LEADER_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::DETACH_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
             Some("d")
         );
         assert_eq!(
-            env.get(sessions::keys::FORWARD_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::FORWARD_KEY_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::BELL_ENV).map(String::as_str),
+            env.get(boxes::keys::BELL_ENV).map(String::as_str),
             Some("0")
         );
 
@@ -1269,10 +1225,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
@@ -1286,7 +1242,7 @@ mod tests {
     #[test]
     fn attach_command_omits_session_keys_when_none() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -1300,10 +1256,10 @@ mod tests {
             })
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(!env.contains_key(name), "{name} should not be set for exec");
         }
@@ -1313,10 +1269,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 !args.iter().any(|a| a == format!("SendEnv={name}").as_str()),

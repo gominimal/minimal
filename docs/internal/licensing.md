@@ -56,7 +56,7 @@ demand.
 
 `hakoniwa` uses LGPL-3.0-only WITH LGPL-3.0-linking-exception, so static
 linking is expressly permitted without LGPL relink obligations. Its
-footprint is Linux-only. `sandbox2` and `minimald` use it, and it no
+footprint is Linux-only. `sandbox` and `minimald` use it, and it no
 longer reaches macOS builds since #721 decoupled `mctx` from it.
 
 ## Redistributed third-party code in release artifacts
@@ -70,7 +70,7 @@ The release artifacts redistribute two Apache-2.0 components, pinned in
   release distributes it as `libkrun.1.dylib`. The Linux (amd64, arm64)
   release links it statically into the `minvmd` binary
   (`scripts/build-libkrun-linux.sh`).
-- gvproxy v0.8.9 from gvisor-tap-vsock
+- gvproxy v0.9.0 from gvisor-tap-vsock
   (`vendor/gvproxy/gvproxy.lock`), the upstream pre-built binaries,
   https://github.com/containers/gvisor-tap-vsock. Both the macOS
   (darwin/arm64) and the Linux (amd64, arm64) releases distribute it.

@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use sessions::core::egress::{IPPROTO_TCP, IPPROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 
@@ -97,6 +97,33 @@ pub(crate) const CHALLENGE_WINDOW: Duration = Duration::from_millis(500);
 /// listener (`PortsForwarder::Unexpose`, as an HTTP 500): the goal state
 /// already holds.
 const NOT_BOUND_BODY: &str = "proxy not found";
+
+/// The body gvproxy answers an expose with when a forward is already bound
+/// at the listener (`PortsForwarder::Expose`, as an HTTP 500). The gate
+/// answers a publish it holds back with the same status and body
+/// ([`held_answer`]), so the guest reads what the switch itself would say.
+const ALREADY_BOUND_BODY: &str = "proxy already running";
+
+/// The whole answer gvproxy gives an expose of a listener it already holds,
+/// as the daemon's client reads it: the status, and a body framed by its
+/// `Content-Length`.
+pub(crate) fn held_answer() -> Vec<u8> {
+    format!(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\r\n{ALREADY_BOUND_BODY}\n",
+        ALREADY_BOUND_BODY.len() + 1
+    )
+    .into_bytes()
+}
+
+/// The answer gvproxy gives an expose it bound, as the daemon's client
+/// reads it: a 2xx status and no body. The gate answers with it a publish
+/// of a forward its own expose already bound for the publishing box
+/// ([`expose`]), so the guest reads what the switch would have said had it
+/// bound the forward for that request.
+pub(crate) fn bound_answer() -> &'static [u8] {
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+}
 
 /// One forwarded TCP connection, keyed from the box's side: the box's
 /// address and port, then the peer's address and port. The peer is the
@@ -434,25 +461,7 @@ pub(crate) async fn unexpose(
 ) -> io::Result<Unexposed> {
     let body =
         serde_json_lenient::to_vec(&UnexposeBody { local, protocol }).map_err(io::Error::other)?;
-    let mut request = format!(
-        "POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(&body);
-    let (status, body) = tokio::time::timeout(bound, async {
-        let mut switch = UnixStream::connect(switch_sock).await?;
-        switch.write_all(&request).await?;
-        read_answer(&mut switch).await
-    })
-    .await
-    .map_err(|_elapsed| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("the switch did not answer an unexpose within {bound:?}"),
-        )
-    })??;
+    let (status, body) = post_forwarder(switch_sock, "unexpose", &body, bound).await?;
     let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
         Ok(Unexposed::Unbound)
@@ -464,6 +473,112 @@ pub(crate) async fn unexpose(
             body.trim()
         )))
     }
+}
+
+/// The expose body, in the shape the daemon's own client sends.
+#[derive(serde::Serialize)]
+struct ExposeBody<'a> {
+    local: &'a str,
+    remote: &'a str,
+    protocol: &'a str,
+}
+
+/// What an expose the switch accepted came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exposed {
+    /// The switch bound the listener.
+    Bound,
+    /// The switch already held a forward at the listener: an earlier try
+    /// whose answer was lost bound it, or the box's own publish did. The
+    /// goal state holds, so a retry counts this as done.
+    AlreadyBound,
+}
+
+/// Why an expose did not come to an [`Exposed`]. The two answers a caller
+/// must tell apart: a switch that refused bound nothing, and a switch whose
+/// answer never arrived may have bound the listener all the same.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExposeError {
+    /// The switch answered with a status that refuses the expose: nothing
+    /// is bound at the listener for it.
+    #[error("the switch answered the expose with HTTP {status}: {body:?}")]
+    Refused { status: u16, body: String },
+    /// No status was read: the connect, write or read failed, or the bound
+    /// passed. The switch may have bound the listener before the answer was
+    /// lost.
+    #[error("the expose went unanswered: {0}")]
+    Unanswered(#[from] io::Error),
+    /// The forward names a protocol the switch has no spelling for: nothing
+    /// was sent.
+    #[error("the forward names a protocol the switch has no spelling for")]
+    Unspellable,
+}
+
+/// Asks the switch at `switch_sock` to expose `local` toward `remote`,
+/// bounded by `bound`: the publish the daemon's own client makes, originated
+/// by the host for a forward that waited on its listener. A 2xx status is
+/// [`Exposed::Bound`]. gvproxy's 500 whose body says a proxy is already
+/// running there is [`Exposed::AlreadyBound`].
+///
+/// # Errors
+///
+/// [`ExposeError::Unanswered`] for the connect, write or read error and for
+/// a timeout past `bound`; [`ExposeError::Refused`] for any other status
+/// outside 2xx.
+pub(crate) async fn expose(
+    switch_sock: &Path,
+    local: &str,
+    remote: &str,
+    protocol: &str,
+    bound: Duration,
+) -> Result<Exposed, ExposeError> {
+    let body = serde_json_lenient::to_vec(&ExposeBody {
+        local,
+        remote,
+        protocol,
+    })
+    .map_err(io::Error::other)?;
+    let (status, body) = post_forwarder(switch_sock, "expose", &body, bound).await?;
+    let body = String::from_utf8_lossy(&body);
+    if (200..300).contains(&status) {
+        Ok(Exposed::Bound)
+    } else if status == 500 && body.trim() == ALREADY_BOUND_BODY {
+        Ok(Exposed::AlreadyBound)
+    } else {
+        Err(ExposeError::Refused {
+            status,
+            body: body.trim().to_owned(),
+        })
+    }
+}
+
+/// One forwarder exchange with the switch at `switch_sock`, bounded by
+/// `bound`: `verb` posted with `body`, answered by a status and a body.
+async fn post_forwarder(
+    switch_sock: &Path,
+    verb: &str,
+    body: &[u8],
+    bound: Duration,
+) -> io::Result<(u16, Vec<u8>)> {
+    let mut request = format!(
+        "POST /services/forwarder/{verb} HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    tokio::time::timeout(bound, async {
+        let mut switch = UnixStream::connect(switch_sock).await?;
+        switch.write_all(&request).await?;
+        read_answer(&mut switch).await
+    })
+    .await
+    .map_err(|_elapsed| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("the switch did not answer an {verb} within {bound:?}"),
+        )
+    })?
 }
 
 /// Reads an HTTP answer and returns its status code and its body, as much
@@ -696,6 +811,7 @@ pub(crate) async fn inject(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use tracing::Instrument as _;
 
     const BOX: [u8; 4] = [100, 64, 0, 9];
     const PEER: [u8; 4] = [100, 64, 0, 1];
@@ -769,7 +885,7 @@ pub(crate) mod tests {
                 return;
             };
             let resets = resets.clone();
-            tokio::spawn(async move {
+            let serve = async move {
                 let mut chunk = [0u8; 4096];
                 let mut head = Vec::new();
                 while !head.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -798,7 +914,8 @@ pub(crate) mod tests {
                         }
                     }
                 }
-            });
+            };
+            tokio::spawn(serve.in_current_span());
         }
     }
 
@@ -985,7 +1102,7 @@ pub(crate) mod tests {
         let sock = dir.path().join("switch.sock");
         let listener = tokio::net::UnixListener::bind(&sock).expect("binding the stand-in switch");
         let (resets_tx, mut resets_rx) = tokio::sync::mpsc::unbounded_channel();
-        let switch = tokio::spawn(hijacking_switch(listener, resets_tx));
+        let switch = tokio::spawn(hijacking_switch(listener, resets_tx).in_current_span());
         let flows = ForwardedFlows::default();
         let now = Instant::now();
         flows.observe_toward_box(&toward_box(1, 0, TCP_SYN, 0), now);
@@ -1048,7 +1165,7 @@ pub(crate) mod tests {
         flows.observe_from_box(&from_box(501, 5, TCP_ACK, 100), now);
         let taken = flows.take_at(BOX);
         let connect: &'static [u8] = b"POST /connect HTTP/1.1\r\n\r\n";
-        let injecting = tokio::spawn(async move {
+        let inject_fut = async move {
             inject(
                 &sock,
                 connect,
@@ -1057,7 +1174,8 @@ pub(crate) mod tests {
                 Duration::from_secs(2),
             )
             .await
-        });
+        };
+        let injecting = tokio::spawn(inject_fut.in_current_span());
 
         let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
         answer_the_probe(&mut switch, connect).await;

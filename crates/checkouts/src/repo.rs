@@ -70,7 +70,7 @@ impl Repo {
         if !output.status.success() {
             return Err(Error::GitCommandFailed {
                 command: "clone".to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                stderr: scrub_stderr(&url, &output.stderr),
                 status: output.status.to_string(),
             });
         }
@@ -259,7 +259,7 @@ impl Repo {
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = scrub_stderr(&self.url, &output.stderr);
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
@@ -283,7 +283,7 @@ impl Repo {
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = scrub_stderr(&self.url, &output.stderr);
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
@@ -301,4 +301,30 @@ impl std::fmt::Debug for Repo {
             .field("bare", &self.bare)
             .finish()
     }
+}
+
+/// Git's stderr, with the secret parts of `url` taken out: the whole URL is
+/// replaced by the scrubbed remote, and then any userinfo or query/fragment
+/// left is removed on its own, because git echoes the URL it was given
+/// ("unable to access '…'"), sometimes with its own userinfo already gone.
+/// A token in the URL must not reach an error message (spec 25 TEL-041).
+fn scrub_stderr(url: &str, stderr: &[u8]) -> String {
+    let mut stderr = String::from_utf8_lossy(stderr).into_owned();
+    let scrubbed = crate::scrubbed_remote(url);
+    if scrubbed == url {
+        return stderr;
+    }
+    stderr = stderr.replace(url, &scrubbed);
+    let (base, tail) = url
+        .find(['?', '#'])
+        .map_or((url, ""), |at| url.split_at(at));
+    if !tail.is_empty() {
+        stderr = stderr.replace(tail, "");
+    }
+    let authority = base.split_once("://").map_or(base, |(_, rest)| rest);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    if let Some((userinfo, _)) = authority.rsplit_once('@') {
+        stderr = stderr.replace(&format!("{userinfo}@"), "");
+    }
+    stderr
 }

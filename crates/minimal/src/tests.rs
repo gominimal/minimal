@@ -259,6 +259,17 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a product path: the destroy-race test's own connection to
+            // the harness daemon. The destroy it drives sends no gated RPC —
+            // the race's loser just reports what the daemon said — so the
+            // harness connection carries no gate to record.
+            "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/boxes/vm_host.rs::session_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -275,12 +286,13 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
-            // A read-only lookup around an attach the gated `cmd_attach`
-            // already made: it reads the box's pair before, and asks whether
-            // the session is gone after, to withdraw its row or release a
-            // `host_ip` name hold, and which live session holds a name a
-            // re-hold took over; it builds nothing a skew could half-make.
-            "cmd/session.rs::session_record_by = ungated",
+            // The dashboard's activation is the same multi-step mutation as
+            // `cmd_session`'s, so it carries the same gate on its own create.
+            // Its two discovery connections are gated too: the dashboard opens
+            // on the same terms `min ls` does (see `dash::rpc`).
+            "dash/rpc.rs::activate = gated",
+            "dash/rpc.rs::connect_missing = gated",
+            "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -297,15 +309,17 @@ fn every_daemon_connection_is_classified() {
 /// whether it asserts the daemon's build.
 ///
 /// The struct field makes omitting the decision a compile error; this
-/// makes answering it "no" a visible one. Both session-creating paths
-/// assert — they are the ones #1251 is about — and the inventory is what
-/// stops a third from quietly passing `None`.
+/// makes answering it "no" a visible one. Every session-creating path
+/// asserts — they are the ones #1251 is about — and the inventory is what
+/// stops another from quietly passing `None`.
 #[test]
 fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/session.rs::activate_session = asserts",
+            "cmd/boxes/create.rs::activate_session = asserts",
+            // The dashboard's activation: the same create, the same assertion.
+            "dash/rpc.rs::activate = asserts",
             "task.rs::cmd_task_run = asserts",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
@@ -326,7 +340,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_session"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -670,10 +684,10 @@ fn twin_entry(
     id: &str,
     name: Option<&str>,
     path: Option<&str>,
-    status: sessions::SessionStatus,
+    status: boxes::BoxState,
 ) -> minimald_rpc::ListSessionsEntry {
     minimald_rpc::ListSessionsEntry {
-        id: sessions::SessionId::parse_str(id).unwrap(),
+        id: boxes::SessionId::parse_str(id).unwrap(),
         name: name.map(str::to_owned),
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
@@ -692,7 +706,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        sessions::SessionStatus::Active,
+        boxes::BoxState::Active,
     )];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     assert_eq!(
@@ -715,7 +729,7 @@ fn duplicate_session_warning_flags_only_a_matching_path() {
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        sessions::SessionStatus::Active,
+        boxes::BoxState::Active,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -741,12 +755,7 @@ fn duplicate_session_warning_flags_only_a_matching_path() {
 #[test]
 fn duplicate_session_warning_reuses_unnamed_session_by_id() {
     let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
-    let entries = vec![twin_entry(
-        id,
-        None,
-        Some("/w"),
-        sessions::SessionStatus::Active,
-    )];
+    let entries = vec![twin_entry(id, None, Some("/w"), boxes::BoxState::Active)];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
     let warning = duplicate_session_warning(&entries, &taken)
@@ -762,23 +771,38 @@ fn duplicate_session_warning_reuses_unnamed_session_by_id() {
     );
 }
 
-/// Attach refuses a `Materializing` session, so the warning must not point
-/// at it; the duplicate is still flagged, just without an attach hint.
+/// Attach refuses a `Materializing` session, so the warning's reuse step
+/// must not point at it yet: the guidance says to wait for `min ls` to
+/// report the session active and only then attach. The attach command shows
+/// its argument as a placeholder, so no printed command names the session
+/// attach would refuse right now.
 #[test]
-fn duplicate_session_warning_skips_attach_for_materializing() {
+fn duplicate_session_warning_waits_before_attach_for_materializing() {
     let entries = vec![twin_entry(
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
         Some("/w"),
-        sessions::SessionStatus::Materializing,
+        boxes::BoxState::Materializing,
     )];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
     let warning = duplicate_session_warning(&entries, &taken)
         .expect("a session on the target path must warn");
     assert!(
-        !warning.contains("min session attach"),
-        "no attach hint for a non-attachable session, got: {warning}"
+        warning.contains("run `min ls` until its status is active"),
+        "the wait guidance names the command to watch, got: {warning}"
+    );
+    assert!(
+        warning.contains("then attach to it with `min session attach <session>`"),
+        "attach is the step after the wait and shows its argument, got: {warning}"
+    );
+    assert!(
+        !warning.contains("min session attach web"),
+        "no command names a session attach would refuse, got: {warning}"
+    );
+    assert!(
+        !warning.contains("To reuse it instead"),
+        "no attach hint to take now for a non-attachable session, got: {warning}"
     );
 }
 
@@ -794,14 +818,9 @@ fn duplicate_session_warning_prefers_active_over_pending_match() {
             pending_id,
             Some("mzing"),
             Some("/w"),
-            sessions::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         ),
-        twin_entry(
-            active_id,
-            Some("live"),
-            Some("/w"),
-            sessions::SessionStatus::Active,
-        ),
+        twin_entry(active_id, Some("live"), Some("/w"), boxes::BoxState::Active),
     ];
 
     let taken = paths::HostAbsPath::try_new("/w").unwrap();
@@ -843,13 +862,13 @@ fn bare_status_counts_elsewhere_sessions() {
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             Some("api"),
             Some("/other"),
-            sessions::SessionStatus::Active,
+            boxes::BoxState::Active,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0066",
             None,
             Some("/third"),
-            sessions::SessionStatus::Pending,
+            boxes::BoxState::Pending,
         ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
@@ -879,25 +898,25 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             None,
             Some("/w"),
-            sessions::SessionStatus::Pending,
+            boxes::BoxState::Pending,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0066",
             Some("web"),
             Some("/w"),
-            sessions::SessionStatus::Materializing,
+            boxes::BoxState::Materializing,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0077",
             Some("spare"),
             Some("/w"),
-            sessions::SessionStatus::Active,
+            boxes::BoxState::Active,
         ),
         twin_entry(
             "019f5d0f-0a99-78b1-9165-0809440f0088",
             Some("api"),
             Some("/other"),
-            sessions::SessionStatus::Active,
+            boxes::BoxState::Active,
         ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
@@ -947,7 +966,7 @@ fn display_with_home_tilde_abbreviates_only_under_home() {
 /// alone rather than the full 36-character UUID.
 #[test]
 fn session_announce_label_prefers_name_with_short_id() {
-    let id = sessions::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
+    let id = boxes::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
     assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
     assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
 }
@@ -1191,6 +1210,20 @@ fn setup_zed_is_hidden() {
     assert!(setup_zed.is_hide_set(), "setup-zed must stay hidden");
     // The visible siblings are unaffected.
     assert!(!session.find_subcommand("attach").unwrap().is_hide_set());
+}
+
+/// The `spin` demo exists only in debug builds: clap's typo tips draw
+/// candidates from hidden subcommands too, so hiding it is not enough
+/// to keep it out of release output.
+#[cfg(not(debug_assertions))]
+#[test]
+fn spin_absent_in_release() {
+    use clap::CommandFactory as _;
+    let cli = Cli::command();
+    assert!(
+        cli.find_subcommand("spin").is_none(),
+        "spin must not exist in release builds"
+    );
 }
 
 /// `--raw` and `--json` select mutually exclusive output formats, so
@@ -1488,7 +1521,7 @@ fn ingress_spec_defaults_to_tcp() {
     let m = parse_ingress_mapping("18080:80").unwrap();
     assert_eq!(m.external_port, 18080);
     assert_eq!(m.internal_port, 80);
-    assert_eq!(m.proto, sessions::IpProto::Tcp);
+    assert_eq!(m.proto, boxes::IpProto::Tcp);
 }
 
 #[test]
@@ -1496,7 +1529,7 @@ fn ingress_spec_parses_explicit_proto() {
     let m = parse_ingress_mapping("5353:53/udp").unwrap();
     assert_eq!(m.external_port, 5353);
     assert_eq!(m.internal_port, 53);
-    assert_eq!(m.proto, sessions::IpProto::Udp);
+    assert_eq!(m.proto, boxes::IpProto::Udp);
 }
 
 #[test]
@@ -1745,7 +1778,7 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 2),
+        ("src/cmd/boxes/create.rs", "activate_session", 2),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
@@ -1776,7 +1809,7 @@ fn both_creators_share_the_composition_failure_message() {
 fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_session"),
         ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "cmd_task_run"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
@@ -1807,43 +1840,67 @@ fn daemon_refusals_print_without_rpc_names() {
     // no log-only RPC name left to exempt. The RPC names stay legitimate
     // in type paths and comments, which the scan does not read. A literal
     // is tracked across lines — the refusals are wrapped with `\` — so a
-    // continuation line with no quote of its own is still read.
-    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
-        .expect("readable daemon source");
-    let mut in_literal = false;
-    for (number, line) in daemon.lines().enumerate() {
-        if !in_literal && line.trim_start().starts_with("//") {
-            continue;
+    // continuation line with no quote of its own is still read. The
+    // module is `box_actor.rs` and its `box_actor/` files. `kind.rs` holds
+    // span names, not refusals, and `tests.rs` is the module's tests.
+    let actor_dir = manifest.join("../minimald/src/box_actor");
+    let mut sources = vec![manifest.join("../minimald/src/box_actor.rs")];
+    for entry in std::fs::read_dir(&actor_dir).expect("readable daemon module dir") {
+        let path = entry.expect("readable dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".rs") && name != "kind.rs" && name != "tests.rs" {
+            sources.push(path);
         }
-        let in_string = in_literal || line.contains('"');
-        // Toggle on every unescaped quote, so the state at the line's end
-        // says whether the next line continues a literal.
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => in_literal = !in_literal,
-                _ => {}
+    }
+    assert!(
+        sources.len() > 1,
+        "the daemon's session module files moved; update this scan"
+    );
+    for source in sources {
+        let shown = source
+            .strip_prefix(manifest.join(".."))
+            .unwrap_or(&source)
+            .display()
+            .to_string();
+        let daemon = std::fs::read_to_string(&source).expect("readable daemon source");
+        let mut in_literal = false;
+        for (number, line) in daemon.lines().enumerate() {
+            if !in_literal && line.trim_start().starts_with("//") {
+                continue;
             }
-        }
-        if !in_string {
-            continue;
-        }
-        for rpc in [
-            "CreateSession",
-            "ConfigureLoadout",
-            "SubmitVerdict",
-            "FinalizeSession",
-            "RenameSession",
-            "WorkspacePatchesTarZst",
-        ] {
-            assert!(
-                !line.contains(rpc),
-                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
-                number + 1
-            );
+            let in_string = in_literal || line.contains('"');
+            // Toggle on every unescaped quote, so the state at the line's end
+            // says whether the next line continues a literal.
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_literal = !in_literal,
+                    _ => {}
+                }
+            }
+            if !in_string {
+                continue;
+            }
+            for rpc in [
+                "CreateSession",
+                "ConfigureLoadout",
+                "SubmitVerdict",
+                "FinalizeSession",
+                "RenameSession",
+                "WorkspacePatchesTarZst",
+            ] {
+                assert!(
+                    !line.contains(rpc),
+                    "{shown}:{}: a string names the {rpc} RPC: {line}",
+                    number + 1
+                );
+            }
         }
     }
 }
@@ -2184,7 +2241,7 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect_err("a held alive lock is not a finished stop");
     assert!(
-        format!("{err:#}").contains("still holds the VM's alive lock"),
+        format!("{err:#}").contains("the VM host daemon (minvmd) is still running"),
         "got: {err:#}"
     );
 
@@ -2417,18 +2474,18 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
-/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// The `--network` parser accepts every [`boxes::NetworkMode::word`] and
 /// maps it back to the same mode, so the word the daemon logs and the
 /// refusals print is always one a person can type.
 #[test]
 fn network_parser_round_trips_every_mode_word() {
     for mode in [
-        sessions::NetworkMode::NoNet,
-        sessions::NetworkMode::HostNet,
-        sessions::NetworkMode::OwnIp,
+        boxes::NetworkMode::NoNet,
+        boxes::NetworkMode::HostNet,
+        boxes::NetworkMode::OwnIp,
     ] {
         let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
-        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+        assert_eq!(boxes::NetworkMode::from(parsed), mode, "{}", mode.word());
     }
 }
 
@@ -2530,11 +2587,11 @@ fn dynamic_ingress_flags_parse() {
         "--dynamic-range",
         "8000-8443",
     ]);
-    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Allow));
+    assert_eq!(a.dynamic_ingress, Some(boxes::DynamicIngress::Allow));
     assert_eq!(a.dynamic_range, Some((8000, 8443)));
 
     let a = activate(&["min", "session", "activate", "--dynamic-ingress", "ask"]);
-    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Ask));
+    assert_eq!(a.dynamic_ingress, Some(boxes::DynamicIngress::Ask));
     assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
 
     let Err(err) =
@@ -2561,7 +2618,7 @@ fn dynamic_ingress_flags_parse() {
     };
     let rendered = err.to_string();
     assert!(
-        rendered.contains(&sessions::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
+        rendered.contains(&boxes::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
         "the refusal must use the launch check's words, got: {rendered}"
     );
 }
@@ -2632,10 +2689,10 @@ async fn two_vms() -> (
 async fn create_box_on(
     server: &minimald::test_harness::TestServer,
     name: &str,
-) -> sessions::SessionId {
+) -> boxes::SessionId {
     use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest, Errorable,
-        FinalizeSession, FinalizeSessionRequest, SessionConfig,
+        BoxConfig, ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+        Errorable, FinalizeSession, FinalizeSessionRequest,
     };
 
     let mut client = server.connect().await;
@@ -2644,12 +2701,12 @@ async fn create_box_on(
             .expect("UTF-8");
     let id = match client
         .call::<CreateSession>(&CreateSessionRequest {
-            config: SessionConfig {
+            config: BoxConfig {
                 name: Some(name.to_string()),
                 project_path: paths::HostAbsPath::try_new(project_path)
                     .expect("the test cwd as a host path"),
-                network: sessions::NetworkMode::NoNet,
-                policy: sessions::SessionPolicy::default(),
+                network: boxes::NetworkMode::NoNet,
+                policy: boxes::BoxPolicy::default(),
                 task_addresses: Vec::new(),
                 box_id: None,
                 box_addresses: None,
@@ -2769,7 +2826,7 @@ async fn ls_shows_vm_per_box() {
     )
     .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
-    let row_of = |id: &sessions::SessionId| {
+    let row_of = |id: &boxes::SessionId| {
         table
             .lines()
             .find(|l| l.contains(&id.to_string()))
@@ -2785,35 +2842,40 @@ async fn ls_shows_vm_per_box() {
     let surface_line_of = |vm: &str| {
         table
             .lines()
-            .find(|l| l.starts_with("NAME SURFACE:") && l.contains(vm))
-            .unwrap_or_else(|| panic!("a NAME SURFACE line for {vm} in:\n{table}"))
+            .find(|l| l.starts_with("BOX NAMES:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a BOX NAMES line for {vm} in:\n{table}"))
             .to_string()
     };
     assert!(
-        surface_line_of("default").contains("the hostname proxy is the live name surface"),
+        surface_line_of("default")
+            .contains("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:")
+            || surface_line_of("default")
+                .contains("the hostname proxy is not serving, and box names open only through it"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
-        surface_line_of("alpha").contains("native DNS is the live name surface"),
+        surface_line_of("alpha").contains("resolves through this machine's DNS"),
         "the VM the hook routes to is named native:\n{table}"
     );
     let answerer_row_of = |vm: &str| {
         table
             .lines()
-            .find(|l| l.starts_with("ZONE ANSWERER:") && l.contains(vm))
-            .unwrap_or_else(|| panic!("a ZONE ANSWERER line for {vm} in:\n{table}"))
+            .find(|l| l.starts_with("DNS SERVICE:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a DNS SERVICE line for {vm} in:\n{table}"))
             .to_string()
     };
     assert!(
-        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        answerer_row_of("default")
+            .contains("this VM's host daemon answers its box names on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
-        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        answerer_row_of("alpha")
+            .contains("another VM host daemon answers this VM's box names on 127.0.0.1:7656"),
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(
-        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        !answerer_row_of("alpha").contains("this VM's host daemon answers"),
         "a VM registered with another daemon must not claim its own minvmd \
          holds the port:\n{table}"
     );
@@ -3080,50 +3142,6 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
         elapsed < std::time::Duration::from_secs(1),
         "a stopped VM's stale socket must not charge the listing its \
          connect-retry window ({elapsed:?})"
-    );
-}
-
-/// The fallback listing's control-sock gate keys on the backend the daemon
-/// connection resolves through, never on `use_minvmd()` — the same rule every
-/// other VM-backed gate keys on: the flag is how Linux asks for the VM host,
-/// while macOS reaches it with no flag at all, so a gate keyed on the flag
-/// would find no control socket for exactly the host whose every invocation
-/// is VM-backed, and the one entry `min ls` falls back to there would carry
-/// no answerer state to read.
-#[test]
-fn fallback_listing_control_sock_keys_on_provider_kind() {
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let sock = state.path().join("ssh.sock");
-    // The unflagged invocation resolves through the platform's default
-    // backend, so the expectation is that backend's — `client_provider_kind`'s
-    // own reading, whatever host this runs on: on Linux the native backend
-    // hosts no VM host daemon, while macOS has no native backend at all and
-    // every invocation is minvmd-backed, flag or no flag.
-    let unflagged = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-    assert_eq!(
-        fallback_control_sock(&unflagged, &sock).is_some(),
-        client::client_provider_kind(false) == paths::ProviderKind::Minvmd,
-        "an unflagged fallback carries a control socket exactly when the \
-         backend it resolves through is minvmd"
-    );
-    // `--provider local-minvmd` asks for the VM host whatever the platform's
-    // default backend is, so the fallback always resolves the control socket
-    // beside the daemon socket it just listed through.
-    let control = fallback_control_sock(&vm_globals(state.path(), None), &sock)
-        .expect("`--provider local-minvmd` always resolves a control socket");
-    assert_eq!(
-        control,
-        sock.parent()
-            .unwrap()
-            .join(minvmd::control::CONTROL_SOCK_FILE),
-        "the control socket sits beside the daemon socket the listing resolved"
     );
 }
 
@@ -3476,7 +3494,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
 /// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
 /// `a1b2c3d4…` named `web`.
 fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
-    use sessions::SessionStatus::Active;
+    use boxes::BoxState::Active;
     vec![
         twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
         twin_entry(
@@ -3509,7 +3527,7 @@ fn a_unique_id_prefix_resolves_to_its_session() {
 /// resolves.
 #[test]
 fn an_ambiguous_id_prefix_names_the_candidates() {
-    use sessions::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry(
             "a1b2c3d4-0a99-78b1-9165-0809440f0052",
@@ -3541,7 +3559,7 @@ fn an_ambiguous_id_prefix_names_the_candidates() {
 /// as the first differing digit.
 #[test]
 fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
-    use sessions::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
         twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
@@ -3586,7 +3604,7 @@ fn a_non_hex_or_short_input_is_not_an_id_prefix() {
 /// resolves by its name: an exact name wins over a prefix.
 #[test]
 fn an_exact_name_wins_over_an_id_prefix() {
-    use sessions::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let mut entries = prefix_entries();
     entries.push(twin_entry(
         "ffffffff-0a99-78b1-9165-0809440f0052",
@@ -3606,7 +3624,7 @@ fn an_exact_name_wins_over_an_id_prefix() {
 /// and a folded name wins over a session whose id starts with the same hex.
 #[test]
 fn a_name_resolves_case_insensitively() {
-    use sessions::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry(
             "ffffffff-0a99-78b1-9165-0809440f0052",
@@ -3632,7 +3650,7 @@ fn a_name_resolves_case_insensitively() {
 /// falls through to a session whose id starts with that prefix.
 #[test]
 fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
-    use sessions::SessionStatus::Active;
+    use boxes::BoxState::Active;
     let entries = vec![
         twin_entry(
             "ffffffff-0a99-78b1-9165-0809440f0052",

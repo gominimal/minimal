@@ -217,6 +217,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "asn1-rs"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 2.0.21",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "synstructure",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -418,6 +457,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "bep"
+version = "0.0.1"
+dependencies = [
+ "aes-gcm",
+ "base64 0.23.1",
+ "clap",
+ "core-foundation",
+ "getrandom 0.3.4",
+ "libc",
+ "p256",
+ "proptest",
+ "rcgen",
+ "reqwest",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "security-framework",
+ "security-framework-sys",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -461,6 +529,9 @@ name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -576,6 +647,28 @@ dependencies = [
  "tracing",
  "untrusted 0.9.0",
  "x25519-dalek",
+]
+
+[[package]]
+name = "boxes"
+version = "0.0.1"
+dependencies = [
+ "camino",
+ "common",
+ "globset",
+ "hex",
+ "indoc",
+ "nutype",
+ "paths",
+ "proptest",
+ "serde",
+ "serde_json_lenient",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -747,6 +840,7 @@ dependencies = [
  "futures",
  "graph",
  "lcache",
+ "mlog",
  "moka",
  "nickel-lang-core",
  "object 0.40.0",
@@ -1564,6 +1658,20 @@ dependencies = [
  "const-oid",
  "pem-rfc7468",
  "zeroize",
+]
+
+[[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom",
+ "num-bigint 0.4.8",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -2898,7 +3006,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -3862,8 +3970,9 @@ dependencies = [
  "ot",
  "paths",
  "rcache",
- "sandbox2",
+ "sandbox",
  "serial_test",
+ "shlex",
  "stdlib",
  "tempfile",
  "thiserror 2.0.21",
@@ -3925,11 +4034,11 @@ name = "mfile"
 version = "0.0.1"
 dependencies = [
  "args",
+ "boxes",
  "common",
  "indoc",
  "paths",
  "serde",
- "sessions",
  "shlex",
  "tempfile",
  "toml",
@@ -3990,31 +4099,37 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "bep",
+ "boxes",
  "camino",
  "chrono",
  "clap",
  "clap_complete",
+ "common",
+ "crossterm",
  "diagnostics",
  "dirs",
+ "futures",
  "hex",
  "hickory-proto",
  "inquire",
+ "insta",
  "mctx",
  "mfile",
  "minimal-client",
- "minimal-tui",
  "minimald",
  "minimald-rpc",
  "minvmd",
+ "mlog",
  "nix 0.31.3",
  "op",
  "ot",
  "paths",
+ "ratatui",
  "reqwest",
  "russh",
  "serde",
  "serde_json_lenient",
- "sessions",
  "sha2 0.11.0",
  "switch",
  "tempfile",
@@ -4024,8 +4139,10 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "url",
  "version",
+ "zeroize",
 ]
 
 [[package]]
@@ -4035,6 +4152,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "boxes",
  "camino",
  "constcat",
  "indicatif",
@@ -4046,7 +4164,6 @@ dependencies = [
  "russh",
  "serde",
  "serde_json_lenient",
- "sessions",
  "tempfile",
  "tokio",
  "tracing",
@@ -4060,33 +4177,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "minimal-tui"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "camino",
- "chrono",
- "common",
- "crossterm",
- "dirs",
- "futures",
- "insta",
- "mfile",
- "minimal-client",
- "minimald-rpc",
- "nix 0.31.3",
- "paths",
- "ratatui",
- "serde",
- "serde_json_lenient",
- "sessions",
- "tempfile",
- "tokio",
- "tracing",
- "unicode-width 0.2.2",
-]
-
-[[package]]
 name = "minimald"
 version = "0.8.0"
 dependencies = [
@@ -4098,6 +4188,7 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "boringtun",
+ "boxes",
  "bytes",
  "camino",
  "check",
@@ -4123,6 +4214,8 @@ dependencies = [
  "mlog",
  "nix 0.31.3",
  "op",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "orchestrator",
  "ot",
  "paths",
@@ -4130,11 +4223,10 @@ dependencies = [
  "rand_core 0.6.4",
  "russh",
  "russh-sftp",
- "sandbox2",
+ "sandbox",
  "serde",
  "serde_json_lenient",
  "serial_test",
- "sessions",
  "sha2 0.11.0",
  "size",
  "stdlib",
@@ -4148,9 +4240,11 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-appender",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
  "version",
+ "vsock",
  "vt100",
  "walkdir",
  "zstd",
@@ -4160,6 +4254,7 @@ dependencies = [
 name = "minimald-rpc"
 version = "0.0.1"
 dependencies = [
+ "boxes",
  "chrono",
  "constcat",
  "hex",
@@ -4167,7 +4262,6 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json_lenient",
- "sessions",
 ]
 
 [[package]]
@@ -4194,6 +4288,7 @@ name = "minvmd"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "boxes",
  "camino",
  "clap",
  "clap_complete",
@@ -4202,13 +4297,15 @@ dependencies = [
  "libc",
  "minimald-rpc",
  "mlog",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "paths",
  "russh",
  "russh-sftp",
  "serde",
+ "serde_json",
  "serde_json_lenient",
  "serial_test",
- "sessions",
  "sha2 0.11.0",
  "switch",
  "sysinfo",
@@ -4218,6 +4315,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-appender",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
  "version",
@@ -4230,6 +4328,7 @@ dependencies = [
  "anyhow",
  "clap",
  "minvmd",
+ "switch",
  "tracing-subscriber",
  "version",
 ]
@@ -4275,7 +4374,7 @@ dependencies = [
  "rayon",
  "rcache",
  "remote-client",
- "sandbox2",
+ "sandbox",
  "serde",
  "serde_json_lenient",
  "serial_test",
@@ -4306,10 +4405,21 @@ name = "mlog"
 version = "0.0.1"
 dependencies = [
  "json-subscriber",
+ "libc",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "paths",
+ "reqwest",
+ "serde_json",
  "serde_json_lenient",
+ "tempfile",
  "tracing",
  "tracing-appender",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "version",
 ]
@@ -4738,6 +4848,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4773,7 +4892,7 @@ dependencies = [
  "ot",
  "rayon",
  "rcache",
- "sandbox2",
+ "sandbox",
  "serde",
  "serde_json_lenient",
  "sha2 0.11.0",
@@ -4818,6 +4937,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-appender-tracing"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2b304e8d8f11326ba366a99ca5c7aaf7cd397b67268a332437175aeb42a40db"
+dependencies = [
+ "opentelemetry",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee2c3625b8aa04209f7e01e513bc8044da9687fa38a9eacf59628ca5f3b87300"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+ "reqwest",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699a67345e21962a231955b9059a157e428b219fa5df8efe11f08346fb23a344"
+dependencies = [
+ "http",
+ "httpdate",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25da1ac11a0aeccf38d7f77ee0348715adaf8340f65ad46c94a02c6b20e2f65d"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+]
+
+[[package]]
 name = "opentelemetry-semantic-conventions"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4837,6 +5009,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -4861,7 +5034,7 @@ dependencies = [
  "op",
  "ot",
  "rcache",
- "sandbox2",
+ "sandbox",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -5100,6 +5273,16 @@ checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
  "digest 0.11.3",
  "hmac 0.13.0",
+]
+
+[[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
+ "serde_core",
 ]
 
 [[package]]
@@ -5939,6 +6122,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.14.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "x509-parser",
+ "yasna",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6063,6 +6260,7 @@ checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -6276,6 +6474,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6290,9 +6497,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -6354,9 +6561,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -6417,7 +6624,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox2"
+name = "sandbox"
 version = "0.0.1"
 dependencies = [
  "common",
@@ -6733,27 +6940,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sessions"
-version = "0.0.1"
-dependencies = [
- "camino",
- "common",
- "globset",
- "hex",
- "indoc",
- "nutype",
- "paths",
- "serde",
- "serde_json_lenient",
- "tempfile",
- "thiserror 2.0.21",
- "toml",
- "tracing",
- "uuid",
- "walkdir",
-]
-
-[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7063,7 +7249,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stdlib"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "fd-lock",
  "tempfile",
@@ -7894,8 +8080,10 @@ checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry",
+ "smallvec",
  "tracing",
  "tracing-core",
+ "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]
@@ -8349,9 +8537,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8811,6 +8999,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "ring",
+ "rusticata-macros",
+ "thiserror 2.0.21",
+ "time",
+]
+
+[[package]]
 name = "xattr"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8831,6 +9037,16 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
+dependencies = [
+ "bit-vec 0.9.1",
+ "time",
+]
 
 [[package]]
 name = "yoke"

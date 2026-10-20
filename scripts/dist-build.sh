@@ -2,11 +2,10 @@
 #
 # dist-build.sh — THE single build entrypoint for a shippable build.
 #
-# One command produces what the packaging files (AUR, Homebrew, nfpm) ship:
-# the release binaries for a target triple, built exactly the way the
-# release workflow builds them (the build-release-linux-* jobs in
-# .github/workflows/release.yml call this script, so CI builds == downstream
-# builds), plus shell completions generated from the built `min`.
+# One command produces the release binaries for a target triple, built
+# exactly the way the release workflow builds them (the build-release-linux-*
+# jobs in .github/workflows/release.yml call this script, so CI builds ==
+# local builds), plus shell completions generated from the built `min`.
 #
 # Build shape (extracted from those jobs; do not recollapse without cutting
 # the release profile's link-time memory first):
@@ -150,10 +149,9 @@ cargo build --release --locked --target "$TARGET" --package minzoned
 # bytes stay the checked bytes.
 "$ROOT/scripts/check-zoned-links.sh" "$BIN_DIR/minzoned"
 
-# Completions from the built `min`, the technique packaging/arch/PKGBUILD-bin.tmpl
-# uses: XDG
-# overrides steer its user-level install targets into a scratch dir, and
-# ZDOTDIR keeps the zsh compinit-dump cleanup off this host's ~.
+# Completions from the built `min`: XDG overrides steer its user-level
+# install targets into a scratch dir, and ZDOTDIR keeps the zsh
+# compinit-dump cleanup off this host's ~.
 #
 # The gate compares OS as well as arch: an arm64 macOS host matches an
 # aarch64-linux target on arch alone, and running that musl ELF is a hard

@@ -51,7 +51,8 @@
 //! again, so a box whose shuttle reconnects keeps its row. The client boxes'
 //! registrations — the creator's declarations, never anything the guest said
 //! — are persisted in this daemon's state dir ([`BoxRegistry::persisting_to`])
-//! and reloaded detached at start, and a creator whose box outlived its row
+//! and reloaded under the resume bound at start — a VM's cold boot
+//! outlasts the detach grace — and a creator whose box outlived its row
 //! asks for the row back from that persisted record
 //! ([`BoxRegistry::resume_client_box`]).
 
@@ -63,13 +64,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
-use sessions::core::egress::EgressRules;
-use sessions::core::zone_answer;
-use sessions::{DynamicIngress, EgressPolicy, IpProto};
+use boxes::core::egress::EgressRules;
+use boxes::core::zone_answer;
+use boxes::{DynamicIngress, EgressPolicy, IpProto};
 use switch::SwitchSubnet;
 
 use crate::bep_attach::BoxId;
-use crate::net::answerer::canonical_box_name;
 
 /// The per-row cap on runtime-admitted ports (NET-138): the row's
 /// runtime-published set answers to this bound, so a report storm cannot
@@ -99,9 +99,9 @@ const ADMIT_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1)
 /// answers it.
 const ALLOW_ALL_SUBNET: &str = "0.0.0.0/0";
 
-/// How long a detached row — one whose last carrying relay ended, or one
-/// reloaded from the persisted registry at start — stands before it is
-/// withdrawn, unless a relay carries its box's frames again first.
+/// How long a detached row — one whose last carrying relay ended — stands
+/// before it is withdrawn, unless a relay carries its box's frames again
+/// first.
 ///
 /// NET-138 bounds a row's withdrawal at 60 seconds from the end of the
 /// box's attachment. The grace runs from the drainer's arrival of the
@@ -128,10 +128,13 @@ pub const DETACH_GRACE: Duration = Duration::from_secs(45);
 /// row it was resumed for, while a resume nobody follows with an attach
 /// holds its addresses no longer than this. NET-138's 60 s runs from the
 /// end of an attachment, and a reinstated row has had none since it was
-/// published. The bound is armed only when a resume reinstates a withdrawn
-/// row: a resume of a row that stands changes nothing about its liveness,
-/// so it never stretches a detached row's grace past
-/// [`NET_138_WITHDRAWAL_BOUND`] nor puts a bound on a row a relay carries.
+/// published. The bound is armed when a resume reinstates a withdrawn row
+/// and when a load reinstates a standing creation
+/// ([`BoxRegistry::persisting_to`]) — the same wait for the box's first
+/// frame, over the same cold boot: a resume of a row that stands changes
+/// nothing about its liveness, so it never stretches a detached row's
+/// grace past [`NET_138_WITHDRAWAL_BOUND`] nor puts a bound on a row a
+/// relay carries.
 pub const RESUME_ATTACH_BOUND: Duration = Duration::from_secs(300);
 
 /// NET-138's bound on a detached row: withdrawn no later than 60 seconds
@@ -455,14 +458,14 @@ pub struct BoxRecord {
 /// - **awaiting** — no relay has carried it yet, and no grace runs: a
 ///   fresh registration stands until its box's first frame or its
 ///   creator's withdrawal; one its creator reinstated
-///   ([`BoxRegistry::resume_client_box`]) stands until a relay carries its
-///   box or one of its task rows, or until [`RESUME_ATTACH_BOUND`] passes
-///   and it is withdrawn as at a grace's end;
+///   ([`BoxRegistry::resume_client_box`]) or the load reloaded from the
+///   persisted registry ([`BoxRegistry::persisting_to`]) stands until a
+///   relay carries its box or one of its task rows, or until
+///   [`RESUME_ATTACH_BOUND`] passes and it is withdrawn as at a grace's
+///   end;
 /// - **attached** — at least one relay carries it;
-/// - **detached** — its last relay ended, or it was reloaded from the
-///   persisted registry at start ([`BoxRegistry::persisting_to`]); it is
-///   withdrawn once [`DETACH_GRACE`] passes unless a relay carries it
-///   again first.
+/// - **detached** — its last relay ended; it is withdrawn once
+///   [`DETACH_GRACE`] passes unless a relay carries it again first.
 ///
 /// A detached row decides frames exactly as an attached one does: the
 /// gate's verdict reads the row's rules, never its liveness, and the row's
@@ -852,7 +855,7 @@ pub struct BoxRegistration {
     admitted_ports: Vec<u16>,
     declared_names: Vec<String>,
     egress: Option<EgressPolicy>,
-    credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    credentialed_upstream: Option<boxes::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
     task_addrs: Vec<Ipv4Addr>,
@@ -926,10 +929,7 @@ impl BoxRegistration {
     /// declaration is reduced to a lane in the row; its own content is the
     /// proxy document's to extend, so nothing of it is retained here.
     #[must_use]
-    pub fn with_credentialed_upstream(
-        mut self,
-        declaration: sessions::CredentialedUpstream,
-    ) -> Self {
+    pub fn with_credentialed_upstream(mut self, declaration: boxes::CredentialedUpstream) -> Self {
         self.credentialed_upstream = Some(declaration);
         self
     }
@@ -968,7 +968,7 @@ pub struct ClientBoxSpec {
     pub ingress_ports: Vec<u16>,
     /// The box's egress policy, as the client declared it. Absent compiles
     /// the egress default the registry's phase and opt-out resolve
-    /// (`sessions::effective_egress`), the same meaning the create request's
+    /// (`boxes::effective_egress`), the same meaning the create request's
     /// absent policy carries in the guest.
     pub egress: Option<EgressPolicy>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
@@ -977,7 +977,7 @@ pub struct ClientBoxSpec {
     /// rules say — while `None` is no lane, and the proxy's address stays
     /// refused under the box-to-host default-deny. The one field a client
     /// that predates NET-134 sends absent, every time.
-    pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    pub credentialed_upstream: Option<boxes::CredentialedUpstream>,
     /// The box's dynamic-ingress stance (NET-045): the stance half of the
     /// grant the row holds a runtime port report against. `None` is the
     /// declaration's `deny` default — a client that predates the grant
@@ -996,11 +996,12 @@ pub struct ClientBoxSpec {
 /// a row stands for it. A creation lives from its registration until its
 /// creator withdraws the box ([`BoxRegistry::withdraw_client_box`]) or a
 /// new registration takes its name; a row withdrawn at the end of its
-/// detach grace leaves the creation **dormant** (`standing: false`) for
-/// its creator to resume ([`BoxRegistry::resume_client_box`]). A creation,
-/// standing or dormant, keeps its addresses reserved: its switch and task
-/// addresses stay out of the hand-out book — taken again from a fresh book
-/// at reload — and its published loopback address stays the answerer's
+/// detach grace or its resume bound leaves the creation **dormant**
+/// (`standing: false`) for its creator to resume
+/// ([`BoxRegistry::resume_client_box`]). A creation, standing or dormant,
+/// keeps its addresses reserved: its switch and task addresses stay out of
+/// the hand-out book — taken again from a fresh book at reload — and its
+/// published loopback address stays the answerer's
 /// link for its name, so a resume finds every address its box was created
 /// with. Its creator's withdrawal releases them all. There is at most one
 /// creation per box name.
@@ -1016,7 +1017,7 @@ struct Creation {
     loopback_address: Ipv4Addr,
     ingress_ports: Vec<u16>,
     egress: Option<EgressPolicy>,
-    credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    credentialed_upstream: Option<boxes::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
     /// The task addresses filed with the box (NET-138), persisted with it
@@ -1082,7 +1083,7 @@ struct RegistryFile {
 #[serde(deny_unknown_fields)]
 struct HeldNamesFile {
     version: u32,
-    held_names: BTreeMap<String, Option<sessions::SessionId>>,
+    held_names: BTreeMap<String, Option<boxes::SessionId>>,
 }
 
 /// Writes `file` to `path` the one way any of the registry's persisted
@@ -1203,7 +1204,7 @@ fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Crea
 /// a rename that fails is a second error line, and the next hold writes
 /// over it — the holds are an interim every session's attach re-makes,
 /// never a record a resume is checked against.
-fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<sessions::SessionId>> {
+fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<boxes::SessionId>> {
     let why = match std::fs::read(path) {
         Ok(bytes) => match serde_json_lenient::from_slice::<HeldNamesFile>(&bytes) {
             Ok(file) if file.version == HELD_NAMES_FILE_VERSION => {
@@ -1297,15 +1298,15 @@ const SWITCH_REUSE_QUARANTINE: Duration = switch::SWITCH_ADDRESS_REUSE_QUARANTIN
 
 const _: () = assert!(
     SWITCH_REUSE_QUARANTINE.as_millis()
-        >= sessions::core::egress::REPLY_UDP_REPLIED_WINDOW.as_millis(),
+        >= boxes::core::egress::REPLY_UDP_REPLIED_WINDOW.as_millis(),
     "the switch address quarantine must outlast a replied UDP flow's record"
 );
 const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis() >= sessions::core::egress::REPLY_TCP_IDLE_CAP.as_millis(),
+    SWITCH_REUSE_QUARANTINE.as_millis() >= boxes::core::egress::REPLY_TCP_IDLE_CAP.as_millis(),
     "the switch address quarantine must outlast an idle TCP flow's record"
 );
 const _: () = assert!(
-    SWITCH_REUSE_QUARANTINE.as_millis() >= sessions::core::egress::DNS_ADMISSION_WINDOW.as_millis(),
+    SWITCH_REUSE_QUARANTINE.as_millis() >= boxes::core::egress::DNS_ADMISSION_WINDOW.as_millis(),
     "the switch address quarantine must outlast a DNS pin's admission window"
 );
 
@@ -1404,13 +1405,20 @@ impl std::fmt::Display for HandOutCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {} box addresses are held by live boxes and {} are in their {} s reuse \
-             quarantine",
-            self.live,
-            self.capacity,
-            self.quarantined,
-            SWITCH_REUSE_QUARANTINE.as_secs()
+            "{} of {} box addresses are in use",
+            self.live, self.capacity
         )?;
+        // The resting rule is named only when an address is resting.
+        if self.quarantined > 0 {
+            write!(
+                f,
+                " and {} {} released but cannot be reused yet (an address rests {} s after its \
+                 release)",
+                self.quarantined,
+                if self.quarantined == 1 { "was" } else { "were" },
+                SWITCH_REUSE_QUARANTINE.as_secs()
+            )?;
+        }
         if let Some(wait) = self.next_free_in {
             // Rounded up: an address that frees in 0.4 s is not free now.
             let secs = wait
@@ -1597,8 +1605,8 @@ pub enum AllocationError {
     /// forwarded connections, or have its own forwards unbound at the old
     /// box's end, so the registration is refused instead.
     #[error(
-        "address {addr} is still held by a withdrawn box whose forwards the host has not \
-         finished unbinding"
+        "address {addr} still belongs to a box that is shutting down (its port forwards are not \
+         removed yet); try again shortly"
     )]
     RevocationPending {
         /// The held address: a switch address or a published loopback one.
@@ -1607,11 +1615,11 @@ pub enum AllocationError {
     /// A withdrawal under the box's name landed while the answerer was
     /// allocating its published address: the withdrawal is ordered after
     /// the registration was read, so the registration writes no row.
-    #[error("the box was withdrawn while its address was being allocated")]
+    #[error("the box's registration was cancelled while its address was being assigned")]
     WithdrawnWhileAllocating,
     /// The name folds to one a live row already holds: the answerer keys
     /// an address by the name's canonical form
-    /// ([`crate::net::answerer::canonical_box_name`]), so two rows under
+    /// ([`canonical_box_name`]), so two rows under
     /// folded-equal names would share one published address — one box, one
     /// address, one row. The registration is refused before any address is
     /// spent, and names the spelling the live row holds.
@@ -2772,7 +2780,7 @@ pub struct BoxRegistry {
     /// session that made it, when its client named one, so a release
     /// frees only that session's hold, never a newer session's under the
     /// same name.
-    held_names: Arc<RwLock<BTreeMap<String, Option<sessions::SessionId>>>>,
+    held_names: Arc<RwLock<BTreeMap<String, Option<boxes::SessionId>>>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -2852,14 +2860,14 @@ pub struct BoxRegistry {
     /// section is compiled under: the gate's own phase
     /// ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]), so the row's
     /// frame half and the gate's publish half read one constant.
-    egress_default_phase: sessions::EgressDefaultPhase,
+    egress_default_phase: boxes::EgressDefaultPhase,
     /// The operator's deny-all opt-out (NET-077), read from
     /// `MINVMD_EGRESS_DENY_ALL_OPT_OUT` by the supervisor: with it set, a
     /// client box with no `egress` section keeps the earlier allow-all in
     /// every phase — the same default the guest daemon is handed on its boot
     /// line, so the host gate never denies what the guest allows. That
     /// agreement also needs this registry's phase to match the guest's
-    /// (`sessions::EGRESS_DEFAULT_PHASE`); if the two constants diverge, the
+    /// (`boxes::EGRESS_DEFAULT_PHASE`); if the two constants diverge, the
     /// stricter side wins.
     egress_deny_all_opt_out: bool,
     /// The client boxes' creations ([`Creation`]), keyed by the name's
@@ -2980,7 +2988,7 @@ impl BoxRegistry {
     /// the announced one no build ships now as well as the in-force one.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_egress_default_phase(mut self, phase: sessions::EgressDefaultPhase) -> Self {
+    pub(crate) fn with_egress_default_phase(mut self, phase: boxes::EgressDefaultPhase) -> Self {
         self.egress_default_phase = phase;
         self
     }
@@ -3110,12 +3118,14 @@ impl BoxRegistry {
     ///
     /// Every creation whose row stood at the last write is reinstated at
     /// its own addresses with its own box id, compiled from its creator's
-    /// declaration as a registration is, and marked **detached** from this
-    /// instant ([`RowLiveness`]): the VM the row's box ran in ended with
-    /// the previous run, so the row is withdrawn once [`DETACH_GRACE`]
-    /// passes unless the box's shuttle carries a frame from its address
-    /// again. A resume does not extend that grace; once the row has gone,
-    /// its creator's resume reinstates it ([`Self::resume_client_box`]). A
+    /// declaration as a registration is, and awaits its box's first frame
+    /// under [`RESUME_ATTACH_BOUND`] from this instant ([`RowLiveness`]):
+    /// the VM the row's box ran in ended with the previous run, so the
+    /// box's host is not launched in the new VM until the guest daemon
+    /// starts, and the row is withdrawn once the bound passes unless the
+    /// box's shuttle carries a frame from its address again. A resume
+    /// does not extend that bound; once the row has gone, its creator's
+    /// resume reinstates it ([`Self::resume_client_box`]). A
     /// dormant creation stays dormant. The hand-out book takes every
     /// creation's switch and task addresses, dormant ones' included, so a
     /// fresh book hands none of them to a new box; their quarantine is not
@@ -3199,13 +3209,14 @@ impl BoxRegistry {
         );
         match self.try_register_since(registration, None, None) {
             Ok(record) => {
-                record.liveness().detached_since = Some(now);
+                record.liveness().resumed_since = Some(now);
                 tracing::info!(
                     box = %record.name(),
                     switch_addr = %record.switch_addr(),
-                    grace = ?DETACH_GRACE,
-                    "reloaded a persisted box's row detached; it is withdrawn after the \
-                     grace unless its box attaches again or its creator resumes it"
+                    bound = ?RESUME_ATTACH_BOUND,
+                    "reloaded a persisted box's row; it awaits its box's first frame \
+                     under the resume bound and is withdrawn once that bound passes \
+                     unless its box attaches again or its creator resumes it"
                 );
                 true
             }
@@ -3521,7 +3532,7 @@ impl BoxRegistry {
             .unwrap_or_else(crate::bep_attach::mint_box_id);
         // The row's derived allow-list: the declaration's `allow_subnets`
         // dimension in its own spelling. `None` reaches this row only from
-        // the opt-out or the announced arm (`sessions::effective_egress`
+        // the opt-out or the announced arm (`boxes::effective_egress`
         // resolves it to present and empty in force), and there it is
         // allow-all, the meaning the compiled rules give `None`.
         let egress_allow_list = registration
@@ -4054,15 +4065,15 @@ impl BoxRegistry {
         // default is in force, unless the operator opted out — the shipped
         // allow-all otherwise. The row is compiled from what the box is held
         // to, so the host gate and the guest's gate agree.
-        let egress = match sessions::effective_egress(
+        let egress = match boxes::effective_egress(
             spec.egress.as_ref(),
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             self.egress_default_phase,
             self.egress_deny_all_opt_out,
         ) {
-            sessions::EffectiveEgress::Declared(policy) => Some(policy),
-            sessions::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
-            sessions::EffectiveEgress::AllowAll => None,
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            boxes::EffectiveEgress::AllowAll => None,
         };
         if let Some(policy) = egress {
             registration = registration.with_egress_policy(policy);
@@ -4166,7 +4177,7 @@ impl BoxRegistry {
     /// The name a live row or a kept creation holds that `name` folds to,
     /// in its own spelling, or `None` when none folds to it. The answerer
     /// allocates a published address by the name's canonical form
-    /// ([`crate::net::answerer::canonical_box_name`]), so two live rows
+    /// ([`canonical_box_name`]), so two live rows
     /// under folded-equal names would share one address; this is the check
     /// that keeps the live set one row per folded name. A dormant creation
     /// holds its name too ([`Creation`]): its creator may still resume it,
@@ -4856,7 +4867,7 @@ impl BoxRegistry {
     /// the row with the greatest id, because every id is a UUIDv7 this
     /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
     /// orders those by creation within a process. The name is matched in
-    /// its canonical form ([`crate::net::answerer::canonical_box_name`]):
+    /// its canonical form ([`canonical_box_name`]):
     /// the answerer keys the box's published address by that form, so the
     /// row table and the address hold one box to a folded-equal name.
     #[must_use]
@@ -4917,7 +4928,7 @@ impl BoxRegistry {
     ///
     /// The hold is persisted ([`Self::persisting_to`]), so it survives a
     /// daemon restart.
-    pub fn hold_box_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
+    pub fn hold_box_name(&self, name: &str, owner: Option<boxes::SessionId>) -> bool {
         let old = {
             let mut held = self.held_names.write().expect(
                 "the held names' lock is never held across a panic, so it cannot be poisoned",
@@ -4954,7 +4965,7 @@ impl BoxRegistry {
     /// under whatever name it holds now (a rename moved it), plus `name`'s
     /// hold when no session owns it; a hold another session made under
     /// `name` stays. Without one, `name`'s hold goes whoever made it.
-    pub fn release_held_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
+    pub fn release_held_name(&self, name: &str, owner: Option<boxes::SessionId>) -> bool {
         let canonical = canonical_box_name(name);
         let mut held = self
             .held_names
@@ -5351,6 +5362,21 @@ fn zone_name(name: &str) -> String {
     format!("{name}.{}", zone_answer::ZONE_APEX)
 }
 
+/// The one form a box's registry name is compared in wherever it keys the
+/// box's published address: the answerer's allocations and releases
+/// ([`crate::net::answerer::box_zone_name`]), the box registry's in-flight
+/// registrations ([`BoxRegistry::begin_registration`]), and its
+/// live rows — the row table's name lookups
+/// ([`BoxRegistry::row_by_name`]), a client
+/// registration's name-collision refusal
+/// ([`AllocationError::NameAlreadyHeld`]), and a
+/// client withdrawal's name proof. Names are DNS labels, so the fold is
+/// ASCII lower-case: "Web" and "web" are one box to the answerer, and must
+/// be one to everything its hold is checked against.
+pub(crate) fn canonical_box_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 /// Whether `addr` is one an A answer in the box zone may carry (NET-127):
 /// the host's shared loopback address, or an address from the reserved
 /// local range the address plan publishes boxes at. Anything else — a box's
@@ -5620,7 +5646,7 @@ impl BoxTable {
     /// octet arrays the publish decision compares a request's switch address
     /// by. The same bounds [`Self::is_allocatable`] decides frames by; the
     /// publish decision needs them as values because its table is an owned,
-    /// pure one ([`sessions::core::switch_request`]), built fresh per
+    /// pure one ([`boxes::core::switch_request`]), built fresh per
     /// request.
     #[must_use]
     pub fn ptask_run(&self) -> ([u8; 4], [u8; 4]) {
@@ -5755,8 +5781,8 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
 mod tests {
     use std::time::Duration;
 
-    use sessions::IpProto;
-    use sessions::core::egress::FrameVerdict;
+    use boxes::IpProto;
+    use boxes::core::egress::FrameVerdict;
     use switch::SwitchSubnet;
     use tokio::io::AsyncWriteExt;
 
@@ -5955,19 +5981,19 @@ mod tests {
         // applies — drops a frame to an address outside the LAN the first
         // declaration allowed, and admits the same frame under the row the
         // re-registration left.
-        let outside = sessions::core::egress::summarize(&ipv4_frame(
+        let outside = boxes::core::egress::summarize(&ipv4_frame(
             Ipv4Addr::new(100, 64, 0, 9).octets(),
             6,
             [203, 0, 113, 7],
             443,
         ));
         assert!(matches!(
-            sessions::core::egress::verdict(&outside, web.egress()),
+            boxes::core::egress::verdict(&outside, web.egress()),
             FrameVerdict::Drop(_)
         ));
         assert!(
             matches!(
-                sessions::core::egress::verdict(&outside, restated_row.egress()),
+                boxes::core::egress::verdict(&outside, restated_row.egress()),
                 FrameVerdict::Admit
             ),
             "the re-registration's reach is what the gate now decides by"
@@ -5985,7 +6011,7 @@ mod tests {
     /// and empty (NET-074), which does not touch the address rules below.
     #[test]
     fn undeclared_row_default_follows_phase_and_opt_out() {
-        use sessions::EgressDefaultPhase::{Announced, InForce};
+        use boxes::EgressDefaultPhase::{Announced, InForce};
 
         let reach_to = |phase, opt_out, egress: Option<EgressPolicy>, dest: [u8; 4]| {
             let registry = BoxRegistry::new(SUBNET)
@@ -6001,14 +6027,14 @@ mod tests {
                     dynamic_allowed_range: None,
                 })
                 .expect("the default plan hands out a client box");
-            let outside = sessions::core::egress::summarize(&ipv4_frame(
+            let outside = boxes::core::egress::summarize(&ipv4_frame(
                 row.switch_addr().octets(),
                 6,
                 dest,
                 443,
             ));
             matches!(
-                sessions::core::egress::verdict(&outside, row.egress()),
+                boxes::core::egress::verdict(&outside, row.egress()),
                 FrameVerdict::Admit
             )
         };
@@ -6768,10 +6794,11 @@ mod tests {
 
     /// NET-138: the client boxes' registrations persist host-side, and a
     /// registry started over the file reinstates each standing row — its
-    /// name, both addresses, its box id and its compiled rules — detached
-    /// from the load, with its switch address out of the hand-out book.
+    /// name, both addresses, its box id and its compiled rules — awaiting
+    /// its box's first frame under the resume bound, with its switch
+    /// address out of the hand-out book.
     #[test]
-    fn registry_persists_and_reloads_rows_as_detached() {
+    fn registry_persists_and_reloads_rows_awaiting_their_boxes() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let before = persisted_registry(&dir);
         let mut spec = client_spec("web");
@@ -6797,7 +6824,10 @@ mod tests {
             web.egress(),
             "compiled from its declaration"
         );
-        assert!(reloaded.is_detached(), "reloaded detached");
+        assert!(
+            !reloaded.is_detached(),
+            "reloaded awaiting its box's first frame"
+        );
         assert_eq!(after.live_switch_addrs(), 1, "its switch address is out");
         let api = after
             .register_client_box(client_spec("api"))
@@ -6809,11 +6839,11 @@ mod tests {
         );
     }
 
-    /// NET-138: a reloaded row no relay carries again is withdrawn after its
-    /// grace, as any detached row is, and stays withdrawn across the next
-    /// reload: its creation is kept dormant, its switch address reserved
-    /// for it across the reload too, so the reloaded book hands it to no
-    /// other box.
+    /// NET-138: a reloaded row no relay carries again is withdrawn once its
+    /// resume bound passes, as any row awaiting its box is, and stays
+    /// withdrawn across the next reload: its creation is kept dormant, its
+    /// switch address reserved for it across the reload too, so the
+    /// reloaded book hands it to no other box.
     #[test]
     fn a_reloaded_row_not_reattributed_is_withdrawn() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -6826,10 +6856,10 @@ mod tests {
         after.spawn_withdrawal_drainer(move |name| {
             let _ = released.send(name.to_string());
         });
-        after.advance_clock(DETACH_GRACE);
+        after.advance_clock(RESUME_ATTACH_BOUND);
         wait_until(
             || after.row_by_name("web").is_none(),
-            "the reloaded row is withdrawn once its grace passes",
+            "the reloaded row is withdrawn once its bound passes",
         );
         assert!(
             releases.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -6862,6 +6892,60 @@ mod tests {
             "the creator's destroy ends the dormant creation"
         );
         assert_eq!(again.live_switch_addrs(), 1, "only the new box's is out");
+    }
+
+    /// NET-138 (finding: a reload armed the detach grace): a reloaded row
+    /// awaits its box's first frame under the resume bound, not the detach
+    /// grace — the VM's cold boot outlasts the grace — so it stands past
+    /// [`DETACH_GRACE`] and is withdrawn only once
+    /// [`RESUME_ATTACH_BOUND`] passes; a frame carried within the bound
+    /// stands it back up the way any attributed row stands.
+    #[test]
+    fn a_reloaded_row_awaits_its_box_under_the_resume_bound() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        persisted_registry(&dir)
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+
+        let registry = persisted_registry(&dir);
+        registry.spawn_withdrawal_drainer(|_| {});
+        registry.advance_clock(DETACH_GRACE);
+        let_the_drainer_sweep();
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "the reloaded row stands past the detach grace: its VM's cold boot \
+             outlasts the grace"
+        );
+
+        registry.advance_clock(RESUME_ATTACH_BOUND.saturating_sub(DETACH_GRACE));
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the reloaded row is withdrawn at its bound",
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            1,
+            "the dormant creation keeps its switch address reserved"
+        );
+
+        // A reload alone, no resume: the reloaded row's first frame clears
+        // the bound the load armed.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let web = persisted_registry(&dir)
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let reloaded = persisted_registry(&dir);
+        reloaded.spawn_withdrawal_drainer(|_| {});
+        reloaded
+            .table()
+            .mark_attributed(web.switch_addr().octets())
+            .expect("the reloaded row stands at its switch address");
+        reloaded.advance_clock(RESUME_ATTACH_BOUND);
+        let_the_drainer_sweep();
+        assert!(
+            reloaded.row_by_name("web").is_some(),
+            "a reloaded row its box's first frame reached stands past the bound"
+        );
     }
 
     /// NET-138: the persisted registry is its owner's alone — mode 0600,
@@ -6914,9 +6998,9 @@ mod tests {
     #[test]
     fn held_box_names_persist_and_reload() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let owner = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
-        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+        let other = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
             .expect("a session id");
 
         let registry = persisted_registry(&dir);
@@ -6967,7 +7051,7 @@ mod tests {
         registry
             .register_client_box(client_spec("db"))
             .expect("the plan has an address for the box");
-        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let owner = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
         assert!(registry.hold_box_name("web", Some(owner)));
 
@@ -7022,7 +7106,7 @@ mod tests {
             }}"#,
         )
         .expect("a held-names file");
-        let first = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let first = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
 
         let registry = persisted_registry(&dir);
@@ -7051,9 +7135,9 @@ mod tests {
     #[test]
     fn an_unconfirmed_reloaded_hold_expires_and_a_reconfirmed_one_stays() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let gone = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let gone = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
-        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+        let live = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
             .expect("a session id");
         let before = persisted_registry(&dir);
         assert!(before.hold_box_name("old", Some(gone)));
@@ -7630,7 +7714,7 @@ mod tests {
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
             ..EgressPolicy::default()
         });
-        spec.credentialed_upstream = Some(sessions::CredentialedUpstream {});
+        spec.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
         spec.dynamic_ingress = Some(DynamicIngress::Allow);
         spec.dynamic_allowed_range = Some((9000, 9100));
         let web = registry
@@ -7920,10 +8004,10 @@ mod tests {
         assert_eq!(registry.live_switch_addrs(), 3);
 
         registry.spawn_withdrawal_drainer(|_| {});
-        registry.advance_clock(DETACH_GRACE);
+        registry.advance_clock(RESUME_ATTACH_BOUND);
         wait_until(
             || registry.table().is_empty(),
-            "the reloaded box goes at its grace's end, its task rows with it",
+            "the reloaded box goes at its bound, its task rows with it",
         );
         let claim = registry.begin_registration("web");
         let resumed = registry
@@ -8161,8 +8245,8 @@ mod tests {
         let said = error.to_string();
         assert!(
             said.contains(
-                "124 of 125 box addresses are held by live boxes and 1 are in their 300 s \
-                 reuse quarantine; the next one frees in 200 s"
+                "124 of 125 box addresses are in use and 1 was released but cannot be reused yet \
+                 (an address rests 300 s after its release); the next one frees in 200 s"
             ),
             "the refusal names the counts, got: {said}"
         );
@@ -8170,6 +8254,36 @@ mod tests {
             registry.live_switch_addrs(),
             CARVED_RUN - 1,
             "the refusal holds nothing"
+        );
+    }
+
+    /// The exhaustion's sentence names the resting rule only when an address
+    /// is resting, and counts the resting addresses in the right number.
+    #[test]
+    fn switch_exhaustion_words_follow_the_quarantined_count() {
+        let registry = BoxRegistry::new(carved());
+        let _rows = fill_carved_run(&registry);
+        let error = register_carved(&registry, "late").expect_err("the run is exhausted");
+        assert!(
+            matches!(&error, AllocationError::SwitchExhausted(counts) if counts.quarantined == 0),
+            "nothing was returned, got: {error}"
+        );
+        let said = error.to_string();
+        assert!(
+            said.ends_with("125 of 125 box addresses are in use"),
+            "a run with every address live says only that, got: {said}"
+        );
+
+        let two = HandOutCounts {
+            live: 123,
+            quarantined: 2,
+            capacity: 125,
+            next_free_in: None,
+        };
+        assert_eq!(
+            two.to_string(),
+            "123 of 125 box addresses are in use and 2 were released but cannot be reused yet \
+             (an address rests 300 s after its release)"
         );
     }
 
@@ -8558,24 +8672,24 @@ mod tests {
         // daemon's registry does: an A lookup for the published address,
         // NODATA for the name held at an address the host may not be told,
         // NXDOMAIN for a name no row holds.
-        let a = sessions::core::zone_answer::Lookup {
+        let a = boxes::core::zone_answer::Lookup {
             name: "web.min.internal".to_string(),
-            record: sessions::core::zone_answer::RecordType::A,
-            origin: sessions::core::zone_answer::Origin::OnMachine,
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
         };
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &view),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a held live name answers A with its published address"
         );
-        let lease_only = sessions::core::zone_answer::Lookup {
+        let lease_only = boxes::core::zone_answer::Lookup {
             name: "lease-only.min.internal".to_string(),
-            record: sessions::core::zone_answer::RecordType::A,
-            origin: sessions::core::zone_answer::Origin::OnMachine,
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
         };
         assert_eq!(
-            sessions::core::zone_answer::decide(&lease_only, &view),
-            sessions::core::zone_answer::Verdict::Nodata,
+            boxes::core::zone_answer::decide(&lease_only, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
             "a name held only at an address the host may not be told is NODATA"
         );
 
@@ -8595,8 +8709,8 @@ mod tests {
             "a stopped namespace keeps its name held, live: false"
         );
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &view),
-            sessions::core::zone_answer::Verdict::Nodata,
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
             "a stopped namespace answers NODATA, held"
         );
         registry.register(BoxRegistration::new(
@@ -8605,8 +8719,8 @@ mod tests {
             web.loopback_addr(),
         ));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a re-registration is a namespace that is running again"
         );
 
@@ -8614,8 +8728,8 @@ mod tests {
         // no name, so NXDOMAIN, never a stopped name held forever.
         assert!(registry.withdraw(web.switch_addr()).is_some());
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Nxdomain,
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
             "a withdrawn namespace's name is held by nothing"
         );
     }
@@ -8627,14 +8741,14 @@ mod tests {
     #[test]
     fn the_zone_view_holds_a_host_ip_box_name_with_no_row_behind_it() {
         let registry = BoxRegistry::new(SUBNET);
-        let a = sessions::core::zone_answer::Lookup {
+        let a = boxes::core::zone_answer::Lookup {
             name: "web.min.internal".to_string(),
-            record: sessions::core::zone_answer::RecordType::A,
-            origin: sessions::core::zone_answer::Origin::OnMachine,
+            record: boxes::core::zone_answer::RecordType::A,
+            origin: boxes::core::zone_answer::Origin::OnMachine,
         };
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Nxdomain,
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
             "a name nothing holds is NXDOMAIN, the pre-box state"
         );
 
@@ -8653,8 +8767,8 @@ mod tests {
             "a held name is held with no address and live"
         );
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &view),
-            sessions::core::zone_answer::Verdict::Nodata,
+            boxes::core::zone_answer::decide(&a, &view),
+            boxes::core::zone_answer::Verdict::Nodata,
             "a held name answers NODATA: the box exists, no address to tell"
         );
 
@@ -8663,8 +8777,8 @@ mod tests {
         assert!(registry.release_held_name("web", None));
         assert!(!registry.release_held_name("web", None));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Nxdomain,
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Nxdomain,
             "a released name answers nothing again"
         );
 
@@ -8677,14 +8791,14 @@ mod tests {
         ));
         assert!(registry.hold_box_name("web", None));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "a name a row publishes answers the row's address, hold or no hold"
         );
         assert!(registry.release_held_name("web", None));
         assert_eq!(
-            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
-            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            boxes::core::zone_answer::decide(&a, &registry.zone_view()),
+            boxes::core::zone_answer::Verdict::Address(web.loopback_addr()),
             "the row keeps answering its address once the hold is gone"
         );
     }
@@ -8701,8 +8815,8 @@ mod tests {
                 .rows()
                 .any(|(held, _)| held == zone_name(name))
         };
-        let old = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let new = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let old = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let new = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
 
         // A newer session took the name: the old session's release leaves it.
         assert!(registry.hold_box_name("web", Some(old)));

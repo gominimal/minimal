@@ -9,20 +9,27 @@
 //!
 //! The server-side serving glue lives in the `minimald` crate.
 
+use boxes::SessionId;
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sessions::SessionId;
 
 pub mod exec;
 pub mod taskenv;
 pub mod trace;
 
-pub use sessions::{
-    BoxAddresses, CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
-    EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+pub use boxes::{
+    BoxAddresses, BoxPolicy, CredentialedUpstream, DynamicIngress, EffectiveBoxPolicy,
+    EffectiveEgress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
+
+/// The message every RPC refusal carries once the daemon has begun its
+/// shutdown: a client racing `min stop` matches on it to name the lost race
+/// in plain language instead of surfacing the raw RPC chain. Matching keys
+/// on this exact text across builds, so changing it is a wire-contract
+/// change, not display copy.
+pub const SHUTDOWN_REFUSAL: &str = "the daemon is shutting down";
 
 /// Describes a minimal-specific RPC method sent over ssh.
 ///
@@ -134,7 +141,8 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
             "This CLI is minimal {cli}, but the running minimald is {daemon}. \
              The two speak the same RPCs only when built together, so continuing \
              would fail partway through and tear down whatever it had created. \
-             Restart the daemon on the new build: run `min stop`, then re-run this \
+             Restart the daemon on the new build: run `min stop --force` (the \
+             plain stop is refused while sessions are live), then re-run this \
              command (the daemon is started again automatically). \
              Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
         )
@@ -143,11 +151,11 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
 
 /// How a user-namespace refusal opens (NET-141): the daemon formats a
 /// create refused on the host's user-namespace verdict as this lead, the
-/// cause (`sandbox2::UsernsRestriction::cause`) closing the parenthesis,
+/// cause (`sandbox::UsernsRestriction::cause`) closing the parenthesis,
 /// and the cause's remedy for the daemon on a second line. Clients print
 /// the daemon's text verbatim, as they do every create refusal, so nothing
 /// on their side matches on the lead. Only the lead lives here: the cause
-/// and remedy texts are `sandbox2`'s, where the restriction is diagnosed
+/// and remedy texts are `sandbox`'s, where the restriction is diagnosed
 /// and both binaries that probe it already look.
 pub const USER_NAMESPACE_REFUSAL_LEAD: &str =
     "this machine blocks the private sandbox every box runs in (";
@@ -185,18 +193,18 @@ pub struct RunningSessionAttrs {
 /// when it did not and the box runs with the host's address and no verdict
 /// of its own.
 ///
-/// The type is defined in the sessions crate — beside the
-/// [`Record`](sessions::Record) field that carries a box's own launch
+/// The type is defined in the `boxes` crate — beside the
+/// [`Record`](boxes::Record) field that carries a box's own launch
 /// outcome, a session-plane type this crate already depends on — and
 /// re-exported here so the paths this crate's clients spell stay what they
 /// were: the listing's [`ListSessionsEntry::host_ip_enforcement`] answers in
 /// it, and the stringly surfaces carry its machine spelling.
-pub use sessions::HostIpEnforcement;
+pub use boxes::HostIpEnforcement;
 
 /// An entry in the ListSessions response.
 ///
 /// `project_path` and `status` mirror the fields of the same name on the
-/// session [`Record`](sessions::Record). They let a client resolve "which
+/// session [`Record`](boxes::Record). They let a client resolve "which
 /// session was built from this directory" and render a state glyph in a
 /// picker without a follow-up `GetSessionRecord` round-trip per session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,14 +214,14 @@ pub struct ListSessionsEntry {
     /// The absolute host path the session was built from. `None` on responses
     /// from daemons that predate this field — clients treat such entries as
     /// not matching the cwd but still listable/pickable. Always `Some` from a
-    /// current daemon, since [`Record`](sessions::Record) requires the path.
+    /// current daemon, since [`Record`](boxes::Record) requires the path.
     #[serde(default)]
     pub project_path: Option<paths::HostAbsPath>,
     /// The session's lifecycle status, used to render a state glyph in the
     /// interactive picker. Defaults to `Active` for daemons that predate the
     /// field so an older server still deserializes cleanly.
     #[serde(default)]
-    pub status: sessions::SessionStatus,
+    pub status: boxes::BoxState,
     /// Git context for the project path, probed by the client at list time
     /// (the daemon cannot probe it: on macOS it runs in the minvmd guest,
     /// where the host's project paths do not exist and git is not on PATH).
@@ -245,7 +253,7 @@ pub struct ListSessionsEntry {
     /// The declared ingress ports this box yields because another box at the
     /// same shared loopback address holds them (NET-129, first-come), one
     /// entry per port naming the holding box: the same registry read
-    /// [`SessionRuntimeFacts::shared_port_collisions`] answers from, so a
+    /// [`BoxRuntimeFacts::shared_port_collisions`] answers from, so a
     /// listing and the policy view cannot disagree. Serde-defaulted, so an
     /// entry from a daemon that predates the field decodes as empty, and
     /// omitted when empty, so the common entry is unchanged on the wire.
@@ -369,7 +377,7 @@ pub enum GetSessionRecordRequest {
 /// The response for a [`GetSessionRecord`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSessionRecordResponse {
-    pub record: Option<sessions::Record>,
+    pub record: Option<boxes::Record>,
     /// The build this daemon runs, so a client can assert the pair matches
     /// without spending a round trip on [`GetVersion`]. `None` from a daemon
     /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
@@ -445,7 +453,7 @@ pub struct CreateSession;
 /// `id` and `status` are also out: id is allocated by the store,
 /// status is managed by the manager actor.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionConfig {
+pub struct BoxConfig {
     /// User-supplied name. `None` is anonymous; the daemon may render
     /// a short display name (e.g. `<user>-<project>-<uuid-suffix>`).
     pub name: Option<String>,
@@ -461,7 +469,7 @@ pub struct SessionConfig {
     pub network: NetworkMode,
     /// Per-session networking policy (egress + ingress).
     #[serde(default)]
-    pub policy: SessionPolicy,
+    pub policy: BoxPolicy,
     /// The addresses the VM host daemon handed this box's registration
     /// (T66), when the activating client registered one: its switch
     /// address, which the in-VM daemon attaches with instead of drawing
@@ -478,7 +486,7 @@ pub struct SessionConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_addresses: Vec<std::net::Ipv4Addr>,
     /// The box id the same registration handed back
-    /// ([`sessions::Record::box_id`]): the id the host's row of the box
+    /// ([`boxes::Record::box_id`]): the id the host's row of the box
     /// holds. `None` for every activation that handed no box addresses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_id: Option<BoxId>,
@@ -503,17 +511,17 @@ pub struct SessionConfig {
     pub attrs: std::collections::BTreeMap<String, String>,
 }
 
-/// Serde default for [`SessionConfig::hooks_enabled`]. See
-/// [`sessions::Record::hooks_enabled`] for why this cannot be a bare
+/// Serde default for [`BoxConfig::hooks_enabled`]. See
+/// [`boxes::Record::hooks_enabled`] for why this cannot be a bare
 /// `#[serde(default)]`.
 fn default_hooks_enabled() -> bool {
     true
 }
 
-/// A box's identity on its host ([`sessions::BoxId`]): defined beside the
+/// A box's identity on its host ([`boxes::BoxId`]): defined beside the
 /// session record that carries it and re-exported under the path its
 /// clients spell, so no wire form changes.
-pub use sessions::BoxId;
+pub use boxes::BoxId;
 
 /// What a successful registration hands back: the allocated addresses —
 /// the pair [`BoxAddresses`] has always carried — and the box id the
@@ -564,7 +572,7 @@ pub const TASK_SLOTS_PER_BOX: u8 = 4;
 /// Nothing else crosses it: the session RPCs are the daemon crate's
 /// HTTP-shaped socket, and the box's switch and loopback addresses come
 /// from here so the daemon's create request can carry them (see
-/// [`SessionConfig`]).
+/// [`BoxConfig`]).
 ///
 /// These types live here rather than in `minvmd` because both ends depend
 /// on this crate — the activating client and the host daemon — and the
@@ -773,7 +781,7 @@ pub struct HoldBoxNameRequest {
     /// them, never a newer session's under the same name. `None` from a
     /// client that predates the field: the release is by name alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<sessions::SessionId>,
+    pub session_id: Option<boxes::SessionId>,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
@@ -1456,7 +1464,7 @@ impl<'de> Deserialize<'de> for AnswererStatusReply {
 }
 
 /// The addresses a successful registration hands back
-/// ([`sessions::BoxAddresses`]): the box's switch address and its published
+/// ([`boxes::BoxAddresses`]): the box's switch address and its published
 /// loopback address, both allocated on the host from the address plan the
 /// host switch serves — the same pair the create request carries so the
 /// in-VM daemon attaches with it.
@@ -1637,7 +1645,7 @@ pub enum BoxControlReply {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionRequest {
     /// Out-of-band session config.
-    pub config: SessionConfig,
+    pub config: BoxConfig,
     /// The build the caller expects the daemon to be. When set, the daemon
     /// compares it against its own version and fails the RPC with
     /// [`version_skew_message`] *before allocating anything*, so a skewed pair
@@ -1718,7 +1726,7 @@ pub struct CreateSessionResponse {
     /// Whether the serving daemon opted out of the deny-all egress default
     /// (NET-077). The rollout's one fact the client cannot know from its
     /// own build: the phase is a build-time constant both sides share
-    /// ([`sessions::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
+    /// ([`boxes::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
     /// daemon alone. Carried here — on the reply the activation path
     /// already holds — so `min session activate` can keep its in-force note
     /// (NET-074) off a deployment that opted out: its bare boxes keep
@@ -1816,7 +1824,7 @@ pub struct ConfigureLoadoutRequest {
     /// empty-contribution fast path to
     /// [`ConfigureLoadoutResponse::Materialized`].
     #[serde(default)]
-    pub contribution: sessions::wire::request::WireContribution,
+    pub contribution: boxes::wire::request::WireContribution,
 }
 
 /// The response for a [`ConfigureLoadout`] RPC.
@@ -1824,7 +1832,7 @@ pub struct ConfigureLoadoutRequest {
 /// Both variants are part of the Phase 2 flow and reachable on the
 /// wire: `Materialized` when the daemon's composer finalizes in one
 /// shot (the session record is now
-/// [`Materializing`](sessions::SessionStatus::Materializing), not
+/// [`Materializing`](boxes::BoxState::Materializing), not
 /// yet `Active`), `Pending` when it collects items the client must
 /// gate before composition completes (the client follows up via
 /// `SubmitVerdict`).
@@ -1837,17 +1845,17 @@ pub struct ConfigureLoadoutRequest {
 pub enum ConfigureLoadoutResponse {
     /// No items need user gating; composition is complete and the
     /// session record has advanced to
-    /// [`Materializing`](sessions::SessionStatus::Materializing).
+    /// [`Materializing`](boxes::BoxState::Materializing).
     /// The client still has to upload the composition's patches
     /// and call `FinalizeSession` before the session becomes
     /// attachable.
     Materialized,
     /// Items need client-side gating. The session stays in
-    /// [`Pending`](sessions::SessionStatus::Pending); the client
+    /// [`Pending`](boxes::BoxState::Pending); the client
     /// follows up with `SubmitVerdict` carrying the same id.
     Pending {
         /// Pending items the client must gate.
-        response: sessions::wire::request::ContributionResponse,
+        response: boxes::wire::request::ContributionResponse,
     },
 }
 
@@ -2003,6 +2011,13 @@ pub struct DestroySessionRequest {
     pub id: SessionId,
 }
 
+/// How a [`DestroySession`] for an id the daemon holds no record of opens:
+/// the daemon formats that refusal as this lead followed by the quoted id.
+/// The client matches on it to tell an already-destroyed session (the
+/// loser of two concurrent destroys) from a destroy that failed, so both
+/// sides read the one constant rather than each spelling the text.
+pub const UNKNOWN_SESSION_ID_LEAD: &str = "no session with ID";
+
 /// The response for a [`DestroySession`] RPC.
 ///
 /// Carries the session's failed `on_destroy` hooks, so the client can
@@ -2154,11 +2169,11 @@ impl OneshotSshRpc for Shutdown {
 /// Resume a `Pending` session with the client's per-item
 /// [`ContributionVerdict`]. The daemon promotes the record
 /// `Pending → Materializing` and replies with
-/// [`SessionStep::Materialized`](sessions::wire::request::SessionStep::Materialized);
+/// [`BoxStep::Materialized`](boxes::wire::request::BoxStep::Materialized);
 /// the client still has to upload patches and call
 /// `FinalizeSession` before the session is attachable.
 /// A `Fault` reply carries a structured
-/// [`WireError`](sessions::wire::errors::WireError) —
+/// [`WireError`](boxes::wire::errors::WireError) —
 /// `UnknownSessionId` for a verdict against no stashed session,
 /// `WrongState` if the record isn't `Pending`, or an
 /// `InvalidContribution` / `Internal` reflecting a failed
@@ -2167,8 +2182,8 @@ pub struct SubmitVerdict;
 
 impl OneshotSshRpc for SubmitVerdict {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SubmitVerdict");
-    type Request<'a> = sessions::wire::request::ContributionVerdict;
-    type Response = Errorable<sessions::wire::request::SessionStep>;
+    type Request<'a> = boxes::wire::request::ContributionVerdict;
+    type Response = Errorable<boxes::wire::request::BoxStep>;
 }
 
 /// Abort a `Pending` session before its `SubmitVerdict`.
@@ -2203,11 +2218,11 @@ impl OneshotSshRpc for AbortSession {
 // ---------------------------------------------------------------------------
 // Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
 //
-// `PortMapping`, `EgressPolicy`, `IngressPolicy`, `SessionPolicy`, and the
-// effective halves (`EffectiveEgress`, `EffectiveSessionPolicy`) are defined
-// in `sessions` and re-exported above, so the only live per-session store
-// (`sessions::Record`) can carry the policy configured at launch without a
-// `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
+// `PortMapping`, `EgressPolicy`, `IngressPolicy`, `BoxPolicy`, and the
+// effective halves (`EffectiveEgress`, `EffectiveBoxPolicy`) are defined
+// in `boxes` and re-exported above, so the only live per-session store
+// (`boxes::Record`) can carry the policy configured at launch without a
+// `boxes` → `minimald-rpc` dependency cycle. The RPC method types below
 // stay here, where the wire contract lives.
 // ---------------------------------------------------------------------------
 
@@ -2225,14 +2240,14 @@ pub enum GetSessionPolicyRequest {
 impl OneshotSshRpc for GetSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionPolicy");
     type Request<'a> = GetSessionPolicyRequest;
-    type Response = Errorable<SessionPolicy>;
+    type Response = Errorable<BoxPolicy>;
 }
 
 /// An RPC to read the *effective* networking policy for a session: the same
 /// record [`GetSessionPolicy`] serves, with its egress half resolved to what
 /// the gate enforces (NET-075) — the answer `min session policy` renders.
 ///
-/// A separate response rather than a field on [`SessionPolicy`], so the
+/// A separate response rather than a field on [`BoxPolicy`], so the
 /// strict declaration a client reads back stays exactly what the box was
 /// launched with: the deny-all default (NET-074) reaches the client as
 /// `deny_all` in this response without rewriting the record. The daemon
@@ -2253,7 +2268,7 @@ pub enum GetEffectiveSessionPolicyRequest {
 impl OneshotSshRpc for GetEffectiveSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetEffectiveSessionPolicy");
     type Request<'a> = GetEffectiveSessionPolicyRequest;
-    type Response = Errorable<EffectiveSessionPolicy>;
+    type Response = Errorable<EffectiveBoxPolicy>;
 }
 
 /// One live dynamic-ingress mapping (NET-044): a port a process inside the box
@@ -2313,9 +2328,9 @@ impl LiveMapping {
 /// declaration, which is what makes a publish visible rather than only
 /// permitted.
 ///
-/// A separate response rather than a field on [`EffectiveSessionPolicy`], for
+/// A separate response rather than a field on [`EffectiveBoxPolicy`], for
 /// the same reason the effective halves are separate from the strict
-/// [`SessionPolicy`] at all: the declaration is a fact about the launch, and
+/// [`BoxPolicy`] at all: the declaration is a fact about the launch, and
 /// these are facts about the running box. They are also the live actor's own
 /// state — a box that is not running holds none — so this resolves the session
 /// where [`GetSessionPolicy`] and [`GetEffectiveSessionPolicy`] read the
@@ -2342,7 +2357,7 @@ impl OneshotSshRpc for GetLiveIngress {
 /// box actually runs under — the same state [`ListSessionsEntry::host_ip_enforcement`]
 /// and the create response answer over, served the same way.
 ///
-/// A separate reply rather than a field on [`EffectiveSessionPolicy`] because
+/// A separate reply rather than a field on [`EffectiveBoxPolicy`] because
 /// that policy struct is `deny_unknown_fields`: a strict struct an older `min`
 /// has no field for rejects a new key rather than ignoring it, so a fact that
 /// did not exist when that client was built must ride its own reply, the same
@@ -2373,13 +2388,13 @@ pub enum GetSessionRuntimeFactsRequest {
 /// field the error object never carries makes that reply fail the `Ok(S)`
 /// arm and fall through to `Err`, without refusing a key it does not know.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionRuntimeFacts {
+pub struct BoxRuntimeFacts {
     /// The session these facts are about: the record the daemon read them
     /// from. Required, so the daemon's error reply never decodes as facts.
     pub id: SessionId,
     /// The per-box egress enforcement the session's box actually runs under
     /// (NET-079): the box's own launch record —
-    /// [`Record::host_ip_enforcement`](sessions::Record) — lowered to `none`
+    /// [`Record::host_ip_enforcement`](boxes::Record) — lowered to `none`
     /// when the host can no longer decide per box and never raised above it,
     /// and the host's own state only while the session's box has not
     /// launched. `None` for a session that is not host-address, for a
@@ -2414,7 +2429,7 @@ pub struct SessionRuntimeFacts {
 impl OneshotSshRpc for GetSessionRuntimeFacts {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionRuntimeFacts");
     type Request<'a> = GetSessionRuntimeFactsRequest;
-    type Response = Errorable<SessionRuntimeFacts>;
+    type Response = Errorable<BoxRuntimeFacts>;
 }
 
 /// An RPC to list the lifecycle hooks composed into a session, and where
@@ -2441,7 +2456,7 @@ impl OneshotSshRpc for GetSessionHooks {
     /// Each hook paired with the loadout or project that declared it, in
     /// setup order (project first, then loadouts). Teardown order is the
     /// reverse; the caller renders whichever it needs.
-    type Response = Errorable<Vec<sessions::wire::primitives::WireProvenancedHook>>;
+    type Response = Errorable<Vec<boxes::wire::primitives::WireProvenancedHook>>;
 }
 
 /// An RPC for a process inside a PTask to request a dynamic ingress port
@@ -2699,7 +2714,7 @@ impl CleanCacheUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::wire::request::{ContributionResponse, WireContribution};
+    use boxes::wire::request::{ContributionResponse, WireContribution};
 
     /// A failed finalize must decode as an error, not as a success with
     /// nothing in it.
@@ -2975,7 +2990,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![mapping],
             dynamic_allowed_range: Some((10000, 20000)),
-            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            dynamic_ingress: Some(boxes::DynamicIngress::Ask),
         };
         let json = serde_json_lenient::to_string(&ingress).unwrap();
         let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
@@ -2986,8 +3001,8 @@ mod tests {
         let json = serde_json_lenient::to_string(&egress).unwrap();
         let _: EgressPolicy = serde_json_lenient::from_str(&json).unwrap();
 
-        // SessionPolicy with null egress and default ingress matches expected CLI output
-        let policy = SessionPolicy {
+        // BoxPolicy with null egress and default ingress matches expected CLI output
+        let policy = BoxPolicy {
             egress: None,
             ingress: Some(IngressPolicy::default()),
             credentialed_upstream: None,
@@ -3041,13 +3056,13 @@ mod tests {
 
     /// Regression: the daemon reports "no such session" from `GetSessionPolicy`
     /// as `Errorable::Err { error }` (`{"error":"..."}`). Because `Errorable`
-    /// is untagged and every `SessionPolicy` field is optional, that object
-    /// once decoded as `Ok(SessionPolicy { egress: None, ingress: None })` —
+    /// is untagged and every `BoxPolicy` field is optional, that object
+    /// once decoded as `Ok(BoxPolicy { egress: None, ingress: None })` —
     /// exit 0, "no restrictions" — for any nonexistent session. It must decode
     /// as `Err` instead.
     #[test]
     fn errorable_session_policy_decodes_daemon_error_as_err() {
-        let decoded: Errorable<SessionPolicy> =
+        let decoded: Errorable<BoxPolicy> =
             serde_json_lenient::from_str(r#"{"error":"no session found"}"#).expect("deserialize");
         assert_eq!(
             decoded,
@@ -3057,11 +3072,11 @@ mod tests {
         );
 
         // A real policy response still decodes as the `Ok` arm.
-        let decoded: Errorable<SessionPolicy> =
+        let decoded: Errorable<BoxPolicy> =
             serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#).expect("deserialize");
         assert_eq!(
             decoded,
-            Errorable::Ok(SessionPolicy {
+            Errorable::Ok(BoxPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None
@@ -3174,11 +3189,11 @@ mod tests {
     #[test]
     fn create_session_request_round_trips() {
         let req = CreateSessionRequest {
-            config: SessionConfig {
+            config: BoxConfig {
                 name: Some("my-session".into()),
                 project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
                 network: NetworkMode::OwnIp,
-                policy: SessionPolicy::default(),
+                policy: BoxPolicy::default(),
                 // The non-`None` shape of the handed addresses: a fixture
                 // leaving it `None` would round-trip green even if the
                 // field never reached the wire.
@@ -3251,7 +3266,7 @@ mod tests {
         );
     }
 
-    /// A `SessionConfig` from a client that predates `hooks_enabled`
+    /// A `BoxConfig` from a client that predates `hooks_enabled`
     /// deserializes with hooks **on**. A bare `#[serde(default)]` would
     /// give `false` and silently disable hooks for every older client.
     #[test]
@@ -3262,7 +3277,7 @@ mod tests {
             "network": "host_net",
             "attrs": {}
         }"#;
-        let c: SessionConfig = serde_json_lenient::from_str(json).expect("legacy config must load");
+        let c: BoxConfig = serde_json_lenient::from_str(json).expect("legacy config must load");
         assert!(c.hooks_enabled);
     }
 
@@ -3440,7 +3455,7 @@ mod tests {
     }
 
     /// NET-079's enforcement state never rides the strict policy reply: an
-    /// older `min` built against the two-field [`EffectiveSessionPolicy`] —
+    /// older `min` built against the two-field [`EffectiveBoxPolicy`] —
     /// `deny_unknown_fields`, the strictness that keeps an all-optional
     /// struct from swallowing the daemon's `{"error":...}` replies under
     /// the untagged [`Errorable`] — rejects a key it has no field for, so a
@@ -3461,7 +3476,7 @@ mod tests {
         // The reply this build serves for a lane-less box: no enforcement
         // key, and no lane key either — the shape every earlier client
         // reads.
-        let reply = Errorable::Ok(EffectiveSessionPolicy {
+        let reply = Errorable::Ok(EffectiveBoxPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
             credentialed_upstream: None,
@@ -3523,7 +3538,7 @@ mod tests {
         // facts object with nothing to report — while a facts reply that
         // grew a key this client has no field for still decodes, because
         // runtime facts grow and an older client keeps the ones it knows.
-        let facts = SessionRuntimeFacts {
+        let facts = BoxRuntimeFacts {
             id: SessionId::nil(),
             host_ip_enforcement: Some(HostIpEnforcement::None),
             unaudited_listen_ports: Vec::new(),
@@ -3531,7 +3546,7 @@ mod tests {
             shared_port_collisions: Vec::new(),
         };
         assert_eq!(round_trip(&facts), facts);
-        let unaudited = SessionRuntimeFacts {
+        let unaudited = BoxRuntimeFacts {
             unaudited_listen_ports: vec![3000, 3001],
             audit_log: Some("/state/audit/decisions.log".to_string()),
             ..facts.clone()
@@ -3542,7 +3557,7 @@ mod tests {
             !empty.contains("unaudited_listen_ports") && !empty.contains("audit_log"),
             "an empty unaudited list is omitted from the wire: {empty}"
         );
-        match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
+        match serde_json_lenient::from_str::<Errorable<BoxRuntimeFacts>>(
             r#"{"error":"no session found"}"#,
         )
         .expect("an error reply is one of the untagged arms")
@@ -3552,14 +3567,14 @@ mod tests {
                 panic!("an error reply must not decode as facts, got {facts:?}")
             }
         }
-        match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
+        match serde_json_lenient::from_str::<Errorable<BoxRuntimeFacts>>(
             r#"{"id":"00000000-0000-0000-0000-000000000000","host_ip_enforcement":"per_box","a_later_fact":true}"#,
         )
         .expect("a facts reply with a key this client does not know still decodes")
         {
             Errorable::Ok(decoded) => assert_eq!(
                 decoded,
-                SessionRuntimeFacts {
+                BoxRuntimeFacts {
                     id: SessionId::nil(),
                     host_ip_enforcement: Some(HostIpEnforcement::PerBox),
                     unaudited_listen_ports: Vec::new(),
@@ -3725,7 +3740,7 @@ mod tests {
         assert!(entry.project_path.is_none(), "missing project_path → None");
         assert_eq!(
             entry.status,
-            sessions::SessionStatus::Active,
+            boxes::BoxState::Active,
             "missing status → default Active"
         );
     }
@@ -3831,7 +3846,7 @@ mod tests {
             id: SessionId::nil(),
             name: Some("second".to_string()),
             project_path: None,
-            status: sessions::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             git: None,
             attrs: None,
             host_ip_enforcement: None,

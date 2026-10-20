@@ -32,7 +32,15 @@ pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 /// - `timeout_secs`: only meaningful under `--detach`; `None` when the flag was
 ///   omitted. Rejected without `--detach` rather than silently ignored;
 ///   defaults to [`DEFAULT_DETACH_TIMEOUT_SECS`] when detaching.
-pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
+/// - `root`: this process's root span ([`crate::telemetry::root_span`]),
+///   entered. A `--detach` caller holds it until it returns; the supervisor
+///   ends it once the VM is ready, so it exports while the VM runs
+///   (`telemetry::SupervisorStart`).
+pub fn run(
+    detach: bool,
+    timeout_secs: Option<u64>,
+    root: tracing::span::EnteredSpan,
+) -> Result<()> {
     // `--timeout` only bounds the detach poll loop; foreground runs supervise
     // the VMM child for its whole life and never consult it. Accepting it in
     // foreground mode would silently ignore it, so reject the combination.
@@ -79,17 +87,50 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
 
     #[cfg(minvmd_libkrun)]
-    return run_supervisor(detach, timeout_secs);
+    return run_supervisor(detach, timeout_secs, root);
 
     #[cfg(not(minvmd_libkrun))]
     {
         let _ = (detach, timeout_secs);
+        drop(root);
         bail!("`minvmd run` requires libkrun (macOS, or Linux with libkrun installed)");
     }
 }
 
+/// Reap a stale gvproxy left by a killed supervisor before the node proxy
+/// port is drawn, and hand the resolved pair to the spawn block.
+///
+/// A SIGKILLed or aborted supervisor leaves its gvproxy alive — the pidfd
+/// stop paths are clean-stop-only and gvproxy holds no alive lock — and the
+/// leftover keeps the hostname proxy's default port bound. Reaping only
+/// after the draw (at the gvproxy spawn, as before) is too late: the draw
+/// sees the default port refused and hands the proxy an ephemeral one.
+///
+/// Runs only when a gvproxy binary is installed; the reaper's match is
+/// exact argv tokens — argv[0] is the gvproxy binary and `-listen` names
+/// this VM's switch socket. The supervisor's alive lock (held by the time
+/// this is called) rules out a live same-instance supervisor, so a match
+/// owned by a live minvmd fails the start rather than spawning a duplicate
+/// switch. The caller is the synchronous supervisor thread, not a tokio
+/// worker, so the reap's bounded wait may block it.
+///
+/// The socket dir and stale-socket cleanup stay at the spawn block, next
+/// to the bind they guard; the resolved pair is returned so the spawn
+/// block does not resolve twice.
 #[cfg(minvmd_libkrun)]
-fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
+fn reap_stale_gvproxy_before_port_draw() -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)>
+{
+    let binary = crate::image::resolve_gvproxy_path();
+    if !binary.exists() {
+        return Ok((binary, None));
+    }
+    let switch_sock = crate::net::resolve_switch_sock().context("resolving switch socket")?;
+    crate::net::reap_stale_gvproxy(&binary, &switch_sock).context("reaping a stale gvproxy")?;
+    Ok((binary, Some(switch_sock)))
+}
+
+#[cfg(minvmd_libkrun)]
+fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredSpan) -> Result<()> {
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own `local-minvmd0` dir, so an upgraded host reuses
     // its existing VM state (data volume, boot log) instead of orphaning it.
@@ -108,14 +149,18 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
-        return run_detach(timeout_secs);
+        // The caller's root covers its whole wait: the hand-off ends when this
+        // returns, with the VM serving or the wait failed.
+        let result = run_detach(timeout_secs);
+        drop(root);
+        return result;
     }
     // A supervisor stopped by SIGTERM/SIGINT returns here once its teardown
     // (the `Stopped` write, the guards' drops) has run; `main` then ends the
-    // process by that signal after flushing its log
+    // process by that signal after flushing its telemetry and its log
     // ([`crate::control::die_by_received_stop_signal`]), so its exit status
     // still says what stopped it.
-    run_foreground()
+    run_foreground(root)
 }
 
 /// Outcome of one poll of the `--detach` readiness loop, decided from the
@@ -259,6 +304,8 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     // Forward the state-dir override and VM name so the re-exec'd supervisor
     // resolves the same per-VM state dir this process did.
     crate::state::forward_identity(&mut cmd);
+    // And the trace: the supervisor's spans are children of this `run`.
+    crate::telemetry::forward_trace(&mut cmd);
     // Mark the child as detached so it routes tracing to the daily-rotated
     // log file (`<state>/logs/minvmd.log`) instead of stdout.
     cmd.env(crate::DETACHED_ENV, "1");
@@ -347,8 +394,12 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
+///
+/// `root` (the process's root span, entered) and the `supervisor.start` span
+/// under it end once the VM is ready; the rest of the VM's life runs under a
+/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
 #[cfg(minvmd_libkrun)]
-fn run_foreground() -> Result<()> {
+fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     use std::io::Read as _;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -362,12 +413,14 @@ fn run_foreground() -> Result<()> {
     use crate::net::answerer::DEFAULT_ANSWERER_PORT;
     use crate::state::{StartingGuard, State, StateDir};
 
-    // One span per supervised VM, like minimald's per-connection `conn` span:
-    // every record the supervisor emits carries `vm`, so a detached
+    // One span per supervisor phase, like minimald's per-connection `conn`
+    // span: every record the supervisor emits carries `vm`, so a detached
     // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
     // to every VM on the host) stay attributable once a second VM runs —
-    // grep instead of manual fields on each line.
-    let _vm_scope = tracing::info_span!("supervisor", vm = %crate::state::vm_name()).entered();
+    // grep instead of manual fields on each line. This one, `supervisor.start`,
+    // is the parent of the switch start and of `vm.boot` (and so of the guest's
+    // `guest.ready`), and ends with the process root at READY below.
+    let start_phase = crate::telemetry::SupervisorStart::enter(root);
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
@@ -529,6 +582,12 @@ fn run_foreground() -> Result<()> {
     // the kernel, and the kernel releases it when this supervisor stops,
     // exits or crashes — never a pid file, never a stale entry to clean.
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
+    // A stale gvproxy from a killed supervisor still holds the hostname
+    // proxy's default port bound, so the reaper runs before the port draw:
+    // drawing first would hand the proxy an ephemeral port for no reason.
+    // The reaper's own guard still fails the start when the matching
+    // gvproxy belongs to a live minvmd.
+    let (gvproxy_binary, switch_sock) = reap_stale_gvproxy_before_port_draw()?;
     let mut node_port =
         assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
     boxes
@@ -634,6 +693,27 @@ fn run_foreground() -> Result<()> {
         &proxy_publish,
     )?;
 
+    // The guest telemetry door (TEL-034): bound only with telemetry on,
+    // and handed to the VMM child the same way, so the guest daemon's
+    // records reach this process's exporter and spool over the vsock
+    // bridge and the guest needs no endpoint. Best-effort like the doors
+    // above: a bind failure is warned and the VM boots without it, and the
+    // guest then spools alone (TEL-046).
+    let guest_telemetry_door = if mlog::otel::telemetry_enabled() {
+        crate::control::resolve_control_sock()
+            .and_then(|sock_path| crate::guest_telemetry::spawn_guest_telemetry_door(&sock_path))
+            .inspect_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "failed to bind the guest telemetry door; the guest daemon's telemetry \
+                     stays in the guest's own spool"
+                );
+            })
+            .ok()
+    } else {
+        None
+    };
+
     // The host answerer (NET-138): the box zone's answerer on the host
     // loopback, answering from this host-authored table — the same
     // semantics the native daemon's answerer gives, over the same shared
@@ -692,24 +772,16 @@ fn run_foreground() -> Result<()> {
     // lanes that exercise only the vsock bridge) we warn and boot without
     // egress rather than failing the VM — the daemon then has no network, the
     // pre-existing behaviour.
-    let _gvproxy = match crate::image::resolve_gvproxy_path() {
-        binary if binary.exists() => {
-            let switch_sock =
-                crate::net::resolve_switch_sock().context("resolving switch socket")?;
+    // The reaper above decided whether the binary is installed: a switch
+    // socket comes back only when it is, so the decision is made once.
+    let _gvproxy = match (gvproxy_binary, switch_sock) {
+        (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
-            // A crashed supervisor (SIGKILL, abort) leaves its gvproxy alive:
-            // the pidfd stop paths are clean-stop-only and gvproxy holds no
-            // alive lock, so nothing reaps it. Unlinking the stale socket
-            // below would let the fresh gvproxy bind while the leftover still
-            // holds the host-side forwards. Kill it first — matched on exact
-            // argv tokens: argv[0] is the gvproxy binary and `-listen` names
-            // this VM's switch socket. This supervisor's alive lock rules out
-            // a live same-instance supervisor, so a match owned by a live
-            // minvmd fails the start rather than spawning a duplicate switch.
-            // This thread is the synchronous supervisor thread, not a tokio
-            // worker, so the reap's bounded wait may block it.
-            crate::net::reap_stale_gvproxy(&binary, &switch_sock)
-                .context("reaping a stale gvproxy")?;
+            // The stale gvproxy of a killed supervisor was reaped above,
+            // before the node proxy port was drawn, so it can no longer
+            // hold the hostname proxy's default port; this block only
+            // clears the sockets it left behind. The reaper's argv match
+            // and live-minvmd guard are the reaper's own (above).
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             // The gate binds the socket beside the switch socket, so a stale
@@ -836,7 +908,7 @@ fn run_foreground() -> Result<()> {
                 }
             }
         }
-        binary if crate::cmd::own_ip_requested() => {
+        (binary, None) if crate::cmd::own_ip_requested() => {
             // An own-IP VM cannot work without the switch: fail loudly rather
             // than booting a session that silently has no network.
             bail!(
@@ -845,7 +917,7 @@ fn run_foreground() -> Result<()> {
                 binary.display()
             );
         }
-        binary => {
+        (binary, None) => {
             // Non-own-IP boots (e.g. the boot/session e2e lanes) tolerate a
             // missing gvproxy: warn and boot without guest egress.
             tracing::warn!(
@@ -901,11 +973,28 @@ fn run_foreground() -> Result<()> {
             generation = publish_generation,
             "drew the boot's publish generation"
         );
+        // `vm.boot`: from spawning the VMM child to the guest's READY beacon,
+        // one span per boot (a T93 redraw boots again under a fresh one). The
+        // child and, through the boot line, the guest daemon inherit it as
+        // their parent (`telemetry::forward_trace`), so the guest's boot
+        // spans land under it in the same trace.
+        let boot_span = tracing::info_span!(
+            "vm.boot",
+            vm = %crate::state::vm_name(),
+            otel.status_code = tracing::field::Empty,
+        )
+        .entered();
+        // Every return from here to READY (the spawn's `?`, the lifecycle
+        // lock, read and write `?`s, the `bail!` on a lifecycle changed
+        // during spawn, a failed wait) exports `vm.boot` with an error
+        // status (TEL-035), as `minvmd boot` does; reaching READY clears it.
+        let boot_failed = crate::telemetry::ErrorUnlessOk::new(&boot_span);
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("__krun-vmm");
         // Forward the state-dir override and VM name so the VMM child resolves the
         // same per-VM state dir this supervisor does.
         crate::state::forward_identity(&mut cmd);
+        crate::telemetry::forward_trace(&mut cmd);
         alive_lock.inherit_into(&mut cmd);
         // The guest report door's path travels the same way the marker
         // socket's does: the child is the process that owns the libkrun
@@ -915,6 +1004,9 @@ fn run_foreground() -> Result<()> {
         // names. A redraw hands the same door to the fresh boot.
         let (name, path) = &guest_report_door;
         cmd.env(name, path);
+        if let Some(path) = guest_telemetry_door.as_ref() {
+            cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
+        }
         cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
             // The node's proxy port travels to the guest through the VMM child's
             // env: the child is a separate process (like the marker socket path),
@@ -993,6 +1085,8 @@ fn run_foreground() -> Result<()> {
                 // guard drops here → StartingGuard resets state to Stopped (R4.6)
             }
         };
+        boot_failed.ok();
+        drop(boot_span);
 
         // T93: watch what became of the port this start reserved. The guest
         // reports the publish's outcome over the marker channel — served, or
@@ -1118,8 +1212,10 @@ fn run_foreground() -> Result<()> {
     // from a guest too old to echo one — none.
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
-        // The watcher keeps the supervisor's span, so its lines carry `vm`.
-        let vm_scope = tracing::Span::current();
+        // The watcher's lines carry `vm` through a span of its own: it may
+        // outlive READY, and keeping the start phase's span would keep that
+        // phase from exporting (`telemetry::vm_task`).
+        let vm_scope = crate::telemetry::vm_task("proxy.publish.watch");
         std::thread::spawn(move || {
             let _vm_scope = vm_scope.entered();
             for event in marker_events {
@@ -1218,8 +1314,21 @@ fn run_foreground() -> Result<()> {
         }
     }
 
+    // The VM is ready: the start phase and the process root end and are
+    // flushed now, not when the supervisor exits — which is the VM's whole
+    // life later, if ever: a supervisor killed with its VM never exports what
+    // is still open. Supervision runs under its own root.
+    let _serve_phase = start_phase.ready();
+
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
+    // The VM is gone, so the guest telemetry door's connection ends: let
+    // the door hand the guest's last records (its shutdown) to the host's
+    // endpoint before this process exits, bounded (TEL-034). The spool
+    // already holds them either way.
+    if guest_telemetry_door.is_some() {
+        crate::guest_telemetry::drain_at_exit(crate::guest_telemetry::DRAIN_AT_EXIT);
+    }
     // The VM is gone, so no answer to a pending ask can still matter: each
     // is cancelled and audited before the supervisor exits (NET-045).
     crate::control::stop_pending_asks(&boxes);
@@ -1888,14 +1997,27 @@ fn port_holder(_port: u16) -> Option<(u32, String)> {
 /// two VMs and a native daemon can all want the default proxy port, so a boot
 /// that landed elsewhere says so here, in the supervisor's own log, rather
 /// than leaving a hostname surface that never answered to be found there.
+/// A preferred port refused because something holds it names that holder's
+/// pid and executable, so the log says which leftover owns the bind the
+/// boot moved off.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn log_node_port_assignment(surface: &str, assigned: &NodePortAssignment) {
+    // The holder is looked up only for the bind-refused skip: any other skip
+    // (loopback answering, reserved by another VM) is not a holder question,
+    // and a configured port never reaches here — its refusal fails the
+    // start naming the holder already.
+    let holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
+        .then(|| port_holder(assigned.preferred))
+        .flatten()
+        .map(|(_, holder)| holder)
+        .unwrap_or_default();
     tracing::info!(
         surface,
         preferred = assigned.preferred,
         handed = assigned.port,
         configured = assigned.configured,
         skip_reason = assigned.skipped.unwrap_or(""),
+        port_holder = %holder,
         "assigned the node port"
     );
 }
@@ -2672,7 +2794,7 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_bails_without_libkrun() {
-        let err = run(false, None).unwrap_err();
+        let err = run(false, None, tracing::Span::none().entered()).unwrap_err();
         assert!(
             err.to_string().contains("requires libkrun"),
             "expected libkrun-required message, got: {err}"
@@ -2682,7 +2804,7 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_rejects_timeout_without_detach() {
-        let err = run(false, Some(5)).unwrap_err();
+        let err = run(false, Some(5), tracing::Span::none().entered()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("`--timeout` only applies with `--detach`"),
@@ -3315,6 +3437,33 @@ mod tests {
             None,
             "a start that failed on something else lifts nothing"
         );
+    }
+
+    /// A preferred port something holds is skipped with `bind refused`, and
+    /// the same draw hands it back once the holder releases it. This pins
+    /// only the draw's half of the reap-before-draw fix: the order of the
+    /// reap and the draw in `run_foreground` needs a real VM, so only the
+    /// e2e lanes check it.
+    #[test]
+    fn node_port_draw_skips_a_held_preferred_port_and_hands_it_back_once_released() {
+        // The preferred port: hold it on the loopback the TCP probe
+        // addresses, so the first draw sees it refused.
+        let stale = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let default = stale.local_addr().unwrap().port();
+        let ports = tempfile::tempdir().expect("a test reservation dir");
+        let drawn_before = super::assign_node_port(ports.path(), default, false).unwrap();
+        assert_eq!(drawn_before.preferred, default);
+        assert_eq!(drawn_before.skipped, Some(super::SKIP_BIND_REFUSED));
+        assert_ne!(
+            drawn_before.port, default,
+            "the held default is not handed to the proxy"
+        );
+
+        // Release the holder, and the same draw hands the port back.
+        drop(stale);
+        let drawn_after = super::assign_node_port(ports.path(), default, false).unwrap();
+        assert_eq!(drawn_after.port, default);
+        assert_eq!(drawn_after.skipped, None);
     }
 
     /// The holder lookup names the pid of a listener in another process —

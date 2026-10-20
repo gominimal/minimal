@@ -201,7 +201,7 @@
 #                                    and host-OS resolution with no proxies
 #   native_resolution_from_host_answerer_on_vm_host
 #                                    NET-124..128/138 on a VM-backed lane:
-#                                    the VM host daemon answers the zone on
+#                                    this VM's host daemon answers the zone on
 #                                    the host loopback and the in-VM daemon
 #                                    owns no answerer
 #   native_answerer_survives_session_stop
@@ -639,7 +639,7 @@ export RUST_LOG="${RUST_LOG:-warn,minimald::exec=info}"
 # (plan, watcher start, sockets seen, verdicts, admissions) must ride this
 # default to reach the guest at all. Widened only when nothing was set by hand.
 if [ -n "${E2E_VM:-}" ] && [ "$RUST_LOG" = "warn,minimald::exec=info" ]; then
-  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::session_host=debug"
+  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::box_runtime=debug"
 fi
 
 # Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
@@ -1723,7 +1723,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # no longer prints), and `min session policy` names the default it got.
   # This daemon runs without the opt-out, so the default binds. The box is
   # kept for the reach legs below, which need a live control first.
-  egress_in_force_note="egress: deny-all (default for an own-ip box with no egress section)"
+  egress_in_force_note="This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default"
   bare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-bare --network own_ip 2>"$WORK/egress-bare.err")" || {
     echo "::error::'min session activate --network own_ip' (bare box) failed"
@@ -2375,11 +2375,11 @@ proof_host_ip_deny_all() {
 
   # The record filter both halves warm their own daemon under: the launch
   # and node-plane records this case reads are INFO from
-  # minimald::session_host and minimald::net::classifier, the
+  # minimald::box_runtime and minimald::net::classifier, the
   # advisory-bearing create record is INFO from minimald::rpc, and the
   # lane's default filter would drop all of them before they reached the
   # file this case reads them from.
-  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info,minimald::rpc=info"
+  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::box_runtime=info,minimald::rpc=info"
 
   # ---- the decided half's gates: one fact each, printed when it is missing.
   # Where one misses the decided half does not run and the unenforced half
@@ -2663,9 +2663,9 @@ proof_host_ip_deny_all() {
     # two host-loopback listeners this box's connections are about to meet —
     # printed because they are what the verdicts below are read against.
     hida_ls="$(mnl ls 2>"$WORK/hida-ls.err" || true)"
-    hida_answerer_line="$(printf '%s\n' "$hida_ls" | grep -F -- 'ZONE ANSWERER' | head -n1 || true)"
+    hida_answerer_line="$(printf '%s\n' "$hida_ls" | grep -F -- 'DNS SERVICE' | head -n1 || true)"
     if [ -z "$hida_answerer_line" ]; then
-      echo "::error::min ls reports no ZONE ANSWERER line: the daemon's answerer never came up, so the resolver this box is given is an address with nothing behind it"
+      echo "::error::min ls reports no DNS SERVICE line: the daemon's answerer never came up, so the resolver this box is given is an address with nothing behind it"
       fail
     fi
     hida_proxy_port="$(printf '%s\n' "$hida_ls" \
@@ -2678,7 +2678,7 @@ proof_host_ip_deny_all() {
     echo "surfaces: the answerer above, and the hostname proxy on 127.0.0.1:$hida_proxy_port — the two listeners this box's connections meet below"
 
     # ---- the resolver Minimal owns for this box: the plan's answerer
-    # address is all /etc/resolv.conf can name (the table retargets its
+    # address is all /etc/resolv.conf can name (the table steers its
     # DNS-port lookups onto the answerer's own port, the one port the deny
     # chain admits), and nothing else is left in the box's resolver file —
     # the host's own first nameserver, printed beside it, is not this box's.
@@ -2698,7 +2698,7 @@ proof_host_ip_deny_all() {
 
     # ---- the box's own connections, each printed with its verdict. First
     # its own name: the lookup must answer through the answerer (its only
-    # resolver, reached through the table's DNS retarget), and the connect
+    # resolver, reached through the table's DNS steer), and the connect
     # must then be refused — a deny-all box serves what reaches it, but
     # opens nothing. Port 9 is the discard port, an address with nothing
     # listening, so the connect alone is what this beat reads.
@@ -2718,7 +2718,7 @@ proof_host_ip_deny_all() {
       fail
     fi
     hida_tail="$(printf '%s\n' "$hida_err" | tail -n1)"
-    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS retarget) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
+    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS steer) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
 
     # A name outside the box zone: the answerer is authoritative for the
     # box zone and refuses everything else, and the box has no other
@@ -3437,7 +3437,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # pattern). Nothing after the warm-up can spawn a daemon.
   #
   # The filter: the two records this proof reads are INFO records from
-  # minimald::net::classifier and minimald::session_host, a daemon's filter
+  # minimald::net::classifier and minimald::box_runtime, a daemon's filter
   # comes from RUST_LOG at autospawn, and the lane's default filter would
   # drop both before they reached the file this proof reads them from.
   #
@@ -3447,7 +3447,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # cache into an empty dir of its own, under $WORK so it shares the state
   # dir's device (the daemon hardlinks built packages from its cache into
   # the session rootfs, and a hardlink cannot cross filesystems).
-  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info"
+  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::box_runtime=info"
   net080_cache="$WORK/net080-cache"
   if ! RUST_LOG="$net080_rust_log" XDG_CACHE_HOME="$net080_cache" \
       mnl ls >/dev/null 2>"$WORK/net080-warm.err"; then
@@ -3604,7 +3604,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   grep -q "deny_subnets 0.0.0.0/0" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not name the rule it refused over (deny_subnets 0.0.0.0/0)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -qF -- "--network own_ip, which enforces them" "$WORK/net080-refused-range.err" \
+  grep -qF -- "--network own_ip to apply them" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not say own-address boxes enforce these rules"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
   grep -q "Remove them" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not end with what to do (Remove them)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
@@ -4050,7 +4050,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
     kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
     if [ -z "$boxreg_ctrlc_armed" ] \
-      && grep -qF -- "egress: deny-all (default for an own-ip box with no egress section)" \
+      && grep -qF -- "This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default" \
         "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
     fi
@@ -4508,7 +4508,7 @@ proof_vm_host_row_read_tracks_create_and_destroy() {
 #     for want of one: a lane that cannot ship a switch cannot prove what
 #     this case exists for, so the fetch failing is a failure.
 #   * The system-package half (the daemon serving the same mapping from
-#     /usr/bin/gvproxy-min, the nfpm/AUR dest) runs only on a lane that can
+#     /usr/bin/gvproxy-min, the package dest) runs only on a lane that can
 #     stage that path — writable /usr/bin, never over an existing binary;
 #     the probe ORDER that finds it is pinned by the switch crate's resolver
 #     tests either way.
@@ -4871,8 +4871,8 @@ if (
   done
 
   # The system-package half: the daemon must serve the same mapping when the
-  # only switch binary it can find is /usr/bin/gvproxy-min (the nfpm/AUR
-  # dest), not the one the installer placed in ~/.local/bin. Gated on what
+  # only switch binary it can find is /usr/bin/gvproxy-min (the distro
+  # package dest), not the one the installer placed in ~/.local/bin. Gated on what
   # this lane permits — never over an existing binary — and the subshell's
   # EXIT trap (set above) removes the staged one on every path out of the proof.
   if [ -w /usr/bin ] && [ ! -e /usr/bin/gvproxy-min ]; then
@@ -7051,6 +7051,16 @@ if [[ "$attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail
 fi
+# The shared session's box runs on the default network mode, which registers
+# no row with the VM host daemon, so the attach must not have tried to
+# subscribe to its port prompts and then warned that it could not. The
+# warning goes to the attach's terminal, which is the pty this transcript
+# was read from.
+if [[ "$attach_out" == *"will not show port prompts for box"* ]]; then
+  echo "::error::attach warned about port prompts for a box that registered no row"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
 # Orientation banner: the first interactive prompt must have printed the
 # two orientation lines, with the ACTUAL session name and loadout list
 # interpolated in-shell from the $MINIMAL_* vars (daemon baseline +
@@ -7287,6 +7297,11 @@ proof_local_range_reserved_by_privileged_step() {
   RANGE_LABEL="dev.minimal.local-range"
   RANGE_PROGRAM_PATH="/Library/PrivilegedHelperTools/$RANGE_LABEL"
   RANGE_PLIST_PATH="/Library/LaunchDaemons/$RANGE_LABEL.plist"
+  # Where the step installs the answerer's app bundle (a `min` with a
+  # bundled minzoned beside it or on PATH, as a release ships it), the
+  # range unit runs the bundle's program with the range verb instead of
+  # the script at RANGE_PROGRAM_PATH, and the script removes that file.
+  RANGE_BUNDLE_PROGRAM="/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
   RANGE_NAME="e2e-local-range"
 
   # A prior run killed past its own EXIT trap (a SIGKILL'd runner) can leave
@@ -7303,6 +7318,7 @@ proof_local_range_reserved_by_privileged_step() {
     range_remove_unit
   fi
   if [ -e /Library/LaunchDaemons/dev.gominimal.zone.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
      || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, for the same reason"
     ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
@@ -7319,13 +7335,13 @@ proof_local_range_reserved_by_privileged_step() {
   range_port=""
   for _ in $(seq 1 40); do
     range_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$range_port" ] && break
     sleep 0.25
   done
   if [ -z "$range_port" ]; then
-    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    echo "::error::the daemon's zone answerer never came up (no DNS SERVICE line in min ls)"
     fail
   fi
 
@@ -7360,7 +7376,7 @@ proof_local_range_reserved_by_privileged_step() {
       fail
       ;;
   esac
-  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: box names for every host program"; then
+  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: DNS names for boxes (<box>.min.internal) in every program on this machine"; then
     echo "::error::the setup script's header does not name the names item it finishes"
     echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,4p'
     fail
@@ -7369,6 +7385,22 @@ proof_local_range_reserved_by_privileged_step() {
     echo "::error::the setup script does not carry both the resolver step and the local-range step"
     echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,12p'
     fail
+  fi
+  # The program the range unit runs, read off the range plist the script
+  # carries (its heredoc alone: the answerer's own plist names the bundle's
+  # program in both shapes): the bundle's program when the script installs
+  # the bundle, else the script it writes to RANGE_PROGRAM_PATH.
+  if printf '%s\n' "$range_cmd" \
+       | awk -v start="cat > $RANGE_PLIST_PATH <<" '
+           index($0, start) == 1 { inside = 1; next }
+           inside && /^MINIMAL_RANGE_PLIST_EOF$/ { inside = 0 }
+           inside { print }' \
+       | grep -qF -- "<string>$RANGE_BUNDLE_PROGRAM</string>"; then
+    RANGE_UNIT_PROGRAM="$RANGE_BUNDLE_PROGRAM"
+    echo "the range unit runs the answerer bundle's program ($RANGE_UNIT_PROGRAM)"
+  else
+    RANGE_UNIT_PROGRAM="$RANGE_PROGRAM_PATH"
+    echo "the range unit runs the script it installs ($RANGE_UNIT_PROGRAM)"
   fi
   # The script the header promised: one elevation for the resolver and the
   # range together, carrying both files' bytes and the boot step.
@@ -7406,7 +7438,7 @@ proof_local_range_reserved_by_privileged_step() {
   esac
   # One elevation: the user runs the script under one sudo, so no statement
   # in it elevates again (the header's comment names the sudo it runs under).
-  if printf '%s\n' "$range_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+  if setup_script_elevates "$range_cmd"; then
     echo "::error::the setup script elevates on its own — the user must never be asked twice"
     echo "--- script ---"; printf '%s\n' "$range_cmd"
     fail
@@ -7441,7 +7473,7 @@ proof_local_range_reserved_by_privileged_step() {
   # Custody, the facts the CLI's own detection checks: both files root-owned
   # at their exact modes, the directories the command made root's, and the
   # plist naming the root-owned program.
-  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_PROGRAM_PATH" 2>/dev/null || true)"
+  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_UNIT_PROGRAM" 2>/dev/null || true)"
   range_plist_stat="$(stat -f '%u %Lp' "$RANGE_PLIST_PATH" 2>/dev/null || true)"
   if [ "$range_prog_stat" != "0 755" ] || [ "$range_plist_stat" != "0 644" ]; then
     echo "::error::the range unit's files are not root-owned at their modes (program: '$range_prog_stat', plist: '$range_plist_stat')"
@@ -7457,9 +7489,20 @@ proof_local_range_reserved_by_privileged_step() {
     esac
   done
   range_plist_prog="$(plutil -extract ProgramArguments.0 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
-  if [ "$range_plist_prog" != "$RANGE_PROGRAM_PATH" ]; then
-    echo "::error::the plist does not name the root-owned program (ProgramArguments[0]: '$range_plist_prog')"
+  if [ "$range_plist_prog" != "$RANGE_UNIT_PROGRAM" ]; then
+    echo "::error::the plist does not name the root-owned program $RANGE_UNIT_PROGRAM (ProgramArguments[0]: '$range_plist_prog')"
     fail
+  fi
+  if [ "$RANGE_UNIT_PROGRAM" = "$RANGE_BUNDLE_PROGRAM" ]; then
+    range_plist_verb="$(plutil -extract ProgramArguments.1 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
+    if [ "$range_plist_verb" != reserve-local-range ]; then
+      echo "::error::the plist does not run the bundle's program with the range verb (ProgramArguments[1]: '$range_plist_verb')"
+      fail
+    fi
+    if [ -e "$RANGE_PROGRAM_PATH" ]; then
+      echo "::error::the range script $RANGE_PROGRAM_PATH is still on the host, though the unit runs the bundle's program"
+      fail
+    fi
   fi
   echo "custody holds: both files root-owned at 0755/0644, the plist runs the root-owned program"
 
@@ -7500,7 +7543,7 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'resolves in any browser on this machine' "$range2_err"; then
+  if ! grep -q -- 'resolves on this machine' "$range2_err"; then
     echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
@@ -7517,7 +7560,7 @@ proof_local_range_reserved_by_privileged_step() {
     launchctl print "system/$RANGE_LABEL" 2>&1 || true
     fail
   fi
-  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_PROGRAM_PATH"; then
+  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_UNIT_PROGRAM"; then
     echo "::error::the loaded job does not name the root-owned program (launchctl print:)"
     printf '%s\n' "$range_print" | head -40
     fail
@@ -7660,8 +7703,12 @@ answerer_service_teardown() {
   [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
   if [ "$(uname -s)" = Darwin ]; then
     sudo -n launchctl bootout "system/dev.gominimal.zone" >/dev/null 2>&1 || true
+    # The program copy sits in an app bundle; the bare path is where an
+    # install from before the bundle put it.
     sudo -n rm -f "/Library/LaunchDaemons/dev.gominimal.zone.plist" \
       "/Library/PrivilegedHelperTools/minzoned" >/dev/null 2>&1 || true
+    sudo -n rm -rf "/Library/PrivilegedHelperTools/Minimal.app" \
+      "/Library/PrivilegedHelperTools/Minimal.app.old" >/dev/null 2>&1 || true
   else
     sudo -n systemctl disable --now minzoned.socket \
       minzoned.service >/dev/null 2>&1 || true
@@ -7757,6 +7804,18 @@ setup_classifier_teardown() {
   SETUP_CLASSIFIER_INSTALLED=""
 }
 
+# Whether a setup script elevates on its own: `sudo` in command position on
+# a line that is not a comment. A hint inside a quoted message ("try: sudo
+# ...") is text, not an elevation. awk reads its whole input, so no early
+# exit can break the pipe; under `pipefail` a broken pipe would read as "no
+# sudo" and pass a script that elevates.
+setup_script_elevates() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*#/ { next }
+    /(^|[;&|({`!]|(^|[^[:alnum:]_])(then|do|else|if|elif|while|until|time))[[:space:]]*sudo([[:space:]]|$)/ { found = 1 }
+    END { exit !found }'
+}
+
 # The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
 # when that is a script — its first line `#!/bin/sh` — and nothing otherwise
 # (a host with nothing to run, or a blocker, prints only its note on
@@ -7848,7 +7907,7 @@ proof_native_resolution_without_proxy_env() {
   native_port=""
   for _ in $(seq 1 40); do
     native_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$native_port" ] && break
     sleep 0.25
@@ -7862,7 +7921,7 @@ proof_native_resolution_without_proxy_env() {
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    echo "::error::the daemon's zone answerer never came up (no DNS SERVICE line in min ls)"
     fail
   fi
 
@@ -7922,7 +7981,7 @@ proof_native_resolution_without_proxy_env() {
           ;;
       esac
     fi
-    if printf '%s\n' "$native_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    if setup_script_elevates "$native_cmd"; then
       echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
       echo "--- script ---"; printf '%s\n' "$native_cmd"
       fail
@@ -8171,8 +8230,8 @@ proof_native_resolution_without_proxy_env() {
 #     a VM-backed host the zone is the host's to answer, the guest daemon
 #     starts no answerer, and the CLI reads the host answerer's state from
 #     minvmd's control socket — never through the guest — and prints the
-#     ZONE ANSWERER line from it: answered by the VM host daemon, naming the
-#     holder.
+#     DNS SERVICE line from it: the VM host daemon answering this VM's
+#     box names, or another VM host daemon answering them.
 #   * The VM host daemon's answerer answers real zone names on the host, and
 #     dig reads the wire a host resolver would, at the port the answerer's
 #     own start record names — the listener it holds, or the machine's
@@ -8232,13 +8291,13 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
   host_answerer_ls="$(mnl ls 2>/dev/null || true)"
   if ! printf '%s\n' "$host_answerer_ls" \
-      | grep -qF -- 'ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)'; then
+      | grep -qE -- "DNS SERVICE: +(this VM's host daemon answers its|another VM host daemon answers this VM's) box names on 127\.0\.0\.1:"; then
     echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
     echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
     fail
   fi
   echo "min ls names the VM host daemon as the zone's answerer (NET-138):"
-  printf '%s\n' "$host_answerer_ls" | grep -- 'ZONE ANSWERER' | sed 's/^/  /'
+  printf '%s\n' "$host_answerer_ls" | grep -- 'DNS SERVICE' | sed 's/^/  /'
 
   # The VM host daemon's own log candidates, newest first: the answerer is a
   # host process, so its start record sits beside the daemon's in minvmd's
@@ -8621,12 +8680,12 @@ proof_box_name_resolves_natively_without_proxy() {
   fi
 
   # The daemon's log filter for the restart below — INFO for the records
-  # this case reads (the loopback lease and release, minimald::session; the
+  # this case reads (the loopback lease and release, minimald::box_actor; the
   # name registrations, minimald::net::dns; the publish exposes,
   # minimald::net::gvproxy_network) and DEBUG for the zone answerer, so
   # every lookup this case makes leaves its own line. The exec records the
   # harness's default keeps, for the `min bug` tail.
-  bn_rust_log="warn,minimald::exec=info,minimald::session=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
+  bn_rust_log="warn,minimald::exec=info,minimald::box_actor=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
   # Restart with it — a standalone run has no daemon yet; `min ls` below
   # autospawns it. No restart and no new filter when this run cannot read
   # the daemon's log: the daemon already up keeps the one it came with.
@@ -8657,7 +8716,7 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_port=""
   for _ in $(seq 1 40); do
     bn_port="$(bn_warm ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$bn_port" ] && break
     sleep 0.25
@@ -8672,7 +8731,7 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    echo "::error::the daemon's zone answerer never came up (no DNS SERVICE line in min ls)"
     fail
   fi
 
@@ -8764,7 +8823,7 @@ proof_box_name_resolves_natively_without_proxy() {
         fail
         ;;
     esac
-    if printf '%s\n' "$bn_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    if setup_script_elevates "$bn_cmd"; then
       echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
       echo "--- script ---"; printf '%s\n' "$bn_cmd"
       fail
@@ -8981,19 +9040,19 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'resolves in any browser on this machine' \
+  bn_api_surface="$(grep -F -- 'resolves on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not report native DNS as the live name surface (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its name resolves on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
   echo "activate reported the surface (NET-018): $bn_api_surface"
   # The activate line is the one host line, naming the box (NET-142). That
   # the hostname proxy still serves beside native DNS (NET-019) is `min
-  # ls`'s to say, on its NAME SURFACE row, asserted below.
+  # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
-    "names: $BN_API_NAME.min.internal resolves in any browser on this machine"*) ;;
+    "names: $BN_API_NAME.min.internal resolves on this machine"*) ;;
     *)
       echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
@@ -9075,20 +9134,20 @@ proof_box_name_resolves_natively_without_proxy() {
   # ---- NET-018/NET-019: what `min ls` reports beside the live boxes -------
   bn_ls="$(mnl ls 2>&1 || true)"
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
-  bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'NAME SURFACE:' | head -n1 || true)"
+  bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
   case "$bn_surface_line" in
-    *"native DNS is the live name surface"*) ;;
+    *"resolves through this machine's DNS"*) ;;
     *)
-      echo "::error::min ls does not report native DNS as the live name surface (NET-018)"
-      echo "--- NAME SURFACE line ---"; printf '%s\n' "$bn_surface_line"
+      echo "::error::min ls's BOX NAMES line does not say box names resolve through this machine's DNS (NET-018)"
+      echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
   case "$bn_surface_line" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    *"the hostname proxy also listens on 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the hostname proxy still serves (NET-019)"
-      echo "--- NAME SURFACE line ---"; printf '%s\n' "$bn_surface_line"
+      echo "::error::min ls's surface line does not say the hostname proxy also listens (NET-019)"
+      echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
@@ -9410,6 +9469,7 @@ proof_answerer_survives_session_stop() {
   # over could never exist. Remove it first, the range case's reasoning.
   if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
      || [ -e /usr/local/lib/minimal/minzoned ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
      || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$asr_channel"
@@ -9753,23 +9813,23 @@ for row in json.load(open(sys.argv[1])):
   fi
   echo "  node A released the port and publishes to the manager-held service over $asr_channel"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
-  # The hook probe's own answer, as `min ls` prints it: manager-held, with
-  # the channel node A publishes over. Capture-then-grep (grep's early exit
-  # would SIGPIPE the CLI).
+  # The hook probe's own answer, as `min ls` prints it: Minimal's DNS
+  # service answers this VM's box names. Capture-then-grep (grep's early
+  # exit would SIGPIPE the CLI).
   local asr_ls=""
   for _ in $(seq 1 20); do
     asr_ls="$(mnl ls 2>/dev/null || true)"
     case "$asr_ls" in
-      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+      *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*) break ;;
     esac
     sleep 0.5
   done
   case "$asr_ls" in
-    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
-      printf '%s\n' "$asr_ls" | grep -F -- 'ZONE ANSWERER' | sed 's/^/  /'
+    *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*)
+      printf '%s\n' "$asr_ls" | grep -F -- 'DNS SERVICE' | sed 's/^/  /'
       ;;
     *)
-      echo "::error::min ls does not say the zone is manager-held after the handover"
+      echo "::error::min ls does not say Minimal's DNS service answers this VM's box names after the handover"
       echo "--- min ls ---"; printf '%s\n' "$asr_ls"
       fail
       ;;
@@ -9784,14 +9844,14 @@ for row in json.load(open(sys.argv[1])):
   for _ in $(seq 1 60); do
     asr_b_ls="$(mnl2 ls 2>/dev/null || true)"
     case "$asr_b_ls" in
-      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+      *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*) break ;;
     esac
     sleep 0.5
   done
   case "$asr_b_ls" in
-    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
+    *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*)
       echo "  node B re-published to the manager-held service after the handover"
-      printf '%s\n' "$asr_b_ls" | grep -F -- 'ZONE ANSWERER' | sed 's/^/  /'
+      printf '%s\n' "$asr_b_ls" | grep -F -- 'DNS SERVICE' | sed 's/^/  /'
       ;;
     *)
       echo "::error::node B never re-published to the manager-held answerer service after the handover"
@@ -10600,7 +10660,7 @@ while True:
 
   recover_activate_err="$(cat "$WORK/recover-activate.err" 2>/dev/null || true)"
   case "$recover_activate_err" in
-    *"session hostnames will not route"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
       echo "::error::activate against the held port did not warn with the reason and the remedy (NET-020)"
       echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
@@ -10617,7 +10677,7 @@ while True:
 
   recover_ls_out="$(mnl ls 2>&1)"
   case "$recover_ls_out" in
-    *"session hostnames will not route"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
       echo "::error::min ls against the held port did not warn with the reason and the remedy (NET-020)"
       echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
@@ -10630,7 +10690,7 @@ while True:
     echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
     fail
   fi
-  printf '%s\n' "$recover_ls_out" | grep -F -- 'session hostnames will not route' | sed 's/^/  /'
+  printf '%s\n' "$recover_ls_out" | grep -F -- 'warning: the hostname proxy is not serving' | sed 's/^/  /'
 
   # The daemon log's own record: the warn the retry left, with its status
   # and next-retry schedule (the file log is JSON lines).
@@ -10688,7 +10748,7 @@ while True:
       | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
     if [ "$recover_port_now" = "$RECOVER_PIN" ]; then
       case "$recover_ls_after" in
-        *"session hostnames will not route"*) ;; # serving but still warning: keep polling
+        *"warning: the hostname proxy is not serving"*) ;; # serving but still warning: keep polling
         *) recover_cleared=1; break ;;
       esac
     fi
@@ -10700,7 +10760,7 @@ while True:
     fail
   fi
   echo "min ls cleared the warning after ${recover_try} one-second poll(s); it now reads:"
-  printf '%s\n' "$recover_ls_after" | grep -E -- 'HOSTNAME PROXY|ZONE ANSWERER' | sed 's/^/  /'
+  printf '%s\n' "$recover_ls_after" | grep -E -- 'HOSTNAME PROXY|DNS SERVICE' | sed 's/^/  /'
 
   recover_pid_after="$(recover_pids_for "hostname-proxy-port $RECOVER_PIN" | head -n1)"
   if [ "$recover_pid_after" != "$recover_pid_before" ]; then
@@ -10753,41 +10813,60 @@ while True:
 
   # ---- beat D: a second daemon on the same machine ------------------------
   echo "beat D: a second daemon under its own state dir"
-  # Beat A picked a spare pin when 7654 looked busy, but that holder may be
-  # gone by now (a daemon still shutting down from the stop above releases
-  # it a moment later). Re-assert the invariant rather than trust beat A's
-  # probe: if 7654 is free, hold it ourselves so the second daemon's
-  # default is busy and it must relocate.
-  if [ "$RECOVER_PIN" != 7654 ] && recover_port_free 7654; then
+  # Beat A picked a spare pin when 7654 looked busy, but a busy probe now
+  # says nothing about the moment the second daemon starts: whatever held
+  # the port at beat A may be a transient (a daemon still shutting down
+  # from the stop above) that releases mid-beat, leaving the default free
+  # for daemon 2 to bind — and then the relocation this beat stages, and
+  # its NET-025 warn, are never owed. So never gate on the probe: wait out
+  # any foreign holder, then hold 7654 with this run's own stand-in.
+  if [ "$RECOVER_PIN" != 7654 ]; then
+    for _ in $(seq 1 60); do
+      recover_port_free 7654 && break
+      sleep 0.5
+    done
+    rm -f "$WORK/recover-default-holder.ready"
     python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 7654))
 s.listen(1)
+open(sys.argv[1], "w").close()
 while True:
-    time.sleep(3600)' \
+    time.sleep(3600)' "$WORK/recover-default-holder.ready" \
       >/dev/null 2>"$WORK/recover-default-holder.err" &
     RECOVER_HOLDER_PID=$!
     holder_bound=""
     for _ in $(seq 1 40); do
-      if ! recover_port_free 7654; then holder_bound=1; break; fi
+      [ -f "$WORK/recover-default-holder.ready" ] && { holder_bound=1; break; }
+      kill -0 "$RECOVER_HOLDER_PID" 2>/dev/null || break # its bind lost: it exited
       sleep 0.25
     done
-    if [ -z "$holder_bound" ]; then
-      echo "::error::7654 was free at beat D and the stand-in holder never took it — the relocation cannot be staged"
+    if [ -n "$holder_bound" ]; then
+      echo "default port: python3 holds 127.0.0.1:7654 (pid $RECOVER_HOLDER_PID) for the second daemon's start"
+    elif ! recover_port_free 7654; then
+      # The stand-in's bind lost to a foreign listener that outlasted the
+      # wait above — no transient does that. It keeps the default busy the
+      # way a dev host's own daemon does, so the story stands; the assert
+      # below still fails loudly if it lets go before daemon 2 starts.
+      kill "$RECOVER_HOLDER_PID" 2>/dev/null || true
+      RECOVER_HOLDER_PID=""
+      echo "default port: a foreign listener owns 127.0.0.1:7654, so it keeps the second daemon's default busy"
+    else
+      echo "::error::127.0.0.1:7654 is free and this staging does not hold it — the foreign holder that looked busy released, so the relocation cannot be staged"
       echo "--- holder stderr ---"; cat "$WORK/recover-default-holder.err" 2>/dev/null || true
       fail
     fi
-    echo "default port: 7654 was free again, so python3 holds it (pid $RECOVER_HOLDER_PID) for the second daemon's start"
   fi
   RECOVER_STATE2_DIR="$WORK/state2"
   mkdir -p "$RECOVER_STATE2_DIR"
   mnl2() { min --minimal-dir "$RECOVER_STATE2_DIR" "$@"; }
 
   # Boot it through the CLI's own autospawn, then read the port `min ls`
-  # discovers (NET-026): the default is busy (the first daemon holds 7654,
-  # or the dev daemon that made us pick a spare pin does), so this daemon
-  # selects a free one (NET-025) and reports it.
+  # discovers (NET-026): the default is busy (daemon 1 holds it when the
+  # pin is 7654; otherwise the stand-in or the foreign listener the staging
+  # left on it does), so this daemon selects a free one (NET-025) and
+  # reports it.
   recover_ls2=""
   for _ in $(seq 1 60); do
     if recover_ls2="$(mnl2 ls 2>&1)"; then break; fi
@@ -10808,6 +10887,10 @@ while True:
   if [ -z "$recover_port2" ]; then
     echo "::error::the second daemon never reported a HOSTNAME PROXY port (NET-026)"
     echo "--- min ls output ---"; printf '%s\n' "${recover_ls2:-<none>}"
+    fail
+  fi
+  if [ "$RECOVER_PIN" != 7654 ] && [ "$recover_port2" = 7654 ]; then
+    echo "::error::daemon 2 ended up on the default 127.0.0.1:7654, so the port was not held when it started — the staging lost the busy default and the relocation cannot be staged (NET-025)"
     fail
   fi
   if [ "$recover_port2" = "$RECOVER_PIN" ]; then
@@ -11434,8 +11517,8 @@ proof_github_only_allowlist() {
   # TEST-NET-3 (RFC 5737), the same range the own-IP egress proof uses as its
   # can-never-admit-live-traffic allow rule.
   GOA_DEAD_CIDR="203.0.113.0/24"
-  # The toolchain's hosts, verbatim from sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
-  # (crates/sessions/src/lib.rs) — the one list the minimald unit fixture and
+  # The toolchain's hosts, verbatim from boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
+  # (crates/boxes/src/lib.rs) — the one list the minimald unit fixture and
   # the minvmd VM harness share; keep this copy in step with it. Docker Hub
   # serves its image blobs through a 307 redirect that lands on either of
   # its two CDNs, so a container pull needs both.
@@ -12378,7 +12461,7 @@ PY
 #     published: the zone answerer's A record for the box's name
 #     (NET-010/NET-127), the address the host-side forwarders bind, asked
 #     for straight at the answerer's own port — the one `min ls` reports as
-#     `ZONE ANSWERER`, which the guest daemon binds and the VM host's
+#     `DNS SERVICE`, which the guest daemon binds and the VM host's
 #     forwarders publish on the host loopback — with no OS resolver hook in
 #     the way. The box-registry record's `loopback_address` is a different
 #     allocation the forwarders do not bind at (#1908), so the leg does not
@@ -12721,7 +12804,7 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_ans_port=""
   for _ in $(seq 1 40); do
     upr_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$upr_ans_port" ] && break
     sleep 0.25
@@ -12729,7 +12812,7 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_addr_leg=""
   upr_ans_addr=""
   if [ -z "$upr_ans_port" ]; then
-    upr_addr_leg="skipped (no zone answerer on record for this VM host: 'min ls' carries no ZONE ANSWERER line, so the host's own word for where the box is published cannot be asked for)"
+    upr_addr_leg="skipped (no zone answerer on record for this VM host: 'min ls' carries no DNS SERVICE line, so the host's own word for where the box is published cannot be asked for)"
     echo "host address leg: SKIPPED ($upr_addr_leg)"
   elif ! upr_ans_addr="$(zone_answerer_a "$upr_ans_port" \
        "$upr_t_name.min.internal" 2>"$WORK/upr-ans.err")"; then
@@ -14356,11 +14439,14 @@ PY
 # own drops rather than by the boxes' declared union.
 #
 # Two resident boxes with disjoint declared egress bound the union: box A
-# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the runner's
-# address as a /32 (the destination their own probes reach) and the fabric
-# (100.64.0.0/16), which carries the host alias, the node-plane baseline
-# set's one category-pair (NET-130: the alias is the registry and the cache,
-# shown beside the rules by `min session policy`). The arms:
+# declares 198.18.0.0/16 and box B 198.19.0.0/16 — the two halves of
+# 198.18.0.0/15, RFC 2544 benchmark space, spelled outside RFC 1918 so no
+# infrastructure rule can take a cross-box destination before the row's
+# own rules do — and both declare the runner's address as a /32 (the
+# destination their own probes reach) and the fabric (100.64.0.0/16),
+# which carries the host alias, the node-plane baseline set's one
+# category-pair (NET-130: the alias is the registry and the cache, shown
+# beside the rules by `min session policy`). The arms:
 #
 #   * each box's own probe to the runner's address arrives — the whole chain
 #     working, and the union's declared half live for a box's own address;
@@ -14369,12 +14455,13 @@ PY
 #     rows declare: it is dropped before any frame leaves the VM, under the
 #     gate's own unregistered rule, and the drop line names the source —
 #     the receipt for the frames the spoofer spoke;
-#   * box A's address toward 192.168.77.7, declared only by box B — the
-#     union's other half — is refused: the row that holds the source address
-#     decides, and box A's row does not cover it (the RFC 1918 the
-#     infrastructure set takes where the row's own allow-list does not);
-#   * box B's address toward 10.0.0.7, box A's private half, refused the
-#     same way from the other side;
+#   * box A's address toward 198.19.0.7, declared only by box B — the
+#     union's other half — is refused under egress-undeclared-subnet: the
+#     row that holds the source address decides, and box A's row does not
+#     cover it — the verdict the union bound rides on, which the public
+#     range cannot let the private-space rule answer for;
+#   * box B's address toward 198.18.0.7, box A's half, refused the same way
+#     from the other side;
 #   * box A's address toward 198.51.100.7 — beyond the whole union — is
 #     refused by box A's own rules (egress-undeclared-subnet);
 #   * a made-up in-plan lease toward that same 198.51.100.7 is dropped the
@@ -14717,11 +14804,11 @@ ESU_LISTENER_EOF
 
   esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-a --network own_ip \
-    --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.18.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-a.err")" || {
-    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box A's activate (--network own_ip, 198.18.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-a.err" 2>/dev/null || true
     esu_fail
   }
@@ -14734,11 +14821,11 @@ ESU_LISTENER_EOF
   fi
   esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-b --network own_ip \
-    --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.19.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-b.err")" || {
-    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box B's activate (--network own_ip, 198.19.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-b.err" 2>/dev/null || true
     esu_fail
   }
@@ -14782,8 +14869,8 @@ ESU_LISTENER_EOF
     echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
     esu_fail
   fi
-  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric + $esu_host/32)"
-  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric + $esu_host/32)"
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 198.18.0.0/16 + the fabric + $esu_host/32)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 198.19.0.0/16 + the fabric + $esu_host/32)"
 
   # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
   # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
@@ -14883,15 +14970,15 @@ ESU_LISTENER_EOF
     echo "box $esu_box's effective policy (the baseline set beside the rules):"
     printf '%s\n' "$esu_policy" | sed 's/^/  /'
     if [ "$esu_box" = a ]; then
-      esu_line="subnets  10.0.0.0/8, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.18.0.0/16, 100.64.0.0/16, $esu_host/32"
     else
-      esu_line="subnets  192.168.0.0/16, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.19.0.0/16, 100.64.0.0/16, $esu_host/32"
     fi
     if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
       esu_fail
     fi
-    if ! grep -q 'node-plane baseline set (helper enumeration)' <<<"$esu_policy" \
+    if ! grep -q 'own downloads in this VM' <<<"$esu_policy" \
       || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
       || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"
@@ -15258,19 +15345,20 @@ source=$esu_ip_b (box B's own probe) destination=$esu_host:$ESU_LISTEN_PORT verd
   esu_rows="$esu_rows
 source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward a destination both rows declare)"
 
-  # Box A's address toward box B's private half — inside the union, outside
-  # the row that holds the worn address: the gate's infrastructure rule
-  # refuses it, and its line names both the source and the destination, so
-  # both are pinned inside the wait: a line box A's own traffic wrote under
-  # the same rule names a different destination and cannot pass for this
-  # arm's, and a line that predates the arm cannot either (the window
-  # discipline below).
-  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-infrastructure-destination 192.168.77.7 | wc -l)"
-  esu_run_spoofer cross-a "$esu_ip_a" 192.168.77.7 esu-spoof-cross-a 3 no
+  # Box A's address toward box B's half — inside the union, outside the row
+  # that holds the worn address: box A's own rules refuse it, under
+  # egress-undeclared-subnet — the public half no infrastructure rule
+  # takes, so the refusal is the row's own and the union bound it proves.
+  # The line names both the source and the destination, so both are pinned
+  # inside the wait: a line box A's own traffic wrote under the same rule
+  # names a different destination and cannot pass for this arm's, and a
+  # line that predates the arm cannot either (the window discipline below).
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet 198.19.0.7 | wc -l)"
+  esu_run_spoofer cross-a "$esu_ip_a" 198.19.0.7 esu-spoof-cross-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box A's address completed a flow to 192.168.77.7 — box B's declared half must be refused for a source box A's row holds"
+      echo "::error::the spoofer wearing box A's address completed a flow to 198.19.0.7 — box B's declared half must be refused for a source box A's row holds"
       esu_fail
       ;;
   esac
@@ -15278,13 +15366,25 @@ source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-infrastructure-destination \
-    192.168.77.7 "$esu_prior")" || {
-    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet \
+    198.19.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box A's address toward 198.19.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
+source=$esu_ip_a destination=198.19.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box B's declared half, which box A's row does not cover)"
+
+  # The window pace: box A wears two undeclared-subnet arms — this one and
+  # the far-side one below — and the gate's limiter writes one line per
+  # source per rule per DROP_WARN_MIN_INTERVAL (60s), keyed by source and
+  # rule only, never the destination (DropLimiter::decide in
+  # crates/minvmd/src/net/egress_gate.rs). The far-side arm's line would be
+  # Silent inside this arm's window and never land, failing its wait. The
+  # made-up arms dodge the same limiter by wearing a fresh made-up address
+  # no row holds; these two arms cannot — the address each wears is box
+  # A's own, and that is the bound they prove — so the window is waited
+  # out instead.
+  sleep 60
 
   # Box A's address toward a destination no resident box declared — beyond
   # the whole union: the row's own rules refuse it, and the undeclared-subnet
@@ -15348,15 +15448,15 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
   esu_rows="$esu_rows
 source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source names the source, no marker — an in-plan lease no row holds never reaches past the union)"
 
-  # Box B's address toward box A's private half: the same refusal, worn from
-  # the other side — whichever box's address the spoofer wears, its own row is
+  # Box B's address toward box A's half: the same refusal, worn from the
+  # other side — whichever box's address the spoofer wears, its own row is
   # the one that decides, and the destination stays pinned inside the wait.
-  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-infrastructure-destination 10.0.0.7 | wc -l)"
-  esu_run_spoofer cross-b "$esu_ip_b" 10.0.0.7 esu-spoof-cross-b 3 no
+  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-undeclared-subnet 198.18.0.7 | wc -l)"
+  esu_run_spoofer cross-b "$esu_ip_b" 198.18.0.7 esu-spoof-cross-b 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box B's address completed a flow to 10.0.0.7 — box A's declared half must be refused for a source box B's row holds"
+      echo "::error::the spoofer wearing box B's address completed a flow to 198.18.0.7 — box A's declared half must be refused for a source box B's row holds"
       esu_fail
       ;;
   esac
@@ -15364,13 +15464,13 @@ source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at 
     echo "::error::a refused spoof from box B's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-infrastructure-destination \
-    10.0.0.7 "$esu_prior")" || {
-    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-undeclared-subnet \
+    198.18.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box B's address toward 198.18.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box A's declared half, which box B's row does not cover)"
+source=$esu_ip_b destination=198.18.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box A's declared half, which box B's row does not cover)"
 
   # An address outside the plan's lease block: refused outright, under either
   # posture — outside the plan there is no lease to spoof. The source is
@@ -15736,7 +15836,7 @@ proof_min_internal_names_through_proxy() {
   for proxy_bind_try in 1 2 3 4 5; do
     proxy_ls_out="$(mnl ls 2>&1)"
     case "$proxy_ls_out" in
-      *"session hostnames will not route"*) proxy_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) proxy_bind_taken=1 ;;
       *) proxy_bind_taken=0; break ;;
     esac
     [ "$proxy_bind_try" = 5 ] || sleep 3
@@ -15762,7 +15862,7 @@ proof_min_internal_names_through_proxy() {
   proxy_start_host_listener
 
   # socat carries the in-box responder below. It is a launcher baseline
-  # package (crates/minimald/src/session_host.rs BASELINE_PACKAGES), so every
+  # package (crates/minimald/src/box_runtime.rs BASELINE_PACKAGES), so every
   # box ships it — at /usr/bin: packages install with --prefix=/usr, and the
   # generic rootfs has no /bin, so the case says the absolute path, the
   # daemon's own convention for in-box argv, rather than lean on PATH.
@@ -16159,7 +16259,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
   for da_bind_try in 1 2 3 4 5; do
     da_ls_out="$(mnl ls 2>&1)"
     case "$da_ls_out" in
-      *"session hostnames will not route"*) da_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) da_bind_taken=1 ;;
       *) da_bind_taken=0; break ;;
     esac
     [ "$da_bind_try" = 5 ] || sleep 3
@@ -16693,7 +16793,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     for po_try in 1 2 3 4 5; do
       po_ls="$(mnl ls 2>&1)"
       case "$po_ls" in
-        *"session hostnames will not route"*) po_bind_taken=1 ;;
+        *"warning: the hostname proxy is not serving"*) po_bind_taken=1 ;;
         *) po_bind_taken=0; break ;;
       esac
       [ "$po_try" = 5 ] || sleep 3
@@ -18074,12 +18174,13 @@ proof_listen_published_port_reaches_peer_and_host() {
   echo "listen: socat also serves the OUT-OF-RANGE port $lp_out_port inside the box — the stance does not allow it, so nothing may publish it"
 
   # The host answerer's own port, read the way the proofs around this one
-  # read it: the ZONE ANSWERER line of `min ls`, whose spelling is the
+  # read it: the DNS SERVICE line of `min ls`, whose spelling is the
   # target's own — a host-native daemon prints "listening on
   # 127.0.0.1:PORT (UDP)", while the VM-backed target this case's own-address
   # box needs names the port in the line the CLI renders from the VM host
-  # daemon's answerer state ("this VM's minvmd holds it on 127.0.0.1:PORT
-  # (UDP)", or the registered form) — so both spellings read here. A target
+  # daemon's answerer state ("this VM's host daemon answers its box names
+  # on 127.0.0.1:PORT (UDP)", or the registered form) — so both spellings
+  # read here. A target
   # that names no port has no word for where its boxes are published, and the
   # host legs below are WHERE-skipped on it, never failed: the peer legs
   # carry the case's enforcement assertions without it.
@@ -18087,17 +18188,17 @@ proof_listen_published_port_reaches_peer_and_host() {
   lp_ans_port=""
   for _ in $(seq 1 40); do
     lp_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER:.*on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE:.*on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$lp_ans_port" ] && break
     sleep 0.25
   done
   if [ -z "$lp_ans_port" ]; then
-    lp_ans_why="no zone answerer on record for this host: 'min ls' carries no ZONE ANSWERER line naming a port, so the host's own word for where the box is published cannot be asked for"
+    lp_ans_why="no zone answerer on record for this host: 'min ls' carries no DNS SERVICE line naming a port, so the host's own word for where the box is published cannot be asked for"
     echo "host legs: SKIPPED ($lp_ans_why)"
-    echo "--- min ls (ZONE ANSWERER lines) ---"
+    echo "--- min ls (DNS SERVICE lines) ---"
     lp_ans_ls="$(mnl ls 2>/dev/null || true)"
-    printf '%s\n' "$lp_ans_ls" | grep -F 'ZONE ANSWERER' | sed 's/^/  /' || true
+    printf '%s\n' "$lp_ans_ls" | grep -F 'DNS SERVICE' | sed 's/^/  /' || true
   fi
 
   # WHERE-gated like the answerer's port above it: without the box's
@@ -19480,7 +19581,7 @@ exit" E2E_PTY_ANSWER=keep \
   # prefix mnl hands an autospawn (native_switch_daemon).
   mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
   eib_saved_rust_log="${RUST_LOG:-}"
-  export RUST_LOG="warn,minimald::session=info"
+  export RUST_LOG="warn,minimald::box_actor=info"
   eib_restore_log() {
     if [ -n "$eib_saved_rust_log" ]; then export RUST_LOG="$eib_saved_rust_log"; else unset RUST_LOG; fi
   }
@@ -20190,7 +20291,7 @@ proof_proxy_refuses_like_direct() {
   for par_bind_try in 1 2 3 4 5; do
     par_ls_out="$(mnl ls 2>&1)"
     case "$par_ls_out" in
-      *"session hostnames will not route"*) par_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) par_bind_taken=1 ;;
       *) par_bind_taken=0; break ;;
     esac
     [ "$par_bind_try" = 5 ] || sleep 3
@@ -20209,7 +20310,7 @@ proof_proxy_refuses_like_direct() {
   fi
 
   # socat carries the responders below and base64 carries the echo script in;
-  # both are launcher-baseline packages (crates/minimald/src/session_host.rs
+  # both are launcher-baseline packages (crates/minimald/src/box_runtime.rs
   # BASELINE_PACKAGES), at /usr/bin — packages install with --prefix=/usr and
   # the generic rootfs has no /bin, so the absolute paths are the daemon's own
   # convention for in-box argv.
@@ -20748,7 +20849,7 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   fi
 
   # socat carries the in-box responder. It is a launcher baseline package
-  # (crates/minimald/src/session_host.rs BASELINE_PACKAGES), so every box
+  # (crates/minimald/src/box_runtime.rs BASELINE_PACKAGES), so every box
   # ships it — at /usr/bin: packages install with --prefix=/usr, and the
   # generic rootfs has no /bin, so the case says the absolute path, the
   # daemon's own convention for in-box argv, rather than lean on PATH.

@@ -67,7 +67,18 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let registry = tracing_subscriber::registry().with(filter);
+    // OTel export (opt-in: MINIMAL_TELEMETRY=1 plus an OTLP endpoint; see
+    // mlog::otel): the layers are None when off and carry their own
+    // info-level filter when on; the console keeps its own filter, with the
+    // OTel SDK's errors silenced.
+    mlog::otel::init("minimal-cli");
+    // A CLI lives for one command: its exit flush is short, so a collector
+    // that is down or silent never shows in a command's wall time.
+    mlog::otel::set_exit_flush(mlog::otel::CLI_EXIT_FLUSH);
+    let filter = mlog::otel::quiet(filter);
+    let registry = tracing_subscriber::registry()
+        .with(mlog::otel::span_layer())
+        .with(mlog::otel::log_layer());
     // `min dash` owns the terminal (alternate screen); a log line landing on
     // stdout/stderr would corrupt the frame. Log to <state>/dash.log
     // instead, discarding if the state dir can't be written.
@@ -97,25 +108,37 @@ async fn run() -> ExitCode {
             }
         };
         registry
-            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .with(
+                fmt::layer()
+                    .with_writer(log)
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
             .init();
     } else if stdout_is_data_contract(&cli.command) {
         registry
-            .with(console_layer(
-                std::io::stderr,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    std::io::stderr,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     } else {
         registry
-            .with(console_layer(
-                ot::StderrWriter::new,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    ot::StderrWriter::new,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     }
+    mlog::otel::report_init();
 
     // The output mode the run is under, read before the CLI is consumed:
     // the error path keys on it (below), so a machine-output run answers a
@@ -126,7 +149,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
-    if let Err(e) = minimal::run(cli).await {
+    let result = minimal::run(cli).await;
+    // Flush exported telemetry (bounded; a no-op when export is off). What
+    // the bound cuts off is in the spool already.
+    mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+    if let Err(e) = result {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
         // (the git-remote helper's ExitCode precedent).
@@ -163,13 +190,23 @@ async fn run() -> ExitCode {
 }
 
 /// The exit code a failed run ends with, from the architecture's reserved
-/// codes ("Exit codes"): 7 when the VM host could not be reached to
-/// register or resume an own-address box's row (provider/host
+/// codes ("Exit codes"): 3 when the activation refused the box spec
+/// (`boxes::core::bep::ActivationRefused`) or found the project's
+/// `minimal.toml` invalid (`minimal::ProjectFileInvalid`), 7 when the VM host could not
+/// be reached to register or resume an own-address box's row (provider/host
 /// unreachable, #1790), 8 when the host refused the registration for want
 /// of addresses (insufficient resources), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
+    // BEP-008/009/010/017/056: a box spec refused at activation.
+    if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
+        return refused.exit_code();
+    }
+    // An invalid project `minimal.toml` refuses the activation with exit 3.
+    if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
+        return 3;
+    }
     if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
         .is_some()
     {
@@ -778,6 +815,39 @@ mod tests {
             MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
             MachineModeAnswer::Quiet => panic!("a refusal is an error object"),
         }
+    }
+
+    /// BEP-008: a box spec the activation refused ends the run with exit 3,
+    /// through the context the activation adds over it, and the message
+    /// names each missing host. `cmd::session`'s test of the same name
+    /// proves the refusal comes before the create.
+    #[test]
+    fn activation_refuses_grant_before_create_with_exit_3() {
+        let refused = boxes::core::bep::ActivationRefused {
+            refusals: vec![boxes::core::bep::BepRefusal::HostsOutsideEgress {
+                missing: vec!["uploads.github.com".into(), "codeload.github.com".into()],
+            }],
+        };
+        let e = anyhow::Error::new(refused).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+        let text = format!("{:#}", e.root_cause());
+        assert!(
+            text.contains("does not allow: uploads.github.com, codeload.github.com."),
+            "{text}"
+        );
+    }
+
+    /// Exit codes: an invalid project `minimal.toml` ends the run with
+    /// exit 3, through the context the activation adds over it.
+    /// `cmd::session`'s test of the same name proves the refusal comes
+    /// before the create and carries this type.
+    #[test]
+    fn activation_refuses_unloadable_project_file_before_create() {
+        let invalid = minimal::ProjectFileInvalid {
+            error: mfile::Error::HarnessTable(None),
+        };
+        let e = anyhow::Error::new(invalid).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

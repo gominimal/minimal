@@ -29,7 +29,7 @@
 //!   grace period runs out.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
-//! `crates/sandbox2/tests/caps_root_integration.rs`
+//! `crates/sandbox/tests/caps_root_integration.rs`
 //! (`boxes_lack_cap_net_raw`), pinning the same credentials for the box's own
 //! processes. Test binaries in separate crates cannot call each other's
 //! helpers, so the plumbing this file and that one share — the base-directory
@@ -41,7 +41,7 @@
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
-//! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for own-IP
+//! `CLONE_NEWNET` `unshare` that `sandbox::new_container` performs for own-IP
 //! tasks, identified by the holder process's PID exactly as the live launcher
 //! identifies a sandbox child's netns, and the tap is moved+configured by the
 //! production [`minimald::net::switch::tap_netns_commands`]. Those commands
@@ -81,10 +81,17 @@
 //! neither captured nor indented — reaching the parser as an annotation on
 //! the check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
+// An integration test has no `crate::traced` to route its spawns through,
+// and nothing it spawns is in a daemon request's trace; the crate's clippy
+// `disallowed-methods` (see clippy.toml) is for the daemon's own sources.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an integration test cannot reach crate::traced, and traces nothing"
+)]
 
-use sandbox2::NetPlan;
-use sandbox2::Network as _;
-use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
+use sandbox::NetPlan;
+use sandbox::Network as _;
+use sandbox::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -92,10 +99,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use minimald::net::switch::{SessionGate, attach_to_switch, open_tap, tap_netns_commands};
+use boxes::BoxPolicy;
+use minimald::net::switch::{BoxGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 use minimald::nsenter::GROUP_GRACE;
-use sessions::SessionPolicy;
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
 /// default `cargo test` run (and this sandbox) never attempts privileged netns
@@ -520,7 +527,7 @@ fn proc_session_and_tty(pid: u32) -> (u32, i32) {
 ///
 /// The plan comes from the production provider, not the `NetPlan::none()`
 /// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
-/// to `sandbox2::NoNet` — a `--network none` session's box and a no-net
+/// to `sandbox::NoNet` — a `--network none` session's box and a no-net
 /// task's sandbox alike, since `task_network` goes through the same mapping —
 /// so this proof runs the exact plan a no-net task's sandbox is built with
 /// and pins that the task path is sealed like the session path.
@@ -537,7 +544,7 @@ async fn network_none_blocks_all_outside_sockets() {
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let no_net = sandbox2::NoNet
+    let no_net = sandbox::NoNet
         .plan()
         .await
         .expect("the production NoNet provider plans do not fail");
@@ -612,8 +619,8 @@ async fn network_none_attach_works() {
         return;
     }
     announce_to_the_runner("network_none_attach_works");
+    use minimald::box_runtime::{Pty, WinSize};
     use minimald::nsenter::{Injection, session_leader_pid};
-    use minimald::session_host::{Pty, WinSize};
     use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
@@ -638,7 +645,7 @@ async fn network_none_attach_works() {
     let mut container = sandbox
         .new_container(&plan)
         .expect("building none-box container");
-    // The session host's own sequence (session_host.rs:2207): the box becomes
+    // The session host's own sequence (box_runtime.rs:2207): the box becomes
     // its own session leader *before* `Sandbox::command` builds the command
     // whose program the seccomp closure swap replaces, so the swap is what has
     // to carry the runctl to the child hakoniwa forks.
@@ -663,7 +670,7 @@ async fn network_none_attach_works() {
     // The terminal the launch hands the box, on stdin — the fd hakoniwa's
     // `TIOCSCTTY` acts on, so `Runctl::NewSession` can make it the box's
     // controlling terminal.  A real session wires stdout and stderr to the
-    // same slave (session_host.rs:2256-2260); stdout stays a pipe here so the
+    // same slave (box_runtime.rs:2256-2260); stdout stays a pipe here so the
     // report below arrives byte-exact, and the box's stdin — the one the
     // terminal dance needs — is the part this proof exercises.  The pair
     // outlives the box: closing the master while the box runs would SIGHUP it.
@@ -1120,7 +1127,7 @@ impl Drop for LiveBox {
 /// mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_process_lacks_cap_net_raw() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping injected_process_lacks_cap_net_raw: this host denies the \
              unprivileged user namespace every sandbox starts by unsharing: \
@@ -1298,7 +1305,7 @@ const GROUP_KILL_MARKER: &str = "/tmp/group-kill-marker";
 /// `None` when the host denies the unprivileged user namespace every sandbox
 /// starts by unsharing; the caller skips.
 async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOutcome> {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping {name}: this host denies the unprivileged user namespace \
              every sandbox starts by unsharing: {reason}"
@@ -1560,7 +1567,7 @@ async fn a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace() {
 /// hakoniwa's mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joined_process_refuses_namespace_bypass_families() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping joined_process_refuses_namespace_bypass_families: this \
              host denies the unprivileged user namespace every sandbox starts \
@@ -1724,7 +1731,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
 /// A no-network task cannot reach the internet.
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
-/// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for an
+/// `CLONE_NEWNET` syscall that `sandbox::new_container` calls for an
 /// isolating plan. If `new_container` stopped calling `CLONE_NEWNET`, the
 /// `isolates_netns` assertion would no longer match the actual namespacing
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
@@ -1738,10 +1745,10 @@ async fn netns_nonet_refuses_egress() {
 
     // The production decision under test: `NoNet` plans an isolated network
     // namespace, `HostNet` a shared one.
-    assert!(sandbox2::NoNet.plan().await.unwrap().isolates_netns());
-    assert!(!sandbox2::HostNet.plan().await.unwrap().isolates_netns());
+    assert!(sandbox::NoNet.plan().await.unwrap().isolates_netns());
+    assert!(!sandbox::HostNet.plan().await.unwrap().isolates_netns());
 
-    // Exercise the same OS primitive that sandbox2::new_container uses for NoNet
+    // Exercise the same OS primitive that sandbox::new_container uses for NoNet
     // (CLONE_NEWNET via unshare): enter a fresh, empty network namespace and
     // attempt egress. The namespace has only a down lo and no routes, so the
     // TCP connect must fail with ENETUNREACH — the same contract new_container
@@ -1776,7 +1783,7 @@ async fn netns_ownip_ptask_to_ptask() {
         return;
     }
     announce_to_the_runner("netns_ownip_ptask_to_ptask");
-    use sessions::{IngressPolicy, IpProto, PortMapping};
+    use boxes::{IngressPolicy, IpProto, PortMapping};
 
     let state = tempfile::tempdir().expect("switch state dir");
 
@@ -1796,8 +1803,8 @@ async fn netns_ownip_ptask_to_ptask() {
     // inbound listeners. PTask B declares the port its listener sits on inbound,
     // which is what the inbound gate needs to admit A's connection.
     const PORT: u16 = 9009;
-    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &SessionPolicy::default()).await;
-    let b_policy = SessionPolicy {
+    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &BoxPolicy::default()).await;
+    let b_policy = BoxPolicy {
         ingress: Some(IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: PORT,
@@ -1871,8 +1878,8 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         return;
     }
     announce_to_the_runner("netns_ingress_static_port_mapping_exposes_then_unexposes");
+    use boxes::{IngressPolicy, IpProto, PortMapping};
     use minimald::net::policy::{ControlChannel, apply_ingress, remove_ingress};
-    use sessions::{IngressPolicy, IpProto, PortMapping};
 
     const INTERNAL: u16 = 80;
     const EXTERNAL: u16 = 18080;
@@ -1888,7 +1895,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // targets the PTask's `INTERNAL` listener — so the inbound gate must see
     // that port declared or the proof's own gate would drop the connection it
     // exists to expose.
-    let gate_policy = SessionPolicy {
+    let gate_policy = BoxPolicy {
         ingress: Some(IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: EXTERNAL,
@@ -2014,14 +2021,14 @@ impl Ptask {
         lease: PtaskLease,
         subnet: SwitchSubnet,
         api_sock: &std::path::Path,
-        policy: &SessionPolicy,
+        policy: &BoxPolicy,
     ) -> Self {
         let tap = format!("tap-{name}");
         let _ = sudo(&["ip", "link", "del", &tap]);
 
         // Create the PTask's network namespace the way the production path does:
         // a process that `unshare`s `CLONE_NEWNET` (the same syscall
-        // `sandbox2::new_container` issues for OwnIp) and then lingers, so its
+        // `sandbox::new_container` issues for OwnIp) and then lingers, so its
         // PID identifies `/proc/<pid>/ns/net` for the move/config below.
         let (netns_pid, holder) = spawn_netns_holder();
 
@@ -2051,7 +2058,7 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
+        let gate = BoxGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
         let relay = attach_to_switch(
             fd,
             api_sock,
@@ -2111,7 +2118,7 @@ impl Ptask {
 }
 
 /// Spawns a long-lived process in a fresh network namespace (the same
-/// `CLONE_NEWNET` `sandbox2::new_container` unshares for `OwnIp`/`NoNet`) and
+/// `CLONE_NEWNET` `sandbox::new_container` unshares for `OwnIp`/`NoNet`) and
 /// returns its host PID plus the wrapper handle. `/proc/<pid>/ns/net` is the
 /// PTask netns the production launcher targets.
 fn spawn_netns_holder() -> (u32, std::process::Child) {

@@ -13,8 +13,8 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 #[cfg(target_os = "linux")]
-use sandbox2::Container;
-use sandbox2::config::{Invocation, SandboxMapped};
+use sandbox::Container;
+use sandbox::config::{Invocation, SandboxMapped};
 use tempfile::TempDir;
 
 struct EnvChannel<'a> {
@@ -377,7 +377,7 @@ impl EnvChannel<'_> {
                     Some(&task.vars),
                     task.packages.clone(),
                     // A nested `min task` inside a bound-dir sandbox: paths
-                    // are mirrored one-for-one and sandbox2 gave this process
+                    // are mirrored one-for-one and `sandbox` gave this process
                     // the outer environment's `HOME`, so the ambient home is
                     // the outer home, which is the one `~/` meant all along.
                     PatchHome::Ambient,
@@ -403,7 +403,7 @@ impl EnvChannel<'_> {
     }
 }
 
-impl sandbox2::Channel for EnvChannel<'_> {
+impl sandbox::Channel for EnvChannel<'_> {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path) {
         // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
 
@@ -527,7 +527,7 @@ impl sandbox2::Channel for EnvChannel<'_> {
 /// run by the daemon sees the same paths the interactive session does rather
 /// than the daemon's internal tree.
 ///
-/// [`WdSetup`]: sandbox2::config::WdSetup
+/// [`WdSetup`]: sandbox::config::WdSetup
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum WdLayout {
     /// Mirror host paths one-for-one; the working directory is [`EnvArgs::cwd`].
@@ -552,12 +552,12 @@ pub enum WdLayout {
 /// whose host path lies inside `home` or `working` is retargeted to the same
 /// place under `/home` or `/workbench` (see [`session_mapping`]).
 fn apply_wd_layout(
-    config: sandbox2::config::Config,
+    config: sandbox::config::Config,
     layout: &WdLayout,
     cwd: &Path,
     home: Option<&Path>,
     fs_mappings: Vec<common::FsMapping>,
-) -> sandbox2::config::Config {
+) -> sandbox::config::Config {
     match layout {
         WdLayout::BoundDir => config
             .with_wd(cwd.to_path_buf(), false, fs_mappings)
@@ -584,8 +584,8 @@ fn session_mapping(mut m: common::FsMapping, home: &Path, working: &Path) -> com
         return m;
     }
     let mut bases = [
-        (home, sandbox2::SESSION_HOME),
-        (working, sandbox2::SESSION_DEFAULT_WD),
+        (home, sandbox::SESSION_HOME),
+        (working, sandbox::SESSION_DEFAULT_WD),
     ];
     bases.sort_by_key(|(base, _)| std::cmp::Reverse(base.as_os_str().len()));
     let host = Path::new(&m.host_path);
@@ -628,8 +628,8 @@ pub struct EnvArgs<'a> {
 
     /// The sandbox's network provider. Decides the namespace, the tap and the
     /// resolver the sandbox gets, and does any post-spawn wiring; see
-    /// [`sandbox2::Network`].
-    pub network: std::sync::Arc<dyn sandbox2::Network>,
+    /// [`sandbox::Network`].
+    pub network: std::sync::Arc<dyn sandbox::Network>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
 }
@@ -638,6 +638,27 @@ pub struct EnvArgs<'a> {
 /// the task's parameters — `task_packages` plus any `parsed_args` — so that
 /// `%{name}`-style placeholders are resolved.
 ///
+/// Argument values are data, never code, so how a value reaches the
+/// program depends on the action:
+///
+/// - An `exec` single string is split into argv words first, with every
+///   string value standing in as an opaque token, and each value then fills
+///   in the one word its reference sits in. The result is a list-form
+///   `exec`: no shell runs, and a value never adds, removes or splits a
+///   word, whatever it holds and however the reference is quoted.
+/// - A `bash` script never has a value spliced into it: a string reference
+///   expands to the shell variable `${MIN_ARG_<NAME>}`, and the value is
+///   bound in the action's environment by [`task_arg_env`].
+/// - `echo`, list-form `exec` and `cmdcmd` actions take values verbatim;
+///   their runners start no shell.
+///
+/// Numbers, booleans and enum values keep their real values in every
+/// action: number and boolean text cannot carry shell syntax, and an enum
+/// value is one of the author's own permitted values. Only string values
+/// stand in as a token or a variable reference while the Nickel expression
+/// evaluates, so an expression that compares, measures or parses a string
+/// argument does not see its value.
+///
 /// Shared by the invocation path ([`Env::task_invocations`]) and the
 /// sandbox-free `echo` short-circuits, so an echoed string is interpolated
 /// the same way an `exec`/`bash` action would be.
@@ -645,7 +666,227 @@ pub fn interpolate_task_strings(
     task: &mfile::Task,
     parsed_args: Option<&args::ArgsSet>,
 ) -> Result<mfile::Task, Error> {
-    let base = [(
+    let args = parsed_args
+        .map(|args| args.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    match &task.action {
+        mfile::TaskAction::Exec(mfile::StrOrList::Single(template)) => {
+            if template.contains([SENTINEL_OPEN, SENTINEL_CLOSE]) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "exec string contains a reserved character (U+E000 or U+E001): {template}"
+                )));
+            }
+            let mut values = Vec::new();
+            let bound: Vec<_> = args
+                .into_iter()
+                .map(|(k, v)| (k.as_str(), sentinel_arg(v, &mut values)))
+                .collect();
+            let var_ctx = task_var_ctx(task, bound);
+            let interpolated = eval_task_string(&var_ctx, template).map_err(Error::Other)?;
+            let argv = shlex::Shlex::new(interpolated.trim())
+                .map(|word| fill_sentinels(&word, &values))
+                .collect();
+            Ok(mfile::Task {
+                action: mfile::TaskAction::Exec(mfile::StrOrList::Multiple(argv)),
+                ..task.clone()
+            })
+        }
+        mfile::TaskAction::Bash(_) => {
+            // Checked here as well as where the environment is built, so a
+            // colliding pair fails before anything runs.
+            check_arg_env_names(&args).map_err(Error::Other)?;
+            let bound: Vec<_> = args
+                .into_iter()
+                .map(|(k, v)| (k.as_str(), env_reference_arg(k, v)))
+                .collect();
+            let var_ctx = task_var_ctx(task, bound);
+            task.map_exec_strings(|s| eval_task_string(&var_ctx, s))
+        }
+        _ => {
+            let bound: Vec<_> = args
+                .into_iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            let var_ctx = task_var_ctx(task, bound);
+            task.map_exec_strings(|s| eval_task_string(&var_ctx, s))
+        }
+    }
+    .map_err(Error::Other)
+}
+
+/// The environment a `bash` action's argument references read: one
+/// variable per argument, holding its value as data.
+///
+/// A scalar or enum argument `name` binds `MIN_ARG_<NAME>`, where `<NAME>`
+/// is the argument name uppercased with every character outside `A-Z`/`0-9`
+/// replaced by `_`. An array argument binds `MIN_ARG_<NAME>_COUNT` to its
+/// length and `MIN_ARG_<NAME>_<i>` to element `i`, counting from 0. Two
+/// arguments that would bind the same variable are refused.
+pub fn task_arg_env(
+    parsed_args: Option<&args::ArgsSet>,
+) -> Result<BTreeMap<String, String>, Error> {
+    let args = parsed_args
+        .map(|args| args.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    check_arg_env_names(&args).map_err(Error::Other)?;
+    let mut env = BTreeMap::new();
+    for (name, arg) in args {
+        let var = arg_env_name(name);
+        match arg {
+            args::Arg::Scalar(s) => {
+                env.insert(var, scalar_text(s));
+            }
+            args::Arg::Enum(s) => {
+                env.insert(var, s.clone());
+            }
+            args::Arg::Array(items) => {
+                env.insert(format!("{var}_COUNT"), items.len().to_string());
+                for (i, item) in items.iter().enumerate() {
+                    env.insert(format!("{var}_{i}"), scalar_text(item));
+                }
+            }
+        }
+    }
+    Ok(env)
+}
+
+/// The variable a `bash` action binds argument `name` to; see
+/// [`task_arg_env`].
+fn arg_env_name(name: &str) -> String {
+    let upper: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("MIN_ARG_{upper}")
+}
+
+/// Refuses two arguments that would bind the same variable (`a-b` and
+/// `a_b`, or array `a` and scalar `a_0`).
+fn check_arg_env_names(args: &[(&String, &args::Arg)]) -> Result<(), anyhow::Error> {
+    let mut owners: BTreeMap<String, &str> = BTreeMap::new();
+    for (name, arg) in args {
+        let var = arg_env_name(name);
+        let vars = match arg {
+            args::Arg::Array(items) => std::iter::once(format!("{var}_COUNT"))
+                .chain((0..items.len()).map(|i| format!("{var}_{i}")))
+                .collect(),
+            _ => vec![var],
+        };
+        for v in vars {
+            if let Some(other) = owners.insert(v.clone(), name.as_str()) {
+                anyhow::bail!(
+                    "task arguments `{other}` and `{name}` both bind the environment \
+                     variable `{v}`; rename one of them"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The text a scalar value takes in an environment variable.
+fn scalar_text(s: &args::ScalarArg) -> String {
+    match s {
+        args::ScalarArg::String(s) => s.clone(),
+        args::ScalarArg::Number(n) => n.to_string(),
+        args::ScalarArg::Boolean(b) => b.to_string(),
+    }
+}
+
+/// Binds a `bash` argument for Nickel: each string becomes a reference to
+/// the variable [`task_arg_env`] holds it in, so the script carries the
+/// reference and never the value. An enum value is bound as it is.
+fn env_reference_arg(name: &str, arg: &args::Arg) -> args::Arg {
+    let var = arg_env_name(name);
+    let reference = |v: String| args::ScalarArg::String(format!("${{{v}}}"));
+    match arg {
+        args::Arg::Scalar(args::ScalarArg::String(_)) => args::Arg::Scalar(reference(var)),
+        // Validated against the author's permitted set, so author text.
+        args::Arg::Enum(_) => arg.clone(),
+        args::Arg::Scalar(other) => args::Arg::Scalar(other.clone()),
+        args::Arg::Array(items) => args::Arg::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    args::ScalarArg::String(_) => reference(format!("{var}_{i}")),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Open and close the token a string value stands in as while an `exec`
+/// string is split into words. Private-use characters: shlex treats them
+/// as ordinary word characters, and an author has no reason to type them.
+const SENTINEL_OPEN: char = '\u{E000}';
+const SENTINEL_CLOSE: char = '\u{E001}';
+
+/// Binds an `exec` argument for Nickel: each string becomes an opaque
+/// token naming its slot in `values`, which [`fill_sentinels`] swaps back
+/// once the words are split. An enum value is bound as it is.
+fn sentinel_arg(arg: &args::Arg, values: &mut Vec<String>) -> args::Arg {
+    let mut token = |v: &str| {
+        values.push(v.to_string());
+        format!("{SENTINEL_OPEN}{}{SENTINEL_CLOSE}", values.len() - 1)
+    };
+    match arg {
+        args::Arg::Scalar(args::ScalarArg::String(s)) => {
+            args::Arg::Scalar(args::ScalarArg::String(token(s)))
+        }
+        // Validated against the author's permitted set, so author text.
+        args::Arg::Enum(_) => arg.clone(),
+        args::Arg::Scalar(other) => args::Arg::Scalar(other.clone()),
+        args::Arg::Array(items) => args::Arg::Array(
+            items
+                .iter()
+                .map(|item| match item {
+                    args::ScalarArg::String(s) => args::ScalarArg::String(token(s)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Replaces each token [`sentinel_arg`] made in one split word with the
+/// value it stands for. Text that is not a whole token stays as it is.
+fn fill_sentinels(word: &str, values: &[String]) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(start) = rest.find(SENTINEL_OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + SENTINEL_OPEN.len_utf8()..];
+        let filled = after.find(SENTINEL_CLOSE).and_then(|end| {
+            let value = values.get(after[..end].parse::<usize>().ok()?)?;
+            Some((value, end))
+        });
+        match filled {
+            Some((value, end)) => {
+                out.push_str(value);
+                rest = &after[end + SENTINEL_CLOSE.len_utf8()..];
+            }
+            None => {
+                out.push(SENTINEL_OPEN);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The Nickel context a task's strings evaluate in: `task_packages` plus
+/// the arguments as `bound`.
+fn task_var_ctx(task: &mfile::Task, bound: Vec<(&str, args::Arg)>) -> common::ncl_eval::VarCtx {
+    let base = (
         "task_packages",
         args::Arg::Array(
             task.packages
@@ -653,31 +894,25 @@ pub fn interpolate_task_strings(
                 .map(|s| args::ScalarArg::String(s.clone()))
                 .collect(),
         ),
-    )]
-    .into_iter();
-    let var_ctx = if let Some(args) = parsed_args {
-        common::ncl_eval::VarCtx::from_iter(
-            base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
-        )
-    } else {
-        common::ncl_eval::VarCtx::from_iter(base)
-    };
-    task.map_exec_strings(|s| {
-        var_ctx.eval_string(s).map_err(|_| {
-            if s.contains("%{") {
-                anyhow::anyhow!(
-                    "nickel eval failed for string: {s}\n\
-                     note: command strings are Nickel-evaluated, so `%{{` opens an \
-                     interpolation even when the task defines no matching arg; to keep a \
-                     literal `%{{` (as in curl's `-w \"%{{http_code}}\"`), escape it as \
-                     `%{{\"%\"}}{{http_code}}` — see docs/reference/tasks.md"
-                )
-            } else {
-                anyhow::anyhow!("nickel eval failed for string: {s}")
-            }
-        })
+    );
+    common::ncl_eval::VarCtx::from_iter(std::iter::once(base).chain(bound))
+}
+
+/// Evaluates one task string, pointing a failed `%{` at its escape.
+fn eval_task_string(var_ctx: &common::ncl_eval::VarCtx, s: &str) -> Result<String, anyhow::Error> {
+    var_ctx.eval_string(s).map_err(|_| {
+        if s.contains("%{") {
+            anyhow::anyhow!(
+                "nickel eval failed for string: {s}\n\
+                 note: command strings are Nickel-evaluated, so `%{{` opens an \
+                 interpolation even when the task defines no matching arg; to keep a \
+                 literal `%{{` (as in curl's `-w \"%{{http_code}}\"`), escape it as \
+                 `%{{\"%\"}}{{http_code}}` — see docs/reference/tasks.md"
+            )
+        } else {
+            anyhow::anyhow!("nickel eval failed for string: {s}")
+        }
     })
-    .map_err(Error::Other)
 }
 
 /// Names whoever put a patch path into the environment: the package that
@@ -715,12 +950,12 @@ struct DeclaredMapping<'a> {
 /// back to the first declaration when nothing narrows it (the common case:
 /// exactly one declaration at that path).
 fn attribute_fs_mapping_error(
-    e: &sandbox2::Error,
+    e: &sandbox::Error,
     declarations: &BTreeMap<String, Vec<DeclaredMapping<'_>>>,
     fs_mapping_packages: &BTreeMap<String, String>,
     task: &str,
 ) -> Option<Error> {
-    let sandbox2::Error::IO(op, path, io_err) = e else {
+    let sandbox::Error::IO(op, path, io_err) = e else {
         return None;
     };
     let candidates = path.to_str().and_then(|p| declarations.get(p))?;
@@ -765,7 +1000,7 @@ pub enum PatchHome {
     ///
     /// The right answer for `mip` run by a developer: the sandbox mirrors
     /// host paths one-for-one (`WdSetup::BoundDir`), so the home a package
-    /// means by `~` *is* the invoking user's, and sandbox2 synthesizes the
+    /// means by `~` *is* the invoking user's, and `sandbox` synthesizes the
     /// same home into the sandbox's passwd. An unset `HOME` leaves no home at
     /// all, which is an error for a `~/`-rooted mapping and fine for anything
     /// else.
@@ -776,7 +1011,7 @@ pub enum PatchHome {
     ///
     /// [`Daemon`]-realm because that is the filesystem the daemon assembles
     /// the sandbox on, and because it is the realm the session already tracks
-    /// its home in (`SessionPaths::home`, `minimald::env::EnvArgs::home`) —
+    /// its home in (`BoxPaths::home`, `minimald::env::EnvArgs::home`) —
     /// so it arrives here without a conversion that could launder the realm.
     ///
     /// [`Daemon`]: paths::Daemon
@@ -797,7 +1032,7 @@ impl PatchHome {
 
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
-    sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
+    sandbox: sandbox::Sandbox<EnvChannel<'a>>,
     temp_dirs: Vec<TempDir>,
 }
 
@@ -860,7 +1095,7 @@ impl<'a> Env<'a> {
                 declared_by(&fs_mapping_packages, &e.declared, args.name)
             ))
         })?;
-        // Expanded path → the declaration(s) behind it. sandbox2 only ever
+        // Expanded path → the declaration(s) behind it. `sandbox` only ever
         // sees the expanded form, so its fs-mapping failures name a path
         // nobody wrote down; this puts the `~/`-rooted declaration back
         // into the message. A path can carry more than one declaration (a
@@ -895,7 +1130,7 @@ impl<'a> Env<'a> {
             });
 
         let mut config = apply_wd_layout(
-            sandbox2::config::Config::new(args.name),
+            sandbox::config::Config::new(args.name),
             &args.wd_layout,
             &args.cwd,
             home.as_deref(),
@@ -980,24 +1215,30 @@ impl<'a> Env<'a> {
     ) -> Result<(bool, Vec<Invocation>), Error> {
         let mapped_task = interpolate_task_strings(task, parsed_args)?;
 
-        Ok((
-            task.interactive,
-            op::TaskEnv {
-                task: &mapped_task,
-                sandbox: &mut self.sandbox,
+        let mut invocations = op::TaskEnv {
+            task: &mapped_task,
+            sandbox: &mut self.sandbox,
+        }
+        .resolve()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?;
+        // A `bash` script reads its arguments from these variables; see
+        // [`interpolate_task_strings`].
+        if matches!(task.action, mfile::TaskAction::Bash(_)) {
+            let arg_env = task_arg_env(parsed_args)?;
+            for inv in &mut invocations {
+                inv.envs.extend(arg_env.clone());
             }
-            .resolve()
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?,
-        ))
+        }
+        Ok((task.interactive, invocations))
     }
 
     /// Step 1 of a launch: the provider's plan, with its release owed. See
-    /// [`sandbox2::Sandbox::plan_launch`].
+    /// [`sandbox::Sandbox::plan_launch`].
     #[cfg(target_os = "linux")]
     pub fn plan_launch(
         &self,
-    ) -> impl std::future::Future<Output = Result<sandbox2::PlannedLaunch, Error>> + Send + 'static
+    ) -> impl std::future::Future<Output = Result<sandbox::PlannedLaunch, Error>> + Send + 'static
     {
         let planned = self.sandbox.plan_launch();
         async move { planned.await.map_err(Error::from) }
@@ -1007,7 +1248,7 @@ impl<'a> Env<'a> {
     /// `plan`. One *spawn* is what gets a namespace, so a caller running
     /// several invocations needs a container per plan.
     #[cfg(target_os = "linux")]
-    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> Result<Container, Error> {
+    pub fn container(&mut self, plan: &sandbox::NetPlan) -> Result<Container, Error> {
         self.sandbox
             .new_container(plan)
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
@@ -1019,13 +1260,31 @@ impl<'a> Env<'a> {
         container: &Container,
         program: &str,
         args: I,
-    ) -> Result<sandbox2::Command, Error>
+    ) -> Result<sandbox::Command, Error>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         self.sandbox
             .command(container, program, args, [("", ""); 0])
+            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
+    }
+
+    /// Builds the command for one invocation: its program, its argv and its
+    /// own environment variables ([`Invocation::envs`]).
+    #[cfg(target_os = "linux")]
+    pub fn invocation_command(
+        &mut self,
+        container: &Container,
+        invocation: &Invocation,
+    ) -> Result<sandbox::Command, Error> {
+        self.sandbox
+            .command(
+                container,
+                &invocation.executable,
+                &invocation.args,
+                &invocation.envs,
+            )
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
@@ -1138,7 +1397,7 @@ impl tokio::io::AsyncWrite for StreamWriter {
 mod tests {
     use super::*;
     use crate::ConfigBuilder;
-    use sandbox2::Channel;
+    use sandbox::Channel;
     use std::io::{BufRead, BufReader};
     use tempfile::tempdir;
 
@@ -1198,7 +1457,7 @@ mod tests {
     #[test]
     fn wd_layout_selects_session_or_bound_dir() {
         let session = apply_wd_layout(
-            sandbox2::config::Config::new("task"),
+            sandbox::config::Config::new("task"),
             &WdLayout::Session {
                 home: PathBuf::from("/var/lib/minimal/sessions/s1/home"),
                 working: PathBuf::from("/var/lib/minimal/sessions/s1/tree"),
@@ -1211,7 +1470,7 @@ mod tests {
         assert_eq!(session.sandbox_home(), "/home");
 
         let bound = apply_wd_layout(
-            sandbox2::config::Config::new("task"),
+            sandbox::config::Config::new("task"),
             &WdLayout::BoundDir,
             Path::new("/var/lib/minimal/sessions/s1/tree"),
             Some(Path::new("/home/dev")),
@@ -1225,7 +1484,7 @@ mod tests {
     }
 
     /// A task's `patch` table still applies under the session layout: every
-    /// mapping reaches sandbox2 with its declared mode, a mapping inside the
+    /// mapping reaches `sandbox` with its declared mode, a mapping inside the
     /// session home or tree is retargeted under `/home` or `/workbench`, and
     /// any other absolute path (a host socket) keeps its own path.
     #[test]
@@ -1240,7 +1499,7 @@ mod tests {
         let home = "/var/lib/minimal/sessions/s1/home";
         let working = "/var/lib/minimal/sessions/s1/tree";
         let config = apply_wd_layout(
-            sandbox2::config::Config::new("task"),
+            sandbox::config::Config::new("task"),
             &WdLayout::Session {
                 home: PathBuf::from(home),
                 working: PathBuf::from(working),
@@ -1254,7 +1513,7 @@ mod tests {
                 mapping("/var/run/docker.sock", false, true),
             ],
         );
-        let sandbox2::config::WdSetup::Session { fs_mappings, .. } = &config.wd else {
+        let sandbox::config::WdSetup::Session { fs_mappings, .. } = &config.wd else {
             panic!("expected the session layout, got {:?}", config.wd);
         };
         let placed: Vec<(String, bool)> = fs_mappings
@@ -1290,7 +1549,7 @@ mod tests {
         )]);
         let packages = BTreeMap::new();
 
-        let missing = sandbox2::Error::IO(
+        let missing = sandbox::Error::IO(
             "fs mapping",
             PathBuf::from("/home/dev/.aws"),
             std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1309,7 +1568,7 @@ mod tests {
             "task-own patch entry must be attributed to the task, got: {msg}"
         );
 
-        let create = sandbox2::Error::IO(
+        let create = sandbox::Error::IO(
             "create mapped file",
             PathBuf::from("/home/dev/.aws"),
             std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem),
@@ -1351,7 +1610,7 @@ mod tests {
         )]);
         let packages = BTreeMap::new();
 
-        let collision = sandbox2::Error::IO(
+        let collision = sandbox::Error::IO(
             "stat fs mapping",
             PathBuf::from("/home/dev/shared"),
             std::io::Error::new(
@@ -1405,11 +1664,18 @@ mod tests {
         };
         let resolved = interpolate_task_strings(&task, None)
             .expect("the escaped `%{` must evaluate successfully");
-        let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
-            panic!("expected a single exec string");
-        };
+        let (exec, argv) = resolved.exec_and_args().unwrap();
+        assert_eq!(exec, "/bin/curl");
         assert_eq!(
-            cmd, "curl -s -o /dev/null -w \"%{http_code}\" https://example.com",
+            argv,
+            [
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "https://example.com"
+            ],
             "the `%{{\"%\"}}{{...}}` escape should resolve to a literal `%{{http_code}}`"
         );
     }
@@ -1431,13 +1697,269 @@ mod tests {
         .unwrap();
         let task = mf.task("useparam").unwrap();
 
-        for (argv, want) in [("", "echo hi"), ("--greeting bye", "echo bye")] {
+        for (argv, want) in [("", "hi"), ("--greeting bye", "bye")] {
             let parsed = task.args.parse(argv).unwrap();
             let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
-            let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
-                panic!("expected a single exec string");
+            assert_eq!(
+                resolved.exec_and_args(),
+                Some(("/bin/echo".to_string(), vec![want.to_string()])),
+                "argv `{argv}`"
+            );
+        }
+    }
+
+    /// Argument values a hostile caller might pass: words, shell control
+    /// operators, command substitutions, both quote characters, and nothing.
+    /// `./victim` and `pwned` are relative, so a value that did run as code
+    /// would act inside the test's own temporary directory.
+    const HOSTILE: &[&str] = &[
+        "harmless",
+        "two words",
+        "x; rm -rf ./victim",
+        "$(touch pwned)",
+        "`touch pwned`",
+        "it's \"quoted\"",
+        "",
+    ];
+
+    /// Parses `--name <value>` against a one-string-arg schema.
+    fn name_arg(task: &mfile::Task, value: &str) -> args::ArgsSet {
+        task.args
+            .parse_argv_named("task", vec!["--name", value])
+            .unwrap()
+    }
+
+    /// A single `exec` string is split into words before any value is
+    /// filled in, so each `%{name}` lands in exactly the one argv entry it
+    /// sits in — unquoted, single-quoted or double-quoted, alone or joined
+    /// to other text — whatever the value holds.
+    #[test]
+    fn interpolate_exec_value_fills_exactly_one_argv_entry() {
+        let schema: args::ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+        for value in HOSTILE {
+            for (template, want) in [
+                ("runner %{name} run", value.to_string()),
+                ("runner '%{name}' run", value.to_string()),
+                ("runner \"%{name}\" run", value.to_string()),
+                ("runner --name=%{name} run", format!("--name={value}")),
+                ("runner '--name=%{name}' run", format!("--name={value}")),
+                ("runner \"--name=%{name}\" run", format!("--name={value}")),
+            ] {
+                let task = mfile::Task {
+                    action: mfile::TaskAction::exec_from_str(template),
+                    args: schema.clone(),
+                    ..Default::default()
+                };
+                let parsed = name_arg(&task, value);
+                let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+                assert_eq!(
+                    resolved.exec_and_args(),
+                    Some(("/bin/runner".to_string(), vec![want, "run".to_string()])),
+                    "template {template:?}, value {value:?}"
+                );
+            }
+        }
+    }
+
+    /// An array joined into a single `exec` string yields one argv entry
+    /// per element, each element intact.
+    #[test]
+    fn interpolate_exec_array_elements_stay_whole() {
+        let schema: args::ArgsSpec = toml::from_str("files = \"Array string\"").unwrap();
+        let task = mfile::Task {
+            action: mfile::TaskAction::exec_from_str("runner %{std.string.join \" \" files} done"),
+            args: schema,
+            ..Default::default()
+        };
+        let mut argv = Vec::new();
+        for v in HOSTILE {
+            argv.extend(["--files", v]);
+        }
+        let parsed = task.args.parse_argv_named("task", argv).unwrap();
+        let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+        let mut want: Vec<String> = HOSTILE.iter().map(|v| v.to_string()).collect();
+        want.push("done".to_string());
+        assert_eq!(
+            resolved.exec_and_args(),
+            Some(("/bin/runner".to_string(), want))
+        );
+    }
+
+    /// Runs `script` the way a `bash` action runs — `bash -c` with the
+    /// task's argument environment — in a fresh directory holding a
+    /// `victim` file, and returns its stdout. Fails if the script created
+    /// `pwned` or removed `victim`, which only a value run as code would do.
+    fn run_bash_action(task: &mfile::Task, parsed: &args::ArgsSet) -> String {
+        let resolved = interpolate_task_strings(task, Some(parsed)).unwrap();
+        let mfile::TaskAction::Bash(script) = &resolved.action else {
+            panic!("expected a bash action");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("victim"), "").unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .envs(task_arg_env(Some(parsed)).unwrap())
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "script {script:?} failed: {out:?}");
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "script {script:?} ran a value as code"
+        );
+        assert!(
+            dir.path().join("victim").exists(),
+            "script {script:?} ran a value as code"
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A `bash` script never carries a value, only a reference to the
+    /// variable holding it, so no value runs as code in any quoting
+    /// context. Double-quoted, the value arrives whole; unquoted, it is
+    /// word-split like any unquoted variable; single-quoted, the reference
+    /// itself is printed.
+    #[test]
+    fn interpolate_bash_value_never_runs_as_code() {
+        let schema: args::ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+        for value in HOSTILE {
+            let split: String = match value.split_whitespace().collect::<Vec<_>>() {
+                words if words.is_empty() => "[]\n".to_string(),
+                words => words.iter().map(|w| format!("[{w}]\n")).collect(),
             };
-            assert_eq!(cmd, want, "argv `{argv}`");
+            for (script, want) in [
+                ("printf '[%s]\\n' \"%{name}\"", format!("[{value}]\n")),
+                (
+                    "printf '[%s]\\n' \"Hello %{name}!\"",
+                    format!("[Hello {value}!]\n"),
+                ),
+                ("printf '[%s]\\n' %{name}", split),
+                (
+                    "printf '[%s]\\n' '%{name}'",
+                    "[${MIN_ARG_NAME}]\n".to_string(),
+                ),
+            ] {
+                let task = mfile::Task {
+                    action: mfile::TaskAction::Bash(script.to_string()),
+                    args: schema.clone(),
+                    ..Default::default()
+                };
+                let parsed = name_arg(&task, value);
+                assert_eq!(
+                    run_bash_action(&task, &parsed),
+                    want,
+                    "script {script:?}, value {value:?}"
+                );
+            }
+        }
+    }
+
+    /// Array arguments bind one variable per element plus a count, and an
+    /// element reference expands to its own variable.
+    #[test]
+    fn interpolate_bash_array_elements_bind_one_variable_each() {
+        let schema: args::ArgsSpec = toml::from_str("files = \"Array string\"").unwrap();
+        let task = mfile::Task {
+            action: mfile::TaskAction::Bash(
+                "printf '[%s]\\n' \"$MIN_ARG_FILES_COUNT\" \"%{std.array.at 2 files}\" \
+                 \"%{std.array.at 3 files}\""
+                    .to_string(),
+            ),
+            args: schema,
+            ..Default::default()
+        };
+        let mut argv = Vec::new();
+        for v in HOSTILE {
+            argv.extend(["--files", v]);
+        }
+        let parsed = task.args.parse_argv_named("task", argv).unwrap();
+        assert_eq!(
+            run_bash_action(&task, &parsed),
+            format!("[{}]\n[{}]\n[{}]\n", HOSTILE.len(), HOSTILE[2], HOSTILE[3])
+        );
+    }
+
+    /// Two argument names that map to the same variable are refused rather
+    /// than letting one value shadow the other.
+    #[test]
+    fn interpolate_bash_refuses_colliding_arg_variables() {
+        let schema: args::ArgsSpec = toml::from_str("a-b = \"string\"\na_b = \"string\"").unwrap();
+        let task = mfile::Task {
+            action: mfile::TaskAction::Bash("echo \"%{a_b}\"".to_string()),
+            args: schema,
+            ..Default::default()
+        };
+        let parsed = task
+            .args
+            .parse_argv_named("task", vec!["--a-b", "x", "--a_b", "y"])
+            .unwrap();
+        let err = interpolate_task_strings(&task, Some(&parsed)).expect_err("names collide");
+        assert!(
+            format!("{err}").contains("MIN_ARG_A_B"),
+            "error should name the variable, got: {err}"
+        );
+        assert!(task_arg_env(Some(&parsed)).is_err());
+    }
+
+    /// An enum value is one of the author's permitted values, so a Nickel
+    /// expression sees the real value and takes the branch it selects, in
+    /// `exec` and in `bash`; `bash` still binds `MIN_ARG_<NAME>` for it.
+    #[test]
+    fn interpolate_enum_value_reaches_nickel_expressions() {
+        let schema: args::ArgsSpec = toml::from_str("profile = \"[debug, release]\"").unwrap();
+        let branch = "%{if profile == \"release\" then \"--release\" else \"--debug\"}";
+        for (value, want) in [("release", "--release"), ("debug", "--debug")] {
+            let exec = mfile::Task {
+                action: mfile::TaskAction::exec_from_str(&format!("runner {branch} done")),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            let parsed = exec
+                .args
+                .parse_argv_named("task", vec!["--profile", value])
+                .unwrap();
+            let resolved = interpolate_task_strings(&exec, Some(&parsed)).unwrap();
+            assert_eq!(
+                resolved.exec_and_args(),
+                Some((
+                    "/bin/runner".to_string(),
+                    vec![want.to_string(), "done".to_string()]
+                )),
+                "exec, profile {value:?}"
+            );
+
+            let bash = mfile::Task {
+                action: mfile::TaskAction::Bash(format!(
+                    "printf '[%s]\\n' {branch} \"$MIN_ARG_PROFILE\""
+                )),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                run_bash_action(&bash, &parsed),
+                format!("[{want}]\n[{value}]\n"),
+                "bash, profile {value:?}"
+            );
+        }
+    }
+
+    /// `echo` runs no shell, so the value is printed verbatim.
+    #[test]
+    fn interpolate_echo_value_is_verbatim() {
+        let schema: args::ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+        for value in HOSTILE {
+            let task = mfile::Task {
+                action: mfile::TaskAction::Echo("Hello %{name}!".to_string()),
+                args: schema.clone(),
+                ..Default::default()
+            };
+            let parsed = name_arg(&task, value);
+            let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+            assert_eq!(
+                resolved.action.as_echo(),
+                Some(format!("Hello {value}!").as_str())
+            );
         }
     }
 

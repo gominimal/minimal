@@ -10,16 +10,16 @@
 //! ## The in-sandbox `min` command channel
 //!
 //! Packages, tasks and checks can be driven from *inside* a running session via
-//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox2`]'s listener
+//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox`]'s listener
 //! is synchronous — a blocking `accept()` loop on its own OS thread — which is
 //! why the equivalent handler in `mctx` has to spin up a fresh tokio runtime per
 //! command. Here we bridge that synchronous world to the daemon's async runtime
 //! with an actor:
 //!
-//! - [`BridgeChannel`] is the trivial synchronous [`sandbox2::Channel`]. For each
+//! - [`BridgeChannel`] is the trivial synchronous [`sandbox::Channel`]. For each
 //!   request it clones the connection and forwards it (with the request line)
 //!   down an mpsc to the actor, then returns immediately.
-//! - [`SessionChannel`] is the actor: it owns the context and graph and processes
+//! - [`BoxChannel`] is the actor: it owns the context and graph and processes
 //!   requests one at a time on the runtime, so every handler is a plain
 //!   `async fn` that `.await`s — no nested runtimes, no sync/async bridge writers.
 
@@ -33,6 +33,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
+use crate::traced::spawn_blocking;
 use camino::{Utf8Path, Utf8PathBuf};
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
@@ -40,11 +41,11 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
-use sandbox2::config::{ClassifierLeaf, Config, SandboxMapped};
-use sandbox2::{Container, Sandbox};
+use sandbox::config::{ClassifierLeaf, Config, SandboxMapped};
+use sandbox::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::JoinHandle;
 
 /// The min helper script installed at `/usr/bin/min` inside the sandbox.
 const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
@@ -103,9 +104,9 @@ const ATTACH_ENV_HOOK_POSIX: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\n[ -r ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     " ] && . ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     "\n: \n",
 );
 
@@ -119,9 +120,9 @@ const ATTACH_ENV_HOOK_BASH: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\n__minimal_attach_env() {\n    [ -r ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     " ] && . ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     "\n    return 0\n}\ntrap '__minimal_attach_env' DEBUG\n",
 );
 
@@ -169,9 +170,9 @@ const ATTACH_ENV_HOOK_ZSH: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\nautoload -Uz add-zsh-hook\n__minimal_attach_env() {\n    [ -r ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     " ] && . ",
-    crate::session_host::ATTACH_ENV_SH,
+    crate::box_runtime::ATTACH_ENV_SH,
     "\n}\nadd-zsh-hook precmd __minimal_attach_env\nadd-zsh-hook preexec __minimal_attach_env\n",
 );
 
@@ -181,13 +182,13 @@ const ATTACH_ENV_HOOK_FISH: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\nfunction __minimal_attach_env --on-event fish_prompt\n    test -r ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\n    and source ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\nend\nfunction __minimal_attach_env_preexec --on-event fish_preexec\n    test -r ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\n    and source ",
-    crate::session_host::ATTACH_ENV_FISH,
+    crate::box_runtime::ATTACH_ENV_FISH,
     "\nend\n",
 );
 
@@ -198,21 +199,21 @@ const ATTACH_ENV_HOOK_NU: &str = constcat::concat!(
     "# ",
     ATTACH_ENV_HOOK_MARKER,
     "\n$env.config.hooks.pre_prompt ++= [{||\n    let p = \"",
-    crate::session_host::ATTACH_ENV_JSON,
+    crate::box_runtime::ATTACH_ENV_JSON,
     "\"\n    if ($p | path exists) { load-env (open $p) }\n}]\n$env.config.hooks.pre_execution ++= [{||\n    let p = \"",
-    crate::session_host::ATTACH_ENV_JSON,
+    crate::box_runtime::ATTACH_ENV_JSON,
     "\"\n    if ($p | path exists) { load-env (open $p) }\n}]\n",
 );
 
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
-/// the same directory at [`SessionChannel::working`], so this is the prefix
+/// the same directory at [`BoxChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
-pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_DEFAULT_WD);
 
 /// Where the session's home directory appears inside the sandbox, backed by
-/// [`SessionChannel::home`]. The second of the two directories a sandbox path
+/// [`BoxChannel::home`]. The second of the two directories a sandbox path
 /// can name on the daemon's side.
-pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
 /// The parameters used to construct an [`Env`].
 ///
@@ -233,11 +234,15 @@ pub struct EnvArgs {
     patches: Option<EnvPatches>,
     env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
-    network: sandbox2::NetPlan,
+    network: sandbox::NetPlan,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
-    session: crate::session::WeakSessionHandle,
+    session: crate::box_actor::WeakBoxHandle,
+    /// The owning session's id, for the helper channel's request spans
+    /// (`session.id`), beside the box id: host-side facts about who is
+    /// asking, never read from the request.
+    session_id: Option<boxes::SessionId>,
     /// When true (default), [`Env::build`] consumes package
     /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
     /// When false, the caller supplies both via `env_vars` /
@@ -264,7 +269,7 @@ impl EnvArgs {
         cwd: impl Into<DaemonAbsPath>,
         home: impl Into<DaemonAbsPath>,
         state_base_dir: impl Into<DaemonAbsPath>,
-        session: crate::session::WeakSessionHandle,
+        session: crate::box_actor::WeakBoxHandle,
     ) -> Self {
         Self {
             name: name.into(),
@@ -276,11 +281,21 @@ impl EnvArgs {
             patches: None,
             env_vars: None,
             ot: None,
-            network: sandbox2::NetPlan::host(),
+            network: sandbox::NetPlan::host(),
             session,
+            session_id: None,
             include_package_attr_wiring: true,
             classifier_leaf: None,
         }
+    }
+
+    /// Names the owning session, so every helper request the box sends is
+    /// served in a span that carries `session.id` (the host's knowledge of
+    /// the asker, beside `box.id`).
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: boxes::SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
     }
 
     /// Opts out of consuming `env_vars` / `fs_mappings` from
@@ -350,7 +365,7 @@ impl EnvArgs {
     /// Sets what the session sandbox's network looks like when no provider
     /// decides it — a plan, because that is what the sandbox layer acts on.
     #[must_use]
-    pub fn with_network(mut self, plan: sandbox2::NetPlan) -> Self {
+    pub fn with_network(mut self, plan: sandbox::NetPlan) -> Self {
         self.network = plan;
         self
     }
@@ -383,7 +398,7 @@ pub struct Env {
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
     /// Variables the channel actor has added since launch; see
-    /// [`SessionChannel::runtime_env`].
+    /// [`BoxChannel::runtime_env`].
     runtime_env: RuntimeEnv,
     /// Extra directories kept alive for the environment's lifetime (e.g. a
     /// temporary `/state` directory). Dropped after the sandbox.
@@ -393,7 +408,7 @@ pub struct Env {
 /// Environment variables a *running* session has acquired, on top of the ones
 /// it was launched with. Usually happens due to `min add`.
 ///
-/// Shared between [`Env`] and the [`SessionChannel`] actor that learns of them.
+/// Shared between [`Env`] and the [`BoxChannel`] actor that learns of them.
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeEnv(Arc<Mutex<BTreeMap<String, String>>>);
 
@@ -431,14 +446,21 @@ fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<Str
 
 /// Looks up a session package by name in `graph`.
 ///
-/// The one lookup both [`Env::build`] (at launch) and session activation's
-/// finalize check use, so a name activation accepts is one the launch
-/// resolves, and both report an unknown name in the same words.
+/// The lookup [`Env::build`] uses at launch. Session activation's finalize
+/// check judges the same names against the same graph's names, and both
+/// word an unknown name through [`unknown_package`].
 pub(crate) fn session_package(graph: &Graph, name: &str) -> std::io::Result<BuildSpecRef> {
     graph
         .by_name(name)
         .copied()
-        .ok_or_else(|| std::io::Error::other(format!("no such package: {name}")))
+        .ok_or_else(|| unknown_package(name))
+}
+
+/// The error for a session package `name` the graph does not declare,
+/// shared by the launch ([`session_package`]) and the finalize check, so
+/// both report an unknown name in the same words.
+pub(crate) fn unknown_package(name: &str) -> std::io::Error {
+    std::io::Error::other(format!("no such package: {name}"))
 }
 
 impl Env {
@@ -586,7 +608,7 @@ impl Env {
         let command_cwd = sandbox.command_cwd().map_err(sandbox_err_to_io)?;
 
         let runtime_env = RuntimeEnv::default();
-        let channel = SessionChannel {
+        let channel = BoxChannel {
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(sandbox.rootfs().to_path_buf()).unwrap(),
             )
@@ -598,13 +620,19 @@ impl Env {
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
             box_id,
+            session_id: args.session_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
             ctx,
             graph,
             rx,
         };
-        let actor = tokio::spawn(channel.run());
+        // The actor serves the box's in-session `min` for the env's life, past
+        // the launch that built it: a root of its own, linked to the launch.
+        let actor = crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "session.env"),
+            channel.run(),
+        );
 
         Ok(Self {
             sandbox,
@@ -624,7 +652,7 @@ impl Env {
     }
 
     /// Creates a fresh container in this environment's sandbox.
-    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> std::io::Result<Container> {
+    pub fn container(&mut self, plan: &sandbox::NetPlan) -> std::io::Result<Container> {
         self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
     }
 
@@ -641,18 +669,18 @@ impl Env {
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn closure_report_path(
         &self,
-        leaf: &sandbox2::config::ClassifierLeaf,
+        leaf: &sandbox::config::ClassifierLeaf,
     ) -> std::path::PathBuf {
         self.sandbox.closure_report_path(leaf)
     }
 
     /// Holds the program of every command `container` spawns at a start gate
-    /// until the returned gate is released; see [`sandbox2::Sandbox::hold_start`].
+    /// until the returned gate is released; see [`sandbox::Sandbox::hold_start`].
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn hold_start(
         &self,
         container: &mut Container,
-    ) -> std::io::Result<sandbox2::StartGate> {
+    ) -> std::io::Result<sandbox::StartGate> {
         self.sandbox
             .hold_start(container)
             .map_err(sandbox_err_to_io)
@@ -662,7 +690,7 @@ impl Env {
     ///
     /// Exposed so the launcher can answer "is this shell installed in
     /// this session" before it spawns one
-    /// ([`crate::session_shell::resolve`]) — the same question
+    /// ([`crate::attach_shell::resolve`]) — the same question
     /// [`install_min_helpers`] answers about directories it writes into.
     /// Only meaningful once [`Env::build`] has returned: the rootfs is
     /// what that assembles.
@@ -694,10 +722,10 @@ impl Env {
     /// session **as it stands now** — `/workbench`, the composed session
     /// variables, and anything `min add` has installed since launch.
     #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn command_environment(&self) -> crate::session_host::SessionEnvironment {
+    pub(crate) fn command_environment(&self) -> crate::box_runtime::BoxEnvironment {
         let mut vars = self.sandbox.command_env();
         vars.extend(self.runtime_env.snapshot());
-        crate::session_host::SessionEnvironment {
+        crate::box_runtime::BoxEnvironment {
             cwd: self.command_cwd.clone(),
             vars,
         }
@@ -722,8 +750,8 @@ fn err_to_io(e: Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// Converts a [`sandbox2::Error`] into an [`std::io::Error`].
-fn sandbox_err_to_io(e: sandbox2::Error) -> std::io::Error {
+/// Converts a [`sandbox::Error`] into an [`std::io::Error`].
+fn sandbox_err_to_io(e: sandbox::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
@@ -820,8 +848,8 @@ struct ChannelRequest {
     stream: UnixStream,
 }
 
-/// The synchronous [`sandbox2::Channel`] that bridges the listener thread to the
-/// async [`SessionChannel`] actor. It does no work itself beyond handing each
+/// The synchronous [`sandbox::Channel`] that bridges the listener thread to the
+/// async [`BoxChannel`] actor. It does no work itself beyond handing each
 /// request off; the connection clone stays open in the actor until the handler
 /// finishes, at which point dropping it closes the connection and the client's
 /// `socat` sees EOF.
@@ -829,7 +857,7 @@ struct BridgeChannel {
     tx: mpsc::Sender<ChannelRequest>,
 }
 
-impl sandbox2::Channel for BridgeChannel {
+impl sandbox::Channel for BridgeChannel {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, _rootfs: &Path) {
         let stream = match stream.try_clone() {
             Ok(s) => s,
@@ -855,7 +883,7 @@ impl sandbox2::Channel for BridgeChannel {
 ///
 /// Owns the session's [`Context`] and [`Graph`] and processes one request at a
 /// time, so all of its handlers can be plain `async fn`s.
-struct SessionChannel {
+struct BoxChannel {
     ctx: Context,
     graph: Graph,
     /// The box's name, as the environment was built with it — the one fact
@@ -879,21 +907,107 @@ struct SessionChannel {
     /// in one, else the session's name — so the daemon's own fetches are
     /// recorded with the box that asked for them.
     box_id: String,
+    /// The owning session's id ([`EnvArgs::with_session_id`]); `None` for
+    /// an env built without one (tests).
+    session_id: Option<boxes::SessionId>,
     ot: Option<OpTracker>,
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
-    session: crate::session::WeakSessionHandle,
+    session: crate::box_actor::WeakBoxHandle,
     /// Accumulates env vars of newly-installed packages, shared with the owning [`Env`].
     runtime_env: RuntimeEnv,
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
-impl SessionChannel {
+/// The span one helper request is handled in, and the request with its
+/// trace prefix removed.
+///
+/// The helper (`env_min_helper.sh`, `__min_rpc`) sends
+/// `traceparent%<w3c traceparent>%<method>%<data>` when the box has a
+/// `TRACEPARENT` — the exec span's context, handed to the box by
+/// [`crate::exec`] — and the bare `<method>%<data>` otherwise. The actor runs
+/// for the env's life under its own `session.env` root, so without this a
+/// request's mailbox messages (`StartMaterialize`, `ExposeDynamic`) and the
+/// spans they open were children of that root, in a trace of their own
+/// (scenarios 717b and 770). Here the request gets a root of its own that
+/// adopts the forwarded context ([`crate::exec::adopt_trace`] records the
+/// ids and `remember`s them for [`crate::traced::caller_context`]), so the
+/// messages sent while handling it join the exec that ran the helper.
+///
+/// `box_id` and `session_id` are the host's own knowledge of who is asking
+/// (the channel was built for that box, by that session): they go on the
+/// span as `box.id` and `session.id`, and nothing the box sends can set
+/// them. The box-supplied part of the line (the traceparent) only parents
+/// the span, and the method is recorded as one of [`CHANNEL_METHODS`] or
+/// `other` ([`channel_method`]), never as the text the box sent.
+fn channel_request_span<'a>(
+    line: &'a str,
+    box_id: &str,
+    session_id: Option<boxes::SessionId>,
+) -> (tracing::Span, &'a str) {
+    let (traceparent, request) = match line.split_once('%') {
+        Some(("traceparent", rest)) => match rest.split_once('%') {
+            Some((tp, request)) => (Some(tp), request),
+            None => (None, rest),
+        },
+        _ => (None, line),
+    };
+    let method = channel_method(request);
+    let span = tracing::info_span!(
+        parent: None,
+        "session.channel",
+        method,
+        box.id = box_id,
+        session.id = session_id.as_ref().map(tracing::field::display),
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    let client_ctx = traceparent.and_then(minimald_rpc::trace::TraceContext::parse_traceparent);
+    crate::exec::adopt_trace(&span, client_ctx);
+    (span, request)
+}
+
+/// The methods [`BoxChannel::handle`] dispatches: the only values the
+/// `session.channel` span's `method` takes besides `other`. Keep it in step
+/// with the arms of `handle`.
+const CHANNEL_METHODS: &[&str] = &[
+    "add-transient",
+    "add-build",
+    "add-runtime",
+    "add-session",
+    "search",
+    "check",
+    "patched-pkg",
+    "run",
+    "build",
+    "materialize",
+    "net-expose",
+];
+
+/// The `method` a helper request is recorded under: the text before its
+/// first `%` when that is a method [`BoxChannel::handle`] dispatches,
+/// else `other` (a line with no `%` is never dispatched, so it is `other`
+/// too). The line comes from inside the box and the span is exported and
+/// spooled, so no box-chosen text, of any length, reaches the host's
+/// telemetry through this field.
+fn channel_method(request: &str) -> &'static str {
+    request
+        .split_once('%')
+        .and_then(|(method, _)| CHANNEL_METHODS.iter().find(|known| **known == method))
+        .copied()
+        .unwrap_or("other")
+}
+
+impl BoxChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
         while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
             tracing::trace!("session channel handling: {line}");
-            self.handle(&line, &mut stream).await;
+            let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
+            // Boxed: the handler's future is large (every subcommand's state in
+            // one `async fn`) and it is awaited once per request, not per byte.
+            tracing::Instrument::instrument(Box::pin(self.handle(line, &mut stream)), span).await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
@@ -976,6 +1090,8 @@ impl SessionChannel {
                 self.expose_port(stream, port).await;
                 None
             }
+            // A new arm above also goes in `CHANNEL_METHODS`, or its span
+            // records `other`.
             _ => {
                 let _ = writeln!(stream, "error: unhandled input '{line}'");
                 None
@@ -1174,7 +1290,7 @@ impl SessionChannel {
         crate::sandbox_progress::FetchRecord {
             box_id: self.box_id.clone(),
             leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
-                sandbox2::classifier::TREE_ROOT,
+                sandbox::classifier::TREE_ROOT,
             )),
             cache_host: crate::net::classifier::cache_host(
                 &self.ctx.daemon_context().config().remote_cache_url(),
@@ -1211,7 +1327,7 @@ impl SessionChannel {
     /// kicks off a session side-op check run and streams each object's results
     /// back to the client until the run completes.
     async fn run_check(&mut self, stream: &mut UnixStream, args: &str) {
-        use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+        use crate::box_ops::{CheckOpts, CheckOutcome, CheckUpdate};
 
         let Some(session) = self.session.upgrade() else {
             let _ = writeln!(stream, "error: session is gone");
@@ -1383,12 +1499,8 @@ impl SessionChannel {
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
             let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
-            let network = crate::exec::task_network(
-                &record,
-                &switch,
-                sessions::EGRESS_DEFAULT_PHASE,
-                opt_out,
-            );
+            let network =
+                crate::exec::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, opt_out);
             let mut env = ctx
                 .make_env_with_network(
                     task_name,
@@ -1464,7 +1576,7 @@ impl SessionChannel {
             }
         };
 
-        use crate::session_sop::{BuildOutcome, BuildUpdate};
+        use crate::box_ops::{BuildOutcome, BuildUpdate};
         let mut renderer = orchestrator::BuildRenderer::new(flag_verbose);
         let mut outcome = None;
         // The same meter as `min add`. Unscoped: this build runs on the
@@ -1510,7 +1622,7 @@ impl SessionChannel {
     /// where the user typed it and stays inside the workspace — the one
     /// directory the daemon and the sandbox share.
     async fn run_materialize(&mut self, stream: &mut UnixStream, request: &str) {
-        use crate::session_sop::{MaterializeOutcome, MaterializeUpdate};
+        use crate::box_ops::{MaterializeOutcome, MaterializeUpdate};
         use tokio::io::AsyncWriteExt as _;
 
         let prepared: Result<_, String> = async {
@@ -1707,7 +1819,7 @@ impl SessionChannel {
                                 record.name.unwrap_or_else(|| self.name.clone()),
                                 record.network,
                             ),
-                            Err(_) => (self.name.clone(), sessions::NetworkMode::OwnIp),
+                            Err(_) => (self.name.clone(), boxes::NetworkMode::OwnIp),
                         };
                         let text = refusal.for_caller(&box_name, network, port_number);
                         if matches!(
@@ -1817,7 +1929,7 @@ fn install_scope(graph: &Graph, pkgs: &[(&str, BuildSpecRef)]) -> HashSet<String
 /// the session to put it.
 #[derive(Debug, PartialEq)]
 struct MaterializeArgs {
-    opts: crate::session_sop::MaterializeOpts,
+    opts: crate::box_ops::MaterializeOpts,
     /// Where the artifact lands, as an absolute path in the *sandbox* —
     /// resolved against the sandbox cwd, and not yet tied to a daemon
     /// directory. [`sandbox_to_daemon`] decides which one it names.
@@ -1890,7 +2002,7 @@ impl MaterializeArgs {
         };
 
         Ok(Self {
-            opts: crate::session_sop::MaterializeOpts { output_name, arch },
+            opts: crate::box_ops::MaterializeOpts { output_name, arch },
             output,
         })
     }
@@ -2103,6 +2215,186 @@ impl tokio::io::AsyncWrite for StreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A helper request arrives as `traceparent%<tp>%<method>%<data>` when
+    /// the box has a `TRACEPARENT`, and bare otherwise; the prefix is taken
+    /// off before dispatch and the request's span is named for the method.
+    /// Without a subscriber the adopted ids are not observable here; the
+    /// shape of the request is.
+    #[test]
+    fn channel_request_span_strips_the_traceparent_prefix() {
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let expose = format!("traceparent%{tp}%net-expose%8770");
+        let (_, request) = super::channel_request_span(&expose, "b", None);
+        assert_eq!(request, "net-expose%8770");
+        let materialize = format!("traceparent%{tp}%materialize%/workbench%--output o o717b");
+        let (_, request) = super::channel_request_span(&materialize, "b", None);
+        assert_eq!(request, "materialize%/workbench%--output o o717b");
+        let (_, request) = super::channel_request_span("net-expose%8770", "b", None);
+        assert_eq!(request, "net-expose%8770");
+        // A prefix with no request after it is handed on as-is, to be refused
+        // by the dispatcher as unhandled input rather than guessed at.
+        let (_, request) = super::channel_request_span("traceparent%garbage", "b", None);
+        assert_eq!(request, "garbage");
+    }
+
+    /// A request from inside a box is served in a span that
+    /// names the box and the session it belongs to, as the host knows them
+    /// (the channel was built for that box by that session), whatever the
+    /// line says: the box-supplied traceparent parents the span and sets
+    /// nothing else.
+    #[test]
+    fn a_box_request_span_carries_the_host_side_box_identity() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let session_id =
+            boxes::SessionId::parse_str("7b3e1f2a-9c4d-4e5f-8a6b-1c2d3e4f5a6b").unwrap();
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = format!("traceparent%{tp}%net-expose%8770");
+        let (span, request) = super::channel_request_span(&line, "leaf-7", Some(session_id));
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "method", "net-expose");
+        assert_eq!(served.field("box.id"), Some("leaf-7"), "{served:?}");
+        assert_eq!(
+            served.field("session.id"),
+            Some(session_id.to_string().as_str()),
+            "{served:?}"
+        );
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the line's traceparent parents the span"
+        );
+
+        // Without a session id the field is simply absent; the box id stays.
+        let (span, _) = super::channel_request_span("net-expose%8770", "solo", None);
+        drop(span);
+        let bare = log.find("session.channel", "box.id", "solo");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].field("session.id"), None);
+    }
+
+    /// The span's `method` is one of the methods the channel
+    /// dispatches, or `other`: a line with no `%`, an unknown method, or a
+    /// long one never puts box-chosen text on the host's span.
+    #[test]
+    fn a_box_request_span_names_only_a_dispatched_method() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let long = "x".repeat(64 * 1024);
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        for (line, method) in [
+            ("net-expose%8770".to_string(), "net-expose"),
+            (format!("traceparent%{tp}%materialize%/w%o"), "materialize"),
+            ("add-session%jq".to_string(), "add-session"),
+            ("net-expose".to_string(), "other"),
+            ("no percent sign at all".to_string(), "other"),
+            ("rm-rf%/".to_string(), "other"),
+            (format!("{long}%x"), "other"),
+            (long.clone(), "other"),
+            (format!("traceparent%{tp}%{long}"), "other"),
+        ] {
+            let (span, _) = super::channel_request_span(&line, "m", None);
+            drop(span);
+            let served = log.find("session.channel", "box.id", "m");
+            let last = served.last().expect("a session.channel span");
+            assert_eq!(last.field("method"), Some(method), "{:.40}", line);
+        }
+        for method in super::CHANNEL_METHODS {
+            assert_eq!(super::channel_method(&format!("{method}%")), *method);
+        }
+    }
+
+    /// TEL-025: a `min` inside a box (the shipped helper, `__min_rpc`)
+    /// hands the box's inherited `TRACEPARENT` to the daemon as the request
+    /// line's `traceparent%` prefix, and the daemon serves the request in a
+    /// span that adopts it, so the daemon's work for it joins the outer
+    /// trace. The inner `min` is a shell function: it has no exporter and
+    /// exports nothing. The helper runs under bash with a `socat` stand-in
+    /// that records the line it would send; the span is the one the channel
+    /// actor serves that line in. A value that is not the 55-character W3C
+    /// form is not forwarded at all, so a `%` in it cannot shift the split.
+    #[cfg(unix)]
+    #[test]
+    fn a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("min_helper.sh");
+        std::fs::write(&helper, MIN_SCRIPT).unwrap();
+        let sent_line = tmp.path().join("line");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(
+            &socat,
+            format!("#!/bin/sh\ncat > '{}'\necho done:\n", sent_line.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let send = |traceparent: Option<&str>| -> String {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(format!(
+                    ". '{}'; __min_rpc net-expose 8770",
+                    helper.display()
+                ))
+                .env("PATH", &path)
+                .env_remove("TRACEPARENT");
+            if let Some(tp) = traceparent {
+                cmd.env("TRACEPARENT", tp);
+            }
+            let out = cmd.output().expect("run bash");
+            assert!(out.status.success(), "{out:?}");
+            std::fs::read_to_string(&sent_line)
+                .unwrap()
+                .trim_end_matches('\n')
+                .to_string()
+        };
+
+        let tp = "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01";
+        let line = send(Some(tp));
+        assert_eq!(line, format!("traceparent%{tp}%net-expose%8770"));
+
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (span, request) = super::channel_request_span(&line, "inner", None);
+        assert_eq!(request, "net-expose%8770");
+        drop(span);
+        let served = log.one("session.channel", "box.id", "inner");
+        assert_eq!(
+            served.field("trace_id"),
+            Some("af79b928d8ae574b659f1fbf40208758"),
+            "the daemon's span joins the outer trace: {served:?}"
+        );
+        assert_eq!(
+            served.field("parent_span_id"),
+            Some("ed105930ec67df47"),
+            "{served:?}"
+        );
+
+        // Not the W3C form: the request goes bare, and the daemon mints.
+        for bad in [
+            "",
+            "garbage",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-0",
+            "00-af79b928d8ae574b659f1fbf40208758%ed105930ec67df4-01",
+            "00-AF79B928D8AE574B659F1FBF40208758-ED105930EC67DF47-01",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01%x",
+            "00-af79b928d8ae574b659f1fbf40208758-ed105930ec67df47-01 x",
+        ] {
+            assert_eq!(send(Some(bad)), "net-expose%8770", "{bad:?}");
+        }
+        assert_eq!(send(None), "net-expose%8770");
+    }
 
     /// Every session rootfs carries the per-attach environment hook for every
     /// shell we support, at that shell's own vendor/system integration point
@@ -2158,9 +2450,9 @@ mod tests {
             // through `$MINIMAL_ATTACH_ENV`, so a composed variable of that
             // name cannot redirect or break the refresh.
             assert!(
-                body.contains(crate::session_host::ATTACH_ENV_SH)
-                    || body.contains(crate::session_host::ATTACH_ENV_FISH)
-                    || body.contains(crate::session_host::ATTACH_ENV_JSON),
+                body.contains(crate::box_runtime::ATTACH_ENV_SH)
+                    || body.contains(crate::box_runtime::ATTACH_ENV_FISH)
+                    || body.contains(crate::box_runtime::ATTACH_ENV_JSON),
                 "{rel} should hard-code the published path: {body}"
             );
             assert!(
@@ -2191,7 +2483,7 @@ mod tests {
     }
 
     /// Runs a rootfs's bash rc the way an attach does — the argv
-    /// `crate::session_shell`'s table gives bash — with `home` standing in
+    /// `crate::attach_shell`'s table gives bash — with `home` standing in
     /// for the session home, and returns the shell's stdout.
     ///
     /// `None` when the host has no bash to run it with: the caller skips,
@@ -2391,8 +2683,8 @@ exit $rc
         };
         assert_eq!(code, 0, "help should exit 0, got: {stdout} {stderr}");
         assert!(
-            stderr.contains("Usage: min package patched-build <package-name>"),
-            "help should print usage, got: {stderr}"
+            stdout.contains("Usage: min package patched-build <package name>"),
+            "help should print usage on stdout, got: {stdout}"
         );
         assert!(
             !stderr.contains("RPC-CALLED"),
@@ -2415,12 +2707,240 @@ exit $rc
             };
             assert_eq!(code, 1, "`{args}` should exit 1, got: {stdout} {stderr}");
             assert!(
-                stderr.contains("Usage: min package patched-build <package-name>"),
+                stderr.contains("Usage: min package patched-build <package name>"),
                 "`{args}` should print usage, got: {stderr}"
             );
             assert!(
                 !stderr.contains("RPC-CALLED"),
                 "`{args}` must not reach the daemon, got: {stderr}"
+            );
+        }
+    }
+
+    /// Runs the installed `min` helper as a script, with `PATH` prefixed by
+    /// a directory holding a `socat` stand-in that announces itself on
+    /// stderr — loud RPC detection for the main dispatch path, which runs
+    /// only when the file is executed rather than sourced. Returns `None`
+    /// when the host has no bash, matching the repo's self-skip-locally
+    /// convention.
+    fn run_min_command(rootfs: &Path, args: &str) -> Option<(String, String, i32)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = rootfs.join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(&socat, "#!/bin/sh\necho RPC-CALLED >&2\n").unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = rootfs.join("usr/bin/min");
+        let out = std::process::Command::new("bash")
+            .arg(script.to_str().unwrap())
+            .args(args.split_whitespace())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    }
+
+    /// `-h`, `--help`, and `help` at every dispatch level of the in-session
+    /// `min` helper print that level's own usage and exit 0 without
+    /// contacting the daemon, as does a help flag after other arguments to
+    /// a command that takes no task arguments; a bare `min package`/`min task`/`min net` and an unknown
+    /// subcommand print usage on stderr and exit 1.
+    #[test]
+    fn help_spellings_print_usage_without_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for (args, code, stream, usage) in [
+            ("--help", 0, "stdout", "Usage: min <subcommand>"),
+            ("-h", 0, "stdout", "Usage: min <subcommand>"),
+            ("help", 0, "stdout", "Usage: min <subcommand>"),
+            (
+                "package --help",
+                0,
+                "stdout",
+                "Usage: min package <subcommand>",
+            ),
+            ("package -h", 0, "stdout", "Usage: min package <subcommand>"),
+            (
+                "package help",
+                0,
+                "stdout",
+                "Usage: min package <subcommand>",
+            ),
+            ("pkg --help", 0, "stdout", "Usage: min package <subcommand>"),
+            (
+                "task --help",
+                0,
+                "stdout",
+                "Usage: min task run <task name>",
+            ),
+            ("net --help", 0, "stdout", "Usage: min net expose <port>"),
+            (
+                "add --help",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            (
+                "add -h",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            (
+                "add --build --help",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            (
+                "add jq --help",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            ("run --help", 0, "stdout", "Usage: min task run <task name>"),
+            (
+                "task run --help",
+                0,
+                "stdout",
+                "Usage: min task run <task name>",
+            ),
+            (
+                "search --help",
+                0,
+                "stdout",
+                "Usage: min package search <query>",
+            ),
+            (
+                "package search --help",
+                0,
+                "stdout",
+                "Usage: min package search <query>",
+            ),
+            (
+                "package build --help",
+                0,
+                "stdout",
+                "Usage: min package build <packages>",
+            ),
+            (
+                "package build foo --help",
+                0,
+                "stdout",
+                "Usage: min package build <packages>",
+            ),
+            (
+                "package patched-build --help",
+                0,
+                "stdout",
+                "Usage: min package patched-build <package name>",
+            ),
+            ("check --help", 0, "stdout", "Usage: min check"),
+            ("check foo --help", 0, "stdout", "Usage: min check"),
+            (
+                "materialize --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
+                "materialize --output x --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
+                "materialize --arch x86_64 --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
+                "net expose --help",
+                0,
+                "stdout",
+                "Usage: min net expose <port>",
+            ),
+            ("package", 1, "stderr", "Usage: min package <subcommand>"),
+            ("task", 1, "stderr", "Usage: min task run <task name>"),
+            ("net", 1, "stderr", "Usage: min net expose <port>"),
+            ("bogus", 1, "stderr", "Usage: min <subcommand>"),
+            (
+                "package bogus",
+                1,
+                "stderr",
+                "Usage: min package <subcommand>",
+            ),
+            ("task bogus", 1, "stderr", "Usage: min task run <task name>"),
+            ("net bogus", 1, "stderr", "Usage: min net expose <port>"),
+        ] {
+            let Some((stdout, stderr, exit)) = run_min_command(rootfs, args) else {
+                return;
+            };
+            assert_eq!(
+                exit, code,
+                "`{args}` should exit {code}, got: {stdout} {stderr}"
+            );
+            let (out, other) = if stream == "stdout" {
+                (&stdout, &stderr)
+            } else {
+                (&stderr, &stdout)
+            };
+            assert!(
+                out.contains(usage),
+                "`{args}` should print `{usage}` on {stream}, got: {stdout} {stderr}"
+            );
+            assert!(
+                other.is_empty(),
+                "`{args}` should print only on {stream}, got: {stdout} {stderr}"
+            );
+            assert!(
+                !stdout.contains("RPC-CALLED") && !stderr.contains("RPC-CALLED"),
+                "`{args}` must not reach the daemon, got: {stdout} {stderr}"
+            );
+        }
+    }
+
+    /// In an argument slot a bare `help` is a package name, search term, or
+    /// task name, not a help request, so it still reaches the daemon. So
+    /// does a help flag after a task name: it is the task's argument. So
+    /// does a help flag in a materialize value slot: it is the path.
+    #[test]
+    fn help_word_in_argument_slot_reaches_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for args in [
+            "search help",
+            "add help",
+            "package build help",
+            "task run help",
+            "run mytask --help",
+            "materialize --output --help x",
+            "materialize -o -h x",
+        ] {
+            let Some((stdout, stderr, _)) = run_min_command(rootfs, args) else {
+                return;
+            };
+            assert!(
+                stderr.contains("RPC-CALLED"),
+                "`{args}` should reach the daemon, got: {stdout} {stderr}"
             );
         }
     }
@@ -2431,19 +2951,19 @@ exit $rc
     use tempfile::tempdir;
 
     /// Builds a `Context` and `Graph` from mctx's fakerepo fixture, plus a
-    /// `SessionChannel` wired to them with a dummy receiver so handlers can be
+    /// `BoxChannel` wired to them with a dummy receiver so handlers can be
     /// driven directly.
-    fn setup_channel() -> (TempDir, TempDir, TempDir, SessionChannel) {
-        setup_channel_with(crate::session::WeakSessionHandle::dangling(), "web")
+    fn setup_channel() -> (TempDir, TempDir, TempDir, BoxChannel) {
+        setup_channel_with(crate::box_actor::WeakBoxHandle::dangling(), "web")
     }
 
     /// [`setup_channel`] for a channel bound to the session that owns it: the
     /// session's weak handle and the box's name, so the paths that reach into
     /// the session — the expose hop — can be driven against a live one.
     fn setup_channel_with(
-        session: crate::session::WeakSessionHandle,
+        session: crate::box_actor::WeakBoxHandle,
         name: &str,
-    ) -> (TempDir, TempDir, TempDir, SessionChannel) {
+    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -2462,7 +2982,7 @@ exit $rc
         graph.top_levels = vec![];
 
         let (_tx, rx) = mpsc::channel(1);
-        let channel = SessionChannel {
+        let channel = BoxChannel {
             name: name.to_string(),
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(rootfs.path().to_path_buf()).unwrap(),
@@ -2480,6 +3000,7 @@ exit $rc
                 .unwrap(),
             has_packages: HashSet::new(),
             box_id: "a session in a test".to_string(),
+            session_id: None,
             ot: None,
             session,
             runtime_env: RuntimeEnv::default(),
@@ -2565,7 +3086,7 @@ exit $rc
     /// the name, so it writes those lines; each request leaves exactly one,
     /// naming the box, the port as given, and the outcome. Every path the
     /// actor did see — including a publish that failed, whatever the source
-    /// — leaves its own line there, pinned by the expose tests in `session`,
+    /// — leaves its own line there, pinned by the expose tests in `box_actor`,
     /// so the channel writes none for it: one request, one line, on every
     /// path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2578,7 +3099,7 @@ exit $rc
         // each request's line below is found and counted by the box it
         // names.
         let (_state, _rootfs, _cwd, mut chan) =
-            setup_channel_with(crate::session::WeakSessionHandle::dangling(), "chanweb");
+            setup_channel_with(crate::box_actor::WeakBoxHandle::dangling(), "chanweb");
         let (mut ours, theirs) = UnixStream::pair().unwrap();
         #[expect(
             clippy::large_futures,
@@ -2616,7 +3137,7 @@ exit $rc
             crate::test_harness::create_configured_session(&mut client, "recweb", "/tmp").await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the session resolves");
@@ -2651,7 +3172,9 @@ exit $rc
         let lines = read_lines(&theirs);
         assert_eq!(lines.len(), 1, "one reply: {lines:?}");
         assert!(
-            lines[0].starts_with("error: reading the session record for port 3000 failed:"),
+            lines[0].starts_with(
+                "error: port 3000 was not opened: the session's saved state could not be read:"
+            ),
             "the reply is the typed record-read failure: {lines:?}"
         );
 
@@ -2663,7 +3186,7 @@ exit $rc
         // channel of the next request, which no actor saw: that one is the
         // `ActorGone` failure, and its line is this channel's.
         let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(
-            crate::session::WeakSessionHandle::answering(vec![Err(
+            crate::box_actor::WeakBoxHandle::answering(vec![Err(
                 crate::net::policy::ExposeFailure::Publish {
                     port: 3000,
                     source: std::io::Error::new(
@@ -2701,7 +3224,7 @@ exit $rc
         let lines = read_lines(&theirs);
         assert_eq!(lines.len(), 1, "one reply: {lines:?}");
         assert!(
-            lines[0].starts_with("error: the session actor for port 3000 is gone"),
+            lines[0].starts_with("error: port 3000 was not opened: the box is stopping or stopped"),
             "a reply channel the actor dropped is its own typed failure: {lines:?}"
         );
 
@@ -2759,8 +3282,9 @@ exit $rc
         assert!(
             lines_for("recweb")[0].contains("port=3000")
                 && lines_for("recweb")[0].contains("outcome=\"refused\"")
-                && lines_for("recweb")[0]
-                    .contains("reason=reading the session record for port 3000 failed"),
+                && lines_for("recweb")[0].contains(
+                    "reason=port 3000 was not opened: the session's saved state could not be read"
+                ),
             "the record-read failure's line names the box, whose name the \
              unreadable record could not: {}",
             lines_for("recweb")[0]
@@ -2769,7 +3293,7 @@ exit $rc
             lines_for("bindweb")[0].contains("port=3000")
                 && lines_for("bindweb")[0].contains("outcome=\"refused\"")
                 && lines_for("bindweb")[0]
-                    .contains("reason=the session actor for port 3000 is gone"),
+                    .contains("reason=port 3000 was not opened: the box is stopping or stopped"),
             "the dropped reply channel's line is this channel's, naming the \
              box: {}",
             lines_for("bindweb")[0]
@@ -2788,7 +3312,7 @@ exit $rc
         // below bind at the box's own address.
         let manager = server.state.sessions_manager().await;
         manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
-        let web = crate::session::tests::finalize_declared_dynamic_ingress_session(
+        let web = crate::box_actor::tests::finalize_declared_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 51),
@@ -2796,7 +3320,7 @@ exit $rc
         )
         .await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -2811,7 +3335,7 @@ exit $rc
             .lock()
             .await
             .control_socket();
-        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (forwarder, served) = crate::box_actor::tests::fake_forwarder(sock, 200).await;
         let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
 
         // The declared port: the gate admitted it when the box attached, so
@@ -2858,7 +3382,7 @@ exit $rc
     /// below: each pins the line the box's caller reads, which is where a
     /// refusal names its way forward.
     async fn expose_reply(
-        handle: &crate::session::SessionHandle,
+        handle: &crate::box_actor::BoxHandle,
         name: &str,
         port: u16,
     ) -> Vec<String> {
@@ -2882,7 +3406,7 @@ exit $rc
     async fn expose_deny_reply_names_the_way_forward() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        let id = crate::session::tests::finalize_dynamic_ingress_session(
+        let id = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 52),
@@ -2893,7 +3417,7 @@ exit $rc
         .await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -2917,7 +3441,7 @@ exit $rc
     async fn expose_reply_names_the_renamed_box() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        let id = crate::session::tests::finalize_dynamic_ingress_session(
+        let id = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 54),
@@ -2928,7 +3452,7 @@ exit $rc
         .await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -2964,7 +3488,7 @@ exit $rc
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
         let mut request = crate::test_harness::create_session_req("web", "/uwu");
-        request.config.network = sessions::NetworkMode::NoNet;
+        request.config.network = boxes::NetworkMode::NoNet;
         let id = client.call::<CreateSession>(&request).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client
@@ -2984,7 +3508,7 @@ exit $rc
             .unwrap();
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3005,18 +3529,18 @@ exit $rc
     async fn expose_ask_unattended_reply_names_the_way_forward() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
-        let id = crate::session::tests::finalize_dynamic_ingress_session(
+        let id = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 53),
             std::net::Ipv4Addr::new(127, 0, 64, 53),
-            Some(sessions::DynamicIngress::Ask),
+            Some(boxes::DynamicIngress::Ask),
             Some((3000, 3999)),
         )
         .await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3043,7 +3567,7 @@ exit $rc
         let id = crate::test_harness::create_configured_session(&mut client, "web", "/uwu").await;
         let manager = server.state.sessions_manager().await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3075,17 +3599,17 @@ exit $rc
         // publish below binds at the box's own address.
         let manager = server.state.sessions_manager().await;
         manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
-        let web = crate::session::tests::finalize_dynamic_ingress_session(
+        let web = crate::box_actor::tests::finalize_dynamic_ingress_session(
             &mut client,
             "web",
             std::net::Ipv4Addr::new(100, 64, 128, 61),
             std::net::Ipv4Addr::new(127, 0, 64, 61),
-            Some(sessions::DynamicIngress::Allow),
+            Some(boxes::DynamicIngress::Allow),
             Some((3000, 3999)),
         )
         .await;
         let handle = manager
-            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -3100,7 +3624,7 @@ exit $rc
             .lock()
             .await
             .control_socket();
-        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (forwarder, served) = crate::box_actor::tests::fake_forwarder(sock, 200).await;
         let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
 
         // The stance the create stored — the fixed point every request below
@@ -3114,10 +3638,10 @@ exit $rc
             .policy;
         assert_eq!(
             policy_at_create.ingress,
-            Some(sessions::IngressPolicy {
+            Some(boxes::IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some((3000, 3999)),
-                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             }),
             "the harness box is the one this test's stance describes"
         );
@@ -3422,7 +3946,7 @@ exit $rc
     #[test]
     fn materialize_args_parse_both_flag_forms() {
         let expected = MaterializeArgs {
-            opts: crate::session_sop::MaterializeOpts {
+            opts: crate::box_ops::MaterializeOpts {
                 output_name: "image".to_string(),
                 arch: Some("arm64".to_string()),
             },

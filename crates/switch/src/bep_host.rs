@@ -1652,7 +1652,7 @@ impl BepStack {
 }
 
 impl Drop for BepStack {
-    /// The stack's teardown flush, mirroring the relay's `SessionGate::Drop`
+    /// The stack's teardown flush, mirroring the relay's `BoxGate::Drop`
     /// half: every count its audit still holds unsaid is said now, in the one
     /// audit format, because nothing after the stack exists to carry one. The
     /// peer's stack lives for the daemon's lifetime, so this is the whole

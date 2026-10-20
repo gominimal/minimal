@@ -11,6 +11,7 @@ use std::io;
 use std::process::Stdio;
 use std::time::Duration;
 
+use boxes::SessionId;
 use futures::{
     StreamExt,
     stream::{self, BoxStream, Stream},
@@ -20,7 +21,6 @@ use russh::{
     Channel, ChannelId,
     server::{Msg, Session},
 };
-use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
 use tokio::sync::{mpsc, watch};
@@ -28,18 +28,21 @@ use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    spawn,
 };
 use tracing::Instrument as _;
+
+// Every task this module spawns carries the caller's span (TEL-022): the
+// clippy `disallowed-methods` for the crate names tokio's own spawn.
+use crate::traced::spawn;
 
 use diagnostics::redact::scrub_secrets;
 
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
+    box_actor::BoxHandle,
+    box_manager::BoxKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
     server::ServerStateHandle,
-    session::SessionHandle,
-    sessions::SessionKeyPredicate,
 };
 
 /// "What to run." Turns into a [`Stream`] of one or more process
@@ -57,7 +60,7 @@ use crate::{
 pub trait Exec: Send + 'static {
     type Process: Process;
 
-    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>>;
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>>;
 }
 
 /// A handle to one spawned process: stdio plus lifecycle controls.
@@ -139,11 +142,11 @@ fn task_start_dir(
         return Ok(None);
     }
     if working.join(cwd).is_dir() {
-        Ok(Some(format!("/{}/{cwd}", sandbox2::SESSION_DEFAULT_WD)))
+        Ok(Some(format!("/{}/{cwd}", sandbox::SESSION_DEFAULT_WD)))
     } else {
         Err(format!(
             "minimal: {cwd} is not in the uploaded tree; running the task at /{}\n",
-            sandbox2::SESSION_DEFAULT_WD
+            sandbox::SESSION_DEFAULT_WD
         ))
     }
 }
@@ -151,7 +154,7 @@ fn task_start_dir(
 impl Exec for TaskExec {
     type Process = TaskProcess;
 
-    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
         // the next child once the consumer pulls. Dropping a
         // `HakoniwaProcess` orphans the child, so we don't want to
@@ -165,7 +168,7 @@ impl Exec for TaskExec {
         // spawned child has finished — which is exactly when the
         // consumer drops the stream, the channels close, this task
         // exits, and `env` falls out of scope.
-        tokio::spawn(task_producer(self, session, req_rx, proc_tx));
+        crate::traced::spawn(task_producer(self, session, req_rx, proc_tx));
 
         // Pull-based stream: each `poll_next` sends a request and waits
         // for the producer's response. `None` from either channel ends
@@ -185,7 +188,7 @@ impl Exec for TaskExec {
 /// the deny-all default in force, allow-all behind the opt-out — and none of
 /// its ingress. Shared by the two ways a
 /// task starts — over an exec channel here, and from inside the session
-/// (`env::SessionChannel::run_task`).
+/// (`env::BoxChannel::run_task`).
 ///
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
@@ -193,7 +196,7 @@ impl Exec for TaskExec {
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
 /// reported for it. `phase` is the rollout phase to resolve the egress under
-/// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
+/// — both callers pass [`boxes::EGRESS_DEFAULT_PHASE`], the phase this
 /// build ships, while the tests pass the phase by name so each arm's posture
 /// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
@@ -210,14 +213,14 @@ impl Exec for TaskExec {
 /// so attaching one where nothing needs gating would change behaviour the
 /// opt-out exists to keep.
 pub(crate) fn task_network(
-    record: &sessions::Record,
+    record: &boxes::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    phase: sessions::EgressDefaultPhase,
+    phase: boxes::EgressDefaultPhase,
     deny_all_opt_out: bool,
-) -> std::sync::Arc<dyn sandbox2::Network> {
+) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    let egress = crate::session::effective_egress_section(
+    let egress = crate::box_actor::effective_egress_section(
         &record.policy,
         record.network,
         phase,
@@ -227,7 +230,7 @@ pub(crate) fn task_network(
         record.network,
         switch,
         &format!("{session}-task"),
-        egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
+        egress.map(|section| boxes::BoxPolicy::new(Some(section), None)),
         // Never the record's handed box addresses (T66): the task's sandbox
         // is not the box the registration named — attaching it at the
         // session box's address would key its frames to the session's row.
@@ -254,7 +257,7 @@ pub(crate) fn task_network(
 /// host registered nothing for (a native host, a `host_ip` or `none` box)
 /// asks nothing.
 async fn ensure_task_rows_stand(
-    record: &sessions::Record,
+    record: &boxes::Record,
     switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
 ) -> io::Result<()> {
     let Some(addresses) = record.box_addresses else {
@@ -262,7 +265,7 @@ async fn ensure_task_rows_stand(
     };
     let standing = match record.box_id {
         Some(box_id) => {
-            let control = crate::session::switch_control_of(switch).await;
+            let control = crate::box_actor::switch_control_of(switch).await;
             crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
                 .await
                 == Some(true)
@@ -273,8 +276,9 @@ async fn ensure_task_rows_stand(
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "box {}'s row on the VM host has ended, so a task run in it would reach \
-             nothing; destroy and re-activate the session",
+            "the VM host daemon could not confirm session {}'s network addresses, so \
+             the task was not run; destroy the session with `min session destroy <session>`, \
+             then start it again with `min session activate`",
             record.name.as_deref().unwrap_or("(unnamed)")
         )))
     }
@@ -297,18 +301,18 @@ impl Reapable for hakoniwa::Child {
 
 /// Step 3 of a task launch: wire the process's namespace, or kill and reap the
 /// process so it does not run on with the network it failed to get — as
-/// `sandbox2::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
+/// `sandbox::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
 async fn attach_or_reap<P: Reapable>(
-    planned: sandbox2::PlannedLaunch,
-    spawned: sandbox2::Spawned,
+    planned: sandbox::PlannedLaunch,
+    spawned: sandbox::Spawned,
     child: &mut P,
-) -> io::Result<Box<dyn sandbox2::NetGuard>> {
+) -> io::Result<Box<dyn sandbox::NetGuard>> {
     match planned.attach(spawned).await {
         Ok(guard) => Ok(guard),
         Err(e) => {
             child.kill_and_reap();
             Err(io::Error::other(format!(
-                "attaching the task network failed: {e}"
+                "connecting the task's network failed: {e}"
             )))
         }
     }
@@ -344,7 +348,7 @@ fn parse_task_args(
 /// governed by the consumer's stream.
 async fn task_producer(
     exec: TaskExec,
-    session: SessionHandle,
+    session: BoxHandle,
     mut req_rx: mpsc::Receiver<()>,
     proc_tx: mpsc::Sender<io::Result<TaskProcess>>,
 ) {
@@ -380,7 +384,7 @@ async fn task_producer(
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
-        let (mut ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (mut ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
             (ctx, r)
         })
@@ -420,7 +424,7 @@ async fn task_producer(
         let network = task_network(
             &record,
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
         );
         // A task's `~/` resolves against the session's home, the same
@@ -474,13 +478,13 @@ async fn task_producer(
                 // One plan, container and attach per invocation: hakoniwa
                 // unshares per `spawn()`, so each needs its own address.
                 let planned = env.plan_launch().await.map_err(|e| {
-                    io::Error::other(format!("planning the task network failed: {e}"))
+                    io::Error::other(format!("setting up the task's network failed: {e}"))
                 })?;
                 let container = env
                     .container(planned.plan())
                     .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 let mut cmd = env
-                    .command(&container, &inv.executable, inv.args.iter())
+                    .invocation_command(&container, &inv)
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
                 if let Some(dir) = &start_dir {
                     cmd.current_dir(dir);
@@ -491,7 +495,7 @@ async fn task_producer(
                 let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                let spawned = sandbox2::Spawned::from_child(&mut child);
+                let spawned = sandbox::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
                 let mut process = HakoniwaProcess::new(child, guard);
                 // The fallback notice leads the first invocation's stderr.
@@ -506,7 +510,7 @@ async fn task_producer(
                 // rootfs — and reap it, which is what releases its network.
                 if let Ok(mut proc) = send_err.0 {
                     let _ = proc.start_kill();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = proc.wait().await;
                     });
                 }
@@ -562,7 +566,7 @@ pub struct HakoniwaProcess {
 /// guard would never detach. It runs on its own task instead, and `wait`
 /// awaits the handle, which survives being dropped and re-awaited.
 struct NetRelease {
-    guard: Option<Box<dyn sandbox2::NetGuard>>,
+    guard: Option<Box<dyn sandbox::NetGuard>>,
     /// The teardown in flight, once started.
     running: Option<JoinHandle<()>>,
 }
@@ -581,7 +585,7 @@ impl Drop for NetRelease {
 }
 
 impl NetRelease {
-    fn new(guard: Box<dyn sandbox2::NetGuard>) -> Self {
+    fn new(guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             guard: Some(guard),
             running: None,
@@ -592,7 +596,7 @@ impl NetRelease {
     /// leaves the teardown running, and the next call waits for it.
     async fn release(&mut self) {
         if let Some(guard) = self.guard.take() {
-            self.running = Some(tokio::spawn(guard.teardown()));
+            self.running = Some(crate::traced::spawn(guard.teardown()));
         }
         if let Some(running) = &mut self.running {
             let _ = running.await;
@@ -622,7 +626,7 @@ enum WaitState {
 }
 
 impl HakoniwaProcess {
-    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
@@ -657,7 +661,7 @@ impl Process for HakoniwaProcess {
                 unreachable!();
             };
             let mut child = *child;
-            self.state = WaitState::Waiting(tokio::task::spawn_blocking(move || child.wait()));
+            self.state = WaitState::Waiting(crate::traced::spawn_blocking(move || child.wait()));
         }
 
         // Waiting → Exited / Failed. The `await` is the cancel point —
@@ -802,7 +806,7 @@ pub struct TokioExec {
 impl Exec for TokioExec {
     type Process = TokioProcess;
 
-    fn exec(self, _session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+    fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
             cmd.arg("-c")
@@ -848,7 +852,7 @@ fn git_repo_location_env() -> BTreeSet<String> {
 /// What to run inside the session, and whether a shell stands between the
 /// client's words and the process.
 #[derive(Debug, Clone)]
-pub enum SessionProgram {
+pub enum BoxProgram {
     /// A command line for the session's shell. The client wrote a shell
     /// command, so quoting, globs, pipes and redirections are part of what it
     /// means — matching what `ssh host '...'` does everywhere else.
@@ -860,7 +864,7 @@ pub enum SessionProgram {
     Argv(Vec<String>),
 }
 
-impl SessionProgram {
+impl BoxProgram {
     /// The program and arguments to hand the session, resolving a shell
     /// command into an explicit `bash -c` argv.
     fn argv(self) -> (String, Vec<String>) {
@@ -878,8 +882,11 @@ impl SessionProgram {
 /// An [`Exec`] that runs a command *inside* the session's sandbox, joining the
 /// namespaces of the running session process.
 #[derive(Debug, Clone)]
-pub struct SessionExec {
-    pub program: SessionProgram,
+pub struct BoxExec {
+    pub program: BoxProgram,
+    /// Variables layered over the session's own for this one process: the
+    /// exec's `TRACEPARENT` on telemetry opt-in ([`minimald_rpc::taskenv::trace_env`]).
+    pub extra_env: BTreeMap<String, String>,
     /// The SSH username, needed only if the session has no host running and one
     /// has to be launched to service this request.
     pub conn_username: String,
@@ -890,10 +897,10 @@ pub struct SessionExec {
 /// has no `/bin/bash`.
 const SESSION_SHELL: &str = "/usr/bin/bash";
 
-impl Exec for SessionExec {
+impl Exec for BoxExec {
     type Process = TokioProcess;
 
-    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             // Launching the sandbox is part of servicing the request: an exec
             // against an idle session should work, not fail because nobody
@@ -903,7 +910,9 @@ impl Exec for SessionExec {
                 .await
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             let (program, args) = self.program.argv();
-            let command = host.command_in_session(&program, &args).await?;
+            let command = host
+                .command_in_session_env(&program, &args, self.extra_env)
+                .await?;
 
             let mut command = Command::from(command);
             command
@@ -1032,7 +1041,7 @@ struct ExecTask<S: Exec> {
 
     serv: ServerStateHandle,
     conn: ConnectionHandle,
-    session: SessionHandle,
+    session: BoxHandle,
 }
 
 impl<S: Exec> ExecTask<S> {
@@ -1662,7 +1671,10 @@ where
         %channel_id,
         "exec: child exited with its stdio still held open; draining in the background",
     );
-    spawn(async move {
+    // Detached: a grandchild holding the pipes can keep this draining for
+    // as long as it likes, and the exec's span must not stay open for it.
+    let drain = tracing::info_span!(parent: None, "exec.drain", %channel_id);
+    crate::traced::spawn_detached(drain, async move {
         async fn discard<S: AsyncRead + Unpin>(src: Option<S>) {
             let Some(mut src) = src else { return };
             let mut buf = [0u8; 8 * 1024];
@@ -1752,8 +1764,21 @@ pub(crate) async fn handle_exec(
         return Ok(());
     };
 
+    // The exec span (which adopts the client's TRACEPARENT) is opened before
+    // the session lookup, so the manager's GetSession is a child of the
+    // caller's trace instead of a root of its own.
+    let (span, traceparent) = exec_span(&config, session_id, &argv);
+    let trace_env = minimald_rpc::taskenv::trace_env(
+        mlog::otel::exporting(),
+        traceparent,
+        minimald_rpc::trace::opted_out(&config.env_vars),
+    );
     let mngr = serv.sessions_manager().await;
-    let session_handle = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+    let session_handle = match mngr
+        .get_session(BoxKeyPredicate::Id(session_id))
+        .instrument(span.clone())
+        .await
+    {
         Ok(Some(h)) => h,
         Ok(None) => {
             tracing::warn!(%session_id, "execution request rejected: unknown session");
@@ -1771,8 +1796,14 @@ pub(crate) async fn handle_exec(
     // one it is: an operator reading the log should see what a client asked to
     // run, whether it was serviced by the daemon, handed to the session, or
     // refused below. The command is scrubbed so a credential passed as an
-    // argument never lands in the log verbatim.
-    tracing::info!(%session_id, command = %scrub_secrets(&argv), "exec request");
+    // argument never lands in the log verbatim. For a client that opted out
+    // of telemetry the line says so and carries no command at all: the log
+    // exporter would otherwise ship the one record of what it ran.
+    if minimald_rpc::trace::opted_out(&config.env_vars) {
+        tracing::info!(%session_id, telemetry = OPT_OUT, "exec request (command not recorded)");
+    } else {
+        tracing::info!(%session_id, command = %scrub_secrets(&argv), "exec request");
+    }
 
     // Parsed, never sniffed. The vocabulary in `minimald_rpc::exec` is the only
     // way to ask for one of the daemon's own forms, so a session command can no
@@ -1798,11 +1829,11 @@ pub(crate) async fn handle_exec(
     match request {
         ExecRequest::Shell(_) | ExecRequest::Argv(_) => {
             let program = match request {
-                ExecRequest::Shell(cmd) => SessionProgram::Shell(cmd),
-                ExecRequest::Argv(words) => SessionProgram::Argv(words),
+                ExecRequest::Shell(cmd) => BoxProgram::Shell(cmd),
+                ExecRequest::Argv(words) => BoxProgram::Argv(words),
                 _ => unreachable!("the match arm admits only Shell and Argv"),
             };
-            let span = exec_span(&config, session_id, &argv);
+            let span = span.clone();
             session.channel_success(id)?;
             spawn(
                 run_in_session(
@@ -1813,6 +1844,7 @@ pub(crate) async fn handle_exec(
                     channel,
                     program,
                     conn_username,
+                    trace_env,
                 )
                 .instrument(span),
             );
@@ -1833,49 +1865,65 @@ pub(crate) async fn handle_exec(
             // shell and carried on the channel environment (#585). Empty from a
             // client that predates it — in which case the task path resolves
             // them the old way, daemon-side.
-            let task_env = minimald_rpc::taskenv::from_channel_env(&config.env_vars);
+            // Plus the exec span's TRACEPARENT on opt-in (TEL-023):
+            // a `min` the task runs joins the caller's trace.
+            let task_env = minimald_rpc::taskenv::with_trace(
+                minimald_rpc::taskenv::from_channel_env(&config.env_vars),
+                trace_env.clone(),
+            );
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
+            let span = span.clone();
             session.channel_success(id)?;
-            spawn(async move {
-                // `ExecTask::run` consumes the server handle; the box's end
-                // needs one after the bridge returns.
-                let end_serv = serv.clone();
-                let exec_task = ExecTask {
-                    conn,
-                    serv,
-                    session: session_handle,
-                    channel_id: id,
-                    exec: TaskExec {
-                        args,
-                        // The name stays behind for the run-box-end log line.
-                        task: task.clone(),
-                        env: task_env,
-                        drop_env,
-                        cwd,
-                    },
-                };
-                let exit_status = exec_task.run(channel).await;
-                // The exit status is on the wire and the channel closed: the
-                // run is over whether or not its client is still here, so a
-                // box created for it ends now (NET-131).
-                if owns_box {
-                    end_run_box(&end_serv, session_id, &task, exit_status).await;
-                }
-            });
+            spawn(tracing::Instrument::instrument(
+                async move {
+                    // `ExecTask::run` consumes the server handle; the box's end
+                    // needs one after the bridge returns.
+                    let end_serv = serv.clone();
+                    let exec_task = ExecTask {
+                        conn,
+                        serv,
+                        session: session_handle,
+                        channel_id: id,
+                        exec: TaskExec {
+                            args,
+                            // The name stays behind for the run-box-end log line.
+                            task: task.clone(),
+                            env: task_env,
+                            drop_env,
+                            cwd,
+                        },
+                    };
+                    let exit_status = exec_task.run(channel).await;
+                    // The exit status is on the wire and the channel closed: the
+                    // run is over whether or not its client is still here, so a
+                    // box created for it ends now (NET-131).
+                    if owns_box {
+                        end_run_box(&end_serv, session_id, &task, exit_status).await;
+                    }
+                },
+                span,
+            ));
         }
         ExecRequest::PackageBuild(args) => {
+            let span = span.clone();
             session.channel_success(id)?;
             let build_args = args.trim().to_string();
-            spawn(async move {
-                run_build_exec(session_handle, id, channel, build_args).await;
-            });
+            spawn(tracing::Instrument::instrument(
+                async move {
+                    run_build_exec(session_handle, id, channel, build_args).await;
+                },
+                span,
+            ));
         }
         ExecRequest::Check(args) => {
             session.channel_success(id)?;
             let check_args = args.trim().to_string();
-            spawn(async move {
-                run_check_exec(session_handle, id, channel, check_args).await;
-            });
+            spawn(tracing::Instrument::instrument(
+                async move {
+                    run_check_exec(session_handle, id, channel, check_args).await;
+                },
+                span,
+            ));
         }
     }
 
@@ -1915,38 +1963,198 @@ fn unsupported_command_message(reason: &str) -> String {
 /// with the daemon's. A missing or malformed value mints a fresh context:
 /// propagation is a diagnostic aid and must never fail a request. The command
 /// rides on the span, so every record the exec emits names what was asked for.
-fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> tracing::Span {
+/// The exec span, and its context as a `TRACEPARENT` (what a box gets on
+/// opt-in, so a `min` run inside joins this trace) — `None` unless the span
+/// is actually recorded (see [`box_traceparent`]).
+fn exec_span(
+    config: &ChannelConfig,
+    session_id: SessionId,
+    argv: &str,
+) -> (tracing::Span, Option<String>) {
+    // Two callsites, not one span with a recorded field: the opted-out
+    // request's span never carries the command, not even in the file log's
+    // span fields, and the recorded one is what the exec-span tests read
+    // at creation.
+    let span = if minimald_rpc::trace::opted_out(&config.env_vars) {
+        tracing::info_span!(
+            "exec",
+            %session_id,
+            command = tracing::field::Empty,
+            telemetry = OPT_OUT,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        )
+    } else {
+        tracing::info_span!(
+            "exec",
+            %session_id,
+            command = %scrub_secrets(argv),
+            telemetry = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        )
+    };
+    let adopted = adopt_client_trace(&span, config);
+    let tp = box_traceparent(&adopted);
+    (span, tp)
+}
+
+/// The value of a request span's `telemetry` field when its client opted
+/// out: the one mark the file log keeps of such a request (the span is
+/// recorded nowhere else).
+pub(crate) const OPT_OUT: &str = "opt-out";
+
+/// A span's trace context, and whether that span is recorded by the export
+/// (its ids are the exported span's ids).
+pub(crate) struct AdoptedTrace {
+    ctx: minimald_rpc::trace::TraceContext,
+    /// False with export off, and with the export filter not admitting the
+    /// span (`MINIMAL_OTEL_FILTER=warn` against an info-level span): the ids
+    /// were minted for the file log only, and no exporter or spool ever sees
+    /// a span with them.
+    recorded: bool,
+}
+
+/// The `TRACEPARENT` a box may be given for `adopted`: only one that names a
+/// recorded span. Under `MINIMAL_OTEL_FILTER=warn`
+/// the daemon handed the box a `TRACEPARENT` whose span id was spooled and
+/// exported nowhere, so a `min` run inside parented itself to an orphan. A
+/// trace nobody can follow is worse than a fresh one: hand the box nothing.
+fn box_traceparent(adopted: &AdoptedTrace) -> Option<String> {
+    adopted.recorded.then(|| adopted.ctx.traceparent())
+}
+
+/// Makes `span` a child of the client's `TRACEPARENT` (channel env) and
+/// records its ids. With OTel export on and the span admitted, the exported
+/// span's ids are the ids; otherwise adopt-or-mint exactly as before. The
+/// span must declare the `trace_id`, `span_id` and `parent_span_id` fields.
+pub(crate) fn adopt_client_trace(span: &tracing::Span, config: &ChannelConfig) -> AdoptedTrace {
     use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
 
+    if minimald_rpc::trace::opted_out(&config.env_vars) {
+        return adopt_opt_out(span);
+    }
     let client_ctx = config
         .env_vars
         .get(TRACEPARENT_ENV)
         .and_then(|v| TraceContext::parse_traceparent(v));
-    let ctx = client_ctx
-        .as_ref()
-        .map(TraceContext::child)
-        .unwrap_or_else(TraceContext::mint);
-    let span = tracing::info_span!(
-        "exec",
-        %session_id,
-        command = %scrub_secrets(argv),
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
-        parent_span_id = tracing::field::Empty,
+    adopt_trace(span, client_ctx)
+}
+
+/// The client opted out of telemetry (`MINIMAL_OTEL=off` on the channel,
+/// or in a forward's originator field): make `span`, and every span under
+/// it, non-recording ([`mlog::otel::opt_out`]), mark it `telemetry =
+/// opt-out`, and give it ids for the file log only. Nothing is adopted: an
+/// opted-out client sends no `TRACEPARENT`, and one that did would still
+/// get no span in its trace. The result is never `recorded`, so the box
+/// gets no `TRACEPARENT` either ([`box_traceparent`]). The span must
+/// declare the `trace_id`, `span_id`, `parent_span_id` and `telemetry`
+/// fields.
+pub(crate) fn adopt_opt_out(span: &tracing::Span) -> AdoptedTrace {
+    use minimald_rpc::trace::TraceContext;
+
+    // `record` drops a field the span did not declare without a word, and
+    // the opt-out mark would be lost (the `git_receive`/`git_upload` spans
+    // once lacked it): fail loudly in tests instead.
+    debug_assert!(
+        span.metadata()
+            .is_none_or(|m| m.fields().field("telemetry").is_some()),
+        "span {:?} must declare `telemetry` to be opted out",
+        span.metadata().map(tracing::Metadata::name)
     );
+    let ctx = mlog::otel::opt_out(span)
+        .map(|(t, s, f)| TraceContext::from_parts(t, s, f))
+        .unwrap_or_else(|| TraceContext::mint().unsampled());
+    span.record("telemetry", OPT_OUT);
+    span.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    span.record("span_id", tracing::field::display(ctx.span_id_hex()));
+    // The mailbox messages sent from inside carry these unsampled ids, so
+    // the `*.message` spans they open are opted out too (`adopt_trace`
+    // aligns them under a flags-00 parent).
+    crate::traced::remember(span, ctx);
+    AdoptedTrace {
+        ctx,
+        recorded: false,
+    }
+}
+
+/// Makes `span` a child of `client_ctx` — the client's context however it
+/// travelled (the channel env for session channels and RPCs, the open
+/// request's originator field for a direct-tcpip forward) — and records its
+/// ids. With OTel export on and the span admitted, the exported span's ids
+/// are the ids; otherwise adopt-or-mint exactly as before. The span must
+/// declare the `trace_id`, `span_id` and `parent_span_id` fields.
+pub(crate) fn adopt_trace(
+    span: &tracing::Span,
+    client_ctx: Option<minimald_rpc::trace::TraceContext>,
+) -> AdoptedTrace {
+    use minimald_rpc::trace::TraceContext;
+
+    let aligned = mlog::otel::align(span, client_ctx.as_ref().map(TraceContext::parts))
+        .map(|(t, s, f)| TraceContext::from_parts(t, s, f));
+    let recorded = aligned.is_some();
+    let ctx = aligned.unwrap_or_else(|| {
+        client_ctx
+            .as_ref()
+            .map(TraceContext::child)
+            .unwrap_or_else(TraceContext::mint)
+    });
+    span.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    span.record("span_id", tracing::field::display(ctx.span_id_hex()));
     if let Some(client_ctx) = &client_ctx {
         span.record(
             "parent_span_id",
             tracing::field::display(client_ctx.span_id_hex()),
         );
     }
-    span
+    // For a mailbox message sent from inside this span (or anything it
+    // encloses) to carry these ids: see `traced::caller_context`.
+    crate::traced::remember(span, ctx);
+    AdoptedTrace { ctx, recorded }
+}
+
+#[cfg(test)]
+mod box_traceparent_tests {
+    use super::{AdoptedTrace, box_traceparent};
+
+    /// A box gets a `TRACEPARENT` only for a recorded span: with export off,
+    /// or the export filter not admitting the exec span, the context exists
+    /// (the file log uses it) but names a span no exporter or spool sees.
+    #[test]
+    fn an_unrecorded_exec_span_gives_the_box_no_traceparent() {
+        let ctx = minimald_rpc::trace::TraceContext::mint();
+        assert_eq!(
+            box_traceparent(&AdoptedTrace {
+                ctx,
+                recorded: false
+            }),
+            None
+        );
+        assert_eq!(
+            box_traceparent(&AdoptedTrace {
+                ctx,
+                recorded: true
+            }),
+            Some(ctx.traceparent())
+        );
+    }
+
+    /// Without an exporter installed (this test process), `align` admits
+    /// nothing, so the adopted trace is never marked recorded.
+    #[test]
+    fn without_an_exporter_nothing_is_recorded() {
+        assert!(!mlog::otel::exporting());
+        let span = tracing::info_span!("exec");
+        assert!(mlog::otel::align(&span, None).is_none());
+    }
 }
 
 /// Runs `argv` inside the session's sandbox, streamed over the SSH channel.
 ///
 /// The fallback for every exec request the daemon does not service itself. It
-/// needs the session's sandbox up, which [`SessionExec`] arranges — launching a
+/// needs the session's sandbox up, which [`BoxExec`] arranges — launching a
 /// host for an idle session if there isn't one.
 // Left positional: a single call site that immediately packs the arguments into
 // an `ExecTask`, so a struct would be single-use ceremony.
@@ -1954,20 +2162,22 @@ fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> traci
 async fn run_in_session(
     serv: ServerStateHandle,
     conn: ConnectionHandle,
-    session: SessionHandle,
+    session: BoxHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
-    program: SessionProgram,
+    program: BoxProgram,
     conn_username: String,
+    extra_env: BTreeMap<String, String>,
 ) {
     let exec_task = ExecTask {
         conn,
         serv,
         session,
         channel_id,
-        exec: SessionExec {
+        exec: BoxExec {
             program,
             conn_username,
+            extra_env,
         },
     };
     exec_task.run(channel).await;
@@ -1994,7 +2204,7 @@ async fn end_run_box(
     // reason `serve_destroy_session` resolves it there: once the record is
     // gone there is nothing left to resolve it against.
     let session_name = mngr
-        .get_record(SessionKeyPredicate::Id(session_id))
+        .get_record(BoxKeyPredicate::Id(session_id))
         .await
         .ok()
         .flatten()
@@ -2022,7 +2232,7 @@ async fn end_run_box(
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
 /// channel. Kicks off a session side-op build based on an existing session.
 async fn run_build_exec(
-    session: SessionHandle,
+    session: BoxHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
     args: String,
@@ -2048,7 +2258,7 @@ async fn run_build_exec(
 
     let exit_status = match session.start_build(rebuild, pkgs).await {
         Ok(mut events) => {
-            use crate::session_sop::{BuildOutcome, BuildUpdate};
+            use crate::box_ops::{BuildOutcome, BuildUpdate};
             let mut renderer = BuildRenderer::new(verbose);
             let mut outcome = None;
             while let Some(update) = events.recv().await {
@@ -2115,12 +2325,12 @@ async fn run_build_exec(
 /// exec over the SSH channel. Kicks off a session side-op check run based on an
 /// existing session.
 async fn run_check_exec(
-    session: SessionHandle,
+    session: BoxHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
     args: String,
 ) {
-    use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+    use crate::box_ops::{CheckOpts, CheckOutcome, CheckUpdate};
 
     let (_rs, ws) = channel.split();
     let mut w = ws.make_writer();
@@ -2182,6 +2392,12 @@ async fn run_check_exec(
     let _ = ws.close().await; // needed to release the remote
 }
 
+/// Serves `git-receive-pack min://<session>` (a `min` push to a session's
+/// workspace) on channel `id`.
+///
+/// Runs in a `git_receive` span that adopts the client's `TRACEPARENT`: the
+/// session lookup and the spawned receive-pack process's work are its
+/// children, so a push is one trace with the CLI's (TEL-022).
 async fn handle_git_receive(
     ident: &str,
     serv: ServerStateHandle,
@@ -2194,7 +2410,7 @@ async fn handle_git_receive(
     let session_pred = {
         match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
             Some(id_str) => match SessionId::parse_str(id_str) {
-                Ok(id) => SessionKeyPredicate::Id(id),
+                Ok(id) => BoxKeyPredicate::Id(id),
                 Err(_e) => {
                     tracing::warn!(
                         value = %id_str,
@@ -2205,14 +2421,28 @@ async fn handle_git_receive(
                 }
             },
             None => match SessionId::parse_str(ident) {
-                Ok(id) => SessionKeyPredicate::Id(id),
-                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+                Ok(id) => BoxKeyPredicate::Id(id),
+                Err(_e) => BoxKeyPredicate::Name(ident.to_string()),
             },
         }
     };
 
+    // The lookup runs in this push's span, so its manager message is not a
+    // trace root of its own (as for an exec: see `handle_exec`).
+    let span = tracing::info_span!(
+        "git_receive",
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    adopt_client_trace(&span, &config);
     let mngr = serv.sessions_manager().await;
-    let session_handle = match mngr.get_session(session_pred).await {
+    let session_handle = match mngr
+        .get_session(session_pred)
+        .instrument(span.clone())
+        .await
+    {
         Ok(Some(h)) => h,
         Ok(None) => {
             tracing::warn!("git-receive-pack rejected: unknown session");
@@ -2227,7 +2457,10 @@ async fn handle_git_receive(
     };
     session.channel_success(id)?;
 
-    spawn(async move {
+    // The receive-pack process ends with this channel: request-bounded work,
+    // so it runs as the span's child (`traced::spawn` carries the entered
+    // span), not as a root of its own.
+    let task = async move {
         let paths = match session_handle.paths().await {
             Ok(paths) => paths,
             // The actor died between resolve and this call (raced an
@@ -2270,6 +2503,19 @@ async fn handle_git_receive(
                 WORK_TREE=$(dirname "$GIT_DIR_ABS")
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
+                # The branch currently checked out in the worktree, and
+                # whether HEAD resolves to a commit (`born`). The first push
+                # into a fresh workspace has no commit on HEAD, so the first
+                # pushed branch that checks out cleanly populates the
+                # worktree and becomes HEAD. After that, a push to any branch
+                # other than the checked-out one must not move HEAD or touch
+                # the worktree. post-receive runs after the refs moved, so a
+                # first push that includes HEAD's own branch already reads as
+                # born, and that branch is the one checked out.
+                cur=$(g symbolic-ref -q HEAD)
+                born=
+                detached_moved=
+                g rev-parse -q --verify HEAD >/dev/null && born=yes
 
                 zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
@@ -2280,6 +2526,18 @@ async fn handle_git_receive(
                     [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
 
+                    # A push to a branch that is not the one checked out
+                    # leaves HEAD and the worktree alone: the ref itself has
+                    # already moved in receive-pack, so there is nothing more
+                    # to do. Only on the still-unborn first push does the
+                    # hook check out the first arriving branch.
+                    # A detached HEAD (`cur` empty) matches no branch, so
+                    # every push lands here; note it for the message below.
+                    if [ "$ref" != "$cur" ] && [ -n "$born" ]; then
+                        [ -z "$cur" ] && detached_moved=yes
+                        continue
+                    fi
+
                     if [ "$old" = "$zero" ]; then
                         # Previously-unborn branch: nothing tracked, so tracked
                         # dirtiness cannot exist — but uploaded/untracked files
@@ -2288,7 +2546,12 @@ async fn handle_git_receive(
                         # pushed tip and checks it out; WITHOUT -f, git refuses
                         # to overwrite untracked files (its stderr names them),
                         # and we surface the skip like the dirty case below.
-                        if ! g checkout -q -B "$branch" "$new"; then
+                        if g checkout -q -B "$branch" "$new"; then
+                            # HEAD is born now: later refs in this same push
+                            # are other branches and must not move it.
+                            cur=$ref
+                            born=yes
+                        else
                             echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
                         fi
                         continue
@@ -2303,7 +2566,13 @@ async fn handle_git_receive(
                         continue
                     fi
                     g checkout -qf "$branch"
-                done"#
+                done
+
+                # A detached HEAD stays detached, as with plain git; say so
+                # once, so the pusher knows the worktree did not change.
+                if [ -n "$detached_moved" ]; then
+                    echo "remote worktree HEAD is detached; moved refs without checking out (run git switch <branch> in the session)" >&2
+                fi"#
                     .as_bytes(),
             )
             .await
@@ -2334,11 +2603,19 @@ async fn handle_git_receive(
         };
         exec_task.run(channel).await;
         drop(hooks_tmp);
-    });
+    };
+    span.in_scope(|| crate::traced::spawn(task));
 
     Ok(())
 }
 
+/// Serves `git-upload-pack min://<session>` (a `min` fetch, clone or
+/// ls-remote of a session's workspace) on channel `id`.
+///
+/// Runs in a `git_upload` span that adopts the client's `TRACEPARENT`, as a
+/// push runs in `git_receive`: the session lookup and the spawned pack
+/// process's work are its children, so a fetch is one trace with the CLI's
+/// (TEL-022) rather than a root `GetSession` of its own.
 async fn handle_git_upload(
     ident: &str,
     serv: ServerStateHandle,
@@ -2351,7 +2628,7 @@ async fn handle_git_upload(
     let session_pred = {
         match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
             Some(id_str) => match SessionId::parse_str(id_str) {
-                Ok(id) => SessionKeyPredicate::Id(id),
+                Ok(id) => BoxKeyPredicate::Id(id),
                 Err(_e) => {
                     tracing::warn!(
                         value = %id_str,
@@ -2362,29 +2639,45 @@ async fn handle_git_upload(
                 }
             },
             None => match SessionId::parse_str(ident) {
-                Ok(id) => SessionKeyPredicate::Id(id),
-                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+                Ok(id) => BoxKeyPredicate::Id(id),
+                Err(_e) => BoxKeyPredicate::Name(ident.to_string()),
             },
         }
     };
 
+    // The lookup runs in this fetch's span, so its manager message is not a
+    // trace root of its own (as for a push: see `handle_git_receive`).
+    let span = tracing::info_span!(
+        "git_upload",
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    adopt_client_trace(&span, &config);
     let mngr = serv.sessions_manager().await;
-    let session_handle = match mngr.get_session(session_pred).await {
+    let lookup = mngr
+        .get_session(session_pred)
+        .instrument(span.clone())
+        .await;
+    let session_handle = match lookup {
         Ok(Some(h)) => h,
         Ok(None) => {
-            tracing::warn!("git-upload-pack rejected: unknown session");
+            span.in_scope(|| tracing::warn!("git-upload-pack rejected: unknown session"));
             session.channel_failure(id)?;
             return Ok(());
         }
         Err(e) => {
-            tracing::warn!(error = %e, "git-upload-pack rejected: lookup failed");
+            span.in_scope(|| tracing::warn!(error = %e, "git-upload-pack rejected: lookup failed"));
             session.channel_failure(id)?;
             return Ok(());
         }
     };
     session.channel_success(id)?;
 
-    spawn(async move {
+    // The pack process ends with this channel: request-bounded work, so it
+    // runs as the span's child (`traced::spawn` carries the entered span).
+    let task = async move {
         let paths = match session_handle.paths().await {
             Ok(paths) => paths,
             Err(e) => {
@@ -2424,7 +2717,8 @@ async fn handle_git_upload(
             },
         };
         exec_task.run(channel).await;
-    });
+    };
+    span.in_scope(|| crate::traced::spawn(task));
 
     Ok(())
 }
@@ -2577,6 +2871,10 @@ pub(crate) mod testing {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "upstream's tests spawn plain tokio tasks; the traced-spawn rule is for request handling"
+)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -2687,23 +2985,24 @@ mod tests {
 
     /// A session record carrying `mode`, with everything else at its default.
     #[cfg(target_os = "linux")]
-    fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
-        sessions::Record {
-            id: sessions::SessionId::nil(),
+    fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
+        boxes::Record {
+            id: boxes::SessionId::nil(),
             name: None,
             username: None,
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
-            policy: sessions::SessionPolicy::default(),
+            policy: boxes::BoxPolicy::default(),
             task_addresses: Vec::new(),
             box_addresses: None,
-            status: sessions::SessionStatus::Active,
+            status: boxes::BoxState::Active,
             hooks_enabled: true,
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: Default::default(),
         }
     }
@@ -2722,14 +3021,14 @@ mod tests {
                     port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
                 }),
         );
-        let unregistered = record_with(sessions::NetworkMode::OwnIp);
+        let unregistered = record_with(boxes::NetworkMode::OwnIp);
         super::ensure_task_rows_stand(&unregistered, &switch)
             .await
             .expect("a box with no host registration asks nothing");
 
-        let mut registered = record_with(sessions::NetworkMode::OwnIp);
+        let mut registered = record_with(boxes::NetworkMode::OwnIp);
         registered.name = Some("web".to_string());
-        registered.box_addresses = Some(sessions::BoxAddresses {
+        registered.box_addresses = Some(boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
         });
@@ -2738,7 +3037,14 @@ mod tests {
             .await
             .expect_err("a registered box with no id is never answered as standing");
         assert!(
-            refused.to_string().contains("row on the VM host has ended"),
+            refused.to_string().contains("could not confirm session"),
+            "{refused}"
+        );
+        // The bare command fails: a destroy needs a session or `--all`.
+        assert!(
+            refused
+                .to_string()
+                .contains("`min session destroy <session>`"),
             "{refused}"
         );
     }
@@ -2760,38 +3066,35 @@ mod tests {
         ));
 
         let host = super::task_network(
-            &record_with(sessions::NetworkMode::HostNet),
+            &record_with(boxes::NetworkMode::HostNet),
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
         assert!(!host.plan().await.unwrap().isolates_netns());
 
         let no_net = super::task_network(
-            &record_with(sessions::NetworkMode::NoNet),
+            &record_with(boxes::NetworkMode::NoNet),
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
         let plan = no_net.plan().await.unwrap();
         assert!(plan.isolates_netns() && plan.tap().is_none());
 
-        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        let mut record = record_with(boxes::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
-        record.policy.ingress = Some(sessions::IngressPolicy::default());
+        record.policy.ingress = Some(boxes::IngressPolicy::default());
         // A VM host's switch draws nothing (NET-138): the task attaches at a
         // task address its box's registration filed.
         record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
-        let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let own_ip = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
             plan.isolates_netns(),
             "an own-IP task gets its own namespace"
         );
-        assert!(matches!(
-            plan.resolver(),
-            sandbox2::Resolver::Nameservers(_)
-        ));
+        assert!(matches!(plan.resolver(), sandbox::Resolver::Nameservers(_)));
         // Its own identity on the switch, and the session's *effective*
         // egress (NET-074) — resolved under the phase this build ships, so
         // the same rules the session's own gate enforces, whatever the
@@ -2799,10 +3102,10 @@ mod tests {
         // session's PTask is attached at the same time. The gate exists only
         // where that egress has rules, so the answer follows the shipped
         // phase rather than a literal a cutover would invalidate.
-        let gated = crate::session::effective_egress_section(
+        let gated = crate::box_actor::effective_egress_section(
             &record.policy,
             record.network,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         )
         .is_some();
@@ -2816,12 +3119,12 @@ mod tests {
 
         // No name: the session id, rather than an empty hostname.
         let unnamed = super::task_network(
-            &record_with(sessions::NetworkMode::OwnIp),
+            &record_with(boxes::NetworkMode::OwnIp),
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
-        assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+        assert!(format!("{unnamed:?}").contains(&boxes::SessionId::nil().to_string()));
     }
 
     /// A VM host's switch, which hands every address and draws none
@@ -2846,14 +3149,14 @@ mod tests {
     #[tokio::test]
     async fn in_box_run_task_draws_a_task_slot() {
         let switch = vm_host_switch();
-        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        let mut record = record_with(boxes::NetworkMode::OwnIp);
         record.task_addresses = vec![
             std::net::Ipv4Addr::new(100, 64, 128, 2),
             std::net::Ipv4Addr::new(100, 64, 128, 3),
         ];
-        let first = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let first = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         first.plan().await.expect("a free task address");
-        let second = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let second = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         second.plan().await.expect("a second free task address");
         let held: Vec<_> = switch
             .lock()
@@ -2867,7 +3170,7 @@ mod tests {
             "each run holds one task address"
         );
 
-        let third = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let third = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         let err = third.plan().await.expect_err("every task address is held");
         assert!(
             err.to_string()
@@ -2888,8 +3191,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
         let switch = vm_host_switch();
-        let record = record_with(sessions::NetworkMode::OwnIp);
-        let task = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let record = record_with(boxes::NetworkMode::OwnIp);
+        let task = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
         let err = task.plan().await.expect_err("nothing is drawn");
         assert!(
             err.to_string()
@@ -2932,16 +3235,16 @@ mod tests {
         ));
         // A bare own-address box: no egress declaration, so its egress is
         // whatever the default resolves for an absent one.
-        let record = record_with(sessions::NetworkMode::OwnIp);
+        let record = record_with(boxes::NetworkMode::OwnIp);
 
         // Announced, no opt-out: an absent section still allows all, so the
         // task gets no gate at all — its inbound stays as open as it was
         // before the default was announced.
         assert_eq!(
-            crate::session::effective_egress_section(
+            crate::box_actor::effective_egress_section(
                 &record.policy,
                 record.network,
-                sessions::EgressDefaultPhase::Announced,
+                boxes::EgressDefaultPhase::Announced,
                 false,
             ),
             None,
@@ -2950,7 +3253,7 @@ mod tests {
         let announced = super::task_network(
             &record,
             &switch,
-            sessions::EgressDefaultPhase::Announced,
+            boxes::EgressDefaultPhase::Announced,
             false,
         );
         assert!(
@@ -2961,21 +3264,17 @@ mod tests {
         // In force, no opt-out: the same absent section is the deny-all one,
         // and the task carries the gate built from it.
         assert_eq!(
-            crate::session::effective_egress_section(
+            crate::box_actor::effective_egress_section(
                 &record.policy,
                 record.network,
-                sessions::EgressDefaultPhase::InForce,
+                boxes::EgressDefaultPhase::InForce,
                 false,
             ),
-            Some(sessions::EgressPolicy::deny_all()),
+            Some(boxes::EgressPolicy::deny_all()),
             "the in-force default resolves an absent section to deny-all"
         );
-        let in_force = super::task_network(
-            &record,
-            &switch,
-            sessions::EgressDefaultPhase::InForce,
-            false,
-        );
+        let in_force =
+            super::task_network(&record, &switch, boxes::EgressDefaultPhase::InForce, false);
         assert!(
             format!("{in_force:?}").contains("has_policy: true"),
             "the in-force default gates a bare box's task: {in_force:?}"
@@ -2990,24 +3289,24 @@ mod tests {
         // decides the destination list the declaration left absent
         // (`allow_dns_hosts`): present and empty, granting nothing
         // (NET-074); announced, the section is carried as declared.
-        let section = sessions::EgressPolicy {
+        let section = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..sessions::EgressPolicy::default()
+            ..boxes::EgressPolicy::default()
         };
-        let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
+        let mut declared_record = record_with(boxes::NetworkMode::OwnIp);
         declared_record.policy.egress = Some(section.clone());
         for (phase, expected) in [
-            (sessions::EgressDefaultPhase::Announced, section.clone()),
+            (boxes::EgressDefaultPhase::Announced, section.clone()),
             (
-                sessions::EgressDefaultPhase::InForce,
-                sessions::EgressPolicy {
+                boxes::EgressDefaultPhase::InForce,
+                boxes::EgressPolicy {
                     allow_dns_hosts: Some(Vec::new()),
                     ..section.clone()
                 },
             ),
         ] {
             assert_eq!(
-                crate::session::effective_egress_section(
+                crate::box_actor::effective_egress_section(
                     &declared_record.policy,
                     declared_record.network,
                     phase,
@@ -3021,7 +3320,7 @@ mod tests {
         let declared = super::task_network(
             &declared_record,
             &switch,
-            sessions::EGRESS_DEFAULT_PHASE,
+            boxes::EGRESS_DEFAULT_PHASE,
             false,
         );
         assert!(
@@ -3040,12 +3339,12 @@ mod tests {
 
         #[derive(Debug)]
         struct Refuses;
-        impl sandbox2::Network for Refuses {
-            fn plan(&self) -> sandbox2::PlanFuture<'_> {
-                Box::pin(std::future::ready(Ok(sandbox2::NetPlan::isolated())))
+        impl sandbox::Network for Refuses {
+            fn plan(&self) -> sandbox::PlanFuture<'_> {
+                Box::pin(std::future::ready(Ok(sandbox::NetPlan::isolated())))
             }
-            fn attach(&self, _: sandbox2::Spawned) -> sandbox2::AttachFuture<'_> {
-                Box::pin(std::future::ready(Err(sandbox2::NetworkError::new(
+            fn attach(&self, _: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+                Box::pin(std::future::ready(Err(sandbox::NetworkError::new(
                     std::io::Error::other("switch refused the client"),
                 ))))
             }
@@ -3060,13 +3359,13 @@ mod tests {
             }
         }
 
-        let planned = sandbox2::PlannedLaunch::begin(Arc::new(Refuses))
+        let planned = sandbox::PlannedLaunch::begin(Arc::new(Refuses))
             .await
             .expect("planning succeeds; it is the attach that fails");
         assert!(planned.plan().isolates_netns());
 
         let mut child = Child { reaped: false };
-        let err = super::attach_or_reap(planned, sandbox2::Spawned::new(1), &mut child)
+        let err = super::attach_or_reap(planned, sandbox::Spawned::new(1), &mut child)
             .await
             .err()
             .expect("a refused attach must surface as an error");
@@ -3082,7 +3381,7 @@ mod tests {
         go: std::sync::Arc<tokio::sync::Notify>,
         done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
-    impl sandbox2::NetGuard for SlowGuard {
+    impl sandbox::NetGuard for SlowGuard {
         fn teardown(
             self: Box<Self>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -3155,7 +3454,7 @@ mod tests {
         let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
         let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -3446,7 +3745,7 @@ mod tests {
             let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
             let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
-            let bridge_task = tokio::spawn(async move {
+            let bridge_task = crate::traced::spawn(async move {
                 let exit = bridge_noting_shutdown(
                     "test",
                     process,
@@ -3517,7 +3816,7 @@ mod tests {
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
         drop(closed_stdin_w);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -3545,7 +3844,7 @@ mod tests {
     /// driving, reports the kill as exit 1, and stops the sequence without
     /// ever pulling the next process, so nothing beyond the exec's own
     /// command was touched. The box the exec ran against is the session
-    /// plane's concern (`session::tests` proves it survives the same loss).
+    /// plane's concern (`box_actor::tests` proves it survives the same loss).
     #[tokio::test]
     async fn lost_exec_client_kills_only_its_own_process() {
         use std::time::Duration;
@@ -3572,7 +3871,7 @@ mod tests {
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
         drop(closed_stdin_w);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 iter,
@@ -3642,7 +3941,7 @@ mod tests {
         // The client-loss signal fires: the SSH channel closed.
         let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -3699,7 +3998,7 @@ mod tests {
         // The client-loss signal never fires: the channel stays open.
         let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -3752,11 +4051,11 @@ mod tests {
 
         // Far more than the child's stdin pipe holds; this writer blocks
         // once both pipes are full, which is the point.
-        let feeder = tokio::spawn(async move {
+        let feeder = crate::traced::spawn(async move {
             let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
         });
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -3811,7 +4110,7 @@ mod tests {
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
         let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -3852,7 +4151,7 @@ mod tests {
         }));
         let (stdin_w, mut stdin_r) = duplex(64);
         let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
-        let pump = tokio::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
 
         msg_tx
             .send(russh::ChannelMsg::Data {
@@ -3892,7 +4191,7 @@ mod tests {
         }));
         let (stdin_w, _stdin_r) = duplex(64);
         let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
-        let pump = tokio::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
 
         drop(msg_tx);
         timeout(Duration::from_secs(10), lost_rx.changed())
@@ -3935,7 +4234,7 @@ mod tests {
         let (mut client_stdout, mut bridge_stdout) = duplex(1024 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 process,
@@ -4002,7 +4301,7 @@ mod tests {
         let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 iter,
@@ -4064,7 +4363,7 @@ mod tests {
         client_lost_tx.send(true).unwrap();
         client_lost_rx.borrow_and_update();
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 iter,
@@ -4113,7 +4412,7 @@ mod tests {
         let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 iter,
@@ -4160,7 +4459,7 @@ mod tests {
         let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
         let (mut client_stderr, mut bridge_stderr) = duplex(64 * 1024);
 
-        let bridge_task = tokio::spawn(async move {
+        let bridge_task = crate::traced::spawn(async move {
             bridge(
                 "test",
                 &mut echo_stream,
@@ -4188,7 +4487,7 @@ mod tests {
         //! Tests that exercise the full ssh-exec stack against a real
         //! `TestServer`: russh transport, `ConnectionHandler` dispatch,
         //! and `handle_exec` request routing.
-        use sessions::SessionId;
+        use boxes::SessionId;
 
         use minimald_rpc::exec::ExecRequest;
 
@@ -4868,6 +5167,284 @@ mod tests {
 
             // The exec outcome is not the point of this test.
             let _ = out;
+        }
+    }
+}
+
+/// The exec channel's spans (OTel TEL-021, TEL-022, TEL-043): the client's
+/// `TRACEPARENT` reaches the `exec` and `git_*` spans, and the session
+/// lookup those channels make runs inside them. Export is off here, so the
+/// ids are the ones `adopt_trace` records for the file log; with export on
+/// they are the exported ids (the same code path, see `adopt_trace`).
+#[cfg(test)]
+mod trace_tests {
+    use crate::test_harness::{ExecRejected, SpanLog, TestServer};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    const PARENT: &str = "b7ad6b7169203331";
+    /// A session id no fresh server knows.
+    const UNKNOWN: &str = "6f1c1f9e-5a1b-4c2d-8e3f-000000000001";
+
+    fn traceparent() -> String {
+        format!("00-{TRACE}-{PARENT}-01")
+    }
+
+    /// `command` on `argv`'s channel of a fresh server, with the client's
+    /// `TRACEPARENT` and `MINIMAL_SESSION_ID` naming no session: the request
+    /// is refused after the lookup. Returns what the spans looked like.
+    async fn exec_unknown_session(command: &str) -> SpanLog {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session = UNKNOWN.to_owned();
+        let tp = traceparent();
+        let env = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::TRACEPARENT_ENV, tp.as_str()),
+        ];
+        let outcome = client.exec(&env, false, command, b"").await;
+        assert_eq!(outcome.err(), Some(ExecRejected), "an unknown session");
+        log
+    }
+
+    /// `verb min://<session>` on a channel of a fresh server's configured
+    /// session, with the client's `TRACEPARENT`: the lookup succeeds and the
+    /// pack task runs (to whatever end; its outcome is not the point).
+    /// Returns what the spans looked like.
+    async fn exec_known_session(verb: &str) -> SpanLog {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session =
+            crate::test_harness::create_configured_session(&mut client, "git-trace", "/tmp")
+                .await
+                .to_string();
+        let tp = traceparent();
+        let env = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::TRACEPARENT_ENV, tp.as_str()),
+        ];
+        let command = format!("{verb} min://{session}");
+        let run = client.exec(&env, false, &command, b"");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), run)
+            .await
+            .expect("the pack task ends with its channel");
+        assert!(outcome.is_ok(), "a known session is accepted");
+        log
+    }
+
+    /// The span `name`, in the client's trace, is the parent of the pack
+    /// task's `GetPaths` session message: the task runs in it.
+    fn assert_task_in(log: &SpanLog, name: &str) {
+        let span = log.one(name, "trace_id", TRACE);
+        let paths: Vec<_> = log
+            .find("session.message", "kind", "GetPaths")
+            .into_iter()
+            .filter(|m| m.field("trace_id") == Some(TRACE))
+            .collect();
+        assert_eq!(
+            paths.len(),
+            1,
+            "one GetPaths in the client's trace: {paths:#?}"
+        );
+        assert_eq!(
+            paths[0].field("parent_span_id"),
+            span.field("span_id"),
+            "the pack task runs in {name}: {paths:?}"
+        );
+    }
+
+    /// The span `name` is the client's span's child, and the manager's
+    /// `GetSession` message (the session lookup) is that span's child, all
+    /// in the client's trace.
+    fn assert_lookup_in(log: &SpanLog, name: &str) -> crate::test_harness::LoggedSpan {
+        let span = log.one(name, "trace_id", TRACE);
+        assert_eq!(span.field("parent_span_id"), Some(PARENT), "{span:?}");
+        let lookup = log.one("sessions.manager.message", "kind", "GetSession");
+        assert_eq!(lookup.field("trace_id"), Some(TRACE), "{lookup:?}");
+        assert_eq!(
+            lookup.field("parent_span_id"),
+            span.field("span_id"),
+            "the lookup is a child of {name}: {lookup:?}"
+        );
+        span
+    }
+
+    /// TEL-021, TEL-022: an exec adopts the client's `TRACEPARENT`,
+    /// and its session lookup is a child of the exec span. TEL-043: the command
+    /// line on the span is scrubbed of secrets.
+    #[tokio::test]
+    async fn an_exec_session_lookup_runs_in_the_exec_span() {
+        let log =
+            exec_unknown_session("curl -H 'Authorization: Bearer abc123def456' https://x/").await;
+        let exec = assert_lookup_in(&log, "exec");
+        let command = exec.field("command").unwrap_or_default();
+        assert!(!command.contains("abc123def456"), "{command}");
+        assert!(
+            command.contains("Authorization: Bearer <redacted"),
+            "{command}"
+        );
+    }
+
+    /// An exec whose client opted out of telemetry
+    /// (`MINIMAL_OTEL=off` on the channel, no `TRACEPARENT`) leaves no
+    /// span in the daemon's export: a tracer under the daemon's subscriber
+    /// sees nothing of it or of what ran in it, while the same exec from a
+    /// client that did not opt out exports its `exec` span. The file log
+    /// still has the span, marked `telemetry=opt-out`, with unsampled ids
+    /// its session lookup shares, and no command line.
+    ///
+    /// The lookup's own `sessions.manager.message` span is a root that
+    /// adopts the request's ids through `mlog::otel::align`, which asks the
+    /// process-wide tracer and so cannot be driven by this test's; the
+    /// flags-00 ids it adopts are the mechanism TEL-024 proves.
+    #[tokio::test]
+    async fn an_opted_out_request_leaves_no_daemon_span() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("t")))
+                .with(log.clone()),
+        );
+        let exported = || -> Vec<(String, String)> {
+            exporter
+                .get_finished_spans()
+                .unwrap()
+                .iter()
+                .map(|s| (s.name.to_string(), s.span_context.trace_id().to_string()))
+                .collect()
+        };
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session = UNKNOWN.to_owned();
+        let command = "curl -H 'Authorization: Bearer abc123def456' https://x/";
+
+        let off = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::OTEL_ENV, minimald_rpc::trace::OTEL_OFF),
+        ];
+        let outcome = client.exec(&off, false, command, b"").await;
+        assert_eq!(outcome.err(), Some(ExecRejected), "an unknown session");
+        let exec = log.one("exec", "telemetry", super::OPT_OUT);
+        assert_eq!(exec.field("command"), None, "no command line: {exec:?}");
+        assert_eq!(exec.field("parent_span_id"), None, "{exec:?}");
+        let trace_id = exec
+            .field("trace_id")
+            .expect("ids for the file log")
+            .to_owned();
+        let lookup = log.one("sessions.manager.message", "kind", "GetSession");
+        assert_eq!(
+            lookup.field("trace_id"),
+            Some(trace_id.as_str()),
+            "the lookup joins the request in the file log: {lookup:?}"
+        );
+        let sent = exporter
+            .get_finished_spans()
+            .unwrap()
+            .iter()
+            .filter(|s| s.name == "exec" || s.span_context.trace_id().to_string() == trace_id)
+            .count();
+        assert_eq!(
+            sent,
+            0,
+            "nothing of the request was exported: {:?}",
+            exported()
+        );
+
+        let tp = traceparent();
+        let on = [
+            (crate::MINIMAL_SESSION_ID_ENV, session.as_str()),
+            (minimald_rpc::trace::TRACEPARENT_ENV, tp.as_str()),
+        ];
+        let outcome = client.exec(&on, false, command, b"").await;
+        assert_eq!(outcome.err(), Some(ExecRejected), "an unknown session");
+        assert!(
+            exported().iter().any(|(name, _)| name == "exec"),
+            "a client that did not opt out is exported: {:?}",
+            exported()
+        );
+        assert!(
+            log.one("exec", "trace_id", TRACE)
+                .field("command")
+                .is_some_and(|c| c.contains("<redacted")),
+            "and its span carries the scrubbed command"
+        );
+    }
+
+    /// TEL-022: a push's session lookup runs in the
+    /// `git_receive` span, in the client's trace.
+    #[tokio::test]
+    async fn a_git_receive_lookup_runs_in_its_span() {
+        let log = exec_unknown_session(&format!("git-receive-pack min://{UNKNOWN}")).await;
+        assert_lookup_in(&log, "git_receive");
+    }
+
+    /// TEL-022: a fetch's session lookup runs in the
+    /// `git_upload` span, in the client's trace.
+    #[tokio::test]
+    async fn a_git_upload_lookup_runs_in_its_span() {
+        let log = exec_unknown_session(&format!("git-upload-pack min://{UNKNOWN}")).await;
+        assert_lookup_in(&log, "git_upload");
+    }
+
+    /// TEL-022: a push's receive-pack task runs in `git_receive`,
+    /// so its session messages join the client's trace instead of rooting
+    /// their own.
+    #[tokio::test]
+    async fn a_git_receive_task_runs_in_its_span() {
+        let log = exec_known_session("git-receive-pack").await;
+        assert_task_in(&log, "git_receive");
+    }
+
+    /// TEL-022: a fetch's upload-pack task runs in `git_upload`
+    /// (here it refuses a session with no repository, after `GetPaths`).
+    #[tokio::test]
+    async fn a_git_upload_task_runs_in_its_span() {
+        let log = exec_known_session("git-upload-pack").await;
+        assert_task_in(&log, "git_upload");
+    }
+
+    /// A push or a fetch from a client that opted out
+    /// (`MINIMAL_OTEL=off` on the channel) marks its git span
+    /// `telemetry=opt-out`, with ids for the file log and no parent. This
+    /// runs `adopt_opt_out` on both git spans, so its debug assertion that
+    /// the span declares `telemetry` fails here if either span loses it.
+    #[tokio::test]
+    async fn an_opted_out_git_span_is_marked_opt_out() {
+        for (verb, name) in [
+            ("git-receive-pack", "git_receive"),
+            ("git-upload-pack", "git_upload"),
+        ] {
+            let log = SpanLog::default();
+            let _g =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let env = [
+                (crate::MINIMAL_SESSION_ID_ENV, UNKNOWN),
+                (minimald_rpc::trace::OTEL_ENV, minimald_rpc::trace::OTEL_OFF),
+            ];
+            let outcome = client
+                .exec(&env, false, &format!("{verb} min://{UNKNOWN}"), b"")
+                .await;
+            assert_eq!(
+                outcome.err(),
+                Some(ExecRejected),
+                "{verb}: an unknown session"
+            );
+            let span = log.one(name, "telemetry", super::OPT_OUT);
+            assert_eq!(span.field("parent_span_id"), None, "{span:?}");
+            assert!(span.field("trace_id").is_some(), "file-log ids: {span:?}");
         }
     }
 }

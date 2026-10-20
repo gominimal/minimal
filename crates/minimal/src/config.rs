@@ -22,20 +22,20 @@ pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
 /// disk twice.
 pub fn read_client_config(
     global: &GlobalArgs,
-) -> Result<sessions::client::config::Config, anyhow::Error> {
+) -> Result<boxes::client::config::Config, anyhow::Error> {
     let cfg_path = resolve_minimal_config_dir(global).join("config.toml");
-    sessions::client::config::read_config_or_default(&cfg_path).map_err(|e| anyhow::anyhow!("{e}"))
+    boxes::client::config::read_config_or_default(&cfg_path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Read the user policy from `<config>/minimal/user_policy.toml`.
 /// A missing file returns [`UserPolicy::empty`] — a fresh install
 /// activates fine without needing the file to exist.
 ///
-/// [`UserPolicy::empty`]: sessions::core::policy::UserPolicy::empty
+/// [`UserPolicy::empty`]: boxes::core::policy::UserPolicy::empty
 pub fn read_user_policy(
     global: &GlobalArgs,
-) -> Result<sessions::core::policy::UserPolicy, anyhow::Error> {
-    sessions::core::policy::read_user_policy_or_default(&user_policy_path(global))
+) -> Result<boxes::core::policy::UserPolicy, anyhow::Error> {
+    boxes::core::policy::read_user_policy_or_default(&user_policy_path(global))
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -45,4 +45,64 @@ pub fn read_user_policy(
 /// reuse the same resolution.
 pub fn user_policy_path(global: &GlobalArgs) -> PathBuf {
     resolve_minimal_config_dir(global).join("user_policy.toml")
+}
+
+/// The organization-level client configuration. An administrator writes it,
+/// and it applies to every user of this machine.
+pub const ORGANIZATION_CONFIG_PATH: &str = "/etc/minimal/config.toml";
+
+/// Whether the user or the organization client configuration sets
+/// `[secrets] acknowledge_full_breadth_unenrolled = true` (BEP-057).
+/// A missing file sets nothing. A project file is never read here.
+///
+/// # Errors
+///
+/// A file that exists but is not read or does not parse, naming its path.
+pub fn full_breadth_acknowledged(global: &GlobalArgs) -> Result<bool, anyhow::Error> {
+    let user = resolve_minimal_config_dir(global).join("config.toml");
+    acknowledged_in(&[user, PathBuf::from(ORGANIZATION_CONFIG_PATH)])
+}
+
+/// Whether any of `paths` sets the acknowledgement. The first file that
+/// sets it decides.
+///
+/// # Errors
+///
+/// A file that exists but is not read or does not parse, naming its path.
+pub fn acknowledged_in(paths: &[PathBuf]) -> Result<bool, anyhow::Error> {
+    for path in paths {
+        let config = boxes::client::config::read_config_or_default(path)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if config.secrets.acknowledge_full_breadth_unenrolled {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BEP-057: the `[secrets]` table the refusal text names parses through
+    /// the client configuration reader, so `min session` still starts, and
+    /// the acknowledgement reads as set.
+    #[test]
+    fn secrets_table_reads_through_client_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("minimal");
+        std::fs::create_dir_all(&config_dir).expect("mkdir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[secrets]\nacknowledge_full_breadth_unenrolled = true\n",
+        )
+        .expect("write config.toml");
+        let global = GlobalArgs {
+            config_dir: Some(dir.path().to_path_buf()),
+            ..GlobalArgs::default()
+        };
+        let config = read_client_config(&global).expect("config.toml parses");
+        assert!(config.secrets.acknowledge_full_breadth_unenrolled);
+        assert!(full_breadth_acknowledged(&global).expect("reads"));
+    }
 }

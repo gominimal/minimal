@@ -26,7 +26,7 @@ mod env;
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
-pub use sandbox2::config::Invocation;
+pub use sandbox::config::Invocation;
 
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings, task_arg_env};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -934,7 +934,7 @@ impl Context {
     #[allow(clippy::too_many_arguments)]
     /// Builds an [`env::Env`] whose sandbox shares the host network. Use
     /// [`make_env_with_network`](Self::make_env_with_network) to run it under
-    /// another [`sandbox2::Network`] (e.g. an isolated PTask).
+    /// another [`sandbox::Network`] (e.g. an isolated PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -954,7 +954,7 @@ impl Context {
             patches,
             env_vars,
             packages,
-            std::sync::Arc::new(sandbox2::HostNet),
+            std::sync::Arc::new(sandbox::HostNet),
             home,
             WdLayout::BoundDir,
         )
@@ -962,7 +962,7 @@ impl Context {
     }
 
     /// Like [`make_env`](Self::make_env) but runs the sandbox under the given
-    /// [`sandbox2::Network`], so callers (e.g. the minimald task-exec path) can
+    /// [`sandbox::Network`], so callers (e.g. the minimald task-exec path) can
     /// give a task the same network as its session rather than always the
     /// host's. A provider, not a mode: the caller owns the mode and what it
     /// means, and the sandbox layer acts on what the provider says to do.
@@ -987,7 +987,7 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
-        network: std::sync::Arc<dyn sandbox2::Network>,
+        network: std::sync::Arc<dyn sandbox::Network>,
         home: PatchHome,
         wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
@@ -1147,7 +1147,10 @@ impl Context {
                 let rc_clone = rc.clone(); // TODO: This is trash
                 let cache_clone = self.daemon.cache.clone();
                 let semaphore = semaphore.clone();
-                task_set.spawn(async move {
+                // A spawned task starts with no current span: without this every
+                // package fetch (`materialize`) began a trace of its own, cut off
+                // from the activation that needed it.
+                let fetch = async move {
                     let sema = semaphore.acquire().await;
                     let res = rc_clone
                         .materialize(&spec_hash, &cache_clone, &name)
@@ -1166,7 +1169,11 @@ impl Context {
                         });
                     drop(sema);
                     res
-                });
+                };
+                task_set.spawn(tracing::Instrument::instrument(
+                    fetch,
+                    tracing::Span::current(),
+                ));
             }
         }
 
@@ -1217,7 +1224,7 @@ impl Context {
         let mut did_edit = false;
         match mode {
             AddDepMode::BuildPackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
+                if let Some(h) = doc["stack"].as_table_like_mut() {
                     did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
                     println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
@@ -1227,7 +1234,7 @@ impl Context {
                 }
             }
             AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
+                if let Some(h) = doc["stack"].as_table_like_mut() {
                     did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
                     println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
@@ -1239,7 +1246,7 @@ impl Context {
             AddDepMode::TaskPackages { name } => {
                 if let Some(tasks) = doc.get_mut("tasks")
                     && let Some(t) = tasks.get_mut(&name)
-                    && let Some(t) = t.as_table_mut()
+                    && let Some(t) = t.as_table_like_mut()
                 {
                     did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
                     println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
@@ -1251,7 +1258,7 @@ impl Context {
                 }
             }
             AddDepMode::SessionPackages => {
-                if let Some(h) = doc["session"].as_table_mut() {
+                if let Some(h) = doc["session"].as_table_like_mut() {
                     did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
                 } else {
                     doc.insert(
@@ -1288,7 +1295,7 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(
+fn upsert_toml_packages_list<T: TableLike + ?Sized>(
     t: &mut T,
     key: &str,
     upsert: &[String],
@@ -1750,6 +1757,119 @@ mod tests {
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
         );
+    }
+
+    #[test]
+    fn add_deps_inline_tables() {
+        let state = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let mfile_path = cwd.path().join("minimal.toml");
+        std::fs::write(
+            &mfile_path,
+            format!(
+                indoc! {
+                    "
+                    stack = {{ use = \"fake-stack\", build_packages = [] }}
+                    tasks = {{ something = {{ exec = \"./something\" }} }}
+                    session = {{ packages = [], vars = {{ ANSWER = \"42\" }} }}
+
+                    [upstream]
+                    dir = \"{}\"
+                    "
+                },
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-stack")
+                    .to_str()
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(cwd.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        let read_doc = || {
+            std::fs::read_to_string(&mfile_path)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap()
+        };
+        let str_list = |item: &Item| -> Vec<String> {
+            item.as_array()
+                .unwrap_or_else(|| panic!("expected an array, got {item:?}"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        // Adding to an inline [stack] must edit it in place and keep its
+        // sibling keys.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap();
+        ctx.add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::RuntimePackages)
+            .unwrap();
+        let doc = read_doc();
+        assert!(doc["stack"].is_inline_table(), "stack lost inline form");
+        assert_eq!(str_list(&doc["stack"]["build_packages"]), ["uroot"]);
+        assert_eq!(
+            str_list(&doc["stack"]["runtime_packages"]),
+            ["extra-runtime-pkg"]
+        );
+        assert_eq!(doc["stack"]["use"].as_str(), Some("fake-stack"));
+
+        // Adding to an inline task must edit it in place and keep its
+        // sibling keys.
+        ctx.add_deps(
+            &graph,
+            ["uroot"],
+            AddDepMode::TaskPackages {
+                name: "something".to_string(),
+            },
+        )
+        .unwrap();
+        let doc = read_doc();
+        assert!(doc["tasks"]["something"].is_inline_table());
+        assert_eq!(str_list(&doc["tasks"]["something"]["packages"]), ["uroot"]);
+        assert_eq!(
+            doc["tasks"]["something"]["exec"].as_str(),
+            Some("./something")
+        );
+
+        // A task that is not in the inline `tasks` table is still an error.
+        assert!(
+            ctx.add_deps(
+                &graph,
+                ["uroot"],
+                AddDepMode::TaskPackages {
+                    name: "missing".to_string(),
+                },
+            )
+            .is_err()
+        );
+
+        // Adding to an inline [session] must not replace the whole table.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
+            .unwrap();
+        let doc = read_doc();
+        assert!(doc["session"].is_inline_table(), "session lost inline form");
+        assert_eq!(str_list(&doc["session"]["packages"]), ["uroot"]);
+        assert_eq!(doc["session"]["vars"]["ANSWER"].as_str(), Some("42"));
+
+        // The surviving settings must still parse into the config.
+        let session = ctx.minimal_file().session.clone().unwrap_or_default();
+        assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
+        assert!(session.packages.contains(&"uroot".to_string()));
     }
 
     #[test]

@@ -202,7 +202,7 @@ pub async fn finalize_holding_lease<T>(
 pub struct RegisteredWithVmHost {
     /// The addresses the create request carries, so the in-VM daemon
     /// attaches with the handed switch address instead of drawing its own.
-    pub addresses: sessions::BoxAddresses,
+    pub addresses: boxes::BoxAddresses,
     /// The box's own id the reply returned — 32 hex digits on the wire,
     /// the one spelling the row, the attachment and a diagnostic all name
     /// it by — or `None` when the answering daemon predates ids.
@@ -233,7 +233,7 @@ pub async fn register_box_with_vm_host(
         // beside the id the published row holds, on the connection a held
         // registration keeps as its lease.
         minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
-            addresses: sessions::BoxAddresses {
+            addresses: boxes::BoxAddresses {
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
             },
@@ -340,7 +340,7 @@ pub async fn register_box_with_vm_host(
 pub async fn withdraw_box_row(
     control_sock: Option<PathBuf>,
     name: Option<&str>,
-    box_addresses: Option<sessions::BoxAddresses>,
+    box_addresses: Option<boxes::BoxAddresses>,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(name) = name else { return };
@@ -397,7 +397,7 @@ pub async fn withdraw_box_row(
 /// exists, and the in-VM daemon's own row check before it relaunches the
 /// box's host is the gate that fails closed. Exit 7 stays with the
 /// registration a create makes.
-pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) -> anyhow::Result<()> {
+pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyhow::Result<()> {
     let Some(control_sock) = control_sock_beside(sock) else {
         return Ok(());
     };
@@ -472,11 +472,11 @@ pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) -> a
 pub async fn register_box_for_activation(
     kind: paths::ProviderKind,
     minimal_dir: Option<&Path>,
-    network: sessions::NetworkMode,
+    network: boxes::NetworkMode,
     name: &str,
-    policy: &sessions::SessionPolicy,
+    policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    if kind != paths::ProviderKind::Minvmd || network != sessions::NetworkMode::OwnIp {
+    if kind != paths::ProviderKind::Minvmd || network != boxes::NetworkMode::OwnIp {
         return Ok(None);
     }
     // The control socket sits beside the ssh socket in the provider dir the
@@ -504,11 +504,11 @@ pub async fn register_box_for_activation(
 /// `Ok(None)`, and the create goes ahead as it always has.
 pub async fn register_box_beside(
     ssh_sock: &Path,
-    network: sessions::NetworkMode,
+    network: boxes::NetworkMode,
     name: &str,
-    policy: &sessions::SessionPolicy,
+    policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    if network != sessions::NetworkMode::OwnIp {
+    if network != boxes::NetworkMode::OwnIp {
         return Ok(None);
     }
     let Some(sock_path) = vm_host_control_sock(ssh_sock) else {
@@ -556,7 +556,7 @@ pub fn control_sock_beside(ssh_sock: &Path) -> Option<PathBuf> {
 async fn register_box_at(
     sock_path: &Path,
     name: &str,
-    policy: &sessions::SessionPolicy,
+    policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<RegisteredWithVmHost> {
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
@@ -649,7 +649,7 @@ async fn register_box_at(
 /// to one a live row already holds; for an autogen `name` that refusal is a
 /// name collision like the create's, so the name is re-minted with `remint`
 /// and registered again, within the bounded budget
-/// ([`crate::session_name::should_retry_autogen`]) the `CreateSession`
+/// ([`crate::box_name::should_retry_autogen`]) the `CreateSession`
 /// collision retry spends — `attempts` is shared with
 /// it. A refused registration publishes no row, so nothing is withdrawn
 /// between attempts. A user-supplied name, any other failure, and a spent
@@ -659,9 +659,9 @@ async fn register_box_at(
 pub async fn register_box_reminting_autogen(
     kind: paths::ProviderKind,
     minimal_dir: Option<&Path>,
-    network: sessions::NetworkMode,
+    network: boxes::NetworkMode,
     name: &mut String,
-    policy: &sessions::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     autogen: bool,
     attempts: &mut u32,
     remint: impl FnMut() -> String,
@@ -675,9 +675,9 @@ pub async fn register_box_reminting_autogen(
 /// [`register_box_reminting_autogen`] does for the CLI's activation.
 pub async fn register_box_beside_reminting_autogen(
     ssh_sock: &Path,
-    network: sessions::NetworkMode,
+    network: boxes::NetworkMode,
     name: &mut String,
-    policy: &sessions::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     autogen: bool,
     attempts: &mut u32,
     remint: impl FnMut() -> String,
@@ -704,9 +704,9 @@ enum VmHost<'a> {
 /// within the budget, re-mint the name and register again.
 async fn reminting_autogen(
     target: VmHost<'_>,
-    network: sessions::NetworkMode,
+    network: boxes::NetworkMode,
     name: &mut String,
-    policy: &sessions::SessionPolicy,
+    policy: &boxes::BoxPolicy,
     autogen: bool,
     attempts: &mut u32,
     mut remint: impl FnMut() -> String,
@@ -720,7 +720,7 @@ async fn reminting_autogen(
         };
         match registered {
             Err(error)
-                if crate::session_name::should_retry_autogen(
+                if crate::box_name::should_retry_autogen(
                     autogen,
                     *attempts,
                     &format!("{error:#}"),
@@ -790,9 +790,9 @@ mod tests {
         .unwrap();
         let registered = register_box_beside(
             &provider.join(paths::SSH_SOCK_FILE),
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             "web",
-            &sessions::SessionPolicy::default(),
+            &boxes::BoxPolicy::default(),
         )
         .await
         .expect("a native host registers nothing");
@@ -806,26 +806,27 @@ mod tests {
         (sock, listener)
     }
 
-    fn own_ip_record(addresses: sessions::BoxAddresses) -> sessions::Record {
-        sessions::Record {
-            id: sessions::SessionId::nil(),
+    fn own_ip_record(addresses: boxes::BoxAddresses) -> boxes::Record {
+        boxes::Record {
+            id: boxes::SessionId::nil(),
             name: Some("web".to_string()),
             username: None,
             project_path: paths::HostAbsPath::try_new("/p").unwrap(),
-            network: sessions::NetworkMode::OwnIp,
-            policy: sessions::SessionPolicy::default(),
-            status: sessions::SessionStatus::default(),
+            network: boxes::NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::default(),
+            status: boxes::BoxState::default(),
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
             box_id: None,
             host_ip_enforcement: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: Default::default(),
         }
     }
 
-    const PAIR: sessions::BoxAddresses = sessions::BoxAddresses {
+    const PAIR: boxes::BoxAddresses = boxes::BoxAddresses {
         switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
         loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
     };

@@ -42,6 +42,14 @@ pub(crate) mod provider;
 // (NET-136). Relay-internal, so no more public than this.
 pub(crate) mod dns_gate;
 
+// The guest's own DNS listener (NET-079): the loopback answerer a deny-all
+// host-address box's lookups are dstnat'd onto inside a VM-backed guest,
+// which refuses out-of-zone names and forwards the zone's A questions to
+// the switch gateway alone. Public because the daemon's `main` (a separate
+// bin crate) starts it at the guest's boot. Carries unit tests, so it is
+// not `#[cfg(not(test))]`.
+pub mod guest_dns;
+
 // The cgroup classifier a host-address box's egress verdict is decided on
 // (NET-079): the deny-or-allow subtree a box's declaration places its leaf
 // in, and the start-time fact of whether this host can decide per box at
@@ -1946,7 +1954,7 @@ mod tests {
             SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
                 .with_hostname_proxy_port(Some(7654)),
         ));
-        let waiter = tokio::spawn({
+        let waiter = crate::traced::spawn({
             let switch = Arc::clone(&switch);
             async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
         });
@@ -1969,7 +1977,7 @@ mod tests {
                 .with_hostname_proxy_port(None)
                 .with_hostname_proxy_pending(true),
         ));
-        let waiter = tokio::spawn({
+        let waiter = crate::traced::spawn({
             let switch = Arc::clone(&switch);
             async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
         });

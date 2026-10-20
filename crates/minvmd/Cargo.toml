@@ -29,6 +29,10 @@ libc.workspace = true
 serde = { workspace = true }
 thiserror.workspace = true
 serde_json_lenient.workspace = true
+# The strict parser the guest telemetry door reads the guest's lines with
+# (`guest_telemetry::accept_line`): no comments, no trailing commas, so the
+# host forwards only what a strict collector reads the same way.
+serde_json.workspace = true
 toml.workspace = true
 # Cross-platform per-process resource sampling (CPU%, RSS, disk I/O) of the VMM
 # child PID, and host capacity (cores/memory) for `config set` validation (#747).
@@ -36,12 +40,12 @@ sysinfo.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-# The shared, pure frame verdict (`sessions::core::egress`) the host-side
+# The shared, pure frame verdict (`boxes::core::egress`) the host-side
 # egress gate applies per source address (NET-081), and the policy types the
 # host-side box table (NET-138) compiles a namespace's declaration from. The
 # gate runs in `minvmd` itself, outside the VM, so the verdict must be a
 # normal dependency, not a test-only one.
-sessions.workspace = true
+boxes.workspace = true
 # Shares minimald's portable RPC wire types: `NetworkMode` / `IpProto` drive the
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and
 # cannot be imported here, but the wire-types crate is portable).
@@ -89,6 +93,11 @@ russh-sftp.workspace = true
 # real registry (`bep_stub`, NET-132) on the switch crate's channel-wired
 # lane and box-side client — the same `test_util` the pool's own tests use.
 switch = { workspace = true, features = ["test-util"] }
+# The supervisor's span-phase tests (`telemetry`) record what the OTel layer
+# exports in memory, with the same layer `mlog::otel` installs.
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
 
 [lints]
 workspace = true

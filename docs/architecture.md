@@ -9,9 +9,9 @@ The crates fall into two groups:
 
 - **Core crates** power the deep internals, most of the library crates.
   Declarative evaluation (`mfile`, `decode`, `checkouts`, `stdlib`), the
-  dependency graph and build machinery (`graph`, `orchestrator`, `sandbox2`,
+  dependency graph and build machinery (`graph`, `orchestrator`, `sandbox`,
   `lcache`, `rcache`, `op`), and the session/composition primitives
-  (`sessions`, `switch`). They expose no stable external interface; they exist
+  (`boxes`, `switch`). They expose no stable external interface; they exist
   to be wired together.
 - **Product-surface crates**: typically the binaries, give users a stable
   interface: `mip` (the package/build CLI), `min` (the session CLI), `minimald`
@@ -37,7 +37,7 @@ flowchart TB
         CHK["checkouts<br/>upstream layer clones"] --> DEC
         DEC --> GR["graph<br/>dependency graph + planner"]
         GR --> ORC["orchestrator<br/>build scheduling"]
-        ORC --> SBX["sandbox2<br/>namespaced build execution"]
+        ORC --> SBX["sandbox<br/>namespaced build execution"]
         SBX --> LC["lcache<br/>content-addressed artifacts"]
         RC["rcache / remote-client<br/>remote cache + execution"] <--> LC
     end
@@ -84,8 +84,8 @@ contributions and routes anything needing approval back to the client; the
 client gates those pending items and returns verdicts; the daemon assembles the
 final `Composition` (vars, file patches, packages, lifecycle hooks) for the
 apply layer. User policy is enforced only on the client; the daemon never runs
-it. The **sessions** crate holds these primitives; the full data flow is
-documented in [Sessions composition](internal/sessions-composition.md) (source: `crates/sessions/docs/COMPOSITION.md`).
+it. The **boxes** crate holds these primitives. [Sessions composition](internal/sessions-composition.md)
+documents the full data flow (source: `crates/boxes/docs/COMPOSITION.md`).
 
 ### VM internals
 
@@ -151,7 +151,7 @@ Notable crates, in roughly the order the build pipeline drives them:
 | `mctx` | Provides a 'minimal context': a higher-level API bringing the main features together. Both CLIs and `minimald` drive the build machinery through it. |
 | `op` | Complex operations over the graph or packages, anything complex enough to warrant its own place/process-name. |
 | `orchestrator` | Owns runtime orchestration of package builds. |
-| `sandbox2` | Sandboxed build/task execution API using Linux namespaces. |
+| `sandbox` | Sandboxed build/task execution API using Linux namespaces. |
 | `check` | Lints Minimal configuration: `minimal.toml`, packages, profiles, and stacks. |
 | `mip` | The package/build CLI entry-point. |
 
@@ -201,13 +201,13 @@ plane instead, which no manifest records.
 execution:
 
 `args`, `check`, `checkouts`, `decode`, `graph`, `lcache`, `mfile`, `mip`, `op`,
-`orchestrator`, `rcache`, `remote-client`, `remote-proto`, `sandbox2`, `stdlib`
+`orchestrator`, `rcache`, `remote-client`, `remote-proto`, `sandbox`, `stdlib`
 
 **session** covers the CLIs and daemons behind a running session, on the host
 and inside the microVM:
 
-`async-dialog`, `minimal`, `minimal-client`, `minimal-tui`, `minimald`,
-`minimald-rpc`, `minvmd`, `sessions`, `switch`
+`async-dialog`, `minimal`, `minimal-client`, `minimald`,
+`minimald-rpc`, `minvmd`, `boxes`, `switch`
 
 **shared** covers the utilities the other planes draw on:
 

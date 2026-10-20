@@ -175,8 +175,8 @@ fn resolve_switch_octet(lock_dir: Option<&std::path::Path>, identity: &str) -> u
     octet
 }
 
+use crate::box_manager;
 use crate::connection::{Connection, ConnectionHandle};
-use crate::sessions;
 
 /// The ed25519 host private key for the SSH server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,7 +266,7 @@ pub struct Config {
     pub daemon_identity_dir: Option<DaemonAbsPath>,
 
     /// The daemon's opt-out of the deny-all egress default (NET-077). With
-    /// the default in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
+    /// the default in force (see [`boxes::EGRESS_DEFAULT_PHASE`]), an
     /// own-address box created with no `egress` section reaches nothing
     /// outside itself (NET-074) and shows `deny-all (default)` in
     /// `min session policy` (NET-075). A deployment that cannot carry that
@@ -275,7 +275,7 @@ pub struct Config {
     /// that declares its own egress section keeps its declared lists either
     /// way; the opt-out also keeps the earlier allow-all reading of a
     /// destination list the section left absent, which in force resolves to
-    /// present and empty (`sessions::effective_egress`).
+    /// present and empty (`boxes::effective_egress`).
     #[serde(default)]
     pub deny_all_opt_out: bool,
     /// How the create gate learns the host's verdict on the unprivileged
@@ -300,9 +300,9 @@ pub fn this_daemon_path() -> String {
 }
 
 /// The verdict [`UsernsGate::Fixed`] carries, re-exported so the daemon
-/// binary and the harness-driven tests name it without a `sandbox2`
+/// binary and the harness-driven tests name it without a `sandbox`
 /// dependency of their own.
-pub use sandbox2::UsernsRestriction;
+pub use sandbox::UsernsRestriction;
 
 /// Where the create gate's user-namespace verdict comes from (NET-141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -382,7 +382,10 @@ impl DaemonLogRelease {
         Self(Box::new(release))
     }
 
-    fn run(self) {
+    /// Run the release: the file layer off, the appender flushed and closed.
+    /// Once, at shutdown ([`ServerStateHandle::release_log`]), or by a test of
+    /// the binary's `DaemonLogger` that wants to read what the file holds.
+    pub fn run(self) {
         (self.0)()
     }
 }
@@ -397,7 +400,7 @@ impl std::fmt::Debug for DaemonLogRelease {
 #[derive(Debug)]
 pub struct ServerState {
     config: Config,
-    sessions: sessions::ManagerHandle,
+    sessions: box_manager::BoxManagerHandle,
     daemon_id: String,
 
     /// The daemon-scoped gvproxy switch, cloned beside the copy the sessions
@@ -576,8 +579,8 @@ impl ServerState {
             slice_octet = slice_octet,
             reserved_loopback = %format!(
                 "{first}-{last}",
-                first = ::sessions::core::loopback::POOL_FIRST,
-                last = ::sessions::core::loopback::POOL_LAST
+                first = ::boxes::core::loopback::POOL_FIRST,
+                last = ::boxes::core::loopback::POOL_LAST
             ),
             "gvproxy switch this daemon's boxes lease on; published boxes \
              are granted from this host's reserved local range"
@@ -602,7 +605,7 @@ impl ServerState {
         );
 
         Ok(Self {
-            sessions: sessions::Manager::init(
+            sessions: box_manager::BoxManager::init(
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
@@ -776,7 +779,7 @@ impl ServerStateHandle {
     }
 
     /// Returns a handle to the sessions manager.
-    pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
+    pub async fn sessions_manager(&self) -> box_manager::BoxManagerHandle {
         self.0.lock().await.sessions.clone()
     }
 
@@ -807,7 +810,7 @@ impl ServerStateHandle {
         // match scrutinee would otherwise hold it across the `/proc` reads.
         let gate = self.0.lock().await.config.user_namespace_gate;
         match gate {
-            UsernsGate::Live => sandbox2::user_namespaces_restriction(),
+            UsernsGate::Live => sandbox::user_namespaces_restriction(),
             UsernsGate::Off => None,
             UsernsGate::Fixed(restriction) => Some(restriction),
         }
@@ -1108,7 +1111,7 @@ impl Server {
                 .await
                 .enqueue_resume_active_sessions()
                 .await;
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 if let Err(error) = resumed.await {
                     tracing::warn!(
                         %error,
@@ -1287,6 +1290,14 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 /// Unanswered keepalives tolerated before the connection is torn down.
 const KEEPALIVE_MAX: usize = 3;
 
+/// Wall-clock budget for tearing down a connection whose transport has
+/// stopped making progress — a full keepalive cycle plus one interval, so
+/// an otherwise-quiet but healthy attach (which answers each keepalive,
+/// resetting the clock) is never reaped: a healthy idle attach sees a
+/// keepalive every [`KEEPALIVE_INTERVAL`], long before this fires.
+const INACTIVITY_TIMEOUT: std::time::Duration =
+    KEEPALIVE_INTERVAL.saturating_mul(KEEPALIVE_MAX as u32 + 1);
+
 /// Builds the shared russh server config from the server state.
 async fn build_russh_config(
     state: &ServerStateHandle,
@@ -1295,9 +1306,14 @@ async fn build_russh_config(
         keys: vec![state.host_key().await?],
         auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         nodelay: true,
-        // Keepalives own deadness detection; the default 600s inactivity
-        // reaper would kill healthy idle attaches, so it is explicitly off.
-        inactivity_timeout: None,
+        // Keepalives own deadness detection, so this must never reap an
+        // idle-but-alive attach (the default 600s would). But russh bounds
+        // every transport write by the inactivity timer, and with `None` a
+        // wedged write parks the session loop forever — keepalives are
+        // dispatched from that same loop, so they stop firing too and the
+        // connection outlives every budget. Arming it at the keepalive
+        // budget bounds a stuck transport without touching a healthy one.
+        inactivity_timeout: Some(INACTIVITY_TIMEOUT),
         keepalive_interval: Some(KEEPALIVE_INTERVAL),
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
@@ -1337,7 +1353,7 @@ mod reap_seam {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use ::sessions::SessionId;
+    use ::boxes::SessionId;
     use tokio::sync::oneshot;
 
     type Hold = (oneshot::Sender<()>, oneshot::Receiver<()>);
@@ -1384,7 +1400,8 @@ mod reap_seam {
 /// restart. A finalized (`Active`) session is long-lived and must
 /// survive the connection that created it, so it is left untouched.
 /// Best-effort and never fatal: minimald is pid-1 in the guest.
-async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::sessions::SessionId>) {
+#[tracing::instrument(level = "info", name = "sessions.reap_unfinalized", skip_all, fields(count = ids.len()))]
+async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::SessionId>) {
     if ids.is_empty() {
         return;
     }
@@ -1393,7 +1410,7 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
         // Re-read the status at teardown: a clean client abort already
         // deleted the record (`get_record` → `None`), and a finalized
         // session is `Active` — neither should be reaped here.
-        let status = match mngr.get_record(sessions::SessionKeyPredicate::Id(id)).await {
+        let status = match mngr.get_record(box_manager::BoxKeyPredicate::Id(id)).await {
             Ok(Some(record)) => record.status,
             Ok(None) => continue,
             Err(e) => {
@@ -1407,7 +1424,7 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
         };
         if !matches!(
             status,
-            ::sessions::SessionStatus::Pending | ::sessions::SessionStatus::Materializing
+            ::boxes::BoxState::Pending | ::boxes::BoxState::Materializing
         ) {
             continue;
         }
@@ -1478,7 +1495,7 @@ async fn start_host_proxies(
     // that port on the host loopback follows the same default-first rule and
     // walks to a host port of its own when the host already holds the
     // default — the bind itself never moves for a publish (NET-059).
-    tokio::spawn(drive_proxy_until_serving(
+    crate::traced::spawn(drive_proxy_until_serving(
         state.clone(),
         HostProxyStartup::Egress {
             bind_base,
@@ -1532,7 +1549,7 @@ async fn start_host_proxies(
         );
     }
     let hook_port = zone_answerer_port.unwrap_or(crate::net::answerer::ANSWERER_PORT);
-    tokio::spawn(crate::net::answerer::acquire(
+    crate::traced::spawn(crate::net::answerer::acquire(
         state.clone(),
         hook_port,
         answerer_status,
@@ -1774,7 +1791,7 @@ impl HostProxyStartup {
             proxied_request_verdict,
         );
         match self {
-            Self::Egress { .. } => tokio::spawn(async move {
+            Self::Egress { .. } => crate::traced::spawn(async move {
                 if let Err(error) = serve(listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
@@ -2298,7 +2315,7 @@ pub(crate) async fn drive_proxy_until_serving(
                 // tell. Sent in the background: the report's vsock dial can
                 // take seconds per try, and the drive must record serving
                 // without waiting on it.
-                tokio::spawn(report_proxy_serving(host_port));
+                crate::traced::spawn(report_proxy_serving(host_port));
                 break;
             }
             Some(failure) => {
@@ -2357,7 +2374,7 @@ pub(crate) async fn drive_proxy_until_serving(
                     // ends here and never waits on the report's vsock dial,
                     // which can take seconds per try.
                     proxy.record_unavailable(&state, failure.report).await;
-                    tokio::spawn(report_proxy_port_held(host_port));
+                    crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }
                 // No rung left to walk to, a pinned port, or a transient
@@ -2507,7 +2524,7 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
                         // handle is dropped on purpose — nothing ever aborts
                         // it, because nothing ever rebinds: the walk below
                         // moves the *publication*, never the socket.
-                        drop(tokio::spawn(async move {
+                        drop(crate::traced::spawn(async move {
                             if let Err(error) =
                                 crate::net::answerer::serve(socket, serve_answerer).await
                             {
@@ -2912,6 +2929,10 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "upstream's tests spawn plain tokio tasks; the traced-spawn rule is for request handling"
+)]
 mod tests {
     use std::time::Duration;
 
@@ -2928,6 +2949,27 @@ mod tests {
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
         super::test_config(dir.path())
+    }
+
+    /// The inactivity deadline is the whole keepalive budget, derived from the
+    /// keepalive settings rather than restated: a healthy idle attach answers a
+    /// keepalive every interval (resetting the clock), so the deadline must
+    /// outlast every keepalive round the budget allows.
+    #[test]
+    fn inactivity_deadline_spans_the_full_keepalive_budget() {
+        assert_eq!(INACTIVITY_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        assert!(INACTIVITY_TIMEOUT > KEEPALIVE_INTERVAL * KEEPALIVE_MAX as u32);
+    }
+
+    /// The production config arms the inactivity deadline: with `None` a
+    /// wedged transport write parks the session loop forever.
+    #[tokio::test]
+    async fn the_production_config_arms_the_inactivity_deadline() {
+        let server = crate::test_harness::TestServer::new().await;
+        let config = build_russh_config(&server.state).await.unwrap();
+        assert_eq!(config.inactivity_timeout, Some(INACTIVITY_TIMEOUT));
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, KEEPALIVE_MAX);
     }
 
     /// The node address's interim opening follows the port the proxy actually
@@ -3063,7 +3105,7 @@ mod tests {
     ) {
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::run(config, listener, None));
+        let run = crate::traced::spawn(Server::run(config, listener, None));
         (run, sock)
     }
 
@@ -3089,7 +3131,7 @@ mod tests {
         start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::serve(state.clone(), listener));
+        let run = crate::traced::spawn(Server::serve(state.clone(), listener));
         (state, run, sock)
     }
 
@@ -3298,7 +3340,7 @@ mod tests {
         let working = state
             .sessions_manager()
             .await
-            .get_session(sessions::SessionKeyPredicate::Id(id))
+            .get_session(box_manager::BoxKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("session should resolve")
@@ -3388,7 +3430,7 @@ mod tests {
                 .await
                 .record
                 .map(|record| record.status),
-            Some(::sessions::SessionStatus::Pending),
+            Some(::boxes::BoxState::Pending),
             "the refused attach must leave the session unfinalized for the reap"
         );
 
@@ -3493,7 +3535,7 @@ mod tests {
             .unwrap();
         // A compressed schedule: first retry 5 ms after the failure, doubling
         // to a 20 ms cap, so a loop's worth of failures costs milliseconds.
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: addr.ip(),
@@ -3579,9 +3621,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_backend_on(addr: std::net::SocketAddr, body: &'static str) {
         let backend = TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
                     let mut scratch = [0u8; 1024];
@@ -3689,7 +3731,7 @@ mod tests {
         // host-loopback gate, record the bound port. The compressed backoff
         // keeps a failed attempt cheap should the box be noisy.
         let retry = RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(100));
-        tokio::spawn(drive_proxy_until_serving(
+        crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -3731,7 +3773,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
+        let drive = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -3830,7 +3872,7 @@ mod tests {
 
         // The answerer never does: no line of its component — not a bind, not
         // a retry, not a serving — and its discovery field, the one `min ls`
-        // prints its ZONE ANSWERER line from, stays empty for a window the
+        // prints its DNS SERVICE line from, stays empty for a window the
         // native startup fills it in within its first bind attempt.
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(
@@ -3949,7 +3991,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
+        let drive = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -4103,7 +4145,7 @@ mod tests {
             .hostnames()
             .write()
             .unwrap()
-            .register_host_net(::sessions::SessionId::nil(), "web");
+            .register_host_net(::boxes::SessionId::nil(), "web");
         let authority = format!("web.min.internal:{backend}");
         let routed = proxy_get(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
@@ -4137,14 +4179,16 @@ mod tests {
     async fn proxy_auto_selects_free_port() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        // Hold the documented default so the fallback is observable: the
-        // daemon's first bind must fail, its second must land elsewhere.
-        let held = TcpListener::bind((
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-        ))
-        .await
-        .ok();
+        // Hold the "default" so the fallback is observable: the daemon's
+        // first bind must fail, its second must land elsewhere. An OS-picked
+        // port this process owns, not the documented one: the `Server::run`
+        // tests beside this one bind the real default in their own
+        // processes, and one could release it between a failed hold here and
+        // the proxy's bind, which would then take the default.
+        let held = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let default = held.local_addr().unwrap().port();
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -4157,13 +4201,23 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        start_host_proxies(&state, false, None, None).await;
+        // The native startup shape `start_host_proxies` spawns, with the
+        // held port as the default.
+        crate::traced::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: ProxyPort::DefaultThenSelect { default },
+            },
+            false,
+            HostExpose::Shuttle,
+            RetryBackoff::production(),
+        ));
 
         let bound = wait_for_proxy_port(&state).await;
         assert_ne!(bound, 0, "port 0 is a request for a port, not an answer");
         assert_ne!(
-            bound,
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+            bound, default,
             "a busy default must not be waited on or taken"
         );
         assert!(
@@ -4180,7 +4234,7 @@ mod tests {
             .hostnames()
             .write()
             .unwrap()
-            .register_host_net(::sessions::SessionId::nil(), "web");
+            .register_host_net(::boxes::SessionId::nil(), "web");
         let authority = format!("web.min.internal:{backend}");
         let routed = proxy_get(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound),
@@ -4309,7 +4363,7 @@ mod tests {
             switch.lock().await.hostname_proxy_unsettled(),
             "an OS-picked port's bind is pending, not absent"
         );
-        let waiter = tokio::spawn({
+        let waiter = crate::traced::spawn({
             let switch = Arc::clone(&switch);
             async move { crate::net::hostname_proxy_serving_port(&switch, Some(BOX_LEASE)).await }
         });
@@ -4384,7 +4438,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4457,7 +4511,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 // `192.0.2.1` is TEST-NET-1: no interface holds it, so every
@@ -4550,7 +4604,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4628,8 +4682,27 @@ mod tests {
     async fn a_walked_publication_keeps_the_bind_and_reports_the_rung() {
         use std::net::{IpAddr, Ipv4Addr};
 
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+
         // A free port stands in for the documented default, with a free rung
-        // above it for the walk to land on.
+        // above it for the walk to land on. Probed last, right before the
+        // drive binds it: the probe has to be released for the drive to take
+        // the port, and every sibling test process allocating loopback ports
+        // in between can land on it — the drive then relocates (the busy
+        // default's NET-025 fallback) and publishes a port the ledger never
+        // held, which is a different test. Keeping the state's construction
+        // (host-key generation included) out of that window makes it
+        // microseconds wide instead of tens of milliseconds.
         let (default_port, rung) = loop {
             let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
@@ -4643,18 +4716,6 @@ mod tests {
             }
             break (port, rung);
         };
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
 
         // The forwarder's ledger with the default already held — the host
         // loopback as a second VM's daemon finds it.
@@ -4749,7 +4810,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
+        let drive = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4915,7 +4976,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        tokio::spawn(drive_proxy_until_serving(
+        crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -5034,9 +5095,9 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     let _ = sock.read(&mut scratch).await;
                     let response = format!(
@@ -5167,7 +5228,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_zone_routes_on_an_instance_scoped_registry() {
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
 
         let dir = TempDir::new().unwrap();
         let state = ServerStateHandle::new(test_config(&dir), None)
@@ -5217,7 +5278,7 @@ mod tests {
         use std::collections::BTreeMap;
         use std::net::{IpAddr, Ipv4Addr};
 
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
 
         // `in_microvm` is what makes a daemon's registry route an own-IP box
         // to its reported address (a lease on the switch) rather than to the
@@ -5672,7 +5733,7 @@ mod tests {
     async fn answerer_starts_and_serves_the_zone_on_loopback() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
         use hickory_proto::op::{Message, ResponseCode};
         use hickory_proto::rr::rdata::A;
         use hickory_proto::rr::{RData, RecordType};
@@ -5704,7 +5765,7 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        tokio::spawn(drive_answerer_until_serving(
+        crate::traced::spawn(drive_answerer_until_serving(
             state.clone(),
             answerer,
             addr.ip(),
@@ -5777,15 +5838,16 @@ mod tests {
     async fn answerer_relocates_when_its_default_port_is_busy() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use crate::net::answerer::{ANSWERER_PORT, AnswerScope, ZoneAnswerer};
+        use crate::net::answerer::{AnswerScope, ZoneAnswerer};
 
-        // Hold the answerer's documented default (UDP) for the whole test.
-        // `.ok()`, not `unwrap`: the `Server::run` tests beside this one bind
-        // the real defaults too, and nextest runs each test in its own
-        // process, so another process may already hold it. Either holder
-        // produces the same relocation; nothing here needs *this* process to
-        // be the one holding it.
-        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, ANSWERER_PORT)).ok();
+        // Hold the "default" for the whole test: an OS-picked port this
+        // process owns, not the documented one. The `Server::run` tests
+        // beside this one bind the real defaults in their own processes, so
+        // a hold on the documented port could fail while another process
+        // held it, and that process could release it before the answerer's
+        // bind, which would then take the default.
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let default = held.local_addr().unwrap().port();
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -5800,13 +5862,11 @@ mod tests {
             .unwrap();
         let hostnames = state.sessions_manager().await.hostnames();
         let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        tokio::spawn(drive_answerer_until_serving(
+        crate::traced::spawn(drive_answerer_until_serving(
             state.clone(),
             answerer,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ProxyPort::DefaultThenSelect {
-                default: ANSWERER_PORT,
-            },
+            ProxyPort::DefaultThenSelect { default },
             false,
             HostExpose::Shuttle,
             RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
@@ -5823,7 +5883,7 @@ mod tests {
         .await
         .expect("the answerer must relocate and report its port");
         assert_ne!(
-            reported, ANSWERER_PORT,
+            reported, default,
             "a busy default must not be waited on or taken"
         );
 
@@ -5853,27 +5913,11 @@ mod tests {
     async fn a_walked_answerer_publication_keeps_the_bind_and_reports_the_rung() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use ::sessions::SessionId;
+        use ::boxes::SessionId;
         use hickory_proto::op::{Message, ResponseCode};
         use hickory_proto::rr::RecordType;
 
         use crate::net::answerer::{AnswerScope, ZoneAnswerer, encode_query};
-
-        // A free port stands in for the documented default, with a free rung
-        // above it for the walk to land on.
-        let (default_port, rung) = loop {
-            let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            let Some(rung) = next_host_publish_port(port) else {
-                continue;
-            };
-            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, rung)) {
-                Ok(rung_probe) => drop(rung_probe),
-                Err(_) => continue,
-            }
-            break (port, rung);
-        };
 
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -5891,6 +5935,29 @@ mod tests {
             .write()
             .expect("registry lock")
             .register_host_net(SessionId::nil(), "web");
+
+        // A free port stands in for the documented default, with a free rung
+        // above it for the walk to land on. Probed last, right before the
+        // drive binds it: the probe has to be released for the drive to take
+        // the port, and every sibling test process allocating loopback ports
+        // in between can land on it — the drive then relocates (the busy
+        // default's NET-025 fallback) and publishes a port the ledger never
+        // held, which is a different test. Keeping the state's construction
+        // (host-key generation included) out of that window makes it
+        // microseconds wide instead of tens of milliseconds.
+        let (default_port, rung) = loop {
+            let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let Some(rung) = next_host_publish_port(port) else {
+                continue;
+            };
+            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, rung)) {
+                Ok(rung_probe) => drop(rung_probe),
+                Err(_) => continue,
+            }
+            break (port, rung);
+        };
 
         // The forwarder's ledger with the default already held — the host
         // loopback as a second VM's daemon finds it.
