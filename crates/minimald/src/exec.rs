@@ -416,6 +416,57 @@ fn apply_patch_verdict(
     Ok(())
 }
 
+/// Refuses a task whose `~/` patch key leads outside the session's home.
+///
+/// The session's home is the box's own `/home`, so anything in the box can
+/// put a symlink there. The bind mount follows it on this machine, so a
+/// `~/x` the client allowed by name could mount any directory the daemon
+/// can reach. The client cannot look inside the session's home, so this
+/// check runs here: each `~/` key must still lie under the home once its
+/// links are followed. A key whose links cannot be followed is refused.
+/// A box that swaps a link after this check and before the mount is not
+/// caught.
+///
+/// # Errors
+///
+/// The refusal text, naming the task and the key.
+fn refuse_escaping_home_patches(
+    task_name: &str,
+    patch: &mfile::EnvPatches,
+    home: &camino::Utf8Path,
+) -> Result<(), String> {
+    use boxes::core::compose::resolve_patch_target;
+    let mut tilde = patch
+        .dir
+        .keys()
+        .chain(patch.file.keys())
+        .filter_map(|key| key.strip_prefix("~/").map(|rest| (key, rest)))
+        .peekable();
+    if tilde.peek().is_none() {
+        return Ok(());
+    }
+    let Some(home_real) = resolve_patch_target(home) else {
+        return Err(format!(
+            "task '{task_name}' declares patch paths under `~/`, and the session's \
+             home {home} cannot be read, so the task did not run"
+        ));
+    };
+    for (key, rest) in tilde {
+        match resolve_patch_target(&home.join(rest)) {
+            Some(target) if target.starts_with(&home_real) => {}
+            _ => {
+                return Err(format!(
+                    "task '{task_name}' declares the patch path `{key}`, which leads \
+                     outside the session's home through a symbolic link, so the task \
+                     did not run. Remove the link from the session, then run the task \
+                     again"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a task started from inside a box (`min run <task>`) that
 /// declares any patch path.
 ///
@@ -443,8 +494,41 @@ pub(crate) fn refuse_in_box_patches(
 
 #[cfg(test)]
 mod patch_verdict_tests {
-    use super::{apply_patch_verdict, refuse_in_box_patches};
+    use super::{apply_patch_verdict, refuse_escaping_home_patches, refuse_in_box_patches};
     use minimald_rpc::taskenv::{AllowedPatch, DroppedPatch, PatchVerdict};
+
+    /// A `~/` key that a link in the session's home sends elsewhere is
+    /// refused. A key that stays inside, including one that does not
+    /// exist yet, and an absolute key, pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_tilde_patch_through_a_link_out_of_the_home_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root =
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let home = root.join("home");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(home.join("inside").as_std_path()).unwrap();
+        std::fs::create_dir(outside.as_std_path()).unwrap();
+        std::os::unix::fs::symlink(outside.as_std_path(), home.join("x").as_std_path()).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("gone").as_std_path(),
+            home.join("dangling").as_std_path(),
+        )
+        .unwrap();
+
+        for key in ["~/x", "~/x/sub", "~/dangling"] {
+            let err = refuse_escaping_home_patches("t", &patches(&[key], &[]), &home).unwrap_err();
+            assert!(err.contains(&format!("`{key}`")), "{err}");
+            assert!(err.contains("outside the session's home"), "{err}");
+        }
+        refuse_escaping_home_patches(
+            "t",
+            &patches(&["~/inside", "~/new/dir", "/opt/x"], &["~/inside/f"]),
+            &home,
+        )
+        .expect("every key stays inside the home");
+    }
 
     fn patches(dirs: &[&str], files: &[&str]) -> mfile::EnvPatches {
         let mut p = mfile::EnvPatches::default();
@@ -668,6 +752,10 @@ async fn task_producer(
         // `/workbench`), and a patch that expanded into either directory is
         // mounted at the matching path there, keeping its declared mode.
         let session_paths = session.paths().await?;
+        // A `~/` key the client allowed by name must not lead out of the
+        // session's home through a link the box put there.
+        refuse_escaping_home_patches(&exec.task, &task.patch, session_paths.home.as_utf8_path())
+            .map_err(io::Error::other)?;
         // `inherit_cwd`: start where the client was invoked, inside the
         // uploaded tree, or fall back to the root with a notice.
         let (start_dir, mut start_notice) = match task_start_dir(
