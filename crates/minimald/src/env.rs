@@ -2683,8 +2683,8 @@ exit $rc
         };
         assert_eq!(code, 0, "help should exit 0, got: {stdout} {stderr}");
         assert!(
-            stderr.contains("Usage: min package patched-build <package-name>"),
-            "help should print usage, got: {stderr}"
+            stdout.contains("Usage: min package patched-build <package name>"),
+            "help should print usage on stdout, got: {stdout}"
         );
         assert!(
             !stderr.contains("RPC-CALLED"),
@@ -2707,12 +2707,240 @@ exit $rc
             };
             assert_eq!(code, 1, "`{args}` should exit 1, got: {stdout} {stderr}");
             assert!(
-                stderr.contains("Usage: min package patched-build <package-name>"),
+                stderr.contains("Usage: min package patched-build <package name>"),
                 "`{args}` should print usage, got: {stderr}"
             );
             assert!(
                 !stderr.contains("RPC-CALLED"),
                 "`{args}` must not reach the daemon, got: {stderr}"
+            );
+        }
+    }
+
+    /// Runs the installed `min` helper as a script, with `PATH` prefixed by
+    /// a directory holding a `socat` stand-in that announces itself on
+    /// stderr — loud RPC detection for the main dispatch path, which runs
+    /// only when the file is executed rather than sourced. Returns `None`
+    /// when the host has no bash, matching the repo's self-skip-locally
+    /// convention.
+    fn run_min_command(rootfs: &Path, args: &str) -> Option<(String, String, i32)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = rootfs.join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let socat = bin.join("socat");
+        std::fs::write(&socat, "#!/bin/sh\necho RPC-CALLED >&2\n").unwrap();
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = rootfs.join("usr/bin/min");
+        let out = std::process::Command::new("bash")
+            .arg(script.to_str().unwrap())
+            .args(args.split_whitespace())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    }
+
+    /// `-h`, `--help`, and `help` at every dispatch level of the in-session
+    /// `min` helper print that level's own usage and exit 0 without
+    /// contacting the daemon, as does a help flag after other arguments to
+    /// a command that takes no task arguments; a bare `min package`/`min task`/`min net` and an unknown
+    /// subcommand print usage on stderr and exit 1.
+    #[test]
+    fn help_spellings_print_usage_without_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for (args, code, stream, usage) in [
+            ("--help", 0, "stdout", "Usage: min <subcommand>"),
+            ("-h", 0, "stdout", "Usage: min <subcommand>"),
+            ("help", 0, "stdout", "Usage: min <subcommand>"),
+            (
+                "package --help",
+                0,
+                "stdout",
+                "Usage: min package <subcommand>",
+            ),
+            ("package -h", 0, "stdout", "Usage: min package <subcommand>"),
+            (
+                "package help",
+                0,
+                "stdout",
+                "Usage: min package <subcommand>",
+            ),
+            ("pkg --help", 0, "stdout", "Usage: min package <subcommand>"),
+            (
+                "task --help",
+                0,
+                "stdout",
+                "Usage: min task run <task name>",
+            ),
+            ("net --help", 0, "stdout", "Usage: min net expose <port>"),
+            (
+                "add --help",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            (
+                "add -h",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            (
+                "add --build --help",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            (
+                "add jq --help",
+                0,
+                "stdout",
+                "Usage: min add [--session|--build|--runtime] <packages>",
+            ),
+            ("run --help", 0, "stdout", "Usage: min task run <task name>"),
+            (
+                "task run --help",
+                0,
+                "stdout",
+                "Usage: min task run <task name>",
+            ),
+            (
+                "search --help",
+                0,
+                "stdout",
+                "Usage: min package search <query>",
+            ),
+            (
+                "package search --help",
+                0,
+                "stdout",
+                "Usage: min package search <query>",
+            ),
+            (
+                "package build --help",
+                0,
+                "stdout",
+                "Usage: min package build <packages>",
+            ),
+            (
+                "package build foo --help",
+                0,
+                "stdout",
+                "Usage: min package build <packages>",
+            ),
+            (
+                "package patched-build --help",
+                0,
+                "stdout",
+                "Usage: min package patched-build <package name>",
+            ),
+            ("check --help", 0, "stdout", "Usage: min check"),
+            ("check foo --help", 0, "stdout", "Usage: min check"),
+            (
+                "materialize --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
+                "materialize --output x --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
+                "materialize --arch x86_64 --help",
+                0,
+                "stdout",
+                "Usage: min materialize --output <path> [--arch <arch>] <output name>",
+            ),
+            (
+                "net expose --help",
+                0,
+                "stdout",
+                "Usage: min net expose <port>",
+            ),
+            ("package", 1, "stderr", "Usage: min package <subcommand>"),
+            ("task", 1, "stderr", "Usage: min task run <task name>"),
+            ("net", 1, "stderr", "Usage: min net expose <port>"),
+            ("bogus", 1, "stderr", "Usage: min <subcommand>"),
+            (
+                "package bogus",
+                1,
+                "stderr",
+                "Usage: min package <subcommand>",
+            ),
+            ("task bogus", 1, "stderr", "Usage: min task run <task name>"),
+            ("net bogus", 1, "stderr", "Usage: min net expose <port>"),
+        ] {
+            let Some((stdout, stderr, exit)) = run_min_command(rootfs, args) else {
+                return;
+            };
+            assert_eq!(
+                exit, code,
+                "`{args}` should exit {code}, got: {stdout} {stderr}"
+            );
+            let (out, other) = if stream == "stdout" {
+                (&stdout, &stderr)
+            } else {
+                (&stderr, &stdout)
+            };
+            assert!(
+                out.contains(usage),
+                "`{args}` should print `{usage}` on {stream}, got: {stdout} {stderr}"
+            );
+            assert!(
+                other.is_empty(),
+                "`{args}` should print only on {stream}, got: {stdout} {stderr}"
+            );
+            assert!(
+                !stdout.contains("RPC-CALLED") && !stderr.contains("RPC-CALLED"),
+                "`{args}` must not reach the daemon, got: {stdout} {stderr}"
+            );
+        }
+    }
+
+    /// In an argument slot a bare `help` is a package name, search term, or
+    /// task name, not a help request, so it still reaches the daemon. So
+    /// does a help flag after a task name: it is the task's argument. So
+    /// does a help flag in a materialize value slot: it is the path.
+    #[test]
+    fn help_word_in_argument_slot_reaches_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for args in [
+            "search help",
+            "add help",
+            "package build help",
+            "task run help",
+            "run mytask --help",
+            "materialize --output --help x",
+            "materialize -o -h x",
+        ] {
+            let Some((stdout, stderr, _)) = run_min_command(rootfs, args) else {
+                return;
+            };
+            assert!(
+                stderr.contains("RPC-CALLED"),
+                "`{args}` should reach the daemon, got: {stdout} {stderr}"
             );
         }
     }

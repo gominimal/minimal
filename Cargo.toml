@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/args",
+    "crates/bep",
     "crates/async-dialog",
     "crates/lcache",
     "crates/rcache",
@@ -120,6 +121,7 @@ codegen-units = 16
 debug = "line-tables-only"
 
 [workspace.dependencies]
+aes-gcm = "0.11"
 anyhow = "1.0"
 arbitrary = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
@@ -145,6 +147,7 @@ either = { version = "1.17", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
+getrandom = "0.3"
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.15"
 google-cloud-storage = "1.17"
@@ -187,6 +190,7 @@ nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
 nutype = { version = "0.8", features = ["serde"] }
 object = { version = "0.40", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
+p256 = { version = "0.14", features = ["ecdh"] }
 path-absolutize = "4.0"
 rand = "0.10"
 # rand_core 0.6 (not 0.10) to match boringtun/x25519-dalek's RNG traits for
@@ -244,6 +248,7 @@ unicode-width = "0.2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 vt100 = { version = "0.16.2" }
+zeroize = "1"
 zstd = "0.14"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }
