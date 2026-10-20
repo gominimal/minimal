@@ -399,6 +399,14 @@ pub async fn apply_ingress(
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
                 release_declared_ingress(control, &bound).await;
+                // A taken host port deliberately fails the apply here rather
+                // than being skipped: NET-121 (docs/specs/18-spec-box-networking,
+                // design §7.1) makes a failed bind "a surfaced error, never a
+                // silent fallback", so the box never publishes a name while one
+                // of its declared ports is missing. Skipping the port was the
+                // original PR's design and was replaced by this rollback arm
+                // in review; the activation warning still names the port and
+                // offers `--ingress <other>:<internal>` as the way out.
                 if is_address_in_use(&e) {
                     return Err(address_in_use_error(mapping.external_port, &e));
                 }
