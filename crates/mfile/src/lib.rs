@@ -482,10 +482,31 @@ pub struct Session {
     /// client's loadout).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
+    /// `[session.network]`: the box's network settings this file owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<SessionNetwork>,
+    /// `[session.secrets.<VAR>]`: the credential grants, by the environment
+    /// variable each one lands in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: boxes::core::bep::SecretGrants,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
+}
+
+/// The `[session.network]` table: the UDP 443 stance and the Box Egress
+/// Proxy settings.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionNetwork {
+    /// `[session.network] quic443`: the box's stance on UDP to port 443.
+    /// `None` reads as `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// `[session.network.bep]`: steering, `proxy_env`, `no_proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bep: Option<boxes::core::bep::BepSettings>,
 }
 
 // No `impl Eq for Session`: the `extra: HashMap<String, toml::Value>`
@@ -517,6 +538,10 @@ impl Session {
             vars_lenient,
             patches,
             lifecycle_hooks,
+            // Proxy settings and grants are box policy, not composition
+            // primitives: the client carries them on the box's policy.
+            network: _,
+            secrets: _,
             extra: _,
         } = self;
         packages.is_empty()
@@ -2338,6 +2363,34 @@ mod tests {
         .unwrap();
         let session = mf.session.expect("populated block parses");
         assert!(session.extra.contains_key("weird_new_thing"));
+    }
+
+    /// `quic443` is a `[session.network]` setting: it loads there, and the
+    /// `[session.network.bep]` table refuses it as an unknown field.
+    #[test]
+    fn session_network_quic443_loads() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.network]
+            quic443 = "auto"
+            "#
+        })
+        .unwrap();
+        let network = mf
+            .session
+            .and_then(|session| session.network)
+            .expect("network table parses");
+        assert_eq!(network.quic443, Some(boxes::core::bep::Quic443::Auto));
+        assert!(network.bep.is_none());
+
+        let err = toml::from_str::<File>(indoc! {
+            r#"
+            [session.network.bep]
+            quic443 = "auto"
+            "#
+        })
+        .expect_err("quic443 is not a [network.bep] field");
+        assert!(err.to_string().contains("quic443"), "{err}");
     }
 
     #[test]

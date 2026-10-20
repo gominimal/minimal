@@ -562,6 +562,117 @@ fn refuse_ingress_off_own_ip(
     Ok(())
 }
 
+/// A project `minimal.toml` that exists but does not load. The activation
+/// refuses it before anything is created, and the run ends with exit 3
+/// (`main.rs`), the architecture's code for an invalid `minimal.toml`.
+#[derive(Debug)]
+pub struct ProjectFileInvalid {
+    /// Why the file did not load.
+    pub error: mfile::Error,
+}
+
+impl std::fmt::Display for ProjectFileInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cannot start the box: the project's {name} does not load: {error}",
+            name = mfile::MFILE_NAME,
+            error = self.error,
+        )
+    }
+}
+
+impl std::error::Error for ProjectFileInvalid {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The project's `[session.network.bep]` settings and `[session.secrets]`
+/// grants. Only a missing project file reads as empty. A file that exists
+/// but does not load refuses the activation, so a broken file can never
+/// skip the grant checks (BEP-008).
+fn project_bep_and_grants(
+    project: &camino::Utf8Path,
+) -> Result<
+    (
+        boxes::core::bep::BepSettings,
+        boxes::core::bep::SecretGrants,
+    ),
+    ProjectFileInvalid,
+> {
+    let session = match mfile::File::from_dir_recursive(project.as_std_path()) {
+        Ok(file) => file.session,
+        Err(mfile::Error::NotFound) => None,
+        Err(error) => {
+            tracing::debug!(
+                rule = "BEP-008",
+                project = %project,
+                error = %error,
+                "activation refused: the project file does not load"
+            );
+            return Err(ProjectFileInvalid { error });
+        }
+    };
+    Ok(session.map_or_else(Default::default, |session| {
+        (
+            session.network.and_then(|n| n.bep).unwrap_or_default(),
+            session.secrets,
+        )
+    }))
+}
+
+/// The box's credentialed-upstream declaration: the `--credentialed-upstream`
+/// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
+/// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
+/// setting or a `client_env` grant alone declares nothing. The settings
+/// ride the declaration.
+fn credentialed_upstream_for(
+    flag: bool,
+    bep: &boxes::core::bep::BepSettings,
+    secrets: &boxes::core::bep::SecretGrants,
+) -> Option<boxes::CredentialedUpstream> {
+    let declared = flag
+        || secrets
+            .values()
+            .any(|grant| grant.source == boxes::core::bep::GrantSource::Broker);
+    declared.then(|| boxes::CredentialedUpstream {
+        bep: bep.clone(),
+        secrets: secrets.clone(),
+    })
+}
+
+/// Refuses a box spec whose grants the box or this host cannot honour, and
+/// prints the warnings of one it accepts. It checks the project's settings
+/// whether or not they declare a credentialed upstream, so a contradiction
+/// in `[session.network.bep]` alone is still refused. The refusal ends the
+/// run with exit 3 (`main.rs`). Every host today is un-enrolled and has no
+/// box-zone resolver.
+fn refuse_unhonourable_grants(
+    network: boxes::NetworkMode,
+    egress: Option<&boxes::EgressPolicy>,
+    settings: &boxes::core::bep::BepSettings,
+    secrets: &boxes::core::bep::SecretGrants,
+) -> Result<(), anyhow::Error> {
+    use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
+    let hosts: Vec<&str> = bep::module::GITHUB
+        .hosts
+        .iter()
+        .map(|authority| authority.host)
+        .collect();
+    let spec = ActivationSpec {
+        network,
+        egress,
+        bep: settings,
+        secrets,
+    };
+    let plan = check_activation(&spec, HostFacts::LOCAL, &hosts)?;
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -575,7 +686,6 @@ pub(crate) async fn activate_session(
     // A static mapping needs an own-IP box too: only it has a published
     // address a static forwarder could apply to.
     refuse_ingress_off_own_ip(args.network, !args.ingress.is_empty())?;
-    ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -636,6 +746,7 @@ pub(crate) async fn activate_session(
     // same as an explicit deny.
     let has_ingress =
         !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
+    let (project_bep, project_secrets) = project_bep_and_grants(&utf8_path)?;
     let policy = boxes::BoxPolicy {
         egress,
         ingress: has_ingress.then_some(boxes::IngressPolicy {
@@ -647,10 +758,22 @@ pub(crate) async fn activate_session(
         // a box that did not ask for a credentialed upstream keeps every
         // frame it sends to the proxy's address refused at the host-side
         // gate, whatever its egress rules say.
-        credentialed_upstream: args
-            .credentialed_upstream
-            .then(boxes::CredentialedUpstream::default),
+        credentialed_upstream: credentialed_upstream_for(
+            args.credentialed_upstream,
+            &project_bep,
+            &project_secrets,
+        ),
     };
+
+    // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
+    // refused here, before the daemon starts and before anything is created.
+    refuse_unhonourable_grants(
+        args.network.into(),
+        policy.egress.as_ref(),
+        &project_bep,
+        &project_secrets,
+    )?;
+    ensure_daemon(global)?;
 
     // A session with no `--name` still deserves a typable handle, so mint
     // `<dir-basename>-<4 hex>` client-side; without it `min ls`, the attach
@@ -4726,6 +4849,179 @@ mod tests {
     }
 
     const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// BEP-008/009/017: a project whose `minimal.toml` declares a GitHub
+    /// grant the box cannot honour is refused with exit 3 before the create.
+    /// The activation stops before it starts the daemon: the state
+    /// directory stays empty, so nothing was spawned or created. The
+    /// refusal names each GitHub host the egress omits.
+    #[tokio::test]
+    async fn activation_refuses_grant_before_create_with_exit_3() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.network.bep]\nsteering = \"proxy_env\"\n\n\
+             [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+             scopes = [\"github:user-token\"]\n",
+        )
+        .expect("write minimal.toml");
+        let state = tempfile::tempdir().expect("state dir");
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("grant-box".into()),
+            path: Some(project.path().to_string_lossy().into_owned()),
+            sync: None,
+            network: CliNetworkMode::OwnIp,
+            ingress: Vec::new(),
+            dynamic_ingress: None,
+            dynamic_range: None,
+            allow_subnets: Vec::new(),
+            allow_dns_hosts: vec!["github.com".into(), "api.github.com".into()],
+            allow_protocols: Vec::new(),
+            deny_subnets: Vec::new(),
+            deny_all_egress: false,
+            credentialed_upstream: false,
+            loadout: Vec::new(),
+            no_loadouts: true,
+            no_hooks: true,
+            no_prompt: true,
+            attach: false,
+        };
+        let err = activate_session(&global, args, false)
+            .await
+            .expect_err("the grant box is refused");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
+        assert_eq!(
+            refused.to_string(),
+            "This box declares a GitHub grant, but its egress does not allow: \
+             uploads.github.com, codeload.github.com. Add them to egress.allow_dns_hosts."
+        );
+        assert!(
+            std::fs::read_dir(state.path())
+                .expect("state dir")
+                .next()
+                .is_none(),
+            "nothing was spawned or created before the refusal"
+        );
+    }
+
+    /// BEP-008: a project file that exists but does not load refuses the
+    /// activation before the create. It never reads as "no grants
+    /// declared", so a broken file cannot skip the grant checks.
+    #[tokio::test]
+    async fn activation_refuses_unloadable_project_file_before_create() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.secrets.GH_TOKEN\nsource = \"broker\"\n",
+        )
+        .expect("write minimal.toml");
+        let state = tempfile::tempdir().expect("state dir");
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("broken-box".into()),
+            path: Some(project.path().to_string_lossy().into_owned()),
+            sync: None,
+            network: CliNetworkMode::OwnIp,
+            ingress: Vec::new(),
+            dynamic_ingress: None,
+            dynamic_range: None,
+            allow_subnets: Vec::new(),
+            allow_dns_hosts: Vec::new(),
+            allow_protocols: Vec::new(),
+            deny_subnets: Vec::new(),
+            deny_all_egress: false,
+            credentialed_upstream: false,
+            loadout: Vec::new(),
+            no_loadouts: true,
+            no_hooks: true,
+            no_prompt: true,
+            attach: false,
+        };
+        let err = activate_session(&global, args, false)
+            .await
+            .expect_err("the broken project file is refused");
+        assert!(
+            err.downcast_ref::<ProjectFileInvalid>().is_some(),
+            "the refusal is typed: {err}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("Cannot start the box: the project's minimal.toml does not load"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::read_dir(state.path())
+                .expect("state dir")
+                .next()
+                .is_none(),
+            "nothing was spawned or created before the refusal"
+        );
+    }
+
+    /// BEP-016: a `[session.network.bep]` setting alone declares no
+    /// credentialed upstream. The set is derived from broker grants.
+    #[test]
+    fn bep_settings_alone_activate_without_credentialed_upstream() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.network.bep]\nsteering = \"proxy_env\"\n",
+        )
+        .expect("write minimal.toml");
+        let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
+        let (bep, secrets) = project_bep_and_grants(path).expect("loads");
+        assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
+        assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
+        refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets)
+            .expect("accepted");
+    }
+
+    /// A `client_env` grant alone declares no credentialed upstream. A
+    /// broker grant, or the flag, does.
+    #[test]
+    fn only_broker_grants_declare_credentialed_upstream() {
+        use boxes::core::bep::{BepSettings, GrantSource, SecretGrant, SecretGrants};
+        let bep = BepSettings::default();
+        let grant = |source| SecretGrant {
+            source,
+            scopes: Vec::new(),
+            mode: None,
+        };
+        let client = SecretGrants::from([("NPM_TOKEN".into(), grant(GrantSource::ClientEnv))]);
+        assert!(credentialed_upstream_for(false, &bep, &client).is_none());
+        assert!(credentialed_upstream_for(true, &bep, &client).is_some());
+        let broker = SecretGrants::from([("GH_TOKEN".into(), grant(GrantSource::Broker))]);
+        assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
+    }
+
+    /// BEP-010: `steering = "off"` with `proxy_env = true` is refused with
+    /// exit 3 even when no grant declares a credentialed upstream.
+    #[test]
+    fn steering_off_with_proxy_env_is_refused_without_a_grant() {
+        let bep = boxes::core::bep::BepSettings {
+            steering: Some(boxes::core::bep::Steering::Off),
+            proxy_env: true,
+            ..Default::default()
+        };
+        let secrets = boxes::core::bep::SecretGrants::new();
+        assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
+        let err = refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets)
+            .expect_err("refused");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
+    }
 
     /// An ask create stands on a VM-backed host (NET-045): T94's refusal is
     /// gone, and the registration hands the host row the ask stance — as it

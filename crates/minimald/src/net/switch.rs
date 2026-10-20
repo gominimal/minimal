@@ -4282,7 +4282,7 @@ pub(crate) mod tests {
                 deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             }),
             ingress: None,
-            credentialed_upstream: Some(boxes::CredentialedUpstream {}),
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
         };
         let mut harness = spawn_test_relay(&deny_all);
 
@@ -4485,7 +4485,7 @@ pub(crate) mod tests {
         let laned = boxes::BoxPolicy {
             egress: None,
             ingress: None,
-            credentialed_upstream: Some(boxes::CredentialedUpstream {}),
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
         };
         let mut harness = spawn_test_relay(&laned);
 

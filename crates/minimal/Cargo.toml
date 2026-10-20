@@ -71,6 +71,9 @@ sha2.workspace = true
 # The GitHub sign-in item `min auth` writes and reads (`bep::signin`).
 bep = { path = "../bep" }
 boxes.workspace = true
+# The GitHub module's host set, which activation checks a grant box's
+# egress against.
+bep = { path = "../bep" }
 # The reserved local range the resolver advisory's bind probe reads. Owned by
 # the zero-dependency `switch` crate — the same constant the daemon's DNS zone
 # re-exports and publishes per-box addresses from — so the CLI's probe and the
