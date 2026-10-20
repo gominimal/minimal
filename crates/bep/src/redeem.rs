@@ -34,6 +34,8 @@
 //!    signature verifies under a registered client key, the clock is before
 //!    its expiry, its `upstream` is within the current rule and its `inject`
 //!    equals the rule's (BEP-064). A sign-in reference's rule is the module.
+//!    The shell reads the handle from the opened member with
+//!    [`crate::handle::read_opened`], so the handle is sealed with the value.
 //!    For a store handle, the shell gives the handle's `upstream` as the
 //!    bound set and the rule's authorities as the current set, so checks 8
 //!    to 10 read them where they read a module's host sets (BEP-032).
@@ -225,7 +227,9 @@ pub struct Redemption<B, H, I = Inject> {
     pub request: RequestAuthority<H>,
     /// The authorities the sending box's declared egress admits (BEP-022).
     pub egress: Vec<Authority<H>>,
-    /// The member's handle, as [`crate::handle::read`] found it (BEP-064).
+    /// The member's handle, as [`crate::handle::read_opened`] found it
+    /// (BEP-064). The shell reads it from the same [`Opened`] that gave
+    /// [`Self::unsealed`], so it is the sealed member's own `jws`.
     pub handle: Handle<H, I>,
 }
 

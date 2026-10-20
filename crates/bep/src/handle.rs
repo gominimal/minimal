@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::module::{HTTPS_PORT, Module};
 use crate::redeem::Authority;
-use crate::seal::ProxyPublicKey;
+use crate::seal::{MemberKind, Opened, ProxyPublicKey};
 
 /// The JWS `alg` of every handle.
 pub const ALG: &str = "ES256";
@@ -418,6 +418,19 @@ pub fn read<R: Rules + ?Sized>(
     module: &Module,
     now: u64,
 ) -> Read {
+    read_bound(jws, keys, rules, module, now, |_| true)
+}
+
+/// [`read`], with `bound` deciding whether the claims belong where the
+/// handle came from. Claims that do not belong have no rule.
+fn read_bound<R: Rules + ?Sized>(
+    jws: &str,
+    keys: &ClientKeys,
+    rules: &R,
+    module: &Module,
+    now: u64,
+    bound: impl Fn(&Claims) -> bool,
+) -> Read {
     let (claims, verified) = match verify(jws, keys) {
         Ok(claims) => (Some(claims), Ok(())),
         Err(error) => (unverified_claims(jws).ok().map(|(_, c)| c), Err(error)),
@@ -441,6 +454,9 @@ pub fn read<R: Rules + ?Sized>(
         };
     };
     let rule = match claims.kind {
+        _ if !bound(&claims) => None,
+        // A sign-in reference for another module has no rule here.
+        HandleKind::SignIn if claims.store != module.id => None,
         HandleKind::SignIn => Some(Rule {
             upstream: module
                 .hosts
@@ -473,9 +489,11 @@ pub fn read<R: Rules + ?Sized>(
         (Ok(()), Err(invalid)) => invalid.to_string(),
         (Ok(()), Ok(())) => "valid".to_owned(),
     };
+    // The store and identifier can come from a handle that did not verify,
+    // so they are logged escaped.
     tracing::debug!(
-        store = %claims.store,
-        id = %claims.id,
+        store = ?claims.store,
+        id = ?claims.id,
         outcome = %outcome,
         "store handle checked"
     );
@@ -483,6 +501,35 @@ pub fn read<R: Rules + ?Sized>(
         identifier: Some(claims.identifier()),
         handle,
     }
+}
+
+/// Reads the handle of the member that [`crate::seal::open`] opened.
+///
+/// The shell builds [`crate::redeem::Redemption::handle`] with this, from
+/// the same [`Opened`] that gave [`crate::redeem::Unsealed::Opened`]. So the
+/// handle that [`crate::redeem::decide`] judges is the sealed member's own
+/// `jws`, and never a handle from somewhere else. A handle whose kind is
+/// not the member's kind, or a sign-in reference for a module other than
+/// the value's, has no rule, so it is refused as
+/// `store_handle_invalid`.
+pub fn read_opened<R: Rules + ?Sized>(
+    opened: &Opened,
+    keys: &ClientKeys,
+    rules: &R,
+    module: &Module,
+    now: u64,
+) -> Read {
+    let kind = match opened.member.kind {
+        MemberKind::SignIn => HandleKind::SignIn,
+    };
+    read_bound(
+        opened.member.jws.as_str(),
+        keys,
+        rules,
+        module,
+        now,
+        |claims| claims.kind == kind && opened.context.module == module.id,
+    )
 }
 
 #[cfg(test)]
@@ -775,7 +822,88 @@ mod tests {
             Err(Invalid::InjectMismatch)
         );
         assert_eq!(
-            decide(&redemption(api, read_inject, false)),
+            decide(&redemption(api.clone(), read_inject, false)),
+            Decision::Refuse(Check::StoreHandleInvalid)
+        );
+
+        // A reference signed for another module is not judged against this
+        // one, even when its upstream is within this module's hosts.
+        let other = sign(
+            &key,
+            &Claims {
+                store: "other-module".into(),
+                ..sign_in_claims()
+            },
+        );
+        let read_other = read(&other, &keys, &no_rules, &GITHUB, 1_000);
+        assert_eq!(read_other.handle.check(1_000), Err(Invalid::NoRule));
+        assert_eq!(
+            decide(&redemption(api, read_other, false)),
+            Decision::Refuse(Check::StoreHandleInvalid)
+        );
+    }
+
+    /// A value opened for `module`, whose one member carries `jws`.
+    fn opened(jws: &str, module: &str) -> Opened {
+        use crate::seal::{Context, Member};
+        Opened {
+            context: Context {
+                box_id: "b1".into(),
+                host: "host".into(),
+                module: module.into(),
+                host_set_version: 1,
+                mode: Mode::User,
+                iat: 0,
+                expiry: 5_000,
+                kid: "kid".into(),
+            },
+            member: Member {
+                kind: MemberKind::SignIn,
+                breadth: Breadth::Full,
+                jws: zeroize::Zeroizing::new(jws.into()),
+                exp: None,
+            },
+            default_owner: None,
+        }
+    }
+
+    /// BEP-064: the handle the decision judges is the opened member's own
+    /// `jws`. A handle of another kind than the member, or a value opened
+    /// for another module, has no rule and is refused.
+    #[test]
+    fn handle_is_read_from_the_opened_member() {
+        let key = client_key(3);
+        let keys = registered(&key);
+        let no_rules: Vec<StoreRule> = Vec::new();
+        let api = parse_authority("api.github.com").expect("authority");
+
+        let reference = sign(&key, &sign_in_claims());
+        let own = read_opened(
+            &opened(&reference, GITHUB.id),
+            &keys,
+            &no_rules,
+            &GITHUB,
+            1_000,
+        );
+        assert_eq!(own.identifier.as_deref(), Some("github:instance-1"));
+        assert!(admitted(decide(&redemption(api.clone(), own, false))));
+
+        let other_module = read_opened(
+            &opened(&reference, "other"),
+            &keys,
+            &no_rules,
+            &GITHUB,
+            1_000,
+        );
+        assert_eq!(other_module.handle.check(1_000), Err(Invalid::NoRule));
+
+        // A store handle inside a sign-in member, with a rule that admits it.
+        let rules = vec![store_rule()];
+        let store = sign(&key, &store_claims());
+        let foreign = read_opened(&opened(&store, GITHUB.id), &keys, &rules, &GITHUB, 1_000);
+        assert_eq!(foreign.handle.check(1_000), Err(Invalid::NoRule));
+        assert_eq!(
+            decide(&redemption(api, foreign, true)),
             Decision::Refuse(Check::StoreHandleInvalid)
         );
     }
