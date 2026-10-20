@@ -340,6 +340,15 @@ pub fn parse_request(buf: &[u8]) -> Result<Parse<Request>, CloseReason> {
     {
         return Err(CloseReason::Malformed("target_host_mismatch"));
     }
+    // RFC 9110 §9.3.6: a CONNECT target is authority-form, `host:port`. The
+    // tunnel goes to that authority, so it must agree with Host as an
+    // absolute-form target does. Port 443 equals no port in Host.
+    if method == "CONNECT"
+        && !(is_connect_authority(target.as_bytes())
+            && same_authority("https", target.as_bytes(), host))
+    {
+        return Err(CloseReason::Malformed("target_host_mismatch"));
+    }
     if list_elements(values(&headers, "connection")).any(|t| t.eq_ignore_ascii_case(b"host")) {
         return Err(CloseReason::Malformed("connection_names_host"));
     }
@@ -849,6 +858,19 @@ fn absolute_form_authority(target: &[u8]) -> Option<(&'static str, &[u8])> {
     Some((scheme, &rest[..end]))
 }
 
+/// Whether a CONNECT target is authority-form: a host and an explicit port.
+fn is_connect_authority(target: &[u8]) -> bool {
+    let host_end = if target.first() == Some(&b'[') {
+        target.iter().position(|&b| b == b']').map_or(0, |i| i + 1)
+    } else {
+        target
+            .iter()
+            .position(|&b| b == b':')
+            .unwrap_or(target.len())
+    };
+    target.get(host_end) == Some(&b':') && is_host_authority(target)
+}
+
 /// Whether an absolute-form authority and a Host value name the same
 /// authority. Case does not count, and the scheme's default port equals no
 /// port. An authority with user info never matches.
@@ -1351,6 +1373,58 @@ mod tests {
             };
             assert_eq!(upstream, request.serialize());
             assert!(audit.is_empty());
+        }
+    }
+
+    // BEP-077: a CONNECT target names the tunnel's authority, so it must
+    // agree with Host, or the policy and the upstream see two authorities.
+    #[test]
+    fn connect_target_must_match_host() {
+        for (head, ok) in [
+            (
+                &b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"[..],
+                true,
+            ),
+            (
+                &b"CONNECT GitHub.com:443 HTTP/1.1\r\nHost: github.com\r\n\r\n"[..],
+                true,
+            ),
+            (
+                &b"CONNECT evil.example:443 HTTP/1.1\r\nHost: github.com\r\n\r\n"[..],
+                false,
+            ),
+            (
+                &b"CONNECT evil.example:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"[..],
+                false,
+            ),
+            (
+                &b"CONNECT github.com:8443 HTTP/1.1\r\nHost: github.com\r\n\r\n"[..],
+                false,
+            ),
+            (
+                &b"CONNECT github.com HTTP/1.1\r\nHost: github.com\r\n\r\n"[..],
+                false,
+            ),
+            (
+                &b"CONNECT user@github.com:443 HTTP/1.1\r\nHost: github.com\r\n\r\n"[..],
+                false,
+            ),
+            (
+                &b"CONNECT /x HTTP/1.1\r\nHost: github.com\r\n\r\n"[..],
+                false,
+            ),
+        ] {
+            let result = parse_request(head);
+            if ok {
+                assert!(matches!(result, Ok(Parse::Complete { .. })), "{result:?}");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(CloseReason::Malformed("target_host_mismatch")),
+                    "{}",
+                    String::from_utf8_lossy(head)
+                );
+            }
         }
     }
 
