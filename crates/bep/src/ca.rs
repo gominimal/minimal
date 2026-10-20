@@ -26,9 +26,9 @@ use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PublicKeyData,
-    SanType, SerialNumber, SignatureAlgorithm, SigningKey,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    NameConstraints, PublicKeyData, SanType, SerialNumber, SignatureAlgorithm, SigningKey,
 };
 use rustls_pki_types::CertificateDer;
 use time::OffsetDateTime;
@@ -40,6 +40,11 @@ use crate::module::Module;
 /// The names that the root never permits, also when a module or a store rule
 /// registers them. A name in this set, or a subdomain of one, is outside the
 /// union. The root also carries the set as its excluded-names constraint.
+///
+/// This set is provisional. Gatehouse §6.10 also names the BEP, EGW and
+/// relay endpoints, the registry and build cache, and the node-plane
+/// baseline set. One deny set must serve this check and the store-rule
+/// check of BEP-034. Until that set exists, this list is a partial reading.
 pub const DENY_SET: &[&str] = &[
     // The box-internal names (`host.min.internal` and the services under it).
     "min.internal",
@@ -63,6 +68,10 @@ const SIGNING_VALIDITY: Duration = Duration::from_secs(365 * DAY);
 const LEAF_VALIDITY: Duration = Duration::from_secs(7 * DAY);
 
 /// A held key that can sign a certificate.
+///
+/// No keychain key implements this trait yet, so the signing CA key is not
+/// held in the keychain until it does (BEP-014). The keychain
+/// implementation belongs in `keys.rs`, outside this module.
 pub trait CaKey: HeldKey {
     /// An ECDSA P-256 SHA-256 signature over `msg`, DER-encoded as X9.62
     /// specifies. The private half stays in the store.
@@ -145,17 +154,36 @@ fn host_of(authority: &str) -> String {
     }
 }
 
-/// Whether `host` is a DNS name and not an IP literal. A DNS name
-/// constraint cannot carry an IP address, so the union skips one.
+/// Whether `host` is a DNS name that the root can permit. A DNS name
+/// constraint cannot carry an IP address, so the union skips one. It also
+/// skips a name that a permitted subtree must not carry: a wildcard, a
+/// name with an empty label, a non-ASCII name, and a single-label name
+/// such as a top-level domain, which permits every name under it.
 fn dns_host(host: &str) -> bool {
-    let dns = !host.contains([':', '[', ']']) && host.parse::<std::net::IpAddr>().is_err();
-    if !dns {
+    if host.contains([':', '[', ']']) || host.parse::<std::net::IpAddr>().is_ok() {
         tracing::warn!(
             host,
             "skipped a registered host that is an IP address, not a DNS name"
         );
+        return false;
     }
-    dns
+    let labels: Vec<&str> = host.split('.').collect();
+    let valid = labels.len() >= 2
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    if !valid {
+        tracing::warn!(
+            host,
+            "skipped a registered host that is not a DNS name of two or more labels"
+        );
+    }
+    valid
 }
 
 /// Whether `host` is a name in the deny set or a subdomain of one.
@@ -461,9 +489,16 @@ fn root_params(union: &Union, now: SystemTime) -> Result<CertificateParams, CaEr
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.name_constraints = Some(NameConstraints {
         permitted_subtrees: union.names().map(dns).collect::<Result<_, _>>()?,
+        // The union holds DNS names only. A name type with no subtree is
+        // unconstrained (RFC 5280 §4.2.1.10), so the root excludes every IP
+        // address.
         excluded_subtrees: DENY_SET
             .iter()
             .map(|name| GeneralSubtree::DnsName((*name).to_owned()))
+            .chain([
+                GeneralSubtree::IpAddress(CidrSubnet::V4([0; 4], [0; 4])),
+                GeneralSubtree::IpAddress(CidrSubnet::V6([0; 16], [0; 16])),
+            ])
             .collect(),
     });
     params.serial_number = Some(serial()?);
@@ -607,6 +642,11 @@ mod tests {
             while !list.is_empty() {
                 let (_, subtree, more) = tlv(list);
                 let (name_tag, name, _) = tlv(subtree);
+                list = more;
+                if name_tag == 0x87 {
+                    // An iPAddress subtree: the IP sets hold these.
+                    continue;
+                }
                 assert_eq!(name_tag, 0x82, "a dNSName subtree");
                 let name = String::from_utf8(name.to_vec()).unwrap();
                 match tag {
@@ -614,7 +654,6 @@ mod tests {
                     0xa1 => sets.1.insert(name),
                     other => panic!("unexpected subtree tag {other:#x}"),
                 };
-                list = more;
             }
             subtrees = next;
         }
@@ -832,6 +871,97 @@ mod tests {
             ],
         );
         assert_eq!(union.names().collect::<Vec<_>>(), ["cache.example.com"]);
+    }
+
+    #[test]
+    fn names_a_subtree_must_not_carry_are_not_in_the_union() {
+        let union = Union::new(
+            &[],
+            [
+                "com",
+                "localhost:443",
+                "*.github.com",
+                ".example.com",
+                "a..example.com",
+                "bücher.example",
+                "-bad.example.com",
+                "ok.example.com",
+            ],
+        );
+        assert_eq!(union.names().collect::<Vec<_>>(), ["ok.example.com"]);
+    }
+
+    /// The elements of a certificate's authority key identifier, as their
+    /// tags.
+    fn akid_tags(cert: &[u8]) -> Vec<u8> {
+        const OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1d, 0x23];
+        let at = cert
+            .windows(OID.len())
+            .position(|w| w == OID)
+            .expect("an authority key identifier extension");
+        let mut rest = &cert[at + OID.len()..];
+        if rest[0] == 0x01 {
+            rest = tlv(rest).2;
+        }
+        let (_, octets, _) = tlv(rest);
+        let (_, mut seq, _) = tlv(octets);
+        let mut tags = Vec::new();
+        while !seq.is_empty() {
+            let (tag, _, next) = tlv(seq);
+            tags.push(tag);
+            seq = next;
+        }
+        tags
+    }
+
+    #[test]
+    fn signing_ca_and_leaf_carry_a_keyid_only_akid() {
+        let (root_key, signing_key) = keys();
+        let ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        let leaf = ca.issue_leaf("github.com", now()).unwrap();
+        // [0] keyIdentifier alone: no authorityCertIssuer, no serial number.
+        assert_eq!(akid_tags(ca.signing()), [0x80]);
+        assert_eq!(akid_tags(&leaf.chain[0]), [0x80]);
+    }
+
+    #[test]
+    fn ip_address_leaf_fails_against_the_root() {
+        let (root_key, signing_key) = keys();
+        let ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        for ip in ["10.0.0.1", "::1"] {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = CertificateParams::default();
+            params.subject_alt_names = vec![SanType::IpAddress(ip.parse().unwrap())];
+            params.is_ca = IsCa::ExplicitNoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            params.use_authority_key_identifier_extension = true;
+            validity(&mut params, now(), LEAF_VALIDITY);
+            let cert = params
+                .signed_by(
+                    &key,
+                    &Issuer::from_params(&ca.signing_params, &ca.signing_key),
+                )
+                .unwrap();
+            let forged = Leaf {
+                hostname: ip.to_owned(),
+                chain: vec![cert.der().clone(), ca.signing().clone()],
+                key: Zeroizing::new(key.serialize_der()),
+            };
+            assert!(!validates(ca.root(), &forged, ip), "{ip} validated");
+        }
     }
 
     // BEP-013
