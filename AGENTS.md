@@ -245,6 +245,78 @@ proves, `nightly` ships.
   `ls .github/workflows/`, `just --list`). The prose rules reject a stated
   count (`inventory.StatedCount`).
 
+### User-facing text
+
+Everything `min`, `mip`, the daemons and the installer scripts print for a
+person is part of the product. Treat a message like an interface: specify it,
+test it, and review it.
+
+**Every message passes one test.** It states the current situation in plain
+words, or it tells the user one action to take and what that action does.
+Remove or rewrite a message that does neither.
+
+- Use the words the user types and sees: command names, flag names, file
+  paths. Do not name internal components, design terms, RPC names, or
+  requirement identifiers. A product term that the user configures or sees,
+  such as the Box Egress Proxy, is not an internal component. A process name
+  or a crate name is.
+- An instruction names a command the user can run as written. If no such
+  command exists, state the situation and stop.
+- A command that takes an argument shows it. Fill in the value when the
+  message knows it. Use a placeholder in angle brackets when it does not, or
+  when the value is a secret. A secret prints only where the command itself
+  just issued it for the user to keep.
+- Say only what the code can prove. Leave out a remedy that you did not check
+  against the code path that prints the message.
+- When one condition covers several causes with different outcomes, say what
+  can happen, not one outcome.
+- Give each fact its own sentence. Do not merge sentences that read alike but
+  state different facts.
+- A label that prints after both a pass mark and a fail mark is a noun
+  phrase, never a statement.
+- A refusal says what the tool refused, why, and the next step. Where a flag
+  and a `minimal.toml` setting both give the remedy, name both.
+- Use one name for one thing across the CLI, the dashboard and the docs. When
+  a sentence appears in two places, change both or neither.
+- A logged warning is not a message for the user. Log records go to the log.
+  Write a message for the user by hand.
+
+**Do not add a message before the box shell on a healthy start.** On an
+interactive attach, the shell's first paint replaces whatever the command
+printed before it, so nobody can read a line there. A command that does not
+attach, or that runs without a terminal, prints lines that stay. A healthy
+start is one that reaches the shell with nothing for the user to do. A value
+that a command prints on stdout for a script to read is output, not a message.
+
+- This rule governs new messages. A line that a spec requires at session
+  start stays until that spec changes. Do not remove it to satisfy this rule.
+- On the healthy path, do not add a warning or a note to an interactive start
+  or attach.
+- A new line can appear before the shell only when the command cannot
+  continue without a decision from the user. That line is a prompt that waits
+  for an answer. A prompt is never for information, and an advisory never
+  becomes a prompt.
+- Without a terminal, or with `--no-input`, a new prompt is an immediate
+  error that names the flag that answers it, and the command does not wait.
+- Anything else worth telling the user goes to a surface that stays, such as
+  `min ls`, `min session policy`, `min dash` or a notice inside the box. A
+  detail for whoever debugs the start goes to the log.
+- An error that ends the command is not covered by this rule: the command
+  exits non-zero and the text stays on screen.
+
+**When you specify or plan work that adds or changes a message:**
+
+- Write the exact text in the spec or the issue, with the condition that
+  prints it and the surface it appears on.
+- Say why it is true: name the code path or state that makes it so.
+- List the tests and scripts that pin the text, so the change updates them.
+- If a spec pins the old text, say so. Change the spec in the same piece of
+  work, or record the spec line that must follow in an issue linked from the
+  PR.
+
+**When you review such work**, read each new string as a user who has never
+seen the design. Apply the test above before you approve.
+
 ### Pre-PR verification
 
 The canonical pre-PR command is `just ci`, per
