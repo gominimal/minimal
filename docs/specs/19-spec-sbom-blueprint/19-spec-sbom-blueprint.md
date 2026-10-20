@@ -75,11 +75,12 @@ emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe 
 in that decision, so SBOM-001's determinism holds. A referenced document is
 **absent** when the cache answers an authoritative not-found for its name;
 every other failure to fetch it is **unfetchable** and is SBOM-012's
-failure under every pin, with the architecture's exit codes: a host that
-cannot be reached (a timeout, a refused connection, no route) exits 7; a
-request the cache refuses for authentication or authorization exits 5,
-naming the pin, the object and the host; and every other fetch failure (a
-malformed answer, a truncated object) exits 6 as a failed check. Absence
+failure under every pin, in three classes with the architecture's exit
+codes: **unreachable**, a host that cannot be reached (a timeout, a
+refused connection, no route), exits 7; **refused**, a request the cache
+refuses for authentication or authorization, exits 5, naming the pin, the
+object and the host; and **malformed**, every other fetch failure (a
+malformed answer, a truncated object), exits 6 as a failed check. Absence
 is SBOM-012's failure,
 exit 6, while the pin records a bundle for the document; while it records
 none, absence is SBOM-013's interim (the component keeps its artifact
@@ -237,9 +238,11 @@ developer running agent boxes; build-infra operator; auditor.
   and provenance only, SHALL record every other credential-bearing posture
   field by reference — `[secrets]` as name and `source` kind, never the
   value; `[[github_imports]]`, `[[file_imports]]`, egress destinations and
-  the `[otel]` endpoint as a location reduced to scheme, host, port and
-  path (an allowlist of parts: no userinfo, no query, no fragment, no
-  header, whatever a parameter is called) — SHALL copy from a per-package
+  the `[otel]` endpoint as a location reduced to scheme, host and port (an
+  allowlist of parts: no userinfo, no path, no query, no fragment, no
+  header, whatever a parameter is called; a path segment can carry a token,
+  `/hooks/<token>`, so the path goes too; a `[[github_imports]]` location
+  keeps its `owner/repo` path alone, which is identity, not secret) — SHALL copy from a per-package
   document (SBOM-009) only an allowlist of fields: a build-closure
   component's name, version, `purl` and digests, and a build-environment
   tool's name and version, with every location among them reduced the same
@@ -253,13 +256,18 @@ developer running agent boxes; build-infra operator; auditor.
     every environment asset in parse_s(emit_s(c)) carries only name and
     provenance fields, every secret carries only name and source kind, every
     location field (the posture's and the imported documents' alike) is of
-    the form scheme://host[:port]/path, fields(imported(d)) ⊆ {name, version,
-    purl, digests, tool name, tool version} for every document d, for all
-    credentials v in credentials(c) ∪ planted(d), where every v is at least
-    16 characters drawn so that no v is a substring of any declared input,
-    package name or version of c: v not in ir(c), and no string anywhere in
-    parse_s(emit_s(c)) equals or contains v
-  - verify: cargo nextest run -p sbom sbom_credential_planted_in_a_per_package_document_never_emitted
+    the form scheme://host[:port], or scheme://host/owner/repo for a GitHub
+    import, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
+    tool version} for every document d, for all credentials v in
+    credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where every v is at
+    least 16 characters drawn so that no v is a substring of any declared
+    input, package name or version of c, and planted_in_paths(c) plants one
+    v as a path segment of each location kind: v not in ir(c), and no
+    string anywhere in parse_s(emit_s(c)) equals or contains v
+  - THE SYSTEM SHALL emit no credential a per-package document carries, in
+    any of the fields it copies from it, bundled or not.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_credential_planted_in_a_per_package_document_never_emitted
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
@@ -322,13 +330,14 @@ developer running agent boxes; build-infra operator; auditor.
   property: for all attempts a and referenced objects o:
     unreachable(o) ⇒ ¬emitted(a) ∧ exit(a) = 7 ∧ error(a) names (pin, o,
     host, remediation); refused(o) ⇒ ¬emitted(a) ∧ exit(a) = 5 ∧ error(a)
-    names (pin, o, host, remediation); (unfetchable(o) ∨ (absent(o) ∧
+    names (pin, o, host, remediation); (malformed(o) ∨ (absent(o) ∧
     pin_records_bundle(o)) ∨ unresolved(o)) ⇒ ¬emitted(a) ∧ exit(a) = 6 ∧
     error(a) names (pin, o, check(o), remediation), where absent(o) is an
-    authoritative not-found, unreachable(o) is a host that could not be
-    reached (a timeout, a refused connection, no route), refused(o) is an
-    authentication or authorization refusal by the cache, unfetchable(o)
-    is every other fetch failure, and unresolved(o) is SBOM-013's set
+    authoritative not-found, unfetchable(o) = unreachable(o) ∨ refused(o)
+    ∨ malformed(o) with unreachable(o) a host that could not be reached (a
+    timeout, a refused connection, no route), refused(o) an authentication
+    or authorization refusal by the cache, malformed(o) every other fetch
+    failure, and unresolved(o) is SBOM-013's set
     (subject mismatch with both digests as check(o), a failed bundle check
     by name, an absent pinned bundle on a reachable host, a document the
     pin records no bundle for under require_bundles)
@@ -402,14 +411,15 @@ developer running agent boxes; build-infra operator; auditor.
     takes them from the graph at the pin), and IF the document's subject
     names a package other than the closure entry's THEN THE SYSTEM SHALL
     treat it as a subject mismatch (SBOM-012); the identities of the build
-    closure's entries are the document's claims, nested under the component
-    and covered by its `unverified` mark, never promoted to components of
-    the box. This path ends by
+    closure's entries are the document's claims from an untrusted source
+    (the cache's writer, Security considerations), nested under the
+    component and covered by its `unverified` mark, never promoted to
+    components of the box. This path ends by
     itself: the first pin that records bundles for its documents takes the
     path above for them, with no flag and no release step.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_without_a_pinned_bundle_is_marked_and_diagnosed
-    property: ¬pin_records_bundle(d) ∧ fetched(d) ∧ subject_matches(d) ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185"), where fetched(d) is a document the cache returned (neither absent nor unfetchable, unreachable or refused) and subject_matches(d) is SBOM-013's subject check
+    property: ¬pin_records_bundle(d) ∧ fetched(d) ∧ subject_matches(d) ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185"), where fetched(d) is a document the cache returned (neither absent nor unfetchable in any of its three classes) and subject_matches(d) is SBOM-013's subject check
   - A document that carries any `unverified` component is not evidence:
     its build facts for those components are whatever the cache's writer
     put under a correct subject. THE SYSTEM SHALL mark such a document at
