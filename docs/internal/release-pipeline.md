@@ -156,9 +156,9 @@ its own `release/vX.Y.Z` branch. The 0.7.0 pass ran on 2026-10-14 against
 
 ### 8. Forward port the release branch
 
-The fixes that landed on `release/X.Y.Z` are not on `main` yet. `main`
-moves while a release is out, so a port that waits costs more than one that
-does not.
+Bring the fixes that landed on `release/X.Y.Z` back to `main`. `main` moves
+while a release is out, so a port that waits costs more than one that does
+not.
 
 The promotion created the tag on GitHub, so fetch it first. `--force`
 replaces a stale local tag of the same name. If the release commit is
