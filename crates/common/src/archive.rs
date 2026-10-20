@@ -454,7 +454,8 @@ fn extract_tar_impl<R: Read>(
         // `Entry::unpack` is disallowed workspace-wide because it resolves
         // hardlink targets against the process CWD; here it is only reached
         // after the hardlink interception above, so every entry that survives
-        // to this call is a regular file or directory.
+        // to this call is a regular file, a directory, or a symlink whose
+        // target was checked.
         #[expect(clippy::disallowed_methods)]
         if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&safe_path))? {
             f.sync_all()?;
