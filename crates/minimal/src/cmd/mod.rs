@@ -810,7 +810,7 @@ fn host_port_in_use_warning(port: u16) -> String {
     format!(
         "warning: host port {port} is already in use on the host. \
          Commands in this session will fail until that port is free. \
-         To use another host port, declare --ingress <other>:<internal>."
+         To use another host port, activate again with --ingress <other>:<internal>."
     )
 }
 
@@ -1047,7 +1047,7 @@ mod tests {
             line,
             "warning: host port 18999 is already in use on the host. \
              Commands in this session will fail until that port is free. \
-             To use another host port, declare --ingress <other>:<internal>."
+             To use another host port, activate again with --ingress <other>:<internal>."
         );
     }
 }

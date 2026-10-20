@@ -2815,10 +2815,13 @@ impl BoxActor {
                 // this box's published address: each one fails every spawn
                 // until it is free (NET-121), so the client warns about it
                 // at activation. The daemon probes, not the client, because
-                // the forwarder binds on the daemon's host. Skipped when
-                // activate hooks ran: their host already bound the forwards,
-                // so a probe finds the box's own forwards, and a taken port
-                // already failed this finalize.
+                // on a native host the forwarder binds in the daemon's own
+                // network namespace. On a VM-backed host the forwarder binds
+                // on the host OS, out of the guest's reach, so the probe
+                // reports nothing there. Skipped when activate hooks ran:
+                // their host already bound the forwards, so a probe finds the
+                // box's own forwards, and a taken port already failed this
+                // finalize.
                 #[cfg(target_os = "linux")]
                 let host_ports_in_use = match (
                     &record.network,
@@ -2826,6 +2829,7 @@ impl BoxActor {
                     self.has_hooks_for(crate::hooks::HookEvent::Activate),
                 ) {
                     (boxes::NetworkMode::OwnIp, Some(ingress), false) => {
+                        let control = self.switch_control().await;
                         let published = self
                             .hostnames
                             .read()
@@ -2835,7 +2839,9 @@ impl BoxActor {
                             shared_port_collisions.iter().map(|c| c.port).collect();
                         published
                             .map(|published| {
-                                crate::net::policy::host_ports_in_use(published, ingress, &yielded)
+                                crate::net::policy::host_ports_in_use(
+                                    &control, published, ingress, &yielded,
+                                )
                             })
                             .unwrap_or_default()
                     }
