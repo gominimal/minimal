@@ -334,18 +334,7 @@ impl<'k, K: CaKey> Ca<'k, K> {
             .der()
             .clone();
 
-        let mut signing_params = CertificateParams::default();
-        signing_params.distinguished_name = subject(SIGNING_COMMON_NAME);
-        signing_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-        signing_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        signing_params.use_authority_key_identifier_extension = true;
-        signing_params.serial_number = Some(serial()?);
-        validity(&mut signing_params, now, SIGNING_VALIDITY);
-        let signing = signing_params
-            .signed_by(&signing_key, &Issuer::from_params(&root_params, &root_key))
-            .map_err(|err| root_key.error(err))?
-            .der()
-            .clone();
+        let (signing_params, signing) = issue_signing(&root_params, &root_key, &signing_key, now)?;
 
         Ok(Self {
             root_key,
@@ -436,6 +425,32 @@ impl<'k, K: CaKey> Ca<'k, K> {
         })
     }
 
+    /// The time at which the signing CA expires. After it, [`Ca::issue_leaf`]
+    /// refuses every leaf until [`Ca::renew_signing`] runs.
+    #[must_use]
+    pub fn signing_expiry(&self) -> SystemTime {
+        self.signing_params.not_after.into()
+    }
+
+    /// Issues the signing CA again under the same key, from `now`, issued by
+    /// the current root. A long-running caller runs it before
+    /// [`Ca::signing_expiry`]. Leaves that the earlier signing CA issued stay
+    /// valid until their own expiry, because the key and subject are the same.
+    ///
+    /// # Errors
+    ///
+    /// [`CaError::Key`] when the store refuses a key. The current signing CA
+    /// stays in place on an error.
+    pub fn renew_signing(&mut self, now: SystemTime) -> Result<(), CaError> {
+        let root_params = root_params(&self.union, now)?;
+        let (params, signing) =
+            issue_signing(&root_params, &self.root_key, &self.signing_key, now)?;
+        tracing::info!(expiry = %params.not_after, "renewed the signing CA under the same key");
+        self.signing_params = params;
+        self.signing = signing;
+        Ok(())
+    }
+
     /// Issues the root again under the same key and subject, constrained to
     /// `union`. It returns `false` and issues nothing when the union did not
     /// change. The signing CA and the leaves stay valid under each issue of
@@ -476,6 +491,29 @@ impl<'k, K: CaKey> Ca<'k, K> {
         self.union = union;
         Ok(true)
     }
+}
+
+/// Issues the signing CA under `signing_key`, signed by the root that
+/// `root_params` and `root_key` describe.
+fn issue_signing<K: CaKey>(
+    root_params: &CertificateParams,
+    root_key: &Signer<'_, K>,
+    signing_key: &Signer<'_, K>,
+    now: SystemTime,
+) -> Result<(CertificateParams, CertificateDer<'static>), CaError> {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = subject(SIGNING_COMMON_NAME);
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.use_authority_key_identifier_extension = true;
+    params.serial_number = Some(serial()?);
+    validity(&mut params, now, SIGNING_VALIDITY);
+    let signing = params
+        .signed_by(signing_key, &Issuer::from_params(root_params, root_key))
+        .map_err(|err| root_key.error(err))?
+        .der()
+        .clone();
+    Ok((params, signing))
 }
 
 fn subject(common_name: &str) -> DistinguishedName {
@@ -869,6 +907,27 @@ mod tests {
         assert_eq!(not_after(&late.chain[0]), not_after(ca.signing()));
         let expired = ca.issue_leaf(host, now() + SIGNING_VALIDITY);
         assert!(matches!(expired, Err(CaError::SigningExpired(_))));
+    }
+
+    #[test]
+    fn signing_ca_renews_under_same_key_and_subject() {
+        let (root_key, signing_key) = keys();
+        let mut ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        let host = GITHUB.hosts[0].host;
+        let before = ca.signing().clone();
+        let later = now() + SIGNING_VALIDITY;
+        assert!(ca.issue_leaf(host, later).is_err());
+        ca.renew_signing(later).unwrap();
+        assert!(ca.signing_expiry() > later);
+        assert_eq!(subject_and_key(&before), subject_and_key(ca.signing()));
+        let leaf = ca.issue_leaf(host, later).unwrap();
+        assert_eq!(leaf.chain[1], *ca.signing());
     }
 
     #[test]
