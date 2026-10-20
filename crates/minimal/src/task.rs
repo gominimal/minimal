@@ -357,13 +357,15 @@ fn refused_vars_snippet(names: &[String]) -> String {
 /// Format refused patch paths as the `[patches] allow` snippet an
 /// operator can paste — the patch-side sibling of
 /// [`refused_vars_snippet`](fn@refused_vars_snippet), emitted through
-/// `toml_edit` for the same escaping reason.
+/// `toml_edit` for the same escaping reason. Each path is written as a
+/// pattern that matches only that path, as "allow always" records it, so a
+/// `*`, `[` or `{` in a path neither widens the rule nor breaks the policy.
 fn refused_patches_snippet(paths: &[String]) -> String {
     let mut doc = toml_edit::DocumentMut::new();
     let mut patches = toml_edit::Table::new();
     let mut allow = toml_edit::Array::new();
     for path in paths {
-        allow.push(path.as_str());
+        allow.push(boxes::core::expansion::literal_policy_pattern(path));
     }
     patches.insert("allow", toml_edit::value(allow));
     doc.insert("patches", toml_edit::Item::Table(patches));
@@ -449,17 +451,19 @@ fn resolve_task_patches(
     // Dir entries first, then files, each in declaration order — the
     // same order `to_fs_mappings` iterates when mounting.
     let mut entries: Vec<TaskPatchEntry<'_>> = Vec::new();
-    for key in task.patch.dir.keys() {
+    for (key, setting) in &task.patch.dir {
         entries.push(TaskPatchEntry {
             declared: key,
             is_file: false,
+            read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
             source,
         });
     }
-    for key in task.patch.file.keys() {
+    for (key, setting) in &task.patch.file {
         entries.push(TaskPatchEntry {
             declared: key,
             is_file: true,
+            read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
             source,
         });
     }
@@ -482,6 +486,19 @@ fn resolve_task_patches(
         Err(boxes::core::compose::ComposeError::TaskPatchUnchecked { what, gap, .. }) => {
             bail!(unchecked_task_patch_message(task_name, &what, &gap))
         }
+        Err(boxes::core::compose::ComposeError::TaskPatchNotAbsolute { what, .. }) => {
+            bail!(relative_task_patch_message(task_name, &what))
+        }
+        Err(boxes::core::compose::ComposeError::TaskPatchWritableDeny {
+            what, pattern, ..
+        }) => {
+            bail!(writable_deny_task_patch_message(
+                task_name,
+                &what,
+                &pattern,
+                policy_path
+            ))
+        }
         Err(e) => {
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("gating `patch` for task '{task_name}'"));
@@ -497,15 +514,10 @@ fn resolve_task_patches(
         let key = entry.declared.to_string();
         match verdict {
             boxes::core::compose::NameVerdict::Allowed => {
-                let setting = if entry.is_file {
-                    &task.patch.file[entry.declared]
-                } else {
-                    &task.patch.dir[entry.declared]
-                };
                 out.allow.insert(minimald_rpc::taskenv::AllowedPatch {
                     path: key,
                     is_file: entry.is_file,
-                    read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
+                    read_only: entry.read_only,
                 })
             }
             boxes::core::compose::NameVerdict::Ignored => {
@@ -526,6 +538,33 @@ fn dot_segment_task_patch_message(task_name: &str, path: &str) -> String {
         "task '{task_name}' declares the patch path `{path}`, which holds a \
          `.` or `..` segment, so your [patches] policy cannot tell what it \
          mounts; declare the path it means without them"
+    )
+}
+
+/// The rejection body for a declared patch key that is neither absolute
+/// nor `~/`-rooted. Split out for unit tests.
+fn relative_task_patch_message(task_name: &str, path: &str) -> String {
+    format!(
+        "task '{task_name}' declares the patch path `{path}`, which is not an \
+         absolute path and does not start with `~/`, so your [patches] policy \
+         cannot check it; declare the full path, starting with `/` or `~/`"
+    )
+}
+
+/// The rejection body for a read-write patch directory that a `deny` rule
+/// reaches into. Split out for unit tests.
+fn writable_deny_task_patch_message(
+    task_name: &str,
+    path: &str,
+    pattern: &str,
+    policy_path: &std::path::Path,
+) -> String {
+    format!(
+        "task '{task_name}' declares the read-write patch directory `{path}`. \
+         The task can create files in it that the `[patches] deny` rule \
+         `{pattern}` in {policy} forbids. Declare the directory \"ro\", or \
+         declare a directory that leaves those paths out",
+        policy = policy_path.display(),
     )
 }
 
@@ -613,13 +652,24 @@ fn resolve_task_patches_non_interactive(
 /// A task this machine cannot find declared (one a stack provides, or a
 /// project whose `minimal.toml` is gone) gets an empty verdict rather than
 /// an error. The daemon still runs it when it declares no patches, and
-/// refuses it when it does, since nothing here checked them.
+/// refuses it when it does, since nothing here checked them. A
+/// `minimal.toml` that cannot be read is a different case: its error is
+/// returned, since it is the real cause of any refusal that follows.
 pub(crate) fn gate_session_task_patches(
     global: &GlobalArgs,
     project_path: &camino::Utf8Path,
     task_name: &str,
 ) -> Result<minimald_rpc::taskenv::PatchVerdict, anyhow::Error> {
-    let Ok(declared) = declared_task(project_path, task_name) else {
+    let file = match mfile::File::from_dir_recursive(project_path.as_std_path()) {
+        Ok(file) => file,
+        Err(mfile::Error::NotFound) => return Ok(minimald_rpc::taskenv::PatchVerdict::default()),
+        Err(e) => bail!(
+            "cannot check the patch paths of task '{task_name}': the {name} for \
+             {project_path} cannot be read: {e}",
+            name = mfile::MFILE_NAME,
+        ),
+    };
+    let Some(declared) = file.task(task_name) else {
         return Ok(minimald_rpc::taskenv::PatchVerdict::default());
     };
     if declared.patch.dir.is_empty() && declared.patch.file.is_empty() {
@@ -2196,6 +2246,76 @@ mod tests {
         assert!(msg.contains("`..` segment"), "{msg}");
     }
 
+    /// A relative key would be mounted against the daemon's working
+    /// directory, where no rule reaches, so it is refused by name.
+    #[test]
+    fn a_relative_patch_key_is_refused_by_name() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.dir]\n\"root/.cache\" = \"rw\"\n",
+        );
+        let policy =
+            boxes::core::policy::PatchesPolicy::default().with_allow(vec!["**".to_string()]);
+        let err = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("a relative key must fail the gate");
+        let msg = err.to_string();
+        assert!(msg.contains("`root/.cache`"), "{msg}");
+        assert!(msg.contains("start with `~/`"), "{msg}");
+    }
+
+    /// A read-write directory a deny rule reaches into is refused, naming
+    /// the rule and the way out, even though the file does not exist yet.
+    #[test]
+    fn a_writable_directory_under_a_deny_is_refused_naming_the_rule() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.dir]\n\
+             \"/nonexistent-min-test/home\" = \"rw\"\n",
+        );
+        let policy = boxes::core::policy::PatchesPolicy::default()
+            .with_allow(vec!["/nonexistent-min-test/**".to_string()])
+            .with_deny(vec!["/nonexistent-min-test/home/.ssh/**".to_string()]);
+        let err = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("a writable directory under a deny must fail the gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`/nonexistent-min-test/home/.ssh/**`"),
+            "{msg}"
+        );
+        assert!(msg.contains("\"ro\""), "{msg}");
+    }
+
+    /// A glob metacharacter in a refused path is escaped in the snippet,
+    /// so the rule matches that one path and the policy still loads.
+    #[test]
+    fn the_patch_refusal_snippet_escapes_glob_metacharacters() {
+        let path = "/srv/a*b[1]{c,d}".to_string();
+        let snippet = refused_patches_snippet(std::slice::from_ref(&path));
+        let parsed: toml::Value = toml::from_str(&snippet).expect("snippet must parse");
+        let rule = parsed["patches"]["allow"][0]
+            .as_str()
+            .expect("one rule")
+            .to_owned();
+        assert_ne!(rule, path, "{snippet}");
+        let set = boxes::core::primitives::FileSet::try_new(rule.clone()).expect("rule compiles");
+        assert!(set.is_match(&path), "{rule}");
+        assert!(!set.is_match("/srv/aXb1c"), "{rule}");
+    }
+
     /// `min session run` gates the task as the session project declares
     /// it: a task with no patches, or one this machine cannot find, gets
     /// an empty verdict; a declared patch the policy does not allow is
@@ -2233,6 +2353,26 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("task 'mounts' declares 1 patch "), "{msg}");
         assert!(msg.contains("/opt/tool/bin"), "{msg}");
+    }
+
+    /// A broken `minimal.toml` is reported as the cause, not left for the
+    /// daemon to refuse the task for a reason that hides it.
+    #[test]
+    fn session_run_reports_a_broken_project_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        std::fs::write(dir.join(mfile::MFILE_NAME), "[tasks.t\n").unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let err = gate_session_task_patches(&global, dir, "t")
+            .expect_err("a broken minimal.toml must fail the run");
+        let msg = err.to_string();
+        assert!(msg.contains("task 't'"), "{msg}");
+        assert!(msg.contains("cannot be read"), "{msg}");
     }
 
     /// An ignored patch path lands in the drop list the daemon removes

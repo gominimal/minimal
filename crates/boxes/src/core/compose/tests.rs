@@ -2532,6 +2532,7 @@ mod gate_task_patch_paths {
             .map(|&(d, is_file)| TaskPatchEntry {
                 declared: d,
                 is_file,
+                read_only: true,
                 source,
             })
             .collect()
@@ -3230,6 +3231,182 @@ mod gate_task_patch_paths {
                     ..
                 } if what == file.as_str()
             ),
+            "{err}"
+        );
+    }
+
+    /// A writable `patch.dir` entry, for the tests of the read-write
+    /// rules. `entries_for` gives read-only ones.
+    fn writable_dir<'a>(source: &'a Source, declared: &'a str) -> Vec<TaskPatchEntry<'a>> {
+        vec![TaskPatchEntry {
+            declared,
+            is_file: false,
+            read_only: false,
+            source,
+        }]
+    }
+
+    /// A symlink inside a directory the walk cannot search does not
+    /// resolve. That is not "missing": the link can lead to `/etc`, so
+    /// the entry fails closed rather than being matched as declared.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_an_unsearchable_directory_is_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_root(&tmp);
+        let locked = root.join("locked");
+        std::fs::create_dir(locked.as_std_path()).unwrap();
+        let link = locked.join("link");
+        std::os::unix::fs::symlink("/etc", link.as_std_path()).unwrap();
+        std::fs::set_permissions(locked.as_std_path(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let restore = || {
+            std::fs::set_permissions(locked.as_std_path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        };
+        // Root searches it regardless, so there is nothing to refuse.
+        if std::fs::canonicalize(link.as_std_path()).is_ok() {
+            restore();
+            eprintln!("skipped: running as root, a 0o000 directory is searchable");
+            return;
+        }
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(link.as_str(), true)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![format!("{root}/**")])
+            .with_deny(vec!["/etc/**".to_string()]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        restore();
+        assert!(
+            matches!(err, ComposeError::Denied { ref what, .. } if what == link.as_str()),
+            "{err}"
+        );
+    }
+
+    /// A relative key matches no absolute rule and would be mounted
+    /// against the daemon's working directory, so it is refused, whatever
+    /// the policy says.
+    #[test]
+    fn a_relative_key_is_refused_before_the_policy_decides() {
+        let source = project_source();
+        for declared in ["root/.cache", "~", "~user/x", ""] {
+            let entries = entries_for(&source, &[(declared, false)]);
+            let policy = PatchesPolicy::default().with_allow(vec!["**".to_string()]);
+            let err = gate_task_patch_paths(&entries, policy, None, &NoVars, Some("/home/u"))
+                .unwrap_err();
+            assert!(
+                matches!(err, ComposeError::TaskPatchNotAbsolute { ref what, .. } if what == declared),
+                "{declared:?}: {err}"
+            );
+        }
+    }
+
+    /// A read-write directory lets the task create a file a deny names,
+    /// so the deny applies to the paths it can hold, not only the ones it
+    /// holds now. A read-only one cannot gain the file, so it is allowed.
+    #[test]
+    fn a_writable_directory_is_refused_when_a_deny_reaches_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = canonical_root(&tmp).join("home");
+        std::fs::create_dir(home.as_std_path()).unwrap();
+        let deny = format!("{home}/.ssh/authorized_keys");
+        let policy = || {
+            PatchesPolicy::default()
+                .with_allow(vec![home.to_string()])
+                .with_deny(vec![deny.clone()])
+        };
+
+        let source = project_source();
+        let err = gate_task_patch_paths(
+            &writable_dir(&source, home.as_str()),
+            policy(),
+            None,
+            &NoVars,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ComposeError::TaskPatchWritableDeny { ref what, ref pattern, .. }
+                if what == home.as_str() && *pattern == deny),
+            "{err}"
+        );
+
+        let entries = entries_for(&source, &[(home.as_str(), false)]);
+        let (verdicts, _) = gate_task_patch_paths(&entries, policy(), None, &NoVars, None).unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// The read-write rule matches `~/` entries too, against the same home
+    /// the policy's own `~` expands to, and leaves alone a directory no
+    /// deny reaches into.
+    #[test]
+    fn a_writable_tilde_directory_meets_a_deny_inside_it() {
+        let source = project_source();
+        let policy = || {
+            PatchesPolicy::default()
+                .with_allow(vec!["~/**".to_string()])
+                .with_deny(vec!["~/.ssh/**".to_string()])
+        };
+        let err = gate_task_patch_paths(
+            &writable_dir(&source, "~/"),
+            policy(),
+            None,
+            &NoVars,
+            Some("/home/u"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ComposeError::TaskPatchWritableDeny { .. }),
+            "{err}"
+        );
+
+        let (verdicts, _) = gate_task_patch_paths(
+            &writable_dir(&source, "~/.cache"),
+            policy(),
+            None,
+            &NoVars,
+            Some("/home/u"),
+        )
+        .unwrap();
+        assert_eq!(verdicts, vec![NameVerdict::Allowed]);
+    }
+
+    /// The literal prefix of a deny pattern decides whether it can reach
+    /// inside a directory, erring towards yes once a metacharacter starts.
+    #[test]
+    fn deny_reaches_inside_reads_the_literal_prefix() {
+        use crate::core::compose::deny_reaches_inside;
+        assert!(deny_reaches_inside("/h/u/.ssh/**", "/h/u"));
+        assert!(deny_reaches_inside("/h/u/.ssh/authorized_keys", "/h/u/"));
+        assert!(deny_reaches_inside("**/.env", "/srv/app"));
+        assert!(deny_reaches_inside("/h/*/.ssh/**", "/h/u/proj"));
+        assert!(deny_reaches_inside("/h/u/a[*]b/**", "/h/u/a*b"));
+        assert!(!deny_reaches_inside("/h/u/.ssh/**", "/h/u/proj"));
+        assert!(!deny_reaches_inside("/etc/**", "/h/u"));
+        assert!(!deny_reaches_inside("/h/u", "/h/u"));
+        assert!(!deny_reaches_inside("/h/u/a[*]b/**", "/h/u/axb"));
+        assert!(!deny_reaches_inside("/h/uu/x", "/h/u"));
+    }
+
+    /// A deny that names a directory without `/**` still applies to that
+    /// directory when the walk meets it inside a declared one.
+    #[test]
+    fn a_contained_directory_a_deny_names_denies_the_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = canonical_root(&tmp).join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(ssh.as_std_path()).unwrap();
+
+        let source = project_source();
+        let entries = entries_for(&source, &[(home.as_str(), false)]);
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![home.to_string()])
+            .with_deny(vec![ssh.to_string()]);
+        let err = gate_task_patch_paths(&entries, policy, None, &NoVars, None).unwrap_err();
+        assert!(
+            matches!(err, ComposeError::Denied { ref what, .. } if what == home.as_str()),
             "{err}"
         );
     }

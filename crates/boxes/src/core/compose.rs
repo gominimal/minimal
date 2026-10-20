@@ -529,6 +529,24 @@ pub enum ComposeError {
     /// [`gate_task_patch_paths`].
     #[error("the patch path `{what}` (from {from}) holds a `.` or `..` segment")]
     TaskPatchDotSegment { what: String, from: Source },
+    /// A task's declared `patch.dir` / `patch.file` key is neither absolute
+    /// nor `~/`-rooted. The daemon would mount it relative to its own
+    /// working directory, which no `[patches]` rule names. Surfaces from
+    /// [`gate_task_patch_paths`].
+    #[error("the patch path `{what}` (from {from}) is not absolute and does not start with `~/`")]
+    TaskPatchNotAbsolute { what: String, from: Source },
+    /// A task's declared read-write `patch.dir` entry holds a place where
+    /// the task could create a path that a `[patches] deny` rule names, so
+    /// mounting it would let the task write past that rule. `pattern` is
+    /// the deny rule, as expanded. Surfaces from [`gate_task_patch_paths`].
+    #[error(
+        "the read-write patch directory `{what}` (from {from}) can hold a path that the [patches] deny rule `{pattern}` names"
+    )]
+    TaskPatchWritableDeny {
+        what: String,
+        from: Source,
+        pattern: String,
+    },
     /// A task's declared `patch.dir` entry could not be checked file by
     /// file against a `[patches] deny`: the walk of what it holds could
     /// not finish. The entry is refused rather than mounted unchecked.
@@ -1562,6 +1580,10 @@ pub struct TaskPatchEntry<'a> {
     pub declared: &'a str,
     /// `true` for a `patch.file` entry, `false` for `patch.dir`.
     pub is_file: bool,
+    /// `true` for a `"ro"` entry. A read-write directory lets the task
+    /// create paths in it, so it is checked against every path a `deny`
+    /// rule can name inside it, not only the paths it holds now.
+    pub read_only: bool,
     /// The contributing task's provenance — always a project, since only
     /// `minimal.toml` declares tasks.
     pub source: &'a Source,
@@ -1610,10 +1632,12 @@ const TASK_PATCH_LINK_HOPS: usize = 40;
 
 /// Why [`resolve_existing_prefix`] could not say where a path leads: a
 /// dangling symlink it could not follow (unreadable, too many hops, or a
-/// target it cannot pin down). The caller denies the entry, since the
-/// daemon would write through the link to a path no rule was checked on.
+/// target it cannot pin down), or a path the OS refused to resolve for a
+/// reason other than "not found" (a directory on the way that cannot be
+/// searched, say). The caller denies the entry, since the daemon would
+/// reach a path no rule was checked on.
 #[derive(Debug)]
-struct UnresolvableLink;
+struct Unresolvable;
 
 /// The path `path` reaches on this machine: its deepest existing ancestor
 /// canonicalized, with the missing tail joined back on. So a
@@ -1622,9 +1646,14 @@ struct UnresolvableLink;
 /// canonicalization cannot see through, is followed by hand: writing a
 /// missing `rw` entry creates the link's target, so the target is what
 /// must be checked. `Ok(None)` when it resolves to itself.
+///
+/// Only a "not found" error means a path is missing. Any other error
+/// (permission denied on a parent, a file where a directory must be, a
+/// link loop) is [`Unresolvable`]: such a path can still be a symlink
+/// that leads anywhere.
 fn resolve_existing_prefix(
     path: &camino::Utf8Path,
-) -> Result<Option<camino::Utf8PathBuf>, UnresolvableLink> {
+) -> Result<Option<camino::Utf8PathBuf>, Unresolvable> {
     let resolved = resolve_path(path, 0)?;
     Ok(resolved.filter(|out| out != path))
 }
@@ -1635,28 +1664,36 @@ fn resolve_existing_prefix(
 fn resolve_path(
     path: &camino::Utf8Path,
     hops: usize,
-) -> Result<Option<camino::Utf8PathBuf>, UnresolvableLink> {
+) -> Result<Option<camino::Utf8PathBuf>, Unresolvable> {
     let mut tail: Vec<&str> = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(canonical) = std::fs::canonicalize(cur.as_std_path()) {
-            let Ok(mut out) = camino::Utf8PathBuf::from_path_buf(canonical) else {
-                return Ok(None);
-            };
-            for seg in tail.iter().rev() {
-                out.push(seg);
+        match std::fs::canonicalize(cur.as_std_path()) {
+            Ok(canonical) => {
+                let Ok(mut out) = camino::Utf8PathBuf::from_path_buf(canonical) else {
+                    return Ok(None);
+                };
+                for seg in tail.iter().rev() {
+                    out.push(seg);
+                }
+                return Ok(Some(out));
             }
-            return Ok(Some(out));
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Unresolvable),
         }
         // `cur` does not resolve. If it is a link, it dangles: follow it
         // to where it points, where a write through it would land.
-        if std::fs::symlink_metadata(cur.as_std_path()).is_ok_and(|m| m.file_type().is_symlink()) {
+        let is_link = match std::fs::symlink_metadata(cur.as_std_path()) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(Unresolvable),
+        };
+        if is_link {
             if hops >= TASK_PATCH_LINK_HOPS {
-                return Err(UnresolvableLink);
+                return Err(Unresolvable);
             }
-            let target = std::fs::read_link(cur.as_std_path()).map_err(|_| UnresolvableLink)?;
-            let target =
-                camino::Utf8PathBuf::from_path_buf(target).map_err(|_| UnresolvableLink)?;
+            let target = std::fs::read_link(cur.as_std_path()).map_err(|_| Unresolvable)?;
+            let target = camino::Utf8PathBuf::from_path_buf(target).map_err(|_| Unresolvable)?;
             let mut next = match cur.parent() {
                 Some(parent) if target.is_relative() => parent.join(target),
                 _ => target,
@@ -1668,8 +1705,65 @@ fn resolve_path(
         }
         // A `..` from a link's target, under a parent that does not exist,
         // has no name to carry: the walk cannot say where it lands.
-        tail.push(cur.file_name().ok_or(UnresolvableLink)?);
-        cur = cur.parent().ok_or(UnresolvableLink)?;
+        tail.push(cur.file_name().ok_or(Unresolvable)?);
+        cur = cur.parent().ok_or(Unresolvable)?;
+    }
+}
+
+/// Where `path` leads on this machine: its deepest existing ancestor
+/// canonicalized, a dangling symlink on the way followed by hand, and the
+/// missing tail joined back on. `None` when that cannot be said, for a
+/// link that cannot be followed or any error other than "not found". The
+/// daemon uses it to keep a `~/` patch key inside the session's home.
+#[must_use]
+pub fn resolve_patch_target(path: &camino::Utf8Path) -> Option<camino::Utf8PathBuf> {
+    resolve_path(path, 0).ok().flatten()
+}
+
+/// Whether the `deny` pattern `pattern` can match a path strictly inside
+/// the directory `dir`. It errs towards `true`: the caller refuses a
+/// read-write directory on it, so a false `true` costs a refusal and a
+/// false `false` costs a write past a deny.
+///
+/// The pattern's literal prefix decides, read up to its first glob
+/// metacharacter (`*`, `?`, `[`, `{`). A backslash escape and a one-byte
+/// class such as `[*]` count as literal. A pattern with no metacharacter
+/// names one path, so it must lie under `dir`. Otherwise `*` and `**`
+/// cross `/` in these patterns, so the prefix only has to agree with
+/// `dir/` as far as the shorter of the two reaches.
+pub(crate) fn deny_reaches_inside(pattern: &str, dir: &str) -> bool {
+    let inside = format!("{}/", dir.trim_end_matches('/'));
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut literal = String::with_capacity(pattern.len());
+    let mut i = 0;
+    let mut has_meta = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                literal.push(chars[i + 1]);
+                i += 2;
+            }
+            '[' if i + 2 < chars.len()
+                && chars[i + 2] == ']'
+                && !matches!(chars[i + 1], '!' | '^' | ']') =>
+            {
+                literal.push(chars[i + 1]);
+                i += 3;
+            }
+            '*' | '?' | '[' | '{' => {
+                has_meta = true;
+                break;
+            }
+            c => {
+                literal.push(c);
+                i += 1;
+            }
+        }
+    }
+    if has_meta {
+        literal.starts_with(&inside) || inside.starts_with(&literal)
+    } else {
+        literal.starts_with(&inside)
     }
 }
 
@@ -1699,7 +1793,8 @@ fn decide_task_patch_path(
 /// symlinked prefix such as macOS's `/tmp` → `/private/tmp` therefore needs
 /// the resolved form allowed too; the prompt and the refusal snippet name
 /// it (see [`task_patch_forms`]). A dangling link that cannot be followed
-/// denies the entry ([`UnresolvableLink`]).
+/// denies the entry ([`Unresolvable`]), as does a path the OS refuses
+/// to resolve for any reason other than "not found".
 fn check_task_patch_path(
     expanded: &ExpandedPatchesPolicy,
     source: &Source,
@@ -1714,7 +1809,7 @@ fn check_task_patch_path(
     match resolve_existing_prefix(path) {
         Ok(Some(resolved)) => own.combine(decide_task_patch_path(expanded, source, &resolved)),
         Ok(None) => own,
-        Err(UnresolvableLink) => PathDecision::Denied,
+        Err(Unresolvable) => PathDecision::Denied,
     }
 }
 
@@ -1812,7 +1907,9 @@ fn decide_answered_task_patch_forms(
 /// so a rule naming the declared directory, as the prompt and the refusal
 /// snippet record it, approves the entry whatever it holds.
 ///
-/// The probe follows a contained symlink to a directory and walks what the
+/// Every entry the walk meets is checked, a directory as well as a file,
+/// so a `deny` that names a directory without `/**` still applies. The
+/// probe follows a contained symlink to a directory and walks what the
 /// target holds, since the mount keeps the link and so exposes it.
 ///
 /// With no `deny` rule there is nothing to probe for, so the directory's
@@ -1874,12 +1971,9 @@ fn check_task_patch_dir(
             }
             let file_type = entry.file_type().ok();
             let on_disk = canonical.as_ref().map(|c| c.join(entry.file_name()));
-            if file_type.is_some_and(|t| t.is_dir()) {
-                if on_disk.as_ref().is_none_or(|c| visited.insert(c.clone())) {
-                    stack.push((entry.path(), on_disk));
-                }
-                continue;
-            }
+            // Every entry meets the deny rules, a directory too: a deny
+            // that names a directory (no `/**`) is bypassed when the walk
+            // only checks what lies beneath it.
             let path = utf8(&entry.path());
             // Only a symlink reaches somewhere other than its own path,
             // so only a symlink pays for the resolution.
@@ -1893,6 +1987,12 @@ fn check_task_patch_dir(
             {
                 return Ok(PathDecision::Denied);
             }
+            if file_type.is_some_and(|t| t.is_dir()) {
+                if on_disk.as_ref().is_none_or(|c| visited.insert(c.clone())) {
+                    stack.push((entry.path(), on_disk));
+                }
+                continue;
+            }
             if is_link
                 && let Ok(target) = std::fs::canonicalize(entry.path())
                 && target.is_dir()
@@ -1905,21 +2005,61 @@ fn check_task_patch_dir(
     Ok(own)
 }
 
+/// The first `deny` rule that can name a path inside the read-write
+/// directory `dir`, as declared or, when `resolve` is set, as it resolves
+/// on this machine ([`deny_reaches_inside`]). A read-write mount lets the
+/// task create such a path, so what the directory holds now does not
+/// settle it.
+fn writable_task_patch_deny(
+    expanded: &ExpandedPatchesPolicy,
+    dir: &camino::Utf8Path,
+    resolve: bool,
+) -> Option<String> {
+    let mut forms = vec![dir.to_path_buf()];
+    if resolve && let Ok(Some(resolved)) = resolve_existing_prefix(dir) {
+        forms.push(resolved);
+    }
+    expanded
+        .deny()
+        .iter()
+        .find(|rule| {
+            forms
+                .iter()
+                .any(|form| deny_reaches_inside(rule.pattern(), form.as_str()))
+        })
+        .map(|rule| rule.pattern().to_owned())
+}
+
 /// A declared entry's decision: the file form checks its one path, the
-/// directory form also probes the files it currently holds.
+/// directory form also probes the files it currently holds. A read-write
+/// directory is also refused when a `deny` rule can name a path inside it
+/// ([`writable_task_patch_deny`]).
 ///
 /// # Errors
 ///
-/// [`ComposeError::TaskPatchUnchecked`] when a directory's probe could
-/// not finish ([`check_task_patch_dir`]).
+/// - [`ComposeError::TaskPatchUnchecked`] when a directory's probe could
+///   not finish ([`check_task_patch_dir`]).
+/// - [`ComposeError::TaskPatchWritableDeny`] when a read-write directory
+///   can hold a path a `deny` rule names.
 fn check_task_patch_entry(
     expanded: &ExpandedPatchesPolicy,
     entry: &TaskPatchEntry<'_>,
     path: &camino::Utf8Path,
     resolve: bool,
 ) -> Result<crate::core::policy::PathDecision, ComposeError> {
-    if entry.is_file {
-        return Ok(check_task_patch_path(expanded, entry.source, path, resolve));
+    use crate::core::policy::PathDecision;
+    let own = check_task_patch_path(expanded, entry.source, path, resolve);
+    if entry.is_file || own == PathDecision::Denied {
+        return Ok(own);
+    }
+    if !entry.read_only
+        && let Some(pattern) = writable_task_patch_deny(expanded, path, resolve)
+    {
+        return Err(ComposeError::TaskPatchWritableDeny {
+            what: entry.declared.to_owned(),
+            from: entry.source.clone(),
+            pattern,
+        });
     }
     check_task_patch_dir(
         expanded,
@@ -1956,6 +2096,14 @@ fn check_task_patch_entry(
 /// A key holding a `.` or `..` segment is refused outright
 /// ([`ComposeError::TaskPatchDotSegment`]): the OS resolves `..` after any
 /// symlinked parent, so the declared string would not say what it mounts.
+/// A key that is neither absolute nor `~/`-rooted is refused too
+/// ([`ComposeError::TaskPatchNotAbsolute`]): no rule matches it, and the
+/// daemon would mount it against its own working directory.
+///
+/// A read-write directory entry is refused when a `deny` rule can name a
+/// path inside it ([`ComposeError::TaskPatchWritableDeny`]), since the
+/// task can create that path. This check reads only the declared and
+/// resolved strings, so it applies to `~/` entries too.
 ///
 /// An absolute entry is also checked as it resolves on this machine, and
 /// a directory entry is probed for contained files a `deny` names. Both
@@ -1983,8 +2131,12 @@ fn check_task_patch_entry(
 ///   path is never preceded by a prompt about its neighbours.
 /// - [`ComposeError::TaskPatchDotSegment`] — a declared key holds a `.`
 ///   or `..` segment. Checked before anything else.
+/// - [`ComposeError::TaskPatchNotAbsolute`] — a declared key is neither
+///   absolute nor `~/`-rooted. Checked right after the dot segments.
 /// - [`ComposeError::TaskPatchUnchecked`] — a `deny` rule is set and a
 ///   directory entry's probe could not check every file it holds.
+/// - [`ComposeError::TaskPatchWritableDeny`] — a read-write directory
+///   entry can hold a path a `deny` rule names.
 /// - [`ComposeError::HookRequired`] — an entry needed approval and there
 ///   was no hook to ask.
 /// - [`ComposeError::Aborted`] — the hook cancelled.
@@ -2022,6 +2174,17 @@ pub fn gate_task_patch_paths(
     // meaning the gate cannot pin down.
     if let Some(entry) = entries.iter().find(|e| has_dot_segment(e.declared)) {
         return Err(ComposeError::TaskPatchDotSegment {
+            what: entry.declared.to_owned(),
+            from: entry.source.clone(),
+        });
+    }
+    // A relative key matches no absolute rule, and the daemon would mount
+    // it against its own working directory, so it is refused too.
+    if let Some(entry) = entries
+        .iter()
+        .find(|e| !e.declared.starts_with('/') && !e.declared.starts_with("~/"))
+    {
+        return Err(ComposeError::TaskPatchNotAbsolute {
             what: entry.declared.to_owned(),
             from: entry.source.clone(),
         });
