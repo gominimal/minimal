@@ -169,7 +169,7 @@ async fn run() -> ExitCode {
         // downcasts. The object is the contract, so there is no second,
         // plain-text line to print for the same failure, only the non-zero
         // status.
-        if output_mode.is_some() {
+        if output_mode {
             match machine_mode_answer(&e) {
                 MachineModeAnswer::Quiet => return ExitCode::from(141),
                 MachineModeAnswer::Object(failure) => {
@@ -278,6 +278,13 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             "the VM host has no address left for another box; destroy a session you no \
              longer need and try again"
                 .to_string(),
+        ));
+    }
+    if let Some(refused) = e.downcast_ref::<minimal::AuditSelfUnsupportedUnenrolled>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            refused.code(),
+            format!("{e:#}"),
+            "on the host, run `min box audit <box>`".to_string(),
         ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
@@ -409,20 +416,25 @@ impl tracing::field::Visit for MessageVisitor {
     }
 }
 
-/// The machine output mode a run is under: the command's `-o`, the flag the
-/// architecture's machine-output contract hangs on — `json` for
-/// `min session policy -o json`, the one command that takes it today.
-/// `None` for every text run, and for a command that has not taken `-o
-/// json` yet, which is the same thing to the error path: its failure is a
-/// plain-text line. Both gates below key on this, so a command joins the
-/// machine mode by growing an `output` flag, and nothing else about its
+/// Whether a run is under the machine output mode: the command's `-o`, the
+/// flag the architecture's machine-output contract hangs on — `json` for
+/// `min session policy -o json` and `jsonl` for `min box audit -o jsonl`.
+/// `false` for every text run, and for a command that has not taken a
+/// machine `-o` yet, which is the same thing to the error path: its failure
+/// is a plain-text line. The error path keys on this, so a command joins
+/// the machine mode by growing an `output` flag, and nothing else about its
 /// error path changes.
-fn machine_output_mode(cli: &minimal::Cli) -> Option<PolicyOutputFormat> {
+fn machine_output_mode(cli: &minimal::Cli) -> bool {
     match &cli.command {
         Some(minimal::Command::Session(minimal::SessionArgs {
             command: minimal::SessionCommand::Policy(PolicyArgs { output, .. }),
-        })) => *output,
-        _ => None,
+        })) => output.is_some(),
+        // Architecture line 379: a `-o jsonl` failure is one `min/v1/error`
+        // object too.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Audit(args),
+        })) => args.output == Some(minimal::BoxAuditOutputFormat::Jsonl),
+        _ => false,
     }
 }
 
@@ -719,7 +731,7 @@ mod tests {
                 }),
             })),
         };
-        assert_eq!(machine_output_mode(&cli), Some(PolicyOutputFormat::Json));
+        assert!(machine_output_mode(&cli));
 
         let cli = minimal::Cli {
             global_args: minimal::GlobalArgs::default(),
@@ -730,13 +742,40 @@ mod tests {
                 }),
             })),
         };
-        assert_eq!(machine_output_mode(&cli), None);
+        assert!(!machine_output_mode(&cli));
 
         let cli = minimal::Cli {
             global_args: minimal::GlobalArgs::default(),
             command: None,
         };
-        assert_eq!(machine_output_mode(&cli), None);
+        assert!(!machine_output_mode(&cli));
+
+        // `min box audit -o jsonl` is a machine mode, its text form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxAuditOutputFormat::Jsonl), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Audit(minimal::BoxAuditArgs {
+                        target: Some("self".to_string()),
+                        parent: None,
+                        output,
+                        follow: false,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
+        // Its defined refusal answers with its own code.
+        match machine_mode_answer(&anyhow::Error::new(minimal::AuditSelfUnsupportedUnenrolled)) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "audit_self_unsupported_unenrolled");
+            }
+            other => panic!("the refusal answers with its code, got {other:?}"),
+        }
     }
 
     /// The one object a machine-output failure answers with: a

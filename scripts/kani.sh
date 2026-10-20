@@ -8,8 +8,10 @@
 # alphabet both its readers agree on and the budget that leaves libkrun
 # its reserve), and bep (the redemption decision: a value that does not
 # decrypt, a misattributed source, a member without bounds, an authority
-# outside either host set, an off-port connection and an expired or
-# revoked value are refused).
+# outside either host set, an off-port connection, an expired or revoked
+# value, an authority outside the box's declared egress and a request
+# whose Host differs from its connection are refused, and the decision
+# admits exactly when every check passes).
 #
 # Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
@@ -275,4 +277,4 @@ expect boxes 10
 expect rcache 3
 expect mlog 9
 expect minvmd 5
-expect bep 6
+expect bep 9
