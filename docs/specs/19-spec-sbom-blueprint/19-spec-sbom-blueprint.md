@@ -249,10 +249,12 @@ developer running agent boxes; build-infra operator; auditor.
   parts: no userinfo, no path, no query, no fragment, no header, whatever a
   parameter is called; a path segment can carry a token, `/hooks/<token>`,
   so the path goes too; a `[[github_imports]]` location keeps its
-  `owner/repo` path alone, which is identity, not secret); `[[file_imports]]`
-  and `[[file_exports]]` are host paths, not URLs, and are recorded by the
-  entry's name and its box-side path only, never the host path (which can
-  carry a user name or a home directory) — SHALL copy from a per-package
+  `owner/repo` path alone, which is identity, not secret); a
+  `[[file_imports]]` or `[[file_exports]]` entry has one field, its `path`
+  relative to the project root (architecture: file imports and exports),
+  and is recorded by that relative path alone, never the project root and
+  never an absolute host path (either can carry a user name or a home
+  directory) — SHALL copy from a per-package
   document (SBOM-009) only an allowlist of fields: a build-closure
   component's name, version, `purl` and digests, and a build-environment
   tool's name and version, with every location among them reduced the same
@@ -267,8 +269,8 @@ developer running agent boxes; build-infra operator; auditor.
     provenance fields, every secret carries only name and source kind, every
     location field (the posture's and the imported documents' alike) is of
     the form scheme://host[:port], or scheme://host/owner/repo for a GitHub
-    import, every file import or export carries only its name and box-side
-    path and no host path, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
+    import, every file import or export carries only its project-root-
+    relative path and no absolute path, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
     tool version} for every document d, for all credentials v in
     credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where every v is at
     least 16 characters drawn so that no v is a substring of any declared
@@ -287,10 +289,16 @@ developer running agent boxes; build-infra operator; auditor.
     document carrying any other value as unresolved (SBOM-012's failure,
     exit code 6, naming the field), so no document can put a control
     character, markup or an oversized value into a serializer's output;
-    the serializers escape every string they emit regardless.
+    the serializers escape every string they emit regardless. THE SYSTEM
+    SHALL read a per-package document only up to 8 MiB of statement bytes,
+    4,096 build-closure entries, 256 build-environment tools and a JSON
+    nesting depth of 16, counting as it parses and stopping at the first
+    limit, and SHALL treat a document over any limit as unresolved
+    (SBOM-012's failure, exit code 6, naming the limit), so an untrusted
+    writer cannot exhaust the emitter's memory or time.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_document_strings_are_bounded_and_control_free
-    property: for all documents d, fields f ∈ copied(d): read(d) ⇒ utf8(f) ∧ len(f) ≤ limit(f) ∧ ∀c ∈ f: ¬control(c) ∧ ¬separator(c); a planted control character or 257-byte name makes d unresolved, and a planted markup string is emitted escaped by every serializer
+    property: for all documents d, fields f ∈ copied(d): read(d) ⇒ utf8(f) ∧ len(f) ≤ limit(f) ∧ ∀c ∈ f: ¬control(c) ∧ ¬separator(c) ∧ bytes(d) ≤ 8 MiB ∧ |closure(d)| ≤ 4096 ∧ |tools(d)| ≤ 256 ∧ depth(d) ≤ 16; a planted control character, a 257-byte name, a 9 MiB body, a 4,097-entry closure or a depth-17 document makes d unresolved, and a planted markup string is emitted escaped by every serializer
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
@@ -363,8 +371,9 @@ developer running agent boxes; build-infra operator; auditor.
     failure, and unresolved(o) is SBOM-013's set
     (subject mismatch with both digests as check(o), a failed bundle check
     by name, an absent pinned bundle on a reachable host, a document the
-    pin records no bundle for under require_bundles, a copied string that
-    fails SBOM-008's validation with the field as check(o))
+    pin records no bundle for under require_bundles, a copied string or a
+    document that fails SBOM-008's validation or exceeds its limits, with
+    the field or the limit as check(o))
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
@@ -420,7 +429,7 @@ developer running agent boxes; build-infra operator; auditor.
     records a bundle, absence is SBOM-012's failure.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_absent_in_the_interim_is_marked_not_fatal
-    property: ¬pin_records_bundle(d) ∧ absent(d) ⇒ emitted ∧ has_sha256(component(d)) ∧ unverified(component(d), no-document) ∧ stderr names (component(d), "build-servers#185")
+    property: ¬pin_records_bundle(d) ∧ absent(d) ∧ ¬require_bundles ⇒ emitted ∧ has_sha256(component(d)) ∧ unverified(component(d), no-document) ∧ stderr names (component(d), "build-servers#185")
   - WHILE the pin records no bundle for the document, IF the cache holds
     the document THEN THE SYSTEM SHALL read it, mark the component
     `unverified` with the reason `no-bundle`, as PKV marks an entry whose
@@ -443,7 +452,7 @@ developer running agent boxes; build-infra operator; auditor.
     path above for them, with no flag and no release step.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_without_a_pinned_bundle_is_marked_and_diagnosed
-    property: ¬pin_records_bundle(d) ∧ fetched(d) ∧ subject_matches(d) ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185"), where fetched(d) is a document the cache returned (neither absent nor unfetchable in any of its three classes) and subject_matches(d) is SBOM-013's subject check
+    property: ¬pin_records_bundle(d) ∧ fetched(d) ∧ subject_matches(d) ∧ ¬require_bundles ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185"), where fetched(d) is a document the cache returned (neither absent nor unfetchable in any of its three classes) and subject_matches(d) is SBOM-013's subject check
   - A document that carries any `unverified` component is not evidence:
     its build facts for those components are whatever the cache's writer
     put under a correct subject. THE SYSTEM SHALL mark such a document at
