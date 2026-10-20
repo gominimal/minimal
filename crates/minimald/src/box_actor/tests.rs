@@ -5107,6 +5107,68 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
     );
 }
 
+/// A restarted daemon's resume launches the host of a restored own-address
+/// box — no RPC, no exec, no attach — so the box's declared ingress is
+/// bound and its name keeps answering without a client. A `HostNet` box
+/// gets no such launch: it owns no declared ingress and publishes no
+/// address, so its restored actor alone is the whole box, as before.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "restored-own-ip",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        handed,
+    )
+    .await;
+    create_configured_session(&mut client, "restored-hostnet", "/uwu").await;
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both active sessions are resumed"
+    );
+
+    let web = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the own-address box's session resolves");
+    for _ in 0..100 {
+        if web.get_attrs().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        web.get_attrs().await.is_some(),
+        "the resumed own-address box holds a host no client asked for"
+    );
+
+    let hostnet = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Name(
+            "restored-hostnet".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .expect("the host-network box's session resolves");
+    // Held for a settle rather than read once: a launch wrongly spawned
+    // for it would be in flight alongside the own-address box's.
+    for _ in 0..20 {
+        assert!(
+            hostnet.get_attrs().await.is_none(),
+            "a resumed host-network box launches no host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// One restored session whose actor cannot start costs only its own name:
 /// the resume logs it and goes on, and the other session still routes.
 #[cfg(target_os = "linux")]
@@ -6938,6 +7000,7 @@ async fn await_served(served: &std::sync::Mutex<Vec<String>>, count: usize) -> V
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes_it() {
+    let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let (manager, holder, yielder, published) = shared_port_pair(&server, &mut client).await;
@@ -7009,6 +7072,21 @@ async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes
     assert!(
         recorded,
         "the box's record names the port it bound at the hand-over"
+    );
+
+    // The hand-over says its info line with the plain box name, the one a
+    // diagnostics bundle's grep is written against — never a Debug-rendered
+    // Option.
+    let logged = capture.contents();
+    let hand_over_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("bound the shared-address port this box took over while it runs")
+        })
+        .unwrap_or_else(|| panic!("the hand-over must say its info line, got: {logged}"));
+    assert!(
+        hand_over_line.contains("session_name=\"yielder\""),
+        "the hand-over names the box that took the port over: {hand_over_line}"
     );
 
     // The box stops for good: the forward bound at the hand-over comes down
@@ -7978,6 +8056,7 @@ async fn expose_allow_publishes_and_lists() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: 3000,
                 owner: crate::net::listeners::PublicationOwner::Expose,
+                pending: false,
             },
         )) => {}
         other => panic!("a second request for a live port is a duplicate: {other:?}"),
@@ -8458,7 +8537,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
         .lines()
         .find(|line| {
             line.contains("the VM host daemon did not admit the port report")
-                && line.contains("name=Some(\"vmrefweb\")")
+                && line.contains("session_name=\"vmrefweb\"")
         })
         .unwrap_or_else(|| panic!("the refused report must say its warn line, got: {logged}"));
     assert!(
@@ -9511,6 +9590,7 @@ async fn expose_logs_every_path() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: 3000,
                 owner: crate::net::listeners::PublicationOwner::Expose,
+                pending: false,
             },
         )) => {}
         other => panic!("the second request for a live port is a duplicate: {other:?}"),
@@ -10007,6 +10087,7 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, listen_port),
         other => panic!("a port the watcher published is a typed duplicate: {other:?}"),
@@ -10260,6 +10341,7 @@ async fn expose_on_listen_published_port_is_already_published() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, port),
         other => panic!("the runtime expose is refused as the duplicate it is: {other:?}"),
@@ -10672,6 +10754,7 @@ async fn listen_plan_travels_in_launched() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, seeded_port),
         other => panic!("the seeded box's two surfaces read one set: {other:?}"),
@@ -10900,6 +10983,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: true,
             },
         )) => assert_eq!(asked, b_port),
         other => panic!(
@@ -10930,7 +11014,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
     assert!(
         b_refusal.contains("owner=listen")
             && b_refusal.contains(&format!(
-                "reason=port {b_port} is published already by this box (listen)"
+                "reason=port {b_port} is being published by this box (listen)"
             )),
         "the refusal names the owner holding the port and the reason it \
          gave: {b_refusal}"
@@ -11472,6 +11556,7 @@ async fn respawn_frees_published_ports() {
             crate::net::policy::ExposeRefusal::AlreadyPublished {
                 port: asked,
                 owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false,
             },
         )) => assert_eq!(asked, port),
         other => panic!("the respawn's watcher owns the port it published: {other:?}"),

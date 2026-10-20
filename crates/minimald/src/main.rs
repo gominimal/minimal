@@ -932,10 +932,12 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
         let render = minimald::net::classifier::GuestRender {
             tree_root,
-            // The resolver every host-address box on the guest is pointed
-            // at, deny-all ones included: the node's DNS layer at the switch
-            // gateway, which the deny subtree's carve-out admits (NET-003).
-            gateway_resolver: minimald::net::DEFAULT_SUBNET.dns_server(),
+            // The listener the deny subtree's DNS-port lookups are dstnat'd
+            // onto (NET-079): the guest's loopback answerer, which refuses
+            // every name outside the box zone and forwards the zone's A
+            // questions to the switch gateway alone.
+            answerer_address: minimald::net::guest_dns::LISTENER_ADDRESS,
+            answerer_port: minimald::net::guest_dns::LISTENER_PORT,
             cohort_address: identity,
             node_plane_address: identity,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
@@ -952,6 +954,12 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
                 )
             },
         );
+        // NET-079: the guest's DNS listener, after the boot above brought the
+        // loopback up — its bind is on 127.0.0.1 — and after the table that
+        // steers the deny subtree's lookups onto it loaded. The daemon's own
+        // lookups are untouched: they are keyed by the cgroup the daemon runs
+        // in, which the deny subtree's rules never match.
+        minimald::net::guest_dns::start(minimald::net::DEFAULT_SUBNET).await;
     }
 
     // NET-079: the start-time fact this daemon answers every create with —

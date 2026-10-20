@@ -1016,6 +1016,24 @@ struct Published {
     refused: Vec<RefusedRow>,
 }
 
+/// What a connect the channel socket's own mode refused means: the
+/// socket is owner-only, so the host's DNS service is another account's.
+/// The service's uid gate says the same once a connect gets through.
+const FOREIGN_CHANNEL_CONNECT: &str = "the host's DNS service belongs to another account; \
+     hosts with more than one operator are not supported";
+
+/// A channel connect's error, with a refusal by the socket's mode (an
+/// owner-only socket another account holds) said as
+/// [`FOREIGN_CHANNEL_CONNECT`] rather than a bare `Permission denied`.
+/// The kind stays `PermissionDenied`, the kind the gate's refusal carries.
+fn foreign_channel_connect(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(io::ErrorKind::PermissionDenied, FOREIGN_CHANNEL_CONNECT)
+    } else {
+        error
+    }
+}
+
 /// Connects to the channel at `channel` and publishes `rows` over it: the
 /// hello with this node's id and protocol version, then the one publish
 /// the connection is held for. The error kinds the acquisition decides
@@ -1027,7 +1045,9 @@ async fn connect_and_publish(
     node: &str,
     rows: Vec<RegisteredRow>,
 ) -> io::Result<Published> {
-    let mut stream = tokio::net::UnixStream::connect(channel).await?;
+    let mut stream = tokio::net::UnixStream::connect(channel)
+        .await
+        .map_err(foreign_channel_connect)?;
     write_line(
         &mut stream,
         &Hello {
@@ -1357,7 +1377,20 @@ fn surface_channel_lost(status: &AnswererStatus, erroring: &mut bool, why: &str)
     status.set(minimald_rpc::ZoneAnswererStatus::Starting);
 }
 
-fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &str) {
+/// In every state this is called from, this daemon neither hosts the
+/// answerer nor publishes to one, so the port its session replies report is
+/// cleared with it: a daemon that hosted or published before keeps no stale
+/// `zone_answerer_port` that says the port it lost is its own, and a reader
+/// that trusts the daemon's report over the status (`min ls`'s `DNS SERVICE`
+/// row) reads the status instead.
+async fn surface_error(
+    state: &crate::server::ServerStateHandle,
+    status: &AnswererStatus,
+    port: u16,
+    erroring: &mut bool,
+    why: &str,
+) {
+    state.clear_zone_answerer_port().await;
     if !*erroring {
         *erroring = true;
         tracing::warn!(
@@ -1671,6 +1704,7 @@ async fn acquire_at(
             // error, never a reason to host.
             Err(error) if installed => {
                 surface_error(
+                    &state,
                     &status,
                     hook_port,
                     &mut erroring,
@@ -1680,7 +1714,8 @@ async fn acquire_at(
                         paths.marker.display(),
                         channel.display()
                     ),
-                );
+                )
+                .await;
                 wait_out_commands(&mut commands, retry, &shutdown).await;
                 retry = (retry * 2).min(PORT_RECHECK);
                 continue;
@@ -1711,11 +1746,13 @@ async fn acquire_at(
             // a reason to host. Retried with backoff.
             Err(error) => {
                 surface_error(
+                    &state,
                     &status,
                     hook_port,
                     &mut erroring,
                     &format!("the answerer channel is present but did not answer: {error}"),
-                );
+                )
+                .await;
                 wait_out_commands(&mut commands, retry, &shutdown).await;
                 retry = (retry * 2).min(PORT_RECHECK);
                 continue;
@@ -1751,7 +1788,7 @@ async fn acquire_at(
             // the recheck cadence until the port frees.
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
                 let why = channelless_holder_error(hook_port, hook_port_holder(hook_port));
-                surface_error(&status, hook_port, &mut erroring, &why);
+                surface_error(&state, &status, hook_port, &mut erroring, &why).await;
                 wait_out_commands(&mut commands, PORT_RECHECK, &shutdown).await;
             }
             Err(error) => {
@@ -1759,7 +1796,7 @@ async fn acquire_at(
                     "could not bind the zone answerer's hook port 127.0.0.1:{hook_port}: \
                      {error}; free port {hook_port} or set the answerer's port"
                 );
-                surface_error(&status, hook_port, &mut erroring, &why);
+                surface_error(&state, &status, hook_port, &mut erroring, &why).await;
                 wait_out_commands(&mut commands, PORT_RECHECK, &shutdown).await;
             }
         }
@@ -3212,6 +3249,28 @@ mod tests {
         );
     }
 
+    /// A channel socket whose mode refuses the connect itself (the
+    /// owner-only socket of another account's service) is said in a plain
+    /// sentence, the service gate's own, never a bare `Permission denied`.
+    #[tokio::test]
+    async fn a_connect_the_socket_mode_refuses_names_the_other_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if nix::unistd::geteuid().is_root() {
+            // Root connects through any mode; there is no refusal to see.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a tempdir for the channel");
+        let channel = dir.path().join("answerer.sock");
+        let _listener = tokio::net::UnixListener::bind(&channel).expect("the channel binds");
+        std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o000))
+            .expect("the channel's mode is set");
+        let Err(refused) = connect_and_publish(&channel, "node-a", Vec::new()).await else {
+            panic!("a connect the socket's mode refuses never publishes");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(refused.to_string(), FOREIGN_CHANNEL_CONNECT);
+    }
+
     /// The recorded service bind is the installed unit's own
     /// `ListenDatagram=`, read — not a constant — and nothing at all when
     /// the unit names none: no default is assumed.
@@ -3589,6 +3648,12 @@ mod tests {
         )
         .await;
         probe_udp_port(hook_port).expect("the hook port stays free through the withdrawal");
+        assert_eq!(
+            server.state.zone_answerer_port().await,
+            None,
+            "the replies stop naming the service's port once the status says no channel \
+             answers"
+        );
 
         end(task, &shutdown);
     }
@@ -4078,6 +4143,74 @@ mod tests {
         assert!(
             !reply.answers.is_empty(),
             "the re-bound interim answers again"
+        );
+
+        end(task, &shutdown);
+    }
+
+    /// A daemon that hosted the interim and then lost its hook port to a
+    /// foreign process reports no answerer port once its status names the
+    /// held port: the replies' `zone_answerer_port` is cleared with the
+    /// `PortHeldNoChannel` status, so a reader that trusts a daemon-reported
+    /// port over the status (`min ls`'s `DNS SERVICE` row) reads the status
+    /// and names the held port, as `min finalize-install --show` does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_interim_that_loses_its_port_reports_no_answerer_port() {
+        let buf = CaptureWriter::default();
+        let server = crate::test_harness::TestServer::new().await;
+        let dir = tempfile::tempdir().expect("a tempdir for the channel that never comes");
+        let hook_port = free_udp_port();
+        let status = AnswererStatus::starting();
+        let shutdown = CancellationToken::new();
+
+        crate::rpc::spawn_answerer_control(&server.state, status.clone())
+            .await
+            .expect("the answerer control socket binds");
+        let sock = std::path::PathBuf::from(server.state.minimal_state_dir().await.as_str())
+            .join(crate::rpc::ANSWERER_CONTROL_SOCK_FILE);
+
+        let task = drive(
+            server.state.clone(),
+            hook_port,
+            status.clone(),
+            AnswererPaths {
+                channel: dir.path().join("answerer.sock"),
+                marker: dir.path().join("minzoned.socket"),
+                release_window: Duration::from_secs(1),
+            },
+            shutdown.clone(),
+            buf.clone(),
+        );
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::Holder { port: hook_port },
+            "hosted the interim before the release",
+        )
+        .await;
+        assert_eq!(
+            server.state.zone_answerer_port().await,
+            Some(hook_port),
+            "the hosting daemon reports its interim's port"
+        );
+
+        // The release frees the port, and a foreign process takes it in the
+        // window: the re-bind fails and the host arm finds the port held.
+        let (acted, detail) =
+            ask_control(&sock, minimald_rpc::BoxControlRequest::ReleaseAnswerer).await;
+        assert!(acted, "the release is answered as acted on: {detail}");
+        let _foreign = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, hook_port))
+            .expect("the foreign process takes the freed hook port");
+
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: hook_port },
+            "surfaced the hook port the foreign process holds",
+        )
+        .await;
+        assert_eq!(
+            server.state.zone_answerer_port().await,
+            None,
+            "a daemon whose hook port a foreign process holds reports no answerer port"
         );
 
         end(task, &shutdown);
