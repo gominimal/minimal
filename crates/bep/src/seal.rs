@@ -50,6 +50,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize as _, Zeroizing};
 
+use crate::keys::{HeldKey, KeyError};
+
 /// The JWE `typ` of every sealed value.
 pub const TYP: &str = "gatehouse-sealed-secret+jwe";
 
@@ -341,6 +343,9 @@ pub enum OpenError {
     /// The member's kind is missing or not one this proxy knows.
     #[error("the sealed member has a missing or unknown kind")]
     UnknownKind,
+    /// The key store refused the use of the host's proxy key, or failed.
+    #[error(transparent)]
+    Key(KeyError),
 }
 
 /// Seals `members` to `recipient`, bound to `context`. Returns the compact
@@ -416,6 +421,39 @@ fn seal_plaintext(
 /// A value that opens is not proof of who sealed it. The caller must verify
 /// the member's signed handle, its `jws`, before it uses it. See the module docs.
 pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, OpenError> {
+    open_with(&key.public(), sealed, expected, |ephemeral| {
+        let shared = p256::ecdh::diffie_hellman(key.0.to_nonzero_scalar(), ephemeral.as_affine());
+        Ok(Zeroizing::new(shared.raw_secret_bytes().to_vec()))
+    })
+}
+
+/// Opens `sealed` under a key that a [`KeyStore`](crate::keys::KeyStore)
+/// holds, through its key agreement ([`HeldKey::agree`]). The private half
+/// never leaves the store. The checks and the errors are those of [`open`].
+///
+/// # Errors
+///
+/// The errors of [`open`], and [`OpenError::Key`] when the store refuses
+/// the key's use or fails.
+pub fn open_held(
+    key: &impl HeldKey,
+    sealed: &str,
+    expected: &Binding,
+) -> Result<Opened, OpenError> {
+    open_with(&key.public(), sealed, expected, |ephemeral| {
+        key.agree(&ProxyPublicKey(*ephemeral))
+            .map_err(OpenError::Key)
+    })
+}
+
+/// The shared path of [`open`] and [`open_held`]. `agree` gives the raw
+/// ECDH shared secret with the value's ephemeral key.
+fn open_with(
+    recipient: &ProxyPublicKey,
+    sealed: &str,
+    expected: &Binding,
+    agree: impl FnOnce(&PublicKey) -> Result<Zeroizing<Vec<u8>>, OpenError>,
+) -> Result<Opened, OpenError> {
     if sealed.len() > MAX_SEALED_LEN {
         return Err(OpenError::Malformed);
     }
@@ -440,7 +478,7 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
         return Err(OpenError::Unsupported);
     }
     // A value sealed to another key is refused before any decryption.
-    if header.kid != key.public().kid() {
+    if header.kid != recipient.kid() {
         return Err(OpenError::NotOpenable);
     }
     let ephemeral = header.epk.to_public_key().ok_or(OpenError::Unsupported)?;
@@ -453,8 +491,8 @@ pub fn open(key: &ProxyKey, sealed: &str, expected: &Binding) -> Result<Opened, 
     }
     message.extend_from_slice(&tag);
 
-    let shared = p256::ecdh::diffie_hellman(key.0.to_nonzero_scalar(), ephemeral.as_affine());
-    let cipher = content_cipher(shared.raw_secret_bytes());
+    let shared = agree(&ephemeral)?;
+    let cipher = content_cipher(&shared);
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(
@@ -1167,5 +1205,91 @@ mod tests {
                 "api.github.com did not reject the sealed value as a credential"
             );
         }
+    }
+
+    /// A held key that reports `public` and agrees under `agree_with`, so
+    /// the `kid` check passes and only the tag can fail.
+    struct Mismatched<K> {
+        public: ProxyPublicKey,
+        agree_with: K,
+    }
+
+    impl<K: HeldKey> HeldKey for Mismatched<K> {
+        fn role(&self) -> crate::keys::Role {
+            self.agree_with.role()
+        }
+
+        fn public(&self) -> ProxyPublicKey {
+            self.public
+        }
+
+        fn exportable(&self) -> bool {
+            false
+        }
+
+        fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            self.agree_with.agree(peer)
+        }
+
+        fn probe(&self) -> Result<(), KeyError> {
+            Ok(())
+        }
+    }
+
+    fn held_sealing_key() -> (
+        crate::keys::memory::MemoryStore,
+        crate::keys::memory::MemoryKey,
+    ) {
+        use crate::keys::KeyStore as _;
+        let store = crate::keys::memory::MemoryStore::default();
+        let key = store.generate(crate::keys::Role::Sealing).unwrap();
+        (store, key)
+    }
+
+    fn held_context(key: &impl HeldKey) -> Context {
+        Context {
+            kid: key.public().kid(),
+            ..fixed_context(&ProxyKey::generate().unwrap())
+        }
+    }
+
+    #[test]
+    fn a_value_sealed_to_a_held_key_opens_through_its_agreement() {
+        let (_store, key) = held_sealing_key();
+        let context = held_context(&key);
+        let sealed = seal(&key.public(), &context, &members("h.p.s")).unwrap();
+        let opened = open_held(&key, &sealed, &binding(&context)).unwrap();
+        assert_eq!(opened.member.jws.as_str(), "h.p.s");
+        assert_eq!(opened.context.kid, key.public().kid());
+    }
+
+    #[test]
+    fn a_wrong_held_keys_agreement_fails_the_tag() {
+        let (_store, key) = held_sealing_key();
+        let (_other_store, other) = held_sealing_key();
+        let context = held_context(&key);
+        let sealed = seal(&key.public(), &context, &members("h.p.s")).unwrap();
+        let wrong = Mismatched {
+            public: key.public(),
+            agree_with: other,
+        };
+        assert_eq!(
+            open_held(&wrong, &sealed, &binding(&context)).unwrap_err(),
+            OpenError::NotOpenable
+        );
+    }
+
+    #[test]
+    fn a_held_key_the_store_refuses_does_not_open() {
+        use crate::keys::KeyStore as _;
+        let (store, key) = held_sealing_key();
+        let context = held_context(&key);
+        let sealed = seal(&key.public(), &context, &members("h.p.s")).unwrap();
+        store.refuse(crate::keys::Role::Sealing);
+        let refused = store.find(crate::keys::Role::Sealing).unwrap().unwrap();
+        assert!(matches!(
+            open_held(&refused, &sealed, &binding(&context)).unwrap_err(),
+            OpenError::Key(KeyError::Refused { .. })
+        ));
     }
 }
