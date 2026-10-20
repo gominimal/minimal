@@ -34,7 +34,7 @@ use rustls_pki_types::CertificateDer;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-use crate::keys::{HeldKey, KeyError};
+use crate::keys::{HeldKey, KeyError, Role};
 use crate::module::Module;
 
 /// The names that the root never permits, also when a module or a store rule
@@ -230,6 +230,18 @@ pub enum CaError {
     /// The root expired, so a signing CA it issues would not validate.
     #[error("the proxy root CA expired at {0}, so the proxy issues no signing CA")]
     RootExpired(OffsetDateTime),
+    /// A key passed for one CA role holds another role.
+    #[error("the proxy {expected} CA needs the {expected} key, not the {got} key")]
+    WrongRole {
+        /// The role the CA needs.
+        expected: Role,
+        /// The role of the key it got.
+        got: Role,
+    },
+    /// A key passed for a CA role is exportable. The proxy holds only
+    /// non-exportable keys.
+    #[error("the proxy {0} key is exportable, so the proxy does not use it for a CA")]
+    Exportable(Role),
     /// The certificate encoding failed.
     #[error("the certificate was not issued: {0}")]
     Certificate(rcgen::Error),
@@ -324,14 +336,21 @@ impl<'k, K: CaKey> Ca<'k, K> {
     ///
     /// # Errors
     ///
-    /// [`CaError::EmptyUnion`] when the union holds no name, and
-    /// [`CaError::Key`] when the store refuses a key.
+    /// [`CaError::WrongRole`] when `root_key` is not the root key or
+    /// `signing_key` is not the signing key, [`CaError::Exportable`] when a
+    /// key is exportable, [`CaError::EmptyUnion`] when the union holds no
+    /// name, and [`CaError::Key`] when the store refuses a key.
     pub fn new(
         root_key: &'k K,
         signing_key: &'k K,
         union: Union,
         now: SystemTime,
     ) -> Result<Self, CaError> {
+        // A key that is not the role's own, or that can leave the store,
+        // lets the signing CA key sign a root that the constraints do not
+        // bind.
+        check_key(root_key, Role::Root)?;
+        check_key(signing_key, Role::Signing)?;
         let root_key = Signer::new(root_key);
         let signing_key = Signer::new(signing_key);
         let root_params = root_params(&union, now)?;
@@ -553,6 +572,18 @@ fn subject(common_name: &str) -> DistinguishedName {
     name
 }
 
+/// Refuses a CA key that does not hold `expected` or that is exportable.
+fn check_key<K: HeldKey>(key: &K, expected: Role) -> Result<(), CaError> {
+    let got = key.role();
+    if got != expected {
+        return Err(CaError::WrongRole { expected, got });
+    }
+    if key.exportable() {
+        return Err(CaError::Exportable(got));
+    }
+    Ok(())
+}
+
 fn root_params(union: &Union, now: SystemTime) -> Result<CertificateParams, CaError> {
     if union.is_empty() {
         return Err(CaError::EmptyUnion);
@@ -609,7 +640,6 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::keys::Role;
     use crate::module::{Authority, GITHUB, HTTPS_PORT};
     use crate::seal::ProxyPublicKey;
 
@@ -617,6 +647,7 @@ mod tests {
     struct TestKey {
         role: Role,
         pair: KeyPair,
+        exportable: bool,
     }
 
     impl TestKey {
@@ -624,6 +655,7 @@ mod tests {
             Self {
                 role,
                 pair: KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap(),
+                exportable: false,
             }
         }
     }
@@ -636,7 +668,7 @@ mod tests {
             ProxyPublicKey::from_sec1_bytes(self.pair.public_key_raw()).unwrap()
         }
         fn exportable(&self) -> bool {
-            false
+            self.exportable
         }
         fn agree(&self, _peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
             Err(KeyError::Store {
@@ -891,6 +923,33 @@ mod tests {
         );
         let forged = ca.sign_leaf("example.com", now()).unwrap();
         assert!(!validates(ca.root(), &forged, "example.com"));
+    }
+
+    #[test]
+    fn ca_refuses_a_wrong_role_or_exportable_key() {
+        let union = || Union::new(&[GITHUB], [""; 0]);
+        let (root_key, signing_key) = keys();
+        let sealing_key = TestKey::new(Role::Sealing);
+
+        // One key for both roles, the roles swapped, and the sealing key.
+        for (root, signing, expected, got) in [
+            (&root_key, &root_key, Role::Signing, Role::Root),
+            (&signing_key, &root_key, Role::Root, Role::Signing),
+            (&root_key, &sealing_key, Role::Signing, Role::Sealing),
+        ] {
+            let err = Ca::new(root, signing, union(), now()).unwrap_err();
+            assert!(
+                matches!(err, CaError::WrongRole { expected: e, got: g } if e == expected && g == got),
+                "{err:?}"
+            );
+        }
+
+        let exportable = TestKey {
+            exportable: true,
+            ..TestKey::new(Role::Signing)
+        };
+        let err = Ca::new(&root_key, &exportable, union(), now()).unwrap_err();
+        assert!(matches!(err, CaError::Exportable(Role::Signing)), "{err:?}");
     }
 
     #[test]
