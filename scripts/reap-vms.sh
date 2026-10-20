@@ -35,21 +35,24 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+usage() {
+  echo "usage: $0 [--vm <NAME>] [--root <DIR>]" >&2
+  exit 2
+}
+
 # The VM to reap by name, or empty for "every VM this checkout spawned".
 VM=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --vm | --root)
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-        echo "usage: $0 [--vm <NAME>] [--root <DIR>]" >&2
-        exit 2
+        usage
       fi
       if [ "$1" = "--vm" ]; then VM="$2"; else ROOT="${2%/}"; fi
       shift 2
       ;;
     *)
-      echo "usage: $0 [--vm <NAME>] [--root <DIR>]" >&2
-      exit 2
+      usage
       ;;
   esac
 done
