@@ -749,6 +749,15 @@ fn wire_color(s: &str) -> Color {
     Color::Reset
 }
 
+/// The upload root shown in the create confirm, shortened so the fixed
+/// question and key hints fit beside it. The leading space is part of the
+/// rendered line, so it counts against the path's budget too.
+fn upload_confirm_path(root: &str, width: u16) -> String {
+    const FIXED: &str = " is not a repository root; upload it?  y / n ";
+    let reserved = 1 + UnicodeWidthStr::width(FIXED);
+    truncate(root, (width as usize).saturating_sub(reserved))
+}
+
 fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
     use ratatui::layout::Alignment;
     match &model.action {
@@ -763,6 +772,7 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
             frame.render_widget(Paragraph::new(line), area);
         }
         Some(Action::ConfirmCreateUpload { root, .. }) => {
+            let root = upload_confirm_path(root, area.width);
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {root} is not a repository root; upload it? "),
@@ -904,6 +914,21 @@ mod tests {
         // pad_truncate inherits the zero-width guard instead of overflowing.
         assert_eq!(pad_truncate("abc", 0), "");
         assert_eq!(pad_truncate("", 3), "   ");
+    }
+
+    #[test]
+    fn upload_confirm_keeps_the_question_and_keys() {
+        let width = 60;
+        let long = "/home/someone/Projects/a-very-long-project-name/with/more/depth";
+        let shown = upload_confirm_path(long, width);
+        let line = format!(" {shown} is not a repository root; upload it?  y / n ");
+        assert!(
+            UnicodeWidthStr::width(line.as_str()) <= width as usize,
+            "{line:?}"
+        );
+        assert!(line.ends_with("upload it?  y / n "), "{line:?}");
+        assert!(shown.ends_with('…'), "{shown:?}");
+        assert_eq!(upload_confirm_path("/tmp/x", width), "/tmp/x");
     }
 
     #[test]

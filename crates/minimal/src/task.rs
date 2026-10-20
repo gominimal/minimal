@@ -783,8 +783,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         crate::UploadProgress::Bar,
     )
     .await;
-    // `min task run` warns on a skipped undeclared root rather than refusing
-    // (it has no `--sync` flags to offer): the session still starts, empty.
+    // `min task run` has no `--sync` flags, so it warns rather than refuses:
+    // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
+    // hooks it drops. The box still starts, as it did before the shared gate.
     crate::report_upload_outcome(outcome, &upload_root, false)?;
 
     // Client-side loadout patches land in the composition whether the

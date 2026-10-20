@@ -1978,6 +1978,27 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
     }
 }
 
+/// The non-refusing caller (`min task run`) proceeds, but its warning names
+/// the hooks the skipped upload loses: the empty-box line alone would read as
+/// a healthy start.
+#[test]
+fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    let (stderr, result) = capture_stderr(|| {
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+            root,
+            false,
+        )
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert!(stderr.contains("Starting with an empty box"), "{stderr:?}");
+    assert!(
+        stderr.contains("2 lifecycle hook(s) declared in /srv/data/run42/minimal.toml"),
+        "{stderr:?}"
+    );
+}
+
 /// The rule `min dash` applies in place of the stderr wording refuses exactly
 /// the skip that would drop hooks: the skips that cost nothing, and the user's
 /// own decline, still create their box.

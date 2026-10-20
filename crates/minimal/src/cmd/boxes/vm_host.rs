@@ -402,11 +402,10 @@ fn rehold_undo(
     Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
 }
 
-/// Whether a session reserves its name on the VM host instead of taking a
-/// DNS row: a `host_ip` session shares the node's own address, so `min
-/// session activate` and `min dash` only hold the name (answering NODATA)
-/// rather than register one. That is exactly the case when the record has
-/// no `box_addresses`.
+/// Whether this box holds its name at the VM host instead of registering
+/// an address there. A `host_ip` box uses the host's own address, so the
+/// host only reserves the name for it (a lookup returns no address), and
+/// the record carries no `box_addresses`.
 pub(crate) fn holds_name(record: &boxes::Record) -> bool {
     record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none()
 }
