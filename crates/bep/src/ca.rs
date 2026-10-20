@@ -41,12 +41,13 @@ use crate::module::Module;
 /// registers them. A name in this set, or a subdomain of one, is outside the
 /// union. The root also carries the set as its excluded-names constraint.
 ///
-/// This set is provisional and partial. Gatehouse §6.10 also names the
+/// This set is provisional and partial. `DENY_SET` takes only the
+/// infrastructure names of the BEP-034 set. Gatehouse §6.10 also names the
 /// tenant issuer, the BEP, EGW and relay endpoints, the registry and build
-/// cache, the node-plane baseline set, and the deep module host sets. One
-/// deny set must serve this check and the store-rule check of BEP-034. When
-/// the BEP-034 task lands its deny set, `DENY_SET` becomes that set, and
-/// this list goes away. The issue that tracks the full set is not filed yet.
+/// cache, and the node-plane baseline set. The module host sets stay in the
+/// union: the store-rule check of BEP-034 refuses a rule that names them,
+/// but the root permits them. When the BEP-034 task lands its deny set, the
+/// infrastructure names of that set replace this list. The issue that tracks the full set is not filed yet.
 pub const DENY_SET: &[&str] = &[
     // The box-internal names (`host.min.internal` and the services under it).
     "min.internal",
@@ -224,6 +225,9 @@ pub enum CaError {
     /// The signing CA expired, so a leaf it signs would not validate.
     #[error("the proxy signing CA expired at {0}, so the proxy issues no leaf certificate")]
     SigningExpired(OffsetDateTime),
+    /// The root expired, so a signing CA it issues would not validate.
+    #[error("the proxy root CA expired at {0}, so the proxy issues no signing CA")]
+    RootExpired(OffsetDateTime),
     /// The certificate encoding failed.
     #[error("the certificate was not issued: {0}")]
     Certificate(rcgen::Error),
@@ -298,6 +302,7 @@ pub struct Ca<'k, K> {
     root_key: Signer<'k, K>,
     signing_key: Signer<'k, K>,
     signing_params: CertificateParams,
+    root_expiry: OffsetDateTime,
     union: Union,
     root: CertificateDer<'static>,
     signing: CertificateDer<'static>,
@@ -334,12 +339,15 @@ impl<'k, K: CaKey> Ca<'k, K> {
             .der()
             .clone();
 
-        let (signing_params, signing) = issue_signing(&root_params, &root_key, &signing_key, now)?;
+        let root_expiry = root_params.not_after;
+        let (signing_params, signing) =
+            issue_signing(&root_params, &root_key, &signing_key, now, root_expiry)?;
 
         Ok(Self {
             root_key,
             signing_key,
             signing_params,
+            root_expiry,
             union,
             root,
             signing,
@@ -436,15 +444,26 @@ impl<'k, K: CaKey> Ca<'k, K> {
     /// the current root. A long-running caller runs it before
     /// [`Ca::signing_expiry`]. Leaves that the earlier signing CA issued stay
     /// valid until their own expiry, because the key and subject are the same.
+    /// The new signing CA never outlives the current root.
     ///
     /// # Errors
     ///
-    /// [`CaError::Key`] when the store refuses a key. The current signing CA
-    /// stays in place on an error.
+    /// [`CaError::RootExpired`] when `now` is at or past the root expiry,
+    /// and [`CaError::Key`] when the store refuses a key. The current signing
+    /// CA stays in place on an error.
     pub fn renew_signing(&mut self, now: SystemTime) -> Result<(), CaError> {
+        if OffsetDateTime::from(now) >= self.root_expiry {
+            tracing::warn!(expiry = %self.root_expiry, "refused to renew the signing CA: the root CA expired");
+            return Err(CaError::RootExpired(self.root_expiry));
+        }
         let root_params = root_params(&self.union, now)?;
-        let (params, signing) =
-            issue_signing(&root_params, &self.root_key, &self.signing_key, now)?;
+        let (params, signing) = issue_signing(
+            &root_params,
+            &self.root_key,
+            &self.signing_key,
+            now,
+            self.root_expiry,
+        )?;
         tracing::info!(expiry = %params.not_after, "renewed the signing CA under the same key");
         self.signing_params = params;
         self.signing = signing;
@@ -488,18 +507,21 @@ impl<'k, K: CaKey> Ca<'k, K> {
             "re-issued the root CA under the same key with changed name constraints"
         );
         self.root = root;
+        self.root_expiry = params.not_after;
         self.union = union;
         Ok(true)
     }
 }
 
 /// Issues the signing CA under `signing_key`, signed by the root that
-/// `root_params` and `root_key` describe.
+/// `root_params` and `root_key` describe. The signing CA expires no later
+/// than `root_expiry`, the expiry of the root certificate in use.
 fn issue_signing<K: CaKey>(
     root_params: &CertificateParams,
     root_key: &Signer<'_, K>,
     signing_key: &Signer<'_, K>,
     now: SystemTime,
+    root_expiry: OffsetDateTime,
 ) -> Result<(CertificateParams, CertificateDer<'static>), CaError> {
     let mut params = CertificateParams::default();
     params.distinguished_name = subject(SIGNING_COMMON_NAME);
@@ -508,6 +530,8 @@ fn issue_signing<K: CaKey>(
     params.use_authority_key_identifier_extension = true;
     params.serial_number = Some(serial()?);
     validity(&mut params, now, SIGNING_VALIDITY);
+    // A signing CA never outlives the root that issued it.
+    params.not_after = params.not_after.min(root_expiry);
     let signing = params
         .signed_by(signing_key, &Issuer::from_params(root_params, root_key))
         .map_err(|err| root_key.error(err))?
@@ -928,6 +952,25 @@ mod tests {
         assert_eq!(subject_and_key(&before), subject_and_key(ca.signing()));
         let leaf = ca.issue_leaf(host, later).unwrap();
         assert_eq!(leaf.chain[1], *ca.signing());
+    }
+
+    #[test]
+    fn renewed_signing_ca_never_outlives_the_root() {
+        let (root_key, signing_key) = keys();
+        let mut ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        let root_expiry = now() + ROOT_VALIDITY;
+        let late = root_expiry - Duration::from_secs(30 * DAY);
+        ca.renew_signing(late).unwrap();
+        assert_eq!(not_after(ca.signing()), not_after(ca.root()));
+        assert!(ca.issue_leaf(GITHUB.hosts[0].host, late).is_ok());
+        let expired = ca.renew_signing(root_expiry);
+        assert!(matches!(expired, Err(CaError::RootExpired(_))));
     }
 
     #[test]
