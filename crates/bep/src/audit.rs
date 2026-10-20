@@ -28,6 +28,10 @@
 //! that a failed or interrupted append left without its newline. Such bytes
 //! never formed a record. [`AuditLog::open`] also takes an exclusive lock,
 //! so a second writer on the same path cannot fork the chain.
+//!
+//! [`LogReader`] is the client's read-only view of the log, across every
+//! segment in the log's directory ([`segments`]). `min box audit` reads
+//! through it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
@@ -472,6 +476,140 @@ impl AuditLog {
         self.len += bytes.len() as u64;
         self.head = line_hash(&line);
         Ok(record)
+    }
+}
+
+/// The file name of segment `n` of a log: `audit-<n>.jsonl`. A log is the
+/// set of these files in one directory. The segment with the highest `n`
+/// is the active one, and a segment is never renamed, so a reader that
+/// tails the log can key its place on the path.
+pub fn segment_name(n: u64) -> String {
+    format!("audit-{n}.jsonl")
+}
+
+/// The segment number of `name`, or `None` when `name` is not a segment.
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("audit-")?
+        .strip_suffix(".jsonl")?
+        .parse()
+        .ok()
+}
+
+/// `~/.minimal/bep/audit`, the directory that holds the proxy's log on
+/// this host.
+pub fn default_dir() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep/audit"))
+}
+
+/// Every segment of the log in `dir`, oldest first. A missing directory is
+/// an empty log.
+pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir.as_ref()) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(n) = entry.file_name().to_str().and_then(segment_number) {
+            found.push((n, entry.path()));
+        }
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, path)| path).collect())
+}
+
+/// One record a [`LogReader`] read, with its line as it is on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The parsed record.
+    pub record: Record,
+    /// The record's line, without the trailing newline.
+    pub line: String,
+}
+
+/// What one [`LogReader::read_new`] call read.
+#[derive(Debug, Default)]
+pub struct ReadBatch {
+    /// The records, in log order.
+    pub entries: Vec<Entry>,
+    /// The segments the call read new bytes from.
+    pub segments: Vec<PathBuf>,
+    /// The lines that did not parse as a record, and were skipped.
+    pub skipped: usize,
+}
+
+/// A read-only reader over the log in one directory, across every
+/// retained segment. The first [`read_new`](Self::read_new) call reads the
+/// whole log. Each later call reads only what the proxy appended since,
+/// so a caller can replay the log and then tail it.
+#[derive(Debug)]
+pub struct LogReader {
+    dir: PathBuf,
+    /// For each segment, the offset after its last complete line read.
+    offsets: std::collections::BTreeMap<PathBuf, u64>,
+}
+
+impl LogReader {
+    /// A reader over the log in `dir`. Nothing is read until
+    /// [`read_new`](Self::read_new).
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            offsets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The log's directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Reads every complete line appended since the last call, segment by
+    /// segment, oldest first. A line the proxy has not finished, which has
+    /// no newline yet, is left for the next call.
+    pub fn read_new(&mut self) -> io::Result<ReadBatch> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut out = ReadBatch::default();
+        for path in segments(&self.dir)? {
+            let start = self.offsets.get(&path).copied().unwrap_or(0);
+            let mut file = match File::open(&path) {
+                Ok(file) => file,
+                // Pruned between the listing and the open.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if file.metadata()?.len() <= start {
+                continue;
+            }
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+            if complete == 0 {
+                continue;
+            }
+            for raw in bytes[..complete].split(|&b| b == b'\n') {
+                let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+                if raw.is_empty() {
+                    continue;
+                }
+                let parsed = std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|line| Some((line, serde_json::from_str::<Record>(line).ok()?)));
+                match parsed {
+                    Some((line, record)) => out.entries.push(Entry {
+                        record,
+                        line: line.to_owned(),
+                    }),
+                    None => out.skipped += 1,
+                }
+            }
+            self.offsets.insert(path.clone(), start + complete as u64);
+            out.segments.push(path);
+        }
+        Ok(out)
     }
 }
 
