@@ -13,9 +13,11 @@
 
 pub mod audit;
 pub mod ca;
+pub mod http;
 pub mod keys;
 pub mod module;
 pub mod publish;
 pub mod redeem;
 pub mod seal;
 pub mod signin;
+pub mod upstream;

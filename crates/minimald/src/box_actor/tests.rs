@@ -7241,21 +7241,21 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
 
     // Present, name not yet registered (a first finalize): the hand.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         Some(hand)
     );
     // Absent: the hand is not vouched for, so the interim stands.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
         None
     );
     // Only an interim publish with a hand behind it moves.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
         None
     );
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
         None
     );
 
@@ -7264,7 +7264,7 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
     reg.register_own_ip(me, "promo", BTreeSet::new());
     assert!(reg.name_held_by(me, "promo"));
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         Some(hand)
     );
 
@@ -7280,7 +7280,7 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
     reg.register_own_ip(other, "promo", BTreeSet::new());
     assert!(reg.name_held_by(other, "promo"));
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         None
     );
 }
