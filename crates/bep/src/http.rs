@@ -585,6 +585,9 @@ impl<R: Read> BodyInput<'_, R> {
         loop {
             let available = &self.buf[self.pos..];
             if let Some(end) = available.windows(2).position(|w| w == b"\r\n") {
+                if end > MAX_CHUNK_LINE_LEN {
+                    return Err(CloseReason::Malformed("chunk_line_too_long"));
+                }
                 let line = available[..end].to_vec();
                 self.pos += end + 2;
                 if line.iter().any(|&b| b == b'\r' || b == b'\n') {
@@ -1495,6 +1498,28 @@ mod tests {
         }
         let long = format!("{head}{}", "1".repeat(MAX_CHUNK_LINE_LEN + 8));
         assert_eq!(forward_all(long.as_bytes()).0.rule(), "chunk_line_too_long");
+    }
+
+    // A chunk line that is already buffered with its CRLF is held to the
+    // same limit as one that arrives in pieces.
+    #[test]
+    fn buffered_chunk_line_over_limit_is_refused() {
+        let line = |len: usize| {
+            let mut buf = format!("1;{}", "e".repeat(len - 2)).into_bytes();
+            buf.extend_from_slice(b"\r\nrest");
+            let mut empty: &[u8] = &[];
+            let mut input = BodyInput {
+                buf,
+                pos: 0,
+                reader: &mut empty,
+            };
+            input.line().map(|l| l.len())
+        };
+        assert_eq!(line(MAX_CHUNK_LINE_LEN), Ok(MAX_CHUNK_LINE_LEN));
+        assert_eq!(
+            line(MAX_CHUNK_LINE_LEN + 1),
+            Err(CloseReason::Malformed("chunk_line_too_long"))
+        );
     }
 
     // A box that closes mid-body closes the connection with its own rule.
