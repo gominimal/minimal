@@ -86,6 +86,8 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Box subcommands: show what a box will get
+    Box(BoxArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
@@ -396,6 +398,27 @@ impl std::fmt::Display for OutputWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("failed to write the document to stdout")
     }
+}
+
+#[derive(Debug, Args)]
+pub struct BoxArgs {
+    #[command(subcommand)]
+    pub command: BoxCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BoxCommand {
+    /// Show how a project's box reaches GitHub through the local proxy:
+    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// the steering mode and the UDP 443 stance
+    Spec(BoxSpecArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BoxSpecArgs {
+    /// The project directory whose minimal.toml declares the box
+    /// (default: --repo-dir, or the current directory)
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
