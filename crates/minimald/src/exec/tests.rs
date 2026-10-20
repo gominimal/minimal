@@ -643,7 +643,7 @@ async fn bridge_relays_output_while_a_stdin_write_is_blocked() {
     let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
     let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-    let bridge_task = crate::traced::spawn(async move {
+    let bridge_task = tokio::spawn(async move {
         bridge(
             "test",
             process,
@@ -657,14 +657,14 @@ async fn bridge_relays_output_while_a_stdin_write_is_blocked() {
 
     // Far more than the child's stdin pipe holds; this writer blocks
     // once both pipes are full, which is the point.
-    let feeder = crate::traced::spawn(async move {
+    let feeder = tokio::spawn(async move {
         let _ = client_stdin.write_all(&vec![b'x'; 256 * 1024]).await;
     });
 
     // Reads the child's output as the bridge relays it; the final
     // read_exact would hang if any of the payload stalled behind the
     // blocked stdin write.
-    let reader = crate::traced::spawn(async move {
+    let reader = tokio::spawn(async move {
         let mut received = vec![0u8; 256 * 1024];
         client_stdout.read_exact(&mut received).await.unwrap();
         received
@@ -738,7 +738,7 @@ async fn bridge_streams_megabytes_through_cat() {
     let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
     let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-    let bridge_task = crate::traced::spawn(async move {
+    let bridge_task = tokio::spawn(async move {
         bridge(
             "test",
             processes,
@@ -753,10 +753,10 @@ async fn bridge_streams_megabytes_through_cat() {
     let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
     let sent = payload.clone();
     // Dropping the write half once the payload is in is the client's EOF.
-    let feeder = crate::traced::spawn(async move {
+    let feeder = tokio::spawn(async move {
         client_stdin.write_all(&sent).await.unwrap();
     });
-    let reader = crate::traced::spawn(async move {
+    let reader = tokio::spawn(async move {
         let mut received = Vec::with_capacity(LEN);
         client_stdout.read_to_end(&mut received).await.unwrap();
         received
@@ -801,11 +801,11 @@ async fn bridge_reports_exit_when_child_exits_with_stdin_queued() {
     let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
     let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
-    let feeder = crate::traced::spawn(async move {
+    let feeder = tokio::spawn(async move {
         let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
     });
 
-    let bridge_task = crate::traced::spawn(async move {
+    let bridge_task = tokio::spawn(async move {
         bridge(
             "test",
             process,

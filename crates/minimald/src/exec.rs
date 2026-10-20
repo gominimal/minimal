@@ -2871,6 +2871,10 @@ pub(crate) mod testing {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "upstream's tests spawn plain tokio tasks; the traced-spawn rule is for request handling"
+)]
 mod tests;
 
 /// The exec channel's spans (OTel TEL-021, TEL-022, TEL-043): the client's
