@@ -492,6 +492,14 @@ pub fn relay_request_body<R: Read, W: Write>(
 /// [`CloseReason::ProtocolSwitch`] with the bytes it read after the
 /// request. It never parses those bytes as HTTP.
 ///
+/// The head goes upstream before the loop reads the body, and `Expect`
+/// goes with it unchanged. A box that sends `Expect: 100-continue` holds
+/// its body until it sees `100 Continue`, and only the upstream sends
+/// that interim response. So the caller must run the response half
+/// concurrently with this loop, and relay each interim `1xx` head to the
+/// box as it arrives. A caller that runs the two halves in turn stalls
+/// such a box until the box's own expect timeout.
+///
 /// Writes one debug log line for the close, with the box id and
 /// [`CloseReason::rule`], and returns the reason.
 pub fn forward_requests<R: Read, W: Write>(
@@ -1348,6 +1356,24 @@ mod tests {
 
     // BEP-077: a Content-Length body goes upstream as exactly that many
     // bytes, and the bytes after it are the next request.
+    #[test]
+    fn expect_continue_is_forwarded_before_the_body() {
+        // The upstream answers `Expect`, so the head carries it unchanged
+        // and reaches the upstream before the loop waits for the body.
+        let raw = b"POST /x HTTP/1.1\r\nHost: github.com\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+        let mut client: &[u8] = raw;
+        let mut upstream = Vec::new();
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        let forwarded = forward_request_head("box-a", &mut client, &mut upstream, &mut audit)
+            .expect("an unambiguous head is forwarded");
+        assert_eq!(forwarded.request.body, BodyFraming::ContentLength(3));
+        assert_eq!(
+            String::from_utf8(upstream).unwrap(),
+            "POST /x HTTP/1.1\r\nhost: github.com\r\nexpect: 100-continue\r\ncontent-length: 3\r\n\r\n"
+        );
+        assert!(audit.is_empty());
+    }
+
     #[test]
     fn content_length_body_is_relayed_exactly() {
         let (reason, upstream, audit) = forward_all(
