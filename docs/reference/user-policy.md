@@ -163,13 +163,19 @@ so the rules apply to the **declared path** itself:
 
 - `allow` must match the path as `minimal.toml` declares it. A rule naming a
   declared directory approves that directory whatever it holds.
-- `deny` on the declared path, or on any file a declared directory holds,
-  stops the run. Minimal follows a symlink to a directory inside a declared
-  directory and checks the files it reaches, since the mount exposes them.
-  If a directory is too large or partly unreadable to check against your deny
-  rules, the run stops and names the reason. A `~/` entry names the
-  session's home. `min` matches it against your rules by its path only, and
-  does not check its contents or links, because the box writes them.
+- `deny` on the declared path, or on any file or directory a declared
+  directory holds, stops the run. Minimal follows a symlink to a directory
+  inside a declared directory and checks the files it reaches, since the mount
+  exposes them. If a directory is too large or partly unreadable to check
+  against your deny rules, the run stops and names the reason. A `~/` entry
+  names the session's home. `min` matches it against your rules by its path
+  only, and does not check its contents or links, because the box writes them.
+- A read-write (`"rw"`) directory stops the run when a `deny` rule can name a
+  path inside it, even a path that does not exist yet, because the task can
+  create it. Declare the directory `"ro"`, or declare a directory that leaves
+  that path out.
+- A `~/` path that leads out of the session's home through a symlink stops the
+  run. The session checks this when the task starts.
 - For a declared absolute path, Minimal also checks the path it resolves to on
   your machine, and `allow` must match that path too. A symlink cannot carry
   the path past a `deny` on its target, or onto a target no rule allows. This
@@ -179,7 +185,12 @@ so the rules apply to the **declared path** itself:
 - `ignore` on the declared path leaves that entry out. An `ignore` on a file
   inside a declared directory does not apply, because a mount cannot leave
   one file out.
-- A declared path with a `.` or `..` segment stops the run.
+- A declared path with a `.` or `..` segment stops the run, and so does a
+  path that does not start with `/` or `~/`.
+- A path that Minimal cannot resolve on your machine, for example a symlink
+  inside a directory you cannot read, stops the run.
+- The `[patches] allow` lines in the error match each path exactly: Minimal
+  escapes a `*`, `?`, `[` or `{` in a path.
 - Minimal matches a `~/` path as declared, and expands its `~/` against your
   home the same way as a rule's `~/`. The session mounts `~/` from the
   session's own home, so Minimal does not check what your home holds.
