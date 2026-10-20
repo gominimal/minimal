@@ -1233,6 +1233,11 @@ impl HostAnswerer {
     /// its sources — the keeper and the refused writer — because a name
     /// two daemons both published is an operator's problem to see, not a
     /// fact to settle by accident of arrival.
+    ///
+    /// This host's own withdrawn-name graces fold in after everything
+    /// else ([`BoxRegistry::fold_withdrawn_names`]): a grace is never a
+    /// writer that refuses a registration, and never a name a publish is
+    /// refused against ([`reserved_names`]).
     fn zone_view(&self) -> ZoneView {
         let mut view = self.own.zone_view();
         // The source each folded name came from: the keeper a later writer
@@ -1324,6 +1329,11 @@ impl HostAnswerer {
                  be poisoned",
             )
             .retain(|name| refused.contains(name));
+        // This host's own withdrawn-name graces fold in last (NET-143): a
+        // name any source above holds keeps its entry, so a dormant box's
+        // grace never refuses or shadows a live box of the same name that
+        // another node registered.
+        self.own.fold_withdrawn_names(&mut view);
         view
     }
 
@@ -4199,6 +4209,65 @@ mod tests {
             a_answer(&reply),
             Ipv4Addr::new(127, 0, 64, 10),
             "a registered row at a host-answerable address answers it"
+        );
+    }
+
+    /// NET-143: this host's withdrawn-name grace answers NODATA for a
+    /// name nothing else holds, but it never refuses or shadows a live box
+    /// of the same name another node registered, and it is never a name a
+    /// publish is refused against or one this host publishes.
+    #[test]
+    fn host_answerer_withdrawn_name_grace_yields_to_a_registered_row() {
+        let own = BoxRegistry::new(SUBNET);
+        own.hold_withdrawn_name_for_tests("web");
+        own.hold_withdrawn_name_for_tests("gone");
+        let peer = Ipv4Addr::new(127, 0, 64, 10);
+        let answerer = answerer_over(own.clone(), |registered| {
+            registered.install(
+                0,
+                vec![RegisteredRow {
+                    name: "web.min.internal".to_string(),
+                    address: Some(peer),
+                    live: true,
+                }],
+            );
+        });
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("web.min.internal.", RecordType::A),
+        )
+        .expect("a registered name is held");
+        assert_eq!(
+            a_answer(&reply),
+            peer,
+            "another node's live row answers its address over this host's grace"
+        );
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("gone.min.internal.", RecordType::A),
+        )
+        .expect("a name in its grace is held");
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "a name only the grace holds answers NODATA"
+        );
+        assert!(reply.answers.is_empty(), "the grace carries no address");
+
+        let own = Arc::new(own);
+        assert!(
+            !reserved_names(Some(&own))
+                .iter()
+                .any(|name| name == "web.min.internal" || name == "gone.min.internal"),
+            "a grace reserves no name against another node's publish"
+        );
+        assert!(
+            zone_rows(&own).is_empty(),
+            "a grace is never published to a shared answerer"
         );
     }
 
