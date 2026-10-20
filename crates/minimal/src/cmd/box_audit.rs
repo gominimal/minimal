@@ -21,6 +21,7 @@
 //! knows from the daemon's listing.
 
 use std::collections::BTreeSet;
+use std::os::fd::AsFd as _;
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -486,9 +487,27 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
         &mut stderr,
         || {
             std::thread::sleep(FOLLOW_INTERVAL);
-            true
+            !reader_gone(std::io::stdout().as_fd())
         },
     )
+}
+
+/// Whether the reader at the other end of `fd` is gone: a pipe whose reader
+/// closed, or a terminal that hung up. Rust ignores SIGPIPE, and `--follow`
+/// writes only when a record matches, so without this probe
+/// `min box audit <box> --follow | head -1` polls the log forever.
+// `nix::poll` comes from the `poll` feature `minimal-client` enables on the
+// same workspace `nix`.
+fn reader_gone(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    // No events requested: poll always reports POLLERR and POLLHUP.
+    let mut fds = [PollFd::new(fd, PollFlags::empty())];
+    match poll(&mut fds, PollTimeout::ZERO) {
+        Ok(_) => fds[0]
+            .revents()
+            .is_some_and(|r| r.intersects(PollFlags::POLLERR | PollFlags::POLLHUP)),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +740,14 @@ mod tests {
     }
 
     // BEP-042: --follow replays the box's records and then tails new ones.
+    #[test]
+    fn box_audit_follow_stops_when_the_reader_closes() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        assert!(!reader_gone(writer.as_fd()));
+        drop(reader);
+        assert!(reader_gone(writer.as_fd()));
+    }
+
     #[test]
     fn box_audit_follow_replays_then_tails() {
         let dir = tempfile::tempdir().unwrap();
