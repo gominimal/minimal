@@ -99,7 +99,7 @@ use serde::{Deserialize, Serialize};
 
 use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
 
-use crate::box_registry::{BoxRegistry, is_host_answerable};
+use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
 
 /// The `component` field every answerer log line carries — the same one the
 /// native daemon's answerer logs under, because it is the same zone service
@@ -762,21 +762,6 @@ fn box_zone_name(name: &str) -> String {
         canonical_box_name(name),
         zone_answer::ZONE_APEX
     ))
-}
-
-/// The one form a box's registry name is compared in wherever it keys the
-/// box's published address: the answerer's allocations and releases
-/// ([`box_zone_name`]), the box registry's in-flight registrations
-/// ([`crate::box_registry::BoxRegistry::begin_registration`]), and its
-/// live rows — the row table's name lookups
-/// ([`crate::box_registry::BoxRegistry::row_by_name`]), a client
-/// registration's name-collision refusal
-/// ([`crate::box_registry::AllocationError::NameAlreadyHeld`]), and a
-/// client withdrawal's name proof. Names are DNS labels, so the fold is
-/// ASCII lower-case: "Web" and "web" are one box to the answerer, and must
-/// be one to everything its hold is checked against.
-pub(crate) fn canonical_box_name(name: &str) -> String {
-    name.to_ascii_lowercase()
 }
 
 /// The rows other VM host daemons published over the channel, keyed by the

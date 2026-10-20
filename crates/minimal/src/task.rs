@@ -727,7 +727,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 must_match_version: minimal_client::version_assertion(),
             })
             .await
-            .context("CreateSession RPC failed")?;
+            .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
         match resp {
             minimald_rpc::Errorable::Ok(r) => break r,
             minimald_rpc::Errorable::Err { error } => {
@@ -804,7 +804,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             contribution,
         })
         .await
-        .context("ConfigureLoadout RPC failed")?;
+        .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
         // Same failure, same wording as an activate: the user knows the

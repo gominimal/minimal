@@ -1,3 +1,4 @@
+pub mod bep;
 pub mod compose;
 pub mod decision;
 pub mod egress;
