@@ -207,15 +207,16 @@ fn apply_pins(
             _ => {}
         }
     }
+    // Each pin lands on one link, which it then consumes. Two sideloads with
+    // the same repo, branch and old commit give two equal pins, and each one
+    // must repin its own link rather than the first pin taking both.
     for pin in sideloads {
-        let mut landed = false;
-        for link in links.iter_mut() {
-            landed |= repin(*link, &pin);
-        }
-        if landed {
-            report.sideloads.push(pin);
-        } else {
-            report.skipped.push(pin);
+        match links.iter_mut().position(|link| repin(*link, &pin)) {
+            Some(i) => {
+                links.remove(i);
+                report.sideloads.push(pin);
+            }
+            None => report.skipped.push(pin),
         }
     }
     report
@@ -287,6 +288,43 @@ branch = "main"
             .collect();
         assert_eq!(commits, [Some("c0"), Some("a1"), Some("b1")]);
         assert!(report.upstream.is_some());
+        assert_eq!(report.sideloads.len(), 2);
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn apply_pins_lands_equal_pins_once_each() {
+        // Two sideloads share repo, branch and old commit, so the snapshot
+        // gives two equal pins. Each pin must land on its own link.
+        let mut doc = r#"
+[upstream]
+repo = "up"
+branch = "main"
+locked_commit = "u0"
+
+[[upstream.sideload]]
+repo = "a"
+branch = "main"
+locked_commit = "a0"
+
+[[upstream.sideload]]
+repo = "a"
+branch = "main"
+locked_commit = "a0"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let report = apply_pins(
+            &mut doc,
+            None,
+            vec![pin("a", Some("a0"), "a1"), pin("a", Some("a0"), "a1")],
+        );
+        let sl = doc["upstream"]["sideload"].as_array_of_tables().unwrap();
+        let commits: Vec<_> = sl
+            .iter()
+            .map(|t| t.get("locked_commit").and_then(Item::as_str))
+            .collect();
+        assert_eq!(commits, [Some("a1"), Some("a1")]);
         assert_eq!(report.sideloads.len(), 2);
         assert!(report.skipped.is_empty());
     }
