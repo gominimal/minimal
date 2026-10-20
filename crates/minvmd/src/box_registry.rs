@@ -3170,6 +3170,13 @@ impl BoxRegistry {
         }
         self.persisted_at = Some(Arc::new(path));
         let mut held_loopbacks = std::collections::BTreeMap::new();
+        // The file is in name order, not registration order. A standing
+        // creation's box was running at the last write, so when two
+        // creations share a loopback the standing one is kept, not a
+        // dormant one that sorts before it by name. The stable sort keeps
+        // the file's order inside each group.
+        let mut loaded = loaded;
+        loaded.sort_by_key(|creation| !creation.standing);
         for mut creation in loaded {
             let key = canonical_box_name(&creation.name);
             if self.creations().contains_key(&key) {
@@ -3191,7 +3198,7 @@ impl BoxRegistry {
                     held = %holder,
                     held_loopback = %creation.loopback_address,
                     "the persisted box registry holds a loopback address twice; \
-                     reloading the first box only"
+                     reloading the standing box, or else the first, only"
                 );
                 continue;
             }
@@ -7347,6 +7354,60 @@ mod tests {
         assert!(
             after.row_by_name("web").is_none(),
             "the second box at the address is dropped"
+        );
+    }
+
+    /// Two persisted creations at one loopback, a dormant `api` that sorts
+    /// before a standing `web`: the reload keeps the standing `web`, so its
+    /// creation survives the rewrite, and sets the dormant `api` aside.
+    #[test]
+    fn a_registry_file_holding_one_loopback_twice_keeps_the_standing_box() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let before = persisted_registry(&dir);
+        before.spawn_withdrawal_drainer(|_| {});
+        let api = before
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for the box");
+        relay_carried_and_ended(&before, &[&api]);
+        wait_until(|| api.is_detached(), "the row detaches at its relay's end");
+        before.advance_clock(DETACH_GRACE);
+        wait_until(
+            || before.row_by_name("api").is_none(),
+            "the api row is withdrawn, its creation dormant",
+        );
+        let web = before
+            .register_client_box_at(client_spec("web"), api.loopback_addr())
+            .expect("a standing box parks itself on the dormant box's address");
+
+        let file: RegistryFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(REGISTRY_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        let names: Vec<_> = file
+            .boxes
+            .iter()
+            .map(|c| (c.name.as_str(), c.standing))
+            .collect();
+        assert_eq!(
+            names,
+            [("api", false), ("web", true)],
+            "the dormant api sorts before the standing web in the file"
+        );
+
+        let after = persisted_registry(&dir);
+        let reloaded = after
+            .row_by_name("web")
+            .expect("the standing box at the address is reloaded");
+        assert_eq!(reloaded.loopback_addr(), web.loopback_addr());
+        let file: RegistryFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(REGISTRY_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        let names: Vec<_> = file.boxes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["web"],
+            "the rewrite keeps web and drops the dormant api"
         );
     }
 
