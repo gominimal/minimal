@@ -502,20 +502,24 @@ developer running agent boxes; build-infra operator; auditor.
   activation) and the box's stored expanded spec (its loadout entries and
   the launcher's additions, BOX-068) alone, so the list fetches no
   per-package document and needs no network; the version it filters on
-  is the one in the box's stored resolution record, below. A box whose stored closure is
-  missing or unreadable on the host, or whose upstream package has no
-  closure entry (the case its SBOM exits 6 on, SBOM-004), is listed with
-  that reason in place of its match, never failing the list for the other
-  boxes.
+  is the one in the box's resolution record, below. A box whose stored
+  closure or resolution record is missing or unreadable on the host, or
+  whose upstream package has no closure entry (the case its SBOM exits 6
+  on, SBOM-004), is listed with that reason in place of its match, never
+  failing the list for the other boxes.
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_using_answers_from_the_sbom_components
-  - THE SYSTEM SHALL keep on the host, beside the stored closure, a
-    resolution record of every package the box was materialized with — its
-    name, version and Build Spec Hash as the graph resolved them at
-    activation — and both the list's `@<ver>` filter and the SBOM's
-    component name and version (SBOM-009's graph facts) SHALL read from
-    that record, so the two agree offline and a version is never fetched
-    to answer a list.
+  - THE SYSTEM SHALL keep, as part of the Box Record (the per-box host
+    state minimald alone writes, outside the box's filesystem and
+    unwritable from inside it), a resolution record of every package the
+    box was materialized with — its name, version and Build Spec Hash as
+    the graph resolved them at activation — and both the list's `@<ver>`
+    filter and the SBOM's component name and version (SBOM-009's graph
+    facts) SHALL read from that record, so the two agree offline and a
+    version is never fetched to answer a list; IF the record is missing or
+    unreadable THEN the box's SBOM is SBOM-012's failure, exit code 6,
+    naming the record, with no fallback to the graph (AT2), and the list
+    reports the box with that reason.
     tier:   T0
     verify: cargo nextest run -p minimal box_list_using_version_answers_from_the_stored_resolution_record
 
