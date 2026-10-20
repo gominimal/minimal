@@ -431,6 +431,12 @@ struct PublishRequest {
 struct AllocateRequest {
     /// The box's name, as the node's registry holds it.
     allocate: String,
+    /// The address the box was created at, when a resume asks: the book
+    /// hands it back while no other box holds it, without reading the
+    /// range, so a resume never moves the box ([`AddressBook::allocate_keeping_at`]).
+    /// An answerer that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep: Option<Ipv4Addr>,
 }
 
 /// A node's release of a box's published address: the box is gone, so the
@@ -632,10 +638,33 @@ const HOST_RANGE_PROBE: fn() -> RangeProbe = || RangeProbe {
 };
 
 impl AddressBook {
-    /// [`Self::allocate_at`], now, with the book's own range probe.
+    /// [`Self::allocate_keeping`] with no address to keep.
+    #[cfg(test)]
     fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
+        self.allocate_keeping(node, name, None)
+    }
+
+    /// [`Self::allocate_keeping_at`], now, with the book's own range probe.
+    fn allocate_keeping(
+        &mut self,
+        node: &str,
+        name: &str,
+        keep: Option<Ipv4Addr>,
+    ) -> Result<Ipv4Addr, String> {
         let probe = self.range_probe;
-        self.allocate_at(node, name, Instant::now(), probe)
+        self.allocate_keeping_at(node, name, keep, Instant::now(), probe)
+    }
+
+    /// [`Self::allocate_keeping_at`] with no address to keep.
+    #[cfg(test)]
+    fn allocate_at(
+        &mut self,
+        node: &str,
+        name: &str,
+        now: Instant,
+        range_probe: impl FnOnce() -> RangeProbe,
+    ) -> Result<Ipv4Addr, String> {
+        self.allocate_keeping_at(node, name, None, now, range_probe)
     }
 
     /// The address `name` of `node` holds, or the lowest free one whose
@@ -651,10 +680,17 @@ impl AddressBook {
     /// comes back without the probe, so its address never moves under it.
     /// A probe refused for any reason other than an absent address refuses
     /// the allocation.
-    fn allocate_at(
+    ///
+    /// `keep` is the address a resumed box was created at. The book can
+    /// hold no record of it, as after an answerer restart. It comes back
+    /// without the probe too, when it is in the box range and no other box
+    /// holds it or released it inside its quarantine. A taken one is not
+    /// kept, and the allocation goes on as for a fresh box.
+    fn allocate_keeping_at(
         &mut self,
         node: &str,
         name: &str,
+        keep: Option<Ipv4Addr>,
         now: Instant,
         range_probe: impl FnOnce() -> RangeProbe,
     ) -> Result<Ipv4Addr, String> {
@@ -675,7 +711,14 @@ impl AddressBook {
             .released
             .iter()
             .find(|(_, (was, _))| *was == holder)
-            .map(|(address, _)| *address);
+            .map(|(address, _)| *address)
+            .or_else(|| {
+                keep.filter(|address| {
+                    in_box_range(*address)
+                        && !self.held.contains_key(address)
+                        && !self.released.contains_key(address)
+                })
+            });
         let (first, last) = switch::box_loopback_interior();
         let free = own.or_else(|| {
             (u32::from(first)..=u32::from(last))
@@ -1031,8 +1074,8 @@ impl RegisteredTables {
     }
 
     /// Hands `name` of `node` a box address (see [`AddressBook::allocate`]).
-    fn allocate(&self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
-        self.book().allocate(node, name)
+    fn allocate(&self, node: &str, name: &str, keep: Option<Ipv4Addr>) -> Result<Ipv4Addr, String> {
+        self.book().allocate_keeping(node, name, keep)
     }
 
     /// Releases the box address `name` of `node` holds.
@@ -2096,28 +2139,29 @@ fn accept_publish(
     let publish = match parse_node_line(line) {
         Ok(NodeLine::Publish(publish)) => Ok(publish),
         Ok(NodeLine::Allocate(request)) => {
-            let reply = match registered.allocate(node, &box_zone_name(&request.allocate)) {
-                Ok(address) => {
-                    tracing::info!(
-                        component = COMPONENT,
-                        node = %node,
-                        name = %request.allocate,
-                        %address,
-                        "handed a box its published address"
-                    );
-                    RegistrationReply::allocated(address)
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        component = COMPONENT,
-                        node = %node,
-                        name = %request.allocate,
-                        %reason,
-                        "could not hand a box a published address"
-                    );
-                    RegistrationReply::refused(reason)
-                }
-            };
+            let reply =
+                match registered.allocate(node, &box_zone_name(&request.allocate), request.keep) {
+                    Ok(address) => {
+                        tracing::info!(
+                            component = COMPONENT,
+                            node = %node,
+                            name = %request.allocate,
+                            %address,
+                            "handed a box its published address"
+                        );
+                        RegistrationReply::allocated(address)
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            component = COMPONENT,
+                            node = %node,
+                            name = %request.allocate,
+                            %reason,
+                            "could not hand a box a published address"
+                        );
+                        RegistrationReply::refused(reason)
+                    }
+                };
             return reply_or_end(stream, connection, registered, &reply);
         }
         Ok(NodeLine::Release(request)) => {
@@ -2262,9 +2306,14 @@ impl Registration {
     /// Asks the answerer for box `name`'s published address over the held
     /// connection. The outer error is the connection's (the caller
     /// reconnects); the inner one is the answerer's refusal.
-    fn allocate(&mut self, name: &str) -> io::Result<Result<Ipv4Addr, String>> {
+    fn allocate(
+        &mut self,
+        name: &str,
+        keep: Option<Ipv4Addr>,
+    ) -> io::Result<Result<Ipv4Addr, String>> {
         let reply = self.request(&AllocateRequest {
             allocate: name.to_string(),
+            keep,
         })?;
         Ok(if reply.ok {
             reply
@@ -2499,6 +2548,8 @@ enum HandoverCommand {
     Allocate {
         /// The box's registry name.
         name: String,
+        /// The address a resumed box was created at, kept while it is free.
+        keep: Option<Ipv4Addr>,
         /// Where the address (or the refusal) goes.
         reply: std::sync::mpsc::Sender<Result<Ipv4Addr, String>>,
     },
@@ -2759,6 +2810,17 @@ impl AnswererStatus {
     /// The reason no address was handed out: no answerer reachable, the
     /// range exhausted, or no answer in time.
     pub fn allocate(&self, name: &str) -> Result<Ipv4Addr, String> {
+        self.allocate_keeping(name, None)
+    }
+
+    /// [`Self::allocate`] for a resumed box created at `keep`: the answerer
+    /// hands `keep` back while no other box holds it, even where the host
+    /// cannot bind the box range now, so a resume never moves the box.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::allocate`].
+    pub fn allocate_keeping(&self, name: &str, keep: Option<Ipv4Addr>) -> Result<Ipv4Addr, String> {
         let Some(sender) = self.sender() else {
             return Err(NO_ANSWERER.to_string());
         };
@@ -2766,6 +2828,7 @@ impl AnswererStatus {
         if sender
             .send(HandoverCommand::Allocate {
                 name: name.to_string(),
+                keep,
                 reply: reply_to,
             })
             .is_err()
@@ -2848,10 +2911,11 @@ impl AnswererStatus {
             let mut book = AddressBook::default();
             while let Ok(command) = commands.recv() {
                 match command {
-                    HandoverCommand::Allocate { name, reply } => {
-                        let answer = book.allocate_at(
+                    HandoverCommand::Allocate { name, keep, reply } => {
+                        let answer = book.allocate_keeping_at(
                             &node,
                             &box_zone_name(&name),
+                            keep,
                             Instant::now(),
                             &mut range_probe,
                         );
@@ -3077,7 +3141,8 @@ fn wait_out_wake(
 /// connection survived.
 fn serve_over_channel(registration: &mut Registration, command: HandoverCommand) -> bool {
     match command {
-        HandoverCommand::Allocate { name, reply } => match registration.allocate(&name) {
+        HandoverCommand::Allocate { name, keep, reply } => match registration.allocate(&name, keep)
+        {
             Ok(result) => {
                 let _ = reply.send(result);
                 true
@@ -3501,8 +3566,8 @@ fn host_interim(
                 }
                 // The interim is the answerer: its own boxes are handed
                 // addresses from the same book its channel's nodes are.
-                Ok(HandoverCommand::Allocate { name, reply }) => {
-                    let _ = reply.send(registered.allocate(node, &box_zone_name(&name)));
+                Ok(HandoverCommand::Allocate { name, keep, reply }) => {
+                    let _ = reply.send(registered.allocate(node, &box_zone_name(&name), keep));
                 }
                 Ok(HandoverCommand::ReleaseAddress { name }) => {
                     registered.release_address(node, &box_zone_name(&name));
@@ -6073,6 +6138,44 @@ mod tests {
         );
     }
 
+    /// A resumed box asks to keep the address it was created at. A book
+    /// with no record of it, as after a restart, hands it back without the
+    /// probe and records it, even where the host lacks the range. A kept
+    /// address another box holds is not handed out: that ask is a fresh
+    /// one, and it gets the interim.
+    #[test]
+    fn a_resume_keeps_its_address_in_a_book_with_no_record_of_it() {
+        let mut book = AddressBook::default();
+        let (first, _) = switch::box_loopback_interior();
+        let kept = Ipv4Addr::from(u32::from(first) + 3);
+        assert_eq!(
+            book.allocate_keeping_at("node-a", "web", Some(kept), Instant::now(), range_absent),
+            Ok(kept),
+            "the box's own address comes back without the probe"
+        );
+        assert_eq!(
+            book.allocate_at("node-a", "web", Instant::now(), range_absent),
+            Ok(kept),
+            "and it is recorded against the box"
+        );
+        assert_eq!(
+            book.allocate_keeping_at("node-b", "api", Some(kept), Instant::now(), range_absent),
+            Ok(Ipv4Addr::LOCALHOST),
+            "an address another box holds is not kept"
+        );
+        assert_eq!(
+            book.allocate_keeping_at(
+                "node-a",
+                "db",
+                Some(Ipv4Addr::new(127, 0, 0, 9)),
+                Instant::now(),
+                range_absent
+            ),
+            Ok(Ipv4Addr::LOCALHOST),
+            "an address outside the box range is not kept"
+        );
+    }
+
     /// A probe refused for a reason other than an absent address refuses
     /// the allocation and names the refusal, rather than moving the box to
     /// the shared 127.0.0.1. Nothing is recorded.
@@ -6268,7 +6371,7 @@ mod tests {
             .expect("node d connects")
             .registration;
         let d_box = leaving
-            .allocate("box")
+            .allocate("box", None)
             .expect("the channel serves node d")
             .expect("node d's box is handed an address");
         drop(leaving);
@@ -6278,7 +6381,7 @@ mod tests {
             .expect("node e connects")
             .registration;
         let e_box = arriving
-            .allocate("box")
+            .allocate("box", None)
             .expect("the channel serves node e")
             .expect("node e's box is handed an address");
         assert_ne!(
