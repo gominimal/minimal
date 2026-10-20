@@ -70,7 +70,9 @@ recorded registry decides only for a package the closure holds no entry
 for; a package with an `artifact` entry has a digest whatever registry is
 recorded, and one with a `built-locally` or `non-redistributable` entry has
 that gap. Those are the only kinds a package can be. An upstream package
-with no closure entry, or an entry of any other state, is neither a
+with no closure entry, or any package whose entry is of any other state
+(whatever registry is recorded for it: the entry decides first, and an
+entry the closure format does not define is a broken pin), is neither a
 digest nor a gap: the pin does not account for the package, and the
 emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds. A referenced document is
@@ -190,9 +192,9 @@ developer running agent boxes; build-infra operator; auditor.
   verify:   cargo nextest run -p sbom sbom_digest_or_gap_total
   property: for all components k: has_sha256(k) xor has_digest_gap(k),
     and has_sha256(k) implies resolves(sha256(k), closure(pin)); for all
-    packages k with no registry recorded other than the upstream:
-    k ∉ closure(pin) ∨ state(entry(closure(pin), k)) ∉ {artifact,
-    built-locally, non-redistributable} ⇒ not emitted ∧ exit = 6
+    packages k: (k ∉ closure(pin) ∧ no non-upstream registry is recorded
+    for k) ∨ (k ∈ closure(pin) ∧ state(entry(closure(pin), k)) ∉ {artifact,
+    built-locally, non-redistributable}) ⇒ not emitted ∧ exit = 6
 
 - **SBOM-005** THE SYSTEM SHALL include every package present in the
   environment as a component, with launcher-injected packages carrying
@@ -242,12 +244,15 @@ developer running agent boxes; build-infra operator; auditor.
 - **SBOM-008** THE SYSTEM SHALL record environment-variable assets by name
   and provenance only, SHALL record every other credential-bearing posture
   field by reference — `[secrets]` as name and `source` kind, never the
-  value; `[[github_imports]]`, `[[file_imports]]`, egress destinations and
-  the `[otel]` endpoint as a location reduced to scheme, host and port (an
-  allowlist of parts: no userinfo, no path, no query, no fragment, no
-  header, whatever a parameter is called; a path segment can carry a token,
-  `/hooks/<token>`, so the path goes too; a `[[github_imports]]` location
-  keeps its `owner/repo` path alone, which is identity, not secret) — SHALL copy from a per-package
+  value; `[[github_imports]]`, egress destinations and the `[otel]`
+  endpoint as a location reduced to scheme, host and port (an allowlist of
+  parts: no userinfo, no path, no query, no fragment, no header, whatever a
+  parameter is called; a path segment can carry a token, `/hooks/<token>`,
+  so the path goes too; a `[[github_imports]]` location keeps its
+  `owner/repo` path alone, which is identity, not secret); `[[file_imports]]`
+  and `[[file_exports]]` are host paths, not URLs, and are recorded by the
+  entry's name and its box-side path only, never the host path (which can
+  carry a user name or a home directory) — SHALL copy from a per-package
   document (SBOM-009) only an allowlist of fields: a build-closure
   component's name, version, `purl` and digests, and a build-environment
   tool's name and version, with every location among them reduced the same
@@ -262,7 +267,8 @@ developer running agent boxes; build-infra operator; auditor.
     provenance fields, every secret carries only name and source kind, every
     location field (the posture's and the imported documents' alike) is of
     the form scheme://host[:port], or scheme://host/owner/repo for a GitHub
-    import, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
+    import, every file import or export carries only its name and box-side
+    path and no host path, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
     tool version} for every document d, for all credentials v in
     credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where every v is at
     least 16 characters drawn so that no v is a substring of any declared
@@ -284,7 +290,7 @@ developer running agent boxes; build-infra operator; auditor.
     the serializers escape every string they emit regardless.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_document_strings_are_bounded_and_control_free
-    property: for all documents d, fields f ∈ copied(d): read(d) ⇒ utf8(f) ∧ len(f) ≤ limit(f) ∧ ∀c ∈ f: ¬control(c) ∧ ¬separator(c); a planted control character, markup string or 257-byte name makes d unresolved
+    property: for all documents d, fields f ∈ copied(d): read(d) ⇒ utf8(f) ∧ len(f) ≤ limit(f) ∧ ∀c ∈ f: ¬control(c) ∧ ¬separator(c); a planted control character or 257-byte name makes d unresolved, and a planted markup string is emitted escaped by every serializer
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
