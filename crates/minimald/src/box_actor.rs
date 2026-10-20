@@ -34,8 +34,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 mod helpers;
-// The per-message span names: a file of its own, because the daemon's refusal guard scans this
-// file's string literals for RPC names (crates/minimal/src/tests.rs) and span names are not refusals.
+// The per-message span names: a file of its own, because the daemon's refusal guard scans the
+// string literals of this module's files for RPC names (crates/minimal/src/tests.rs), and span
+// names are not refusals. The guard skips kind.rs.
 mod kind;
 
 // The actor's concerns, one file each. The actor type, its loop and its
