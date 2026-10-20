@@ -1041,7 +1041,7 @@ pub struct LsArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("box_or_parent").args(["session", "all"]).required(true).multiple(false)))]
+#[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]

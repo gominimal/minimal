@@ -497,6 +497,11 @@ fn segment_number(name: &str) -> Option<u64> {
 
 /// `~/.minimal/bep/audit`, the directory that holds the proxy's log on
 /// this host.
+///
+/// Interim: `min box audit` reads this directory directly, through
+/// [`LogReader`]. Un-enrolled, the architecture's audit paragraph and
+/// Gatehouse §6.10 put the read behind the proxy's local socket. When the
+/// proxy serves the read there, the client stops reading this directory.
 pub fn default_dir() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/audit"))
 }

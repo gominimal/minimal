@@ -20,7 +20,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use bep::audit::{Entry, LogReader};
 
-use crate::{BoxAuditArgs, BoxAuditOutputFormat, GlobalArgs, client};
+use crate::{BoxAuditArgs, BoxAuditOutputFormat, GlobalArgs};
 
 /// The defined error code for `self` on a host that is not enrolled.
 pub(crate) const AUDIT_SELF_UNSUPPORTED_UNENROLLED: &str = "audit_self_unsupported_unenrolled";
@@ -91,13 +91,36 @@ impl Resolved {
     }
 }
 
-/// Resolves `target` to one box id. `in_box` says whether the command runs
-/// inside a box. No host is enrolled today, so `self` is always refused.
-pub(crate) fn resolve(target: &str, known: &[KnownBox], in_box: bool) -> anyhow::Result<Resolved> {
+/// Refuses every read inside a box. The log is the host-side proxy's, and
+/// no host is enrolled today, so nothing serves the log into a box.
+/// `self` gets the defined error (BEP-042). Any other target gets the
+/// command to run on the host.
+// Interim: flip when the proxy serves the read over its local socket
+// (architecture, audit paragraph; Gatehouse §6.10). The refusal of `self`
+// stays until a Gatehouse answers it.
+pub(crate) fn refuse_in_box(args: &BoxAuditArgs, in_box: bool) -> anyhow::Result<()> {
+    if !in_box {
+        return Ok(());
+    }
+    let (flag, target) = match (&args.target, &args.parent) {
+        (_, Some(parent)) => ("--parent ", parent.as_str()),
+        (Some(target), None) => ("", target.as_str()),
+        (None, None) => return Ok(()),
+    };
     if target == "self" {
-        if in_box {
-            return Err(AuditSelfUnsupportedUnenrolled.into());
-        }
+        return Err(AuditSelfUnsupportedUnenrolled.into());
+    }
+    anyhow::bail!(
+        "`min box audit` reads the audit log on the host, and this shell is inside a box. \
+         On the host, run `min box audit {flag}{}`.",
+        printable(target)
+    );
+}
+
+/// Resolves `target` to one box id, on the host. `self` names no box
+/// there.
+pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolved> {
+    if target == "self" {
         anyhow::bail!(
             "`self` names the box this command runs in, and this shell is not inside a box. \
              Run `min box audit <box>` with a box id or name."
@@ -261,18 +284,18 @@ pub(crate) fn follow(
 }
 
 /// Whether the boxes from [`known_boxes`] carry their parent. The daemon's
-/// listing has no parent field yet.
+/// listing has no parent field yet, so `--parent` is refused.
+// Interim, fail closed: flip to `true` when `ListSessionsEntry` carries
+// the box's parent (architecture, audit paragraph) and `known_boxes` maps
+// it. No issue is named here yet. The pull request lists this as undone.
 const LISTING_RECORDS_PARENTS: bool = false;
 
 /// The boxes the daemon lists. The listing carries no parent, so no box
 /// has a known child yet.
 async fn known_boxes(global: &GlobalArgs) -> anyhow::Result<Vec<KnownBox>> {
     super::ensure_daemon(global)?;
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-    let mut client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
+    // The listing below is the gated call.
+    let mut client = super::connect_daemon_unchecked(global).await?;
     let listed = super::list_sessions_version_gated(&mut client).await?;
     Ok(listed
         .sessions
@@ -281,6 +304,7 @@ async fn known_boxes(global: &GlobalArgs) -> anyhow::Result<Vec<KnownBox>> {
             id: entry.id,
             name: entry.name,
             live: entry.status == boxes::BoxState::Active,
+            // Interim: see `LISTING_RECORDS_PARENTS`.
             parent: None,
         })
         .collect())
@@ -303,9 +327,10 @@ pub(crate) fn run(
     err: &mut dyn std::io::Write,
     wait: impl FnMut() -> bool,
 ) -> anyhow::Result<()> {
+    refuse_in_box(args, in_box)?;
     let (resolved, subjects, name_box) = match (&args.target, &args.parent) {
         (_, Some(parent)) => {
-            let resolved = resolve(parent, known, in_box)?;
+            let resolved = resolve(parent, known)?;
             if !parents_recorded {
                 anyhow::bail!(
                     "`min box audit --parent` cannot run here: this host does not record \
@@ -318,7 +343,7 @@ pub(crate) fn run(
             (resolved, subjects, true)
         }
         (Some(target), None) => {
-            let resolved = resolve(target, known, in_box)?;
+            let resolved = resolve(target, known)?;
             let subjects = BTreeSet::from([resolved.id().to_owned()]);
             (resolved, subjects, false)
         }
@@ -356,6 +381,8 @@ pub(crate) fn run(
 /// `min box audit`.
 pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> anyhow::Result<()> {
     let in_box = std::env::var_os(IN_BOX_ENV).is_some();
+    // Before the listing: inside a box, nothing is read.
+    refuse_in_box(&args, in_box)?;
     let names_a_box = |value: &Option<String>| {
         value
             .as_deref()
@@ -368,6 +395,10 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
     } else {
         Vec::new()
     };
+    // Interim (BEP-042): the client reads the proxy's log files on the host
+    // directly. The architecture's audit paragraph and Gatehouse §6.10 put
+    // the un-enrolled read behind the proxy's local socket. Flip to that
+    // read when the proxy serves it, and drop this direct read.
     let dir = bep::audit::default_dir()
         .context("cannot find the home directory, so the audit log cannot be found")?;
     let mut stdout = std::io::stdout().lock();
@@ -709,6 +740,32 @@ mod tests {
                 error.to_string(),
                 "Reading your own audit trail from inside a box needs a Gatehouse. \
                  On the host, run `min box audit <box>`."
+            );
+            assert!(out.is_empty() && err.is_empty());
+        }
+        // Inside a box, a box id or a name is refused too, with the
+        // command to run on the host.
+        for (audit_args, command) in [
+            (args(Some(A), None, false), format!("`min box audit {A}`")),
+            (
+                args(None, Some("web"), false),
+                "`min box audit --parent web`".to_owned(),
+            ),
+        ] {
+            append(dir.path(), 1, &[(A, "a.example:443")]);
+            let (result, out, err) = run_to_strings(&audit_args, &[], true, dir.path());
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<AuditSelfUnsupportedUnenrolled>()
+                    .is_none()
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "`min box audit` reads the audit log on the host, and this shell is inside \
+                     a box. On the host, run {command}."
+                )
             );
             assert!(out.is_empty() && err.is_empty());
         }
