@@ -1028,6 +1028,111 @@ async fn lost_exec_client_kills_only_its_own_process() {
     );
 }
 
+/// BOX-150: a plain exec, neither a PTY exec nor detached, ends when its
+/// client disconnects, and the box it ran in keeps running. The bridge
+/// drives a real child in the shim's place, as `BoxExec` spawns it. On
+/// client loss the daemon SIGTERMs the shim, which forwards it to the
+/// exec's process group (the `nsenter` tests prove that half). The daemon
+/// then waits, and SIGKILLs a shim that is still alive. This stand-in
+/// traps and ignores SIGTERM, so the test sees each step: the SIGTERM
+/// lands, the wait runs its full length, and the SIGKILL ends the child.
+/// A separate process stands in for the box and must still run.
+#[tokio::test]
+async fn exec_client_loss_ends_exec_keeps_box() {
+    use std::time::{Duration, Instant};
+
+    use tokio::time::timeout;
+
+    use super::TokioProcess;
+
+    // The box: a long-lived process the exec does not own.
+    let mut box_process = tokio::process::Command::new("sleep")
+        .arg("600")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawning the stand-in box");
+
+    let dir = tempfile::tempdir().expect("a temp dir for the SIGTERM marker");
+    let term_marker = dir.path().join("term");
+    // The exec: records the SIGTERM and ignores it, so only a SIGKILL ends
+    // it. `ready` says the trap is installed.
+    let child = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"trap 'echo term > "$1"' TERM; echo ready; while :; do sleep 0.1; done"#,
+            "sh",
+        ])
+        .arg(&term_marker)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawning the stand-in exec");
+    let exec_pid = child.id().expect("a live child has a pid");
+    let process = TokioProcess::shim(child);
+    let stream = futures::stream::iter([Ok::<_, std::io::Error>(process)]);
+
+    // The client: stdin held open, stdout read, then the channel closes.
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
+    let (_client_stderr, mut bridge_stderr) = duplex(64 * 1024);
+    let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+    let bridge_task = crate::traced::spawn(async move {
+        bridge(
+            "test",
+            stream,
+            &mut bridge_stdin,
+            &mut bridge_stdout,
+            &mut bridge_stderr,
+            client_lost_rx,
+        )
+        .await
+    });
+
+    let mut ready = [0u8; 6];
+    timeout(
+        Duration::from_secs(10),
+        client_stdout.read_exact(&mut ready),
+    )
+    .await
+    .expect("the exec prints its ready marker")
+    .expect("reading the ready marker");
+    assert_eq!(&ready, b"ready\n");
+
+    let lost_at = Instant::now();
+    client_lost_tx.send(true).unwrap();
+
+    let exit = timeout(
+        crate::nsenter::SHIM_ESCALATION + Duration::from_secs(10),
+        bridge_task,
+    )
+    .await
+    .expect("a lost client must end the exec, not hang the bridge")
+    .unwrap();
+    let elapsed = lost_at.elapsed();
+
+    // A signalled child has no exit code, which the bridge reports as 1.
+    assert_eq!(exit, 1, "a plain exec ends when its client is lost");
+    let term = std::fs::read_to_string(&term_marker).unwrap_or_default();
+    assert_eq!(term, "term\n", "the exec is sent SIGTERM first");
+    assert!(
+        elapsed >= crate::nsenter::SHIM_ESCALATION,
+        "the daemon waits {:?} before the SIGKILL, ended after {elapsed:?}",
+        crate::nsenter::SHIM_ESCALATION,
+    );
+    // SAFETY: signal 0 only checks that the pid exists; it sends nothing.
+    let alive = unsafe { libc::kill(exec_pid as libc::pid_t, 0) } == 0;
+    assert!(!alive, "the SIGKILL ends an exec that ignores SIGTERM");
+
+    assert!(
+        box_process.try_wait().expect("polling the box").is_none(),
+        "the box keeps running after its exec's client is lost"
+    );
+    let _ = box_process.kill().await;
+}
+
 /// gominimal/inbox#813: a lost client on the *read* side — the SSH
 /// channel closes or its sender drops while the child is silent —
 /// must still kill the child. `make_reader()` used to reduce the
