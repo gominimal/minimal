@@ -259,6 +259,17 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a product path: the destroy-race test's own connection to
+            // the harness daemon. The destroy it drives sends no gated RPC —
+            // the race's loser just reports what the daemon said — so the
+            // harness connection carries no gate to record.
+            "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/boxes/vm_host.rs::session_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -271,21 +282,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
-            // Not a product path: the destroy-race test's own connection to
-            // the harness daemon. The destroy it drives sends no gated RPC —
-            // the race's loser just reports what the daemon said — so the
-            // harness connection carries no gate to record.
-            "cmd/session.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
-            // A read-only lookup around an attach the gated `cmd_attach`
-            // already made: it reads the box's pair before, and asks whether
-            // the session is gone after, to withdraw its row or release a
-            // `host_ip` name hold, and which live session holds a name a
-            // re-hold took over; it builds nothing a skew could half-make.
-            "cmd/session.rs::session_record_by = ungated",
             // The dashboard's activation is the same multi-step mutation as
             // `cmd_session`'s, so it carries the same gate on its own create.
             // Its two discovery connections are gated too: the dashboard opens
@@ -317,7 +317,7 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/session.rs::activate_session = asserts",
+            "cmd/boxes/create.rs::activate_session = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             "task.rs::cmd_task_run = asserts",
@@ -340,7 +340,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_session"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -1778,7 +1778,7 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 2),
+        ("src/cmd/boxes/create.rs", "activate_session", 2),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
@@ -1809,7 +1809,7 @@ fn both_creators_share_the_composition_failure_message() {
 fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_session"),
         ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "cmd_task_run"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
@@ -1840,43 +1840,67 @@ fn daemon_refusals_print_without_rpc_names() {
     // no log-only RPC name left to exempt. The RPC names stay legitimate
     // in type paths and comments, which the scan does not read. A literal
     // is tracked across lines — the refusals are wrapped with `\` — so a
-    // continuation line with no quote of its own is still read.
-    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/box_actor.rs"))
-        .expect("readable daemon source");
-    let mut in_literal = false;
-    for (number, line) in daemon.lines().enumerate() {
-        if !in_literal && line.trim_start().starts_with("//") {
-            continue;
+    // continuation line with no quote of its own is still read. The
+    // module is `box_actor.rs` and its `box_actor/` files. `kind.rs` holds
+    // span names, not refusals, and `tests.rs` is the module's tests.
+    let actor_dir = manifest.join("../minimald/src/box_actor");
+    let mut sources = vec![manifest.join("../minimald/src/box_actor.rs")];
+    for entry in std::fs::read_dir(&actor_dir).expect("readable daemon module dir") {
+        let path = entry.expect("readable dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".rs") && name != "kind.rs" && name != "tests.rs" {
+            sources.push(path);
         }
-        let in_string = in_literal || line.contains('"');
-        // Toggle on every unescaped quote, so the state at the line's end
-        // says whether the next line continues a literal.
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => in_literal = !in_literal,
-                _ => {}
+    }
+    assert!(
+        sources.len() > 1,
+        "the daemon's session module files moved; update this scan"
+    );
+    for source in sources {
+        let shown = source
+            .strip_prefix(manifest.join(".."))
+            .unwrap_or(&source)
+            .display()
+            .to_string();
+        let daemon = std::fs::read_to_string(&source).expect("readable daemon source");
+        let mut in_literal = false;
+        for (number, line) in daemon.lines().enumerate() {
+            if !in_literal && line.trim_start().starts_with("//") {
+                continue;
             }
-        }
-        if !in_string {
-            continue;
-        }
-        for rpc in [
-            "CreateSession",
-            "ConfigureLoadout",
-            "SubmitVerdict",
-            "FinalizeSession",
-            "RenameSession",
-            "WorkspacePatchesTarZst",
-        ] {
-            assert!(
-                !line.contains(rpc),
-                "minimald/src/box_actor.rs:{}: a string names the {rpc} RPC: {line}",
-                number + 1
-            );
+            let in_string = in_literal || line.contains('"');
+            // Toggle on every unescaped quote, so the state at the line's end
+            // says whether the next line continues a literal.
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_literal = !in_literal,
+                    _ => {}
+                }
+            }
+            if !in_string {
+                continue;
+            }
+            for rpc in [
+                "CreateSession",
+                "ConfigureLoadout",
+                "SubmitVerdict",
+                "FinalizeSession",
+                "RenameSession",
+                "WorkspacePatchesTarZst",
+            ] {
+                assert!(
+                    !line.contains(rpc),
+                    "{shown}:{}: a string names the {rpc} RPC: {line}",
+                    number + 1
+                );
+            }
         }
     }
 }
