@@ -565,15 +565,29 @@ fn refuse_ingress_off_own_ip(
 /// The box's credentialed-upstream declaration: the `--credentialed-upstream`
 /// flag, or any `[session.network.bep]` setting or `[session.secrets]` grant
 /// in the project's `minimal.toml` (NET-134, BEP-016). The settings ride the
-/// declaration. A project file that does not load declares nothing here; the
-/// upload path reports a broken file before the create.
+/// declaration. Only a missing project file declares nothing. A file that
+/// exists but does not load refuses the activation, so a broken file can
+/// never skip the grant checks (BEP-008).
 fn credentialed_upstream_for(
     flag: bool,
     project: &camino::Utf8Path,
-) -> Option<boxes::CredentialedUpstream> {
-    let session = mfile::File::from_dir_recursive(project.as_std_path())
-        .ok()
-        .and_then(|file| file.session);
+) -> Result<Option<boxes::CredentialedUpstream>, anyhow::Error> {
+    let session = match mfile::File::from_dir_recursive(project.as_std_path()) {
+        Ok(file) => file.session,
+        Err(mfile::Error::NotFound) => None,
+        Err(e) => {
+            tracing::debug!(
+                rule = "BEP-008",
+                project = %project,
+                error = %e,
+                "activation refused: the project file does not load"
+            );
+            anyhow::bail!(
+                "Cannot start the box: the project's {name} does not load: {e}",
+                name = mfile::MFILE_NAME,
+            );
+        }
+    };
     let (bep, secrets) = session.map_or_else(Default::default, |session| {
         (
             session.network.and_then(|n| n.bep).unwrap_or_default(),
@@ -581,7 +595,7 @@ fn credentialed_upstream_for(
         )
     });
     let declared = flag || !bep.is_empty() || !secrets.is_empty();
-    declared.then_some(boxes::CredentialedUpstream { bep, secrets })
+    Ok(declared.then_some(boxes::CredentialedUpstream { bep, secrets }))
 }
 
 /// Refuses a box spec whose grants the box or this host cannot honour, and
@@ -698,7 +712,7 @@ pub(crate) async fn activate_session(
         // a box that did not ask for a credentialed upstream keeps every
         // frame it sends to the proxy's address refused at the host-side
         // gate, whatever its egress rules say.
-        credentialed_upstream: credentialed_upstream_for(args.credentialed_upstream, &utf8_path),
+        credentialed_upstream: credentialed_upstream_for(args.credentialed_upstream, &utf8_path)?,
     };
 
     // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -4832,6 +4846,59 @@ mod tests {
             refused.to_string(),
             "This box declares a GitHub grant, but its egress does not allow: \
              uploads.github.com, codeload.github.com. Add them to egress.allow_dns_hosts."
+        );
+        assert!(
+            std::fs::read_dir(state.path())
+                .expect("state dir")
+                .next()
+                .is_none(),
+            "nothing was spawned or created before the refusal"
+        );
+    }
+
+    /// BEP-008: a project file that exists but does not load refuses the
+    /// activation before the create. It never reads as "no grants
+    /// declared", so a broken file cannot skip the grant checks.
+    #[tokio::test]
+    async fn activation_refuses_unloadable_project_file_before_create() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.secrets.GH_TOKEN\nsource = \"broker\"\n",
+        )
+        .expect("write minimal.toml");
+        let state = tempfile::tempdir().expect("state dir");
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("broken-box".into()),
+            path: Some(project.path().to_string_lossy().into_owned()),
+            sync: None,
+            network: CliNetworkMode::OwnIp,
+            ingress: Vec::new(),
+            dynamic_ingress: None,
+            dynamic_range: None,
+            allow_subnets: Vec::new(),
+            allow_dns_hosts: Vec::new(),
+            allow_protocols: Vec::new(),
+            deny_subnets: Vec::new(),
+            deny_all_egress: false,
+            credentialed_upstream: false,
+            loadout: Vec::new(),
+            no_loadouts: true,
+            no_hooks: true,
+            no_prompt: true,
+            attach: false,
+        };
+        let err = activate_session(&global, args, false)
+            .await
+            .expect_err("the broken project file is refused");
+        assert!(
+            err.to_string()
+                .starts_with("Cannot start the box: the project's minimal.toml does not load"),
+            "unexpected error: {err}"
         );
         assert!(
             std::fs::read_dir(state.path())
