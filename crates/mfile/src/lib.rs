@@ -486,8 +486,15 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<SessionNetwork>,
     /// `[session.secrets.<VAR>]`: the credential grants, by the environment
-    /// variable each one lands in.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// variable each one lands in. A project cannot set
+    /// `acknowledge_full_breadth_unenrolled` here: the reader ignores it with
+    /// a warning, because only the client configuration accepts full
+    /// breadth (BEP-057).
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "boxes::core::bep::deserialize_project_secrets"
+    )]
     pub secrets: boxes::core::bep::SecretGrants,
 
     /// Any fields which are not understood by this version of minimal.
@@ -2391,6 +2398,25 @@ mod tests {
         })
         .expect_err("quic443 is not a [network.bep] field");
         assert!(err.to_string().contains("quic443"), "{err}");
+    }
+
+    /// BEP-057: a project's `[session.secrets]` acknowledgement loads, is
+    /// dropped, and leaves the grants beside it intact.
+    #[test]
+    fn session_secrets_drop_project_acknowledgement() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.secrets]
+            acknowledge_full_breadth_unenrolled = true
+
+            [session.secrets.GH_TOKEN]
+            source = "broker"
+            scopes = ["github:repo:read"]
+            "#
+        })
+        .unwrap();
+        let secrets = mf.session.expect("session parses").secrets;
+        assert_eq!(secrets.keys().collect::<Vec<_>>(), ["GH_TOKEN"]);
     }
 
     #[test]
