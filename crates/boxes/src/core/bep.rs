@@ -2,7 +2,8 @@
 //! pass before a box with a credential grant is created.
 //!
 //! The settings are the `[network.bep]` table (`steering`, `proxy_env`,
-//! `no_proxy`, `quic443`) and the `[secrets]` grants. A project declares
+//! `no_proxy`) and the `[secrets]` grants. The UDP 443 stance, [`Quic443`],
+//! is a `[network]` setting, not a `[network.bep]` one. A project declares
 //! them under its `[session]` table as `[session.network.bep]` and
 //! `[session.secrets.<VAR>]`. They ride the box's policy inside
 //! [`crate::CredentialedUpstream`].
@@ -11,8 +12,9 @@
 //! It takes the module host set as an argument, so this crate does not
 //! depend on the `bep` crate that owns the set.
 //!
-//! A grant is a GitHub grant when one of its scopes starts with `github:`
-//! (for example `github:user-token`). The grant's key is the environment
+//! A grant is a GitHub grant when its `source` is `broker` and one of its
+//! scopes starts with `github:` (for example `github:user-token`), as
+//! [`SecretGrant::is_github`] decides. The grant's key is the environment
 //! variable the sealed value lands in, and it is the name a message uses for
 //! the grant.
 
@@ -90,9 +92,6 @@ pub struct BepSettings {
     /// Extra `NO_PROXY` entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub no_proxy: Vec<String>,
-    /// The declared UDP 443 stance. `None` reads as [`Quic443::Auto`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quic443: Option<Quic443>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference

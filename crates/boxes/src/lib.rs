@@ -340,8 +340,7 @@ impl IngressPolicy {
 // `deny_unknown_fields` [`BoxPolicy`] carries), rather than silently ignored.
 #[serde(deny_unknown_fields)]
 pub struct CredentialedUpstream {
-    /// The `[network.bep]` settings: steering, `proxy_env`, `no_proxy` and
-    /// `quic443`.
+    /// The `[network.bep]` settings: steering, `proxy_env` and `no_proxy`.
     #[serde(default, skip_serializing_if = "core::bep::BepSettings::is_empty")]
     pub bep: core::bep::BepSettings,
     /// The `[secrets]` grants, by the environment variable each lands in.

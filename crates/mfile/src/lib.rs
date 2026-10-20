@@ -495,12 +495,16 @@ pub struct Session {
     pub extra: HashMap<String, toml::Value>,
 }
 
-/// The `[session.network]` table. Today it holds the Box Egress Proxy
-/// settings only.
+/// The `[session.network]` table: the UDP 443 stance and the Box Egress
+/// Proxy settings.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionNetwork {
-    /// `[session.network.bep]`: steering, `proxy_env`, `no_proxy`, `quic443`.
+    /// `[session.network] quic443`: the box's stance on UDP to port 443.
+    /// `None` reads as `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// `[session.network.bep]`: steering, `proxy_env`, `no_proxy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bep: Option<boxes::core::bep::BepSettings>,
 }
@@ -2359,6 +2363,34 @@ mod tests {
         .unwrap();
         let session = mf.session.expect("populated block parses");
         assert!(session.extra.contains_key("weird_new_thing"));
+    }
+
+    /// `quic443` is a `[session.network]` setting: it loads there, and the
+    /// `[session.network.bep]` table refuses it as an unknown field.
+    #[test]
+    fn session_network_quic443_loads() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.network]
+            quic443 = "auto"
+            "#
+        })
+        .unwrap();
+        let network = mf
+            .session
+            .and_then(|session| session.network)
+            .expect("network table parses");
+        assert_eq!(network.quic443, Some(boxes::core::bep::Quic443::Auto));
+        assert!(network.bep.is_none());
+
+        let err = toml::from_str::<File>(indoc! {
+            r#"
+            [session.network.bep]
+            quic443 = "auto"
+            "#
+        })
+        .expect_err("quic443 is not a [network.bep] field");
+        assert!(err.to_string().contains("quic443"), "{err}");
     }
 
     #[test]
