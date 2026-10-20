@@ -76,9 +76,11 @@ in that decision, so SBOM-001's determinism holds. A referenced document is
 **absent** when the cache answers an authoritative not-found for its name;
 every other failure to fetch it is **unfetchable** and is SBOM-012's
 failure under every pin, with the architecture's exit codes: a host that
-cannot be reached (a timeout, a refused connection, no route) exits 7, and
-every other fetch failure (a malformed answer, a refused request, a
-truncated object) exits 6 as a failed check. Absence is SBOM-012's failure,
+cannot be reached (a timeout, a refused connection, no route) exits 7; a
+request the cache refuses for authentication or authorization exits 5,
+naming the pin, the object and the host; and every other fetch failure (a
+malformed answer, a truncated object) exits 6 as a failed check. Absence
+is SBOM-012's failure,
 exit 6, while the pin records a bundle for the document; while it records
 none, absence is SBOM-013's interim (the component keeps its artifact
 digest and is marked `unverified`, reason `no-document`).
@@ -306,25 +308,30 @@ developer running agent boxes; build-infra operator; auditor.
   SBOM-013's interim while no bundle is pinned), or a per-package document
   is unresolved under SBOM-013 (its subject digest differs from the
   closure's entry, its bundle fails a check, its bundle is absent while the
-  pin records one, or the document is absent under the `require_bundles`
-  option) THEN THE SYSTEM SHALL fail naming the pin, the unresolved object,
-  the check that failed (both digests for a subject mismatch, the failed
-  check's name for a bundle), and the remediation — exit code 7 when the
-  host could not be reached, exit code 6 for every other failure (the
-  architecture's exit-code table) — never emitting a document whose
+  pin records one, or the pin records no bundle for the document under the
+  `require_bundles` option, present or absent) THEN THE SYSTEM SHALL fail
+  naming the pin, the unresolved object, the check that failed (both
+  digests for a subject mismatch, the failed check's name for a bundle),
+  and the remediation — exit code 7 when the host could not be reached,
+  exit code 5 when the cache refused the request for authentication or
+  authorization (naming the host too), exit code 6 for every other failure
+  (the architecture's exit-code table) — never emitting a document whose
   component set is silently incomplete.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_unfetchable_reference_fails_loudly
   property: for all attempts a and referenced objects o:
     unreachable(o) ⇒ ¬emitted(a) ∧ exit(a) = 7 ∧ error(a) names (pin, o,
-    host, remediation); (unfetchable(o) ∨ (absent(o) ∧
+    host, remediation); refused(o) ⇒ ¬emitted(a) ∧ exit(a) = 5 ∧ error(a)
+    names (pin, o, host, remediation); (unfetchable(o) ∨ (absent(o) ∧
     pin_records_bundle(o)) ∨ unresolved(o)) ⇒ ¬emitted(a) ∧ exit(a) = 6 ∧
     error(a) names (pin, o, check(o), remediation), where absent(o) is an
     authoritative not-found, unreachable(o) is a host that could not be
-    reached (a timeout, a refused connection, no route), unfetchable(o) is
-    every other fetch failure, and unresolved(o) is SBOM-013's set (subject
-    mismatch with both digests as check(o), a failed bundle check by name,
-    an absent pinned bundle, absence under require_bundles)
+    reached (a timeout, a refused connection, no route), refused(o) is an
+    authentication or authorization refusal by the cache, unfetchable(o)
+    is every other fetch failure, and unresolved(o) is SBOM-013's set
+    (subject mismatch with both digests as check(o), a failed bundle check
+    by name, an absent pinned bundle on a reachable host, a document the
+    pin records no bundle for under require_bundles)
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
@@ -356,13 +363,15 @@ developer running agent boxes; build-infra operator; auditor.
   - WHEN the pin records a bundle for the document (its state in the sealed
     map, PKV-017's) THE SYSTEM SHALL verify the bundle with PKV-011's checks
     first, then check the subject, and only then read any other field of the
-    document; IF the bundle fails or cannot be fetched THEN THE SYSTEM SHALL
-    treat the document as unresolved (SBOM-012's failure, exit code 6, naming
-    the check or the missing bundle), and never read it. The pin decides, so
-    SBOM-001 holds: the same pin always takes the same path.
+    document; IF the bundle fails a check or is absent THEN THE SYSTEM SHALL
+    treat the document as unresolved (SBOM-012's failure, exit code 6,
+    naming the check or the missing bundle), and never read it; IF the
+    bundle's host cannot be reached THEN THE SYSTEM SHALL fail with exit
+    code 7 naming the host, as SBOM-012 does for any object. The pin
+    decides, so SBOM-001 holds: the same pin always takes the same path.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
-    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
+    property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (unreachable(bundle(d)) ⇒ exit = 7) ∧ (¬unreachable(bundle(d)) ∧ ¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
   - WHILE the pin records no bundle for the document, IF the cache holds no
     document beside the artifact (the producer has published none:
     build-servers#185 not landed, which is every package today) THEN THE
@@ -385,7 +394,14 @@ developer running agent boxes; build-infra operator; auditor.
     the interim is never silent; the document's fields reach the
     composition only through SBOM-008's allowlist, as a bundled document's
     do, which bounds the name, version and `purl` strings read from an
-    unverified document as it bounds every other field. This path ends by
+    unverified document as it bounds every other field. The component's
+    own name, version and `purl` never come from the document (SBOM-009
+    takes them from the graph at the pin), and IF the document's subject
+    names a package other than the closure entry's THEN THE SYSTEM SHALL
+    treat it as a subject mismatch (SBOM-012); the identities of the build
+    closure's entries are the document's claims, nested under the component
+    and covered by its `unverified` mark, never promoted to components of
+    the box. This path ends by
     itself: the first pin that records bundles for its documents takes the
     path above for them, with no flag and no release step.
     tier:   T1
@@ -418,10 +434,10 @@ developer running agent boxes; build-infra operator; auditor.
     verify: cargo nextest run -p sbom sbom_unverified_mark_emitted_by_every_serializer
     property: for all serializers s, components k: unverified(k, r) ⇔ marked_unverified(parse_s(emit_s(c)), k, r)
   - WHERE the emitter's `require_bundles` option is set THE SYSTEM SHALL treat a document
-    the pin records no bundle for as unresolved (SBOM-012's failure, exit
-    code 6, naming the missing bundle) instead of reading it: the strict
-    side of the interim, for a reader that wants no `unverified` component
-    at all.
+    the pin records no bundle for, present or absent, as unresolved
+    (SBOM-012's failure, exit code 6, naming the missing bundle) instead of
+    reading it: the strict side of the interim, for a reader that wants no
+    `unverified` component at all; SBOM-012 names the same condition.
     tier:   T0
     verify: cargo nextest run -p sbom sbom_require_bundles_fails_on_an_absent_bundle
 
@@ -431,13 +447,15 @@ developer running agent boxes; build-infra operator; auditor.
   launcher-injected and an `open` box's loadout packages included, and
   never the nested build-closure entries SBOM-009 records under a
   component), so the list and the box's SBOM never disagree about what the
-  box contains; that set is read from the pin's
-  closure and the box's stored expanded spec (its loadout entries and the
-  launcher's additions, BOX-068) alone, so the list fetches no per-package
-  document and needs no network. A box whose pinned closure cannot be read,
-  or whose upstream package has no closure entry (the case its SBOM exits 6
-  on, SBOM-004), is listed with that reason in place of its match, never
-  failing the list for the other boxes.
+  box contains; that set is read from the host's stored copy of the pin's
+  sealed closure (the object the box's materialization fetched and kept at
+  activation) and the box's stored expanded spec (its loadout entries and
+  the launcher's additions, BOX-068) alone, so the list fetches no
+  per-package document and needs no network. A box whose stored closure is
+  missing or unreadable on the host, or whose upstream package has no
+  closure entry (the case its SBOM exits 6 on, SBOM-004), is listed with
+  that reason in place of its match, never failing the list for the other
+  boxes.
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_using_answers_from_the_sbom_components
 
@@ -592,7 +610,10 @@ from the spec and stay schema-TODO.
 - **Trust boundary:** until build-servers#185 pins the document digest, the
   Registry Build Cache's writer is a trust boundary of this spec: an
   unbundled per-package document's facts are that writer's claim, bound to
-  the tarball by subject digest alone and to no author. The spec's
+  the tarball by subject digest alone and to no author. The cache's
+  writers are the registry's build infrastructure (build-servers) and the
+  registry operator; a private registry's cache is written by whoever
+  operates it. The spec's
   controls on that boundary are the `unverified` and `partial` marks, the
   stderr diagnostic, SBOM-008's allowlist of copied fields, and
   the `require_bundles` option; a gate that consumes a box document as evidence
