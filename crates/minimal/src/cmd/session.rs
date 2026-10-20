@@ -562,54 +562,99 @@ fn refuse_ingress_off_own_ip(
     Ok(())
 }
 
-/// The box's credentialed-upstream declaration: the `--credentialed-upstream`
-/// flag, or any `[session.network.bep]` setting or `[session.secrets]` grant
-/// in the project's `minimal.toml` (NET-134, BEP-016). The settings ride the
-/// declaration. Only a missing project file declares nothing. A file that
-/// exists but does not load refuses the activation, so a broken file can
-/// never skip the grant checks (BEP-008).
-fn credentialed_upstream_for(
-    flag: bool,
+/// A project `minimal.toml` that exists but does not load. The activation
+/// refuses it before anything is created, and the run ends with exit 3
+/// (`main.rs`), the architecture's code for an invalid `minimal.toml`.
+#[derive(Debug)]
+pub struct ProjectFileInvalid {
+    /// Why the file did not load.
+    pub error: mfile::Error,
+}
+
+impl std::fmt::Display for ProjectFileInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cannot start the box: the project's {name} does not load: {error}",
+            name = mfile::MFILE_NAME,
+            error = self.error,
+        )
+    }
+}
+
+impl std::error::Error for ProjectFileInvalid {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The project's `[session.network.bep]` settings and `[session.secrets]`
+/// grants. Only a missing project file reads as empty. A file that exists
+/// but does not load refuses the activation, so a broken file can never
+/// skip the grant checks (BEP-008).
+fn project_bep_and_grants(
     project: &camino::Utf8Path,
-) -> Result<Option<boxes::CredentialedUpstream>, anyhow::Error> {
+) -> Result<
+    (
+        boxes::core::bep::BepSettings,
+        boxes::core::bep::SecretGrants,
+    ),
+    ProjectFileInvalid,
+> {
     let session = match mfile::File::from_dir_recursive(project.as_std_path()) {
         Ok(file) => file.session,
         Err(mfile::Error::NotFound) => None,
-        Err(e) => {
+        Err(error) => {
             tracing::debug!(
                 rule = "BEP-008",
                 project = %project,
-                error = %e,
+                error = %error,
                 "activation refused: the project file does not load"
             );
-            anyhow::bail!(
-                "Cannot start the box: the project's {name} does not load: {e}",
-                name = mfile::MFILE_NAME,
-            );
+            return Err(ProjectFileInvalid { error });
         }
     };
-    let (bep, secrets) = session.map_or_else(Default::default, |session| {
+    Ok(session.map_or_else(Default::default, |session| {
         (
             session.network.and_then(|n| n.bep).unwrap_or_default(),
             session.secrets,
         )
-    });
-    let declared = flag || !bep.is_empty() || !secrets.is_empty();
-    Ok(declared.then_some(boxes::CredentialedUpstream { bep, secrets }))
+    }))
+}
+
+/// The box's credentialed-upstream declaration: the `--credentialed-upstream`
+/// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
+/// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
+/// setting or a `client_env` grant alone declares nothing. The settings
+/// ride the declaration.
+fn credentialed_upstream_for(
+    flag: bool,
+    bep: &boxes::core::bep::BepSettings,
+    secrets: &boxes::core::bep::SecretGrants,
+) -> Option<boxes::CredentialedUpstream> {
+    let declared = flag
+        || secrets
+            .values()
+            .any(|grant| grant.source == boxes::core::bep::GrantSource::Broker);
+    declared.then(|| boxes::CredentialedUpstream {
+        bep: bep.clone(),
+        secrets: secrets.clone(),
+    })
 }
 
 /// Refuses a box spec whose grants the box or this host cannot honour, and
-/// prints the warnings of one it accepts. The refusal ends the run with
-/// exit 3 (`main.rs`). Every host today is un-enrolled and has no box-zone
-/// resolver.
+/// prints the warnings of one it accepts. It checks the project's settings
+/// whether or not they declare a credentialed upstream, so a contradiction
+/// in `[session.network.bep]` alone is still refused. The refusal ends the
+/// run with exit 3 (`main.rs`). Every host today is un-enrolled and has no
+/// box-zone resolver.
 fn refuse_unhonourable_grants(
     network: boxes::NetworkMode,
-    policy: &boxes::BoxPolicy,
+    egress: Option<&boxes::EgressPolicy>,
+    settings: &boxes::core::bep::BepSettings,
+    secrets: &boxes::core::bep::SecretGrants,
 ) -> Result<(), anyhow::Error> {
     use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
-    let Some(upstream) = &policy.credentialed_upstream else {
-        return Ok(());
-    };
     let hosts: Vec<&str> = bep::module::GITHUB
         .hosts
         .iter()
@@ -617,9 +662,9 @@ fn refuse_unhonourable_grants(
         .collect();
     let spec = ActivationSpec {
         network,
-        egress: policy.egress.as_ref(),
-        bep: &upstream.bep,
-        secrets: &upstream.secrets,
+        egress,
+        bep: settings,
+        secrets,
     };
     let plan = check_activation(&spec, HostFacts::LOCAL, &hosts)?;
     for warning in &plan.warnings {
@@ -701,6 +746,7 @@ pub(crate) async fn activate_session(
     // same as an explicit deny.
     let has_ingress =
         !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
+    let (project_bep, project_secrets) = project_bep_and_grants(&utf8_path)?;
     let policy = boxes::BoxPolicy {
         egress,
         ingress: has_ingress.then_some(boxes::IngressPolicy {
@@ -712,12 +758,21 @@ pub(crate) async fn activate_session(
         // a box that did not ask for a credentialed upstream keeps every
         // frame it sends to the proxy's address refused at the host-side
         // gate, whatever its egress rules say.
-        credentialed_upstream: credentialed_upstream_for(args.credentialed_upstream, &utf8_path)?,
+        credentialed_upstream: credentialed_upstream_for(
+            args.credentialed_upstream,
+            &project_bep,
+            &project_secrets,
+        ),
     };
 
     // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
     // refused here, before the daemon starts and before anything is created.
-    refuse_unhonourable_grants(args.network.into(), &policy)?;
+    refuse_unhonourable_grants(
+        args.network.into(),
+        policy.egress.as_ref(),
+        &project_bep,
+        &project_secrets,
+    )?;
     ensure_daemon(global)?;
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -4896,6 +4951,10 @@ mod tests {
             .await
             .expect_err("the broken project file is refused");
         assert!(
+            err.downcast_ref::<ProjectFileInvalid>().is_some(),
+            "the refusal is typed: {err}"
+        );
+        assert!(
             err.to_string()
                 .starts_with("Cannot start the box: the project's minimal.toml does not load"),
             "unexpected error: {err}"
@@ -4907,6 +4966,61 @@ mod tests {
                 .is_none(),
             "nothing was spawned or created before the refusal"
         );
+    }
+
+    /// BEP-016: a `[session.network.bep]` setting alone declares no
+    /// credentialed upstream. The set is derived from broker grants.
+    #[test]
+    fn bep_settings_alone_activate_without_credentialed_upstream() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.network.bep]\nsteering = \"proxy_env\"\n",
+        )
+        .expect("write minimal.toml");
+        let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
+        let (bep, secrets) = project_bep_and_grants(path).expect("loads");
+        assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
+        assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
+        refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets)
+            .expect("accepted");
+    }
+
+    /// A `client_env` grant alone declares no credentialed upstream. A
+    /// broker grant, or the flag, does.
+    #[test]
+    fn only_broker_grants_declare_credentialed_upstream() {
+        use boxes::core::bep::{BepSettings, GrantSource, SecretGrant, SecretGrants};
+        let bep = BepSettings::default();
+        let grant = |source| SecretGrant {
+            source,
+            scopes: Vec::new(),
+            mode: None,
+        };
+        let client = SecretGrants::from([("NPM_TOKEN".into(), grant(GrantSource::ClientEnv))]);
+        assert!(credentialed_upstream_for(false, &bep, &client).is_none());
+        assert!(credentialed_upstream_for(true, &bep, &client).is_some());
+        let broker = SecretGrants::from([("GH_TOKEN".into(), grant(GrantSource::Broker))]);
+        assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
+    }
+
+    /// BEP-010: `steering = "off"` with `proxy_env = true` is refused with
+    /// exit 3 even when no grant declares a credentialed upstream.
+    #[test]
+    fn steering_off_with_proxy_env_is_refused_without_a_grant() {
+        let bep = boxes::core::bep::BepSettings {
+            steering: Some(boxes::core::bep::Steering::Off),
+            proxy_env: true,
+            ..Default::default()
+        };
+        let secrets = boxes::core::bep::SecretGrants::new();
+        assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
+        let err = refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets)
+            .expect_err("refused");
+        let refused = err
+            .downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .expect("the refusal is the box spec refusal");
+        assert_eq!(refused.exit_code(), 3);
     }
 
     /// An ask create stands on a VM-backed host (NET-045): T94's refusal is
