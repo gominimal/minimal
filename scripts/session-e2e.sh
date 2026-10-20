@@ -14439,11 +14439,14 @@ PY
 # own drops rather than by the boxes' declared union.
 #
 # Two resident boxes with disjoint declared egress bound the union: box A
-# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the runner's
-# address as a /32 (the destination their own probes reach) and the fabric
-# (100.64.0.0/16), which carries the host alias, the node-plane baseline
-# set's one category-pair (NET-130: the alias is the registry and the cache,
-# shown beside the rules by `min session policy`). The arms:
+# declares 198.18.0.0/16 and box B 198.19.0.0/16 — the two halves of
+# 198.18.0.0/15, RFC 2544 benchmark space, spelled outside RFC 1918 so no
+# infrastructure rule can take a cross-box destination before the row's
+# own rules do — and both declare the runner's address as a /32 (the
+# destination their own probes reach) and the fabric (100.64.0.0/16),
+# which carries the host alias, the node-plane baseline set's one
+# category-pair (NET-130: the alias is the registry and the cache, shown
+# beside the rules by `min session policy`). The arms:
 #
 #   * each box's own probe to the runner's address arrives — the whole chain
 #     working, and the union's declared half live for a box's own address;
@@ -14452,12 +14455,13 @@ PY
 #     rows declare: it is dropped before any frame leaves the VM, under the
 #     gate's own unregistered rule, and the drop line names the source —
 #     the receipt for the frames the spoofer spoke;
-#   * box A's address toward 192.168.77.7, declared only by box B — the
-#     union's other half — is refused: the row that holds the source address
-#     decides, and box A's row does not cover it (the RFC 1918 the
-#     infrastructure set takes where the row's own allow-list does not);
-#   * box B's address toward 10.0.0.7, box A's private half, refused the
-#     same way from the other side;
+#   * box A's address toward 198.19.0.7, declared only by box B — the
+#     union's other half — is refused under egress-undeclared-subnet: the
+#     row that holds the source address decides, and box A's row does not
+#     cover it — the verdict the union bound rides on, which the public
+#     range cannot let the private-space rule answer for;
+#   * box B's address toward 198.18.0.7, box A's half, refused the same way
+#     from the other side;
 #   * box A's address toward 198.51.100.7 — beyond the whole union — is
 #     refused by box A's own rules (egress-undeclared-subnet);
 #   * a made-up in-plan lease toward that same 198.51.100.7 is dropped the
@@ -14800,11 +14804,11 @@ ESU_LISTENER_EOF
 
   esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-a --network own_ip \
-    --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.18.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-a.err")" || {
-    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box A's activate (--network own_ip, 198.18.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-a.err" 2>/dev/null || true
     esu_fail
   }
@@ -14817,11 +14821,11 @@ ESU_LISTENER_EOF
   fi
   esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-b --network own_ip \
-    --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.19.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-b.err")" || {
-    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box B's activate (--network own_ip, 198.19.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-b.err" 2>/dev/null || true
     esu_fail
   }
@@ -14865,8 +14869,8 @@ ESU_LISTENER_EOF
     echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
     esu_fail
   fi
-  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric + $esu_host/32)"
-  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric + $esu_host/32)"
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 198.18.0.0/16 + the fabric + $esu_host/32)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 198.19.0.0/16 + the fabric + $esu_host/32)"
 
   # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
   # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
@@ -14966,9 +14970,9 @@ ESU_LISTENER_EOF
     echo "box $esu_box's effective policy (the baseline set beside the rules):"
     printf '%s\n' "$esu_policy" | sed 's/^/  /'
     if [ "$esu_box" = a ]; then
-      esu_line="subnets  10.0.0.0/8, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.18.0.0/16, 100.64.0.0/16, $esu_host/32"
     else
-      esu_line="subnets  192.168.0.0/16, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.19.0.0/16, 100.64.0.0/16, $esu_host/32"
     fi
     if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
@@ -15341,19 +15345,20 @@ source=$esu_ip_b (box B's own probe) destination=$esu_host:$ESU_LISTEN_PORT verd
   esu_rows="$esu_rows
 source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward a destination both rows declare)"
 
-  # Box A's address toward box B's private half — inside the union, outside
-  # the row that holds the worn address: the gate's infrastructure rule
-  # refuses it, and its line names both the source and the destination, so
-  # both are pinned inside the wait: a line box A's own traffic wrote under
-  # the same rule names a different destination and cannot pass for this
-  # arm's, and a line that predates the arm cannot either (the window
-  # discipline below).
-  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-infrastructure-destination 192.168.77.7 | wc -l)"
-  esu_run_spoofer cross-a "$esu_ip_a" 192.168.77.7 esu-spoof-cross-a 3 no
+  # Box A's address toward box B's half — inside the union, outside the row
+  # that holds the worn address: box A's own rules refuse it, under
+  # egress-undeclared-subnet — the public half no infrastructure rule
+  # takes, so the refusal is the row's own and the union bound it proves.
+  # The line names both the source and the destination, so both are pinned
+  # inside the wait: a line box A's own traffic wrote under the same rule
+  # names a different destination and cannot pass for this arm's, and a
+  # line that predates the arm cannot either (the window discipline below).
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet 198.19.0.7 | wc -l)"
+  esu_run_spoofer cross-a "$esu_ip_a" 198.19.0.7 esu-spoof-cross-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box A's address completed a flow to 192.168.77.7 — box B's declared half must be refused for a source box A's row holds"
+      echo "::error::the spoofer wearing box A's address completed a flow to 198.19.0.7 — box B's declared half must be refused for a source box A's row holds"
       esu_fail
       ;;
   esac
@@ -15361,13 +15366,25 @@ source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-infrastructure-destination \
-    192.168.77.7 "$esu_prior")" || {
-    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet \
+    198.19.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box A's address toward 198.19.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
+source=$esu_ip_a destination=198.19.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box B's declared half, which box A's row does not cover)"
+
+  # The window pace: box A wears two undeclared-subnet arms — this one and
+  # the far-side one below — and the gate's limiter writes one line per
+  # source per rule per DROP_WARN_MIN_INTERVAL (60s), keyed by source and
+  # rule only, never the destination (DropLimiter::decide in
+  # crates/minvmd/src/net/egress_gate.rs). The far-side arm's line would be
+  # Silent inside this arm's window and never land, failing its wait. The
+  # made-up arms dodge the same limiter by wearing a fresh made-up address
+  # no row holds; these two arms cannot — the address each wears is box
+  # A's own, and that is the bound they prove — so the window is waited
+  # out instead.
+  sleep 60
 
   # Box A's address toward a destination no resident box declared — beyond
   # the whole union: the row's own rules refuse it, and the undeclared-subnet
@@ -15431,15 +15448,15 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
   esu_rows="$esu_rows
 source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source names the source, no marker — an in-plan lease no row holds never reaches past the union)"
 
-  # Box B's address toward box A's private half: the same refusal, worn from
-  # the other side — whichever box's address the spoofer wears, its own row is
+  # Box B's address toward box A's half: the same refusal, worn from the
+  # other side — whichever box's address the spoofer wears, its own row is
   # the one that decides, and the destination stays pinned inside the wait.
-  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-infrastructure-destination 10.0.0.7 | wc -l)"
-  esu_run_spoofer cross-b "$esu_ip_b" 10.0.0.7 esu-spoof-cross-b 3 no
+  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-undeclared-subnet 198.18.0.7 | wc -l)"
+  esu_run_spoofer cross-b "$esu_ip_b" 198.18.0.7 esu-spoof-cross-b 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box B's address completed a flow to 10.0.0.7 — box A's declared half must be refused for a source box B's row holds"
+      echo "::error::the spoofer wearing box B's address completed a flow to 198.18.0.7 — box A's declared half must be refused for a source box B's row holds"
       esu_fail
       ;;
   esac
@@ -15447,13 +15464,13 @@ source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at 
     echo "::error::a refused spoof from box B's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-infrastructure-destination \
-    10.0.0.7 "$esu_prior")" || {
-    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-undeclared-subnet \
+    198.18.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box B's address toward 198.18.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box A's declared half, which box B's row does not cover)"
+source=$esu_ip_b destination=198.18.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box A's declared half, which box B's row does not cover)"
 
   # An address outside the plan's lease block: refused outright, under either
   # posture — outside the plan there is no lease to spoof. The source is
