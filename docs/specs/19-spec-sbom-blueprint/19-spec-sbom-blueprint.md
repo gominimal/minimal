@@ -53,13 +53,22 @@ a cache artifact digest references the document SBOM-013 names from that
 hash, and a component whose entry is `built-locally` or `non-redistributable`
 has no artifact, no document, and the gap; a package is `outside-pin` only
 when the box's stored expanded spec (BOX-068) records a registry for it
-other than `[upstream]` — an `open` box's loadout package from elsewhere —
-and the gap names that registry reduced under SBOM-008 (scheme, host, port,
-path). The Box Spec records one upstream registry and no registry per
-loadout package by default, so a package with no recorded registry is an
-upstream package. Those are the only kinds a package can be. An upstream
-package with no closure entry, or an entry of any other state, is neither
-a digest nor a gap: the pin does not account for the package, and the
+other than `[upstream]`, and the gap names that registry reduced under
+SBOM-008 (scheme, host, port, path). The design's Box Spec records one
+upstream registry and no registry for any loadout package (architecture
+lines 83 and 1074–1077), so today no package has a recorded registry,
+`outside-pin` cannot occur, and an `open` box's loadout package from
+another registry resolves as an upstream package: it has no entry in the
+box's pin, and the emission is SBOM-012's failure below. Whether the design
+records that registry is asked in gominimal/arch#138 (Open questions);
+the kind is defined here so that a yes needs no change to this spec.
+Precedence, for when it exists: the closure entry decides first, and a
+recorded registry decides only for a package the closure holds no entry
+for; a package with an `artifact` entry has a digest whatever registry is
+recorded, and one with a `built-locally` or `non-redistributable` entry has
+that gap. Those are the only kinds a package can be. An upstream package
+with no closure entry, or an entry of any other state, is neither a
+digest nor a gap: the pin does not account for the package, and the
 emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds, and a referenced document
 the cache does not have (a 404 as much as a timeout) is SBOM-012's failure.
@@ -114,9 +123,12 @@ developer running agent boxes; build-infra operator; auditor.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_regeneration_deterministic
   property: for all pin, inputs, and independent emissions a, b under
-    (pin, inputs): bytes(a) == bytes(b)
-  - IF the cache's contents differ between two emissions under the same pin,
-    every object the pinned closure references remaining fetchable, THEN THE
+    (pin, inputs), while the pin records a bundle for every per-package
+    document it references: bytes(a) == bytes(b)
+  - WHILE the pin records a bundle for every per-package document it
+    references, IF the cache's contents differ between two emissions under
+    the same pin, every object the pinned closure references remaining
+    fetchable, THEN THE
     SYSTEM SHALL still produce byte-identical documents, the composition
     being a function of the pin and its closure rather than of what the
     cache happens to hold. (An unfetchable referenced object is SBOM-012's
@@ -134,7 +146,7 @@ developer running agent boxes; build-infra operator; auditor.
     bundle binds the bytes and the property above holds unconditionally.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_replaced_document_changes_only_its_component_and_digest
-    property: ¬pin_records_bundle(d) ∧ bytes(a) ≠ bytes(b) ⇒ ∃d: read_digest_a(d) ≠ read_digest_b(d) ∧ diff(a, b) ⊆ component(d)
+    property: bytes(a) ≠ bytes(b) ⇒ R ≠ ∅ ∧ diff(a, b) ⊆ ⋃{component(d) : d ∈ R}, where R = {d : ¬pin_records_bundle(d) ∧ read_digest_a(d) ≠ read_digest_b(d)}
 
 - **SBOM-002** WHEN a document is emitted as CycloneDX THE SYSTEM SHALL
   produce output that validates against the vendored CycloneDX 1.5 schema.
@@ -268,9 +280,11 @@ developer running agent boxes; build-infra operator; auditor.
   property: for all environments e, k in packages(e): unreferenced(k,
     closure(pin(e))) implies k in components(emit(e)) and has_digest_gap(k),
     where unreferenced(k, c) ⇔ entry(c, k) ∈ {built-locally,
-    non-redistributable} ∨ (the stored expanded spec records a registry for
-    k, and it is not the upstream); a package with no recorded registry is
-    never unreferenced, and its missing entry is SBOM-004's exit 6
+    non-redistributable} ∨ (k ∉ c ∧ the stored expanded spec records a
+    registry for k that is not the upstream); the design records no such
+    registry today (gominimal/arch#138), so the second arm is never true
+    and an `open` box's foreign loadout package with no entry is SBOM-004's
+    exit 6, as every upstream package with no entry is
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
   cannot be fetched THEN THE SYSTEM SHALL fail with exit code 6 naming the
@@ -569,6 +583,11 @@ from the spec and stay schema-TODO.
   now; the state name follows the provenance bundle's (`bundled`) unless the
   producer rules otherwise. Settle on build-servers#185 before the first
   slice's golden fixtures.]
+- [NEEDS CLARIFICATION (MEDIUM): does the Box Spec record, per loadout
+  package, the registry it resolved from under `open` loadout mode? Today
+  it does not (architecture lines 83, 1074–1077), so a foreign loadout
+  package resolves as upstream and `outside-pin` cannot occur. Asked as
+  gominimal/arch#138; a yes makes the kind live with no change here.]
 - [NEEDS CLARIFICATION (LOW): SPDX `created` timestamp source (proposal:
   pinned commit's committer timestamp); both answers satisfy SBOM-001;
   settle in first-slice review.]
