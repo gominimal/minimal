@@ -153,6 +153,13 @@ impl NodeBaselinePhase {
 /// the tests pin both of its arms, so the flip is one line and nothing else.
 pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::Announced;
 
+/// The ports the node plane's own registry and cache fetches use: the
+/// built-in endpoints name the switch's host alias, whose listener would
+/// otherwise be the enumeration's to admit at every port, so the gate's
+/// in-force arm bounds the alias to these — the ports the daemon's own
+/// HTTPS fetches use, and nothing wider.
+pub(crate) const REGISTRY_CACHE_FETCH_PORTS: [u16; 1] = [443];
+
 /// The node-plane baseline set: the categories in force, each with the
 /// subnets it admits, and the compiled rules the host-side gate decides
 /// node-plane frames by.

@@ -175,7 +175,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
-use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
+use super::baseline::{NodeBaselinePhase, NodePlaneBaseline, REGISTRY_CACHE_FETCH_PORTS};
 use super::dns_pins;
 use super::forward_revoke::{self, ForwardedFlows};
 
@@ -5273,8 +5273,22 @@ fn gate_verdict(
     // verdict against the enumeration's compiled set — the lease it is keyed
     // to is the daemon's own address, so the check above and the lease agree
     // on who may wear it. Announced, the interim node row keeps deciding the
-    // node plane, and the fall-through reaches it below.
+    // node plane, and the fall-through reaches it below. The set's verdict
+    // is by subnet alone, so the alias the built-in endpoints name is the
+    // arm's to bound: a fetch port on it reaches the shared verdict, and a
+    // wider port is the infrastructure drop — the same refusal a box row's
+    // alias frames take — so in-force reach is no wider than announced.
     if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
+        if let Some(dst) = summary.destination()
+            && dst == table.subnet().host_alias().octets()
+            && !REGISTRY_CACHE_FETCH_PORTS.contains(&summary.destination_port())
+        {
+            return Err(GateDrop::Infrastructure {
+                src,
+                dst,
+                dst_port: summary.destination_port(),
+            });
+        }
         return match egress::verdict(summary, baseline.rules()) {
             FrameVerdict::Admit => Ok(GateAdmit::Baseline),
             FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
@@ -15215,6 +15229,48 @@ mod tests {
         );
     }
 
+    /// The in-force arm's own bound on the host alias: the built-in
+    /// registry and cache endpoints name the alias, and the compiled set's
+    /// verdict is by subnet alone — no port dimension — so the arm bounds
+    /// the alias to the ports the daemon's own fetches use. The fetch port
+    /// stays admitted by the set; a wider port on the alias is the
+    /// infrastructure drop, the same refusal a box row's alias frames take
+    /// (design §7.1, NET-062).
+    #[test]
+    fn in_force_baseline_bounds_the_host_alias_to_its_fetch_ports() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET).in_force();
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = baseline.node_addr();
+        let alias = SUBNET.host_alias().octets();
+
+        let fetch = boxes::core::egress::summarize(&ipv4_frame(node, 6, alias, 443));
+        assert_eq!(
+            gate_verdict(&fetch, None, &table, &baseline, &pins, &ReplyTables::new()),
+            Ok(GateAdmit::Baseline),
+            "the daemon's own fetch port on the alias stays admitted by the set"
+        );
+
+        let wider = boxes::core::egress::summarize(&ipv4_frame(node, 6, alias, 18081));
+        assert!(
+            matches!(
+                gate_verdict(
+                    &wider,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    &ReplyTables::new()
+                ),
+                Err(GateDrop::Infrastructure { dst, dst_port, .. })
+                    if dst == alias && dst_port == 18081
+            ),
+            "a wider port on the alias is the infrastructure drop, in force"
+        );
+    }
+
     /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes
     /// from the helper's enumeration, and the gate decides the daemon's own
     /// frames by it **beside** the boxes' rows — a deny-all box's row does not
@@ -15300,7 +15356,7 @@ mod tests {
         // daemon's shipped cache URL resolves to, whose serving addresses no
         // subnet list this tree can name — the set says no.
         let out_of_set = ipv4_frame(node_addr, 6, [8, 8, 8, 8], 443);
-        let node_marker = ipv4_frame(node_addr, 6, registry_endpoint, 444);
+        let node_marker = ipv4_frame(node_addr, 6, registry_endpoint, 443);
         send_frame(&mut h.guest, &out_of_set).await;
         send_frame(&mut h.guest, &node_marker).await;
         let seen = expect_frame(&mut h.switch).await;
