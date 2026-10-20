@@ -875,9 +875,13 @@ confirm_force_stop() {
 
 # daemon_stop_consent records that this run may end live sessions: the user
 # passed --force-stop, or answered yes on the terminal. The post-swap stop
-# reads it, so it never forces a stop the user did not agree to.
+# reads it, so it never forces a stop the user did not agree to. A yes covers
+# only the sessions the question listed, so their ids are kept in
+# pre_swap_sessions (`min ls --raw`, one per line). A listing that fails leaves
+# it empty, and then every session the post-swap stop finds counts as new.
 daemon_stop_tried=0
 daemon_stop_consent=0
+pre_swap_sessions=
 stop_running_daemon() {
     [ "$daemon_stop_tried" -eq 0 ] || return 0
     daemon_stop_tried=1
@@ -891,6 +895,8 @@ stop_running_daemon() {
         fi
         case "$_stop_out" in
             *"$sessions_live_msg"*)
+                pre_swap_sessions="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" \
+                    || pre_swap_sessions=
                 confirm_force_stop || return 1
                 daemon_stop_consent=1
                 ;;
@@ -1016,7 +1022,10 @@ installed=0 skipped=0
 # A session can open in a respawned daemon while the run is still going (a
 # `min new`, an unattended job), and R5.5 never ends a session unasked. So the
 # stop is graceful unless this run already holds consent: --force-stop, or a
-# yes to the pre-swap question. A graceful stop refused for live sessions asks
+# yes to the pre-swap question. The yes covers only the sessions that question
+# listed. So before it forces, the stop lists the daemon's live sessions, and
+# any session the yes did not see (or a listing that fails) makes the stop
+# graceful again. A graceful stop refused for live sessions asks
 # on the terminal, as the pre-swap stop does. Declined, or with no terminal to
 # ask on, it leaves the daemon running and says how to stop it: the swaps are
 # done, so the install itself still succeeds.
@@ -1030,7 +1039,7 @@ stop_stale_daemon() {
     _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
     [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ] || return 0
     say "stopping a daemon still running from build $_sv"
-    if [ "$daemon_stop_consent" -eq 0 ]; then
+    if [ "$force_stop" -eq 0 ] && { [ "$daemon_stop_consent" -eq 0 ] || ! sessions_seen_pre_swap; }; then
         if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
             return 0
         fi
@@ -1049,6 +1058,16 @@ stop_stale_daemon() {
         # stop does: no live sessions were reported, so none are at risk.
     fi
     force_stop_stale "$_sv"
+}
+
+# Succeeds when every live session the daemon lists now was in the list the
+# pre-swap yes covered. A failed listing proves nothing, so it fails too.
+sessions_seen_pre_swap() {
+    _now="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" || return 1
+    printf '%s\n' "$_now" | while read -r _id; do
+        [ -z "$_id" ] && continue
+        printf '%s\n' "$pre_swap_sessions" | grep -qxF -e "$_id" || exit 1
+    done
 }
 
 # The post-swap force stop. It follows a "stopping a daemon" line, so a failed

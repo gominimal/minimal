@@ -161,7 +161,19 @@ case "${1:-}" in
             fi
         fi
         ;;
-    ls)          printf 'session-alpha  running\n' ;;
+    ls)
+        # `ls --raw` prints one session id per line: those in
+        # $HOME/sessions.ids, else session-alpha while sessions are live.
+        if [ "${2:-}" = --raw ]; then
+            if [ -f "$HOME/sessions.ids" ]; then
+                cat "$HOME/sessions.ids"
+            elif [ -f "$HOME/sessions.live" ]; then
+                printf 'session-alpha\n'
+            fi
+        else
+            printf 'session-alpha  running\n'
+        fi
+        ;;
     stop)
         printf '%s\n' "$*" >>"$HOME/stop.calls"
         if [ -f "$HOME/sessions.live" ] && [ "${2:-}" != "--force" ]; then
@@ -180,12 +192,19 @@ case "${1:-}" in
         # previous one stops — a respawn holds no live sessions of its own,
         # and serves from the binaries present at the moment it spawns.
         rm -f "$HOME/daemon.running"
-        [ "${2:-}" = "--force" ] && rm -f "$HOME/sessions.live"
+        [ "${2:-}" = "--force" ] && rm -f "$HOME/sessions.live" "$HOME/sessions.ids"
         if [ -f "$HOME/daemon.reconnect" ] && [ -f "$HOME/bin/minimald" ]; then
             cat "$HOME/bin/minimald" >"$HOME/daemon.running"
             # $HOME/respawn.sessions: the client opens a session in the
-            # respawned daemon, as a `min new` during the install would.
-            if [ -f "$HOME/respawn.sessions" ]; then : >"$HOME/sessions.live"; fi
+            # respawned daemon, as a `min new` during the install would. A
+            # non-empty file holds the ids of the sessions it opens.
+            if [ -f "$HOME/respawn.sessions" ]; then
+                : >"$HOME/sessions.live"
+                [ -s "$HOME/respawn.sessions" ] && cp "$HOME/respawn.sessions" "$HOME/sessions.ids"
+            fi
+            # $HOME/respawn.notty names a terminal file that goes away at the
+            # respawn: the user answered once, then left.
+            if [ -s "$HOME/respawn.notty" ]; then rm -f "$(cat "$HOME/respawn.notty")"; fi
         fi
         ;;
     finalize-install)
@@ -1687,6 +1706,53 @@ stop --force" "$(cat "$HL8F/stop.calls")" \
         "the closing stop asks, then tries the force stop once (R5.5)"
     want_ok "a failed closing force stop is reported (R5.5)" \
         grep -q "the daemon on build old may still be running; run 'min stop --force'" "$OUT"
+
+    # A yes to the pre-swap question covers only the sessions it listed. A
+    # session the client opens in the respawned daemon after that yes is one
+    # the user never saw, so the closing stop does not force it on the old
+    # answer: it stops gracefully, and when that is refused it asks again.
+    HL10="$root/hl10"; mkdir -p "$HL10"
+    stage_live_upgrade "$HL10" livenewsessionyes
+    printf 'stale\n' >"$HL10/daemon.running"
+    : >"$HL10/daemon.reconnect"
+    printf 'session-beta\n' >"$HL10/respawn.sessions"
+    printf 'y\n' >"$root/tty-yes10"
+    TTY_FILE="$root/tty-yes10"
+    run livenewsessionyes "$HL10"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade with a session opened after the pre-swap yes exits 0 (R5.5)"
+    check 2 "$(grep -c "Continue?" "$OUT")" \
+        "a session opened after the pre-swap yes is asked about again (R5.5)"
+    check "stop
+stop --force
+stop
+stop --force" "$(cat "$HL10/stop.calls")" \
+        "the closing stop is graceful first, then forced on the second yes (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL10/daemon.running")" \
+        "the daemon the run leaves is the one just installed (R5.5)"
+
+    # The same session, but the terminal is gone after the pre-swap yes: the
+    # closing stop never forces it. The session survives, and the user is
+    # told how to stop the old-build daemon.
+    HL11="$root/hl11"; mkdir -p "$HL11"
+    stage_live_upgrade "$HL11" livenewsessionnotty
+    printf 'stale\n' >"$HL11/daemon.running"
+    : >"$HL11/daemon.reconnect"
+    printf 'session-beta\n' >"$HL11/respawn.sessions"
+    printf 'y\n' >"$root/tty-yes11"
+    printf '%s\n' "$root/tty-yes11" >"$HL11/respawn.notty"
+    TTY_FILE="$root/tty-yes11"
+    run livenewsessionnotty "$HL11"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade that cannot ask about a new session exits 0 (R5.5)"
+    check "stop
+stop --force
+stop" "$(cat "$HL11/stop.calls")" \
+        "the pre-swap yes does not force the closing stop over a new session (R5.5)"
+    want_ok "the session opened after the yes survives (R5.5)" test -f "$HL11/sessions.live"
+    want_ok "the user is told how to stop the old daemon (R5.5)" \
+        grep -q "min stop --force" "$OUT"
+    check "$h_minimald" "$(hash_file "$HL11/bin/minimald")" "the upgrade still completes (R5.5)"
 
     # A download that fails after the first swap still runs the closing stop,
     # from the EXIT trap, so the daemon a client respawned from the
