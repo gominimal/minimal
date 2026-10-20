@@ -175,7 +175,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
-use super::baseline::{NodeBaselinePhase, NodePlaneBaseline, REGISTRY_CACHE_FETCH_PORTS};
+use super::baseline::{
+    NodeBaselinePhase, NodePlaneBaseline, REGISTRY_CACHE_FETCH_PORTS, REGISTRY_CACHE_FETCH_PROTOCOL,
+};
 use super::dns_pins;
 use super::forward_revoke::{self, ForwardedFlows};
 
@@ -5275,13 +5277,20 @@ fn gate_verdict(
     // on who may wear it. Announced, the interim node row keeps deciding the
     // node plane, and the fall-through reaches it below. The set's verdict
     // is by subnet alone, so the alias the built-in endpoints name is the
-    // arm's to bound: a fetch port on it reaches the shared verdict, and a
-    // wider port is the infrastructure drop — the same refusal a box row's
-    // alias frames take — so in-force reach is no wider than announced.
+    // arm's to bound: TCP at a fetch port reaches the shared verdict, and
+    // any other protocol or port is the infrastructure drop, the same
+    // refusal a box row's alias frames take. The protocol is checked
+    // because the summary reads a destination port from every protocol's
+    // bytes. In force, the node plane reaches the alias at TCP 443 only.
+    // Once the host exposures close by default, that is wider than the
+    // announced phase's alias reach, which admits no port. The bound must
+    // also admit the configured host exposures (TCP and UDP) once they
+    // exist.
     if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
         if let Some(dst) = summary.destination()
             && dst == table.subnet().host_alias().octets()
-            && !REGISTRY_CACHE_FETCH_PORTS.contains(&summary.destination_port())
+            && (summary.protocol() != Some(REGISTRY_CACHE_FETCH_PROTOCOL)
+                || !REGISTRY_CACHE_FETCH_PORTS.contains(&summary.destination_port()))
         {
             return Err(GateDrop::Infrastructure {
                 src,
@@ -15269,6 +15278,48 @@ mod tests {
             ),
             "a wider port on the alias is the infrastructure drop, in force"
         );
+    }
+
+    /// The in-force arm bounds the alias by protocol as well as port: the
+    /// summary reads a destination port from every protocol's bytes, so an
+    /// ICMP frame whose checksum reads 443, or a GRE frame (IP protocol 47)
+    /// whose protocol-type field does, must not pass as a fetch. TCP at 443
+    /// is the one admission.
+    #[test]
+    fn in_force_baseline_admits_only_tcp_at_the_alias_fetch_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET).in_force();
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = baseline.node_addr();
+        let alias = SUBNET.host_alias().octets();
+        let decide = |proto: u8| {
+            let summary = boxes::core::egress::summarize(&ipv4_frame(node, proto, alias, 443));
+            gate_verdict(
+                &summary,
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new(),
+            )
+        };
+
+        assert_eq!(
+            decide(6),
+            Ok(GateAdmit::Baseline),
+            "TCP at the fetch port on the alias is admitted, in force"
+        );
+        for (proto, name) in [(1u8, "ICMP"), (47, "GRE")] {
+            assert!(
+                matches!(
+                    decide(proto),
+                    Err(GateDrop::Infrastructure { dst, dst_port: 443, .. }) if dst == alias
+                ),
+                "{name} to alias:443 is the infrastructure drop, in force"
+            );
+        }
     }
 
     /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes
