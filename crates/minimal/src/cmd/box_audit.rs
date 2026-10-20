@@ -136,6 +136,23 @@ pub(crate) fn children(parent: &str, known: &[KnownBox]) -> BTreeSet<String> {
         .collect()
 }
 
+/// `value` with every control character escaped, so a field that a box
+/// controls cannot move the cursor, hide lines or set the terminal title.
+pub(crate) fn printable(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
+}
+
 /// Writes the entries whose subject is in `subjects`, and returns how many
 /// it wrote. `name_box` puts the subject at the start of each text line.
 pub(crate) fn render(
@@ -169,10 +186,13 @@ pub(crate) fn render(
                 write!(
                     out,
                     "{kind}  {decision}  {}  {}  {} {}",
-                    record.upstream, record.identifier, record.resource, record.permission
+                    printable(&record.upstream),
+                    printable(&record.identifier),
+                    printable(&record.resource),
+                    printable(&record.permission)
                 )?;
                 if let Some(marker) = &record.marker {
-                    write!(out, "  {marker}")?;
+                    write!(out, "  {}", printable(marker))?;
                 }
                 writeln!(out)?;
             }
@@ -183,13 +203,15 @@ pub(crate) fn render(
 }
 
 /// Reads what is new in the log and writes the matching records. One debug
-/// line names the boxes and the segments read.
+/// line names the boxes and the segments read. A line that is not a record
+/// is counted on `err`, so a damaged log is never silent.
 fn read_and_render(
     reader: &mut LogReader,
     subjects: &BTreeSet<String>,
     output: Option<BoxAuditOutputFormat>,
     name_box: bool,
     out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> anyhow::Result<usize> {
     let batch = reader
         .read_new()
@@ -203,6 +225,19 @@ fn read_and_render(
     );
     let written = render(&batch.entries, subjects, output, name_box, out)?;
     out.flush()?;
+    if batch.skipped > 0 {
+        let (lines, are, they) = if batch.skipped == 1 {
+            ("line", "is not an audit record", "It is")
+        } else {
+            ("lines", "are not audit records", "They are")
+        };
+        writeln!(
+            err,
+            "The audit log in {} has {} {lines} that {are}. {they} not shown.",
+            reader.dir().display(),
+            batch.skipped
+        )?;
+    }
     Ok(written)
 }
 
@@ -214,15 +249,20 @@ pub(crate) fn follow(
     output: Option<BoxAuditOutputFormat>,
     name_box: bool,
     out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
     mut wait: impl FnMut() -> bool,
 ) -> anyhow::Result<()> {
     loop {
-        read_and_render(reader, subjects, output, name_box, out)?;
+        read_and_render(reader, subjects, output, name_box, out, err)?;
         if !wait() {
             return Ok(());
         }
     }
 }
+
+/// Whether the boxes from [`known_boxes`] carry their parent. The daemon's
+/// listing has no parent field yet.
+const LISTING_RECORDS_PARENTS: bool = false;
 
 /// The boxes the daemon lists. The listing carries no parent, so no box
 /// has a known child yet.
@@ -247,10 +287,16 @@ async fn known_boxes(global: &GlobalArgs) -> anyhow::Result<Vec<KnownBox>> {
 }
 
 /// The work of `min box audit`, over the log in `dir` and the boxes in
-/// `known`. Messages go to `err`, records to `out`.
+/// `known`. Messages go to `err`, records to `out`. `parents_recorded`
+/// says whether `known` carries each box's parent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one input the tests replace"
+)]
 pub(crate) fn run(
     args: &BoxAuditArgs,
     known: &[KnownBox],
+    parents_recorded: bool,
     in_box: bool,
     dir: &Path,
     out: &mut dyn std::io::Write,
@@ -260,6 +306,14 @@ pub(crate) fn run(
     let (resolved, subjects, name_box) = match (&args.target, &args.parent) {
         (_, Some(parent)) => {
             let resolved = resolve(parent, known, in_box)?;
+            if !parents_recorded {
+                anyhow::bail!(
+                    "`min box audit --parent` cannot run here: this host does not record \
+                     which boxes are children of box {}. \
+                     Run `min box audit <box>` for each child box.",
+                    resolved.id()
+                );
+            }
             let subjects = children(resolved.id(), known);
             (resolved, subjects, true)
         }
@@ -271,16 +325,24 @@ pub(crate) fn run(
         (None, None) => anyhow::bail!("Name a box: run `min box audit <box>`."),
     };
     if let Resolved::Name { name, id } = &resolved {
-        writeln!(err, "Showing {name} (box {id}).")?;
+        writeln!(err, "Showing {} (box {id}).", printable(name))?;
     }
     if args.parent.is_some() && subjects.is_empty() {
         writeln!(err, "Box {} has no child boxes.", resolved.id())?;
     }
     let mut reader = LogReader::new(dir);
     if args.follow {
-        return follow(&mut reader, &subjects, args.output, name_box, out, wait);
+        return follow(
+            &mut reader,
+            &subjects,
+            args.output,
+            name_box,
+            out,
+            err,
+            wait,
+        );
     }
-    let written = read_and_render(&mut reader, &subjects, args.output, name_box, out)?;
+    let written = read_and_render(&mut reader, &subjects, args.output, name_box, out, err)?;
     if written == 0 && !subjects.is_empty() {
         writeln!(
             err,
@@ -313,6 +375,7 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
     run(
         &args,
         &known,
+        LISTING_RECORDS_PARENTS,
         in_box,
         &dir,
         &mut stdout,
@@ -382,7 +445,7 @@ mod tests {
         dir: &Path,
     ) -> (anyhow::Result<()>, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = run(args, boxes, in_box, dir, &mut out, &mut err, || false);
+        let result = run(args, boxes, true, in_box, dir, &mut out, &mut err, || false);
         (
             result,
             String::from_utf8(out).unwrap(),
@@ -437,6 +500,35 @@ mod tests {
         result.unwrap();
         assert!(out.is_empty());
         assert!(err.contains("no audit records for box 01950000-"), "{err}");
+
+        // A line that is not a record is counted on stderr, never silent.
+        {
+            use std::io::Write as _;
+            let mut segment = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(segment_name(2)))
+                .unwrap();
+            writeln!(segment, "not a record").unwrap();
+        }
+        let (result, out, err) =
+            run_to_strings(&args(Some(A), None, false), &[], false, dir.path());
+        result.unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(
+            err.ends_with("has 1 line that is not an audit record. It is not shown.\n"),
+            "{err}"
+        );
+
+        // A field the box controls cannot reach the terminal as a control
+        // sequence: text mode escapes it.
+        append(dir.path(), 3, &[(A, "\u{1b}]0;owned\u{7}evil.example:443")]);
+        let (result, out, _) = run_to_strings(&args(Some(A), None, false), &[], false, dir.path());
+        result.unwrap();
+        assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
+        assert!(
+            out.contains("\\u{1b}]0;owned\\u{7}evil.example:443"),
+            "{out}"
+        );
     }
 
     // BEP-042: a name reads the live box of that name, else the newest
@@ -500,20 +592,29 @@ mod tests {
 
         let mut reader = LogReader::new(dir.path());
         let subjects = BTreeSet::from([A.to_owned()]);
-        let mut out = Vec::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
         let mut rounds = 0;
         let path = dir.path().to_path_buf();
-        follow(&mut reader, &subjects, None, false, &mut out, || {
-            rounds += 1;
-            match rounds {
-                // The writer appends after the replay, then rotates.
-                1 => append(&path, 1, &[(A, "new.example:443"), (B, "b2.example:443")]),
-                2 => append(&path, 2, &[(A, "rotated.example:443")]),
-                _ => return false,
-            }
-            true
-        })
+        follow(
+            &mut reader,
+            &subjects,
+            None,
+            false,
+            &mut out,
+            &mut err,
+            || {
+                rounds += 1;
+                match rounds {
+                    // The writer appends after the replay, then rotates.
+                    1 => append(&path, 1, &[(A, "new.example:443"), (B, "b2.example:443")]),
+                    2 => append(&path, 2, &[(A, "rotated.example:443")]),
+                    _ => return false,
+                }
+                true
+            },
+        )
         .unwrap();
+        assert!(err.is_empty());
         let out = String::from_utf8(out).unwrap();
         let hosts: Vec<&str> = out
             .lines()
@@ -567,6 +668,27 @@ mod tests {
         result.unwrap();
         assert!(out.is_empty());
         assert_eq!(err, format!("Box {B} has no child boxes.\n"));
+
+        // A listing without parents refuses, and says how to read each box.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = run(
+            &args(None, Some("web"), false),
+            &boxes,
+            false,
+            false,
+            dir.path(),
+            &mut out,
+            &mut err,
+            || false,
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("does not record"), "{message}");
+        assert!(
+            message.contains(&format!("children of box {A}")),
+            "{message}"
+        );
+        assert!(message.contains("min box audit <box>"), "{message}");
+        assert!(out.is_empty() && err.is_empty());
     }
 
     // BEP-042: un-enrolled, `self` inside a box is the defined error.
