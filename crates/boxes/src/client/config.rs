@@ -30,6 +30,23 @@ pub struct Config {
     /// within stay `snake_case` to match the rest of the config.
     #[serde(default, rename = "session-keys")]
     pub session_keys: SessionKeysConfig,
+    /// `[secrets]` section: the operator's choices about broker
+    /// secrets.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+/// The `[secrets]` section.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SecretsConfig {
+    /// When true, a GitHub grant that declares scopes narrower than
+    /// `full` is accepted on an un-enrolled host, which mints it
+    /// `full` (BEP-057). Read from the user and organization
+    /// configuration only, never from a project.
+    #[serde(default)]
+    pub acknowledge_full_breadth_unenrolled: bool,
 }
 
 /// The `[loadouts]` section.
@@ -309,6 +326,44 @@ mod tests {
         let path = write_file(dir.path(), "config.toml", "= not = toml =");
         let err = read_config_or_default(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    /// A file with both `[loadouts]` and `[secrets]` parses, and the
+    /// full-breadth acknowledgement round-trips (BEP-057).
+    #[test]
+    fn read_config_file_loadouts_and_secrets() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r#"
+                [loadouts]
+                default_loadouts = ["helix"]
+
+                [secrets]
+                acknowledge_full_breadth_unenrolled = true
+            "#},
+        );
+        let cfg = read_config_file(&path).unwrap();
+        assert_eq!(cfg.loadouts.default_loadouts, vec!["helix"]);
+        assert!(cfg.secrets.acknowledge_full_breadth_unenrolled);
+        // Omitted, the acknowledgement is off.
+        assert!(
+            !Config::default()
+                .secrets
+                .acknowledge_full_breadth_unenrolled
+        );
+    }
+
+    /// An unknown key in `[secrets]` is a parse error.
+    #[test]
+    fn secrets_unknown_field_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(dir.path(), "config.toml", "[secrets]\nacknowledge = true\n");
+        assert!(matches!(
+            read_config_file(&path).unwrap_err(),
+            ConfigError::Parse { .. }
+        ));
     }
 
     // --- [session-keys] ------------------------------------------------
