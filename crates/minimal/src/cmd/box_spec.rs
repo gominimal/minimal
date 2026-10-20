@@ -21,7 +21,7 @@ use crate::{BoxSpecArgs, GlobalArgs};
 
 /// What [`render`] reads.
 pub(crate) struct SpecInputs<'a> {
-    /// The root CA key's SHA-256 fingerprint, or `None` when the proxy has
+    /// The root CA key's RFC 7638 JWK thumbprint under SHA-256, or `None` when the proxy has
     /// not published it.
     pub root_fingerprint: Option<&'a str>,
     /// `[session.network.bep]`.
@@ -75,7 +75,9 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     }
 
     match inputs.root_fingerprint {
-        Some(fingerprint) => writeln!(out, "root CA  SHA256:{fingerprint}")?,
+        // The proxy issues no root certificate yet, so this is the key's
+        // RFC 7638 thumbprint, not a certificate fingerprint. The label says so.
+        Some(fingerprint) => writeln!(out, "root CA  key thumbprint SHA256:{fingerprint}")?,
         None => writeln!(
             out,
             "root CA  not published yet. The proxy publishes it when it starts."
@@ -255,7 +257,7 @@ mod tests {
         let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
         assert_eq!(
             text,
-            "root CA  SHA256:abc123\n\
+            "root CA  key thumbprint SHA256:abc123\n\
              grant  github:user-token  full  GH_TOKEN  hosts github.com, api.github.com, \
              uploads.github.com, codeload.github.com\n\
              store  keychain:npm  NPM_TOKEN  no hosts registered\n\
