@@ -10,6 +10,12 @@
 //! child of a box onto one stream. `--follow` replays and then tails.
 //! `self` is refused on a host that is not enrolled.
 //!
+//! Interim: the client reads the operator-owned log files under file mode,
+//! on the host. The design reads over the proxy's local socket (ruled on
+//! gominimal/arch#137). The interim is
+//! <https://github.com/gominimal/minimal/issues/2459>, and it ends when
+//! <https://github.com/gominimal/minimal/issues/2463> serves the read.
+//!
 //! [`resolve`], [`children`] and [`render`] are pure. [`follow`] takes its
 //! wait step as a closure. [`cmd_box_audit`] gathers the boxes this host
 //! knows from the daemon's listing.
@@ -33,7 +39,7 @@ const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50
 
 /// `min box audit self` inside a box, on a host that is not enrolled.
 #[derive(Debug)]
-pub(crate) struct AuditSelfUnsupportedUnenrolled;
+pub struct AuditSelfUnsupportedUnenrolled;
 
 impl std::fmt::Display for AuditSelfUnsupportedUnenrolled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,14 +54,7 @@ impl std::error::Error for AuditSelfUnsupportedUnenrolled {}
 
 impl AuditSelfUnsupportedUnenrolled {
     /// The defined error code a script can branch on.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the machine-output error object reads it once `-o jsonl` errors are wired"
-        )
-    )]
-    pub(crate) const fn code(&self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         AUDIT_SELF_UNSUPPORTED_UNENROLLED
     }
 }
@@ -96,7 +95,9 @@ impl Resolved {
 /// `self` gets the defined error (BEP-042). Any other target gets the
 /// command to run on the host.
 // Interim: flip when the proxy serves the read over its local socket
-// (architecture, audit paragraph; Gatehouse §6.10). The refusal of `self`
+// (architecture, audit paragraph; Gatehouse §6.10), the same flip as the
+// direct read: https://github.com/gominimal/minimal/issues/2459, ended by
+// https://github.com/gominimal/minimal/issues/2463. The refusal of `self`
 // stays until a Gatehouse answers it.
 pub(crate) fn refuse_in_box(args: &BoxAuditArgs, in_box: bool) -> anyhow::Result<()> {
     if !in_box {
@@ -285,9 +286,11 @@ pub(crate) fn follow(
 
 /// Whether the boxes from [`known_boxes`] carry their parent. The daemon's
 /// listing has no parent field yet, so `--parent` is refused.
-// Interim, fail closed: flip to `true` when `ListSessionsEntry` carries
-// the box's parent (architecture, audit paragraph) and `known_boxes` maps
-// it. No issue is named here yet. The pull request lists this as undone.
+// Interim, fail closed: https://github.com/gominimal/minimal/issues/2386
+// (T1 of spec 29: the record, store and clients carry `parent`) makes the
+// listing carry the box's parent (architecture, audit paragraph). Set this
+// const to `true` when `ListSessionsEntry` carries it and `known_boxes`
+// maps it.
 const LISTING_RECORDS_PARENTS: bool = false;
 
 /// The boxes the daemon lists. The listing carries no parent, so no box
@@ -369,6 +372,15 @@ pub(crate) fn run(
     }
     let written = read_and_render(&mut reader, &subjects, args.output, name_box, out, err)?;
     if written == 0 && !subjects.is_empty() {
+        if !dir.exists() {
+            writeln!(
+                err,
+                "There is no audit log in {}, so no records for box {} are shown.",
+                dir.display(),
+                resolved.id()
+            )?;
+            return Ok(());
+        }
         writeln!(
             err,
             "The proxy has no audit records for box {}.",
@@ -399,6 +411,8 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
     // directly. The architecture's audit paragraph and Gatehouse §6.10 put
     // the un-enrolled read behind the proxy's local socket. Flip to that
     // read when the proxy serves it, and drop this direct read.
+    // Tracked by https://github.com/gominimal/minimal/issues/2459, ended by
+    // https://github.com/gominimal/minimal/issues/2463.
     let dir = bep::audit::default_dir()
         .context("cannot find the home directory, so the audit log cannot be found")?;
     let mut stdout = std::io::stdout().lock();
@@ -531,6 +545,19 @@ mod tests {
         result.unwrap();
         assert!(out.is_empty());
         assert!(err.contains("no audit records for box 01950000-"), "{err}");
+
+        // A missing log directory is named, not read as no activity.
+        let missing = dir.path().join("missing");
+        let (result, out, err) = run_to_strings(&args(Some(A), None, false), &[], false, &missing);
+        result.unwrap();
+        assert!(out.is_empty());
+        assert_eq!(
+            err,
+            format!(
+                "There is no audit log in {}, so no records for box {A} are shown.\n",
+                missing.display()
+            )
+        );
 
         // A line that is not a record is counted on stderr, never silent.
         {
@@ -743,8 +770,23 @@ mod tests {
             );
             assert!(out.is_empty() && err.is_empty());
         }
-        // Inside a box, a box id or a name is refused too, with the
-        // command to run on the host.
+        // On the host, `self` names no box.
+        let (result, _, _) =
+            run_to_strings(&args(Some("self"), None, false), &[], false, dir.path());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<AuditSelfUnsupportedUnenrolled>()
+                .is_none()
+        );
+        assert!(error.to_string().contains("not inside a box"), "{error}");
+    }
+
+    // BEP-042: inside a box, a box id or a `--parent` target is refused
+    // too, with the command to run on the host, and nothing is read.
+    #[test]
+    fn box_audit_in_box_refuses_every_target() {
+        let dir = tempfile::tempdir().unwrap();
         for (audit_args, command) in [
             (args(Some(A), None, false), format!("`min box audit {A}`")),
             (
@@ -769,16 +811,6 @@ mod tests {
             );
             assert!(out.is_empty() && err.is_empty());
         }
-        // On the host, `self` names no box.
-        let (result, _, _) =
-            run_to_strings(&args(Some("self"), None, false), &[], false, dir.path());
-        let error = result.unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<AuditSelfUnsupportedUnenrolled>()
-                .is_none()
-        );
-        assert!(error.to_string().contains("not inside a box"), "{error}");
     }
 
     // The grammar: a box or --parent, never both.

@@ -34,6 +34,7 @@ pub(crate) use session::{daemon_provider_kind, vm_host_control_sock, withdraw_bo
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_status};
+pub use box_audit::AuditSelfUnsupportedUnenrolled;
 pub use finalize_install::*;
 pub use list::*;
 pub use net::*;

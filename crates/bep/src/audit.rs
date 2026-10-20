@@ -500,8 +500,12 @@ fn segment_number(name: &str) -> Option<u64> {
 ///
 /// Interim: `min box audit` reads this directory directly, through
 /// [`LogReader`]. Un-enrolled, the architecture's audit paragraph and
-/// Gatehouse §6.10 put the read behind the proxy's local socket. When the
-/// proxy serves the read there, the client stops reading this directory.
+/// Gatehouse §6.10 put the read behind the proxy's local socket (ruled on
+/// gominimal/arch#137). The interim is tracked by
+/// <https://github.com/gominimal/minimal/issues/2459>. When the proxy
+/// serves the read there
+/// (<https://github.com/gominimal/minimal/issues/2463>), the client stops
+/// reading this directory.
 pub fn default_dir() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/audit"))
 }
@@ -549,6 +553,12 @@ pub struct ReadBatch {
 /// retained segment. The first [`read_new`](Self::read_new) call reads the
 /// whole log. Each later call reads only what the proxy appended since,
 /// so a caller can replay the log and then tail it.
+///
+/// Interim: the client reads the operator-owned log files directly, under
+/// file mode, in place of the read over the proxy's local socket. See
+/// <https://github.com/gominimal/minimal/issues/2459>. The flip is
+/// <https://github.com/gominimal/minimal/issues/2463>, when the proxy
+/// serves the read.
 #[derive(Debug)]
 pub struct LogReader {
     dir: PathBuf,
@@ -585,7 +595,11 @@ impl LogReader {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),
             };
-            if file.metadata()?.len() <= start {
+            let len = file.metadata()?.len();
+            // A segment shorter than the place already read was truncated
+            // or replaced, so read it again from its start.
+            let start = if len < start { 0 } else { start };
+            if len == start {
                 continue;
             }
             file.seek(SeekFrom::Start(start))?;
@@ -876,6 +890,28 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(log);
         AuditLog::open(dir.log()).unwrap();
+    }
+
+    // A segment replaced by a shorter file is read again from its start,
+    // and is not skipped for the rest of a `--follow` run.
+    #[test]
+    fn log_reader_rereads_a_truncated_segment() {
+        let dir = TempDir::new();
+        let segment = dir.0.join(segment_name(1));
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        let mut reader = LogReader::new(&dir.0);
+        assert_eq!(reader.read_new().unwrap().entries.len(), 2);
+
+        fs::remove_file(&segment).unwrap();
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        let batch = reader.read_new().unwrap();
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.entries[0].record.upstream, "example.com:443");
     }
 
     // BEP-041: the descriptor carries O_APPEND and no truncate, and earlier
