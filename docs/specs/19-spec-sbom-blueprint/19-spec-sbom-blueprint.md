@@ -273,6 +273,18 @@ developer running agent boxes; build-infra operator; auditor.
     any of the fields it copies from it, bundled or not.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_credential_planted_in_a_per_package_document_never_emitted
+  - THE SYSTEM SHALL accept a string copied from a per-package document
+    (a name, version, `purl`, tool name or tool version) only when it is
+    valid UTF-8 of at most 256 bytes with no control character (U+0000 to
+    U+001F, U+007F) and no line or paragraph separator, and a location
+    only when it is at most 2048 bytes of the same kind, and SHALL treat a
+    document carrying any other value as unresolved (SBOM-012's failure,
+    exit code 6, naming the field), so no document can put a control
+    character, markup or an oversized value into a serializer's output;
+    the serializers escape every string they emit regardless.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_document_strings_are_bounded_and_control_free
+    property: for all documents d, fields f ∈ copied(d): read(d) ⇒ utf8(f) ∧ len(f) ≤ limit(f) ∧ ∀c ∈ f: ¬control(c) ∧ ¬separator(c); a planted control character, markup string or 257-byte name makes d unresolved
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
@@ -345,7 +357,8 @@ developer running agent boxes; build-infra operator; auditor.
     failure, and unresolved(o) is SBOM-013's set
     (subject mismatch with both digests as check(o), a failed bundle check
     by name, an absent pinned bundle on a reachable host, a document the
-    pin records no bundle for under require_bundles)
+    pin records no bundle for under require_bundles, a copied string that
+    fails SBOM-008's validation with the field as check(o))
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
