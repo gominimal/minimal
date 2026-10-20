@@ -24,6 +24,13 @@ pub use boxes::{
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// The message every RPC refusal carries once the daemon has begun its
+/// shutdown: a client racing `min stop` matches on it to name the lost race
+/// in plain language instead of surfacing the raw RPC chain. Matching keys
+/// on this exact text across builds, so changing it is a wire-contract
+/// change, not display copy.
+pub const SHUTDOWN_REFUSAL: &str = "the daemon is shutting down";
+
 /// Describes a minimal-specific RPC method sent over ssh.
 ///
 /// Oneshot RPCs are not streaming. The trait pairs a subsystem name with its
