@@ -47,7 +47,8 @@ use crate::module::Module;
 /// cache, and the node-plane baseline set. The module host sets stay in the
 /// union: the store-rule check of BEP-034 refuses a rule that names them,
 /// but the root permits them. When the BEP-034 task lands its deny set, the
-/// infrastructure names of that set replace this list. The issue that tracks the full set is not filed yet.
+/// infrastructure names of that set replace this list. The full set is
+/// tracked in <https://github.com/gominimal/minimal/issues/2441>.
 pub const DENY_SET: &[&str] = &[
     // The box-internal names (`host.min.internal` and the services under it).
     "min.internal",
@@ -75,8 +76,8 @@ const LEAF_VALIDITY: Duration = Duration::from_secs(7 * DAY);
 /// No production key implements this trait yet. The CA key is in the host
 /// keychain (BEP-014), but nothing can sign with it, so the signing CA is
 /// not keychain-held until the `Keychain` and `MemoryKey` keys of `keys.rs`
-/// implement `CaKey`. That work is outside this module. The issue that
-/// tracks it is not filed yet.
+/// implement `CaKey`. That work is outside this module. It is tracked in
+/// <https://github.com/gominimal/minimal/issues/2440>.
 pub trait CaKey: HeldKey {
     /// An ECDSA P-256 SHA-256 signature over `msg`, DER-encoded as X9.62
     /// specifies. The private half stays in the store.
