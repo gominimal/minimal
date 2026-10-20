@@ -72,8 +72,14 @@ that gap. Those are the only kinds a package can be. An upstream package
 with no closure entry, or an entry of any other state, is neither a
 digest nor a gap: the pin does not account for the package, and the
 emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe of the cache takes part
-in that decision, so SBOM-001's determinism holds, and a referenced document
-the cache does not have (a 404 as much as a timeout) is SBOM-012's failure.
+in that decision, so SBOM-001's determinism holds. A referenced document is
+**absent** when the cache answers an authoritative not-found for its name;
+every other failure to fetch it (a timeout, a refused connection, a
+malformed answer) is **unfetchable** and is SBOM-012's failure, exit 6,
+under every pin. Absence is SBOM-012's failure while the pin records a
+bundle for the document; while it records none, absence is SBOM-013's
+interim (the component keeps its artifact digest and is marked
+`unverified`, reason `no-document`).
 
 A box's **posture** is what its expanded Box Spec declares it may reach,
 read, write, inherit or expose: `[network]` (mode, `[network.egress]`,
@@ -119,9 +125,11 @@ developer running agent boxes; build-infra operator; auditor.
 ## Requirements
 
 - **SBOM-001** WHEN the same catalog pin and identical declared inputs are
-  emitted twice THE SYSTEM SHALL produce byte-identical documents, deriving
+  emitted twice, the pin recording a bundle for every per-package document
+  it references, THE SYSTEM SHALL produce byte-identical documents, deriving
   serials, namespaces, and timestamps from content and pin, never from wall
-  clock or randomness.
+  clock or randomness (while the pin records no bundle, the interim
+  sub-bullet below bounds how two emissions may differ).
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_regeneration_deterministic
   property: for all pin, inputs, and independent emissions a, b under
@@ -276,9 +284,10 @@ developer running agent boxes; build-infra operator; auditor.
   `non-redistributable`, or `outside-pin` where the stored expanded spec
   records a non-upstream registry for it — THEN THE SYSTEM SHALL emit that component
   carrying that digest gap, never omitting it. (A document the closure
-  *does* reference but that cannot be fetched is not a gap; it is
-  SBOM-012's failure; an upstream package with no entry at all is
-  SBOM-004's exit 6, not a gap.)
+  *does* reference but that is unfetchable is not a gap; it is SBOM-012's
+  failure, as is its absence while the pin records a bundle for it; absence
+  while the pin records none is SBOM-013's interim, not a gap; an upstream
+  package with no entry at all is SBOM-004's exit 6, not a gap.)
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_unreferenced_component_carries_its_gap
   property: for all environments e, k in packages(e): unreferenced(k,
@@ -297,9 +306,11 @@ developer running agent boxes; build-infra operator; auditor.
   whose component set is silently incomplete.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_unfetchable_reference_fails_loudly
-  property: for all attempts a: unfetchable_reference(a) implies not
-    emitted(a) and exit(a) = 6 and error(a) names (pin, unresolved object,
-    remediation)
+  property: for all attempts a and referenced objects o: (unfetchable(o) ∨
+    (absent(o) ∧ pin_records_bundle(o))) ⇒ not emitted(a) ∧ exit(a) = 6 ∧
+    error(a) names (pin, o, remediation), where absent(o) is an
+    authoritative not-found and unfetchable(o) is every other failure, a
+    timeout included
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
@@ -343,25 +354,29 @@ developer running agent boxes; build-infra operator; auditor.
     build-servers#185 not landed, which is every package today) THEN THE
     SYSTEM SHALL emit the component with its artifact digest from the
     closure and no build-time facts, marked `unverified` with the reason
-    `no-document`, and mark the document `partial`, never failing the
-    emission for it; a fetch error other than absence stays SBOM-012's
-    failure. WHILE the pin records a bundle, absence is SBOM-012's failure.
+    `no-document`, mark the document `partial`, and print one diagnostic to
+    stderr per emission that names each `no-document` component and
+    build-servers#185 as the reason, never failing the emission for it; a
+    fetch error other than absence stays SBOM-012's failure. WHILE the pin
+    records a bundle, absence is SBOM-012's failure.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_absent_in_the_interim_is_marked_not_fatal
-    property: ¬pin_records_bundle(d) ∧ absent(d) ⇒ emitted ∧ has_sha256(component(d)) ∧ unverified(component(d), no-document)
-  - WHILE the pin records no bundle for the document (the producer has not
-    published one: build-servers#185) THE SYSTEM SHALL read the document,
-    mark the component `unverified`, as PKV marks an entry whose source has
-    no verified bundle, and print one diagnostic to stderr per emission that
-    names each such component and build-servers#185 as the reason, so the
-    interim is never silent; the document's fields reach the composition
-    only through SBOM-008's allowlist, as a bundled document's do. This
-    path ends by itself: the first pin that
-    records bundles for its documents takes the path above for them, with no
-    flag and no release step.
+    property: ¬pin_records_bundle(d) ∧ absent(d) ⇒ emitted ∧ has_sha256(component(d)) ∧ unverified(component(d), no-document) ∧ stderr names (component(d), "build-servers#185")
+  - WHILE the pin records no bundle for the document, IF the cache holds
+    the document THEN THE SYSTEM SHALL read it, mark the component
+    `unverified` with the reason `no-bundle`, as PKV marks an entry whose
+    source has no verified bundle, and print one diagnostic to stderr per
+    emission that names each such component and build-servers#185 as the
+    reason (the same diagnostic names the `no-document` components), so
+    the interim is never silent; the document's fields reach the
+    composition only through SBOM-008's allowlist, as a bundled document's
+    do, which bounds the name, version and `purl` strings read from an
+    unverified document as it bounds every other field. This path ends by
+    itself: the first pin that records bundles for its documents takes the
+    path above for them, with no flag and no release step.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_without_a_pinned_bundle_is_marked_and_diagnosed
-    property: ¬pin_records_bundle(d) ⇒ read(d) ∧ unverified(component(d)) ∧ stderr names (component(d), "build-servers#185")
+    property: ¬pin_records_bundle(d) ∧ ¬absent(d) ⇒ read(d) ∧ unverified(component(d), no-bundle) ∧ stderr names (component(d), "build-servers#185")
   - A document that carries any `unverified` component is not evidence:
     its build facts for those components are whatever the cache's writer
     put under a correct subject. THE SYSTEM SHALL mark such a document at
@@ -375,15 +390,19 @@ developer running agent boxes; build-infra operator; auditor.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_with_unverified_components_is_marked_partial_at_the_top_level
     property: (∃k: unverified(k)) ⇔ marked_partial(parse_s(emit_s(c))) for every serializer s
-  - THE SYSTEM SHALL emit the `unverified` mark on the component in every
-    serializer — CycloneDX: a `minimal:verification` property with the value
-    `unverified`; SPDX: an annotation of the same text on the package;
-    Blueprint: `verification = "unverified"` on the component — so a reader
-    tells data read without a verified bundle from data read with one, and
-    never from the document's silence.
+  - THE SYSTEM SHALL emit the `unverified` mark and its reason on the
+    component in every serializer — CycloneDX: a `minimal:verification`
+    property with the value `unverified` and a `minimal:verification-reason`
+    property with `no-document` or `no-bundle`; SPDX: an annotation
+    `minimal:verification=unverified;reason=<reason>` on the package;
+    Blueprint: `verification = "unverified"` and `verification_reason =
+    "<reason>"` on the component — so a reader tells data read without a
+    verified bundle from data read with one, and a component with no
+    document from one with an unbundled document, never from the
+    document's silence.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_unverified_mark_emitted_by_every_serializer
-    property: for all serializers s, components k: unverified(k) ⇔ marked_unverified(parse_s(emit_s(c)), k)
+    property: for all serializers s, components k: unverified(k, r) ⇔ marked_unverified(parse_s(emit_s(c)), k, r)
   - WHERE the emitter's `require_bundles` option is set THE SYSTEM SHALL treat a document
     the pin records no bundle for as unresolved (SBOM-012's failure, exit
     code 6, naming the missing bundle) instead of reading it: the strict
