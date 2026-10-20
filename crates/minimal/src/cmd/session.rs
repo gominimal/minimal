@@ -653,6 +653,7 @@ fn refuse_unhonourable_grants(
     egress: Option<&boxes::EgressPolicy>,
     settings: &boxes::core::bep::BepSettings,
     secrets: &boxes::core::bep::SecretGrants,
+    full_breadth_acknowledged: bool,
 ) -> Result<(), anyhow::Error> {
     use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
     let hosts: Vec<&str> = bep::module::GITHUB
@@ -666,7 +667,13 @@ fn refuse_unhonourable_grants(
         bep: settings,
         secrets,
     };
-    let plan = check_activation(&spec, HostFacts::LOCAL, &hosts)?;
+    // BEP-057: the client configuration's acknowledgement, the same one
+    // `min box spec` reads, so the preview and the start agree.
+    let host = HostFacts {
+        full_breadth_acknowledged,
+        ..HostFacts::LOCAL
+    };
+    let plan = check_activation(&spec, host, &hosts)?;
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
     }
@@ -767,11 +774,18 @@ pub(crate) async fn activate_session(
 
     // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
     // refused here, before the daemon starts and before anything is created.
+    // BEP-057: the client configuration is read only when a grant needs the
+    // acknowledgement, so a box with no narrow grant never depends on it.
+    let full_breadth_acknowledged = project_secrets
+        .values()
+        .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
+        && crate::config::full_breadth_acknowledged(global)?;
     refuse_unhonourable_grants(
         args.network.into(),
         policy.egress.as_ref(),
         &project_bep,
         &project_secrets,
+        full_breadth_acknowledged,
     )?;
     ensure_daemon(global)?;
 
@@ -4971,6 +4985,45 @@ mod tests {
         );
     }
 
+    /// BEP-057: the start path honours the client configuration's
+    /// full-breadth acknowledgement, the same as `min box spec` does.
+    #[test]
+    fn start_honours_full_breadth_acknowledgement() {
+        let project = tempfile::tempdir().expect("project dir");
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            "[session.network.bep]\nsteering = \"proxy_env\"\n\
+             [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+             scopes = [\"github:repo:read\"]\n",
+        )
+        .expect("write minimal.toml");
+        let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
+        let (bep, secrets) = project_bep_and_grants(path).expect("loads");
+        // The egress here is unset, so both runs refuse for that too. Only
+        // the narrow-scope refusal depends on the acknowledgement.
+        let narrow = |acknowledged: bool| {
+            let err = refuse_unhonourable_grants(
+                boxes::NetworkMode::OwnIp,
+                None,
+                &bep,
+                &secrets,
+                acknowledged,
+            )
+            .expect_err("refused for the egress");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .expect("an activation refusal");
+            refused.refusals.iter().any(|refusal| {
+                matches!(
+                    refusal,
+                    boxes::core::bep::BepRefusal::NarrowScopesUnenrolled { .. }
+                )
+            })
+        };
+        assert!(narrow(false), "refused without the acknowledgement");
+        assert!(!narrow(true), "accepted with the acknowledgement");
+    }
+
     /// BEP-016: a `[session.network.bep]` setting alone declares no
     /// credentialed upstream. The set is derived from broker grants.
     #[test]
@@ -4985,7 +5038,7 @@ mod tests {
         let (bep, secrets) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
-        refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets)
+        refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false)
             .expect("accepted");
     }
 
@@ -5018,8 +5071,9 @@ mod tests {
         };
         let secrets = boxes::core::bep::SecretGrants::new();
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
-        let err = refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets)
-            .expect_err("refused");
+        let err =
+            refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false)
+                .expect_err("refused");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");

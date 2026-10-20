@@ -77,6 +77,21 @@ pub enum Quic443 {
     Allow,
 }
 
+impl Quic443 {
+    /// Whether the stance in effect blocks UDP to port 443. `block` always
+    /// blocks and `allow` never does. `auto` blocks exactly when the box
+    /// has a credentialed upstream and `steering` is `dns` or `both`
+    /// (BEP-018).
+    #[must_use]
+    pub fn blocks(self, credentialed_upstream: bool, steering: Steering) -> bool {
+        match self {
+            Quic443::Block => true,
+            Quic443::Allow => false,
+            Quic443::Auto => credentialed_upstream && steering.needs_resolver(),
+        }
+    }
+}
+
 /// The `[network.bep]` table. Every field is optional, so an absent table
 /// and an empty one read the same.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -166,6 +181,98 @@ impl SecretGrant {
     pub fn is_github(&self) -> bool {
         self.is_credentialed() && self.scopes.iter().any(|scope| scope.starts_with("github:"))
     }
+
+    /// The `github:repo:*` scopes narrower than `full`: every one but
+    /// `github:repo:full`. An un-enrolled host cannot narrow a member, so
+    /// it mints such a grant `full` (BEP-057).
+    #[must_use]
+    pub fn narrow_scopes(&self) -> Vec<&str> {
+        self.scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|scope| {
+                scope
+                    .strip_prefix("github:repo:")
+                    .is_some_and(|rest| rest != "full")
+            })
+            .collect()
+    }
+
+    /// Whether this is a GitHub grant that declares a scope narrower than
+    /// `full`.
+    #[must_use]
+    pub fn is_narrower_than_full(&self) -> bool {
+        self.is_github() && !self.narrow_scopes().is_empty()
+    }
+}
+
+/// The client configuration key that accepts a `full` member for a grant
+/// that declares narrower scopes on an un-enrolled host (BEP-057). It is
+/// read from the user and organization `config.toml` `[secrets]` table,
+/// never from a project.
+pub const FULL_BREADTH_ACKNOWLEDGEMENT: &str = "acknowledge_full_breadth_unenrolled";
+
+/// A project's `[session.secrets]` table as a project file declares it.
+/// A project cannot set [`FULL_BREADTH_ACKNOWLEDGEMENT`]: the reader drops
+/// that key and records that it did, so the caller can warn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectSecrets {
+    /// The grants, by the environment variable each one lands in.
+    pub grants: SecretGrants,
+    /// Whether the table set the acknowledgement, which was ignored.
+    pub acknowledgement_ignored: bool,
+}
+
+/// The warning for a project that sets the acknowledgement.
+pub const PROJECT_ACKNOWLEDGEMENT_IGNORED: &str = "minimal.toml sets \
+     acknowledge_full_breadth_unenrolled in [session.secrets]. A project cannot set it, \
+     so it is ignored. Set it in [secrets] in your own config.toml instead. \
+     Run `min dirs` to find that file.";
+
+impl<'de> Deserialize<'de> for ProjectSecrets {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ProjectSecrets;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a table of secret grants")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = ProjectSecrets::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == FULL_BREADTH_ACKNOWLEDGEMENT {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                        out.acknowledgement_ignored = true;
+                    } else {
+                        let grant = map.next_value::<SecretGrant>()?;
+                        out.grants.insert(key, grant);
+                    }
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// Reads a project's `[session.secrets]` table for `serde(deserialize_with)`.
+/// It ignores the full-breadth acknowledgement with a warning, because only
+/// the client configuration can set it (BEP-057).
+///
+/// # Errors
+///
+/// The deserializer's error when a grant does not parse.
+pub fn deserialize_project_secrets<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SecretGrants, D::Error> {
+    let secrets = ProjectSecrets::deserialize(deserializer)?;
+    if secrets.acknowledgement_ignored {
+        tracing::warn!("{PROJECT_ACKNOWLEDGEMENT_IGNORED}");
+    }
+    Ok(secrets.grants)
 }
 
 /// The `[secrets]` table: grants by the environment variable that carries
@@ -179,13 +286,17 @@ pub struct HostFacts {
     pub enrolled: bool,
     /// Whether the host runs a box-zone resolver.
     pub box_zone_resolver: bool,
+    /// Whether the client configuration sets
+    /// [`FULL_BREADTH_ACKNOWLEDGEMENT`]. It matters only un-enrolled.
+    pub full_breadth_acknowledged: bool,
 }
 
 impl HostFacts {
-    /// An un-enrolled host with no box-zone resolver: every host today.
+    /// An un-enrolled host with no box-zone resolver and no acknowledgement.
     pub const LOCAL: Self = Self {
         enrolled: false,
         box_zone_resolver: false,
+        full_breadth_acknowledged: false,
     };
 }
 
@@ -243,6 +354,14 @@ pub enum BepRefusal {
         /// The grant's name.
         grant: String,
     },
+    /// BEP-057: a grant narrower than `full` on an un-enrolled host with no
+    /// acknowledgement.
+    NarrowScopesUnenrolled {
+        /// The grant's name.
+        grant: String,
+        /// The narrower scopes it declares.
+        scopes: Vec<String>,
+    },
 }
 
 impl BepRefusal {
@@ -255,6 +374,7 @@ impl BepRefusal {
             Self::SteeringOffWithProxyEnv => "BEP-010",
             Self::NoResolver { .. } => "BEP-017",
             Self::InstallationUnenrolled { .. } => "BEP-056",
+            Self::NarrowScopesUnenrolled { .. } => "BEP-057",
         }
     }
 
@@ -267,6 +387,9 @@ impl BepRefusal {
             Self::SteeringOffWithProxyEnv => "network.bep.steering, network.bep.proxy_env",
             Self::NoResolver { .. } => "secrets, network.bep.steering",
             Self::InstallationUnenrolled { .. } => "secrets.mode",
+            Self::NarrowScopesUnenrolled { .. } => {
+                "secrets.scopes, config [secrets] acknowledge_full_breadth_unenrolled"
+            }
         }
     }
 }
@@ -305,6 +428,15 @@ impl fmt::Display for BepRefusal {
                 "The GitHub secret {grant} sets mode = \"installation\", but this host is \
                  not enrolled, so it cannot act as a GitHub App installation. \
                  Set mode = \"user\"."
+            ),
+            Self::NarrowScopesUnenrolled { grant, scopes } => write!(
+                f,
+                "The GitHub secret {grant} asks for {}, but this host is not enrolled, \
+                 so it cannot limit the secret to those scopes. The secret will reach every \
+                 repository your GitHub sign-in reaches. To accept this, set \
+                 acknowledge_full_breadth_unenrolled = true in [secrets] in your \
+                 config.toml. Run `min dirs` to find that file.",
+                scopes.join(", ")
             ),
         }
     }
@@ -436,6 +568,23 @@ pub fn refusals(
             }
         }
     }
+
+    // BEP-057: un-enrolled, a narrower grant is minted `full`, which the
+    // client configuration must accept.
+    if !host.enrolled && !host.full_breadth_acknowledged {
+        for (name, grant) in spec.secrets {
+            if grant.is_narrower_than_full() {
+                out.push(BepRefusal::NarrowScopesUnenrolled {
+                    grant: name.clone(),
+                    scopes: grant
+                        .narrow_scopes()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                });
+            }
+        }
+    }
     out
 }
 
@@ -495,6 +644,7 @@ mod tests {
     const RESOLVER_HOST: HostFacts = HostFacts {
         enrolled: false,
         box_zone_resolver: true,
+        full_breadth_acknowledged: false,
     };
 
     fn github_grant(mode: Option<GrantMode>) -> SecretGrant {
@@ -626,6 +776,7 @@ mod tests {
         (any::<bool>(), any::<bool>()).prop_map(|(enrolled, box_zone_resolver)| HostFacts {
             enrolled,
             box_zone_resolver,
+            full_breadth_acknowledged: false,
         })
     }
 
@@ -722,7 +873,7 @@ mod tests {
             client in client_env_grants(),
             enrolled in any::<bool>(),
         ) {
-            let host = HostFacts { enrolled, box_zone_resolver: false };
+            let host = HostFacts { enrolled, box_zone_resolver: false, full_breadth_acknowledged: false };
 
             let client_spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &client };
             let client_fired = refusals(&client_spec, host, GITHUB_HOSTS)
@@ -760,7 +911,7 @@ mod tests {
             secrets in any_grants(),
             box_zone_resolver in any::<bool>(),
         ) {
-            let host = HostFacts { enrolled: false, box_zone_resolver };
+            let host = HostFacts { enrolled: false, box_zone_resolver, full_breadth_acknowledged: false };
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
             let expected: Vec<String> = secrets
                 .iter()
@@ -781,6 +932,110 @@ mod tests {
                 prop_assert!(refused.to_string().contains(first.as_str()));
             }
         }
+    }
+
+    proptest! {
+        /// BEP-057: on an un-enrolled host the refusal fires iff a GitHub
+        /// grant declares a `github:repo:*` scope narrower than `full` and
+        /// the client configuration does not acknowledge full breadth. It
+        /// names the grant and the acknowledgement.
+        #[test]
+        fn prop_narrow_scopes_unenrolled_need_acknowledgement(
+            network in any_network(),
+            egress in any_egress(),
+            bep in any_bep(),
+            secrets in any_grants(),
+            box_zone_resolver in any::<bool>(),
+            enrolled in any::<bool>(),
+            acknowledged in any::<bool>(),
+        ) {
+            let host = HostFacts { enrolled, box_zone_resolver, full_breadth_acknowledged: acknowledged };
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let expected: Vec<String> = if enrolled || acknowledged {
+                Vec::new()
+            } else {
+                secrets
+                    .iter()
+                    .filter(|(_, g)| {
+                        g.is_github()
+                            && g.scopes.iter().any(|s| s.starts_with("github:repo:") && s != "github:repo:full")
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            };
+            let named: Vec<String> = refusals(&spec, host, GITHUB_HOSTS)
+                .into_iter()
+                .filter_map(|r| match r {
+                    BepRefusal::NarrowScopesUnenrolled { grant, .. } => Some(grant),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(&named, &expected);
+            if let Some(first) = expected.first() {
+                let refused = check_activation(&spec, host, GITHUB_HOSTS).expect_err("refused");
+                prop_assert_eq!(refused.exit_code(), 3);
+                let text = refused.to_string();
+                prop_assert!(text.contains(first.as_str()), "{}", text);
+                prop_assert!(text.contains(FULL_BREADTH_ACKNOWLEDGEMENT), "{}", text);
+            }
+        }
+    }
+
+    /// `github:repo:full` is not narrower, and `github:user-token` is the
+    /// `full` member's own spelling.
+    #[test]
+    fn full_scopes_are_not_narrow() {
+        let mut grant = github_grant(None);
+        assert!(!grant.is_narrower_than_full());
+        grant.scopes = vec!["github:repo:full".into()];
+        assert!(!grant.is_narrower_than_full());
+        grant.scopes = vec!["github:repo:contents:read".into()];
+        assert!(grant.is_narrower_than_full());
+    }
+
+    /// BEP-057: a project's `[session.secrets]` acknowledgement is dropped
+    /// with a warning, and the grants beside it still load.
+    #[test]
+    fn project_acknowledgement_is_ignored_with_warning() {
+        let table = "acknowledge_full_breadth_unenrolled = true\n\
+                     [GH_TOKEN]\nsource = \"broker\"\nscopes = [\"github:repo:read\"]\n";
+        let secrets: ProjectSecrets = toml::from_str(table).expect("parses");
+        assert!(secrets.acknowledgement_ignored);
+        assert_eq!(secrets.grants.len(), 1);
+        assert!(secrets.grants["GH_TOKEN"].is_narrower_than_full());
+        assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains(FULL_BREADTH_ACKNOWLEDGEMENT));
+        assert!(PROJECT_ACKNOWLEDGEMENT_IGNORED.contains("ignored"));
+
+        // The ignored acknowledgement does not reach the activation: the
+        // narrower grant is still refused on this host.
+        let bep = proxy_env();
+        let egress = egress_with(GITHUB_HOSTS);
+        let spec = ActivationSpec {
+            network: NetworkMode::OwnIp,
+            egress: Some(&egress),
+            bep: &bep,
+            secrets: &secrets.grants,
+        };
+        let refused = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect_err("refused");
+        assert_eq!(refused.exit_code(), 3);
+
+        // A table without the key records nothing to warn about, and a
+        // grant that does not parse is still an error.
+        let quiet: ProjectSecrets =
+            toml::from_str("[GH_TOKEN]\nsource = \"broker\"\n").expect("parses");
+        assert!(!quiet.acknowledgement_ignored);
+        assert!(toml::from_str::<ProjectSecrets>("[GH_TOKEN]\nsource = \"vault\"\n").is_err());
+    }
+
+    /// The resolved `quic443` stance (BEP-018).
+    #[test]
+    fn quic443_auto_blocks_only_on_credentialed_resolver_steering() {
+        assert!(Quic443::Block.blocks(false, Steering::Off));
+        assert!(!Quic443::Allow.blocks(true, Steering::Dns));
+        assert!(Quic443::Auto.blocks(true, Steering::Dns));
+        assert!(Quic443::Auto.blocks(true, Steering::Both));
+        assert!(!Quic443::Auto.blocks(true, Steering::ProxyEnv));
+        assert!(!Quic443::Auto.blocks(false, Steering::Dns));
     }
 
     /// The diagnostic text the task fixes for BEP-008.
