@@ -53,6 +53,12 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+# `--root /` strips to nothing, and an empty root would match every minvmd and
+# gvproxy on the machine, under sudo too.
+if [ -z "$ROOT" ]; then
+  echo "$0: --root must name a directory other than /" >&2
+  exit 2
+fi
 
 # `default` (paths::DEFAULT_VM_NAME) is the default VM, not a name to pin: its
 # processes carry no `--vm` flag and its switch socket sits in no per-name
@@ -67,12 +73,15 @@ ere_quote() {
   printf '%s' "$1" | sed -e 's/[][\\.*^+|(){}?$]/\\&/g'
 }
 
+# The root as a literal in the patterns below: a path can carry `.` or `+`.
+ROOT_RE="$(ere_quote "$ROOT")"
+
 # The `pkill -f` pattern for this checkout's minvmd processes (the supervisor
 # and its __krun-vmm child), pinned to one named VM when asked for. Matching
 # rides the absolute checkout path, never a bare name.
 minvmd_pat() {
   local pat
-  pat="$ROOT/.*minvmd"
+  pat="$ROOT_RE/.*minvmd"
   if [ -n "$VM" ]; then
     pat="$pat.*--vm[= ]$(ere_quote "$VM")( |$)"
   fi
@@ -83,15 +92,17 @@ minvmd_pat() {
 # switch is the one whose argv carries that VM's per-name socket directory.
 gvproxy_pat() {
   if [ -n "$VM" ]; then
-    printf '%s/.*gvproxy.*local-minvmd[0-9]+/%s/' "$ROOT" "$(ere_quote "$VM")"
+    printf '%s/.*gvproxy.*local-minvmd[0-9]+/%s/' "$ROOT_RE" "$(ere_quote "$VM")"
   else
-    printf '%s/.*gvproxy' "$ROOT"
+    printf '%s/.*gvproxy' "$ROOT_RE"
   fi
 }
 
+# SIGKILL, because a VM in `krun_start_enter` ignores SIGTERM: a plain pkill
+# leaves exactly the leftover this script exists to remove.
 # User-owned leftovers first — this must not depend on sudo succeeding.
-pkill -f "$(minvmd_pat)" 2>/dev/null || true
-pkill -f "$(gvproxy_pat)" 2>/dev/null || true
+pkill -9 -f "$(minvmd_pat)" 2>/dev/null || true
+pkill -9 -f "$(gvproxy_pat)" 2>/dev/null || true
 # Root-owned relay leftovers need sudo; -n fails fast without passwordless sudo.
-sudo -n pkill -f "$(minvmd_pat)" 2>/dev/null || true
-sudo -n pkill -f "$(gvproxy_pat)" 2>/dev/null || true
+sudo -n pkill -9 -f "$(minvmd_pat)" 2>/dev/null || true
+sudo -n pkill -9 -f "$(gvproxy_pat)" 2>/dev/null || true
