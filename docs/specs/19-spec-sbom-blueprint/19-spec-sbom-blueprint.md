@@ -74,12 +74,14 @@ digest nor a gap: the pin does not account for the package, and the
 emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds. A referenced document is
 **absent** when the cache answers an authoritative not-found for its name;
-every other failure to fetch it (a timeout, a refused connection, a
-malformed answer) is **unfetchable** and is SBOM-012's failure, exit 6,
-under every pin. Absence is SBOM-012's failure while the pin records a
-bundle for the document; while it records none, absence is SBOM-013's
-interim (the component keeps its artifact digest and is marked
-`unverified`, reason `no-document`).
+every other failure to fetch it is **unfetchable** and is SBOM-012's
+failure under every pin, with the architecture's exit codes: a host that
+cannot be reached (a timeout, a refused connection, no route) exits 7, and
+every other fetch failure (a malformed answer, a refused request, a
+truncated object) exits 6 as a failed check. Absence is SBOM-012's failure,
+exit 6, while the pin records a bundle for the document; while it records
+none, absence is SBOM-013's interim (the component keeps its artifact
+digest and is marked `unverified`, reason `no-document`).
 
 A box's **posture** is what its expanded Box Spec declares it may reach,
 read, write, inherit or expose: `[network]` (mode, `[network.egress]`,
@@ -301,16 +303,28 @@ developer running agent boxes; build-infra operator; auditor.
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
   cannot be fetched (an error other than the document's absence, which is
-  SBOM-013's interim while no bundle is pinned) THEN THE SYSTEM SHALL fail with exit code 6 naming the
-  pin, the unresolved object, and the remediation, never emitting a document
-  whose component set is silently incomplete.
+  SBOM-013's interim while no bundle is pinned), or a per-package document
+  is unresolved under SBOM-013 (its subject digest differs from the
+  closure's entry, its bundle fails a check, its bundle is absent while the
+  pin records one, or the document is absent under the `require_bundles`
+  option) THEN THE SYSTEM SHALL fail naming the pin, the unresolved object,
+  the check that failed (both digests for a subject mismatch, the failed
+  check's name for a bundle), and the remediation — exit code 7 when the
+  host could not be reached, exit code 6 for every other failure (the
+  architecture's exit-code table) — never emitting a document whose
+  component set is silently incomplete.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_unfetchable_reference_fails_loudly
-  property: for all attempts a and referenced objects o: (unfetchable(o) ∨
-    (absent(o) ∧ pin_records_bundle(o))) ⇒ not emitted(a) ∧ exit(a) = 6 ∧
-    error(a) names (pin, o, remediation), where absent(o) is an
-    authoritative not-found and unfetchable(o) is every other failure, a
-    timeout included
+  property: for all attempts a and referenced objects o:
+    unreachable(o) ⇒ ¬emitted(a) ∧ exit(a) = 7 ∧ error(a) names (pin, o,
+    host, remediation); (unfetchable(o) ∨ (absent(o) ∧
+    pin_records_bundle(o)) ∨ unresolved(o)) ⇒ ¬emitted(a) ∧ exit(a) = 6 ∧
+    error(a) names (pin, o, check(o), remediation), where absent(o) is an
+    authoritative not-found, unreachable(o) is a host that could not be
+    reached (a timeout, a refused connection, no route), unfetchable(o) is
+    every other fetch failure, and unresolved(o) is SBOM-013's set (subject
+    mismatch with both digests as check(o), a failed bundle check by name,
+    an absent pinned bundle, absence under require_bundles)
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
