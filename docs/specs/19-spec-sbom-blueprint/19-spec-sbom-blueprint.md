@@ -51,13 +51,16 @@ the document digest in the closure (Non-goals), *references* is decided by
 the closure entry alone: a component whose entry maps its Build Spec Hash to
 a cache artifact digest references the document SBOM-013 names from that
 hash, and a component whose entry is `built-locally` or `non-redistributable`
-has no artifact, no document, and the gap; an `open` box's loadout package
-from another registry has no entry in this pin by design, and carries the
-`outside-pin` gap. Those are the only kinds a package can be. A package from
-the box's `[upstream]` registry with no closure entry, or an entry of any
-other state, is neither a digest nor a gap: the pin does not account for
-the package, and the emission is SBOM-012's failure, exit code 6, naming
-the package. No probe of the cache takes part
+has no artifact, no document, and the gap; a package is `outside-pin` only
+when the box's stored expanded spec (BOX-068) records a registry for it
+other than `[upstream]` — an `open` box's loadout package from elsewhere —
+and the gap names that registry reduced under SBOM-008 (scheme, host, port,
+path). The Box Spec records one upstream registry and no registry per
+loadout package by default, so a package with no recorded registry is an
+upstream package. Those are the only kinds a package can be. An upstream
+package with no closure entry, or an entry of any other state, is neither
+a digest nor a gap: the pin does not account for the package, and the
+emission is SBOM-012's failure, exit code 6, naming the package (AT2). No probe of the cache takes part
 in that decision, so SBOM-001's determinism holds, and a referenced document
 the cache does not have (a 404 as much as a timeout) is SBOM-012's failure.
 
@@ -120,6 +123,18 @@ developer running agent boxes; build-infra operator; auditor.
     failure, and fails the same way on every emission.)
     tier:   T0
     verify: cargo nextest run -p sbom sbom_determinism_independent_of_cache_state
+  - WHILE the pin records no bundle for a per-package document
+    (build-servers#185 not landed) the closure pins the tarball and not the
+    document's bytes, so the composition is a function of the pin and of
+    the document bytes it read: two emissions under one pin differ only
+    where the cache's writer replaced a document under the same subject,
+    and THE SYSTEM SHALL record the statement digest of the bytes it read
+    on the component (SBOM-009), so such a difference is attributable to
+    the document and never silent; WHILE the pin records the bundle, the
+    bundle binds the bytes and the property above holds unconditionally.
+    tier:   T1
+    verify: cargo nextest run -p sbom sbom_replaced_document_changes_only_its_component_and_digest
+    property: ¬pin_records_bundle(d) ∧ bytes(a) ≠ bytes(b) ⇒ ∃d: read_digest_a(d) ≠ read_digest_b(d) ∧ diff(a, b) ⊆ component(d)
 
 - **SBOM-002** WHEN a document is emitted as CycloneDX THE SYSTEM SHALL
   produce output that validates against the vendored CycloneDX 1.5 schema.
@@ -143,8 +158,9 @@ developer running agent boxes; build-infra operator; auditor.
   verify:   cargo nextest run -p sbom sbom_digest_or_gap_total
   property: for all components k: has_sha256(k) xor has_digest_gap(k),
     and has_sha256(k) implies resolves(sha256(k), closure(pin)); for all
-    packages k from the box's upstream registry: k ∉ closure(pin) ⇒ not
-    emitted ∧ exit = 6
+    packages k with no registry recorded other than the upstream:
+    k ∉ closure(pin) ∨ state(entry(closure(pin), k)) ∉ {artifact,
+    built-locally, non-redistributable} ⇒ not emitted ∧ exit = 6
 
 - **SBOM-005** THE SYSTEM SHALL include every package present in the
   environment as a component, with launcher-injected packages carrying
@@ -219,8 +235,10 @@ developer running agent boxes; build-infra operator; auditor.
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
   resolvable through the box's pin THE SYSTEM SHALL take the component's
-  build-time facts — its build closure's components and their digests, and
-  the build environment — from that document, and its metadata — name,
+  build-time facts — its build closure's entries and their digests, and
+  the build environment, recorded as that component's nested dependency
+  facts and never as components of the box (the box's components are
+  SBOM-005's set alone) — from that document, and its metadata — name,
   version, `purl`, and licenses where the pin carries no attribution
   manifest — from the graph at the pin (minimal#700 D9; under a sealed
   attribution manifest SBOM-007 is the one source of licenses);
@@ -250,8 +268,9 @@ developer running agent boxes; build-infra operator; auditor.
   property: for all environments e, k in packages(e): unreferenced(k,
     closure(pin(e))) implies k in components(emit(e)) and has_digest_gap(k),
     where unreferenced(k, c) ⇔ entry(c, k) ∈ {built-locally,
-    non-redistributable} ∨ (k is a loadout package of an open box from a
-    registry other than the upstream)
+    non-redistributable} ∨ (the stored expanded spec records a registry for
+    k, and it is not the upstream); a package with no recorded registry is
+    never unreferenced, and its missing entry is SBOM-004's exit 6
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
   cannot be fetched THEN THE SYSTEM SHALL fail with exit code 6 naming the
@@ -346,8 +365,10 @@ developer running agent boxes; build-infra operator; auditor.
 - **SBOM-014** WHEN `min box list --using <pkg>[@<ver>]` filters boxes THE
   SYSTEM SHALL answer from the component set this spec's composition emits
   for each box (SBOM-005: every package present in the environment, the
-  launcher-injected and an `open` box's loadout packages included), so the
-  list and the box's SBOM never disagree; that set is read from the pin's
+  launcher-injected and an `open` box's loadout packages included, and
+  never the nested build-closure entries SBOM-009 records under a
+  component), so the list and the box's SBOM never disagree about what the
+  box contains; that set is read from the pin's
   closure and the box's stored expanded spec (its loadout entries and the
   launcher's additions, BOX-068) alone, so the list fetches no per-package
   document and needs no network. A box whose pinned closure cannot be read,
@@ -483,8 +504,9 @@ from the spec and stay schema-TODO.
 
 - **Invariant:** THE SYSTEM SHALL include every package present in the
   environment in its SBOM.
-  enforced by: closure-walk emission with launcher-injection tagging, never
-  filtering
+  enforced by: the closure walk plus the stored expanded spec's loadout
+  packages and launcher additions (BOX-068), with launcher-injection
+  tagging, never filtering
   covered by: SBOM-005
 - **Invariant:** THE SYSTEM SHALL emit no fabricated posture values, and no
   posture axis as enforced that is not.
