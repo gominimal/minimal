@@ -24,25 +24,25 @@
 //!    [`Attributed::Cohort`], and the audit records it `cohort_attributed`.
 //!    A value that [`crate::seal::open`] refuses as bound to another box id
 //!    is [`Unsealed::OtherBox`], and this check refuses it too.
-//! 4. The clock is before the value's expiry (BEP-024). A value that
+//! 4. The sending box's declared egress admits the connection authority
+//!    (BEP-022).
+//! 5. The clock is before the value's expiry (BEP-024). A value that
 //!    [`crate::seal::open`] refuses as past its expiry is
 //!    [`Unsealed::Expired`], and this check refuses it too.
-//! 5. No revocation in force covers the value's box id (BEP-024, BEP-071).
-//! 6. The connection's port is a declared port of the module's current host
+//! 6. No revocation in force covers the value's box id (BEP-024, BEP-071).
+//! 7. The connection's port is a declared port of the module's current host
 //!    set for that hostname (BEP-031). A hostname outside the current set is
-//!    not credentialed, so check 8 refuses it.
-//! 7. The connection authority is in the value's bound host set (BEP-021).
-//! 8. The connection authority is in the module's current host set
+//!    not credentialed, so check 9 refuses it.
+//! 8. The connection authority is in the value's bound host set (BEP-021).
+//! 9. The connection authority is in the module's current host set
 //!    (BEP-021).
-//! 9. The sending box's declared egress admits the connection authority
-//!    (BEP-022).
 //! 10. The request's `Host` header, and the authority of an absolute-form
 //!     request target, equal the connection authority (BEP-023).
 //!
 //! [`decide`] admits only when every check passes (BEP-025). The shell then
 //! substitutes the member's credential and forwards the request to the
 //! connection authority. A request that carries no sealed value goes to
-//! [`decide_plain`], which makes checks 9 and 10 alone. So the egress and
+//! [`decide_plain`], which makes checks 4 and 10 alone. So the egress and
 //! request-authority checks hold whether or not a request carries a value.
 
 use std::fmt;
@@ -97,7 +97,7 @@ impl Unsealed<String> {
     /// [`Check::CrossBox`], or as [`Check::NoLiveBox`] when the source
     /// resolves to no live box. A value past its expiry gives
     /// [`Unsealed::Expired`], so [`decide`] refuses it as [`Check::Expired`]
-    /// once the attribution passes.
+    /// once the attribution and the declared egress pass.
     ///
     /// The shell binds the open to the box id that the source resolves to.
     /// For an [`Attribution::OwnIp`] source, that is the sending box, so a
@@ -348,12 +348,17 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
             });
         }
         // BEP-024: open refused the value as past its expiry. The open was
-        // bound to the box the source resolves to, so only the source can
-        // fail first.
+        // bound to the box the source resolves to, so only the source or the
+        // declared egress (BEP-022) can fail first.
         Unsealed::Expired => {
             return Decision::Refuse(match redemption.attribution {
                 Attribution::NoLiveBox => Check::NoLiveBox,
                 Attribution::HostIpCohort if !redemption.named_box_in_cohort => Check::CrossBox,
+                Attribution::OwnIp(_) | Attribution::HostIpCohort
+                    if !redemption.egress.contains(&redemption.authority) =>
+                {
+                    Check::OutsideDeclaredEgress
+                }
                 Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::Expired,
             });
         }
@@ -376,6 +381,11 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
             return Decision::Refuse(Check::CrossBox);
         }
     };
+    // BEP-022: the box reaches only what its declared egress admits.
+    let authority = &redemption.authority;
+    if !redemption.egress.contains(authority) {
+        return Decision::Refuse(Check::OutsideDeclaredEgress);
+    }
     // BEP-024: only a value before its expiry, and not revoked, is redeemed.
     if redemption.now >= expiry {
         return Decision::Refuse(Check::Expired);
@@ -384,7 +394,6 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
         return Decision::Refuse(Check::Revoked);
     }
     // BEP-031: a credentialed hostname is reached only on a declared port.
-    let authority = &redemption.authority;
     let current = &redemption.current_set;
     if current.iter().any(|a| a.host == authority.host) && !current.contains(authority) {
         return Decision::Refuse(Check::OffPort);
@@ -396,9 +405,9 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
     if !current.contains(authority) {
         return Decision::Refuse(Check::OutsideCurrentSet);
     }
-    // BEP-022, BEP-023: the request checks every request passes.
-    if let Some(check) = request_check(authority, &redemption.request, &redemption.egress) {
-        return Decision::Refuse(check);
+    // BEP-023: the request names only the authority it arrived on.
+    if !redemption.request.pins(authority) {
+        return Decision::Refuse(Check::HostMismatch);
     }
     // BEP-025: every check passed.
     Decision::Admit {
@@ -625,6 +634,7 @@ mod tests {
                 matches!(r.attribution, Attribution::NoLiveBox),
             ),
             (Check::CrossBox, !attributed),
+            (Check::OutsideDeclaredEgress, !r.egress.contains(&a)),
             (
                 Check::Expired,
                 matches!(r.unsealed, Unsealed::Expired) || expiry.is_some_and(|e| r.now >= e),
@@ -636,7 +646,6 @@ mod tests {
             (Check::OffPort, credentialed && !r.current_set.contains(&a)),
             (Check::OutsideBoundSet, !r.bound_set.contains(&a)),
             (Check::OutsideCurrentSet, !r.current_set.contains(&a)),
-            (Check::OutsideDeclaredEgress, !r.egress.contains(&a)),
             (Check::HostMismatch, !(host_pinned && target_pinned)),
         ]
     }
