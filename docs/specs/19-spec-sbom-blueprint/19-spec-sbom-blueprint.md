@@ -54,7 +54,7 @@ hash, and a component whose entry is `built-locally` or `non-redistributable`
 has no artifact, no document, and the gap; a package is `outside-pin` only
 when the box's stored expanded spec (BOX-068) records a registry for it
 other than `[upstream]`, and the gap names that registry reduced under
-SBOM-008 (scheme, host, port, path). The design's Box Spec records one
+SBOM-008 (scheme, host and port). The design's Box Spec records one
 upstream registry and no registry for any loadout package (architecture
 lines 83 and 1074–1077), so today no package has a recorded registry and
 `outside-pin` cannot occur. A name resolves against the one upstream
