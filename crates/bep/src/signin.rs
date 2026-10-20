@@ -7,6 +7,16 @@
 //! two expiry times. The metadata holds no token, so `min auth status` reads
 //! it without reading the secret (BEP-004).
 //!
+//! Each backend keeps the metadata where a read of it returns no token:
+//!
+//! - macOS: the login keychain item under [`SERVICE`] holds the secret as
+//!   its password and the metadata as its comment. `security
+//!   find-generic-password` without `-w` prints the comment and no password.
+//! - Linux and other hosts: the Secret Service holds two items. The item
+//!   under [`SERVICE`] holds the secret. A second item under
+//!   [`META_SERVICE`] holds the encoded metadata as its secret and no token.
+//!   `secret-tool lookup` on [`META_SERVICE`] reads the metadata only.
+//!
 //! The instance identifier names one sign-in. A sign-in while no item is
 //! held, or a sign-in to a different account, gets a new identifier. A
 //! sign-in to the held item's account keeps it. A sign-in reference binds
@@ -22,6 +32,11 @@ use zeroize::Zeroize as _;
 
 /// The keychain service name of the sign-in item.
 pub const SERVICE: &str = "dev.minimal.github-sign-in";
+
+/// The service name of the item that holds the metadata on hosts where the
+/// keychain prints an item's secret with its attributes (the Secret
+/// Service). Its secret is the encoded metadata, and it holds no token.
+pub const META_SERVICE: &str = "dev.minimal.github-sign-in.meta";
 
 /// The keychain account name of the sign-in item. The host holds one
 /// sign-in item, so the name is fixed.
@@ -155,14 +170,17 @@ impl Metadata {
     }
 }
 
-/// A GitHub login: ASCII letters, digits and hyphens.
+/// A GitHub login: ASCII letters, digits, hyphens and underscores, at most
+/// 64 characters. An Enterprise Managed User login on github.com has the
+/// form `handle_shortcode`. None of these characters is a separator in
+/// [`Metadata::encode`].
 #[must_use]
 pub fn valid_account(account: &str) -> bool {
     !account.is_empty()
         && account.len() <= 64
         && account
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn valid_instance(instance: &str) -> bool {
@@ -261,9 +279,10 @@ pub enum SignInError {
     Account,
 }
 
-/// The host keychain, as the sign-in item uses it. One item, two parts.
+/// The host keychain, as the sign-in item uses it. One sign-in, two parts.
+/// Only the item under [`SERVICE`] holds the token.
 pub trait Keychain {
-    /// The item's metadata, when an item is held. Reads no secret.
+    /// The item's metadata, when an item is held. Reads no token.
     ///
     /// # Errors
     ///
@@ -341,44 +360,64 @@ pub fn new_instance_id() -> Result<String, SignInError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// A keychain held in memory. For tests, and for no host.
+/// A keychain held in memory, in the Secret Service layout: one item under
+/// [`SERVICE`] that holds the secret, and one under [`META_SERVICE`] that
+/// holds the encoded metadata. For tests, and for no host.
 #[derive(Debug, Default)]
 pub struct MemoryKeychain {
-    item: Mutex<Option<(String, String)>>,
+    items: Mutex<Vec<(&'static str, String)>>,
 }
 
 impl MemoryKeychain {
-    /// The item's two parts as stored: the encoded metadata and the secret.
+    /// The secret of the item under `service`, as stored.
     #[must_use]
-    pub fn raw(&self) -> Option<(String, String)> {
-        self.item.lock().ok().and_then(|g| g.clone())
+    pub fn item(&self, service: &str) -> Option<String> {
+        let g = self.items.lock().ok()?;
+        g.iter()
+            .find(|(s, _)| *s == service)
+            .map(|(_, v)| v.clone())
     }
 
-    /// Delete the item, as a logout does.
+    /// The sign-in's two parts as stored: the encoded metadata (the item
+    /// under [`META_SERVICE`]) and the secret (the item under [`SERVICE`]).
+    #[must_use]
+    pub fn raw(&self) -> Option<(String, String)> {
+        Some((self.item(META_SERVICE)?, self.item(SERVICE)?))
+    }
+
+    /// Delete both items, as a logout does.
     pub fn clear(&self) {
-        if let Ok(mut g) = self.item.lock() {
-            *g = None;
+        if let Ok(mut g) = self.items.lock() {
+            g.clear();
         }
+    }
+
+    fn store(&self, service: &'static str, secret: String) -> Result<(), SignInError> {
+        let mut g = self.items.lock().map_err(|_| SignInError::Keychain {
+            action: "write the sign-in",
+            detail: "poisoned".into(),
+        })?;
+        g.retain(|(s, _)| *s != service);
+        g.push((service, secret));
+        Ok(())
     }
 }
 
 impl Keychain for MemoryKeychain {
     fn metadata(&self) -> Result<Option<Metadata>, SignInError> {
-        self.raw().map(|(m, _)| Metadata::decode(&m)).transpose()
+        self.item(META_SERVICE)
+            .map(|m| Metadata::decode(&m))
+            .transpose()
     }
 
     fn material(&self) -> Result<Option<Material>, SignInError> {
-        self.raw().map(|(_, s)| decode_secret(&s)).transpose()
+        self.item(SERVICE).map(|s| decode_secret(&s)).transpose()
     }
 
     fn write(&self, metadata: &Metadata, material: &Material) -> Result<(), SignInError> {
         let secret = encode_secret(material)?;
-        let mut g = self.item.lock().map_err(|_| SignInError::Keychain {
-            action: "write the sign-in",
-            detail: "poisoned".into(),
-        })?;
-        *g = Some((metadata.encode(), secret));
-        Ok(())
+        self.store(SERVICE, secret)?;
+        self.store(META_SERVICE, metadata.encode())
     }
 }
 
@@ -581,7 +620,7 @@ mod host {
 
 #[cfg(not(target_os = "macos"))]
 mod host {
-    use super::{LABEL, Material, SERVICE, SignInError, decode_captured, run};
+    use super::{LABEL, META_SERVICE, Material, SERVICE, SignInError, decode_captured, run};
     use std::process::Command;
     use zeroize::Zeroize as _;
 
@@ -589,29 +628,24 @@ mod host {
     pub(super) const TOOL: &str = SECRET_TOOL;
     pub(super) const INSTALL: &str = "Install it (the `libsecret-tools` package on Debian and Ubuntu, `libsecret` on Fedora and Arch), then run `min auth login` again.";
 
-    /// The item's label: the fixed label, then the metadata. The item's one
-    /// attribute is `service`, so every write matches the held item's
-    /// attributes and `secret-tool store` replaces it in place.
-    fn label(metadata: &str) -> String {
-        format!("{LABEL}: {metadata}")
-    }
+    /// The label of the item under [`META_SERVICE`].
+    const META_LABEL: &str = "Minimal GitHub sign-in details";
 
+    /// Read the metadata from the item under [`META_SERVICE`]. That item's
+    /// secret is the encoded metadata, so the lookup returns no token.
     pub(super) fn metadata() -> Result<Option<String>, SignInError> {
         let mut cmd = Command::new(SECRET_TOOL);
-        cmd.args(["search", "service", SERVICE]);
-        let mut out = run("read the sign-in", cmd, None)?;
-        // `secret-tool search` prints `label = <label>` and, on its own
-        // line, `secret = <secret>`, and nothing when no item matches. Only
-        // the label is kept, and the captured output is zeroized.
-        let prefix = format!("label = {LABEL}: ");
-        let found = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|l| l.strip_prefix(&prefix).map(str::to_owned));
-        out.stdout.zeroize();
-        if found.is_none() && !out.status.success() && !out.stderr.is_empty() {
+        cmd.args(["lookup", "service", META_SERVICE]);
+        let out = run("read the sign-in", cmd, None)?;
+        if !out.status.success() {
+            if out.stderr.is_empty() {
+                return Ok(None);
+            }
             return Err(refused("read the sign-in", &out.stderr));
         }
-        Ok(found)
+        let text = String::from_utf8_lossy(&out.stdout);
+        let text = text.trim();
+        Ok((!text.is_empty()).then(|| text.to_owned()))
     }
 
     pub(super) fn material() -> Result<Option<Material>, SignInError> {
@@ -628,17 +662,22 @@ mod host {
         decode_captured(&mut out.stdout).map(Some)
     }
 
+    /// Write the secret to the item under [`SERVICE`], then the metadata to
+    /// the item under [`META_SERVICE`].
     pub(super) fn write(metadata: &str, secret: &str) -> Result<(), SignInError> {
+        // A failed secret store leaves both held items as they were. A
+        // failed metadata store after it leaves the old metadata, and the
+        // read-back in `HostKeychain::write` reports the failed write.
+        store(LABEL, SERVICE, secret)?;
+        store(META_LABEL, META_SERVICE, metadata)
+    }
+
+    fn store(label: &str, service: &str, secret: &str) -> Result<(), SignInError> {
         // The Secret Service replaces the item whose attributes all match.
-        // The one attribute is `service`, so the store replaces the held
-        // item in place, and a failed store leaves the held item as it was.
+        // Each item's one attribute is `service`, so the store replaces the
+        // held item in place, and a failed store leaves it as it was.
         let mut cmd = Command::new(SECRET_TOOL);
-        cmd.args([
-            "store",
-            &format!("--label={}", label(metadata)),
-            "service",
-            SERVICE,
-        ]);
+        cmd.args(["store", &format!("--label={label}"), "service", service]);
         let out = run("write the sign-in", cmd, Some(secret))?;
         if !out.status.success() {
             return Err(refused("write the sign-in", &out.stderr));

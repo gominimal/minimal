@@ -601,7 +601,7 @@ fn base64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bep::signin::{MemoryKeychain, Metadata};
+    use bep::signin::{META_SERVICE, MemoryKeychain, Metadata, SERVICE, valid_account};
     use std::sync::{Arc, Mutex};
 
     const ACCESS: &str = "ghu_testaccesstoken0123456789";
@@ -824,6 +824,19 @@ mod tests {
             .count();
         assert_eq!(polls, 2);
         assert!(!out.contains(ACCESS) && !err.contains(ACCESS));
+
+        // An Enterprise Managed User login carries an underscore.
+        assert!(valid_account("octo_emu"));
+        assert!(valid_account(&"a_".repeat(32)));
+        assert!(!valid_account(&"a".repeat(65)));
+        assert!(!valid_account("octo cat") && !valid_account("octo=cat"));
+        let emu = fake_github("octo_emu").await;
+        let keychain = MemoryKeychain::default();
+        let (stored, out, _) = login_with(&keychain, &emu, None, true, &no_browser).await;
+        assert_eq!(out, "Signed in to GitHub as octo_emu.\n");
+        assert_eq!(stored.metadata.account, "octo_emu");
+        let read = keychain.metadata().expect("read").expect("held");
+        assert_eq!(read, stored.metadata);
     }
 
     fn device_polls(gh: &FakeGitHub) -> usize {
@@ -941,9 +954,15 @@ mod tests {
         let gh = fake_github("octocat").await;
         let keychain = MemoryKeychain::default();
         login_with(&keychain, &gh, None, true, &no_browser).await;
-        let (meta, secret) = keychain.raw().expect("one item");
+        // The token item holds the secret. The metadata item, which
+        // `min auth status` reads, holds no token.
+        let secret = keychain.item(SERVICE).expect("token item");
+        let meta = keychain.item(META_SERVICE).expect("metadata item");
         assert!(secret.contains(ACCESS) && secret.contains(REFRESH));
         assert!(!meta.contains(ACCESS) && !meta.contains(REFRESH), "{meta}");
+        assert_eq!(keychain.raw(), Some((meta.clone(), secret)));
+        let read = keychain.metadata().expect("read").expect("held");
+        assert_eq!(read.encode(), meta);
         let material = keychain.material().expect("read").expect("held");
         assert_eq!(material.access_token, ACCESS);
         assert_eq!(material.refresh_token, REFRESH);
