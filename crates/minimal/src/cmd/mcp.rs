@@ -203,7 +203,7 @@ impl McpServer {
         working_dir: Option<PathBuf>,
         name: Option<String>,
         sync: Option<SyncMode>,
-    ) -> Result<crate::cmd::session::ActivatedSession, anyhow::Error> {
+    ) -> Result<crate::cmd::ActivatedSession, anyhow::Error> {
         let path = working_dir
             .or_else(|| self.state.opts.workdir.clone())
             // With neither, the CLI's own default (the cwd) applies.
@@ -234,7 +234,7 @@ impl McpServer {
             no_prompt: true,
             attach: false,
         };
-        crate::cmd::session::create_headless_session(&self.state.global, args, false).await
+        crate::cmd::create_headless_session(&self.state.global, args, false).await
     }
 
     /// Render one session's summary as JSON.
@@ -479,7 +479,7 @@ impl McpServer {
                 no_prompt: true,
                 attach: false,
             };
-            crate::cmd::session::create_headless_session(&self.state.global, args, false).await
+            crate::cmd::create_headless_session(&self.state.global, args, false).await
         };
         let session = match session {
             Ok(s) => s,
