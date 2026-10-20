@@ -160,21 +160,52 @@ pub(crate) fn children(parent: &str, known: &[KnownBox]) -> BTreeSet<String> {
         .collect()
 }
 
-/// `value` with every control character escaped, so a field that a box
-/// controls cannot move the cursor, hide lines or set the terminal title.
+/// `value` with every control character and every invisible format
+/// character escaped, so a field that a box controls cannot move the cursor,
+/// hide lines, set the terminal title or reorder the text a person reads.
 pub(crate) fn printable(value: &str) -> std::borrow::Cow<'_, str> {
-    if !value.chars().any(char::is_control) {
+    if !value.chars().any(needs_escape) {
         return std::borrow::Cow::Borrowed(value);
     }
     let mut escaped = String::with_capacity(value.len());
     for c in value.chars() {
-        if c.is_control() {
+        if needs_escape(c) {
             escaped.extend(c.escape_default());
         } else {
             escaped.push(c);
         }
     }
     std::borrow::Cow::Owned(escaped)
+}
+
+/// A control character (Cc), a format character (Cf, such as the
+/// bidirectional overrides and isolates), or a line or paragraph separator.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
 }
 
 /// Writes the entries whose subject is in `subjects`, and returns how many
@@ -586,6 +617,29 @@ mod tests {
         assert!(
             out.contains("\\u{1b}]0;owned\\u{7}evil.example:443"),
             "{out}"
+        );
+
+        // A bidirectional override cannot reorder the text either, and
+        // `-o jsonl` keeps the line as the log has it.
+        append(
+            dir.path(),
+            4,
+            &[(A, "evil.example\u{202e}moc.buhtig.ipa:443")],
+        );
+        let (result, out, _) = run_to_strings(&args(Some(A), None, false), &[], false, dir.path());
+        result.unwrap();
+        assert!(!out.contains('\u{202e}'), "{out:?}");
+        assert!(
+            out.contains("evil.example\\u{202e}moc.buhtig.ipa:443"),
+            "{out}"
+        );
+        let mut jsonl = args(Some(A), None, false);
+        jsonl.output = Some(BoxAuditOutputFormat::Jsonl);
+        let (result, out, _) = run_to_strings(&jsonl, &[], false, dir.path());
+        result.unwrap();
+        assert!(
+            out.contains("evil.example\u{202e}moc.buhtig.ipa:443"),
+            "{out:?}"
         );
     }
 
