@@ -41,10 +41,12 @@ use crate::module::Module;
 /// registers them. A name in this set, or a subdomain of one, is outside the
 /// union. The root also carries the set as its excluded-names constraint.
 ///
-/// This set is provisional. Gatehouse §6.10 also names the BEP, EGW and
-/// relay endpoints, the registry and build cache, and the node-plane
-/// baseline set. One deny set must serve this check and the store-rule
-/// check of BEP-034. Until that set exists, this list is a partial reading.
+/// This set is provisional and partial. Gatehouse §6.10 also names the
+/// tenant issuer, the BEP, EGW and relay endpoints, the registry and build
+/// cache, the node-plane baseline set, and the deep module host sets. One
+/// deny set must serve this check and the store-rule check of BEP-034. When
+/// the BEP-034 task lands its deny set, `DENY_SET` becomes that set, and
+/// this list goes away. The issue that tracks the full set is not filed yet.
 pub const DENY_SET: &[&str] = &[
     // The box-internal names (`host.min.internal` and the services under it).
     "min.internal",
@@ -69,9 +71,11 @@ const LEAF_VALIDITY: Duration = Duration::from_secs(7 * DAY);
 
 /// A held key that can sign a certificate.
 ///
-/// No keychain key implements this trait yet, so the signing CA key is not
-/// held in the keychain until it does (BEP-014). The keychain
-/// implementation belongs in `keys.rs`, outside this module.
+/// No production key implements this trait yet. The CA key is in the host
+/// keychain (BEP-014), but nothing can sign with it, so the signing CA is
+/// not keychain-held until the `Keychain` and `MemoryKey` keys of `keys.rs`
+/// implement `CaKey`. That work is outside this module. The issue that
+/// tracks it is not filed yet.
 pub trait CaKey: HeldKey {
     /// An ECDSA P-256 SHA-256 signature over `msg`, DER-encoded as X9.62
     /// specifies. The private half stays in the store.
@@ -293,7 +297,6 @@ impl<K: CaKey> SigningKey for Signer<'_, K> {
 pub struct Ca<'k, K> {
     root_key: Signer<'k, K>,
     signing_key: Signer<'k, K>,
-    root_params: CertificateParams,
     signing_params: CertificateParams,
     union: Union,
     root: CertificateDer<'static>,
@@ -347,7 +350,6 @@ impl<'k, K: CaKey> Ca<'k, K> {
         Ok(Self {
             root_key,
             signing_key,
-            root_params,
             signing_params,
             union,
             root,
@@ -470,7 +472,6 @@ impl<'k, K: CaKey> Ca<'k, K> {
             removed = ?removed,
             "re-issued the root CA under the same key with changed name constraints"
         );
-        self.root_params = params;
         self.root = root;
         self.union = union;
         Ok(true)
