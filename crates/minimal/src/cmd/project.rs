@@ -346,28 +346,41 @@ pub(crate) fn dropped_hooks_error(
     )
 }
 
+/// What a caller wants done when a skipped upload would drop the project's
+/// lifecycle hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DroppedHooksPolicy {
+    /// Refuse the activation with the CLI's upload remedy.
+    Refuse,
+    /// Warn with the count and continue.
+    Warn,
+    /// Say nothing about hooks: the caller already disabled them.
+    Ignore,
+}
+
 /// Renders a [`WorkspaceUpload`] outcome on the CLI's stderr — the shared
-/// presentation for `min session activate` and `min task run`. `refuse`
-/// selects the caller's policy: activate refuses the `$HOME` skip that would
-/// drop lifecycle hooks; task run, which has no upload flag to offer, warns
-/// with the count instead. `Ok(())` when the session may proceed.
+/// presentation for `min session activate` and `min task run`. `policy`
+/// selects the caller's treatment of the `$HOME` skip that would drop
+/// lifecycle hooks: activate refuses unless `--no-hooks` disabled them; task
+/// run, which has no upload flag to offer, warns with the count. `Ok(())`
+/// when the session may proceed.
 pub(crate) fn report_upload_outcome(
     outcome: Result<WorkspaceUpload, anyhow::Error>,
     root: &camino::Utf8Path,
-    refuse: bool,
+    policy: DroppedHooksPolicy,
 ) -> Result<(), anyhow::Error> {
     let outcome = outcome?;
-    if refuse {
+    if policy == DroppedHooksPolicy::Refuse {
         refuse_dropped_hooks(&outcome, root, CLI_DROPPED_HOOKS_REMEDY)?;
     }
     match outcome {
         WorkspaceUpload::Uploaded => Ok(()),
         WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks } => {
             eprintln!("Starting with an empty box (nothing here to sync)");
-            if dropped_hooks > 0 {
-                // Reached only for a non-refusing caller: a refusing one
-                // returned the error above. Name the hooks so the warning
-                // does not read as a healthy start.
+            if dropped_hooks > 0 && policy == DroppedHooksPolicy::Warn {
+                // Name the hooks so the warning does not read as a healthy
+                // start. `Refuse` returned above, and `Ignore` belongs to a
+                // caller that already disabled them.
                 eprintln!(
                     "{dropped_hooks} lifecycle hook(s) declared in {} will not run: \
                      the file upload is skipped.",
