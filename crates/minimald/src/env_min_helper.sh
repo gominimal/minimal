@@ -15,6 +15,104 @@ __min_term_cols() {
     fi
 }
 
+# A help request in a subcommand slot, where `help` cannot be a verb.
+__min_is_help() {
+    case "$1" in
+        -h|--help|help) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A help request in an argument slot. A bare `help` there is a package
+# name, search term, or task name, so only the flags count.
+__min_is_help_flag() {
+    case "$1" in
+        -h|--help) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A help flag anywhere in the arguments. Only for commands whose every
+# argument is a valueless flag or a package or object name, none of which
+# can be `-h` or `--help`; `min run` forwards later arguments to the task,
+# and `min materialize` uses __min_materialize_has_help_flag.
+__min_has_help_flag() {
+    local arg
+    for arg in "$@"; do
+        if __min_is_help_flag "$arg"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# A help flag in a `min materialize` argument slot. The value that follows
+# `-o`/`--output` or `--arch` is a path or an arch, never a help request.
+__min_materialize_has_help_flag() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o|--output|--arch) shift ;;
+            -h|--help) return 0 ;;
+        esac
+        shift
+    done
+    return 1
+}
+
+# Usage text for the dispatch level named by $1 (default: top). Help
+# requests print it to stdout and exit 0; error paths print it to stderr.
+__min_usage() {
+    case "${1:-top}" in
+        top)
+            echo "Usage: min <subcommand>"
+            echo ""
+            echo "Add packages: min add [--session|--build|--runtime] <packages>"
+            echo "Run a task: min task run <task name>"
+            echo "Search for packages: min package search <query>"
+            echo "Build packages: min package build <packages>"
+            echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>"
+            echo "Check minimal configuration (bare, by exception): min check"
+            echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>"
+            echo "Publish a port from inside the box: min net expose <port>"
+            ;;
+        package)
+            echo "Usage: min package <subcommand>"
+            echo ""
+            echo "Add packages: min package add [--session|--build|--runtime] <packages>"
+            echo "Search for packages: min package search <query>"
+            echo "Build packages: min package build <packages>"
+            echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>"
+            ;;
+        build)
+            echo "Usage: min package build <packages>"
+            ;;
+        search)
+            echo "Usage: min package search <query>"
+            ;;
+        patched-build)
+            echo "Usage: min package patched-build <package name>"
+            ;;
+        add)
+            echo "Usage: min add [--session|--build|--runtime] <packages>"
+            ;;
+        task)
+            echo "Usage: min task run <task name>"
+            ;;
+        check)
+            echo "Usage: min check"
+            ;;
+        materialize)
+            echo "Usage: min materialize --output <path> [--arch <arch>] <output name>"
+            ;;
+        net)
+            echo "Usage: min net expose <port>"
+            ;;
+        expose)
+            echo "Usage: min net expose <port>"
+            ;;
+    esac
+}
+
 __min_rpc() {
     local method="$1"
     shift
@@ -104,8 +202,12 @@ __min_rpc() {
 
 min_search() {
     local term="$1"
+    if __min_is_help_flag "$term"; then
+        __min_usage search
+        return 0
+    fi
     if [[ -z "$term" ]]; then
-        echo "Usage: min_search <search term>" >&2
+        __min_usage search >&2
         return 1
     fi
 
@@ -114,12 +216,12 @@ min_search() {
 
 min_patched_pkg() {
     local pkg="$1"
-    if [[ "$pkg" == "-h" || "$pkg" == "--help" ]]; then
-        echo "Usage: min package patched-build <package-name>" >&2
+    if __min_is_help_flag "$pkg"; then
+        __min_usage patched-build
         return 0
     fi
     if [[ -z "$pkg" || "$pkg" == -* ]]; then
-        echo "Usage: min package patched-build <package-name>" >&2
+        __min_usage patched-build >&2
         return 1
     fi
 
@@ -131,7 +233,7 @@ __min_add() {
     shift
     local packages="$@"
     if [[ -z "$prefix" || -z "$packages" ]]; then
-        echo "Usage: min_add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
+        __min_usage add >&2
         return 1
     fi
 
@@ -141,6 +243,11 @@ __min_add() {
 min_add() {
     local flag="$1"
 
+    if __min_has_help_flag "$@"; then
+        __min_usage add
+        return 0
+    fi
+
     # If no flag provided, or first arg isn't a flag, default to --session
     if [[ -z "$flag" || "$flag" != --* ]]; then
         flag="--session"
@@ -149,7 +256,7 @@ min_add() {
     fi
 
     if [[ -z "$1" ]]; then
-        echo "Usage: min add [--session|--build|--runtime] <packages>" >&2
+        __min_usage add >&2
         return 1
     fi
 
@@ -168,6 +275,10 @@ min_add() {
 }
 
 min_run() {
+    if __min_is_help_flag "$1"; then
+        __min_usage task
+        return 0
+    fi
     __min_rpc "run" "$@"
 }
 
@@ -175,12 +286,22 @@ min_task() {
     local subcmd="$1"
     shift
 
+    if __min_is_help "$subcmd"; then
+        __min_usage task
+        return 0
+    fi
+
     case "$subcmd" in
         run)
             min_run "$@"
             ;;
+        "")
+            __min_usage task >&2
+            return 1
+            ;;
         *)
             echo "error: unknown subcommand '$subcmd'. Expected 'run'" >&2
+            __min_usage task >&2
             return 1
             ;;
     esac
@@ -190,11 +311,20 @@ min_package() {
     local subcmd="$1"
     shift
 
+    if __min_is_help "$subcmd"; then
+        __min_usage package
+        return 0
+    fi
+
     case "$subcmd" in
         patched-build)
             min_patched_pkg "$@"
             ;;
         build)
+            if __min_has_help_flag "$@"; then
+                __min_usage build
+                return 0
+            fi
             __min_rpc "build" "$@"
             ;;
         search)
@@ -203,18 +333,31 @@ min_package() {
         add)
             min_add "$@"
             ;;
+        "")
+            __min_usage package >&2
+            return 1
+            ;;
         *)
             echo "error: unknown subcommand '$subcmd'. Expected 'add', 'build', 'search', or 'patched-build'" >&2
+            __min_usage package >&2
             return 1
             ;;
     esac
 }
 
 min_check() {
+    if __min_has_help_flag "$@"; then
+        __min_usage check
+        return 0
+    fi
     __min_rpc "check" "$@"
 }
 
 min_materialize() {
+    if __min_materialize_has_help_flag "$@"; then
+        __min_usage materialize
+        return 0
+    fi
     # The working directory leads the arguments so a relative --output
     # can be resolved.
     __min_rpc "materialize" "${PWD}%$*"
@@ -224,17 +367,31 @@ min_net() {
     local subcmd="$1"
     shift
 
+    if __min_is_help "$subcmd"; then
+        __min_usage net
+        return 0
+    fi
+
     case "$subcmd" in
         expose)
             local port="$1"
+            if __min_is_help_flag "$port"; then
+                __min_usage expose
+                return 0
+            fi
             if [[ -z "$port" ]]; then
-                echo "Usage: min net expose <port>" >&2
+                __min_usage expose >&2
                 return 1
             fi
             __min_rpc "net-expose" "$port"
             ;;
+        "")
+            __min_usage net >&2
+            return 1
+            ;;
         *)
             echo "error: unknown subcommand '$subcmd'. Expected 'expose'" >&2
+            __min_usage net >&2
             return 1
             ;;
     esac
@@ -269,17 +426,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         net)
             min_net "$@"
             ;;
+        -h|--help|help)
+            __min_usage
+            exit 0
+            ;;
         *)
-            echo "Usage: min <subcommand>" >&2
-            echo "" >&2
-            echo "Add packages: min add [--session|--build|--runtime] <packages>" >&2
-            echo "Run a task: min task run <task name>" >&2
-            echo "Search for packages: min package search <query>" >&2
-            echo "Build packages: min package build <packages>" >&2
-            echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>" >&2
-            echo "Check minimal configuration (bare, by exception): min check" >&2
-            echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>" >&2
-            echo "Publish a port from inside the box: min net expose <port>" >&2
+            __min_usage >&2
             exit 1
             ;;
     esac
