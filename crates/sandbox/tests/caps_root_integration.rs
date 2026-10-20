@@ -11,13 +11,12 @@
 //!   does not clear — holding none of the capabilities no box may hold,
 //!   `CAP_NET_RAW` first.
 //!
-//! * `proc_sys_writability_follows_the_launching_daemon` — the same open box,
-//!   one more probe: an `open()` of a root-owned sysctl file for writing. A
-//!   box whose launching daemon is root has that root as its one mapped uid,
-//!   so the launch path seals its `/proc/sys` read-only and the open must
-//!   come back `EROFS`; a box launched by an unprivileged daemon keeps it,
-//!   and the open must come back `EACCES` — DAC's refusal, which a nested
-//!   sandbox inside may still need to write past.
+//! * `boxes_mount_a_nested_procfs` — the same open box, one more probe: a
+//!   process unshares a user, mount and pid namespace, as a nested sandbox
+//!   (`mip build` inside a box) does, and mounts a fresh procfs. The kernel
+//!   refuses that mount when the box's own `/proc` is not fully visible, for
+//!   example when a mount covers `/proc/sys`. The mount must succeed, so a
+//!   box keeps its nested sandboxes.
 //!
 //! These proofs launch a real box, which needs the unprivileged user namespace
 //! every sandbox starts by unsharing. A host that would deny it (stock Ubuntu
@@ -142,13 +141,64 @@ fn announce_to_the_runner(proof: &str) {
 /// socket, which needs no capability and therefore still works. One `key:
 /// value` line per fact, parsed by the caller.
 const CAP_PROBE_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <sched.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+static int write_file(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return errno;
+    ssize_t len = (ssize_t)strlen(text);
+    int err = write(fd, text, len) == len ? 0 : errno;
+    close(fd);
+    return err;
+}
+
+/* Exits with the errno of the first step that failed, or 0. Status 255 is
+   kept for a step that failed with no errno to report. */
+static int nested_procfs_child(void) {
+    char map[64];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) != 0) return errno;
+    snprintf(map, sizeof map, "0 %u 1\n", (unsigned)uid);
+    int err = write_file("/proc/self/uid_map", map);
+    if (err) return err;
+    err = write_file("/proc/self/setgroups", "deny\n");
+    if (err) return err;
+    snprintf(map, sizeof map, "0 %u 1\n", (unsigned)gid);
+    err = write_file("/proc/self/gid_map", map);
+    if (err) return err;
+    pid_t init = fork();
+    if (init < 0) return errno;
+    if (init == 0) {
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) _exit(errno);
+        if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+            _exit(errno);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(init, &status, 0) != init) return errno;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+}
+
+static int nested_procfs_mount_errno(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return errno;
+    if (child == 0) _exit(nested_procfs_child());
+    int status;
+    if (waitpid(child, &status, 0) != child) return errno;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+}
 
 int main(void) {
     FILE *status = fopen("/proc/self/status", "r");
@@ -170,15 +220,12 @@ int main(void) {
     printf("stream_socket_errno: %d\n", stream >= 0 ? 0 : errno);
     if (stream >= 0) close(stream);
 
-    /* Whether the box's /proc/sys is writable: one open for write, no
-       O_TRUNC (the open alone is the fact; truncating a sysctl file would
-       itself be the write this probe must not do). The errno says which
-       side of the seal the box is on: EROFS on a read-only remount, EACCES
-       on DAC's refusal to an unprivileged uid, and 0 a /proc/sys this
-       proof's caller must fail on, whichever branch it expected. */
-    int sysctl = open("/proc/sys/kernel/hostname", O_WRONLY | O_CLOEXEC);
-    printf("proc_sys_open_errno: %d\n", sysctl >= 0 ? 0 : errno);
-    if (sysctl >= 0) close(sysctl);
+    /* Whether a nested sandbox can mount its own procfs: what hakoniwa
+       does inside a box. The child unshares a user, mount and pid namespace,
+       maps its uid and gid, and forks the new pid namespace's init, which
+       mounts a fresh procfs on its private /proc. The errno of that mount
+       comes back as the grandchild's exit status, 0 for a mount that took. */
+    printf("nested_procfs_mount_errno: %d\n", nested_procfs_mount_errno());
     return 0;
 }
 "#;
@@ -483,57 +530,35 @@ async fn boxes_lack_cap_net_raw() {
     );
 }
 
-/// Whether the box's `/proc/sys` is writable — the sysctl seal. Every box in
-/// a VM shares the one guest kernel, and a box launched by a root daemon has
-/// that root as its one mapped uid, so the root-owned 0644 sysctl files are
-/// the box's own to write by DAC alone: a program in such a box can rewrite
-/// the machine's kernel settings (the boot-time inotify limits and dmesg
-/// restriction the guest applies) with nothing but an `open()` for write.
-/// The launch path seals exactly those boxes, remounting `/proc/sys`
-/// read-only before the credentials drop; an unprivileged daemon's box keeps
-/// its `/proc/sys` writable, because a nested sandbox inside it mounts its
-/// own procfs and may need to write there.
-///
-/// Which side this proof asserts on is decided by the uid it itself runs as
-/// — the daemon-side fact the launch path seals on: a root runner (a CI lane
-/// under `sudo`) is the one that proves the seal, expecting `EROFS` where
-/// the unsealed box opened the file; an unprivileged runner is the
-/// unprivileged daemon of the ruling, expecting `EACCES` — DAC's refusal —
-/// and proving nothing was sealed in a place that had no DAC refusal to
-/// begin with. A report of `0` fails either branch: a writable `/proc/sys`
-/// is the defect itself on the root side, and a lost DAC refusal on the
-/// other.
+/// A nested sandbox inside a box mounts a fresh procfs: hakoniwa does it for
+/// every container, so `mip build` inside a box depends on it. In a nested user
+/// namespace the kernel refuses that mount with `EPERM` unless a procfs in the
+/// box is fully visible, with no mount covering a non-empty directory in it.
+/// A read-only bind over `/proc/sys` is such a cover, the one container
+/// runtimes add, and it is why nested containers fail there. This proof keeps
+/// the box's `/proc` fully visible, whether a root or an unprivileged daemon
+/// launches the box.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proc_sys_writability_follows_the_launching_daemon() {
+async fn boxes_mount_a_nested_procfs() {
     if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
-            "skipping proc_sys_writability_follows_the_launching_daemon: this host \
-             denies the unprivileged user namespace every sandbox starts by \
-             unsharing: {reason}"
+            "skipping boxes_mount_a_nested_procfs: this host denies the \
+             unprivileged user namespace every sandbox starts by unsharing: \
+             {reason}"
         );
         return;
     }
-    announce_to_the_runner("proc_sys_writability_follows_the_launching_daemon");
+    announce_to_the_runner("boxes_mount_a_nested_procfs");
 
     let report = box_report(NetPlan::host()).await;
-    let got = reported_errno(&report, "proc_sys_open_errno", "an open box");
-    if nix::unistd::geteuid().is_root() {
-        assert_eq!(
-            got,
-            libc::EROFS,
-            "a box launched by a root daemon must find its /proc/sys read-only: \
-             its one mapped uid is root, so without the seal the machine's \
-             sysctls are writable by DAC alone"
-        );
-    } else {
-        assert_eq!(
-            got,
-            libc::EACCES,
-            "a box launched by an unprivileged daemon keeps its /proc/sys — DAC \
-             refuses it to the box's unprivileged uid, and a nested sandbox \
-             inside may still need to write there"
-        );
-    }
+    assert_eq!(
+        reported_errno(&report, "nested_procfs_mount_errno", "an open box"),
+        0,
+        "a process in a box must be able to mount a fresh procfs from a nested \
+         user namespace, as a nested sandbox does: the errno is from the \
+         unshare, the id maps or the mount, and EPERM from the mount means a \
+         mount covers part of the box's /proc"
+    );
 }
 
 /// What every box's report must show: the unprivileged box uid and gid, the

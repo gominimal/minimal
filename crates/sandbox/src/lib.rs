@@ -1274,16 +1274,6 @@ fn install_box_credentials(
             .and_then(std::ffi::OsStr::to_str)
             .map(|box_id| Path::new("/run").join(classifier::closure_report_name(box_id)))
     });
-    // The one fact about the daemon's own credentials the launch closure
-    // cannot read for itself: by the time it runs, hakoniwa has unshared the
-    // user namespace and written the uid map, so the child's euid is already
-    // the mapped box uid — 1000, whatever the daemon's outer uid is. Read
-    // here, in the daemon, before the fork: a box launched by a root daemon
-    // (the in-guest microVM pid-1) has that root mapped as its one uid, which
-    // is what makes /proc/sys writable for it; a box launched by an
-    // unprivileged daemon keeps /proc/sys writable, because a nested sandbox
-    // inside it mounts its own procfs and may need to write there.
-    let launched_by_root = nix::unistd::geteuid().is_root();
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
     // forked child.  `socket_family_filter` is `&'static`: it is one of the
     // process-wide `OnceLock` values, owned for the process's whole life, so
@@ -1300,7 +1290,6 @@ fn install_box_credentials(
                 &args,
                 socket_family_filter,
                 fresh_netns,
-                launched_by_root,
                 classifier_join.as_deref(),
                 force_cover_fallback,
                 closure_report.as_deref(),
@@ -1464,8 +1453,7 @@ fn bring_lo_up() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The body of the launch closure in [`install_box_credentials`]: mount
-/// `/proc/sys` read-only when the daemon launching the box is root, place the
+/// The body of the launch closure in [`install_box_credentials`]: place the
 /// box in its classifier leaf, cover the tree the join went through, take
 /// the box's credentials, install the box's socket-family seal, then exec
 /// the program the caller asked for.  Never returns; a failure is reported
@@ -1484,81 +1472,11 @@ fn exec_box_program(
     args: &[String],
     socket_family_filter: &'static SocketFamilyFilter,
     fresh_netns: bool,
-    launched_by_root: bool,
     classifier_join: Option<&Path>,
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
     start_gate: Option<&Path>,
 ) -> ! {
-    // /proc/sys is the kernel's sysctl store, and every box in a VM shares
-    // the one guest kernel, so a write there is a write to the machine the
-    // daemon booted with: the boot-time settings the guest applies
-    // (inotify limits, dmesg restriction) are one open() away from being
-    // rewritten by any program a box runs. The uid map is what makes that
-    // open legal: a box launched by a root daemon has that root as its one
-    // mapped uid, so the root-owned 0644 files under /proc/sys are the box's
-    // own to write by DAC alone, whatever capabilities the box lacks. Only
-    // such a box is sealed here — an unprivileged daemon's box maps an
-    // unprivileged uid and keeps its /proc/sys, because a nested sandbox
-    // inside it mounts its own procfs and may need to write there.
-    //
-    // The seal is a bind of /proc/sys onto itself — the step that makes the
-    // subdirectory its own mount — followed by a read-only remount of that
-    // bind. Both run at the same pre-exec moment the devpts remount below
-    // does, after the box's /proc is mounted (the closure runs after
-    // hakoniwa's mount setup) and before the credentials drop, while the
-    // process still holds CAP_SYS_ADMIN over this mount namespace — and
-    // inside that namespace only, so the host's own /proc/sys never changes.
-    // The remount restates the fresh /proc mount's flags (MS_NOSUID, MS_NODEV
-    // and MS_NOEXEC — see `mount2` in hakoniwa's unshare, and the same
-    // discipline as the devpts remount below: a remount without a flag
-    // clears it) because a remount inside a user namespace may not clear a
-    // flag the underlying mount holds. Fatal on failure, like the classifier
-    // cover: a box whose sysctl seal did not take is a box that can rewrite
-    // the machine's kernel settings, which is what this exists to prevent.
-    if launched_by_root {
-        // SAFETY: `mount(2)` with valid C strings and no data; a self-bind
-        // carries no options. Async-signal-safe.
-        if unsafe {
-            libc::mount(
-                c"/proc/sys".as_ptr(),
-                c"/proc/sys".as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND | libc::MS_REC,
-                std::ptr::null(),
-            )
-        } == -1
-        {
-            exit_child(
-                "binding the box's /proc/sys onto itself",
-                &std::io::Error::last_os_error(),
-                closure_report,
-            );
-        }
-        // SAFETY: `mount(2)` as above, remounting the bind just made.
-        // Async-signal-safe.
-        if unsafe {
-            libc::mount(
-                c"/proc/sys".as_ptr(),
-                c"/proc/sys".as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND
-                    | libc::MS_REMOUNT
-                    | libc::MS_RDONLY
-                    | libc::MS_NOSUID
-                    | libc::MS_NODEV
-                    | libc::MS_NOEXEC,
-                std::ptr::null(),
-            )
-        } == -1
-        {
-            exit_child(
-                "remounting the box's /proc/sys read-only",
-                &std::io::Error::last_os_error(),
-                closure_report,
-            );
-        }
-    }
     // Cap the box's PTY count before the credentials drop: PTYs are a
     // machine-wide pool, and the box's devpts instance was mounted without a
     // per-instance `max=`, so it draws from the one kernel-wide counter and a
