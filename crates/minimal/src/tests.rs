@@ -1961,7 +1961,7 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
         report_upload_outcome(
             Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
             root,
-            true,
+            DroppedHooksPolicy::Refuse,
         )
         .is_err(),
         "a skipped home that declares hooks is refused"
@@ -1972,7 +1972,7 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
         WorkspaceUpload::Declined,
     ] {
         assert!(
-            report_upload_outcome(Ok(kept), root, true).is_ok(),
+            report_upload_outcome(Ok(kept), root, DroppedHooksPolicy::Refuse).is_ok(),
             "{kept:?}"
         );
     }
@@ -1988,7 +1988,7 @@ fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
         report_upload_outcome(
             Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
             root,
-            false,
+            DroppedHooksPolicy::Warn,
         )
     });
     assert!(result.is_ok(), "{result:?}");
@@ -1997,6 +1997,23 @@ fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
         stderr.contains("2 lifecycle hook(s) declared in /srv/data/run42/minimal.toml"),
         "{stderr:?}"
     );
+}
+
+/// `--no-hooks` already disabled the project's hooks, so the activation
+/// proceeds without a hook warning: only the empty-box line remains.
+#[test]
+fn report_upload_outcome_ignores_hooks_the_caller_disabled() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    let (stderr, result) = capture_stderr(|| {
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+            root,
+            DroppedHooksPolicy::Ignore,
+        )
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert!(stderr.contains("Starting with an empty box"), "{stderr:?}");
+    assert!(!stderr.contains("lifecycle hook"), "{stderr:?}");
 }
 
 /// The rule `min dash` applies in place of the stderr wording refuses exactly

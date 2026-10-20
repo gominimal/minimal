@@ -1959,8 +1959,14 @@ pub(crate) async fn activate_box(
             // A skip that would silently drop the project's lifecycle hooks
             // refuses here (and any upload failure) — either abandons the
             // activation, and the row its registration bought goes with it
-            // (T66).
-            if let Err(error) = report_upload_outcome(outcome, &upload_root, true) {
+            // (T66). `--no-hooks` already disabled them, so that skip cannot
+            // drop anything by surprise and says nothing about them.
+            let dropped_hooks = if args.no_hooks {
+                DroppedHooksPolicy::Ignore
+            } else {
+                DroppedHooksPolicy::Refuse
+            };
+            if let Err(error) = report_upload_outcome(outcome, &upload_root, dropped_hooks) {
                 withdraw_box_row(
                     control_sock.clone(),
                     request.config.name.as_deref(),

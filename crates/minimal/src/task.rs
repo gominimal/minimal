@@ -786,7 +786,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // `min task run` has no `--sync` flags, so it warns rather than refuses:
     // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
     // hooks it drops. The box still starts, as it did before the shared gate.
-    crate::report_upload_outcome(outcome, &upload_root, false)?;
+    crate::report_upload_outcome(outcome, &upload_root, crate::DroppedHooksPolicy::Warn)?;
 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches
