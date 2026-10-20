@@ -62,7 +62,8 @@ pub trait Exec: Send + 'static {
 
     /// Whether a destroy of the box ends this exec's process. True for a
     /// process inside the box, which the destroy's host teardown stops.
-    /// False for a process on the daemon's host, which outlives it.
+    /// False for a process outside the box — on the daemon's host, or in a
+    /// task's own sandbox — which outlives it.
     const ENDED_BY_BOX_DESTROY: bool = true;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>>;
@@ -158,6 +159,11 @@ fn task_start_dir(
 
 impl Exec for TaskExec {
     type Process = TaskProcess;
+
+    // A task runs in a sandbox of its own, beside the box rather than in
+    // it: the destroy's host teardown (`BoxActor::stop_running`) does not
+    // stop it, so a task that ends during a destroy was not ended by it.
+    const ENDED_BY_BOX_DESTROY: bool = false;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
@@ -1091,15 +1097,7 @@ impl<S: Exec> ExecTask<S> {
             &mut w,
             &mut e,
             client_lost_rx,
-            || {
-                if mngr.is_shutting_down() {
-                    Some(SHUTDOWN_NOTICE)
-                } else if S::ENDED_BY_BOX_DESTROY && self.session.is_destroying() {
-                    Some(DESTROYED_NOTICE)
-                } else {
-                    None
-                }
-            },
+            || exit_notice::<S>(mngr.is_shutting_down(), self.session.is_destroying()),
         )
         .await;
 
@@ -1123,6 +1121,20 @@ const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stop
 /// same reason: the client is told why its command stopped, not handed a
 /// bare 137 with nothing on the wire to explain it.
 const DESTROYED_NOTICE: &[u8] = b"the session was destroyed; the command was stopped\n";
+
+/// The notice an exec of kind `S` that ended with a kill-shaped status
+/// leaves on stderr: the daemon's shutdown first, then the box's destroy,
+/// which only names an exec whose process the destroy stops
+/// ([`Exec::ENDED_BY_BOX_DESTROY`]).
+fn exit_notice<S: Exec>(shutting_down: bool, destroying: bool) -> Option<&'static [u8]> {
+    if shutting_down {
+        Some(SHUTDOWN_NOTICE)
+    } else if S::ENDED_BY_BOX_DESTROY && destroying {
+        Some(DESTROYED_NOTICE)
+    } else {
+        None
+    }
+}
 
 /// The lowest exit status that is kill-shaped: `128 + signo` is how a
 /// signal-terminated command reports, in the shell convention.
@@ -2914,7 +2926,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
-    use super::{DESTROYED_NOTICE, SHUTDOWN_NOTICE, bridge, bridge_noting_reason};
+    use super::{
+        BoxExec, DESTROYED_NOTICE, SHUTDOWN_NOTICE, TaskExec, TokioExec, bridge,
+        bridge_noting_reason, exit_notice,
+    };
 
     /// A never-firing client-loss signal for tests that exercise the
     /// bridge without modelling a disconnect.
@@ -3893,6 +3908,64 @@ mod tests {
                 String::from_utf8_lossy(&err),
             );
         }
+    }
+
+    /// Only an exec whose process the destroy stops is told the destroy
+    /// stopped it. A task runs in a sandbox of its own that the destroy
+    /// does not stop, so a task ending 137 during a destroy gets no notice;
+    /// a shutdown still names every kind.
+    #[tokio::test]
+    async fn a_task_ending_during_a_destroy_gets_no_destroy_notice() {
+        assert_eq!(exit_notice::<BoxExec>(false, true), Some(DESTROYED_NOTICE));
+        assert_eq!(exit_notice::<TaskExec>(false, true), None);
+        assert_eq!(exit_notice::<TokioExec>(false, true), None);
+        assert_eq!(exit_notice::<TaskExec>(true, true), Some(SHUTDOWN_NOTICE));
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                mut stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+        let bridge_task = crate::traced::spawn(async move {
+            let exit = bridge_noting_reason(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+                || exit_notice::<TaskExec>(false, true),
+            )
+            .await;
+            (exit, bridge_stderr)
+        });
+
+        stderr_writer.write_all(b"err!").await.unwrap();
+        drop(stderr_writer);
+        drop(stdout_writer);
+        ctrl.signal_exit(137).await;
+
+        let (exit, bridge_stderr) = bridge_task.await.unwrap();
+        assert_eq!(exit, 137, "the task's own status passes through");
+        drop(bridge_stderr);
+
+        let mut err = Vec::new();
+        client_stderr.read_to_end(&mut err).await.unwrap();
+        assert_eq!(
+            err,
+            b"err!",
+            "stderr was {:?}",
+            String::from_utf8_lossy(&err),
+        );
     }
 
     /// A command that exits on its own during a shutdown or a destroy was
