@@ -173,7 +173,9 @@ fn dns_host(host: &str) -> bool {
         return false;
     }
     let labels: Vec<&str> = host.split('.').collect();
-    let valid = labels.len() >= 2
+    // RFC 1035 caps a whole name at 253 bytes in its text form.
+    let valid = host.len() <= 253
+        && labels.len() >= 2
         && labels.iter().all(|label| {
             (1..=63).contains(&label.len())
                 && !label.starts_with('-')
@@ -410,7 +412,11 @@ impl<'k, K: CaKey> Ca<'k, K> {
             KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(CaError::Certificate)?;
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(DnType::CommonName, hostname);
+        // The subject CN is capped at 64 bytes (RFC 5280 ub-common-name).
+        // The SAN carries the name, so a longer name gets no CN.
+        if hostname.len() <= 64 {
+            params.distinguished_name.push(DnType::CommonName, hostname);
+        }
         params.subject_alt_names = vec![SanType::DnsName(name)];
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -971,6 +977,31 @@ mod tests {
         assert!(ca.issue_leaf(GITHUB.hosts[0].host, late).is_ok());
         let expired = ca.renew_signing(root_expiry);
         assert!(matches!(expired, Err(CaError::RootExpired(_))));
+    }
+
+    #[test]
+    fn long_names_stay_within_dns_and_common_name_limits() {
+        let label = "a".repeat(63);
+        // 65 bytes: a valid DNS name, too long for a common name.
+        let medium = format!("{}.com", "b".repeat(61));
+        // 255 bytes: over the 253-byte limit of a DNS name.
+        let long = format!("{label}.{label}.{label}.{label}");
+        assert_eq!(medium.len(), 65);
+        assert_eq!(long.len(), 255);
+        let union = Union::new(&[], [medium.as_str(), long.as_str()]);
+        assert_eq!(union.names().collect::<Vec<_>>(), [medium.as_str()]);
+
+        let (root_key, signing_key) = keys();
+        let ca = Ca::new(&root_key, &signing_key, union, now()).unwrap();
+        let leaf = ca.issue_leaf(&medium, now()).unwrap();
+        assert!(validates(ca.root(), &leaf, &medium));
+        // The name occurs once in the leaf: in the SAN, not in a common name.
+        let der = &leaf.chain[0];
+        let count = der
+            .windows(medium.len())
+            .filter(|w| *w == medium.as_bytes())
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]
