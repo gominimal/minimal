@@ -1114,9 +1114,9 @@ only when the port has none. When the holder ends or its publish leaves the
 address, the port passes to the earliest-created running box that still
 publishes it. That box gets the bind with no reattach (NET-129). A box that is
 not running is never elected, because it binds no forwarder and the port stays
-unbound. A daemon start elects the same way. Election by publish order is the first alternative.
-The holder then depends on the order the daemon resumes boxes in, so two starts
-over the same boxes can name different holders. The second alternative lets an
+unbound. A daemon start elects the same way. Election by publish order is the
+first alternative. The holder then depends on the order the daemon resumes
+boxes in, so two starts over the same boxes can name different holders. The second alternative lets an
 earlier-created box take a port from its standing holder. That moves an
 established forward under its connections. The chosen rule leaves an inversion
 case. A box created earlier than the standing holder that publishes later takes
