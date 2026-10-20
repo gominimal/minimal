@@ -1935,7 +1935,13 @@ mod activation_step_tests {
         let end = body
             .find("\nfn normalize_subnets(")
             .expect("normalize_subnets follows activate_session");
-        let body = &body[..end];
+        // Comment lines name steps too; only code runs them.
+        let body: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
         let needle = concat!("ActivationStep", "::");
         body.match_indices(needle)
             .filter_map(|(at, _)| {
@@ -2005,6 +2011,41 @@ mod activation_step_tests {
                 "upload_files".to_owned(),
                 "Failed to upload project files".to_owned()
             )]
+        );
+    }
+
+    #[derive(clap::Parser)]
+    struct ActivateCli {
+        #[command(flatten)]
+        args: crate::cli::ActivateArgs,
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_steps_run_in_order_and_name_the_failing_step_in_activate_session() {
+        use clap::Parser as _;
+        // A project path that does not exist ends the real activation in its
+        // first step, before any daemon is started or contacted.
+        let missing = tempfile::tempdir().unwrap().path().join("no-such-project");
+        let cli = ActivateCli::try_parse_from(["activate", missing.to_str().unwrap()]).unwrap();
+
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let subscriber = tracing_subscriber::registry().with(Capture(seen.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = super::activate_session(&crate::cli::GlobalArgs::default(), cli.args, false)
+            .await
+            .expect_err("a missing project path ends the activation");
+        let expected = format!("Cannot resolve project path '{}'", missing.display());
+        assert_eq!(error.to_string(), expected);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.spans, ["check_arguments"]);
+        assert_eq!(seen.failures.len(), 1);
+        assert_eq!(seen.failures[0].0, "check_arguments");
+        assert!(
+            seen.failures[0].1.starts_with(&expected),
+            "failure record: {:?}",
+            seen.failures[0].1
         );
     }
 }
