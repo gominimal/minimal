@@ -562,8 +562,24 @@ pub struct ReadBatch {
 #[derive(Debug)]
 pub struct LogReader {
     dir: PathBuf,
-    /// For each segment, the offset after its last complete line read.
-    offsets: std::collections::BTreeMap<PathBuf, u64>,
+    /// For each segment, the file it was and the offset after its last
+    /// complete line read.
+    offsets: std::collections::BTreeMap<PathBuf, (Option<FileIdentity>, u64)>,
+}
+
+/// The device and inode of a file, so a segment replaced by another file of
+/// the same name is read again from its start.
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
 }
 
 impl LogReader {
@@ -588,17 +604,29 @@ impl LogReader {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let mut out = ReadBatch::default();
         for path in segments(&self.dir)? {
-            let start = self.offsets.get(&path).copied().unwrap_or(0);
+            let (seen, start) = self.offsets.get(&path).copied().unwrap_or((None, 0));
             let mut file = match File::open(&path) {
                 Ok(file) => file,
                 // Pruned between the listing and the open.
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),
             };
-            let len = file.metadata()?.len();
-            // A segment shorter than the place already read was truncated
-            // or replaced, so read it again from its start.
-            let start = if len < start { 0 } else { start };
+            let metadata = file.metadata()?;
+            let len = metadata.len();
+            let identity = file_identity(&metadata);
+            // A segment that is another file now, or that is shorter than
+            // the place already read, was replaced or truncated. Read it
+            // again from its start.
+            let replaced = seen.is_some() && seen != identity;
+            let start = if replaced || len < start {
+                0
+            } else if start > 0 && !ends_line_at(&mut file, start)? {
+                // Where identity is unavailable, an offset that is not just
+                // after a newline means the file changed under the reader.
+                0
+            } else {
+                start
+            };
             if len == start {
                 continue;
             }
@@ -625,11 +653,21 @@ impl LogReader {
                     None => out.skipped += 1,
                 }
             }
-            self.offsets.insert(path.clone(), start + complete as u64);
+            self.offsets
+                .insert(path.clone(), (identity, start + complete as u64));
             out.segments.push(path);
         }
         Ok(out)
     }
+}
+
+/// Whether the byte just before `offset` in `file` is a newline.
+fn ends_line_at(file: &mut File, offset: u64) -> io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(offset - 1))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)?;
+    Ok(byte[0] == b'\n')
 }
 
 #[cfg(test)]
@@ -912,6 +950,45 @@ mod tests {
         let batch = reader.read_new().unwrap();
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.entries[0].record.upstream, "example.com:443");
+    }
+
+    // A segment replaced by a longer file between two reads is read from
+    // the start of the new file, not from the old offset.
+    #[test]
+    fn log_reader_rereads_a_replaced_longer_segment() {
+        let dir = TempDir::new();
+        let segment = dir.0.join(segment_name(1));
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        let mut reader = LogReader::new(&dir.0);
+        assert_eq!(reader.read_new().unwrap().entries.len(), 1);
+
+        // Keep the old file open so the new one cannot reuse its inode.
+        let old = segment.with_extension("old");
+        fs::rename(&segment, &old).unwrap();
+        let _hold = File::open(&old).unwrap();
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        assert!(fs::metadata(&segment).unwrap().len() > fs::metadata(&old).unwrap().len());
+        let batch = reader.read_new().unwrap();
+        assert_eq!(batch.skipped, 0);
+        let upstreams: Vec<_> = batch
+            .entries
+            .iter()
+            .map(|e| e.record.upstream.as_str())
+            .collect();
+        assert_eq!(
+            upstreams,
+            [
+                "api.github.com:443",
+                "api.github.com:443",
+                "example.com:443"
+            ]
+        );
     }
 
     // BEP-041: the descriptor carries O_APPEND and no truncate, and earlier
