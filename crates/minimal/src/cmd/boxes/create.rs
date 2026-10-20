@@ -5,9 +5,6 @@ use super::*;
 use minimal_client::box_registration::{
     RegisteredWithVmHost, finalize_holding_lease, register_box_reminting_autogen,
 };
-#[cfg(test)]
-use minimal_client::box_registration::{register_box_for_activation, register_box_with_vm_host};
-
 /// The session-start line for a box the activation registered with the VM
 /// host daemon (T66): the one line the start output owes the registration,
 /// naming the VM host daemon the row lives on and the switch address the box
