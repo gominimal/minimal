@@ -1915,6 +1915,35 @@ fn decide_answered_task_patch_forms(
     Ok((decided, rule_used))
 }
 
+/// The canonical directories on one branch of a patch directory walk, from
+/// the directory being walked back to the declared one
+/// ([`check_task_patch_dir`]). Shared between siblings, so a push is O(1).
+struct PatchWalkBranch {
+    dir: std::path::PathBuf,
+    parent: Option<std::rc::Rc<PatchWalkBranch>>,
+}
+
+impl PatchWalkBranch {
+    /// `parent` extended by `dir`, or `parent` itself when `dir` is unknown.
+    fn push(
+        parent: Option<std::rc::Rc<Self>>,
+        dir: Option<&std::path::PathBuf>,
+    ) -> Option<std::rc::Rc<Self>> {
+        match dir {
+            Some(dir) => Some(std::rc::Rc::new(Self {
+                dir: dir.clone(),
+                parent,
+            })),
+            None => parent,
+        }
+    }
+
+    /// Whether `dir` is on the branch `from`: walking it again is a cycle.
+    fn holds(from: Option<&std::rc::Rc<Self>>, dir: &std::path::Path) -> bool {
+        std::iter::successors(from.map(std::rc::Rc::as_ref), |b| b.parent.as_deref()).any(|b| b.dir == dir)
+    }
+}
+
 /// A declared directory entry's decision: the directory's own path, then
 /// a deny probe over what it currently holds on this machine.
 ///
@@ -1966,14 +1995,16 @@ fn check_task_patch_dir(
     // it sits on disk, so each file is checked in both forms. A symlinked
     // directory (the declared one, or one met mid-walk) holds its files
     // where it points, and the mount keeps the link, so it is walked at
-    // its target. Canonical directories already walked are skipped, which
-    // ends a link cycle.
+    // its target. A directory reached again through another path is walked
+    // again, since the mount exposes its files under that path too; only a
+    // canonical directory already on the current branch is skipped, which
+    // ends a link cycle. `limit` bounds the walk however much aliasing
+    // repeats it.
     let root_canonical = std::fs::canonicalize(dir.as_std_path()).ok();
-    let mut visited: std::collections::HashSet<std::path::PathBuf> =
-        root_canonical.iter().cloned().collect();
-    let mut stack = vec![(dir.as_std_path().to_path_buf(), root_canonical)];
+    let root_branch = PatchWalkBranch::push(None, root_canonical.as_ref());
+    let mut stack = vec![(dir.as_std_path().to_path_buf(), root_canonical, root_branch)];
     let mut seen = 0usize;
-    while let Some((cur, canonical)) = stack.pop() {
+    while let Some((cur, canonical, branch)) = stack.pop() {
         let read = match std::fs::read_dir(&cur) {
             Ok(read) => read,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2007,17 +2038,22 @@ fn check_task_patch_dir(
                 return Ok(PathDecision::Denied);
             }
             if file_type.is_some_and(|t| t.is_dir()) {
-                if on_disk.as_ref().is_none_or(|c| visited.insert(c.clone())) {
-                    stack.push((entry.path(), on_disk));
+                if on_disk
+                    .as_ref()
+                    .is_none_or(|c| !PatchWalkBranch::holds(branch.as_ref(), c))
+                {
+                    let next = PatchWalkBranch::push(branch.clone(), on_disk.as_ref());
+                    stack.push((entry.path(), on_disk, next));
                 }
                 continue;
             }
             if is_link
                 && let Ok(target) = std::fs::canonicalize(entry.path())
                 && target.is_dir()
-                && visited.insert(target.clone())
+                && !PatchWalkBranch::holds(branch.as_ref(), &target)
             {
-                stack.push((entry.path(), Some(target)));
+                let next = PatchWalkBranch::push(branch.clone(), Some(&target));
+                stack.push((entry.path(), Some(target), next));
             }
         }
     }

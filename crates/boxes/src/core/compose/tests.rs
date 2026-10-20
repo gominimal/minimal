@@ -3151,6 +3151,95 @@ mod gate_task_patch_paths {
         assert_eq!(decision, crate::core::policy::PathDecision::Allowed);
     }
 
+    /// An allowed directory `data` holding a real directory `real/secret`
+    /// and the symlinks `aliases`, each pointing at `real`, with `deny` set
+    /// to the rules `deny` builds from `data`.
+    #[cfg(unix)]
+    fn allowed_dir_with_aliases(
+        tmp: &tempfile::TempDir,
+        aliases: &[&str],
+        deny: impl FnOnce(&camino::Utf8Path) -> Vec<String>,
+    ) -> (
+        camino::Utf8PathBuf,
+        crate::core::policy::ExpandedPatchesPolicy,
+    ) {
+        let dir = canonical_root(tmp).join("data");
+        let real = dir.join("real");
+        std::fs::create_dir_all(real.as_std_path()).unwrap();
+        std::fs::write(real.join("secret").as_std_path(), "x").unwrap();
+        for alias in aliases {
+            std::os::unix::fs::symlink(real.as_std_path(), dir.join(alias).as_std_path()).unwrap();
+        }
+        let policy = PatchesPolicy::default()
+            .with_allow(vec![dir.to_string()])
+            .with_deny(deny(&dir))
+            .expand_with(&NoVars, None)
+            .unwrap();
+        (dir, policy)
+    }
+
+    /// Two symlinks to one directory are each walked, since the mount
+    /// exposes its files under both: a deny that names a file only through
+    /// one alias refuses the entry, whichever alias the walk meets first.
+    #[cfg(unix)]
+    #[test]
+    fn a_deny_through_a_second_symlink_alias_is_refused() {
+        use crate::core::compose::check_task_patch_dir;
+        for denied in ["a1", "a2"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (dir, policy) = allowed_dir_with_aliases(&tmp, &["a1", "a2"], |dir| {
+                vec![dir.join(denied).join("secret").to_string()]
+            });
+            let source = project_source();
+            let decision = check_task_patch_dir(&policy, &source, &dir, true, 100).unwrap();
+            assert_eq!(
+                decision,
+                crate::core::policy::PathDecision::Denied,
+                "deny through {denied}"
+            );
+        }
+    }
+
+    /// A symlink back to a directory on the current branch, the declared
+    /// one or one below it, ends that branch rather than looping.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_an_ancestor_ends_the_walk() {
+        use crate::core::compose::check_task_patch_dir;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, policy) =
+            allowed_dir_with_aliases(&tmp, &[], |dir| vec![dir.join("elsewhere").to_string()]);
+        let real = dir.join("real");
+        std::os::unix::fs::symlink(dir.as_std_path(), real.join("root").as_std_path()).unwrap();
+        std::os::unix::fs::symlink(real.as_std_path(), real.join("self").as_std_path()).unwrap();
+        let source = project_source();
+        let decision = check_task_patch_dir(&policy, &source, &dir, true, 1_000).unwrap();
+        assert_eq!(decision, crate::core::policy::PathDecision::Allowed);
+    }
+
+    /// Every alias of a directory is walked in full, so the entry limit,
+    /// not the number of distinct directories, bounds the walk.
+    #[cfg(unix)]
+    #[test]
+    fn many_symlink_aliases_are_bounded_by_the_walk_limit() {
+        use crate::core::compose::{TaskPatchWalkGap, check_task_patch_dir};
+        let tmp = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..20).map(|i| format!("a{i}")).collect();
+        let aliases: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (dir, policy) = allowed_dir_with_aliases(&tmp, &aliases, |dir| {
+            vec![dir.join("elsewhere").to_string()]
+        });
+        let source = project_source();
+        // `real`, its file, then each alias and the file under it: 42.
+        let gap = check_task_patch_dir(&policy, &source, &dir, true, 41).unwrap_err();
+        assert!(
+            matches!(gap, TaskPatchWalkGap::TooLarge { limit: 41 }),
+            "{gap}"
+        );
+        let decision = check_task_patch_dir(&policy, &source, &dir, true, 42).unwrap();
+        assert_eq!(decision, crate::core::policy::PathDecision::Allowed);
+    }
+
     /// With no deny set, nothing is walked, so a directory over the limit
     /// keeps its own decision.
     #[test]
