@@ -1,4 +1,4 @@
-//! The redemption decision (BEP-019, BEP-020, BEP-058).
+//! The redemption decision (BEP-019 to BEP-021, BEP-024, BEP-031, BEP-058).
 //!
 //! The proxy decides whether to redeem a sealed value in one pure function,
 //! [`decide`], over owned values. The TLS and socket shell does the I/O. It
@@ -8,8 +8,9 @@
 //! clock, no socket and no key, so a property test and a Kani harness can
 //! cover every input.
 //!
-//! The box ids are a type parameter. The shell uses the box id strings. A
-//! Kani harness uses `u8` ids, so it can exhaust them.
+//! The box ids and the authority hosts are type parameters. The shell uses
+//! the box id strings and interns each host name. A Kani harness uses `u8`
+//! ids, so it can exhaust them.
 //!
 //! The checks run in a fixed order, and a refusal names the first check that
 //! failed, as a [`Check`]. [`Check::marker`] is the word the audit record
@@ -23,9 +24,19 @@
 //!    [`Attributed::Cohort`], and the audit records it `cohort_attributed`.
 //!    A value that [`crate::seal::open`] refuses as bound to another box id
 //!    is [`Unsealed::OtherBox`], and this check refuses it too.
+//! 4. The clock is before the value's expiry (BEP-024). A value that
+//!    [`crate::seal::open`] refuses as past its expiry is
+//!    [`Unsealed::Expired`], and this check refuses it too.
+//! 5. No revocation in force covers the value's box id (BEP-024, BEP-071).
+//! 6. The connection's port is a declared port of the module's current host
+//!    set for that hostname (BEP-031). A hostname outside the current set is
+//!    not credentialed, so check 8 refuses it.
+//! 7. The connection authority is in the value's bound host set (BEP-021).
+//! 8. The connection authority is in the module's current host set
+//!    (BEP-021).
 //!
-//! The other redemption checks (host sets, egress, request authority,
-//! expiry and revocation) are not in this module yet.
+//! The other redemption checks (egress and request authority) are not in
+//! this module yet.
 
 use std::fmt;
 
@@ -47,12 +58,21 @@ pub enum Unsealed<B> {
     /// reads the member, so no bounds come with it. [`decide`] refuses it
     /// at the attribution check (BEP-020).
     OtherBox,
+    /// The value decrypted for the box the shell bound the open to, but it
+    /// is past its expiry, or its member is past the member's own expiry.
+    /// [`crate::seal::open`] reports this as [`OpenError::Expired`] before
+    /// it reads the member, so no bounds come with it. [`decide`] refuses
+    /// it at the expiry check (BEP-024), after the attribution check.
+    Expired,
     /// The value decrypted.
     Opened {
         /// The box the value names.
         box_id: B,
         /// The member's bounds.
         bounds: Bounds,
+        /// The earliest expiry of the value and its member, in seconds
+        /// since the Unix epoch.
+        expiry: u64,
     },
 }
 
@@ -68,7 +88,9 @@ impl Unsealed<String> {
     /// [`Check::UnboundedMember`]. A value bound to another box id gives
     /// [`Unsealed::OtherBox`], so [`decide`] refuses it as
     /// [`Check::CrossBox`], or as [`Check::NoLiveBox`] when the source
-    /// resolves to no live box.
+    /// resolves to no live box. A value past its expiry gives
+    /// [`Unsealed::Expired`], so [`decide`] refuses it as [`Check::Expired`]
+    /// once the attribution passes.
     ///
     /// The shell binds the open to the box id that the source resolves to.
     /// For an [`Attribution::OwnIp`] source, that is the sending box, so a
@@ -93,6 +115,10 @@ impl Unsealed<String> {
     pub fn from_open(result: Result<Opened, OpenError>) -> Result<Self, OpenError> {
         match result {
             Ok(opened) => Ok(Self::Opened {
+                expiry: opened
+                    .member
+                    .exp
+                    .map_or(opened.context.expiry, |exp| exp.min(opened.context.expiry)),
                 box_id: opened.context.box_id,
                 bounds: Bounds {
                     mode: Some(opened.context.mode),
@@ -100,6 +126,7 @@ impl Unsealed<String> {
                 },
             }),
             Err(OpenError::NotOpenable) => Ok(Self::Undecryptable),
+            Err(OpenError::Expired) => Ok(Self::Expired),
             Err(OpenError::UnknownBreadth) => Ok(Self::Unbounded),
             Err(OpenError::ContextMismatch(BoundField::BoxId)) => Ok(Self::OtherBox),
             Err(other) => Err(other),
@@ -131,9 +158,20 @@ pub enum Attribution<B> {
     HostIpCohort,
 }
 
+/// One authority: a hostname, interned as an `H`, and a port.
+///
+/// A host-set entry written with no port is port 443.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Authority<H> {
+    /// The hostname.
+    pub host: H,
+    /// The port.
+    pub port: u16,
+}
+
 /// One redemption, as the shell sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Redemption<B> {
+pub struct Redemption<B, H> {
     /// The decryption fact, with the named box and the member's bounds.
     pub unsealed: Unsealed<B>,
     /// The box the connection's source resolves to.
@@ -154,6 +192,17 @@ pub struct Redemption<B> {
     /// cross-box and host-shell refusals do not hold in that interim. The
     /// spec records this as a residual risk (T28, Gatehouse §6.10).
     pub named_box_in_cohort: bool,
+    /// The clock reading for this request, in seconds since the Unix epoch.
+    pub now: u64,
+    /// The box ids that the revocations in force name. The shell selects
+    /// the revocations in force before it calls [`decide`] (BEP-071).
+    pub revoked: Vec<B>,
+    /// The authority the connection arrived on.
+    pub authority: Authority<H>,
+    /// The module's host set at the version the value carries.
+    pub bound_set: Vec<Authority<H>>,
+    /// The module's current host set.
+    pub current_set: Vec<Authority<H>>,
 }
 
 /// How an admitted request was attributed to the box the value names.
@@ -178,6 +227,17 @@ pub enum Check {
     /// The source is a box other than the one the value names, or the
     /// `host_ip` cohort when the named box is not in it (BEP-020).
     CrossBox,
+    /// The clock is at or after the value's expiry (BEP-024).
+    Expired,
+    /// A revocation in force names the value's box (BEP-024).
+    Revoked,
+    /// The hostname is in the module's current host set, but not on the
+    /// connection's port (BEP-031).
+    OffPort,
+    /// The authority is not in the value's bound host set (BEP-021).
+    OutsideBoundSet,
+    /// The authority is not in the module's current host set (BEP-021).
+    OutsideCurrentSet,
 }
 
 impl Check {
@@ -189,6 +249,11 @@ impl Check {
             Self::UnboundedMember => "unbounded_member",
             Self::NoLiveBox => "no_live_box",
             Self::CrossBox => "cross_box",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+            Self::OffPort => "off_port",
+            Self::OutsideBoundSet => "outside_bound_set",
+            Self::OutsideCurrentSet => "outside_current_set",
         }
     }
 }
@@ -217,9 +282,9 @@ pub enum Decision {
 
 /// Decides one redemption. Pure: the result depends only on `redemption`.
 #[must_use]
-pub fn decide<B: PartialEq>(redemption: &Redemption<B>) -> Decision {
+pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Decision {
     // BEP-019: only a value this host's key opens is redeemed.
-    let (box_id, bounds) = match &redemption.unsealed {
+    let (box_id, bounds, expiry) = match &redemption.unsealed {
         Unsealed::Undecryptable => return Decision::Refuse(Check::Undecryptable),
         Unsealed::Unbounded => return Decision::Refuse(Check::UnboundedMember),
         // BEP-020: open refused the value as bound to another box id. The
@@ -231,7 +296,21 @@ pub fn decide<B: PartialEq>(redemption: &Redemption<B>) -> Decision {
                 Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::CrossBox,
             });
         }
-        Unsealed::Opened { box_id, bounds } => (box_id, bounds),
+        // BEP-024: open refused the value as past its expiry. The open was
+        // bound to the box the source resolves to, so only the source can
+        // fail first.
+        Unsealed::Expired => {
+            return Decision::Refuse(match redemption.attribution {
+                Attribution::NoLiveBox => Check::NoLiveBox,
+                Attribution::HostIpCohort if !redemption.named_box_in_cohort => Check::CrossBox,
+                Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::Expired,
+            });
+        }
+        Unsealed::Opened {
+            box_id,
+            bounds,
+            expiry,
+        } => (box_id, bounds, *expiry),
     };
     // BEP-058: a member with no mode or no recognised breadth is refused.
     let (Some(mode), Some(breadth)) = (bounds.mode, bounds.breadth) else {
@@ -246,6 +325,26 @@ pub fn decide<B: PartialEq>(redemption: &Redemption<B>) -> Decision {
             return Decision::Refuse(Check::CrossBox);
         }
     };
+    // BEP-024: only a value before its expiry, and not revoked, is redeemed.
+    if redemption.now >= expiry {
+        return Decision::Refuse(Check::Expired);
+    }
+    if redemption.revoked.contains(box_id) {
+        return Decision::Refuse(Check::Revoked);
+    }
+    // BEP-031: a credentialed hostname is reached only on a declared port.
+    let authority = &redemption.authority;
+    let current = &redemption.current_set;
+    if current.iter().any(|a| a.host == authority.host) && !current.contains(authority) {
+        return Decision::Refuse(Check::OffPort);
+    }
+    // BEP-021: the authority is in the bound set and in the current set.
+    if !redemption.bound_set.contains(authority) {
+        return Decision::Refuse(Check::OutsideBoundSet);
+    }
+    if !current.contains(authority) {
+        return Decision::Refuse(Check::OutsideCurrentSet);
+    }
     Decision::Admit {
         attributed,
         mode,
@@ -265,6 +364,48 @@ mod tests {
         mode: Some(Mode::User),
         breadth: Some(Breadth::Full),
     };
+
+    /// The authority every test connects to unless it says otherwise.
+    const API: Authority<u8> = Authority { host: 1, port: 443 };
+
+    /// The facts after attribution, set so that every later check passes.
+    fn rest<B>() -> Redemption<B, u8> {
+        Redemption {
+            unsealed: Unsealed::Undecryptable,
+            attribution: Attribution::NoLiveBox,
+            named_box_in_cohort: false,
+            now: 1_500,
+            revoked: Vec::new(),
+            authority: API,
+            bound_set: vec![API],
+            current_set: vec![API],
+        }
+    }
+
+    /// An opened value for `named`, sent from `named`, that passes the
+    /// source and bounds checks.
+    fn own(named: u8) -> Redemption<u8, u8> {
+        Redemption {
+            unsealed: Unsealed::Opened {
+                box_id: named,
+                bounds: BOUNDED,
+                expiry: 2_000,
+            },
+            attribution: Attribution::OwnIp(named),
+            ..rest()
+        }
+    }
+
+    const ADMITTED: Decision = Decision::Admit {
+        attributed: Attributed::OwnBox,
+        mode: Mode::User,
+        breadth: Breadth::Full,
+    };
+
+    fn any_authority() -> impl Strategy<Value = Authority<u8>> {
+        (0u8..4, prop::sample::select(vec![443u16, 8443, 80]))
+            .prop_map(|(host, port)| Authority { host, port })
+    }
 
     fn key(bytes: [u8; 32]) -> Option<ProxyKey> {
         ProxyKey::from_bytes(&bytes)
@@ -326,6 +467,7 @@ mod tests {
                 unsealed,
                 attribution: Attribution::OwnIp(box_id.clone()),
                 named_box_in_cohort: false,
+                ..rest()
             });
             if same_key {
                 prop_assert!(matches!(decision, Decision::Admit { .. }), "admitted");
@@ -341,6 +483,7 @@ mod tests {
                     unsealed: own,
                     attribution: Attribution::OwnIp(box_id),
                     named_box_in_cohort: false,
+                    ..rest()
                 }),
                 Decision::Admit {
                     attributed: Attributed::OwnBox,
@@ -365,9 +508,10 @@ mod tests {
                 _ => Attribution::HostIpCohort,
             };
             let decision = decide(&Redemption {
-                unsealed: Unsealed::Opened { box_id: named, bounds: BOUNDED },
+                unsealed: Unsealed::Opened { box_id: named, bounds: BOUNDED, expiry: 2_000 },
                 attribution: attribution.clone(),
                 named_box_in_cohort: in_cohort,
+                ..rest()
             });
             let expected = match attribution {
                 Attribution::NoLiveBox => Err(Check::NoLiveBox),
@@ -395,9 +539,10 @@ mod tests {
         ) {
             let bounds = Bounds { mode, breadth: breadth.then_some(Breadth::Full) };
             let decision = decide(&Redemption {
-                unsealed: Unsealed::Opened { box_id: named, bounds },
+                unsealed: Unsealed::Opened { box_id: named, bounds, expiry: 2_000 },
                 attribution: Attribution::OwnIp(named),
                 named_box_in_cohort: false,
+                ..rest()
             });
             match (bounds.mode, bounds.breadth) {
                 (Some(mode), Some(breadth)) => prop_assert_eq!(decision, Decision::Admit {
@@ -408,6 +553,130 @@ mod tests {
                 _ => prop_assert_eq!(decision, Decision::Refuse(Check::UnboundedMember)),
             }
         }
+
+        /// BEP-021: a value redeems only when the connection authority is in
+        /// the value's bound host set and in the module's current host set.
+        #[test]
+        fn prop_authority_outside_bound_or_current_set_is_refused(
+            bound in prop::collection::vec(any_authority(), 0..=4),
+            current in prop::collection::vec(any_authority(), 0..=4),
+            authority in any_authority(),
+            named in any::<u8>(),
+        ) {
+            let decision = decide(&Redemption {
+                authority,
+                bound_set: bound.clone(),
+                current_set: current.clone(),
+                ..own(named)
+            });
+            let in_bound = bound.contains(&authority);
+            let in_current = current.contains(&authority);
+            let credentialed = current.iter().any(|a| a.host == authority.host);
+            let expected = if credentialed && !in_current {
+                Decision::Refuse(Check::OffPort)
+            } else if !in_bound {
+                Decision::Refuse(Check::OutsideBoundSet)
+            } else if !in_current {
+                Decision::Refuse(Check::OutsideCurrentSet)
+            } else {
+                ADMITTED
+            };
+            prop_assert_eq!(decision, expected);
+            prop_assert_eq!(matches!(decision, Decision::Admit { .. }), in_bound && in_current);
+        }
+
+        /// BEP-024: a value redeems only before its expiry, and only when no
+        /// revocation in force names its box.
+        #[test]
+        fn prop_expired_or_revoked_value_is_refused(
+            now in 0u64..4_000,
+            expiry in 0u64..4_000,
+            revoked in prop::collection::vec(0u8..4, 0..=3),
+            named in 0u8..4,
+        ) {
+            let decision = decide(&Redemption {
+                unsealed: Unsealed::Opened { box_id: named, bounds: BOUNDED, expiry },
+                now,
+                revoked: revoked.clone(),
+                ..own(named)
+            });
+            let expected = if now >= expiry {
+                Decision::Refuse(Check::Expired)
+            } else if revoked.contains(&named) {
+                Decision::Refuse(Check::Revoked)
+            } else {
+                ADMITTED
+            };
+            prop_assert_eq!(decision, expected);
+
+            // A value that open refuses as expired is refused as expired
+            // from its own box, whatever the revocations.
+            prop_assert_eq!(
+                decide(&Redemption {
+                    unsealed: Unsealed::Expired,
+                    revoked,
+                    ..own(named)
+                }),
+                Decision::Refuse(Check::Expired)
+            );
+        }
+
+        /// BEP-031: a connection to a credentialed hostname is admitted only
+        /// on a port that the module's current host set declares for it.
+        #[test]
+        fn prop_off_port_connection_is_refused(
+            current in prop::collection::vec(any_authority(), 1..=4),
+            pick in any::<prop::sample::Index>(),
+            port in any::<u16>(),
+            named in any::<u8>(),
+        ) {
+            let host = pick.get(&current).host;
+            let authority = Authority { host, port };
+            let decision = decide(&Redemption {
+                authority,
+                bound_set: current.clone(),
+                current_set: current.clone(),
+                ..own(named)
+            });
+            if current.contains(&authority) {
+                prop_assert_eq!(decision, ADMITTED);
+            } else {
+                prop_assert_eq!(decision, Decision::Refuse(Check::OffPort));
+            }
+        }
+    }
+
+    /// BEP-024: `seal::open` refuses a value past its expiry as `Expired`.
+    /// The shell maps that to `Expired`, and the refusal names `expired`.
+    /// An open value carries the earlier of its own and its member's expiry.
+    #[test]
+    fn from_open_expired_is_refused_as_expired() {
+        let Some(key) = key([5; 32]) else {
+            panic!("a valid key");
+        };
+        let sealed = sealed_to(&key, "box-a", "host-a", Mode::User);
+        let at = |now| Binding {
+            box_id: "box-a".into(),
+            host: "host-a".into(),
+            module: "github".into(),
+            now,
+        };
+        let late = Unsealed::from_open(open(&key, &sealed, &at(2_000))).expect("a decryption fact");
+        assert_eq!(late, Unsealed::Expired);
+        let decision = decide(&Redemption {
+            unsealed: late,
+            attribution: Attribution::OwnIp("box-a".to_owned()),
+            ..rest()
+        });
+        assert_eq!(decision, Decision::Refuse(Check::Expired));
+        assert_eq!(Check::Expired.marker(), "expired");
+
+        let early =
+            Unsealed::from_open(open(&key, &sealed, &at(1_500))).expect("a decryption fact");
+        let Unsealed::Opened { expiry, .. } = early else {
+            panic!("an opened value");
+        };
+        assert_eq!(expiry, 2_000);
     }
 
     /// BEP-058: `seal::open` refuses a member with a missing or unknown
@@ -428,6 +697,7 @@ mod tests {
                 unsealed: unsealed.clone(),
                 attribution,
                 named_box_in_cohort: true,
+                ..rest()
             });
             assert_eq!(decision, Decision::Refuse(Check::UnboundedMember));
             let Decision::Refuse(check) = decision else {
@@ -464,6 +734,7 @@ mod tests {
                 unsealed: unsealed.clone(),
                 attribution,
                 named_box_in_cohort: true,
+                ..rest()
             });
             assert_eq!(decision, Decision::Refuse(check));
         }
@@ -495,6 +766,7 @@ mod tests {
                     unsealed,
                     attribution: Attribution::HostIpCohort,
                     named_box_in_cohort: true,
+                    ..rest()
                 });
                 assert_eq!(decision, Decision::Refuse(Check::CrossBox));
                 continue;
@@ -503,6 +775,7 @@ mod tests {
                 unsealed,
                 attribution: Attribution::HostIpCohort,
                 named_box_in_cohort: true,
+                ..rest()
             }));
             break;
         }
@@ -537,6 +810,11 @@ mod tests {
             Check::UnboundedMember,
             Check::NoLiveBox,
             Check::CrossBox,
+            Check::Expired,
+            Check::Revoked,
+            Check::OffPort,
+            Check::OutsideBoundSet,
+            Check::OutsideCurrentSet,
         ]
         .map(Check::marker);
         assert_eq!(
@@ -545,7 +823,12 @@ mod tests {
                 "undecryptable",
                 "unbounded_member",
                 "no_live_box",
-                "cross_box"
+                "cross_box",
+                "expired",
+                "revoked",
+                "off_port",
+                "outside_bound_set",
+                "outside_current_set",
             ]
         );
     }
@@ -553,7 +836,7 @@ mod tests {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{Attribution, Bounds, Check, Decision, Redemption, Unsealed, decide};
+    use super::{Attribution, Authority, Bounds, Check, Decision, Redemption, Unsealed, decide};
     use crate::seal::{Breadth, Mode};
 
     fn any_mode() -> Option<Mode> {
@@ -576,15 +859,45 @@ mod kani_proofs {
     }
 
     fn any_unsealed() -> Unsealed<u8> {
-        match kani::any::<u8>() % 4 {
+        match kani::any::<u8>() % 5 {
             0 => Unsealed::Undecryptable,
             1 => Unsealed::Unbounded,
             2 => Unsealed::OtherBox,
+            3 => Unsealed::Expired,
             _ => Unsealed::Opened {
                 box_id: kani::any(),
                 bounds: any_bounds(),
+                expiry: kani::any(),
             },
         }
+    }
+
+    /// An authority, with the host interned as a `u8` id.
+    fn any_authority() -> Authority<u8> {
+        Authority {
+            host: kani::any(),
+            port: kani::any(),
+        }
+    }
+
+    /// A host set of at most four authorities.
+    fn any_set() -> Vec<Authority<u8>> {
+        let len = kani::any::<u8>() % 5;
+        let mut set = Vec::with_capacity(4);
+        for _ in 0..len {
+            set.push(any_authority());
+        }
+        set
+    }
+
+    /// The box ids of at most two revocations in force.
+    fn any_revoked() -> Vec<u8> {
+        let len = kani::any::<u8>() % 3;
+        let mut revoked = Vec::with_capacity(2);
+        for _ in 0..len {
+            revoked.push(kani::any());
+        }
+        revoked
     }
 
     fn any_attribution() -> Attribution<u8> {
@@ -595,16 +908,22 @@ mod kani_proofs {
         }
     }
 
-    fn any_redemption() -> Redemption<u8> {
+    fn any_redemption() -> Redemption<u8, u8> {
         Redemption {
             unsealed: any_unsealed(),
             attribution: any_attribution(),
             named_box_in_cohort: kani::any(),
+            now: kani::any(),
+            revoked: any_revoked(),
+            authority: any_authority(),
+            bound_set: any_set(),
+            current_set: any_set(),
         }
     }
 
     /// BEP-019: a value that does not decrypt is never admitted.
     #[kani::proof]
+    #[kani::unwind(6)]
     fn kani_redeem_refuses_undecryptable() {
         let r = any_redemption();
         let decision = decide(&r);
@@ -619,6 +938,7 @@ mod kani_proofs {
     /// BEP-020: an admission comes only from the named `own_ip` box, or
     /// from the `host_ip` cohort when the named box is in it.
     #[kani::proof]
+    #[kani::unwind(6)]
     fn kani_redeem_refuses_misattributed() {
         let r = any_redemption();
         let decision = decide(&r);
@@ -644,6 +964,7 @@ mod kani_proofs {
 
     /// BEP-058: an admission always has a mode and a recognised breadth.
     #[kani::proof]
+    #[kani::unwind(6)]
     fn kani_redeem_refuses_unbounded_member() {
         let r = any_redemption();
         let decision = decide(&r);
@@ -657,6 +978,72 @@ mod kani_proofs {
                 assert_eq!(decision, Decision::Refuse(Check::UnboundedMember));
             }
             _ => {}
+        }
+    }
+
+    /// BEP-021: an admission has the connection authority in the bound set
+    /// and in the current set.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_requires_authority_in_both_sets() {
+        let r = any_redemption();
+        let decision = decide(&r);
+        if matches!(decision, Decision::Admit { .. }) {
+            assert!(r.bound_set.contains(&r.authority));
+            assert!(r.current_set.contains(&r.authority));
+        }
+        if decision == Decision::Refuse(Check::OutsideBoundSet) {
+            assert!(!r.bound_set.contains(&r.authority));
+        }
+        if decision == Decision::Refuse(Check::OutsideCurrentSet) {
+            assert!(!r.current_set.contains(&r.authority));
+        }
+    }
+
+    /// BEP-024: an admission has the clock before the value's expiry, and
+    /// no revocation in force names the value's box.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_refuses_expired_or_revoked() {
+        let r = any_redemption();
+        let decision = decide(&r);
+        if matches!(decision, Decision::Admit { .. }) {
+            let Unsealed::Opened { box_id, expiry, .. } = r.unsealed else {
+                panic!("admitted a value that did not open");
+            };
+            assert!(r.now < expiry);
+            assert!(!r.revoked.contains(&box_id));
+        }
+        if decision == Decision::Refuse(Check::Expired) {
+            match r.unsealed {
+                Unsealed::Expired => {}
+                Unsealed::Opened { expiry, .. } => assert!(r.now >= expiry),
+                _ => panic!("refused as expired with no expiry"),
+            }
+        }
+        if decision == Decision::Refuse(Check::Revoked) {
+            let Unsealed::Opened { box_id, .. } = r.unsealed else {
+                panic!("refused as revoked with no box id");
+            };
+            assert!(r.revoked.contains(&box_id));
+        }
+    }
+
+    /// BEP-031: an admission has the connection's `host:port` declared in
+    /// the current set, and a credentialed hostname on another port is
+    /// never admitted.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_enforces_port_discipline() {
+        let r = any_redemption();
+        let decision = decide(&r);
+        let credentialed = r.current_set.iter().any(|a| a.host == r.authority.host);
+        let declared = r.current_set.contains(&r.authority);
+        if matches!(decision, Decision::Admit { .. }) {
+            assert!(declared);
+        }
+        if decision == Decision::Refuse(Check::OffPort) {
+            assert!(credentialed && !declared);
         }
     }
 }

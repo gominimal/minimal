@@ -7,7 +7,9 @@
 # the spool's clean-up plan), and minvmd (the guest boot line: the token
 # alphabet both its readers agree on and the budget that leaves libkrun
 # its reserve), and bep (the redemption decision: a value that does not
-# decrypt, a misattributed source and a member without bounds are refused).
+# decrypt, a misattributed source, a member without bounds, an authority
+# outside either host set, an off-port connection and an expired or
+# revoked value are refused).
 #
 # Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
@@ -273,4 +275,4 @@ expect boxes 10
 expect rcache 3
 expect mlog 9
 expect minvmd 5
-expect bep 3
+expect bep 6
