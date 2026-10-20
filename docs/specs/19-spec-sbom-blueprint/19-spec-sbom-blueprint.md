@@ -224,14 +224,17 @@ developer running agent boxes; build-infra operator; auditor.
   - THE SYSTEM SHALL emit the Blueprint from the box's stored expanded spec
     (BOX-068) and SHALL carry two digests as document properties: the
     spec's posture-projection digest (BOX-071), which binds exactly the
-    §6.3.2 field set — `type.name`, `type.source`, `type.root` and
-    `type.registry`; `network.mode`, `egress_dns` (the spec's
+    §6.3.2 field set — `type.name`, `type.source`, `type.root`, and
+    `type.registry` when the source is `org`; `network.mode`, `egress_dns` (the spec's
     `egress.allow_dns_hosts`), `egress_subnets` (`egress.allow_subnets`),
     `egress_deny_subnets` (`egress.deny_subnets`), `ingress_ports` and
     `quic443`; `bep.steering`; `registry_pinned` and `registry_commit`;
     `loadout_mode`; `pty_enabled`; `lifetime`; the `[nesting]` bounds; and
-    `secret_grants` — to the posture Gatehouse admitted the box under, and
-    the sha256 of the stored expanded spec's canonical bytes, which binds
+    `secret_grants` — to the posture Gatehouse admitted the box under, as
+    BOX-071 computes it (SHA-256 over the projection's RFC 8785 JCS bytes,
+    encoded base64url, the stored digest copied verbatim), and the spec
+    digest, SHA-256 over the stored expanded spec's RFC 8785 JCS bytes
+    encoded the same way, which binds
     every other field the Blueprint emits (`egress.allow_protocols` and
     `dynamic_ingress`, which BOX-071 projects nowhere; the rest of
     `[network.bep]`; `[secrets]` beyond the grants; variables; file imports
@@ -241,7 +244,7 @@ developer running agent boxes; build-infra operator; auditor.
     does.
     tier:   T1
     verify: cargo nextest run -p sbom blueprint_carries_posture_and_spec_digests
-    property: posture_digest(emit_bp(c)) == projection_digest(expanded_spec(c)) ∧ spec_digest(emit_bp(c)) == sha256(canonical(expanded_spec(c)))
+    property: posture_digest(emit_bp(c)) == stored_projection_digest(c) (BOX-071's base64url(SHA-256(JCS(projection)))) ∧ spec_digest(emit_bp(c)) == base64url(SHA-256(JCS(expanded_spec(c))))
 
 - **SBOM-007** WHEN a box SBOM is emitted under a pin whose commit
   carries a sealed attribution manifest THE SYSTEM SHALL emit component
