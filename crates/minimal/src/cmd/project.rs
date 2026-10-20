@@ -328,11 +328,10 @@ pub(crate) const DASH_DROPPED_HOOKS_REMEDY: &str =
     "Create the box from a terminal with `min session activate --sync tarball` instead";
 
 /// The refusal for the skip that would drop the project's lifecycle hooks,
-/// for the callers that refuse rather than start a session silently missing
-/// them: the `$HOME` that is itself a declared project, whose `minimal.toml`
-/// never reaches the daemon. The facts are worded here so `min session
-/// activate`, `min task run`, and the dashboard cannot drift; `remedy` is the
-/// caller's own, because what can be done about it differs by caller.
+/// for the callers that refuse rather than start a box without them. `min
+/// task run` has no upload flag to offer, so it prints the same facts as a
+/// warning instead. `remedy` is the caller's own, because what can be done
+/// about it differs by caller.
 pub(crate) fn dropped_hooks_error(
     root: &camino::Utf8Path,
     dropped_hooks: usize,
@@ -349,9 +348,9 @@ pub(crate) fn dropped_hooks_error(
 
 /// Renders a [`WorkspaceUpload`] outcome on the CLI's stderr — the shared
 /// presentation for `min session activate` and `min task run`. `refuse`
-/// turns the skip that would drop the project's lifecycle hooks (a `$HOME`
-/// that is itself a declared project) into the returned error; a caller that
-/// only warns passes `false`. `Ok(())` when the session may proceed.
+/// selects the caller's policy: activate refuses the `$HOME` skip that would
+/// drop lifecycle hooks; task run, which has no upload flag to offer, warns
+/// with the count instead. `Ok(())` when the session may proceed.
 pub(crate) fn report_upload_outcome(
     outcome: Result<WorkspaceUpload, anyhow::Error>,
     root: &camino::Utf8Path,
@@ -363,8 +362,18 @@ pub(crate) fn report_upload_outcome(
     }
     match outcome {
         WorkspaceUpload::Uploaded => Ok(()),
-        WorkspaceUpload::SkippedEmptyOrHome { .. } => {
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks } => {
             eprintln!("Starting with an empty box (nothing here to sync)");
+            if dropped_hooks > 0 {
+                // Reached only for a non-refusing caller: a refusing one
+                // returned the error above. Name the hooks so the warning
+                // does not read as a healthy start.
+                eprintln!(
+                    "{dropped_hooks} lifecycle hook(s) declared in {} will not run: \
+                     the file upload is skipped.",
+                    root.join(mfile::MFILE_NAME)
+                );
+            }
             Ok(())
         }
         WorkspaceUpload::SkippedUndeclared => {
