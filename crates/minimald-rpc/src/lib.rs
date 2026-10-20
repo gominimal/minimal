@@ -24,6 +24,13 @@ pub use boxes::{
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// The message every RPC refusal carries once the daemon has begun its
+/// shutdown: a client racing `min stop` matches on it to name the lost race
+/// in plain language instead of surfacing the raw RPC chain. Matching keys
+/// on this exact text across builds, so changing it is a wire-contract
+/// change, not display copy.
+pub const SHUTDOWN_REFUSAL: &str = "the daemon is shutting down";
+
 /// Describes a minimal-specific RPC method sent over ssh.
 ///
 /// Oneshot RPCs are not streaming. The trait pairs a subsystem name with its
@@ -134,7 +141,8 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
             "This CLI is minimal {cli}, but the running minimald is {daemon}. \
              The two speak the same RPCs only when built together, so continuing \
              would fail partway through and tear down whatever it had created. \
-             Restart the daemon on the new build: run `min stop`, then re-run this \
+             Restart the daemon on the new build: run `min stop --force` (the \
+             plain stop is refused while sessions are live), then re-run this \
              command (the daemon is started again automatically). \
              Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
         )
