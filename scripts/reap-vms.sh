@@ -13,7 +13,11 @@
 # MINVMD_GVPROXY_BIN path), so a bare-name pkill would only add collateral —
 # an unrelated checkout's live VM, or podman's gvproxy.
 #
-# Usage: scripts/reap-vms.sh [--vm <NAME>]
+# Usage: scripts/reap-vms.sh [--vm <NAME>] [--root <DIR>]
+#
+# --root <DIR> matches binaries under DIR instead of this checkout. CI's macOS
+# e2e runs a prebuilt testbed and fetched gvproxy from $RUNNER_TEMP, outside
+# the checkout, and the runner persists across jobs (#2456).
 #
 # Without --vm, every VM this checkout spawned is reaped: the default VM's and
 # each named VM's processes alike. With --vm <NAME>, only that named VM's
@@ -33,18 +37,22 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The VM to reap by name, or empty for "every VM this checkout spawned".
 VM=""
-if [ "${1:-}" = "--vm" ]; then
-  if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-    echo "usage: $0 [--vm <NAME>]" >&2
-    exit 2
-  fi
-  VM="$2"
-  shift 2
-fi
-if [ "$#" -gt 0 ]; then
-  echo "usage: $0 [--vm <NAME>]" >&2
-  exit 2
-fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --vm | --root)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "usage: $0 [--vm <NAME>] [--root <DIR>]" >&2
+        exit 2
+      fi
+      if [ "$1" = "--vm" ]; then VM="$2"; else ROOT="${2%/}"; fi
+      shift 2
+      ;;
+    *)
+      echo "usage: $0 [--vm <NAME>] [--root <DIR>]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # `default` (paths::DEFAULT_VM_NAME) is the default VM, not a name to pin: its
 # processes carry no `--vm` flag and its switch socket sits in no per-name
