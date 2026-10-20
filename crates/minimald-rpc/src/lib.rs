@@ -1888,13 +1888,13 @@ pub struct FinalizeSessionRequest {
     #[serde(default, skip_serializing_if = "is_false")]
     pub report_shared_port_collisions: bool,
     /// The client decodes
-    /// [`FinalizeSessionResponse::published_address`], so the daemon may
+    /// [`FinalizeSessionResponse::host_ports_in_use`], so the daemon may
     /// fill it. Same gating and same serde-defaults as
     /// [`Self::report_shared_port_collisions`]: an older client's request
     /// reads as `false`, an older daemon's reply omits the key, and only a
-    /// client that asks is answered with the address.
+    /// client that asks is answered with the list.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub report_published_address: bool,
+    pub report_host_ports_in_use: bool,
 }
 
 /// Serde helper: omit a `false` request flag, so the request matches the one
@@ -1943,17 +1943,16 @@ pub struct FinalizeSessionResponse {
     /// field would refuse the reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_port_collisions: Vec<SharedPortCollision>,
-    /// The address the box publishes its ingress forwards on, so the
-    /// client can probe a declared host port the way the first spawn's
-    /// forwarder will and warn before the box is used. Filled only when
-    /// the request set
-    /// [`FinalizeSessionRequest::report_published_address`], for the same
-    /// `deny_unknown_fields` reason as
-    /// [`Self::shared_port_collisions`]; serde-defaulted and omitted when
-    /// `None`, so a reply from a daemon that predates the field decodes
-    /// the same as one that has no address to report.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_address: Option<std::net::Ipv4Addr>,
+    /// The declared TCP host ports another process on the daemon's host
+    /// already holds at the box's published address, found by the daemon
+    /// at activation. Each one fails the box's spawns until it is free, so
+    /// the client warns about it now. Filled only when the request set
+    /// [`FinalizeSessionRequest::report_host_ports_in_use`], for the same
+    /// `deny_unknown_fields` reason as [`Self::shared_port_collisions`].
+    /// Serde-defaulted and omitted when empty, so a reply from a daemon that
+    /// predates the field decodes the same as one with nothing to report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_ports_in_use: Vec<u16>,
 }
 
 /// A declared ingress port the box yields because another box at the same
@@ -2863,36 +2862,30 @@ mod tests {
         );
     }
 
-    /// `published_address` is omitted from the wire when `None`, so a
+    /// `host_ports_in_use` is omitted from the wire when empty, so a
     /// client that predates the field still decodes the common success
-    /// payload; when the daemon reports it, it round-trips so the client
-    /// can probe the declared host ports on the address the forwards bind
-    /// on.
+    /// payload. When the daemon reports ports, they round-trip.
     #[test]
-    fn published_address_is_omitted_when_none() {
+    fn host_ports_in_use_is_omitted_when_empty() {
         let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
             .expect("must serialize");
         assert!(
-            !wire.contains("published_address"),
-            "an unset address must not be serialized, got {wire:?}"
+            !wire.contains("host_ports_in_use"),
+            "an empty list must not be serialized, got {wire:?}"
         );
 
-        let published = FinalizeSessionResponse {
-            published_address: Some(std::net::Ipv4Addr::new(127, 0, 64, 9)),
+        let reported = FinalizeSessionResponse {
+            host_ports_in_use: vec![18999],
             ..Default::default()
         };
-        let wire = serde_json_lenient::to_string(&published).expect("must serialize");
+        let wire = serde_json_lenient::to_string(&reported).expect("must serialize");
         assert!(
-            wire.contains("published_address"),
-            "a published address must be serialized, got {wire:?}"
+            wire.contains("host_ports_in_use"),
+            "a reported port must be serialized, got {wire:?}"
         );
         let back: FinalizeSessionResponse =
             serde_json_lenient::from_str(&wire).expect("must decode");
-        assert_eq!(
-            back.published_address,
-            Some(std::net::Ipv4Addr::new(127, 0, 64, 9)),
-            "the address must round-trip"
-        );
+        assert_eq!(back.host_ports_in_use, [18999], "the ports must round-trip");
     }
 
     /// A client and a daemon on either side of the
@@ -2917,7 +2910,7 @@ mod tests {
         let not_asking = FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
-            report_published_address: false,
+            report_host_ports_in_use: false,
         };
         assert_eq!(
             serde_json_lenient::to_string(&not_asking).expect("must serialize"),
@@ -2928,7 +2921,7 @@ mod tests {
         let asking = FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: true,
-            report_published_address: false,
+            report_host_ports_in_use: false,
         };
         let wire = serde_json_lenient::to_string(&asking).expect("must serialize");
         assert!(

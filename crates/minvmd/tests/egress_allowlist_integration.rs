@@ -855,7 +855,7 @@ async fn configure_and_finalize(
         let req = FinalizeSessionRequest {
             session_id,
             report_shared_port_collisions: false,
-            report_published_address: false,
+            report_host_ports_in_use: false,
         };
         let body = serde_json_lenient::to_vec(&req)
             .map_err(|e| format!("serialize FinalizeSession request: {e}"))?;

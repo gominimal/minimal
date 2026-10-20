@@ -2811,35 +2811,52 @@ impl BoxActor {
                 let mut record = self.record.record().await?;
                 record.status = BoxState::Active;
                 self.record.write(record.clone()).await?;
-                // The address this box publishes its ingress forwards on,
-                // read from the registry the registration above wrote — the
-                // same standing-publish read a later registration upgrades
-                // through, so it names the address the box publishes at
-                // right now, whether that is its own hand, a drawn grant,
-                // or the `127.0.0.1` interim. Filled unconditionally here;
-                // `serve_finalize_session` keeps it only for a client that
-                // asked, for the same `deny_unknown_fields` reason as the
-                // collisions list.
-                let published_address = if matches!(record.network, boxes::NetworkMode::OwnIp) {
-                    #[cfg(target_os = "linux")]
-                    {
-                        self.hostnames
+                // The declared host ports another process already holds at
+                // this box's published address: each one fails every spawn
+                // until it is free (NET-121), so the client warns about it
+                // at activation. The daemon probes, not the client, because
+                // the forwarder binds on the daemon's host. Skipped when
+                // activate hooks ran: their host already bound the forwards,
+                // so a probe finds the box's own forwards, and a taken port
+                // already failed this finalize.
+                #[cfg(target_os = "linux")]
+                let host_ports_in_use = match (
+                    &record.network,
+                    record.policy.ingress.as_ref(),
+                    self.has_hooks_for(crate::hooks::HookEvent::Activate),
+                ) {
+                    (boxes::NetworkMode::OwnIp, Some(ingress), false) => {
+                        let published = self
+                            .hostnames
                             .read()
                             .expect("hostname registry lock poisoned")
-                            .published_own_address(record.id)
+                            .published_own_address(record.id);
+                        let yielded: Vec<u16> =
+                            shared_port_collisions.iter().map(|c| c.port).collect();
+                        published
+                            .map(|published| {
+                                crate::net::policy::host_ports_in_use(published, ingress, &yielded)
+                            })
+                            .unwrap_or_default()
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        None
-                    }
-                } else {
-                    None
+                    _ => Vec::new(),
                 };
+                #[cfg(not(target_os = "linux"))]
+                let host_ports_in_use: Vec<u16> = Vec::new();
+                for port in &host_ports_in_use {
+                    tracing::warn!(
+                        port,
+                        session = %record.id,
+                        action = "host-port-in-use",
+                        "declared ingress port is already in use on the host; \
+                         spawns fail until it is free"
+                    );
+                }
                 Ok(minimald_rpc::FinalizeSessionResponse {
                     activate_hooks: ran,
                     package_check_skipped,
                     shared_port_collisions,
-                    published_address,
+                    host_ports_in_use,
                 })
             }
             BoxState::Pending => Err(std::io::Error::new(

@@ -801,54 +801,17 @@ fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) 
     )
 }
 
-/// The stderr line activation prints for a declared TCP port the host
-/// already listens on, ahead of the first spawn's bind: the box activates
-/// and serves its other ports, and this one is bound at the next spawn
-/// once the holder frees it. The probe that decides this is a short-lived
-/// bind on the box's published address, so a port nothing holds stays
-/// silent.
+/// The stderr line activation prints for a declared TCP host port that
+/// another process holds on the daemon's machine. The daemon finds the
+/// port and reports it in the finalize reply. Nothing retries the bind:
+/// each command that starts a process in the session fails until the
+/// holder frees the port, so the line says that and offers the way out.
 fn host_port_in_use_warning(port: u16) -> String {
     format!(
-        "warning: host port {port} is already in use on this machine; this \
-         session will not forward it until it is free; pick another \
-         external port, e.g. --ingress <other>:<internal>"
+        "warning: host port {port} is already in use on the host. \
+         Commands in this session will fail until that port is free. \
+         To use another host port, declare --ingress <other>:<internal>."
     )
-}
-
-/// The warnings for every declared TCP `--ingress` external port something
-/// on this machine already holds, found by binding each the way the first
-/// spawn's forwarder will. The probe is on the box's published address, so
-/// it reports only what would actually refuse that bind — and never a port
-/// another box holds at a shared address, which the collision report has
-/// already said its own line for. Best-effort: a probe that cannot bind
-/// for any other reason says nothing, since the first spawn's refusal is
-/// already logged with the session's name.
-fn host_port_in_use_warnings(
-    published: Option<std::net::Ipv4Addr>,
-    declared: &[boxes::PortMapping],
-    yielded: &[minimald_rpc::SharedPortCollision],
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let Some(published) = published else {
-        return warnings;
-    };
-    for mapping in declared {
-        if mapping.proto != boxes::IpProto::Tcp {
-            continue;
-        }
-        if yielded
-            .iter()
-            .any(|collision| collision.port == mapping.external_port)
-        {
-            continue;
-        }
-        if std::net::TcpListener::bind((published, mapping.external_port))
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
-        {
-            warnings.push(host_port_in_use_warning(mapping.external_port));
-        }
-    }
-    warnings
 }
 
 /// Upload the composition's patches and external hook scripts (if
@@ -866,19 +829,12 @@ fn host_port_in_use_warnings(
 /// `on_activate` hooks, which the daemon runs inside `FinalizeSession`;
 /// the call's deadline is extended by it so a hook declaring more than the
 /// base RPC timeout is not cut short.
-///
-/// `declared_ingress` is the session's own `--ingress` TCP mappings; on a
-/// box that publishes an address, each declared host port is probed the
-/// way the first spawn's forwarder will bind it, so a port something on
-/// this machine already holds warns now — at activation — instead of
-/// surfacing as the raw refusal every later exec would fail on.
 pub(crate) async fn upload_and_finalize(
     client: &mut client::Client,
     session_id: boxes::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
     hook_scripts: &[boxes::client::hookscripts::StagedScript],
     hook_budget: std::time::Duration,
-    declared_ingress: &[boxes::PortMapping],
 ) -> Result<(), anyhow::Error> {
     client
         .upload_patches(session_id, patches)
@@ -896,7 +852,7 @@ pub(crate) async fn upload_and_finalize(
             FinalizeSessionRequest {
                 session_id,
                 report_shared_port_collisions: true,
-                report_published_address: true,
+                report_host_ports_in_use: true,
             },
             hook_budget,
         )
@@ -939,17 +895,11 @@ pub(crate) async fn upload_and_finalize(
             for collision in &ok.shared_port_collisions {
                 eprintln!("{}", shared_port_collision_warning(collision));
             }
-            // A port nothing on this machine holds cannot refuse the
-            // first spawn's bind; a port something does hold would, and
-            // the activation is the last moment to say so before the
-            // raw refusal surfaces inside an exec. Same shape as the
-            // collision lines above: the box still activates.
-            for warning in host_port_in_use_warnings(
-                ok.published_address,
-                declared_ingress,
-                &ok.shared_port_collisions,
-            ) {
-                eprintln!("{warning}");
+            // A declared host port another process holds fails every
+            // spawn until it is free. The activation still succeeds, so this
+            // line is the first place the person reads about it.
+            for port in &ok.host_ports_in_use {
+                eprintln!("{}", host_port_in_use_warning(*port));
             }
             Ok(())
         }
@@ -1086,77 +1036,19 @@ mod tests {
         );
     }
 
-    /// The activation-time line for a declared host port something on this
-    /// machine already holds: it names the port, says what the session will
-    /// and will not do with it, and offers the way out — the same
-    /// `--ingress <other>:<internal>` spelling the collision line offers.
+    /// The activation-time line for a declared host port another process
+    /// holds: it names the port, says that commands fail until the port is
+    /// free, and offers the same `--ingress <other>:<internal>` way out the
+    /// collision line offers.
     #[test]
     fn host_port_in_use_warning_names_the_port_and_the_way_out() {
         let line = super::host_port_in_use_warning(18999);
         assert_eq!(
             line,
-            "warning: host port 18999 is already in use on this machine; this \
-             session will not forward it until it is free; pick another \
-             external port, e.g. --ingress <other>:<internal>"
+            "warning: host port 18999 is already in use on the host. \
+             Commands in this session will fail until that port is free. \
+             To use another host port, declare --ingress <other>:<internal>."
         );
-    }
-
-    /// The probe says its line for exactly the ports another process holds
-    /// on the box's published address — and stays silent for every other
-    /// outcome: a free port, a port another box holds at the shared address
-    /// (the collision report has already said its own line for that one),
-    /// a UDP mapping (the probe binds TCP, as the forwarder's host-side
-    /// listener does), and a machine with no published address to probe.
-    #[test]
-    fn the_host_port_probe_warns_only_for_a_port_something_holds() {
-        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let held_port = held.local_addr().unwrap().port();
-
-        let yielded = vec![minimald_rpc::SharedPortCollision {
-            port: held_port,
-            held_by: "first.min.internal".to_string(),
-        }];
-        let declared = vec![
-            boxes::PortMapping {
-                external_port: 1,
-                internal_port: 80,
-                proto: boxes::IpProto::Tcp,
-            },
-            boxes::PortMapping {
-                external_port: held_port,
-                internal_port: 80,
-                proto: boxes::IpProto::Udp,
-            },
-        ];
-
-        // A free port and the yielded port say nothing.
-        assert!(
-            super::host_port_in_use_warnings(
-                Some(std::net::Ipv4Addr::LOCALHOST),
-                &declared,
-                &yielded
-            )
-            .is_empty()
-        );
-
-        // A port this process holds on the published address is the
-        // probe's own fact: one warning, naming that port.
-        let declared = vec![boxes::PortMapping {
-            external_port: held_port,
-            internal_port: 80,
-            proto: boxes::IpProto::Tcp,
-        }];
-        let warnings =
-            super::host_port_in_use_warnings(Some(std::net::Ipv4Addr::LOCALHOST), &declared, &[]);
-        assert_eq!(warnings.len(), 1, "only the held port warns");
-        assert!(
-            warnings[0].contains(&held_port.to_string()),
-            "the warning names the port it could not bind: {}",
-            warnings[0]
-        );
-
-        // No published address to probe: nothing to say.
-        assert!(super::host_port_in_use_warnings(None, &declared, &[]).is_empty());
     }
 }
 

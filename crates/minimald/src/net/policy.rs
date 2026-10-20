@@ -334,12 +334,11 @@ impl PortForwarder {
 /// not a failure. It is skipped, with one warn line naming the port and the
 /// box that holds it, and the box's other forwards bind as usual.
 ///
-/// A host port another process already holds is the same skip, one rung
-/// down: the forwarder refuses the `expose` with the OS's `address already
-/// in use`, and the box that declared it stays usable rather than failing
-/// every later spawn on a bind the box cannot win. Each such port is
-/// returned beside the bound forwards, so the caller can log it with the
-/// session's name; every other refusal keeps the rollback below.
+/// A host port another process already holds is a failure like any other
+/// refused bind (NET-121): the rollback below runs and the caller withdraws
+/// the name. Only the returned error differs. It names the port and says
+/// the port is in use on the host, in place of the forwarder's raw
+/// refusal, and its kind is [`io::ErrorKind::AddrInUse`].
 ///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
@@ -357,8 +356,8 @@ pub async fn apply_ingress(
     ingress: &IngressPolicy,
     gate: Option<&Arc<super::switch::BoxGate>>,
     yielded: &[super::dns::SharedPortCollision],
-) -> io::Result<AppliedIngress> {
-    let mut applied = AppliedIngress::with_capacity(ingress.port_mappings.len());
+) -> io::Result<Vec<PortForwarder>> {
+    let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
         if let Some(collision) = yielded
             .iter()
@@ -376,7 +375,7 @@ pub async fn apply_ingress(
         }
         let req = expose_request(mapping, published, ptask_ip);
         match post_json(control, "/services/forwarder/expose", &req).await {
-            Ok(()) => applied.bound.push(PortForwarder {
+            Ok(()) => bound.push(PortForwarder {
                 mapping: ExposedMapping {
                     local: req.local,
                     protocol: req.protocol,
@@ -385,23 +384,6 @@ pub async fn apply_ingress(
                 gate: gate.cloned(),
                 revoked: Arc::new(AtomicBool::new(false)),
             }),
-            Err(e) if is_address_in_use(&e) => {
-                // The host port is taken by a process nobody here knows: the
-                // bind cannot win, but the box's other forwards — and its
-                // every later spawn — still can. Said where the bind
-                // happened, naming the port and the address it tried, and
-                // the port joins the apply's skipped set so the caller logs
-                // it with the session's name.
-                tracing::warn!(
-                    port = mapping.external_port,
-                    local = %req.local,
-                    error = %e,
-                    action = "host-port-in-use",
-                    "declared ingress port not bound: the host port is \
-                     already in use"
-                );
-                applied.skipped.push(mapping.external_port);
-            }
             Err(e) => {
                 // The failed bind is the failure's own fact, said where it
                 // happened: the declared port, the address it tried to bind
@@ -416,35 +398,15 @@ pub async fn apply_ingress(
                 );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                release_declared_ingress(control, &applied.bound).await;
+                release_declared_ingress(control, &bound).await;
+                if is_address_in_use(&e) {
+                    return Err(address_in_use_error(mapping.external_port, &e));
+                }
                 return Err(e);
             }
         }
     }
-    Ok(applied)
-}
-
-/// What [`apply_ingress`] bound: the forwards the switch accepted, and the
-/// declared ports it skipped because the host port was already in use —
-/// one entry per skipped port, so the caller can log each beside the
-/// session's name.
-#[derive(Default)]
-pub struct AppliedIngress {
-    /// The forwards the switch bound, one per accepted mapping.
-    pub bound: Vec<PortForwarder>,
-    /// The declared external ports the switch refused because another
-    /// process already holds them on the host.
-    pub skipped: Vec<u16>,
-}
-
-impl AppliedIngress {
-    /// [`Vec::with_capacity`] for both halves, sized by the declaration.
-    fn with_capacity(declared: usize) -> Self {
-        Self {
-            bound: Vec::with_capacity(declared),
-            skipped: Vec::new(),
-        }
-    }
+    Ok(bound)
 }
 
 /// The OS's own text for a bind onto a port another process already holds,
@@ -459,6 +421,47 @@ const ADDRESS_IN_USE_BODY: &str = "address already in use";
 fn is_address_in_use(error: &io::Error) -> bool {
     let said = error.to_string();
     said.contains("returned HTTP 500") && said.contains(ADDRESS_IN_USE_BODY)
+}
+
+/// The declared TCP host ports of `ingress` that another process already
+/// holds at `published`, found by a short-lived bind of each one on this
+/// host — the same bind the forwarder makes at the box's first spawn. A
+/// port in `yielded` is skipped, because another box at the shared address
+/// holds it and the collision report already names it. A bind that fails
+/// for any reason other than `EADDRINUSE` reports nothing: the spawn's own
+/// apply says that failure. Call this only when the box's forwards are not
+/// bound, or it finds the box's own forwards.
+#[must_use]
+pub fn host_ports_in_use(
+    published: Ipv4Addr,
+    ingress: &IngressPolicy,
+    yielded: &[u16],
+) -> Vec<u16> {
+    ingress
+        .port_mappings
+        .iter()
+        .filter(|mapping| mapping.proto == boxes::IpProto::Tcp)
+        .map(|mapping| mapping.external_port)
+        .filter(|port| !yielded.contains(port))
+        .filter(|&port| {
+            std::net::TcpListener::bind((published, port))
+                .is_err_and(|e| e.kind() == io::ErrorKind::AddrInUse)
+        })
+        .collect()
+}
+
+/// The error [`apply_ingress`] returns for a declared port another process
+/// already holds on the host. It names the port in the words a person
+/// reads at the failed command, and keeps the forwarder's refusal after it
+/// for the log.
+fn address_in_use_error(port: u16, refusal: &io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "host port {port} is already in use on the host, so the \
+             session cannot forward it ({refusal})"
+        ),
+    )
 }
 
 /// The body the forwarder answers an expose with when a forward is already
@@ -2735,7 +2738,8 @@ mod tests {
         use tokio::net::UnixListener;
 
         use super::super::{
-            ControlChannel, IngressPolicy, PortMapping, apply_ingress, is_address_in_use,
+            ControlChannel, IngressPolicy, PortMapping, apply_ingress, host_ports_in_use,
+            is_address_in_use,
         };
         use super::forwarder_probe::read_request;
 
@@ -2766,14 +2770,16 @@ mod tests {
         fn forwarder_answering_in_turn(
             path: std::path::PathBuf,
             answers: Vec<(u16, &'static str)>,
-        ) -> tokio::task::JoinHandle<()> {
+        ) -> tokio::task::JoinHandle<Vec<String>> {
             let listener = UnixListener::bind(&path).unwrap();
             crate::traced::spawn(async move {
+                let mut asked = Vec::new();
                 for (status, body) in answers {
                     let Ok((mut sock, _)) = listener.accept().await else {
-                        return;
+                        return asked;
                     };
-                    let _request = read_request(&mut sock).await;
+                    asked
+                        .push(String::from_utf8_lossy(&read_request(&mut sock).await).into_owned());
                     sock.write_all(
                         format!(
                             "HTTP/1.1 {status} Internal Server Error\r\n\
@@ -2785,6 +2791,7 @@ mod tests {
                     .await
                     .expect("the fake forwarder must answer");
                 }
+                asked
             })
         }
 
@@ -2796,17 +2803,20 @@ mod tests {
             "listen tcp 127.0.0.1:18999: bind: address already in use",
         );
 
-        /// One declared port taken by another process: the apply skips it,
-        /// keeps the forward it already bound, and asks the switch for no
-        /// unexpose — the skipped forward never stood, so it has nothing to
-        /// roll back.
+        /// One declared port taken by another process fails the apply
+        /// (NET-121): the forward already bound is rolled back with an
+        /// unexpose, and the error names the taken port in place of the
+        /// forwarder's raw refusal. The caller then withdraws the name, as
+        /// it does for every failed apply.
         #[tokio::test]
-        async fn a_taken_host_port_is_skipped_and_keeps_the_bound_forward() {
+        async fn a_taken_host_port_fails_the_apply_and_rolls_back() {
             let dir = tempfile::TempDir::new().unwrap();
             let sock = dir.path().join("gvproxy.sock");
-            // Two declared ports: the first binds, the second is taken.
-            let forwarder = forwarder_answering_in_turn(sock.clone(), vec![(200, ""), IN_USE]);
-            let applied = apply_ingress(
+            // Two declared ports: the first binds, the second is taken, and
+            // the third request is the rollback of the first.
+            let forwarder =
+                forwarder_answering_in_turn(sock.clone(), vec![(200, ""), IN_USE, (200, "")]);
+            let err = match apply_ingress(
                 &ControlChannel::Unix(sock),
                 PUBLISHED,
                 LEASE,
@@ -2815,14 +2825,52 @@ mod tests {
                 &[],
             )
             .await
-            .expect("a taken host port does not fail the apply");
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a taken host port must fail the apply"),
+            };
 
-            assert_eq!(applied.skipped, [18999], "only the taken port is skipped");
-            assert_eq!(applied.bound.len(), 1, "the free port stays bound");
-            assert_eq!(applied.bound[0].local(), "127.0.64.9:18080");
-            forwarder
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            assert!(
+                err.to_string()
+                    .starts_with("host port 18999 is already in use on the host"),
+                "the error names the taken port: {err}"
+            );
+            let asked = forwarder
                 .await
-                .expect("the fake forwarder served both rounds");
+                .expect("the fake forwarder served every round");
+            assert_eq!(asked.len(), 3, "expose, expose, rollback: {asked:?}");
+            assert!(
+                asked[2].contains("127.0.64.9:18080"),
+                "the rollback releases the forward that bound: {asked:?}"
+            );
+        }
+
+        /// The activation probe names exactly the TCP ports another process
+        /// holds at the published address. A free port, a yielded port and
+        /// a UDP mapping on the held port all stay out of the list.
+        #[test]
+        fn the_probe_names_only_a_port_another_process_holds() {
+            let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let held_port = held.local_addr().unwrap().port();
+            let free = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let free_port = free.local_addr().unwrap().port();
+            drop(free);
+
+            let mut declared = ingress(&[held_port, free_port]);
+            assert_eq!(
+                host_ports_in_use(Ipv4Addr::LOCALHOST, &declared, &[]),
+                [held_port]
+            );
+            assert!(
+                host_ports_in_use(Ipv4Addr::LOCALHOST, &declared, &[held_port]).is_empty(),
+                "a yielded port is the collision report's to name"
+            );
+            declared.port_mappings[0].proto = boxes::IpProto::Udp;
+            assert!(
+                host_ports_in_use(Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
+                "a UDP mapping is not probed with a TCP bind"
+            );
         }
 
         /// The skip reads only the OS's own words: any other refusal of the
