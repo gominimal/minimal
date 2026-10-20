@@ -42,10 +42,10 @@ composition-level facts over references to those units, resolved through the
 box's pin. A component has a **digest gap** when the pinned closure
 references no per-package document for it, which is the ordinary case for a
 package built locally or non-redistributable by policy, and the gap names
-which: `built-locally`, `non-redistributable`, or `outside-pin` — the
-loadout package an `open` box took from a registry other than its
-`[upstream]` (architecture: Loadout Mode), which names that registry.
-SBOM-004 and SBOM-011 use that one definition. A document the closure references but that cannot be
+which: `built-locally`, `non-redistributable`, or `outside-pin` — a
+package for which the box's stored expanded spec records a non-upstream
+registry, which the gap names. SBOM-004 and SBOM-011 use that one
+definition. A document the closure references but that cannot be
 fetched is not a gap; it is SBOM-012's failure. Until build-servers#185 pins
 the document digest in the closure (Non-goals), *references* is decided by
 the closure entry alone: a component whose entry maps its Build Spec Hash to
@@ -56,10 +56,12 @@ when the box's stored expanded spec (BOX-068) records a registry for it
 other than `[upstream]`, and the gap names that registry reduced under
 SBOM-008 (scheme, host, port, path). The design's Box Spec records one
 upstream registry and no registry for any loadout package (architecture
-lines 83 and 1074–1077), so today no package has a recorded registry,
-`outside-pin` cannot occur, and an `open` box's loadout package from
-another registry resolves as an upstream package: it has no entry in the
-box's pin, and the emission is SBOM-012's failure below. Whether the design
+lines 83 and 1074–1077), so today no package has a recorded registry and
+`outside-pin` cannot occur. A name resolves against the one upstream
+(architecture line 1731), so an `open` box's loadout package from another
+registry takes the upstream rule: with an `artifact` entry of that name in
+the closure it has that digest, and with no entry it is SBOM-004's exit 6
+below. Whether the design
 records that registry is asked in gominimal/arch#138 (Open questions);
 the kind is defined here so that a yes needs no change to this spec.
 Precedence, for when it exists: the closure entry decides first, and a
@@ -146,7 +148,7 @@ developer running agent boxes; build-infra operator; auditor.
     bundle binds the bytes and the property above holds unconditionally.
     tier:   T1
     verify: cargo nextest run -p sbom sbom_replaced_document_changes_only_its_component_and_digest
-    property: bytes(a) ≠ bytes(b) ⇒ R ≠ ∅ ∧ diff(a, b) ⊆ ⋃{component(d) : d ∈ R}, where R = {d : ¬pin_records_bundle(d) ∧ read_digest_a(d) ≠ read_digest_b(d)}
+    property: bytes(a) ≠ bytes(b) ⇒ R ≠ ∅ ∧ diff(a, b) ⊆ ⋃{component(d) : d ∈ R}, where R = {d : ¬pin_records_bundle(d) ∧ read_digest_a(d) ≠ read_digest_b(d)} and a document absent on one emission reads as digest ∅
 
 - **SBOM-002** WHEN a document is emitted as CycloneDX THE SYSTEM SHALL
   produce output that validates against the vendored CycloneDX 1.5 schema.
@@ -163,9 +165,9 @@ developer running agent boxes; build-infra operator; auditor.
 - **SBOM-004** THE SYSTEM SHALL attach to every component either an
   artifact digest resolvable through the signed closure object, or its
   digest gap (Context: the closure references no per-package document for
-  it, `built-locally` or `non-redistributable`, or the package is an `open`
-  box's loadout package from another registry, `outside-pin`) — never
-  neither and never both.
+  it, `built-locally` or `non-redistributable`, or the stored expanded spec
+  records a non-upstream registry for it, `outside-pin`) — never neither
+  and never both.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_digest_or_gap_total
   property: for all components k: has_sha256(k) xor has_digest_gap(k),
@@ -241,8 +243,10 @@ developer running agent boxes; build-infra operator; auditor.
     location field (the posture's and the imported documents' alike) is of
     the form scheme://host[:port]/path, fields(imported(d)) ⊆ {name, version,
     purl, digests, tool name, tool version} for every document d, for all
-    credentials v in credentials(c) ∪ planted(d): v not in ir(c), and no
-    string anywhere in parse_s(emit_s(c)) equals or contains v
+    credentials v in credentials(c) ∪ planted(d), where every v is at least
+    16 characters drawn so that no v is a substring of any declared input,
+    package name or version of c: v not in ir(c), and no string anywhere in
+    parse_s(emit_s(c)) equals or contains v
   - verify: cargo nextest run -p sbom sbom_credential_planted_in_a_per_package_document_never_emitted
 
 - **SBOM-009** WHEN a component has a per-package document (SBOM-013)
@@ -269,8 +273,8 @@ developer running agent boxes; build-infra operator; auditor.
 
 - **SBOM-011** IF a component has no per-package document referenced by
   the pinned closure — a declared gap: `built-locally` or
-  `non-redistributable`, or `outside-pin` for an `open` box's loadout
-  package from another registry — THEN THE SYSTEM SHALL emit that component
+  `non-redistributable`, or `outside-pin` where the stored expanded spec
+  records a non-upstream registry for it — THEN THE SYSTEM SHALL emit that component
   carrying that digest gap, never omitting it. (A document the closure
   *does* reference but that cannot be fetched is not a gap; it is
   SBOM-012's failure; an upstream package with no entry at all is
@@ -287,7 +291,8 @@ developer running agent boxes; build-infra operator; auditor.
     exit 6, as every upstream package with no entry is
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
-  cannot be fetched THEN THE SYSTEM SHALL fail with exit code 6 naming the
+  cannot be fetched (an error other than the document's absence, which is
+  SBOM-013's interim while no bundle is pinned) THEN THE SYSTEM SHALL fail with exit code 6 naming the
   pin, the unresolved object, and the remediation, never emitting a document
   whose component set is silently incomplete.
   tier:     T1
@@ -333,6 +338,17 @@ developer running agent boxes; build-infra operator; auditor.
     tier:   T1
     verify: cargo nextest run -p sbom per_package_document_bundle_verified_before_read
     property: pin_records_bundle(d) ⇒ (read(d) ⇒ verified(bundle(d))) ∧ (¬verified(bundle(d)) ⇒ exit = 6); checks(d) = [bundle, subject, rest] in that order
+  - WHILE the pin records no bundle for the document, IF the cache holds no
+    document beside the artifact (the producer has published none:
+    build-servers#185 not landed, which is every package today) THEN THE
+    SYSTEM SHALL emit the component with its artifact digest from the
+    closure and no build-time facts, marked `unverified` with the reason
+    `no-document`, and mark the document `partial`, never failing the
+    emission for it; a fetch error other than absence stays SBOM-012's
+    failure. WHILE the pin records a bundle, absence is SBOM-012's failure.
+    tier:   T1
+    verify: cargo nextest run -p sbom per_package_document_absent_in_the_interim_is_marked_not_fatal
+    property: ¬pin_records_bundle(d) ∧ absent(d) ⇒ emitted ∧ has_sha256(component(d)) ∧ unverified(component(d), no-document)
   - WHILE the pin records no bundle for the document (the producer has not
     published one: build-servers#185) THE SYSTEM SHALL read the document,
     mark the component `unverified`, as PKV marks an entry whose source has
