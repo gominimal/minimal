@@ -151,23 +151,38 @@ fn apply_pins(
     sideloads: Vec<RevChange>,
 ) -> UpdateReport {
     let mut report = UpdateReport::default();
-    let Some(up) = doc.get_mut("upstream") else {
+    // The loader reads `[base]` as `[upstream]`, and `sideloads` as
+    // `sideload`, so the pins look under every spelling it accepts.
+    let Some(up) = ["upstream", "base"]
+        .into_iter()
+        .find(|k| doc.contains_key(k))
+        .and_then(|k| doc.get_mut(k))
+        .and_then(Item::as_table_like_mut)
+    else {
         return report;
     };
     if let Some(pin) = upstream
-        && up.as_table_like_mut().is_some_and(|t| repin(t, &pin))
+        && repin(up, &pin)
     {
         report.upstream = Some(pin);
     }
-    let mut links: Vec<&mut dyn TableLike> = match up.get_mut("sideload") {
-        Some(Item::ArrayOfTables(a)) => a.iter_mut().map(|t| t as &mut dyn TableLike).collect(),
-        Some(Item::Value(Value::Array(a))) => a
-            .iter_mut()
-            .filter_map(Value::as_inline_table_mut)
-            .map(|t| t as &mut dyn TableLike)
-            .collect(),
-        _ => Vec::new(),
-    };
+    let mut links: Vec<&mut dyn TableLike> = Vec::new();
+    for (key, item) in up.iter_mut() {
+        if key.get() != "sideload" && key.get() != "sideloads" {
+            continue;
+        }
+        match item {
+            Item::ArrayOfTables(a) => {
+                links.extend(a.iter_mut().map(|t| t as &mut dyn TableLike));
+            }
+            Item::Value(Value::Array(a)) => links.extend(
+                a.iter_mut()
+                    .filter_map(Value::as_inline_table_mut)
+                    .map(|t| t as &mut dyn TableLike),
+            ),
+            _ => {}
+        }
+    }
     for pin in sideloads {
         let mut landed = false;
         for link in links.iter_mut() {
@@ -274,6 +289,57 @@ sideload = [{ repo = "a", branch = "main", locked_commit = "a0" }]
         assert_eq!(report.sideloads.len(), 1);
         assert_eq!(
             doc["upstream"]["sideload"][0]["locked_commit"].as_str(),
+            Some("a1")
+        );
+    }
+
+    #[test]
+    fn apply_pins_honours_the_base_alias() {
+        let mut doc = r#"
+[base]
+repo = "up"
+branch = "main"
+locked_commit = "u0"
+
+[[base.sideload]]
+repo = "a"
+branch = "main"
+locked_commit = "a0"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let report = apply_pins(
+            &mut doc,
+            Some(pin("up", Some("u0"), "u1")),
+            vec![pin("a", Some("a0"), "a1")],
+        );
+        assert!(report.upstream.is_some());
+        assert_eq!(report.sideloads.len(), 1);
+        assert_eq!(doc["base"]["locked_commit"].as_str(), Some("u1"));
+        assert_eq!(
+            doc["base"]["sideload"][0]["locked_commit"].as_str(),
+            Some("a1")
+        );
+    }
+
+    #[test]
+    fn apply_pins_honours_the_sideloads_spelling() {
+        let mut doc = r#"
+[upstream]
+repo = "up"
+branch = "main"
+
+[[upstream.sideloads]]
+repo = "a"
+branch = "main"
+locked_commit = "a0"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let report = apply_pins(&mut doc, None, vec![pin("a", Some("a0"), "a1")]);
+        assert_eq!(report.sideloads.len(), 1);
+        assert_eq!(
+            doc["upstream"]["sideloads"][0]["locked_commit"].as_str(),
             Some("a1")
         );
     }

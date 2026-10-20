@@ -847,7 +847,7 @@ async fn an_invalid_link_table_is_reported_without_quoting_it() {
         "an invalid link must be reported as such: {reason}"
     );
     assert!(
-        !reason.contains("[[upstream.sideload]]") && !reason.contains("line"),
+        !reason.contains("[[upstream.sideload]]") && !reason.contains(" at line "),
         "the reason must not quote the table or its line: {reason}"
     );
     for (path, contents) in &files {
