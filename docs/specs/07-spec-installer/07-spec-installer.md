@@ -334,10 +334,11 @@ This **post-swap stop** never ends a session without consent. A session can
 open in a respawned daemon while the run continues. The stop is graceful unless
 the run already has consent: `--force-stop`, `MINIMAL_INSTALL_FORCE_STOP`, or a
 yes to the pre-swap question. With consent it is `<bin>/min stop --force`. When
-the graceful stop refuses because sessions are live, the installer leaves the
-daemon running and does not ask. It tells the user to run `min stop` after
-those sessions end, or `min stop --force` to end them now. The upgrade still
-succeeds. A rerun cannot do this stop, because a rerun replaces nothing. Any
+the graceful stop refuses because sessions are live, the installer asks on the
+terminal, as the pre-swap stop does, and a yes runs `stop --force`. On a no, or
+with no terminal, it leaves the daemon running. It tells the user to run
+`min stop` after those sessions end, or `min stop --force` to end them now. The
+upgrade still succeeds. A rerun cannot do this stop, because a rerun replaces nothing. Any
 other failure of the graceful stop falls through to `stop --force`, as the
 pre-swap stop does.
 
@@ -380,9 +381,11 @@ both hash columns in place of digests.
   after each stop leaves a daemon on the old build. After a yes to the pre-swap
   question, the run ends with exactly `stop`, `stop --force`, `stop --force`.
   The daemon it leaves runs from the newly installed `minimald`.
-- **Test** (R5.5): when the respawned daemon holds a session and the run has no
-  consent, the post-swap stop is graceful only. The session survives, nothing
-  is asked, the output names `min stop --force`, and the upgrade succeeds.
+- **Test** (R5.5): the respawned daemon holds a session, and the run has no
+  consent and no terminal. The post-swap stop is then graceful only. The session
+  survives, the output names `min stop --force`, and the upgrade succeeds. With
+  a yes on the terminal, the run asks and ends with `stop`, `stop`,
+  `stop --force`.
 - **Test** (R5.5): a checksum failure on a component after the first
   executable swap exits non-zero and still runs the post-swap stop. The daemon
   it leaves runs from the newly installed `minimald`.

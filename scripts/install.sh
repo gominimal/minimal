@@ -1016,9 +1016,10 @@ installed=0 skipped=0
 # A session can open in a respawned daemon while the run is still going (a
 # `min new`, an unattended job), and R5.5 never ends a session unasked. So the
 # stop is graceful unless this run already holds consent: --force-stop, or a
-# yes to the pre-swap question. A graceful stop refused for live sessions
-# leaves the daemon running and says what to do; it never asks again here,
-# because a rerun of the installer replaces nothing and so stops nothing.
+# yes to the pre-swap question. A graceful stop refused for live sessions asks
+# on the terminal, as the pre-swap stop does. Declined, or with no terminal to
+# ask on, it leaves the daemon running and says how to stop it: the swaps are
+# done, so the install itself still succeeds.
 stale_stop_tried=0
 stop_stale_daemon() {
     [ "$stale_stop_tried" -eq 0 ] || return 0
@@ -1035,6 +1036,10 @@ stop_stale_daemon() {
         fi
         case "$_stop_out" in
             *"$sessions_live_msg"*)
+                if confirm_force_stop; then
+                    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+                    return 0
+                fi
                 say "the daemon has active sessions, so it is still running build $_sv."
                 say "run 'min stop' after those sessions end, or 'min stop --force' to end them now."
                 return 0

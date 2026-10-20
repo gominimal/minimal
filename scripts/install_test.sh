@@ -1622,8 +1622,9 @@ stop --force" "$(cat "$HL7/stop.calls")" \
     # A session opened in the respawned daemon while the run is still going
     # (a `min new`, an unattended job) is never ended unasked. Without
     # --force-stop or a yes on the terminal, the closing stop is graceful.
-    # Refused for live sessions, it leaves the old-build daemon running and
-    # tells the user how to stop it, and the upgrade itself still succeeds.
+    # Refused for live sessions, it asks; with no terminal to ask on, it
+    # leaves the old-build daemon running and tells the user how to stop it,
+    # and the upgrade itself still succeeds.
     HL8="$root/hl8"; mkdir -p "$HL8"
     stage_live_upgrade "$HL8" liverespawnsession
     rm -f "$HL8/sessions.live"
@@ -1638,8 +1639,28 @@ stop" "$(cat "$HL8/stop.calls")" \
     want_ok "the session opened mid-run survives (R5.5)" test -f "$HL8/sessions.live"
     want_ok "the user is told how to stop the old daemon (R5.5)" \
         grep -q "min stop --force" "$OUT"
-    want_err "the closing stop asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+    want_ok "with no terminal, the closing stop says it cannot ask (R5.5)" \
+        grep -q "there is no terminal to confirm on" "$OUT"
     check "$h_minimald" "$(hash_file "$HL8/bin/minimald")" "the upgrade still completes (R5.5)"
+
+    # The same mid-run session with a yes on the terminal: the closing stop
+    # asks, and only then forces the stop.
+    HL8Y="$root/hl8y"; mkdir -p "$HL8Y"
+    stage_live_upgrade "$HL8Y" liverespawnyes
+    rm -f "$HL8Y/sessions.live"
+    printf 'stale\n' >"$HL8Y/daemon.running"
+    : >"$HL8Y/daemon.reconnect"
+    : >"$HL8Y/respawn.sessions"
+    printf 'y\n' >"$root/tty-yes8"
+    TTY_FILE="$root/tty-yes8"
+    run liverespawnyes "$HL8Y"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade that ends a mid-run session on a yes exits 0 (R5.5)"
+    want_ok "the closing stop asks before forcing (R5.5)" grep -q "Continue?" "$OUT"
+    check "stop
+stop
+stop --force" "$(cat "$HL8Y/stop.calls")" \
+        "graceful stop, graceful closing stop, then the consented force stop (R5.5)"
 
     # A download that fails after the first swap still runs the closing stop,
     # from the EXIT trap, so the daemon a client respawned from the
