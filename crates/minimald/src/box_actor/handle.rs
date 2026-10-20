@@ -14,12 +14,23 @@ impl BoxHandle {
         WeakBoxHandle(self.0.downgrade(), self.1.clone())
     }
 
-    /// Whether this session is being destroyed: set after the destroy
-    /// hooks and immediately before the destroy stops the host, so a command the destroy ends can still see why
-    /// when it returns.
+    /// Whether this session is being destroyed.
+    ///
+    /// The destroy sets this after its hooks run. It sets it before it
+    /// stops the host. So a command that the destroy ends can see why.
     #[must_use]
     pub fn is_destroying(&self) -> bool {
         self.1.is_cancelled()
+    }
+
+    /// A token that is cancelled when this session's destroy starts, at
+    /// the same point [`Self::is_destroying`] becomes true.
+    ///
+    /// The token is a child token. Cancelling it does not destroy the
+    /// session.
+    #[must_use]
+    pub fn destroy_signal(&self) -> CancellationToken {
+        self.1.child_token()
     }
 
     /// The session's composition, if it has one. See
