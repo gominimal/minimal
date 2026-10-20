@@ -136,9 +136,10 @@ developer running agent boxes; build-infra operator; auditor.
 
 ## Requirements
 
-- **SBOM-001** WHEN the same catalog pin and identical declared inputs are
-  emitted twice, the pin recording a bundle for every per-package document
-  it references, THE SYSTEM SHALL produce byte-identical documents, deriving
+- **SBOM-001** WHEN the same catalog pin, the same Box Record resolution
+  record and identical declared inputs are emitted twice, the pin recording
+  a bundle for every per-package document it references, THE SYSTEM SHALL
+  produce byte-identical documents, deriving
   serials, namespaces, and timestamps from content and pin, never from wall
   clock or randomness (while the pin records no bundle, the interim
   sub-bullet below bounds how two emissions may differ).
@@ -261,8 +262,11 @@ developer running agent boxes; build-infra operator; auditor.
   document (SBOM-009) only an allowlist of fields: a build-closure
   component's name, version, `purl` and digests, and a build-environment
   tool's name and version, with every location among them reduced the same
-  way and no other field of the document (annotations, command lines,
-  environment values, free text of any kind) ever copied, bundled or not
+  way, every copied `purl` reduced to its type, namespace, name and
+  version with qualifiers and subpath removed (a `repository_url`
+  qualifier can carry userinfo or a token path), and no other field of
+  the document (annotations, command lines, environment values, free text
+  of any kind) ever copied, bundled or not
   — and SHALL never embed a variable value, a secret value, or a credential
   carried by one of those fields in any document.
   tier:     T1
@@ -274,7 +278,8 @@ developer running agent boxes; build-infra operator; auditor.
     the form scheme://host[:port], or scheme://host/owner/repo for a GitHub
     import, every egress field is a CIDR, a host name or a protocol name,
     every file import or export carries only its project-root-relative
-    path and no absolute path, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
+    path and no absolute path, every copied purl has no qualifiers and no
+    subpath, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
     tool version} for every document d, for all credentials v in
     credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where every v is at
     least 16 characters drawn so that no v is a substring of any declared
@@ -309,10 +314,11 @@ developer running agent boxes; build-infra operator; auditor.
   build-time facts — its build closure's entries and their digests, and
   the build environment, recorded as that component's nested dependency
   facts and never as components of the box (the box's components are
-  SBOM-005's set alone) — from that document, and its metadata — name,
-  version, `purl`, and licenses where the pin carries no attribution
-  manifest — from the graph at the pin (minimal#700 D9; under a sealed
-  attribution manifest SBOM-007 is the one source of licenses);
+  SBOM-005's set alone) — from that document; its name and version from
+  the Box Record's resolution record (SBOM-014), with its `purl` built
+  from that name and version; and its licenses, where the pin carries no
+  attribution manifest, from the graph at the pin (minimal#700 D9; under a
+  sealed attribution manifest SBOM-007 is the one source of licenses);
   and SHALL reference the document from the component by the tarball's
   sha256 and the statement digest SBOM-013 defines, never embed it whole.
   tier:     T0
@@ -352,7 +358,8 @@ developer running agent boxes; build-infra operator; auditor.
   is unresolved under SBOM-013 (its subject digest differs from the
   closure's entry, its bundle fails a check, its bundle is absent while the
   pin records one, or the pin records no bundle for the document under the
-  `require_bundles` option, present or absent) THEN THE SYSTEM SHALL fail
+  `require_bundles` option, present or absent), or the Box Record's
+  resolution record is missing or unreadable (SBOM-014) THEN THE SYSTEM SHALL fail
   naming the pin, the unresolved object, the check that failed (both
   digests for a subject mismatch, the failed check's name for a bundle),
   and the remediation — exit code 7 when the host could not be reached,
@@ -377,7 +384,8 @@ developer running agent boxes; build-infra operator; auditor.
     by name, an absent pinned bundle on a reachable host, a document the
     pin records no bundle for under require_bundles, a copied string or a
     document that fails SBOM-008's validation or exceeds its limits, with
-    the field or the limit as check(o))
+    the field or the limit as check(o)), and a missing or unreadable Box
+    Record resolution record is unresolved(record) with the record as o
 
 - **SBOM-013** WHEN the system resolves a component's per-package document
   THE SYSTEM SHALL read `<spec_hash>.sbom.intoto.jsonl` beside the package's
@@ -445,7 +453,8 @@ developer running agent boxes; build-infra operator; auditor.
     do, which bounds the name, version and `purl` strings read from an
     unverified document as it bounds every other field. The component's
     own name, version and `purl` never come from the document (SBOM-009
-    takes them from the graph at the pin), and IF the document's subject
+    takes name and version from the Box Record's resolution record and
+    builds the `purl` from them), and IF the document's subject
     names a package other than the closure entry's THEN THE SYSTEM SHALL
     treat it as a subject mismatch (SBOM-012); the identities of the build
     closure's entries are the document's claims from an untrusted source
