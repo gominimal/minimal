@@ -252,21 +252,23 @@ fn ensure_own_file(path: &Path, file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// The bytes of the file that `file` holds open, read through a second,
-/// read-only handle on the same file and not through `path`. An entry that
-/// is swapped in at `path` after the open cannot supply the head hash.
-fn read_opened(path: &Path, file: &File) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
+/// A second, read-only handle on the file that `file` holds open. The
+/// handle never leads to an entry swapped in at `path` after the open.
+fn reader_for(path: &Path, file: &File) -> io::Result<File> {
     // `/proc/self/fd/N` leads to the open file itself, whatever is at
-    // `path` now. Elsewhere the path is opened again, and the device and
-    // inode check below refuses a different file.
+    // `path` now. Without `/proc`, and on other systems, the path is opened
+    // again, and the device and inode check below refuses a different file.
     #[cfg(target_os = "linux")]
-    let mut reader = {
+    let reader = {
         use std::os::fd::AsRawFd as _;
-        File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?
+        match File::open(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+            Ok(reader) => reader,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => File::open(path)?,
+            Err(err) => return Err(err),
+        }
     };
     #[cfg(not(target_os = "linux"))]
-    let mut reader = File::open(path)?;
+    let reader = File::open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -278,9 +280,41 @@ fn read_opened(path: &Path, file: &File) -> io::Result<Vec<u8>> {
             ));
         }
     }
-    let mut contents = Vec::new();
-    reader.read_to_end(&mut contents)?;
-    Ok(contents)
+    Ok(reader)
+}
+
+/// How many bytes [`read_tail`] reads from the end of the log at a time.
+const TAIL_CHUNK: u64 = 16 * 1024;
+
+/// The end of the log that `reader` reads, enough of it to find the last
+/// complete line. Returns the offset where the bytes start, and the bytes.
+/// The read stops at the first chunk that holds a newline before the last
+/// non-empty complete line, so its cost does not grow with the log.
+fn read_tail(mut reader: &File) -> io::Result<(u64, Vec<u8>)> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let len = reader.metadata()?.len();
+    let mut start = len;
+    let mut tail: Vec<u8> = Vec::new();
+    while start > 0 {
+        let step = start.min(TAIL_CHUNK);
+        start -= step;
+        let mut chunk = vec![0; step as usize];
+        reader.seek(SeekFrom::Start(start))?;
+        reader.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        if let Some(last) = tail.iter().rposition(|&b| b == b'\n') {
+            let complete = &tail[..last];
+            let trimmed = complete
+                .iter()
+                .rposition(|&b| b != b'\n' && b != b'\r')
+                .map_or(&complete[..0], |n| &complete[..=n]);
+            if trimmed.contains(&b'\n') {
+                break;
+            }
+        }
+    }
+    Ok((start, tail))
 }
 
 /// The audit log, open for append only.
@@ -297,7 +331,10 @@ pub struct AuditLog {
 
 impl AuditLog {
     /// Opens the log at `path` for append, and creates it and its parent
-    /// directory when absent. The next record chains to the log's last line.
+    /// directory when absent. A directory it creates gets mode 0700, and the
+    /// log gets mode 0600, also when it exists already. The next record
+    /// chains to the log's last line, which open finds from the end of the
+    /// file without a read of the whole log.
     ///
     /// The call fails when `path` is a symlink, or when another `AuditLog`
     /// holds the log open. A torn last line, which an interrupted append
@@ -305,7 +342,15 @@ impl AuditLog {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            // Directories this call creates are the proxy's alone.
+            let mut dirs = fs::DirBuilder::new();
+            dirs.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                dirs.mode(0o700);
+            }
+            dirs.create(parent)?;
         }
         // Refused before the open as well, so a symlink's target is never
         // created and a FIFO never blocks the open. The check after the
@@ -346,25 +391,32 @@ impl AuditLog {
             ),
             fs::TryLockError::Error(err) => err,
         })?;
-        let contents = read_opened(&path, &file)?;
-        let complete = contents
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |n| n + 1);
-        if complete < contents.len() {
+        // An existing log keeps the mode it was created with, so tighten it
+        // through the held descriptor.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        let (start, tail) = read_tail(&reader_for(&path, &file)?)?;
+        let complete = tail.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+        let len = start + complete as u64;
+        if complete < tail.len() {
             tracing::warn!(
                 path = %path.display(),
-                torn_bytes = contents.len() - complete,
+                torn_bytes = tail.len() - complete,
                 "audit log ends in a torn line, cutting it off"
             );
-            file.set_len(complete as u64)?;
+            file.set_len(len)?;
         }
-        let head = head_hash(&contents[..complete]);
+        let head = head_hash(&tail[..complete]);
         Ok(Self {
             path,
             file,
             head,
-            len: complete as u64,
+            len,
             poisoned: false,
         })
     }
@@ -647,6 +699,30 @@ mod tests {
         assert_eq!(second.previous_hash, line_hash(&written[0]));
     }
 
+    // BEP-048: open finds the head from the end of the log, also when the
+    // last line starts before the last read chunk.
+    #[test]
+    fn audit_log_finds_the_head_past_one_chunk() {
+        let dir = TempDir::new();
+        let mut log = AuditLog::open(dir.log()).unwrap();
+        while fs::metadata(dir.log()).unwrap().len() < 3 * TAIL_CHUNK {
+            log.append(&admit()).unwrap();
+        }
+        let head = log.head().to_owned();
+        drop(log);
+        assert_eq!(AuditLog::open(dir.log()).unwrap().head(), head);
+
+        // A torn tail longer than one chunk is cut off too.
+        let before = fs::read(dir.log()).unwrap();
+        let mut file = OpenOptions::new().append(true).open(dir.log()).unwrap();
+        file.write_all(&vec![b'x'; 2 * TAIL_CHUNK as usize])
+            .unwrap();
+        drop(file);
+        let log = AuditLog::open(dir.log()).unwrap();
+        assert_eq!(log.head(), head);
+        assert_eq!(fs::read(dir.log()).unwrap(), before);
+    }
+
     // BEP-048: a second writer on the same log would fork the chain, so
     // open refuses it while the first one holds the log.
     #[test]
@@ -703,6 +779,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = fs::metadata(dir.log()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+            let state = dir.log().parent().unwrap().to_path_buf();
+            let mode = fs::metadata(&state).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "open made a wider state directory");
+
+            // An existing log with a wider mode is tightened on open.
+            drop(log);
+            fs::set_permissions(dir.log(), fs::Permissions::from_mode(0o644)).unwrap();
+            log = AuditLog::open(dir.log()).unwrap();
+            let mode = fs::metadata(dir.log()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "open kept a wider log mode");
         }
         drop(log);
 
