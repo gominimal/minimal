@@ -103,7 +103,7 @@ impl Union {
             module_hosts
                 .chain(registered_hosts)
                 .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-                .filter(|host| !host.is_empty() && !denied(host))
+                .filter(|host| !host.is_empty() && !denied(host) && dns_host(host))
                 .collect(),
         )
     }
@@ -143,6 +143,19 @@ fn host_of(authority: &str) -> String {
         }
         _ => authority.to_owned(),
     }
+}
+
+/// Whether `host` is a DNS name and not an IP literal. A DNS name
+/// constraint cannot carry an IP address, so the union skips one.
+fn dns_host(host: &str) -> bool {
+    let dns = !host.contains([':', '[', ']']) && host.parse::<std::net::IpAddr>().is_err();
+    if !dns {
+        tracing::warn!(
+            host,
+            "skipped a registered host that is an IP address, not a DNS name"
+        );
+    }
+    dns
 }
 
 /// Whether `host` is a name in the deny set or a subdomain of one.
@@ -368,6 +381,8 @@ impl<'k, K: CaKey> Ca<'k, K> {
         params.use_authority_key_identifier_extension = true;
         params.serial_number = Some(serial()?);
         validity(&mut params, now, LEAF_VALIDITY);
+        // A leaf never outlives the signing CA that issued it.
+        params.not_after = params.not_after.min(self.signing_params.not_after);
         let cert = params
             .signed_by(
                 &key,
@@ -769,6 +784,54 @@ mod tests {
             Ca::new(&root_key, &signing_key, union, now()),
             Err(CaError::EmptyUnion)
         ));
+    }
+
+    /// The raw notAfter time of a certificate.
+    fn not_after(cert: &[u8]) -> Vec<u8> {
+        let (_, cert, _) = tlv(cert);
+        let (_, tbs, _) = tlv(cert);
+        let mut rest = tbs;
+        // version, serial, signature, issuer, then validity
+        for _ in 0..4 {
+            rest = tlv(rest).2;
+        }
+        let (_, validity, _) = tlv(rest);
+        let (_, _, after) = tlv(validity);
+        tlv(after).1.to_vec()
+    }
+
+    #[test]
+    fn leaf_never_outlives_signing_ca() {
+        let (root_key, signing_key) = keys();
+        let ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        let host = GITHUB.hosts[0].host;
+        let early = ca.issue_leaf(host, now()).unwrap();
+        assert_ne!(not_after(&early.chain[0]), not_after(ca.signing()));
+        let late = ca
+            .issue_leaf(host, now() + SIGNING_VALIDITY - Duration::from_secs(DAY))
+            .unwrap();
+        assert_eq!(not_after(&late.chain[0]), not_after(ca.signing()));
+    }
+
+    #[test]
+    fn ip_literal_authorities_are_not_in_the_union() {
+        let union = Union::new(
+            &[],
+            [
+                "[::1]:443",
+                "::1",
+                "127.0.0.1",
+                "10.0.0.1:8080",
+                "cache.example.com:443",
+            ],
+        );
+        assert_eq!(union.names().collect::<Vec<_>>(), ["cache.example.com"]);
     }
 
     // BEP-013
