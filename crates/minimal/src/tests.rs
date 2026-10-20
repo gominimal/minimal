@@ -1840,43 +1840,67 @@ fn daemon_refusals_print_without_rpc_names() {
     // no log-only RPC name left to exempt. The RPC names stay legitimate
     // in type paths and comments, which the scan does not read. A literal
     // is tracked across lines — the refusals are wrapped with `\` — so a
-    // continuation line with no quote of its own is still read.
-    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/box_actor.rs"))
-        .expect("readable daemon source");
-    let mut in_literal = false;
-    for (number, line) in daemon.lines().enumerate() {
-        if !in_literal && line.trim_start().starts_with("//") {
-            continue;
+    // continuation line with no quote of its own is still read. The
+    // module is `box_actor.rs` and its `box_actor/` files. `kind.rs` holds
+    // span names, not refusals, and `tests.rs` is the module's tests.
+    let actor_dir = manifest.join("../minimald/src/box_actor");
+    let mut sources = vec![manifest.join("../minimald/src/box_actor.rs")];
+    for entry in std::fs::read_dir(&actor_dir).expect("readable daemon module dir") {
+        let path = entry.expect("readable dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".rs") && name != "kind.rs" && name != "tests.rs" {
+            sources.push(path);
         }
-        let in_string = in_literal || line.contains('"');
-        // Toggle on every unescaped quote, so the state at the line's end
-        // says whether the next line continues a literal.
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => in_literal = !in_literal,
-                _ => {}
+    }
+    assert!(
+        sources.len() > 1,
+        "the daemon's session module files moved; update this scan"
+    );
+    for source in sources {
+        let shown = source
+            .strip_prefix(manifest.join(".."))
+            .unwrap_or(&source)
+            .display()
+            .to_string();
+        let daemon = std::fs::read_to_string(&source).expect("readable daemon source");
+        let mut in_literal = false;
+        for (number, line) in daemon.lines().enumerate() {
+            if !in_literal && line.trim_start().starts_with("//") {
+                continue;
             }
-        }
-        if !in_string {
-            continue;
-        }
-        for rpc in [
-            "CreateSession",
-            "ConfigureLoadout",
-            "SubmitVerdict",
-            "FinalizeSession",
-            "RenameSession",
-            "WorkspacePatchesTarZst",
-        ] {
-            assert!(
-                !line.contains(rpc),
-                "minimald/src/box_actor.rs:{}: a string names the {rpc} RPC: {line}",
-                number + 1
-            );
+            let in_string = in_literal || line.contains('"');
+            // Toggle on every unescaped quote, so the state at the line's end
+            // says whether the next line continues a literal.
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_literal = !in_literal,
+                    _ => {}
+                }
+            }
+            if !in_string {
+                continue;
+            }
+            for rpc in [
+                "CreateSession",
+                "ConfigureLoadout",
+                "SubmitVerdict",
+                "FinalizeSession",
+                "RenameSession",
+                "WorkspacePatchesTarZst",
+            ] {
+                assert!(
+                    !line.contains(rpc),
+                    "{shown}:{}: a string names the {rpc} RPC: {line}",
+                    number + 1
+                );
+            }
         }
     }
 }
