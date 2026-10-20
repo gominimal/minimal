@@ -18,6 +18,7 @@ use minimal_client::{ensure_version_match, ensure_version_reported, version_asse
 use crate::*;
 
 mod admin;
+mod box_spec;
 mod finalize_install;
 mod list;
 mod net;
@@ -218,6 +219,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Spec(args),
+        })) => box_spec::cmd_box_spec(&cli.global_args, args),
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,

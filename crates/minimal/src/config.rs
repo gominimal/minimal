@@ -46,3 +46,57 @@ pub fn read_user_policy(
 pub fn user_policy_path(global: &GlobalArgs) -> PathBuf {
     resolve_minimal_config_dir(global).join("user_policy.toml")
 }
+
+/// The organization-level client configuration. An administrator writes it,
+/// and it applies to every user of this machine.
+pub const ORGANIZATION_CONFIG_PATH: &str = "/etc/minimal/config.toml";
+
+/// The `[secrets]` table of a client `config.toml`. Only this table is read
+/// here, so the other sections stay with their own readers.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClientSecretsFile {
+    #[serde(default)]
+    secrets: ClientSecrets,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClientSecrets {
+    #[serde(default)]
+    acknowledge_full_breadth_unenrolled: bool,
+}
+
+/// Whether the user or the organization client configuration sets
+/// `[secrets] acknowledge_full_breadth_unenrolled = true` (BEP-057).
+/// A missing file sets nothing. A project file is never read here.
+///
+/// # Errors
+///
+/// A file that exists but is not read or does not parse, naming its path.
+pub fn full_breadth_acknowledged(global: &GlobalArgs) -> Result<bool, anyhow::Error> {
+    let user = resolve_minimal_config_dir(global).join("config.toml");
+    acknowledged_in(&[user, PathBuf::from(ORGANIZATION_CONFIG_PATH)])
+}
+
+/// Whether any of `paths` sets the acknowledgement. The first file that
+/// sets it decides.
+///
+/// # Errors
+///
+/// A file that exists but is not read or does not parse, naming its path.
+pub fn acknowledged_in(paths: &[PathBuf]) -> Result<bool, anyhow::Error> {
+    for path in paths {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::anyhow!("Cannot read {}: {err}", path.display()));
+            }
+        };
+        let file: ClientSecretsFile = toml::from_str(&text)
+            .map_err(|err| anyhow::anyhow!("{} does not parse: {err}", path.display()))?;
+        if file.secrets.acknowledge_full_breadth_unenrolled {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
