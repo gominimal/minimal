@@ -168,6 +168,11 @@ case "${1:-}" in
             echo "daemon has active sessions; pass --force to shut down anyway" >&2
             exit 1
         fi
+        # $HOME/stopforce.fail: a forced stop fails and the daemon keeps running.
+        if [ -f "$HOME/stopforce.fail" ] && [ "${2:-}" = "--force" ]; then
+            echo "error: stop failed" >&2
+            exit 1
+        fi
         # A daemon that stops is gone; --force takes its live sessions with
         # it. $HOME/daemon.running carries the daemon binary the running
         # daemon serves from, and a $HOME/daemon.reconnect client autospawns
@@ -1661,6 +1666,27 @@ stop" "$(cat "$HL8/stop.calls")" \
 stop
 stop --force" "$(cat "$HL8Y/stop.calls")" \
         "graceful stop, graceful closing stop, then the consented force stop (R5.5)"
+
+    # The same yes, but the forced closing stop fails: the run does not leave
+    # the "stopping a daemon" line looking like success. It says the old
+    # daemon may still be running and names the command to stop it.
+    HL8F="$root/hl8f"; mkdir -p "$HL8F"
+    stage_live_upgrade "$HL8F" liverespawnforcefail
+    rm -f "$HL8F/sessions.live"
+    printf 'stale\n' >"$HL8F/daemon.running"
+    : >"$HL8F/daemon.reconnect"
+    : >"$HL8F/respawn.sessions"
+    : >"$HL8F/stopforce.fail"
+    TTY_FILE="$root/tty-yes8"
+    run liverespawnforcefail "$HL8F"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade whose closing force stop fails still exits 0 (R5.5)"
+    check "stop
+stop
+stop --force" "$(cat "$HL8F/stop.calls")" \
+        "the closing stop asks, then tries the force stop once (R5.5)"
+    want_ok "a failed closing force stop is reported (R5.5)" \
+        grep -q "the daemon on build old may still be running; run 'min stop --force'" "$OUT"
 
     # A download that fails after the first swap still runs the closing stop,
     # from the EXIT trap, so the daemon a client respawned from the

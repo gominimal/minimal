@@ -1037,7 +1037,7 @@ stop_stale_daemon() {
         case "$_stop_out" in
             *"$sessions_live_msg"*)
                 if confirm_force_stop; then
-                    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+                    force_stop_stale "$_sv"
                     return 0
                 fi
                 say "the daemon has active sessions, so it is still running build $_sv."
@@ -1048,14 +1048,24 @@ stop_stale_daemon() {
         # Any other failure falls through to the force stop, as the pre-swap
         # stop does: no live sessions were reported, so none are at risk.
     fi
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+    force_stop_stale "$_sv"
+}
+
+# The post-swap force stop. It follows a "stopping a daemon" line, so a failed
+# stop is reported rather than left looking like success: a daemon of the old
+# build may still be serving, and the user is told how to stop it.
+force_stop_stale() {
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null && return 0
+    say "the daemon on build $1 may still be running; run 'min stop --force'"
 }
 
 # Set once the pre-swap stop has run and the first executable is about to be
 # replaced. From then on a `die` (a failed download or checksum on a later
 # component) must still run the post-swap stop below: an attached client can
 # already have respawned the daemon from the half-replaced binaries. The EXIT
-# trap does that.
+# trap does that. From the trap, confirm_force_stop can ask its question after
+# the die message. That is acceptable: it only asks when a terminal is present,
+# and the question lists the sessions a yes would end.
 daemon_stop_ran=0
 trap 'if [ "$daemon_stop_ran" -eq 1 ]; then stop_stale_daemon; fi; rm -rf "$tmpdir"' EXIT
 

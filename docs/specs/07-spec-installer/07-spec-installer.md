@@ -338,15 +338,18 @@ the graceful stop refuses because sessions are live, the installer asks on the
 terminal, as the pre-swap stop does, and a yes runs `stop --force`. On a no, or
 with no terminal, it leaves the daemon running. It tells the user to run
 `min stop` after those sessions end, or `min stop --force` to end them now. The
-upgrade still succeeds. A rerun cannot do this stop, because a rerun replaces nothing. Any
-other failure of the graceful stop falls through to `stop --force`, as the
-pre-swap stop does.
+upgrade still succeeds. A rerun cannot do this stop, because a rerun replaces
+nothing. Any other failure of the graceful stop falls through to
+`stop --force`, as the pre-swap stop does. When a `stop --force` of the
+post-swap stop fails, the installer says the old daemon can still be running
+and names `min stop --force`.
 
 The post-swap stop also runs when the run dies after the pre-swap stop, for
 example on a failed download or checksum of a later component. The installer
 runs it from its exit handler, so a daemon respawned from half-replaced
-binaries does not outlive the failed run. A fresh install, an up-to-date rerun
-and a data-only replacement do not run it from the exit handler.
+binaries does not outlive the failed run. The exit handler runs it once the run
+replaces any executable. An up-to-date rerun and a data-only replacement
+replace no executable, so they do not run it from the exit handler.
 
 **R5.6**, A `kind = symlink` component places a symbolic link at `dest`
 pointing at `src` (the link target, see R3.1). The target is validated with
