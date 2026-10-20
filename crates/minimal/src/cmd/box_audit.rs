@@ -324,6 +324,36 @@ pub(crate) fn follow(
 // maps it.
 const LISTING_RECORDS_PARENTS: bool = false;
 
+/// The refusal of `--parent` on a host whose listing carries no parent.
+fn parents_unrecorded(parent: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`min box audit --parent` cannot run here: this host does not record \
+         which boxes are children of box {parent}. \
+         Run `min box audit <box>` for each child box."
+    )
+}
+
+/// Refuses `--parent` before the daemon's listing when the listing carries
+/// no parent, so the refusal never starts a daemon. A box id or name is
+/// named as given. `self` gets the refusal [`resolve`] gives.
+pub(crate) fn refuse_parent_before_listing(
+    args: &BoxAuditArgs,
+    parents_recorded: bool,
+) -> anyhow::Result<()> {
+    let Some(parent) = &args.parent else {
+        return Ok(());
+    };
+    if parents_recorded {
+        return Ok(());
+    }
+    let named = match resolve(parent, &[]) {
+        Ok(resolved) => resolved.id().to_owned(),
+        Err(_) if parent != "self" => printable(parent).into_owned(),
+        Err(refused) => return Err(refused),
+    };
+    Err(parents_unrecorded(&named))
+}
+
 /// The boxes the daemon lists. The listing carries no parent, so no box
 /// has a known child yet.
 async fn known_boxes(global: &GlobalArgs) -> anyhow::Result<Vec<KnownBox>> {
@@ -366,12 +396,7 @@ pub(crate) fn run(
         (_, Some(parent)) => {
             let resolved = resolve(parent, known)?;
             if !parents_recorded {
-                anyhow::bail!(
-                    "`min box audit --parent` cannot run here: this host does not record \
-                     which boxes are children of box {}. \
-                     Run `min box audit <box>` for each child box.",
-                    resolved.id()
-                );
+                return Err(parents_unrecorded(resolved.id()));
             }
             let subjects = children(resolved.id(), known);
             (resolved, subjects, true)
@@ -431,6 +456,9 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
             .as_deref()
             .is_some_and(|v| v != "self" && boxes::SessionId::parse_str(v).is_err())
     };
+    // Before the listing: `--parent` without parents in the listing never
+    // reaches the daemon.
+    refuse_parent_before_listing(&args, LISTING_RECORDS_PARENTS)?;
     // Only a name needs the daemon's listing, and `--parent` needs it to
     // find the children.
     let known = if names_a_box(&args.target) || args.parent.is_some() {
@@ -801,6 +829,30 @@ mod tests {
         );
         assert!(message.contains("min box audit <box>"), "{message}");
         assert!(out.is_empty() && err.is_empty());
+
+        // `cmd_box_audit` refuses before the daemon's listing, so the
+        // refusal starts no daemon. It takes no listing, so it names the
+        // target as given.
+        for (parent, named) in [("web", "web"), (A, A)] {
+            let message = refuse_parent_before_listing(&args(None, Some(parent), false), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "`min box audit --parent` cannot run here: this host does not record \
+                     which boxes are children of box {named}. \
+                     Run `min box audit <box>` for each child box."
+                )
+            );
+        }
+        let message = refuse_parent_before_listing(&args(None, Some("self"), false), false)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("not inside a box"), "{message}");
+        // A listing with parents, or no `--parent`, goes on to the listing.
+        refuse_parent_before_listing(&args(None, Some("web"), false), true).unwrap();
+        refuse_parent_before_listing(&args(Some("web"), None, false), false).unwrap();
     }
 
     // BEP-042: un-enrolled, `self` inside a box is the defined error.
