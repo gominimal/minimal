@@ -147,7 +147,7 @@ either = { version = "1.17", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
-getrandom = "0.3"
+getrandom = "0.4"
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.15"
 google-cloud-storage = "1.17"
@@ -208,7 +208,7 @@ prost-types = "0.14"
 # Property testing (dev-dependency only; NET-071 proxy parity is the first consumer).
 proptest = "1"
 resolv-conf = "0.7"
-russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.64", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
 serde_json = { version = "1" }
 serde_json_lenient = { version = "0.2" }
