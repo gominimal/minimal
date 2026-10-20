@@ -68,10 +68,11 @@ russh.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
-boxes.workspace = true
-# The GitHub module's host set, which activation checks a grant box's
-# egress against.
+# The GitHub sign-in item `min auth` writes and reads (`bep::signin`), and
+# the GitHub module's host set, which activation checks a grant box's egress
+# against.
 bep = { path = "../bep" }
+boxes.workspace = true
 # The reserved local range the resolver advisory's bind probe reads. Owned by
 # the zero-dependency `switch` crate — the same constant the daemon's DNS zone
 # re-exports and publishes per-box addresses from — so the CLI's probe and the
@@ -94,6 +95,8 @@ tracing-subscriber.workspace = true
 # upload or delete puts a bundle or delete token on the wire.
 url.workspace = true
 version.workspace = true
+# Wipes the raw token reply `min auth login` reads from GitHub.
+zeroize.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
 # the client helpers (sock/lifecycle) and calls no krun code, so it must not

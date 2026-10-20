@@ -19,14 +19,12 @@
 //! bytes one at a time, and a lone Escape is still read as a deny.
 
 use std::io::{IsTerminal as _, Write as _};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
-
-use crate::attach::AskWatch;
 
 /// The ask dialog's question: the native dialog's own frame
 /// (`minimald::box_runtime::ASK_PROMPT`), so a human, and the e2e's pty
@@ -239,6 +237,72 @@ pub fn run_selector(io: &mut impl DialogIo, lead_in: &str) -> std::io::Result<As
         }
         frame = next;
     }
+}
+
+/// A dialog's view of the subscription while it is up: whether the host
+/// has taken its ask away. Every other line read here is held, in order,
+/// for the serving loop.
+pub struct AskWatch<'a> {
+    ask_id: minimald_rpc::AskId,
+    subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    held: &'a mut std::collections::VecDeque<String>,
+}
+
+impl<'a> AskWatch<'a> {
+    pub(crate) fn new(
+        ask_id: minimald_rpc::AskId,
+        subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
+        held: &'a mut std::collections::VecDeque<String>,
+    ) -> Self {
+        Self {
+            ask_id,
+            subscription,
+            held,
+        }
+    }
+
+    /// The subscription's socket, for a poll beside the terminal.
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.subscription.get_ref().as_fd()
+    }
+
+    /// Whether bytes already read off the socket are waiting: a poll of
+    /// the socket would not see them.
+    pub(crate) fn has_buffered(&self) -> bool {
+        !self.subscription.buffer().is_empty()
+    }
+
+    /// Read one line. `true` when it ends this dialog: the dismissal of
+    /// this ask, or the subscription ending, after which nothing this
+    /// attach records could count. Any other line is held.
+    pub(crate) fn take_line(&mut self) -> bool {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        match self.subscription.read_line(&mut line) {
+            Ok(0) | Err(_) => return true,
+            Ok(_) => {}
+        }
+        if is_dismissal_of(&line, self.ask_id) {
+            return true;
+        }
+        self.held.push_back(line);
+        false
+    }
+
+    /// Block until the host dismisses this ask or the subscription ends:
+    /// a dialog that never answers.
+    pub fn wait_dismissed(&mut self) {
+        while !self.take_line() {}
+    }
+}
+
+/// Whether `line` is the host's dismissal of `ask_id`.
+pub(crate) fn is_dismissal_of(line: &str, ask_id: minimald_rpc::AskId) -> bool {
+    matches!(
+        serde_json_lenient::from_str(line.trim()),
+        Ok(minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }) if id == ask_id
+    )
 }
 
 /// The real dialog terminal: the tty the suspended relay handed back, in
