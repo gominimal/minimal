@@ -436,10 +436,94 @@ async fn resume_destroys_a_run_owned_box_instead_of_resuming_it() {
         marker.exists(),
         "destroying the run-owned box on resume skipped its on_destroy hook",
     );
+    wait_for_no_actors(&restarted).await;
+}
+
+/// Waits for the manager to hold `count` actors. The resume's teardown
+/// evicts its actor only after the actor has deleted the record and
+/// answered, so the record goes first.
+async fn wait_for_actor_count(mngr: &BoxManagerHandle, count: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mngr.running_count().await != count {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits for the manager to hold no actor.
+async fn wait_for_no_actors(mngr: &BoxManagerHandle) {
+    wait_for_actor_count(mngr, 0, "the destroyed box must leave no actor behind").await;
+}
+
+/// A `DeleteSession` that lands while the resume's teardown of a run-owned
+/// box runs its `on_destroy` hooks reaches the teardown's own actor, so
+/// the hooks run once. The realistic sender is the surviving `min task run`
+/// client on Ctrl-C. The hook marks its start, then waits, so the delete
+/// lands inside it, and appends one line per run to the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_during_resume_teardown_runs_the_destroy_hooks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = dir.path().join("started");
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!(
+                            "touch {}; sleep 3; echo ran >> {}",
+                            started.display(),
+                            marker.display()
+                        ),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
     assert_eq!(
-        restarted.running_count().await,
-        0,
-        "the destroyed box must leave no actor behind",
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resume's teardown never started the on_destroy hook",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    match restarted.delete_session(id).await {
+        Ok(hook_failures) => assert!(
+            hook_failures.is_empty(),
+            "the delete reported hook failures: {hook_failures:?}"
+        ),
+        // The teardown won the race to the record; still one run.
+        Err(error) if error.kind() == NotFound => {}
+        Err(error) => panic!("deleting the box during its resume teardown failed: {error}"),
+    }
+
+    wait_for_record_gone(&restarted, id).await;
+    wait_for_no_actors(&restarted).await;
+    let lines = std::fs::read_to_string(&marker).expect("the on_destroy hook never ran");
+    assert_eq!(
+        lines.lines().count(),
+        1,
+        "the on_destroy hook must run exactly once, got {lines:?}",
     );
 }
 
@@ -467,11 +551,12 @@ async fn resume_still_resumes_a_plain_session_beside_a_run_owned_one() {
             .is_some(),
         "the plain session's record should survive the resume"
     );
-    assert_eq!(
-        restarted.running_count().await,
+    wait_for_actor_count(
+        &restarted,
         1,
-        "the plain session should have its actor back"
-    );
+        "the plain session should have its actor back",
+    )
+    .await;
 }
 
 /// The create writes the run-owned mark on the record itself, so the

@@ -1151,14 +1151,22 @@ impl BoxManager {
             // it never takes over a name another box routes. The hooks
             // run off the manager's message handling: each can take up to
             // its timeout, and daemon startup and every queued RPC must
-            // not wait on them.
+            // not wait on them. The actor sits in `running` until they
+            // end, so an RPC naming the box in that window, such as the
+            // surviving run client's `DeleteSession`, reaches this actor
+            // rather than bringing up a second one.
+            //
+            // TODO(spec 29, BOX-154): when BOX lands, a restart marks the
+            // box stopped and keeps it rather than destroying it.
             if record.ends_with_run {
                 tracing::info!(
                     session_id = %session_id,
                     session_name = record.name.as_deref().unwrap_or("<anonymous>"),
-                    "resume: destroying the box its run ended (run-owned), not resuming it",
+                    "resume: destroying a run's box instead of resuming it \
+                     (its run ended with the daemon)",
                 );
                 let actor = self.start_box_teardown(session_id, &handle, false).await;
+                let manager = self.weak_self.clone();
                 crate::traced::spawn_detached(
                     tracing::info_span!(
                         parent: None,
@@ -1181,6 +1189,11 @@ impl BoxManager {
                                 "resume: destroying the run-owned box failed; \
                                  leaving its record as it stands",
                             ),
+                        }
+                        // The destroy ended the actor either way, and a
+                        // manager-initiated teardown does not evict itself.
+                        if let Some(manager) = manager.upgrade() {
+                            manager.evict(session_id).await;
                         }
                     },
                 );
@@ -1281,13 +1294,19 @@ impl BoxManager {
         handle: BoxRecordHandle,
     ) -> Result<Vec<String>, BoxManagerError> {
         let actor = self.start_box_teardown(id, &handle, true).await;
-        Self::finish_box_teardown(actor, handle).await
+        let destroyed = Self::finish_box_teardown(actor, handle).await;
+        // The destroy ends the actor whatever it answers.
+        self.running.remove(&id);
+        destroyed
     }
 
-    /// The manager's half of a teardown: takes the box's running actor out
-    /// of `running`, or brings one up from its record. `None` when the
-    /// actor refuses to come up, and the record is then removed without
-    /// its hooks. `registers_name` is the bring-up's
+    /// The manager's half of a teardown: the box's actor in `running`, or one
+    /// brought up from its record and put in `running`. The actor stays there
+    /// until its caller removes or evicts it once the teardown ends, so an
+    /// RPC naming the box meanwhile reaches the same actor; its mailbox is
+    /// closed after the destroy, so a second destroy answers `Ok` with no
+    /// hooks run. `None` when the actor refuses to come up, and the record is
+    /// then removed without its hooks. `registers_name` is the bring-up's
     /// [`BoxActorConfig::registers_name`]: `false` for the resume's
     /// teardown, whose actor must not take over another box's name.
     async fn start_box_teardown(
@@ -1296,13 +1315,16 @@ impl BoxManager {
         handle: &BoxRecordHandle,
         registers_name: bool,
     ) -> Option<BoxHandle> {
-        if let Some(hnd) = self.running.remove(&id) {
-            return Some(hnd);
+        if let Some(hnd) = self.running.get(&id) {
+            return Some(hnd.clone());
         }
         let mut config = self.session_config(handle.clone());
         config.registers_name = registers_name;
         match BoxActor::run(config).await {
-            Ok(hnd) => Some(hnd),
+            Ok(hnd) => {
+                self.running.insert(id, hnd.clone());
+                Some(hnd)
+            }
             // A record the actor refuses to come up on — a
             // restart-orphaned `Materializing` one is the known case —
             // must still be destroyable, so fall through to deleting it

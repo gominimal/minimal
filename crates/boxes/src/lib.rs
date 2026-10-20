@@ -1265,8 +1265,9 @@ pub struct Record {
     /// instead of bringing it back, which is the same teardown a finished
     /// run's own box-end takes. Written once, by the create that mints the
     /// record (the client's `BoxConfig::ends_with_run`), and read only by
-    /// the resume. Defaults to `false` for every record that predates the
-    /// field.
+    /// the resume (`resume_active_sessions`, which runs on Linux only, so
+    /// on other hosts the mark is written and never read). Defaults to
+    /// `false` for every record that predates the field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ends_with_run: bool,
 
