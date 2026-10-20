@@ -42,8 +42,8 @@ const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 /// Bounding the *size* of the request is not the same as bounding the *wait*
 /// for it: a client that writes half an object and then holds the channel open
 /// sends nothing more and never signals EOF, so the read below would park
-/// forever. Nothing else reclaims it — the daemon deliberately runs with
-/// `inactivity_timeout: None` (a live attach must not be reaped), and the SSH
+/// forever. Nothing else reclaims it — the daemon arms its inactivity timeout
+/// at the full keepalive budget (a live attach must not be reaped), and the SSH
 /// keepalives it uses instead only detect a peer that has *stopped answering*,
 /// not one that answers and stays silent. The body is a two-field object
 /// written immediately after the subsystem opens, so this is a generous
@@ -1599,9 +1599,9 @@ mod tests {
     /// R6.3, the other dimension: bounding the request's *size* does not bound
     /// the *wait* for it. A client that writes half an object and then holds
     /// the channel open never sends EOF, and nothing else reclaims the task —
-    /// the daemon runs `inactivity_timeout: None` by design, and its keepalives
-    /// only notice a peer that has stopped answering, not one that answers and
-    /// stays silent.
+    /// the daemon arms its inactivity timeout at the full keepalive budget,
+    /// and its keepalives only notice a peer that has stopped answering, not
+    /// one that answers and stays silent.
     #[tokio::test]
     async fn a_request_that_never_ends_is_abandoned_on_the_deadline() {
         // Kept alive for the whole call: dropping it would deliver the EOF

@@ -555,6 +555,15 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                 tracing::warn!("skipping unreadable directory: {}", root.display());
                 return Ok(());
             }
+            // A subdirectory can vanish between the readdir that listed
+            // it and the recursion into it (a pruned build cache, a
+            // concurrent `git gc`). Only the upload root itself is the
+            // caller's to guarantee: an empty prefix is that root, and
+            // a missing root stays a hard error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !prefix.is_empty() => {
+                tracing::debug!("skipping vanished directory: {}", root.display());
+                return Ok(());
+            }
             Err(e) => {
                 return Err(
                     anyhow::Error::from(e).context(format!("reading directory {}", root.display()))
@@ -570,6 +579,10 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     tracing::warn!("skipping unreadable entry in {}", root.display());
                     continue;
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!("skipping vanished entry in {}", root.display());
+                    continue;
+                }
                 Err(e) => return Err(anyhow::Error::from(e).context("reading directory entry")),
             };
 
@@ -582,6 +595,7 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                 let ft = match entry.file_type().await {
                     Ok(t) => t,
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => {
                         return Err(anyhow::Error::from(e)
                             .context(format!("getting file type for {}", entry_path.display())));
@@ -604,6 +618,10 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     tracing::warn!("skipping unreadable entry: {}", entry_path.display());
                     continue;
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!("skipping vanished entry: {}", entry_path.display());
+                    continue;
+                }
                 Err(e) => {
                     return Err(anyhow::Error::from(e)
                         .context(format!("getting file type for {}", entry_path.display())));
@@ -622,9 +640,24 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
 
                 add_dir_entries_inner(tar, &entry_path, &archive_path, hardlinks).await?;
             } else if file_type.is_symlink() {
-                let target = fs::read_link(&entry_path)
-                    .await
-                    .with_context(|| format!("reading symlink {}", entry_path.display()))?;
+                // A symlink can vanish between the readdir that listed
+                // it and the readlink (a concurrent checkout pruning a
+                // stale link). Skip it rather than aborting the upload.
+                let target = match fs::read_link(&entry_path).await {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        tracing::warn!("skipping unreadable symlink: {}", entry_path.display());
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!("skipping vanished symlink: {}", entry_path.display());
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("reading symlink {}", entry_path.display())));
+                    }
+                };
                 let mut header = async_tar::Header::new_gnu();
                 header.set_size(0);
                 header.set_mode(0o644);
@@ -641,6 +674,10 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     Ok(f) => f,
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                         tracing::warn!("skipping unreadable file: {}", entry_path.display());
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!("skipping vanished file: {}", entry_path.display());
                         continue;
                     }
                     Err(e) => {
@@ -957,6 +994,140 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.contains("secret")),
             "restricted/secret.txt should be skipped"
+        );
+    }
+
+    /// Writer that deletes the given paths on its first `poll_write`,
+    /// then accepts everything. `stream_tar_zstd` streams through a
+    /// bounded (256 KiB) pipe, so once enough incompressible data has
+    /// flowed the first `poll_write` runs while the walk is still in
+    /// progress: deleting there stages the vanish race — names
+    /// already listed by the walk's `readdir`, gone by the time it
+    /// opens them — with no threads and no timing dependence. The
+    /// buffer and deletion flag live in an `Arc<Mutex>` because
+    /// `stream_tar_zstd` consumes the writer, so the test reads the
+    /// buffered archive back out through the shared handle.
+    struct DeletingWriter {
+        targets: Vec<std::path::PathBuf>,
+        state: Arc<std::sync::Mutex<DeletingWriterState>>,
+    }
+
+    struct DeletingWriterState {
+        deleted: bool,
+        buf: Vec<u8>,
+    }
+
+    impl AsyncWrite for DeletingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            if !state.deleted {
+                state.deleted = true;
+                for target in &self.targets {
+                    if target.is_dir() {
+                        std::fs::remove_dir_all(target).unwrap();
+                    } else {
+                        std::fs::remove_file(target).unwrap();
+                    }
+                }
+            }
+            state.buf.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression test: entries that vanish between the `readdir` that
+    /// listed them and the walk's own `read_dir` / `File::open` /
+    /// `read_link` (a concurrent `git gc` pruning object files, a build
+    /// cache being cleaned) must be skipped, not abort the whole
+    /// workspace upload with "No such file or directory".
+    ///
+    /// The race is staged without threads: the walk streams through a
+    /// bounded pipe, and the first `poll_write` deletes `sub/` while
+    /// the first large file the walk reaches is still streaming.
+    /// Where that lands depends on readdir order. If the root yields
+    /// `r1.bin` or `r2.bin` before `sub`, the deletion lands before
+    /// the walk recurses into `sub/`, which then hits the
+    /// subdirectory `read_dir` `NotFound` arm and contributes no
+    /// entries. If `sub` comes first, the deletion lands while `sub/`'s
+    /// already-listed names are being processed, and the names after
+    /// the deletion point hit the `File::open` (and, depending on the
+    /// order inside `sub/`, the `read_link`) `NotFound` arms. Either
+    /// way at most three of `sub/`'s six entries precede the deletion
+    /// point, so the `< 4` assertion holds on any order. No order
+    /// pins one particular per-site arm.
+    #[tokio::test]
+    async fn stream_skips_entries_vanishing_mid_walk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("r1.bin"), incompressible(1, 512 * 1024)).unwrap();
+        std::fs::write(dir.path().join("r2.bin"), incompressible(2, 512 * 1024)).unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        for i in 0..4 {
+            std::fs::write(
+                sub.join(format!("s{i}.bin")),
+                incompressible(10 + i, 512 * 1024),
+            )
+            .unwrap();
+        }
+        std::fs::write(sub.join("vanish.txt"), "gone").unwrap();
+        std::os::unix::fs::symlink("keep.txt", sub.join("slink")).unwrap();
+
+        let state = Arc::new(std::sync::Mutex::new(DeletingWriterState {
+            deleted: false,
+            buf: Vec::new(),
+        }));
+        let writer = DeletingWriter {
+            targets: vec![sub],
+            state: state.clone(),
+        };
+        stream_tar_zstd(dir.path(), writer)
+            .await
+            .expect("entries vanishing mid-walk must be skipped, not abort the upload");
+
+        let archive_bytes = std::mem::take(&mut state.lock().unwrap().buf);
+        let paths = unpack_and_list(&archive_bytes).await;
+        assert!(
+            paths.iter().any(|p| p == "keep.txt"),
+            "keep.txt should be in the archive: {paths:?}"
+        );
+        let sub_entries = paths.iter().filter(|p| p.starts_with("sub/")).count();
+        assert!(
+            sub_entries < 4,
+            "some of sub/'s entries must have been skipped after it vanished: {paths:?}"
+        );
+    }
+
+    /// The vanish-tolerance above stops at the upload root: a missing
+    /// root directory is the caller's mistake (the workspace it
+    /// promised to upload does not exist), and must stay a hard
+    /// error rather than a silent empty archive. Pins the boundary;
+    /// passes both before and after the NotFound-skip fix.
+    #[tokio::test]
+    async fn stream_errors_on_missing_upload_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("no-such-root");
+
+        let mut buf = Vec::new();
+        let err = stream_tar_zstd(&missing, &mut buf)
+            .await
+            .expect_err("a missing upload root must be a hard error");
+        assert!(
+            format!("{err:#}").contains("reading directory"),
+            "expected a 'reading directory' error for the missing root, got: {err:#}"
         );
     }
 

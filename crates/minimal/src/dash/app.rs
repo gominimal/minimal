@@ -388,15 +388,9 @@ pub fn display_name_of(entry: &minimald_rpc::ListSessionsEntry) -> String {
     }
 }
 
-/// Render a network mode the way the sidebar shows it.
+/// Render a network mode the way the sidebar shows it: the CLI's word.
 pub fn network_mode_label(mode: NetworkMode) -> &'static str {
-    match mode {
-        NetworkMode::HostNet => "Host",
-        NetworkMode::OwnIp => "OwnIp",
-        NetworkMode::NoNet => "NoNet",
-        // NetworkMode is #[non_exhaustive]; render future variants by debug.
-        _ => "Custom",
-    }
+    mode.word()
 }
 
 /// The canonical sidebar order for provider groups; unknown labels sort
@@ -913,7 +907,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         anyhow::bail!("min dash requires an interactive terminal on stdin and stdout");
     }
 
-    let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await;
+    // Gated before the terminal is taken over, so a skewed daemon refuses the
+    // dashboard the same way it refuses `min ls` — plain message, terminal
+    // untouched.
+    let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await?;
     let contribution = opts.contribution.clone();
     let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());

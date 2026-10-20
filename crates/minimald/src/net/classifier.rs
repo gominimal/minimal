@@ -1167,20 +1167,21 @@ pub const GUEST_CT_MARK_MASK: u32 = 0x3000_0000;
 const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
 
 /// What the guest's own boot hands the installer's render: the tree this
-/// daemon mounted, the resolver its boxes resolve through, and NET-078's two
-/// source identities — which on a guest are both the guest's own address,
-/// but the render is told so, never left to assume. No answerer: a VM-backed
-/// guest's resolver carve-out is the node's DNS layer at the switch gateway
-/// ([`GUEST_RESOLVER_CARVE_OUT_LINE`]).
+/// daemon mounted, the listener its deny-all boxes' lookups are steered onto,
+/// and NET-078's two source identities — which on a guest are both the
+/// guest's own address, but the render is told so, never left to assume.
 pub struct GuestRender<'a> {
     /// The tree root this daemon itself laid out: `sandbox`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
     pub tree_root: &'a Path,
-    /// The resolver Minimal owns for a host-address box on this guest: the
-    /// node's DNS layer at the switch gateway (NET-003), which the daemon's
-    /// own relay carries every lookup to. The deny subtree's carve-out is
-    /// this address on port 53, over UDP and TCP (NET-079).
-    pub gateway_resolver: Ipv4Addr,
+    /// The guest's own DNS listener (NET-079): the loopback answerer the
+    /// deny subtree's DNS-port lookups are dstnat'd onto, which refuses
+    /// every name outside the box zone and forwards the zone's A questions
+    /// to the switch gateway alone (NET-003).
+    pub answerer_address: Ipv4Addr,
+    /// The listener's port: the answerer's own, free inside a guest where
+    /// the in-VM daemon starts no box-zone answerer.
+    pub answerer_port: u16,
     /// What the boxes cohort leaves as, and what everything else in the
     /// slice leaves as.
     pub cohort_address: IpAddr,
@@ -1206,13 +1207,13 @@ const GUEST_CHILD_DEADLINE: Duration = Duration::from_secs(30);
 /// before the table reads as gone.
 const TABLE_LIST_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The one line the guest's render logs, with the resolver's address beside
-/// it: on a VM-backed host a deny-all host-address box resolves through the
-/// node's DNS layer at the switch gateway, like every other host-address box
-/// there (NET-003), so the guest's table admits that one destination, port
-/// 53 over UDP and TCP, and retargets nothing.
+/// The one line the guest's render logs, with the listener's address beside
+/// it: on a VM-backed host a deny-all host-address box's lookups are dstnat'd
+/// onto the guest's own DNS listener (NET-079), which refuses every name
+/// outside the box zone and forwards the zone's A questions to the switch
+/// gateway alone.
 pub const GUEST_RESOLVER_CARVE_OUT_LINE: &str = "deny-all host-address box on VM host: resolver \
-     carve-out is the node's DNS layer at the gateway, port 53 over udp and tcp";
+     carve-out is the guest's own DNS listener, which refuses names outside the zone";
 
 /// Feeds one of the guest's own runs the bytes it reads on stdin, then
 /// waits for it, both inside the bound it is given. The feed is part of
@@ -1342,8 +1343,10 @@ pub fn render_guest_ruleset_over(
         .arg("--print-ruleset")
         .arg("--root")
         .arg(params.tree_root)
-        .arg("--gateway-resolver")
-        .arg(params.gateway_resolver.to_string())
+        .arg("--answerer-address")
+        .arg(params.answerer_address.to_string())
+        .arg("--answerer-port")
+        .arg(params.answerer_port.to_string())
         .arg("--cohort-address")
         .arg(params.cohort_address.to_string())
         .arg("--node-plane-address")
@@ -1357,7 +1360,11 @@ pub fn render_guest_ruleset_over(
     if let Some(mountinfo) = params.mountinfo_override {
         installer.env(REHEARSAL_MOUNTINFO_ENV, mountinfo);
     }
-    tracing::info!(resolver = %params.gateway_resolver, "{GUEST_RESOLVER_CARVE_OUT_LINE}");
+    tracing::info!(
+        answerer = %params.answerer_address,
+        port = params.answerer_port,
+        "{GUEST_RESOLVER_CARVE_OUT_LINE}"
+    );
     let child = installer
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", bash.display()))?;
@@ -2599,18 +2606,19 @@ fn guest_bash() -> PathBuf {
 }
 
 /// The flags the guest's render passes for its resolver carve-out, spelled
-/// as the installer reads them: the default switch's gateway,
-/// `SwitchSubnet::default().dns_server()`, so the print and install lanes
-/// render the guest's own parameters.
+/// as the installer reads them: the guest's own DNS listener (NET-079), on
+/// the answerer's port at the guest's loopback, so the print and install
+/// lanes render the guest's own parameters.
 #[cfg(test)]
-const GUEST_RESOLVER_FLAGS: [&str; 2] = ["--gateway-resolver", "100.64.0.1"];
+const GUEST_RESOLVER_FLAGS: [&str; 4] =
+    ["--answerer-address", "127.0.0.1", "--answerer-port", "7656"];
 
 /// The parameters a guest's own boot renders its table with, over a
-/// stand-in mount: the switch gateway's resolver (NET-079's one carve-out on
-/// a VM-backed host), the ct-mark bits the boot classifies with,
-/// and the two source identities named by the caller — which a guest hands
-/// as two inputs even where they are the one address an un-enrolled guest
-/// has (NET-078).
+/// stand-in mount: the guest's own DNS listener — the loopback answerer the
+/// deny subtree's lookups are steered onto (NET-079) — the ct-mark bits the
+/// boot classifies with, and the two source identities named by the caller
+/// — which a guest hands as two inputs even where they are the one address
+/// an un-enrolled guest has (NET-078).
 #[cfg(test)]
 fn guest_params<'a>(
     mount: &'a StandinMount,
@@ -2620,7 +2628,8 @@ fn guest_params<'a>(
 ) -> GuestRender<'a> {
     GuestRender {
         tree_root: &mount.root,
-        gateway_resolver: crate::net::SwitchSubnet::default().dns_server(),
+        answerer_address: crate::net::guest_dns::LISTENER_ADDRESS,
+        answerer_port: crate::net::guest_dns::LISTENER_PORT,
         cohort_address: cohort,
         node_plane_address: node_plane,
         ct_mark_mask: GUEST_CT_MARK_MASK,
@@ -5222,6 +5231,8 @@ mod tests {
                     "--print-ruleset",
                     GUEST_RESOLVER_FLAGS[0],
                     GUEST_RESOLVER_FLAGS[1],
+                    GUEST_RESOLVER_FLAGS[2],
+                    GUEST_RESOLVER_FLAGS[3],
                 ],
                 None,
                 &cohort.to_string(),
@@ -5286,8 +5297,10 @@ mod tests {
                 "--print-ruleset".to_string(),
                 "--root".to_string(),
                 mount.root.display().to_string(),
-                "--gateway-resolver".to_string(),
-                crate::net::SwitchSubnet::default().dns_server().to_string(),
+                "--answerer-address".to_string(),
+                crate::net::guest_dns::LISTENER_ADDRESS.to_string(),
+                "--answerer-port".to_string(),
+                crate::net::guest_dns::LISTENER_PORT.to_string(),
                 "--cohort-address".to_string(),
                 guest_ip.to_string(),
                 "--node-plane-address".to_string(),
@@ -5441,31 +5454,49 @@ mod tests {
         );
     }
 
-    /// NET-079's one carve-out on a VM-backed host, as the guest's own render
-    /// spells it: the resolver Minimal owns for a host-address box there is
-    /// the node's DNS layer at the switch gateway (NET-003), so the deny
-    /// chain admits the gateway on DNS's port, over UDP and over TCP (a
-    /// truncated answer retries over TCP), and nothing else beside the reply
-    /// direction. Nothing is retargeted: the box already asks the gateway,
-    /// so the table carries no dstnat chain, and the gateway on any other
-    /// port (its control surface) meets the reject like any destination.
-    /// Read off the guest's own render, over the collapsed pair an
-    /// un-enrolled guest has.
+    /// NET-079's carve-out on a VM-backed host, as the guest's own render
+    /// spells it: the deny subtree's DNS-port lookups are dstnat'd onto the
+    /// guest's own DNS listener at the guest's loopback, on the answerer's
+    /// port, and `deny_out` admits the reply direction and the listener —
+    /// the one destination a deny-all box's lookups reach — and nothing
+    /// else. The match carries no destination address: the box asks the
+    /// switch gateway like every other host-address box there, and the
+    /// retarget is what steers the lookup onto the listener, which refuses
+    /// every name outside the box zone instead of letting the box resolve
+    /// it off the machine. DNS over TCP is not steered and not admitted: a
+    /// truncated answer cannot retry past the verdict. Read off the guest's
+    /// own render, over the collapsed pair an un-enrolled guest has.
     #[test]
-    fn guest_deny_all_renders_gateway_resolver_carve_out() {
+    fn guest_deny_all_renders_listener_carve_out() {
         let subnet = crate::net::SwitchSubnet::default();
         let guest_ip = IpAddr::V4(subnet.daemon_ip());
-        let gateway = subnet.dns_server();
+        let listener_addr = crate::net::guest_dns::LISTENER_ADDRESS;
+        let listener_port = crate::net::guest_dns::LISTENER_PORT;
         assert_eq!(
             GUEST_RESOLVER_FLAGS,
-            ["--gateway-resolver", gateway.to_string().as_str()],
-            "the tests' spelling of the guest's carve-out is the switch gateway"
+            [
+                "--answerer-address",
+                listener_addr.to_string().as_str(),
+                "--answerer-port",
+                listener_port.to_string().as_str()
+            ],
+            "the tests' spelling of the guest's carve-out is the guest's own listener"
         );
         let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
             .expect("the guest's render is text");
-        assert!(
-            chain_rules(&ruleset, "dstnat").is_empty() && !ruleset.contains("chain dstnat"),
-            "the guest's table has no dstnat chain:\n{ruleset}"
+        // The dstnat chain steers the deny subtree's UDP-53 lookups onto
+        // the listener, with no destination address in the match: a box on
+        // this guest asks the gateway, and the steer is the carve-out.
+        let dstnat = chain_rules(&ruleset, "dstnat");
+        let steer = format!(
+            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" udp dport 53 dnat ip to \
+             {listener_addr}:{listener_port}"
+        );
+        assert_eq!(
+            dstnat,
+            [steer.as_str()],
+            "the guest's table steers the deny subtree's DNS-port lookups onto the \
+             listener:\n{ruleset}"
         );
         let deny_out = chain_rules(&ruleset, "deny_out");
         let accepts: Vec<&str> = deny_out
@@ -5473,37 +5504,42 @@ mod tests {
             .copied()
             .filter(|rule| rule.ends_with("accept"))
             .collect();
-        let udp = format!("ip daddr {gateway} udp dport 53 accept");
-        let tcp = format!("ip daddr {gateway} tcp dport 53 accept");
+        let listener = format!("ip daddr {listener_addr} udp dport {listener_port} accept");
         assert_eq!(
             accepts,
             [
                 "ct state established,related ct direction reply accept",
-                udp.as_str(),
-                tcp.as_str(),
+                listener.as_str(),
             ],
-            "the deny chain admits the reply direction and the gateway's resolver \
-             on port 53 over udp and tcp, and nothing else: {deny_out:?}"
+            "the deny chain admits the reply direction and the listener alone: {deny_out:?}"
         );
         assert_eq!(
             deny_out.last().copied(),
             Some("reject with icmpx admin-prohibited"),
             "everything else a deny-all box opens is rejected: {deny_out:?}"
         );
+        // No gateway carve-out remains, and no TCP leg: the interim
+        // NET-079 admission of the gateway's port 53 whole is gone, and a
+        // truncated answer cannot retry past the verdict.
+        let gateway = crate::net::SwitchSubnet::default().dns_server();
         assert!(
-            !ruleset.contains("dnat "),
-            "no rule moves a lookup anywhere:\n{ruleset}"
+            !ruleset.contains(&format!("ip daddr {gateway}")),
+            "the gateway's resolver is no longer admitted:\n{ruleset}"
+        );
+        assert!(
+            !ruleset.contains("tcp dport"),
+            "no TCP destination is admitted or steered:\n{ruleset}"
         );
         for chain in ["output", "classify", "postrouting"] {
             let rules = chain_rules(&ruleset, chain);
             assert!(
                 rules.iter().all(|rule| !rule.contains("dport 53")),
-                "DNS's port is matched in deny_out alone, not {chain}: {rules:?}"
+                "DNS's port is matched in deny_out and dstnat alone, not {chain}: {rules:?}"
             );
         }
         assert!(
-            GUEST_RESOLVER_CARVE_OUT_LINE.contains("node's DNS layer at the gateway")
-                && GUEST_RESOLVER_CARVE_OUT_LINE.contains("port 53 over udp and tcp"),
+            GUEST_RESOLVER_CARVE_OUT_LINE.contains("guest's own DNS listener")
+                && GUEST_RESOLVER_CARVE_OUT_LINE.contains("refuses names outside the zone"),
             "the render's one line names the carve-out it renders"
         );
     }
@@ -5567,8 +5603,8 @@ mod tests {
     /// The native install records the carve-out it loaded beside the marker,
     /// the decision reads that record with the verdict, and a deny-all
     /// launch over it runs only while the record names the answerer's live
-    /// bind (NET-079). An install whose carve-out is the gateway's resolver
-    /// records none.
+    /// bind (NET-079). Every install records one: the carve-out is the
+    /// answerer's address and port on every render, native and guest alike.
     #[test]
     fn carve_out_targets_live_answerer_bind() {
         let mount = standin_mount();
@@ -5607,18 +5643,23 @@ mod tests {
             "a carve-out naming the live bind runs the box"
         );
 
-        // A re-install whose carve-out is the gateway's resolver clears the
-        // answerer record it replaces and writes none.
+        // A re-install records the carve-out it loaded, replacing the
+        // earlier record: the answerer's address and port are the carve-out
+        // every render names, so the record follows the table.
         let bare = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, nft_dir.path());
         assert!(
             bare.status.success(),
             "the re-install runs: {}",
             String::from_utf8_lossy(&bare.stderr),
         );
+        let listener = SocketAddrV4::new(
+            crate::net::guest_dns::LISTENER_ADDRESS,
+            crate::net::guest_dns::LISTENER_PORT,
+        );
         assert_eq!(
             recorded_carve_out(&mount.root),
-            None,
-            "no carve-out, no record"
+            Some(listener),
+            "every install records the carve-out it loaded"
         );
     }
 

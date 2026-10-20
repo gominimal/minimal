@@ -243,6 +243,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // not held across the daemon handshake, where a spawned task's
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
+        #[cfg(debug_assertions)]
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         #[cfg(debug_assertions)]
         Some(Command::DebugAnswererCommand) => {

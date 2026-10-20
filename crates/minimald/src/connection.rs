@@ -1602,4 +1602,180 @@ kill "$peer" 2>/dev/null
             .expect("read on the channel after teardown");
         assert_eq!(n, 0, "the forward's channel must see EOF, not more bytes");
     }
+
+    /// A passthrough transport whose write side can be wedged at will:
+    /// reads always delegate (the client's replies keep flowing until the
+    /// wedge), while writes, flushes and shutdowns park forever once
+    /// `stuck` is set — a transport that accepted the connection and then
+    /// stopped draining.
+    struct Wedgeable<T> {
+        inner: T,
+        stuck: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<T> Wedgeable<T> {
+        fn is_stuck(&self) -> bool {
+            self.stuck.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for Wedgeable<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for Wedgeable<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.is_stuck() {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.is_stuck() {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.is_stuck() {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The tight keepalive/inactivity pair both transport-deadline tests
+    /// run under. The keepalive fires well inside the inactivity window, so
+    /// a healthy peer answers several before it could lapse; the window is
+    /// wide enough that a slow runner's gaps during KEX and auth (which run
+    /// under it too) do not fire it early.
+    const TEST_KEEPALIVE: Duration = Duration::from_millis(100);
+    const TEST_INACTIVITY: Duration = Duration::from_secs(1);
+
+    /// A real russh client handshaken and authenticated against the server
+    /// through a [`Wedgeable`] transport under [`TEST_KEEPALIVE`] /
+    /// [`TEST_INACTIVITY`]. Returns the server's session future, the
+    /// client (which must be held: dropping it EOFs the server's read side)
+    /// and the wedge switch.
+    async fn wedgeable_session(
+        server: &crate::test_harness::TestServer,
+    ) -> (
+        RunningSession<ConnectionHandler>,
+        russh::client::Handle<ForwardHandler>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let host_key = server.state.host_key().await.unwrap();
+        let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Wedgeable {
+            inner: server_side,
+            stuck: stuck.clone(),
+        };
+        let server_setup = {
+            let state = server.state.clone();
+            async move {
+                Connection::from_stream(
+                    transport,
+                    Arc::new(russh::server::Config {
+                        keys: vec![host_key],
+                        auth_rejection_time_initial: Some(Duration::ZERO),
+                        nodelay: true,
+                        keepalive_interval: Some(TEST_KEEPALIVE),
+                        // Far above the inactivity budget: a wedged write
+                        // must be resolved by the inactivity deadline, not
+                        // by exhausting keepalives.
+                        keepalive_max: 100,
+                        inactivity_timeout: Some(TEST_INACTIVITY),
+                        ..Default::default()
+                    }),
+                    state,
+                    true,
+                )
+                .await
+                .expect("handshake over the in-memory pair")
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let ((_conn, session_fut), client) = tokio::join!(server_setup, client_setup);
+        let mut client = client.expect("client handshake");
+        let auth = client
+            .authenticate_none(&SessionId::nil().to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+        (session_fut, client, stuck)
+    }
+
+    /// A write that never completes must not park the session loop forever.
+    /// russh bounds every transport write only by the inactivity timer, so
+    /// with `inactivity_timeout: None` a wedged write parks the loop for
+    /// good — and keepalives are dispatched from that same loop, so they
+    /// stop firing too: the connection outlives every keepalive budget
+    /// while both directions sit dark. Arming the timer bounds the park:
+    /// the session future must resolve with an inactivity error instead of
+    /// hanging.
+    #[tokio::test]
+    async fn a_wedged_transport_write_ends_the_session_on_the_inactivity_deadline() {
+        let server = crate::test_harness::TestServer::new().await;
+        // Hold the client open: dropping it would EOF the server's read
+        // side and end the session for the wrong reason. The wedge is the
+        // write side only.
+        let (session_fut, _client, stuck) = wedgeable_session(&server).await;
+        stuck.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // The next keepalive queues a transport write that can never
+        // complete. Under the old `inactivity_timeout: None` this future
+        // never resolves and the timeout fires instead.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), session_fut).await;
+        let err = outcome
+            .expect("a wedged write must not park the session loop forever")
+            .expect_err("the wedged transport ends the session with an error");
+        assert!(
+            matches!(
+                err,
+                ConnectionError::Protocol(russh::Error::InactivityTimeout)
+            ),
+            "the session must end on the inactivity deadline, got: {err}"
+        );
+    }
+
+    /// The other side of arming the inactivity timer: a healthy peer that
+    /// sends nothing of its own but answers every keepalive must outlive the
+    /// deadline. russh resets the inactivity clock on every loop pass that
+    /// is not a bare keepalive send, so each keepalive answer pushes the
+    /// deadline out; a russh change that stopped counting the answer would
+    /// reap every quiet attach once the deadline elapsed.
+    #[tokio::test]
+    async fn a_healthy_idle_peer_outlives_the_inactivity_deadline() {
+        let server = crate::test_harness::TestServer::new().await;
+        let (session_fut, client, _stuck) = wedgeable_session(&server).await;
+        tokio::pin!(session_fut);
+
+        // Idle for several inactivity windows: only keepalives and their
+        // answers cross the transport.
+        let outcome = tokio::time::timeout(TEST_INACTIVITY * 3, session_fut.as_mut()).await;
+        assert!(
+            outcome.is_err(),
+            "a peer answering keepalives must not be reaped, session ended: {:?}",
+            outcome.map(|r| r.map_err(|e| e.to_string()))
+        );
+        drop(client);
+    }
 }

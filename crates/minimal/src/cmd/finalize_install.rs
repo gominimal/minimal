@@ -1747,6 +1747,7 @@ mod tests {
                 ],
                 install: Some(AnswererInstall {
                     operator: "op".to_string(),
+                    operator_uid: 1000,
                     channel: "/run/min/zone.sock".to_string(),
                     channel_dir: "/run/min".to_string(),
                     source: "/usr/local/bin/minzoned".to_string(),
