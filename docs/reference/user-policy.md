@@ -173,9 +173,13 @@ so the rules apply to the **declared path** itself:
 - A read-write (`"rw"`) directory stops the run when a `deny` rule can name a
   path inside it, even a path that does not exist yet, because the task can
   create it. Declare the directory `"ro"`, or declare a directory that leaves
-  that path out.
+  that path out. A rule with no fixed directory at its start, such as
+  `**/*.pem`, can match inside any directory, so no read-write directory
+  leaves it out: declare the directory `"ro"`.
 - A `~/` path that leads out of the session's home through a symlink stops the
-  run. The session checks this when the task starts.
+  run. The session checks this when the task starts and again before each
+  command the task runs. The check does not catch a symlink that changes
+  after the check and before the mount.
 - For a declared absolute path, Minimal also checks the path it resolves to on
   your machine, and `allow` must match that path too. A symlink cannot carry
   the path past a `deny` on its target, or onto a target no rule allows. This

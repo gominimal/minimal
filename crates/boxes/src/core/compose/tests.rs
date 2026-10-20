@@ -3390,6 +3390,19 @@ mod gate_task_patch_paths {
         assert!(!deny_reaches_inside("/h/uu/x", "/h/u"));
     }
 
+    /// A deny with no fixed directory before its first metacharacter can
+    /// match inside any directory; one with a fixed directory cannot.
+    #[test]
+    fn deny_reaches_any_dir_needs_no_fixed_prefix() {
+        use crate::core::compose::deny_reaches_any_dir;
+        for pattern in ["**/*.pem", "**/.env", "/*/.env", "*"] {
+            assert!(deny_reaches_any_dir(pattern), "{pattern}");
+        }
+        for pattern in ["/h/u/.ssh/**", "/h/*/.ssh/**", "/etc/token", "/", "[*]/x"] {
+            assert!(!deny_reaches_any_dir(pattern), "{pattern}");
+        }
+    }
+
     /// A deny that names a directory without `/**` still applies to that
     /// directory when the walk meets it inside a declared one.
     #[test]

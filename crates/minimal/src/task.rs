@@ -559,11 +559,15 @@ fn writable_deny_task_patch_message(
     pattern: &str,
     policy_path: &std::path::Path,
 ) -> String {
+    let next = if boxes::core::compose::deny_reaches_any_dir(pattern) {
+        "This rule can match inside any directory, so declare the directory \"ro\""
+    } else {
+        "Declare the directory \"ro\", or declare a directory that leaves those paths out"
+    };
     format!(
         "task '{task_name}' declares the read-write patch directory `{path}`. \
          The task can create files in it that the `[patches] deny` rule \
-         `{pattern}` in {policy} forbids. Declare the directory \"ro\", or \
-         declare a directory that leaves those paths out",
+         `{pattern}` in {policy} forbids. {next}",
         policy = policy_path.display(),
     )
 }
@@ -2297,6 +2301,35 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("\"ro\""), "{msg}");
+    }
+
+    /// A deny rule with no fixed directory, such as `**/*.pem`, reaches
+    /// into every read-write directory, so the refusal asks for "ro" only
+    /// and does not suggest declaring another directory.
+    #[test]
+    fn a_writable_directory_under_a_deny_anywhere_asks_for_ro_only() {
+        let task = task_from_toml(
+            "[tasks.t]\nexec = 'true'\n[tasks.t.patch.dir]\n\
+             \"/nonexistent-min-test/cache\" = \"rw\"\n",
+        );
+        let policy = boxes::core::policy::PatchesPolicy::default()
+            .with_allow(vec!["/nonexistent-min-test/**".to_string()])
+            .with_deny(vec!["**/*.pem".to_string()]);
+        let err = resolve_task_patches(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            &minimald_rpc::taskenv::TaskEnv::default(),
+        )
+        .expect_err("a writable directory under a deny anywhere must fail the gate");
+        let msg = err.to_string();
+        assert!(msg.contains("`**/*.pem`"), "{msg}");
+        assert!(msg.contains("can match inside any directory"), "{msg}");
+        assert!(msg.contains("\"ro\""), "{msg}");
+        assert!(!msg.contains("leaves those paths out"), "{msg}");
     }
 
     /// A glob metacharacter in a refused path is escaped in the snippet,

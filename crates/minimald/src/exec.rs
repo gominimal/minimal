@@ -424,12 +424,16 @@ fn apply_patch_verdict(
 /// can reach. The client cannot look inside the session's home, so this
 /// check runs here: each `~/` key must still lie under the home once its
 /// links are followed. A key whose links cannot be followed is refused.
-/// A box that swaps a link after this check and before the mount is not
-/// caught.
+///
+/// The task runs it before each command it spawns, since the mount
+/// follows the links again at each spawn and an earlier command can
+/// change them. It is still not race-free: a link swapped after this
+/// check and before the mount is not caught.
 ///
 /// # Errors
 ///
-/// The refusal text, naming the task and the key.
+/// The refusal text, naming the task, the key, and the first path on it
+/// that cannot be resolved or that resolves outside the home.
 fn refuse_escaping_home_patches(
     task_name: &str,
     patch: &mfile::EnvPatches,
@@ -448,19 +452,38 @@ fn refuse_escaping_home_patches(
     let Some(home_real) = resolve_patch_target(home) else {
         return Err(format!(
             "task '{task_name}' declares patch paths under `~/`, and the session's \
-             home {home} cannot be read, so the task did not run"
+             home {home} cannot be resolved, so the task did not run. Check that \
+             the session is still running with `min session list`, then run the \
+             task again"
         ));
     };
     for (key, rest) in tilde {
-        match resolve_patch_target(&home.join(rest)) {
-            Some(target) if target.starts_with(&home_real) => {}
-            _ => {
-                return Err(format!(
-                    "task '{task_name}' declares the patch path `{key}`, which leads \
-                     outside the session's home through a symbolic link, so the task \
-                     did not run. Remove the link from the session, then run the task \
-                     again"
-                ));
+        // Each path from the home down to the key in turn, so the refusal
+        // names the first one that cannot be resolved or that leaves.
+        let mut at = camino::Utf8PathBuf::from("~");
+        let mut on_disk = home.to_path_buf();
+        for part in camino::Utf8Path::new(rest).components() {
+            at.push(part);
+            on_disk.push(part);
+            match resolve_patch_target(&on_disk) {
+                Some(target) if target.starts_with(&home_real) => {}
+                Some(target) => {
+                    return Err(format!(
+                        "task '{task_name}' declares the patch path `{key}`, and \
+                         `{at}` in the session is a symbolic link to {target}, \
+                         outside the session's home, so the task did not run. \
+                         Remove the link from the session, then run the task again"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "task '{task_name}' declares the patch path `{key}`, and \
+                         `{at}` in the session cannot be resolved: a symbolic link \
+                         on it loops, or a directory on it cannot be read, so the \
+                         task did not run. Fix or remove that link or directory in \
+                         the session, then run the task again"
+                    ));
+                }
             }
         }
     }
@@ -522,12 +545,64 @@ mod patch_verdict_tests {
             assert!(err.contains(&format!("`{key}`")), "{err}");
             assert!(err.contains("outside the session's home"), "{err}");
         }
+        let err =
+            refuse_escaping_home_patches("t", &patches(&["~/x/sub"], &[]), &home).unwrap_err();
+        assert!(
+            err.contains("`~/x` in the session is a symbolic link"),
+            "{err}"
+        );
+        assert!(err.contains(outside.as_str()), "{err}");
         refuse_escaping_home_patches(
             "t",
             &patches(&["~/inside", "~/new/dir", "/opt/x"], &["~/inside/f"]),
             &home,
         )
         .expect("every key stays inside the home");
+    }
+
+    /// A `~/` key through a link loop cannot be resolved: it is refused
+    /// with its own text, naming the looping link, not as leaving the home.
+    #[cfg(unix)]
+    #[test]
+    fn a_tilde_patch_through_a_link_loop_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home =
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.join("b").as_std_path(), home.join("a").as_std_path())
+            .unwrap();
+        std::os::unix::fs::symlink(home.join("a").as_std_path(), home.join("b").as_std_path())
+            .unwrap();
+
+        let err =
+            refuse_escaping_home_patches("t", &patches(&["~/a/sub"], &[]), &home).unwrap_err();
+        assert!(err.contains("`~/a/sub`"), "{err}");
+        assert!(
+            err.contains("`~/a` in the session cannot be resolved"),
+            "{err}"
+        );
+        assert!(!err.contains("outside the session's home"), "{err}");
+    }
+
+    /// A home that is itself a symlink is compared by where it leads: a
+    /// key inside its target passes, and a link out of it is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_that_is_a_symlink_is_checked_by_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root =
+            camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let real = root.join("real-home");
+        let home = root.join("home");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(real.join("inside").as_std_path()).unwrap();
+        std::fs::create_dir(outside.as_std_path()).unwrap();
+        std::os::unix::fs::symlink(real.as_std_path(), home.as_std_path()).unwrap();
+        std::os::unix::fs::symlink(outside.as_std_path(), real.join("x").as_std_path()).unwrap();
+
+        refuse_escaping_home_patches("t", &patches(&["~/inside", "~/new"], &[]), &home)
+            .expect("keys inside the home's target pass");
+        let err = refuse_escaping_home_patches("t", &patches(&["~/x"], &[]), &home).unwrap_err();
+        assert!(err.contains("outside the session's home"), "{err}");
     }
 
     fn patches(dirs: &[&str], files: &[&str]) -> mfile::EnvPatches {
@@ -813,6 +888,15 @@ async fn task_producer(
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
+                // The spawn follows the `~/` links again, and an earlier
+                // invocation mounts the session home, so it can have changed
+                // them: check again right before this mount.
+                refuse_escaping_home_patches(
+                    &exec.task,
+                    &task.patch,
+                    session_paths.home.as_utf8_path(),
+                )
+                .map_err(io::Error::other)?;
                 let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;

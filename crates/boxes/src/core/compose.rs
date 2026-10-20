@@ -1712,9 +1712,10 @@ fn resolve_path(
 
 /// Where `path` leads on this machine: its deepest existing ancestor
 /// canonicalized, a dangling symlink on the way followed by hand, and the
-/// missing tail joined back on. `None` when that cannot be said, for a
-/// link that cannot be followed or any error other than "not found". The
-/// daemon uses it to keep a `~/` patch key inside the session's home.
+/// missing tail joined back on. `None` when that cannot be said: for a
+/// link that cannot be followed, any error other than "not found", or a
+/// path that is not valid UTF-8 once resolved. The daemon uses it to keep
+/// a `~/` patch key inside the session's home.
 #[must_use]
 pub fn resolve_patch_target(path: &camino::Utf8Path) -> Option<camino::Utf8PathBuf> {
     resolve_path(path, 0).ok().flatten()
@@ -1733,6 +1734,28 @@ pub fn resolve_patch_target(path: &camino::Utf8Path) -> Option<camino::Utf8PathB
 /// `dir/` as far as the shorter of the two reaches.
 pub(crate) fn deny_reaches_inside(pattern: &str, dir: &str) -> bool {
     let inside = format!("{}/", dir.trim_end_matches('/'));
+    let (literal, has_meta) = deny_literal_prefix(pattern);
+    if has_meta {
+        literal.starts_with(&inside) || inside.starts_with(&literal)
+    } else {
+        literal.starts_with(&inside)
+    }
+}
+
+/// Whether the `deny` pattern `pattern` has no fixed directory to start
+/// from, such as `**/*.pem` or `/*/.env`, so it can match inside any
+/// directory: [`deny_reaches_inside`] holds for every absolute `dir`. No
+/// read-write directory can leave such a rule's paths out.
+#[must_use]
+pub fn deny_reaches_any_dir(pattern: &str) -> bool {
+    let (literal, has_meta) = deny_literal_prefix(pattern);
+    has_meta && "/".starts_with(literal.as_str())
+}
+
+/// The literal prefix of `pattern`, read up to its first glob
+/// metacharacter (`*`, `?`, `[`, `{`), and whether it has one. A
+/// backslash escape and a one-byte class such as `[*]` count as literal.
+fn deny_literal_prefix(pattern: &str) -> (String, bool) {
     let chars: Vec<char> = pattern.chars().collect();
     let mut literal = String::with_capacity(pattern.len());
     let mut i = 0;
@@ -1760,11 +1783,7 @@ pub(crate) fn deny_reaches_inside(pattern: &str, dir: &str) -> bool {
             }
         }
     }
-    if has_meta {
-        literal.starts_with(&inside) || inside.starts_with(&literal)
-    } else {
-        literal.starts_with(&inside)
-    }
+    (literal, has_meta)
 }
 
 /// One path's decision against the expanded policy, as written.
