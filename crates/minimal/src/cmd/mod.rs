@@ -19,6 +19,7 @@ use crate::*;
 
 mod admin;
 mod auth;
+mod box_audit;
 mod box_spec;
 // `boxes.rs` is mounted under another name: see its module docs.
 #[path = "boxes.rs"]
@@ -36,6 +37,7 @@ pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_status};
+pub use box_audit::AuditSelfUnsupportedUnenrolled;
 pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
@@ -225,9 +227,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
-        Some(Command::Box(BoxArgs {
-            command: BoxCommand::Spec(args),
-        })) => box_spec::cmd_box_spec(&cli.global_args, args),
+        Some(Command::Box(BoxArgs { command })) => match command {
+            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
+            BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
+        },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,

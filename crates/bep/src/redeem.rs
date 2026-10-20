@@ -1,4 +1,4 @@
-//! The redemption decision (BEP-019 to BEP-021, BEP-024, BEP-031, BEP-058).
+//! The redemption decision (BEP-019 to BEP-025, BEP-031, BEP-058).
 //!
 //! The proxy decides whether to redeem a sealed value in one pure function,
 //! [`decide`], over owned values. The TLS and socket shell does the I/O. It
@@ -24,19 +24,26 @@
 //!    [`Attributed::Cohort`], and the audit records it `cohort_attributed`.
 //!    A value that [`crate::seal::open`] refuses as bound to another box id
 //!    is [`Unsealed::OtherBox`], and this check refuses it too.
-//! 4. The clock is before the value's expiry (BEP-024). A value that
+//! 4. The sending box's declared egress admits the connection authority
+//!    (BEP-022).
+//! 5. The clock is before the value's expiry (BEP-024). A value that
 //!    [`crate::seal::open`] refuses as past its expiry is
 //!    [`Unsealed::Expired`], and this check refuses it too.
-//! 5. No revocation in force covers the value's box id (BEP-024, BEP-071).
-//! 6. The connection's port is a declared port of the module's current host
+//! 6. No revocation in force covers the value's box id (BEP-024, BEP-071).
+//! 7. The connection's port is a declared port of the module's current host
 //!    set for that hostname (BEP-031). A hostname outside the current set is
-//!    not credentialed, so check 8 refuses it.
-//! 7. The connection authority is in the value's bound host set (BEP-021).
-//! 8. The connection authority is in the module's current host set
+//!    not credentialed, so check 9 refuses it.
+//! 8. The connection authority is in the value's bound host set (BEP-021).
+//! 9. The connection authority is in the module's current host set
 //!    (BEP-021).
+//! 10. The request's `Host` header, and the authority of an absolute-form
+//!     request target, equal the connection authority (BEP-023).
 //!
-//! The other redemption checks (egress and request authority) are not in
-//! this module yet.
+//! [`decide`] admits only when every check passes (BEP-025). The shell then
+//! substitutes the member's credential and forwards the request to the
+//! connection authority. A request that carries no sealed value goes to
+//! [`decide_plain`], which makes checks 4 and 10 alone. So the egress and
+//! request-authority checks hold whether or not a request carries a value.
 
 use std::fmt;
 
@@ -90,7 +97,7 @@ impl Unsealed<String> {
     /// [`Check::CrossBox`], or as [`Check::NoLiveBox`] when the source
     /// resolves to no live box. A value past its expiry gives
     /// [`Unsealed::Expired`], so [`decide`] refuses it as [`Check::Expired`]
-    /// once the attribution passes.
+    /// once the attribution and the declared egress pass.
     ///
     /// The shell binds the open to the box id that the source resolves to.
     /// For an [`Attribution::OwnIp`] source, that is the sending box, so a
@@ -203,6 +210,42 @@ pub struct Redemption<B, H> {
     pub bound_set: Vec<Authority<H>>,
     /// The module's current host set.
     pub current_set: Vec<Authority<H>>,
+    /// The request's `Host` header and request target.
+    pub request: RequestAuthority<H>,
+    /// The authorities the sending box's declared egress admits (BEP-022).
+    pub egress: Vec<Authority<H>>,
+}
+
+/// The authorities a request names, beside the one it arrived on (BEP-023).
+///
+/// An authority written with no port is port 443.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestAuthority<H> {
+    /// The `Host` header, or the HTTP/2 `:authority`. `None` when the
+    /// request carries neither, which never equals the connection authority.
+    pub host: Option<Authority<H>>,
+    /// The authority of an absolute-form request target. `None` for an
+    /// origin-form target, which names the connection authority itself.
+    pub target: Option<Authority<H>>,
+}
+
+impl<H: PartialEq> RequestAuthority<H> {
+    /// Whether the request names only `connection`.
+    fn pins(&self, connection: &Authority<H>) -> bool {
+        self.host.as_ref() == Some(connection)
+            && self.target.as_ref().is_none_or(|t| t == connection)
+    }
+}
+
+/// One request that carries no sealed value, as the shell sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plain<H> {
+    /// The authority the connection arrived on.
+    pub authority: Authority<H>,
+    /// The request's `Host` header and request target.
+    pub request: RequestAuthority<H>,
+    /// The authorities the sending box's declared egress admits (BEP-022).
+    pub egress: Vec<Authority<H>>,
 }
 
 /// How an admitted request was attributed to the box the value names.
@@ -238,6 +281,12 @@ pub enum Check {
     OutsideBoundSet,
     /// The authority is not in the module's current host set (BEP-021).
     OutsideCurrentSet,
+    /// The sending box's declared egress does not admit the authority
+    /// (BEP-022).
+    OutsideDeclaredEgress,
+    /// The `Host` header or the request target names an authority other
+    /// than the connection authority (BEP-023).
+    HostMismatch,
 }
 
 impl Check {
@@ -254,6 +303,8 @@ impl Check {
             Self::OffPort => "off_port",
             Self::OutsideBoundSet => "outside_bound_set",
             Self::OutsideCurrentSet => "outside_current_set",
+            Self::OutsideDeclaredEgress => "outside_declared_egress",
+            Self::HostMismatch => "host_mismatch",
         }
     }
 }
@@ -297,12 +348,17 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
             });
         }
         // BEP-024: open refused the value as past its expiry. The open was
-        // bound to the box the source resolves to, so only the source can
-        // fail first.
+        // bound to the box the source resolves to, so only the source or the
+        // declared egress (BEP-022) can fail first.
         Unsealed::Expired => {
             return Decision::Refuse(match redemption.attribution {
                 Attribution::NoLiveBox => Check::NoLiveBox,
                 Attribution::HostIpCohort if !redemption.named_box_in_cohort => Check::CrossBox,
+                Attribution::OwnIp(_) | Attribution::HostIpCohort
+                    if !redemption.egress.contains(&redemption.authority) =>
+                {
+                    Check::OutsideDeclaredEgress
+                }
                 Attribution::OwnIp(_) | Attribution::HostIpCohort => Check::Expired,
             });
         }
@@ -325,6 +381,11 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
             return Decision::Refuse(Check::CrossBox);
         }
     };
+    // BEP-022: the box reaches only what its declared egress admits.
+    let authority = &redemption.authority;
+    if !redemption.egress.contains(authority) {
+        return Decision::Refuse(Check::OutsideDeclaredEgress);
+    }
     // BEP-024: only a value before its expiry, and not revoked, is redeemed.
     if redemption.now >= expiry {
         return Decision::Refuse(Check::Expired);
@@ -333,7 +394,6 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
         return Decision::Refuse(Check::Revoked);
     }
     // BEP-031: a credentialed hostname is reached only on a declared port.
-    let authority = &redemption.authority;
     let current = &redemption.current_set;
     if current.iter().any(|a| a.host == authority.host) && !current.contains(authority) {
         return Decision::Refuse(Check::OffPort);
@@ -345,11 +405,45 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
     if !current.contains(authority) {
         return Decision::Refuse(Check::OutsideCurrentSet);
     }
+    // BEP-023: the request names only the authority it arrived on.
+    if !redemption.request.pins(authority) {
+        return Decision::Refuse(Check::HostMismatch);
+    }
+    // BEP-025: every check passed.
     Decision::Admit {
         attributed,
         mode,
         breadth,
     }
+}
+
+/// Decides one request that carries no sealed value. Pure: the result
+/// depends only on `plain`. The shell forwards the request with no
+/// substitution on `Ok`.
+///
+/// # Errors
+///
+/// The first check that failed: [`Check::OutsideDeclaredEgress`] or
+/// [`Check::HostMismatch`].
+pub fn decide_plain<H: PartialEq>(plain: &Plain<H>) -> Result<(), Check> {
+    request_check(&plain.authority, &plain.request, &plain.egress).map_or(Ok(()), Err)
+}
+
+/// The checks a request passes with or without a sealed value, in order.
+fn request_check<H: PartialEq>(
+    authority: &Authority<H>,
+    request: &RequestAuthority<H>,
+    egress: &[Authority<H>],
+) -> Option<Check> {
+    // BEP-022: the box reaches only what its declared egress admits.
+    if !egress.contains(authority) {
+        return Some(Check::OutsideDeclaredEgress);
+    }
+    // BEP-023: the request names only the authority it arrived on.
+    if !request.pins(authority) {
+        return Some(Check::HostMismatch);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -379,8 +473,16 @@ mod tests {
             authority: API,
             bound_set: vec![API],
             current_set: vec![API],
+            request: PINNED,
+            egress: vec![API],
         }
     }
+
+    /// An origin-form request whose `Host` header is the connection's.
+    const PINNED: RequestAuthority<u8> = RequestAuthority {
+        host: Some(API),
+        target: None,
+    };
 
     /// An opened value for `named`, sent from `named`, that passes the
     /// source and bounds checks.
@@ -394,6 +496,158 @@ mod tests {
             attribution: Attribution::OwnIp(named),
             ..rest()
         }
+    }
+
+    /// An origin-form request to `authority`.
+    fn pinned(authority: Authority<u8>) -> RequestAuthority<u8> {
+        RequestAuthority {
+            host: Some(authority),
+            target: None,
+        }
+    }
+
+    /// `redemption`, sent to `authority` with a pinned request, from a box
+    /// whose declared egress admits `authority`.
+    fn reached(authority: Authority<u8>, redemption: Redemption<u8, u8>) -> Redemption<u8, u8> {
+        Redemption {
+            authority,
+            request: pinned(authority),
+            egress: vec![authority],
+            ..redemption
+        }
+    }
+
+    fn any_request() -> impl Strategy<Value = RequestAuthority<u8>> {
+        (
+            prop::option::of(any_authority()),
+            prop::option::of(any_authority()),
+        )
+            .prop_map(|(host, target)| RequestAuthority { host, target })
+    }
+
+    fn any_unsealed() -> impl Strategy<Value = Unsealed<u8>> {
+        prop_oneof![
+            Just(Unsealed::Undecryptable),
+            Just(Unsealed::Unbounded),
+            Just(Unsealed::OtherBox),
+            Just(Unsealed::Expired),
+            (
+                0u8..3,
+                prop::option::of(any::<bool>().prop_map(mode_of)),
+                any::<bool>(),
+                0u64..4_000,
+            )
+                .prop_map(|(box_id, mode, breadth, expiry)| Unsealed::Opened {
+                    box_id,
+                    bounds: Bounds {
+                        mode,
+                        breadth: breadth.then_some(Breadth::Full),
+                    },
+                    expiry,
+                }),
+        ]
+    }
+
+    fn any_redemption() -> impl Strategy<Value = Redemption<u8, u8>> {
+        (
+            any_unsealed(),
+            (0u8..3, 0u8..3).prop_map(|(source, sender)| match source {
+                0 => Attribution::NoLiveBox,
+                1 => Attribution::OwnIp(sender),
+                _ => Attribution::HostIpCohort,
+            }),
+            any::<bool>(),
+            0u64..4_000,
+            prop::collection::vec(0u8..3, 0..=2),
+            any_authority(),
+            (
+                prop::collection::vec(any_authority(), 0..=4),
+                prop::collection::vec(any_authority(), 0..=4),
+                prop::collection::vec(any_authority(), 0..=4),
+            ),
+            any_request(),
+        )
+            .prop_map(
+                |(
+                    unsealed,
+                    attribution,
+                    named_box_in_cohort,
+                    now,
+                    revoked,
+                    authority,
+                    (bound_set, current_set, egress),
+                    request,
+                )| Redemption {
+                    unsealed,
+                    attribution,
+                    named_box_in_cohort,
+                    now,
+                    revoked,
+                    authority,
+                    bound_set,
+                    current_set,
+                    request,
+                    egress,
+                },
+            )
+    }
+
+    /// The checks of BEP-019 to BEP-024, BEP-031 and BEP-058, written out
+    /// one by one in their order, apart from [`decide`]. Each entry is a
+    /// check and whether it fails.
+    fn failures(r: &Redemption<u8, u8>) -> Vec<(Check, bool)> {
+        let a = r.authority;
+        let (opened, box_id, bounded, expiry) = match &r.unsealed {
+            Unsealed::Opened {
+                box_id,
+                bounds,
+                expiry,
+            } => (
+                true,
+                Some(*box_id),
+                bounds.mode.is_some() && bounds.breadth.is_some(),
+                Some(*expiry),
+            ),
+            Unsealed::Undecryptable | Unsealed::Unbounded => (false, None, false, None),
+            Unsealed::OtherBox | Unsealed::Expired => (false, None, true, None),
+        };
+        let attributed = match &r.attribution {
+            Attribution::NoLiveBox => false,
+            Attribution::OwnIp(sender) => {
+                opened && Some(*sender) == box_id || matches!(r.unsealed, Unsealed::Expired)
+            }
+            Attribution::HostIpCohort => {
+                r.named_box_in_cohort && !matches!(r.unsealed, Unsealed::OtherBox)
+            }
+        };
+        let credentialed = r.current_set.iter().any(|c| c.host == a.host);
+        let host_pinned = r.request.host == Some(a);
+        let target_pinned = r.request.target.is_none() || r.request.target == Some(a);
+        vec![
+            (
+                Check::Undecryptable,
+                matches!(r.unsealed, Unsealed::Undecryptable),
+            ),
+            (Check::UnboundedMember, !bounded),
+            (
+                Check::NoLiveBox,
+                matches!(r.attribution, Attribution::NoLiveBox),
+            ),
+            (Check::CrossBox, !attributed),
+            (Check::OutsideDeclaredEgress, !r.egress.contains(&a)),
+            (
+                Check::Expired,
+                matches!(r.unsealed, Unsealed::Expired) || expiry.is_some_and(|e| r.now >= e),
+            ),
+            (
+                Check::Revoked,
+                box_id.is_some_and(|b| r.revoked.contains(&b)),
+            ),
+            (Check::OffPort, credentialed && !r.current_set.contains(&a)),
+            (Check::OutsideBoundSet, !r.bound_set.contains(&a)),
+            (Check::OutsideCurrentSet, !r.current_set.contains(&a)),
+            (Check::HostMismatch, !(host_pinned && target_pinned)),
+        ]
     }
 
     const ADMITTED: Decision = Decision::Admit {
@@ -567,7 +821,7 @@ mod tests {
                 authority,
                 bound_set: bound.clone(),
                 current_set: current.clone(),
-                ..own(named)
+                ..reached(authority, own(named))
             });
             let in_bound = bound.contains(&authority);
             let in_current = current.contains(&authority);
@@ -636,7 +890,7 @@ mod tests {
                 authority,
                 bound_set: current.clone(),
                 current_set: current.clone(),
-                ..own(named)
+                ..reached(authority, own(named))
             });
             if current.contains(&authority) {
                 prop_assert_eq!(decision, ADMITTED);
@@ -644,6 +898,140 @@ mod tests {
                 prop_assert_eq!(decision, Decision::Refuse(Check::OffPort));
             }
         }
+
+        /// BEP-022: a request is admitted only when the sending box's
+        /// declared egress admits its authority, whether or not it carries
+        /// a sealed value.
+        #[test]
+        fn prop_undeclared_egress_authority_is_refused(
+            egress in prop::collection::vec(any_authority(), 0..=4),
+            authority in any_authority(),
+            named in any::<u8>(),
+            other in any_redemption(),
+        ) {
+            let declared = egress.contains(&authority);
+
+            // With a sealed value that passes every other check.
+            let decision = decide(&Redemption {
+                bound_set: vec![authority],
+                current_set: vec![authority],
+                egress: egress.clone(),
+                ..reached(authority, own(named))
+            });
+            if declared {
+                prop_assert_eq!(decision, ADMITTED);
+            } else {
+                prop_assert_eq!(decision, Decision::Refuse(Check::OutsideDeclaredEgress));
+            }
+
+            // With no sealed value.
+            let plain = decide_plain(&Plain {
+                authority,
+                request: pinned(authority),
+                egress: egress.clone(),
+            });
+            if declared {
+                prop_assert_eq!(plain, Ok(()));
+            } else {
+                prop_assert_eq!(plain, Err(Check::OutsideDeclaredEgress));
+            }
+
+            // With any other facts, an admission has a declared authority.
+            let reach = other.authority;
+            let any = decide(&Redemption { egress: egress.clone(), ..other });
+            if matches!(any, Decision::Admit { .. }) {
+                prop_assert!(egress.contains(&reach));
+            }
+        }
+
+        /// BEP-023: a request is admitted, and its value substituted, only
+        /// when its `Host` header and its request target name the
+        /// connection authority. An origin-form target names it.
+        #[test]
+        fn prop_host_header_mismatch_is_refused(
+            authority in any_authority(),
+            request in any_request(),
+            named in any::<u8>(),
+        ) {
+            let pinned_request = request.host == Some(authority)
+                && request.target.is_none_or(|t| t == authority);
+
+            let decision = decide(&Redemption {
+                request,
+                ..reached(authority, Redemption {
+                    bound_set: vec![authority],
+                    current_set: vec![authority],
+                    ..own(named)
+                })
+            });
+            if pinned_request {
+                prop_assert_eq!(decision, ADMITTED);
+            } else {
+                prop_assert_eq!(decision, Decision::Refuse(Check::HostMismatch));
+            }
+
+            let plain = decide_plain(&Plain {
+                authority,
+                request,
+                egress: vec![authority],
+            });
+            if pinned_request {
+                prop_assert_eq!(plain, Ok(()));
+            } else {
+                prop_assert_eq!(plain, Err(Check::HostMismatch));
+            }
+        }
+
+        /// BEP-025: the decision admits exactly when every check passes,
+        /// and otherwise refuses naming the first check that fails.
+        #[test]
+        fn prop_admit_iff_every_check_passes(r in any_redemption()) {
+            admits_iff_every_check_passes(&r)?;
+
+            // The same facts, with every authority check passing, so the
+            // earlier checks decide alone.
+            let a = r.authority;
+            let mut reaching = reached(a, r);
+            reaching.bound_set.push(a);
+            reaching.current_set.push(a);
+            admits_iff_every_check_passes(&reaching)?;
+
+            // And sent from the box the value names, so an opened value
+            // reaches the expiry, revocation and bounds checks.
+            if let Unsealed::Opened { box_id, .. } = reaching.unsealed {
+                reaching.attribution = Attribution::OwnIp(box_id);
+                admits_iff_every_check_passes(&reaching)?;
+            }
+        }
+    }
+
+    /// The decision is `Admit` when no check in [`failures`] fails, and
+    /// otherwise `Refuse` naming the first check that fails.
+    fn admits_iff_every_check_passes(r: &Redemption<u8, u8>) -> Result<(), TestCaseError> {
+        let first = failures(r).into_iter().find(|(_, failed)| *failed);
+        let decision = decide(r);
+        match first {
+            Some((check, _)) => prop_assert_eq!(decision, Decision::Refuse(check)),
+            None => {
+                let Unsealed::Opened { bounds, .. } = r.unsealed else {
+                    panic!("every check passed for a value that did not open");
+                };
+                let attributed = if matches!(r.attribution, Attribution::OwnIp(_)) {
+                    Attributed::OwnBox
+                } else {
+                    Attributed::Cohort
+                };
+                prop_assert_eq!(
+                    decision,
+                    Decision::Admit {
+                        attributed,
+                        mode: bounds.mode.expect("a mode"),
+                        breadth: bounds.breadth.expect("a breadth"),
+                    }
+                );
+            }
+        }
+        Ok(())
     }
 
     /// BEP-024: `seal::open` refuses a value past its expiry as `Expired`.
@@ -815,6 +1203,8 @@ mod tests {
             Check::OffPort,
             Check::OutsideBoundSet,
             Check::OutsideCurrentSet,
+            Check::OutsideDeclaredEgress,
+            Check::HostMismatch,
         ]
         .map(Check::marker);
         assert_eq!(
@@ -829,6 +1219,8 @@ mod tests {
                 "off_port",
                 "outside_bound_set",
                 "outside_current_set",
+                "outside_declared_egress",
+                "host_mismatch",
             ]
         );
     }
@@ -836,7 +1228,10 @@ mod tests {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{Attribution, Authority, Bounds, Check, Decision, Redemption, Unsealed, decide};
+    use super::{
+        Attribution, Authority, Bounds, Check, Decision, Plain, Redemption, RequestAuthority,
+        Unsealed, decide, decide_plain,
+    };
     use crate::seal::{Breadth, Mode};
 
     fn any_mode() -> Option<Mode> {
@@ -900,6 +1295,21 @@ mod kani_proofs {
         revoked
     }
 
+    fn any_option_authority() -> Option<Authority<u8>> {
+        if kani::any() {
+            Some(any_authority())
+        } else {
+            None
+        }
+    }
+
+    fn any_request() -> RequestAuthority<u8> {
+        RequestAuthority {
+            host: any_option_authority(),
+            target: any_option_authority(),
+        }
+    }
+
     fn any_attribution() -> Attribution<u8> {
         match kani::any::<u8>() % 3 {
             0 => Attribution::NoLiveBox,
@@ -918,6 +1328,8 @@ mod kani_proofs {
             authority: any_authority(),
             bound_set: any_set(),
             current_set: any_set(),
+            request: any_request(),
+            egress: any_set(),
         }
     }
 
@@ -1045,5 +1457,88 @@ mod kani_proofs {
         if decision == Decision::Refuse(Check::OffPort) {
             assert!(credentialed && !declared);
         }
+    }
+
+    /// BEP-022: an admission, with or without a sealed value, has the
+    /// connection authority in the box's declared egress.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_requires_egress_admission() {
+        let r = any_redemption();
+        let decision = decide(&r);
+        if matches!(decision, Decision::Admit { .. }) {
+            assert!(r.egress.contains(&r.authority));
+        }
+        if decision == Decision::Refuse(Check::OutsideDeclaredEgress) {
+            assert!(!r.egress.contains(&r.authority));
+        }
+        let plain = Plain {
+            authority: r.authority,
+            request: r.request,
+            egress: r.egress,
+        };
+        match decide_plain(&plain) {
+            Ok(()) => assert!(plain.egress.contains(&plain.authority)),
+            Err(Check::OutsideDeclaredEgress) => {
+                assert!(!plain.egress.contains(&plain.authority));
+            }
+            Err(check) => assert_eq!(check, Check::HostMismatch),
+        }
+    }
+
+    /// BEP-023: an admission, with or without a sealed value, has the
+    /// `Host` header and any absolute-form target equal to the connection
+    /// authority.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_pins_request_authority() {
+        let r = any_redemption();
+        let pinned = r.request.host == Some(r.authority)
+            && (r.request.target.is_none() || r.request.target == Some(r.authority));
+        if matches!(decide(&r), Decision::Admit { .. }) {
+            assert!(pinned);
+        }
+        let plain = Plain {
+            authority: r.authority,
+            request: r.request,
+            egress: r.egress,
+        };
+        if decide_plain(&plain).is_ok() {
+            assert!(pinned);
+        }
+    }
+
+    /// BEP-025: the decision admits exactly when every check passes.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_admits_iff_all_checks_pass() {
+        let r = any_redemption();
+        let decision = decide(&r);
+        let a = r.authority;
+        let all_pass = match r.unsealed {
+            Unsealed::Opened {
+                box_id,
+                bounds,
+                expiry,
+            } => {
+                let attributed = match r.attribution {
+                    Attribution::NoLiveBox => false,
+                    Attribution::OwnIp(sender) => sender == box_id,
+                    Attribution::HostIpCohort => r.named_box_in_cohort,
+                };
+                bounds.mode.is_some()
+                    && bounds.breadth.is_some()
+                    && attributed
+                    && r.now < expiry
+                    && !r.revoked.contains(&box_id)
+                    && r.bound_set.contains(&a)
+                    && r.current_set.contains(&a)
+                    && r.egress.contains(&a)
+                    && r.request.host == Some(a)
+                    && (r.request.target.is_none() || r.request.target == Some(a))
+            }
+            _ => false,
+        };
+        assert_eq!(matches!(decision, Decision::Admit { .. }), all_pass);
     }
 }

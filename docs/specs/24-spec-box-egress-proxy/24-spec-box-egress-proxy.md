@@ -575,6 +575,7 @@ Review, audit and revocation
   tier:     T0
   verify:   cargo nextest run -p minimal box_audit_filters_to_one_box
   <!-- the ruled grammar: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`; the log is the proxy's, not part of the box record, so `rm` and `prune` never touch it; retention is BEP-068's -->
+  <!-- the design reads over the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137); v1 reads the operator-owned log files under file mode in its place until gominimal/minimal#2463 serves the read; the interim is gominimal/minimal#2459 -->
   - WHEN `min box audit <name>` is run with a friendly name THE SYSTEM SHALL read the live box of that name, else the most recent creation under it, and name the id it read.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_name_reads_live_else_latest_creation
