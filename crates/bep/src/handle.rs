@@ -8,21 +8,26 @@
 //! The wire format is a compact JWS, `header.payload.signature`, each part in
 //! unpadded base64url:
 //!
-//! - The header is `{"alg":"ES256","typ":"min-handle","kid":<kid>}`. `kid` is
-//!   the RFC 7638 thumbprint of the signing key (see
+//! - The header is `{"alg":"ES256","typ":"gatehouse-store-handle+jws",
+//!   "kid":<kid>}`. `kid` is the RFC 7638 thumbprint of the signing key (see
 //!   [`crate::seal::ProxyPublicKey::kid`]).
-//! - The payload is a [`Claims`]: `kind`, `store`, `id`, `upstream`,
-//!   `inject` and `exp`.
+//! - The payload is a [`Claims`]: `sub`, `node_id`, `store`, `id`,
+//!   `upstream`, `inject`, `iat`, `exp` and `jti`.
 //! - The signature is ES256 over `header.payload`, as the 64-byte `r || s`.
 //!
-//! The proxy verifies a handle with [`read`] at each request. [`read`] looks
-//! up the signing key in the [`ClientKeys`] registry, and reads the current
-//! rule for the handle's store and identifier from a [`Rules`] source. It
-//! keeps no copy of a rule, so an edited rule decides the next request. A
-//! sign-in reference has the module as its rule: the module's current
-//! authorities and no injection form.
+//! The handle's kind is not in the payload. The sealed member carries it,
+//! as `{kind, jws}`.
 //!
-//! [`read`] gives the facts as a [`Handle`]. [`Handle::check`] is the
+//! The proxy reads a handle with [`read_opened`] at each request, from the
+//! member that [`crate::seal::open`] opened. It looks up the signing key in
+//! the [`ClientKeys`] registry. It compares `sub` and `node_id` with the box
+//! id and the Box Host of the opened value. It reads the current rule for
+//! the handle's store and identifier from a [`Rules`] source. It keeps no
+//! copy of a rule, so an edited rule decides the next request. A sign-in
+//! reference has the module as its rule: the module's current authorities
+//! and no injection form.
+//!
+//! [`read_opened`] gives the facts as a [`Handle`]. [`Handle::check`] is the
 //! BEP-064 decision. It is pure, and [`crate::redeem::decide`] makes it.
 
 use std::fmt;
@@ -41,17 +46,16 @@ use crate::seal::{MemberKind, Opened, ProxyPublicKey};
 pub const ALG: &str = "ES256";
 
 /// The JWS `typ` of every handle.
-pub const TYP: &str = "min-handle";
+pub const TYP: &str = "gatehouse-store-handle+jws";
 
-/// What a handle refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// What a handle refers to. The sealed member carries the kind, not the
+/// handle's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HandleKind {
     /// An item in a host store, under a `[secret-store-rules]` rule.
     Store,
     /// The host's GitHub sign-in item (BEP-005). The GitHub module is its
     /// rule.
-    #[serde(rename = "signin")]
     SignIn,
 }
 
@@ -77,8 +81,10 @@ pub enum Inject {
 /// The payload of a handle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
-    /// What the handle refers to.
-    pub kind: HandleKind,
+    /// The id of the box the handle was minted for.
+    pub sub: String,
+    /// The Box Host whose proxy redeems the handle.
+    pub node_id: String,
     /// The store. A sign-in reference carries the module identifier.
     pub store: String,
     /// The item's identifier in the store. A sign-in reference carries the
@@ -90,8 +96,12 @@ pub struct Claims {
     /// The injection form. A sign-in reference carries none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<Inject>,
+    /// The time of the mint, in seconds since the Unix epoch.
+    pub iat: u64,
     /// The expiry, in seconds since the Unix epoch.
     pub exp: u64,
+    /// The handle's unique id. The audit uses it to correlate records.
+    pub jti: String,
 }
 
 impl Claims {
@@ -308,6 +318,9 @@ pub struct Rule<H, I> {
 pub struct Handle<H, I> {
     /// Whether the signature verifies under a registered client key.
     pub verified: bool,
+    /// Whether the handle's `sub` and `node_id` equal the box id and the
+    /// Box Host of the opened value.
+    pub bound: bool,
     /// The handle's expiry, in seconds since the Unix epoch.
     pub exp: u64,
     /// The handle's upstream authorities.
@@ -325,6 +338,9 @@ pub struct Handle<H, I> {
 pub enum Invalid {
     /// The signature does not verify under a registered client key.
     Signature,
+    /// The handle's `sub` or `node_id` differs from the box id or the Box
+    /// Host of the opened value.
+    ContextMismatch,
     /// The clock is at or after the handle's expiry.
     Expired,
     /// No current rule names the handle's store and identifier.
@@ -339,6 +355,7 @@ impl fmt::Display for Invalid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Signature => "signature",
+            Self::ContextMismatch => "context_mismatch",
             Self::Expired => "expired",
             Self::NoRule => "no_rule",
             Self::OutsideRule => "outside_rule",
@@ -356,6 +373,9 @@ impl<H: PartialEq, I: PartialEq> Handle<H, I> {
     pub fn check(&self, now: u64) -> Result<(), Invalid> {
         if !self.verified {
             return Err(Invalid::Signature);
+        }
+        if !self.bound {
+            return Err(Invalid::ContextMismatch);
         }
         if now >= self.exp {
             return Err(Invalid::Expired);
@@ -395,41 +415,48 @@ fn parse_authorities(list: &[String]) -> Option<Vec<Authority<String>>> {
     list.iter().map(|a| parse_authority(a)).collect()
 }
 
-/// What [`read`] found for one handle.
+/// What [`read_opened`] found for one handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Read {
     /// The audit identifier, `<store>:<id>`, or `None` when the handle does
     /// not parse.
     pub identifier: Option<String>,
+    /// The handle's `jti`, the audit correlation id, or `None` when the
+    /// handle does not parse.
+    pub jti: Option<String>,
     /// The handle's facts.
     pub handle: Handle<String, Inject>,
 }
 
-/// Reads one handle for the request at clock reading `now`.
-///
-/// It verifies the signature under `keys`. It reads the current rule from
-/// `rules` for a store handle, or takes `module`'s authorities and no
-/// injection form for a sign-in reference. It logs one debug line with the
-/// store, the identifier and the outcome, and never the signature.
-pub fn read<R: Rules + ?Sized>(
-    jws: &str,
-    keys: &ClientKeys,
-    rules: &R,
-    module: &Module,
-    now: u64,
-) -> Read {
-    read_bound(jws, keys, rules, module, now, |_| true)
+/// Where a handle came from: the opened value and its member.
+struct Origin<'a> {
+    /// The member's kind.
+    kind: HandleKind,
+    /// The box id of the opened value.
+    box_id: &'a str,
+    /// The Box Host of the opened value.
+    host: &'a str,
+    /// The module the value was opened for.
+    module: &'a str,
 }
 
-/// [`read`], with `bound` deciding whether the claims belong where the
-/// handle came from. Claims that do not belong have no rule.
-fn read_bound<R: Rules + ?Sized>(
+/// Reads one handle from `origin` for the request at clock reading `now`.
+///
+/// It verifies the signature under `keys`, and compares `sub` and
+/// `node_id` with the origin. It reads the current rule from `rules` for a
+/// store handle, or takes `module`'s authorities and no injection form for
+/// a sign-in reference. It logs one debug line with the store, the
+/// identifier and the outcome, and never the signature.
+///
+/// Private: only [`read_opened`] calls it, so the origin is always the
+/// sealed member's own.
+fn read<R: Rules + ?Sized>(
     jws: &str,
+    origin: &Origin<'_>,
     keys: &ClientKeys,
     rules: &R,
     module: &Module,
     now: u64,
-    bound: impl Fn(&Claims) -> bool,
 ) -> Read {
     let (claims, verified) = match verify(jws, keys) {
         Ok(claims) => (Some(claims), Ok(())),
@@ -444,8 +471,10 @@ fn read_bound<R: Rules + ?Sized>(
         );
         return Read {
             identifier: None,
+            jti: None,
             handle: Handle {
                 verified: false,
+                bound: false,
                 exp: 0,
                 upstream: Vec::new(),
                 inject: None,
@@ -453,8 +482,9 @@ fn read_bound<R: Rules + ?Sized>(
             },
         };
     };
-    let rule = match claims.kind {
-        _ if !bound(&claims) => None,
+    let rule = match origin.kind {
+        // A value opened for another module has no rule here.
+        _ if origin.module != module.id => None,
         // A sign-in reference for another module has no rule here.
         HandleKind::SignIn if claims.store != module.id => None,
         HandleKind::SignIn => Some(Rule {
@@ -479,6 +509,7 @@ fn read_bound<R: Rules + ?Sized>(
     let upstream = parse_authorities(&claims.upstream);
     let handle = Handle {
         verified: verified.is_ok() && upstream.is_some(),
+        bound: claims.sub == origin.box_id && claims.node_id == origin.host,
         exp: claims.exp,
         upstream: upstream.unwrap_or_default(),
         inject: claims.inject.clone(),
@@ -499,19 +530,26 @@ fn read_bound<R: Rules + ?Sized>(
     );
     Read {
         identifier: Some(claims.identifier()),
+        jti: Some(claims.jti),
         handle,
     }
 }
 
-/// Reads the handle of the member that [`crate::seal::open`] opened.
+/// Reads the handle of the member that [`crate::seal::open`] opened, for
+/// the request at clock reading `now`.
 ///
 /// The shell builds [`crate::redeem::Redemption::handle`] with this, from
 /// the same [`Opened`] that gave [`crate::redeem::Unsealed::Opened`]. So the
 /// handle that [`crate::redeem::decide`] judges is the sealed member's own
-/// `jws`, and never a handle from somewhere else. A handle whose kind is
-/// not the member's kind, or a sign-in reference for a module other than
-/// the value's, has no rule, so it is refused as
-/// `store_handle_invalid`.
+/// `jws`, and never a handle from somewhere else. The member gives the
+/// kind. The opened value gives the box id and the Box Host that `sub` and
+/// `node_id` must equal. A value opened for a module other than `module`,
+/// or a sign-in reference for another module, has no rule, so it is
+/// refused as `store_handle_invalid`.
+///
+/// A member of [`crate::seal::MemberKind`] has no store kind yet, so this
+/// reads sign-in references only. The store path of the check is the same
+/// code, and a store member kind reaches it through the `match` below.
 pub fn read_opened<R: Rules + ?Sized>(
     opened: &Opened,
     keys: &ClientKeys,
@@ -522,13 +560,19 @@ pub fn read_opened<R: Rules + ?Sized>(
     let kind = match opened.member.kind {
         MemberKind::SignIn => HandleKind::SignIn,
     };
-    read_bound(
+    let origin = Origin {
+        kind,
+        box_id: &opened.context.box_id,
+        host: &opened.context.host,
+        module: &opened.context.module,
+    };
+    read(
         opened.member.jws.as_str(),
+        &origin,
         keys,
         rules,
         module,
         now,
-        |claims| claims.kind == kind && opened.context.module == module.id,
     )
 }
 
@@ -561,14 +605,31 @@ mod tests {
 
     fn store_claims() -> Claims {
         Claims {
-            kind: HandleKind::Store,
+            sub: "b1".into(),
+            node_id: "host".into(),
             store: "keychain".into(),
             id: "anthropic".into(),
             upstream: vec!["api.anthropic.com".into()],
             inject: Some(bearer()),
+            iat: 0,
             exp: 2_000,
+            jti: "jti-store".into(),
         }
     }
+
+    /// A store member of box `b1` on Box Host `host`, opened for GitHub.
+    const STORE: Origin<'static> = Origin {
+        kind: HandleKind::Store,
+        box_id: "b1",
+        host: "host",
+        module: "github",
+    };
+
+    /// A sign-in member of box `b1` on Box Host `host`, opened for GitHub.
+    const SIGN_IN: Origin<'static> = Origin {
+        kind: HandleKind::SignIn,
+        ..STORE
+    };
 
     fn store_rule() -> StoreRule {
         StoreRule {
@@ -623,12 +684,12 @@ mod tests {
         let keys = registered(&key);
         let rules = vec![store_rule()];
         let jws = sign(&key, &store_claims());
-        let read = read(&jws, &keys, &rules, &GITHUB, 1_000);
+        let read = read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000);
         assert_eq!(read.identifier.as_deref(), Some("keychain:anthropic"));
         assert_eq!(read.handle.check(1_000), Ok(()));
         assert_eq!(read.handle.check(2_000), Err(Invalid::Expired));
         let none: Vec<StoreRule> = Vec::new();
-        let read = super::read(&jws, &keys, &none, &GITHUB, 1_000);
+        let read = super::read(&jws, &STORE, &keys, &none, &GITHUB, 1_000);
         assert_eq!(read.handle.check(1_000), Err(Invalid::NoRule));
     }
 
@@ -696,12 +757,12 @@ mod tests {
         let current = std::cell::RefCell::new(vec![store_rule()]);
         let rules = |store: &str, id: &str| current.borrow().rule(store, id);
 
-        let first = read(&jws, &keys, &rules, &GITHUB, 1_000);
+        let first = read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000);
         assert!(admitted(decide(&redemption(api.clone(), first, true))));
 
         // The operator narrows the rule to another authority.
         current.borrow_mut()[0].upstream = vec!["other.example.com".into()];
-        let narrowed = read(&jws, &keys, &rules, &GITHUB, 1_000);
+        let narrowed = read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000);
         assert_eq!(narrowed.handle.check(1_000), Err(Invalid::OutsideRule));
         assert_eq!(
             decide(&redemption(api.clone(), narrowed, true)),
@@ -717,7 +778,7 @@ mod tests {
             },
             ..store_rule()
         };
-        let reformed = read(&jws, &keys, &rules, &GITHUB, 1_000);
+        let reformed = read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000);
         assert_eq!(reformed.handle.check(1_000), Err(Invalid::InjectMismatch));
         assert_eq!(
             decide(&redemption(api.clone(), reformed, true)),
@@ -726,18 +787,18 @@ mod tests {
 
         // The operator removes the rule.
         current.borrow_mut().clear();
-        let removed = read(&jws, &keys, &rules, &GITHUB, 1_000);
+        let removed = read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000);
         assert_eq!(removed.handle.check(1_000), Err(Invalid::NoRule));
 
         // The operator restores the rule: the same handle is admitted again.
         current.borrow_mut().push(store_rule());
-        let restored = read(&jws, &keys, &rules, &GITHUB, 1_000);
+        let restored = read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000);
         assert!(admitted(decide(&redemption(api.clone(), restored, true))));
 
         // A handle past its expiry, or under no registered key, is refused.
-        let late = read(&jws, &keys, &rules, &GITHUB, 2_000);
+        let late = read(&jws, &STORE, &keys, &rules, &GITHUB, 2_000);
         assert_eq!(late.handle.check(2_000), Err(Invalid::Expired));
-        let unknown = read(&jws, &ClientKeys::new(), &rules, &GITHUB, 1_000);
+        let unknown = read(&jws, &STORE, &ClientKeys::new(), &rules, &GITHUB, 1_000);
         assert_eq!(unknown.identifier.as_deref(), Some("keychain:anthropic"));
         assert_eq!(
             decide(&redemption(api, unknown, true)),
@@ -747,12 +808,15 @@ mod tests {
 
     fn sign_in_claims() -> Claims {
         Claims {
-            kind: HandleKind::SignIn,
+            sub: "b1".into(),
+            node_id: "host".into(),
             store: GITHUB.id.into(),
             id: "instance-1".into(),
             upstream: GITHUB.hosts.iter().map(ToString::to_string).collect(),
             inject: None,
+            iat: 0,
             exp: 2_000,
+            jti: "jti-signin".into(),
         }
     }
 
@@ -768,7 +832,7 @@ mod tests {
         let no_rules: Vec<StoreRule> = Vec::new();
 
         let reference = sign(&key, &sign_in_claims());
-        let read_ok = read(&reference, &keys, &no_rules, &GITHUB, 1_000);
+        let read_ok = read(&reference, &SIGN_IN, &keys, &no_rules, &GITHUB, 1_000);
         assert_eq!(read_ok.identifier.as_deref(), Some("github:instance-1"));
         assert_eq!(read_ok.handle.check(1_000), Ok(()));
         assert!(admitted(decide(&redemption(api.clone(), read_ok, false))));
@@ -790,7 +854,7 @@ mod tests {
                 ..sign_in_claims()
             },
         );
-        let read_wide = read(&wide, &keys, &rules, &GITHUB, 1_000);
+        let read_wide = read(&wide, &SIGN_IN, &keys, &rules, &GITHUB, 1_000);
         assert_eq!(read_wide.handle.check(1_000), Err(Invalid::OutsideRule));
         assert_eq!(
             decide(&redemption(api.clone(), read_wide, false)),
@@ -805,7 +869,7 @@ mod tests {
                 ..sign_in_claims()
             },
         );
-        let read_off = read(&off_port, &keys, &no_rules, &GITHUB, 1_000);
+        let read_off = read(&off_port, &SIGN_IN, &keys, &no_rules, &GITHUB, 1_000);
         assert_eq!(read_off.handle.check(1_000), Err(Invalid::OutsideRule));
 
         // A reference with an injection form disagrees with the module.
@@ -816,7 +880,7 @@ mod tests {
                 ..sign_in_claims()
             },
         );
-        let read_inject = read(&injecting, &keys, &no_rules, &GITHUB, 1_000);
+        let read_inject = read(&injecting, &SIGN_IN, &keys, &no_rules, &GITHUB, 1_000);
         assert_eq!(
             read_inject.handle.check(1_000),
             Err(Invalid::InjectMismatch)
@@ -835,7 +899,7 @@ mod tests {
                 ..sign_in_claims()
             },
         );
-        let read_other = read(&other, &keys, &no_rules, &GITHUB, 1_000);
+        let read_other = read(&other, &SIGN_IN, &keys, &no_rules, &GITHUB, 1_000);
         assert_eq!(read_other.handle.check(1_000), Err(Invalid::NoRule));
         assert_eq!(
             decide(&redemption(api, read_other, false)),
@@ -868,8 +932,10 @@ mod tests {
     }
 
     /// BEP-064: the handle the decision judges is the opened member's own
-    /// `jws`. A handle of another kind than the member, or a value opened
-    /// for another module, has no rule and is refused.
+    /// `jws`. The member gives the kind, and the opened value gives the box
+    /// id and the Box Host. A handle for another box or Box Host, a handle
+    /// that does not fit the member's kind, or a value opened for another
+    /// module is refused.
     #[test]
     fn handle_is_read_from_the_opened_member() {
         let key = client_key(3);
@@ -886,6 +952,7 @@ mod tests {
             1_000,
         );
         assert_eq!(own.identifier.as_deref(), Some("github:instance-1"));
+        assert_eq!(own.jti.as_deref(), Some("jti-signin"));
         assert!(admitted(decide(&redemption(api.clone(), own, false))));
 
         let other_module = read_opened(
@@ -897,7 +964,34 @@ mod tests {
         );
         assert_eq!(other_module.handle.check(1_000), Err(Invalid::NoRule));
 
-        // A store handle inside a sign-in member, with a rule that admits it.
+        // A handle minted for another box, or for another Box Host, does not
+        // belong to the value that carries it.
+        for claims in [
+            Claims {
+                sub: "b2".into(),
+                ..sign_in_claims()
+            },
+            Claims {
+                node_id: "other-host".into(),
+                ..sign_in_claims()
+            },
+        ] {
+            let moved = read_opened(
+                &opened(&sign(&key, &claims), GITHUB.id),
+                &keys,
+                &no_rules,
+                &GITHUB,
+                1_000,
+            );
+            assert_eq!(moved.handle.check(1_000), Err(Invalid::ContextMismatch));
+            assert_eq!(
+                decide(&redemption(api.clone(), moved, false)),
+                Decision::Refuse(Check::StoreHandleInvalid)
+            );
+        }
+
+        // A store handle inside a sign-in member, with a rule that admits it,
+        // is judged against the module as the member's kind says.
         let rules = vec![store_rule()];
         let store = sign(&key, &store_claims());
         let foreign = read_opened(&opened(&store, GITHUB.id), &keys, &rules, &GITHUB, 1_000);

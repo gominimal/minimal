@@ -31,11 +31,14 @@
 //!    [`Unsealed::Expired`], and this check refuses it too.
 //! 6. No revocation in force covers the value's box id (BEP-024, BEP-071).
 //! 7. The member's handle passes [`crate::handle::Handle::check`]: its
-//!    signature verifies under a registered client key, the clock is before
+//!    signature verifies under a registered client key, its `sub` and
+//!    `node_id` equal the value's box id and Box Host, the clock is before
 //!    its expiry, its `upstream` is within the current rule and its `inject`
 //!    equals the rule's (BEP-064). A sign-in reference's rule is the module.
 //!    The shell reads the handle from the opened member with
 //!    [`crate::handle::read_opened`], so the handle is sealed with the value.
+//!    The member gives the handle's kind. A sealed member has no store kind
+//!    yet, so today every handle is a sign-in reference.
 //!    For a store handle, the shell gives the handle's `upstream` as the
 //!    bound set and the rule's authorities as the current set, so checks 8
 //!    to 10 read them where they read a module's host sets (BEP-032).
@@ -511,6 +514,7 @@ mod tests {
     fn valid_handle() -> Handle<u8, u8> {
         Handle {
             verified: true,
+            bound: true,
             exp: u64::MAX,
             upstream: vec![API],
             inject: None,
@@ -645,7 +649,7 @@ mod tests {
     /// every injection form and every current rule, or none.
     fn any_handle() -> impl Strategy<Value = Handle<u8, u8>> {
         (
-            any::<bool>(),
+            (any::<bool>(), any::<bool>()),
             0u64..4_000,
             prop::collection::vec(any_authority(), 0..=4),
             prop::option::of(0u8..3),
@@ -654,8 +658,9 @@ mod tests {
                 prop::option::of(0u8..3),
             )),
         )
-            .prop_map(|(verified, exp, upstream, inject, rule)| Handle {
+            .prop_map(|((verified, bound), exp, upstream, inject, rule)| Handle {
                 verified,
+                bound,
                 exp,
                 upstream,
                 inject,
@@ -725,6 +730,7 @@ mod tests {
     /// BEP-064, written out apart from [`Handle::check`].
     fn handle_valid(h: &Handle<u8, u8>, now: u64) -> bool {
         h.verified
+            && h.bound
             && now < h.exp
             && h.rule.as_ref().is_some_and(|rule| {
                 h.upstream.iter().all(|a| rule.upstream.contains(a)) && h.inject == rule.inject
@@ -1092,6 +1098,7 @@ mod tests {
         /// BEP-064: for every handle, every registered key set's verdict,
         /// every clock reading and every current rule, a value that passes
         /// every other check is admitted only when the signature verifies,
+        /// `sub` and `node_id` match the value,
         /// the clock is before `exp`, `upstream` is a subset of the rule's
         /// authorities and `inject` equals the rule's form. Otherwise the
         /// refusal is `store_handle_invalid`.
@@ -1111,6 +1118,7 @@ mod tests {
                 ..own(1)
             };
             let valid = handle.verified
+                && handle.bound
                 && now < handle.exp
                 && handle.rule.as_ref().is_some_and(|rule| {
                     handle.upstream.iter().all(|a| rule.upstream.contains(a))
@@ -1449,6 +1457,7 @@ mod kani_proofs {
         let inject = |pick: u8| if pick % 2 == 0 { None } else { Some(pick) };
         Handle {
             verified: kani::any(),
+            bound: kani::any(),
             exp: kani::any(),
             upstream: any_set(),
             inject: inject(kani::any::<u8>() % 4),
@@ -1657,6 +1666,7 @@ mod kani_proofs {
     /// BEP-064, written out apart from [`Handle::check`].
     fn handle_valid(h: &Handle<u8, u8>, now: u64) -> bool {
         h.verified
+            && h.bound
             && now < h.exp
             && h.rule.as_ref().is_some_and(|rule| {
                 h.upstream.iter().all(|a| rule.upstream.contains(a)) && h.inject == rule.inject
