@@ -36,6 +36,28 @@ pub struct UpdateReport {
     pub upstream: Option<RevChange>,
     /// Any sideload pins that moved.
     pub sideloads: Vec<RevChange>,
+    /// Pins whose branch moved but were not written, because `minimal.toml`
+    /// changed under the update and no link still names the pin's repo,
+    /// branch and old commit.
+    pub skipped: Vec<RevChange>,
+}
+
+impl UpdateReport {
+    /// Whether any pin was written to `minimal.toml`.
+    pub fn repinned(&self) -> bool {
+        self.upstream.is_some() || !self.sideloads.is_empty()
+    }
+}
+
+impl RevChange {
+    /// The line telling the user this pin was skipped and to run `command`
+    /// (such as `min update`) again.
+    pub fn skipped_message(&self, command: &str) -> String {
+        format!(
+            "minimal.toml changed during the update, so {}:{} was not re-pinned. Run {command} again",
+            self.repo, self.branch,
+        )
+    }
 }
 
 impl ProjectOp for UpdateProject {
@@ -132,10 +154,7 @@ impl ProjectOp for UpdateProject {
                 content.ok_or_else(|| anyhow!("reading {} for update: not found", p.display()))?;
             let mut doc = toml.parse::<DocumentMut>().map_err(anyhow::Error::from)?;
             report = apply_pins(&mut doc, upstream_pin, sideload_pins);
-            Ok(
-                (report.upstream.is_some() || !report.sideloads.is_empty())
-                    .then(|| doc.to_string()),
-            )
+            Ok(report.repinned().then(|| doc.to_string()))
         })?;
 
         Ok(report)
@@ -144,7 +163,8 @@ impl ProjectOp for UpdateProject {
 
 /// Writes each pin into `doc` on the link that still matches it: the same
 /// `repo`, `branch` and old `locked_commit`. A pin whose link changed or
-/// went away since the snapshot is dropped. Returns the pins that landed.
+/// went away since the snapshot is not written. Returns the pins that landed,
+/// and those that did not in [`UpdateReport::skipped`].
 fn apply_pins(
     doc: &mut DocumentMut,
     upstream: Option<RevChange>,
@@ -159,12 +179,16 @@ fn apply_pins(
         .and_then(|k| doc.get_mut(k))
         .and_then(Item::as_table_like_mut)
     else {
+        report.skipped.extend(upstream);
+        report.skipped.extend(sideloads);
         return report;
     };
-    if let Some(pin) = upstream
-        && repin(up, &pin)
-    {
-        report.upstream = Some(pin);
+    if let Some(pin) = upstream {
+        if repin(up, &pin) {
+            report.upstream = Some(pin);
+        } else {
+            report.skipped.push(pin);
+        }
     }
     let mut links: Vec<&mut dyn TableLike> = Vec::new();
     for (key, item) in up.iter_mut() {
@@ -190,6 +214,8 @@ fn apply_pins(
         }
         if landed {
             report.sideloads.push(pin);
+        } else {
+            report.skipped.push(pin);
         }
     }
     report
@@ -262,6 +288,7 @@ branch = "main"
         assert_eq!(commits, [Some("c0"), Some("a1"), Some("b1")]);
         assert!(report.upstream.is_some());
         assert_eq!(report.sideloads.len(), 2);
+        assert!(report.skipped.is_empty());
     }
 
     #[test]
@@ -284,6 +311,9 @@ sideload = [{ repo = "a", branch = "main", locked_commit = "a0" }]
         assert_eq!(doc.to_string(), before);
         assert!(report.upstream.is_none());
         assert!(report.sideloads.is_empty());
+        assert!(!report.repinned());
+        let skipped: Vec<_> = report.skipped.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(skipped, ["up", "gone"]);
 
         let report = apply_pins(&mut doc, None, vec![pin("a", Some("a0"), "a1")]);
         assert_eq!(report.sideloads.len(), 1);
@@ -347,8 +377,23 @@ locked_commit = "a0"
     #[test]
     fn apply_pins_without_an_upstream_table_changes_nothing() {
         let mut doc = "[tasks]\n".parse::<DocumentMut>().unwrap();
-        let report = apply_pins(&mut doc, Some(pin("up", None, "u1")), Vec::new());
+        let report = apply_pins(
+            &mut doc,
+            Some(pin("up", None, "u1")),
+            vec![pin("a", None, "a1")],
+        );
         assert!(report.upstream.is_none());
+        let skipped: Vec<_> = report.skipped.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(skipped, ["up", "a"]);
         assert_eq!(doc.to_string(), "[tasks]\n");
+    }
+
+    #[test]
+    fn skipped_message_names_the_pin_and_the_command() {
+        assert_eq!(
+            pin("gominimal/packages", None, "x").skipped_message("mip update"),
+            "minimal.toml changed during the update, so gominimal/packages:main was not \
+             re-pinned. Run mip update again"
+        );
     }
 }

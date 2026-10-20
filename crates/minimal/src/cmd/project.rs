@@ -401,8 +401,11 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
             c.to,
         );
     }
+    for c in &report.skipped {
+        println!("{}", c.skipped_message("min update"));
+    }
 
-    if report.upstream.is_some() || !report.sideloads.is_empty() {
+    if report.repinned() {
         println!(
             "\nRe-pinned minimal.toml (a diff to commit). The next \
              'min session activate' materializes the new closure, which can \
@@ -410,7 +413,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
              This did not update the 'min' binary; reinstall it with the \
              installer to do that."
         );
-    } else {
+    } else if report.skipped.is_empty() {
         println!("Already up to date; no pins moved and minimal.toml is unchanged.");
     }
 

@@ -31,11 +31,28 @@ const MFILE_LOCK_TIMEOUT_ENV: &str = "MINIMAL_MFILE_LOCK_TIMEOUT_SECS";
 /// whole seconds in [`MFILE_LOCK_TIMEOUT_ENV`]. An edit holds the lock only
 /// for a read and a write, so a longer wait means a stuck holder.
 fn mfile_lock_timeout() -> Duration {
-    env::var(MFILE_LOCK_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(60))
+    lock_timeout_from(env::var(MFILE_LOCK_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Parses a [`MFILE_LOCK_TIMEOUT_ENV`] value. A value that is not a whole
+/// number of seconds above zero ("1.5", "60s", "0") warns and waits the
+/// default 60 s, since 0 would fail every contended edit at once.
+fn lock_timeout_from(value: Option<&str>) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(60);
+    let Some(value) = value else {
+        return DEFAULT;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => {
+            tracing::warn!(
+                "{MFILE_LOCK_TIMEOUT_ENV}={value:?} is not a whole number of seconds above 0; \
+                 waiting {}s for the minimal.toml lock",
+                DEFAULT.as_secs()
+            );
+            DEFAULT
+        }
+    }
 }
 
 /// A value from serde that can either be a string, or an array of strings.
@@ -1312,7 +1329,7 @@ impl File {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         match std::fs::File::open(parent) {
-            Ok(dir) => match Self::wait_for_lock(&dir, path, timeout) {
+            Ok(dir) => match Self::wait_for_directory_lock(&dir, path, timeout) {
                 Ok(()) => return Ok(Some(dir)),
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     return Err(Error::IO("locking", path.to_path_buf(), e));
@@ -1389,6 +1406,21 @@ impl File {
         }
     }
 
+    /// [`File::wait_for_lock`] on the directory that holds `path`. Tests can
+    /// make it fail with `EBADF`, as NFS does, through
+    /// `tests::REFUSE_DIRECTORY_FLOCK`, to reach the state-directory lock.
+    fn wait_for_directory_lock(
+        dir: &std::fs::File,
+        path: &Path,
+        timeout: Duration,
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if tests::REFUSE_DIRECTORY_FLOCK.get() {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Self::wait_for_lock(dir, path, timeout)
+    }
+
     /// Takes `file`'s exclusive `flock`, polling with backoff. It says once
     /// on stderr that it waits for `path`, and gives up with
     /// [`std::io::ErrorKind::TimedOut`] after `timeout`.
@@ -1414,8 +1446,9 @@ impl File {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "another command kept this file locked for {}s. Stop that command and \
-                         run this one again, or set {MFILE_LOCK_TIMEOUT_ENV} to wait longer",
+                        "another command kept this file locked for {}s. It may be run by \
+                         another user. Stop that command and run this one again, or set \
+                         {MFILE_LOCK_TIMEOUT_ENV} to wait longer",
                         timeout.as_secs()
                     ),
                 ));
@@ -3091,6 +3124,21 @@ mod tests {
     /// own temp path, so tests do not contend.
     static TEST_LOCK_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempdir().unwrap());
 
+    thread_local! {
+        /// Makes this thread's directory `flock` fail with `EBADF`, as NFS
+        /// answers, so a test reaches the state-directory lock.
+        pub(super) static REFUSE_DIRECTORY_FLOCK: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Runs `f` with this thread's directory `flock` refused.
+    fn with_directory_flock_refused<T>(f: impl FnOnce() -> T) -> T {
+        REFUSE_DIRECTORY_FLOCK.set(true);
+        let out = f();
+        REFUSE_DIRECTORY_FLOCK.set(false);
+        out
+    }
+
     const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn edit_in_test(
@@ -3465,6 +3513,78 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(10));
         assert!(matches!(err, Error::IO("locking", ..)), "error: {err:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 1\n");
+    }
+
+    #[test]
+    fn edit_exclusively_falls_back_to_the_state_dir_lock_when_the_directory_flock_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = 1\n").unwrap();
+        let state = tempdir().unwrap();
+        let lock_dir = state.path().join("mfile-locks");
+
+        // The fallback lock is taken: the edit lands and leaves its lock
+        // file, named by the path's hash, in the state directory.
+        with_directory_flock_refused(|| {
+            File::edit_exclusively_in::<Error>(Some(&lock_dir), TEST_TIMEOUT, &path, |c| {
+                assert_eq!(c, Some("k = 1\n"));
+                Ok(Some("k = 2\n".to_string()))
+            })
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 2\n");
+        let locks: Vec<_> = std::fs::read_dir(&lock_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(locks.len(), 1, "lock files: {locks:?}");
+        assert_eq!(locks[0].extension(), Some(OsStr::new("lock")));
+
+        // And it excludes: while another holder has that lock file, the
+        // edit waits for it and times out without writing.
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&locks[0])
+            .unwrap();
+        held.lock().unwrap();
+        let err = with_directory_flock_refused(|| {
+            File::edit_exclusively_in::<Error>(
+                Some(&lock_dir),
+                Duration::from_millis(200),
+                &path,
+                |_| Ok(Some("k = 3\n".to_string())),
+            )
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::IO("locking", ..)), "error: {err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = 2\n");
+    }
+
+    #[test]
+    fn lock_timeout_takes_whole_seconds_and_warns_on_anything_else() {
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        assert_eq!(lock_timeout_from(None), Duration::from_secs(60));
+        assert_eq!(lock_timeout_from(Some("5")), Duration::from_secs(5));
+        assert!(capture.contents().is_empty(), "{}", capture.contents());
+        for bad in ["1.5", "60s", "0", ""] {
+            assert_eq!(lock_timeout_from(Some(bad)), Duration::from_secs(60));
+            assert!(
+                capture
+                    .contents()
+                    .contains(&format!("{MFILE_LOCK_TIMEOUT_ENV}={bad:?}")),
+                "no warning for {bad:?}: {}",
+                capture.contents()
+            );
+        }
+        assert!(capture.contents().contains("waiting 60s"));
+
+        drop(guard);
     }
 
     #[test]
