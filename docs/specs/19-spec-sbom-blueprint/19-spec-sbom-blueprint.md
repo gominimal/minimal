@@ -244,8 +244,8 @@ developer running agent boxes; build-infra operator; auditor.
 - **SBOM-008** THE SYSTEM SHALL record environment-variable assets by name
   and provenance only, SHALL record every other credential-bearing posture
   field by reference — `[secrets]` as name and `source` kind, never the
-  value; `[[github_imports]]`, egress destinations and the `[otel]`
-  endpoint as a location reduced to scheme, host and port (an allowlist of
+  value; `[[github_imports]]` and the `[otel]` endpoint as a location
+  reduced to scheme, host and port (an allowlist of
   parts: no userinfo, no path, no query, no fragment, no header, whatever a
   parameter is called; a path segment can carry a token, `/hooks/<token>`,
   so the path goes too; a `[[github_imports]]` location keeps its
@@ -254,7 +254,10 @@ developer running agent boxes; build-infra operator; auditor.
   relative to the project root (architecture: file imports and exports),
   and is recorded by that relative path alone, never the project root and
   never an absolute host path (either can carry a user name or a home
-  directory) — SHALL copy from a per-package
+  directory); `[network.egress]` fields are not locations and are recorded
+  verbatim (`allow_subnets` and `deny_subnets` as CIDRs, `allow_dns_hosts`
+  as host names, `allow_protocols` as protocol names: none can carry a
+  credential) — SHALL copy from a per-package
   document (SBOM-009) only an allowlist of fields: a build-closure
   component's name, version, `purl` and digests, and a build-environment
   tool's name and version, with every location among them reduced the same
@@ -269,8 +272,9 @@ developer running agent boxes; build-infra operator; auditor.
     provenance fields, every secret carries only name and source kind, every
     location field (the posture's and the imported documents' alike) is of
     the form scheme://host[:port], or scheme://host/owner/repo for a GitHub
-    import, every file import or export carries only its project-root-
-    relative path and no absolute path, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
+    import, every egress field is a CIDR, a host name or a protocol name,
+    every file import or export carries only its project-root-relative
+    path and no absolute path, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
     tool version} for every document d, for all credentials v in
     credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where every v is at
     least 16 characters drawn so that no v is a substring of any declared
@@ -497,13 +501,23 @@ developer running agent boxes; build-infra operator; auditor.
   sealed closure (the object the box's materialization fetched and kept at
   activation) and the box's stored expanded spec (its loadout entries and
   the launcher's additions, BOX-068) alone, so the list fetches no
-  per-package document and needs no network. A box whose stored closure is
+  per-package document and needs no network; the version it filters on
+  is the one in the box's stored resolution record, below. A box whose stored closure is
   missing or unreadable on the host, or whose upstream package has no
   closure entry (the case its SBOM exits 6 on, SBOM-004), is listed with
   that reason in place of its match, never failing the list for the other
   boxes.
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_using_answers_from_the_sbom_components
+  - THE SYSTEM SHALL keep on the host, beside the stored closure, a
+    resolution record of every package the box was materialized with — its
+    name, version and Build Spec Hash as the graph resolved them at
+    activation — and both the list's `@<ver>` filter and the SBOM's
+    component name and version (SBOM-009's graph facts) SHALL read from
+    that record, so the two agree offline and a version is never fetched
+    to answer a list.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_list_using_version_answers_from_the_stored_resolution_record
 
 ## Non-goals
 
