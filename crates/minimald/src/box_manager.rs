@@ -2479,14 +2479,19 @@ pub(crate) mod tests {
 
     /// Waits for the resume's detached teardown of `id` to remove its
     /// record. The resume returns before the teardown ends, by design.
+    ///
+    /// A read that lands while the teardown deletes the record can find
+    /// the index entry and then miss the record, and answers `NotFound`
+    /// rather than `None`. Both mean the record is gone.
     async fn wait_for_record_gone(mngr: &BoxManagerHandle, id: SessionId) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while mngr
-            .get_record(BoxKeyPredicate::Id(id))
-            .await
-            .unwrap()
-            .is_some()
-        {
+        loop {
+            match mngr.get_record(BoxKeyPredicate::Id(id)).await {
+                Ok(None) => break,
+                Err(error) if error.kind() == NotFound => break,
+                Ok(Some(_)) => {}
+                Err(error) => panic!("reading the run-owned box's record failed: {error}"),
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the run-owned box's record should be gone after the resume"
