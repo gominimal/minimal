@@ -7082,12 +7082,35 @@ mod tests {
             .await;
         assert_eq!(resp, ShutdownResponse::ShuttingDown);
 
-        // ...and, being in shutdown, refuses to hand out sessions afterwards.
-        assert!(
-            mngr.get_session(BoxKeyPredicate::Id(session_id))
-                .await
-                .is_err(),
-            "a forced shutdown should leave the manager rejecting session work",
+        // ...and, being in shutdown, refuses to hand out sessions afterwards,
+        // with the refusal text the client matches on.
+        let refused = mngr
+            .get_session(BoxKeyPredicate::Id(session_id))
+            .await
+            .expect_err("a forced shutdown should leave the manager rejecting session work");
+        assert_eq!(refused.to_string(), minimald_rpc::SHUTDOWN_REFUSAL);
+
+        // The same refusal reaches a client's `CreateSession` as the stderr
+        // text the client-side match keys on, exactly.
+        let mut channel = client.open_subsystem(CreateSession::NAME, &[]).await;
+        let body = serde_json_lenient::to_vec(&crate::test_harness::create_session_req(
+            "after-shutdown",
+            "/tmp",
+        ))
+        .expect("request serializes");
+        channel.data_bytes(body).await.unwrap();
+        channel.eof().await.unwrap();
+        let mut err_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                err_buf.extend_from_slice(&data);
+            }
+        }
+        let stderr = String::from_utf8_lossy(&err_buf);
+        assert_eq!(
+            stderr,
+            format!("Internal error: {}", minimald_rpc::SHUTDOWN_REFUSAL),
+            "a create refused in shutdown should carry exactly the refusal",
         );
     }
 
