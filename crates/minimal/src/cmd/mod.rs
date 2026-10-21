@@ -915,6 +915,18 @@ pub(crate) async fn upload_and_finalize(
             // A declared host port another process holds fails every
             // spawn until it is free. The activation still succeeds, so this
             // line is the first place the person reads about it.
+            //
+            // Review asked (PR #2352, r4338460080) to remove this loop,
+            // `host_port_in_use_warning`, and the
+            // `host_ports_in_use`/`report_host_ports_in_use` wire fields —
+            // contingent on making finalize fail on a held port, which was
+            // declined at the daemon's probe (setup.rs,
+            // r4338460073): the probe is a predictive warning, and the
+            // bind it predicts already fails the first spawn with the
+            // named-port error. With finalize still warning, this loop is
+            // the only surface that reports the held port before the
+            // user's first command fails, on native hosts where the
+            // daemon's namespace is the one that matters. It stays.
             for port in &ok.host_ports_in_use {
                 eprintln!("{}", host_port_in_use_warning(*port));
             }

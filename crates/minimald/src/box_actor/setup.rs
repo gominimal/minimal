@@ -594,6 +594,26 @@ impl BoxActor {
                 // their host already bound the forwards, so a probe finds the
                 // box's own forwards, and a taken port already failed this
                 // finalize.
+                //
+                // Review asked (PR #2352, r4338460073) to move this probe
+                // above the `Active` write and fail finalize on a held port,
+                // citing design §7.1 line 249's bind-before-publish rule.
+                // Declined, and deliberately: line 249 governs the
+                // forwarder's own bind, which happens at this box's first
+                // attach (`finish_own_ip_attach` → `apply_ingress`), where a
+                // taken port already fails the apply, rolls back and
+                // withdraws the name — the all-or-nothing rule this PR's
+                // review settled on. Without activate hooks nothing binds at
+                // finalize at all, so a held port here is a *prediction* that
+                // the first spawn will fail, not a bind failure: failing
+                // activation on it would (a) enforce a TOCTOU window — the
+                // probe passing does not make the later bind succeed, and a
+                // port taken five minutes after activate still meets the
+                // spawn error — (b) diverge native hosts from VM-backed ones,
+                // where no probe exists and the spawn error is the only
+                // report, and (c) revert the warn-at-activation behaviour the
+                // PR's reviewed title and body describe. The probe stays a
+                // warning; the bind itself keeps its error.
                 #[cfg(target_os = "linux")]
                 let host_ports_in_use = match (
                     &record.network,
