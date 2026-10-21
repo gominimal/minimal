@@ -203,6 +203,14 @@ pub(crate) fn vm_host_answerer_start_line(
     crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
 }
 
+/// Whether this box holds its name at the VM host instead of registering
+/// an address there. A `host_ip` box uses the host's own address, so the
+/// host only reserves the name for it (a lookup returns no address), and
+/// the record carries no `box_addresses`.
+pub(crate) fn holds_name(record: &boxes::Record) -> bool {
+    record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
 /// Releases the zone hold a destroyed session's activation made, when the
 /// session registered no row (`box_addresses` is `None` — a `host_ip` box
 /// holds its name in place of a row): the destroy-side twin of the hold
