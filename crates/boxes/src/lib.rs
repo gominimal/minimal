@@ -1268,6 +1268,10 @@ pub struct Record {
     /// the resume (`resume_active_sessions`, which runs on Linux only, so
     /// on other hosts the mark is written and never read). Defaults to
     /// `false` for every record that predates the field.
+    ///
+    /// The destroy on restart is an interim. The architecture keeps a
+    /// `running` record on restart and sets it to `stopped` (spec 29
+    /// BOX-154). gominimal/inbox#731 owns the move to that rule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ends_with_run: bool,
 

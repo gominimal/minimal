@@ -1156,8 +1156,11 @@ impl BoxManager {
             // surviving run client's `DeleteSession`, reaches this actor
             // rather than bringing up a second one.
             //
-            // TODO(spec 29, BOX-154): when BOX lands, a restart marks the
-            // box stopped and keeps it rather than destroying it.
+            // TODO(gominimal/inbox#731, spec 29 BOX-154): this reap of a
+            // `running` record is an interim. The architecture keeps such a
+            // record on restart and sets it to `stopped` (BOX-154, and
+            // BOX-012 reaps only `pending` and `materializing`). When BOX
+            // lands, a restart marks a run's box stopped and keeps it.
             if record.ends_with_run {
                 tracing::info!(
                     session_id = %session_id,
