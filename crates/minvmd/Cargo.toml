@@ -53,6 +53,9 @@ minimald-rpc.workspace = true
 # The JSON file-log layer both daemons write through, so the on-disk log format
 # has one definition (Unit 4).
 mlog.workspace = true
+# The mirror daemon's client contract: the `[mirror]` table, its directories
+# and on-demand start, for the door the supervisor opens its guest (MIR-023).
+mirror-client.workspace = true
 # Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by
 # `net`, with the Box Egress Proxy's host-side stack peer (`switch::bep_host`,
 # NET-132) that `net` starts beside the switch.

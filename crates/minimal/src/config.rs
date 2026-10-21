@@ -80,6 +80,22 @@ pub fn acknowledged_in(paths: &[PathBuf]) -> Result<bool, anyhow::Error> {
     Ok(false)
 }
 
+/// A `--config-dir` for a test whose command reads a project: its client
+/// configuration disables the mirror, which the command would otherwise
+/// start (MIR-020), and no mirror daemon is built for the tests.
+#[cfg(test)]
+pub(crate) fn mirror_disabled_config_dir(base: &std::path::Path) -> PathBuf {
+    let config_dir = base.join("config");
+    let minimal_dir = config_dir.join("minimal");
+    std::fs::create_dir_all(&minimal_dir).expect("the test config dir");
+    std::fs::write(
+        minimal_dir.join("config.toml"),
+        "[mirror]\nenabled = false\n",
+    )
+    .expect("the test config.toml");
+    config_dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

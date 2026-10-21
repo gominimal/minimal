@@ -155,6 +155,14 @@ impl Repos {
                 let meta = entry.meta.lock().expect("lock");
                 (meta.refreshed_at, meta.last_failure.clone())
             };
+            // A copy made by an earlier run of the daemon: its bundle's
+            // write time is when it was last refreshed.
+            let refreshed_at = refreshed_at.or_else(|| {
+                std::fs::metadata(self.store.bundle_path(&slug))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(crate::origin::epoch_secs)
+            });
             let heads = heads(&self.store.repo_git(&slug)).await;
             rows.push(RepoStatus {
                 slug: slug.as_str().to_string(),
@@ -269,7 +277,20 @@ async fn refs_digest(repo: &std::path::Path) -> Result<String, String> {
     Ok(hex::encode(sha2::Sha256::digest(listing.as_bytes())))
 }
 
+/// How many branch heads a status row names.
+const HEADS_SHOWN: usize = 4;
+
+/// The copy's branch heads, the default branch first, at most
+/// [`HEADS_SHOWN`] of them.
 async fn heads(repo: &std::path::Path) -> Vec<Head> {
+    let mut symref = git();
+    symref
+        .arg("-C")
+        .arg(repo)
+        .arg("symbolic-ref")
+        .arg("--short")
+        .arg("HEAD");
+    let default = run(symref).await.ok().map(|s| s.trim().to_string());
     let mut cmd = git();
     cmd.arg("-C")
         .arg(repo)
@@ -279,7 +300,7 @@ async fn heads(repo: &std::path::Path) -> Vec<Head> {
     let Ok(listing) = run(cmd).await else {
         return Vec::new();
     };
-    listing
+    let mut heads: Vec<Head> = listing
         .lines()
         .filter_map(|line| {
             let (commit, name) = line.split_once(' ')?;
@@ -288,6 +309,8 @@ async fn heads(repo: &std::path::Path) -> Vec<Head> {
                 commit: commit.to_string(),
             })
         })
-        .take(8)
-        .collect()
+        .collect();
+    heads.sort_by_key(|h| (Some(&h.name) != default.as_ref(), h.name.clone()));
+    heads.truncate(HEADS_SHOWN);
+    heads
 }

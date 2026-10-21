@@ -70,6 +70,15 @@ pub(crate) const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = "MINVMD_EGRESS_DENY_ALL_OPT
 /// two in step.
 const EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL_OPT_OUT";
 
+/// The boot token the mirror door rides to the guest on (MIR-023), after the
+/// tokens above and before the host's `RUST_LOG`: the vsock port the guest
+/// daemon reads the laptop's mirror through. Written only when the
+/// supervisor handed the door ([`crate::mirror_door::MIRROR_DOOR_SOCK_ENV`]),
+/// and never dropped: it is part of the base line, not of the filter or the
+/// telemetry tokens the budget can drop. The one definition minimald reads
+/// with.
+const MIRROR_DOOR_TOKEN: &str = mirror_client::DOOR_TOKEN;
+
 /// Kernel command line every microVM boots with: the console the guest's
 /// stdout/stderr reaches the host boot log through, and IPv6 disabled (the v1
 /// network posture is IPv4-only — design §4.2 keeps IPv6 ULA dual-stack as a
@@ -330,6 +339,9 @@ impl VmConfig {
         let node_proxy_port = node_proxy_port_from_env()?;
         let publish_generation = publish_generation_from_env()?;
         let egress_deny_all_opt_out = egress_deny_all_opt_out_from_env();
+        // The mirror door's port crosses when the supervisor bound the door
+        // this child registers the port for (MIR-023).
+        let mirror_door = mirror_door_from_env();
         // The host's telemetry decision crosses the same way, under the
         // guest's own `MINIMAL_` names and never with an endpoint, headers
         // or credentials (`telemetry::guest_env`, TEL-033); nothing is
@@ -354,6 +366,7 @@ impl VmConfig {
                 node_proxy_port,
                 publish_generation,
                 egress_deny_all_opt_out,
+                mirror_door,
             ),
             &guest_env,
         );
@@ -682,20 +695,22 @@ fn append_tokens(base: &str, tokens: &[String]) -> Result<String, usize> {
 /// The values are injected rather than read from the process environment here,
 /// so this stays pure and unit-testable; the caller passes
 /// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()`,
-/// `publish_generation_from_env()` and `egress_deny_all_opt_out_from_env()` —
-/// the boot's publish generation (T93), which the guest daemon echoes in its
-/// publish reports, rides beside the port and, like it, is never skipped; the
-/// egress opt-out (NET-077) rides the same way, and is only written when the
-/// operator set it. A `RUST_LOG` value that cannot survive the boot line is
-/// skipped (leaving the base line plus the port, generation and opt-out
-/// tokens byte-identical) with a warning, rather than corrupting the boot: a
-/// value outside the boot alphabet is not one token to the kernel or not a
-/// line libkrun accepts ([`boot_token`]), an empty value carries nothing, and
-/// an over-long one would push the line past [`BOOT_LINE_BUDGET`]. The port,
-/// the generation and the opt-out are never skipped — the guest binds the
-/// port as handed — so their tokens count against the budget when the
-/// filter's length is judged. Commas are untouched — `info,russh=debug` is
-/// the normal form.
+/// `publish_generation_from_env()`, `egress_deny_all_opt_out_from_env()` and
+/// `mirror_door_from_env()` — the boot's publish generation (T93), which the
+/// guest daemon echoes in its publish reports, rides beside the port and,
+/// like it, is never skipped; the egress opt-out (NET-077) rides the same
+/// way, and is only written when the operator set it; the mirror door
+/// (MIR-023) rides after them, only when the supervisor handed it, and is
+/// never dropped either. A `RUST_LOG` value that cannot survive the boot
+/// line is skipped (leaving the base line plus the port, generation, opt-out
+/// and door tokens byte-identical) with a warning, rather than corrupting
+/// the boot: a value outside the boot alphabet is not one token to the
+/// kernel or not a line libkrun accepts ([`boot_token`]), an empty value
+/// carries nothing, and an over-long one would push the line past
+/// [`BOOT_LINE_BUDGET`]. The port, the generation, the opt-out and the door
+/// are never skipped — the guest binds the port as handed — so their tokens
+/// count against the budget when the filter's length is judged. Commas are
+/// untouched — `info,russh=debug` is the normal form.
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
 // runtime-bailing stub, but the tests below still cover this on every target.
 #[cfg_attr(
@@ -710,10 +725,12 @@ fn kernel_cmdline(
     proxy_port: Option<u16>,
     publish_generation: Option<u64>,
     egress_deny_all_opt_out: bool,
+    mirror_door: Option<u32>,
 ) -> Cow<'static, str> {
     // The port rides the boot line first: base, then the port token, then the
     // publish generation beside it, then the egress opt-out when the operator
-    // set it, then the filter when one is forwarded.
+    // set it, then the mirror door when the supervisor handed it, then the
+    // filter when one is forwarded.
     let base_with_port = match (proxy_port, publish_generation) {
         (Some(proxy), Some(generation)) => Cow::Owned(format!(
             "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy} \
@@ -734,6 +751,11 @@ fn kernel_cmdline(
         ))
     } else {
         base_with_port
+    };
+
+    let base_with_port = match mirror_door {
+        Some(port) => Cow::Owned(format!("{base_with_port} {MIRROR_DOOR_TOKEN}={port}")),
+        None => base_with_port,
     };
 
     let Some(value) = rust_log else {
@@ -856,6 +878,31 @@ pub(crate) fn egress_deny_all_opt_out_from_env() -> bool {
     )
 }
 
+/// The mirror door the supervisor handed the VMM child, read off
+/// [`crate::mirror_door::MIRROR_DOOR_SOCK_ENV`] (MIR-023): the door's port
+/// when the supervisor bound the door, which is what the env names, else
+/// none, and the guest then fetches from the origins directly.
+// Only `apply` calls this; see `kernel_cmdline` for the cfg note.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn mirror_door_from_env() -> Option<u32> {
+    mirror_door_from_raw(std::env::var_os(crate::mirror_door::MIRROR_DOOR_SOCK_ENV).as_deref())
+}
+
+/// Decodes a handed mirror door from the raw env value: a non-empty socket
+/// path names the door, and its port is the one the guest dials.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests cover it on every target"
+    )
+)]
+fn mirror_door_from_raw(socket: Option<&std::ffi::OsStr>) -> Option<u32> {
+    socket
+        .filter(|path| !path.is_empty())
+        .map(|_| mirror_client::DOOR_PORT)
+}
+
 /// Append `tokens` (`KEY=VALUE` boot tokens from [`crate::telemetry::guest_env`],
 /// each built by [`boot_token`]) to `base`, all of them or none: if they
 /// would push the line past [`BOOT_LINE_BUDGET`], the guest boots with
@@ -957,8 +1004,9 @@ fn resolve_disk_flags() -> (bool, crate::krun::SyncMode) {
 }
 
 /// The widest line [`kernel_cmdline`] can make before the filter: every
-/// token it adds to the base line present, the port and the publish
-/// generation at their most digits and the egress opt-out set. The proofs
+/// token it adds to the base line present, the port, the publish
+/// generation and the mirror door at their most digits and the egress
+/// opt-out set. The proofs
 /// take it as the bound on the base line, and
 /// `widest_base_len_covers_every_base_token` checks it against
 /// `kernel_cmdline` itself, so a token added there has to be added here.
@@ -970,6 +1018,7 @@ fn widest_base_len() -> usize {
             HOSTNAME_PROXY_PORT_TOKEN.len() + 1 + "65535".len(),
             PUBLISH_GENERATION_TOKEN.len() + 1 + "18446744073709551615".len(),
             EGRESS_DENY_ALL_OPT_OUT_TOKEN.len() + "=1".len(),
+            MIRROR_DOOR_TOKEN.len() + 1 + "4294967295".len(),
         ],
     )
 }
@@ -1203,7 +1252,7 @@ mod tests {
         // The base line exactly: console plus IPv6 disabled, no empty token,
         // no trailing space.
         assert_eq!(
-            kernel_cmdline(None, None, None, false),
+            kernel_cmdline(None, None, None, false, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -1215,8 +1264,8 @@ mod tests {
         // route table never gains an IPv6 entry, loopback's ::1 included —
         // nothing inside the escape boundary gets a v6 family to ride.
         let lines = [
-            kernel_cmdline(None, None, None, false),
-            kernel_cmdline(Some("debug"), None, None, false),
+            kernel_cmdline(None, None, None, false, None),
+            kernel_cmdline(Some("debug"), None, None, false, None),
         ];
         for line in lines {
             let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -1230,7 +1279,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
         assert_eq!(
-            kernel_cmdline(Some("debug"), None, None, false),
+            kernel_cmdline(Some("debug"), None, None, false, None),
             "console=hvc0 ipv6.disable=1 RUST_LOG=debug"
         );
     }
@@ -1239,7 +1288,13 @@ mod tests {
     fn kernel_cmdline_preserves_comma_separated_directives() {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
-            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, None, false),
+            kernel_cmdline(
+                Some("info,russh=debug,minimald=debug"),
+                None,
+                None,
+                false,
+                None
+            ),
             "console=hvc0 ipv6.disable=1 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
@@ -1250,11 +1305,11 @@ mod tests {
         // corrupting the line, so the whole value is dropped — the base line
         // still boots, IPv6 disabled.
         assert_eq!(
-            kernel_cmdline(Some("info, russh=debug"), None, None, false),
+            kernel_cmdline(Some("info, russh=debug"), None, None, false, None),
             "console=hvc0 ipv6.disable=1"
         );
         assert_eq!(
-            kernel_cmdline(Some("info\trussh=debug"), None, None, false),
+            kernel_cmdline(Some("info\trussh=debug"), None, None, false, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -1262,7 +1317,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
         assert_eq!(
-            kernel_cmdline(Some(""), None, None, false),
+            kernel_cmdline(Some(""), None, None, false, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -1272,7 +1327,7 @@ mod tests {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
         assert_eq!(
-            kernel_cmdline(Some(&huge), None, None, false),
+            kernel_cmdline(Some(&huge), None, None, false, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -1290,7 +1345,7 @@ mod tests {
         // value, so this value yields a line that fills the budget exactly.
         let prefix = format!("{BASE_KERNEL_CMDLINE} {GUEST_LOG_ENV}=").len();
         let longest = "d".repeat(BOOT_LINE_BUDGET - prefix);
-        let line = kernel_cmdline(Some(&longest), None, None, false);
+        let line = kernel_cmdline(Some(&longest), None, None, false, None);
         assert_eq!(line.len(), BOOT_LINE_BUDGET);
         assert!(line.ends_with(&longest));
 
@@ -1300,7 +1355,8 @@ mod tests {
                 Some(&"d".repeat(BOOT_LINE_BUDGET - prefix + 1)),
                 None,
                 None,
-                false
+                false,
+                None
             ),
             "console=hvc0 ipv6.disable=1"
         );
@@ -1312,10 +1368,10 @@ mod tests {
     /// while the port, the generation and the opt-out still boot.
     #[test]
     fn kernel_cmdline_forwards_the_longest_filter_behind_the_widest_port_and_generation() {
-        let base = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true);
+        let base = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true, None);
         let prefix = format!("{base} {GUEST_LOG_ENV}=").len();
         let longest = "d".repeat(BOOT_LINE_BUDGET - prefix);
-        let line = kernel_cmdline(Some(&longest), Some(u16::MAX), Some(u64::MAX), true);
+        let line = kernel_cmdline(Some(&longest), Some(u16::MAX), Some(u64::MAX), true, None);
         assert_eq!(line.len(), BOOT_LINE_BUDGET);
         assert!(line.starts_with(&*base) && line.ends_with(&longest));
         assert_eq!(
@@ -1323,10 +1379,73 @@ mod tests {
                 Some(&"d".repeat(BOOT_LINE_BUDGET - prefix + 1)),
                 Some(u16::MAX),
                 Some(u64::MAX),
-                true
+                true,
+                None
             ),
             base
         );
+    }
+
+    /// MIR-023: the door token rides the base line when the supervisor
+    /// handed the door, after the port, generation and opt-out tokens and
+    /// before the host's filter, and is absent when it did not; the door is
+    /// handed as its socket's path and crosses as its port.
+    #[test]
+    fn vm_boot_opens_mirror_door_and_passes_token() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            mirror_door_from_raw(Some(OsStr::new("/s/mirror/door.sock"))),
+            Some(7354)
+        );
+        assert_eq!(mirror_door_from_raw(Some(OsStr::new(""))), None);
+        assert_eq!(mirror_door_from_raw(None), None);
+        assert_eq!(
+            kernel_cmdline(None, None, None, false, Some(mirror_client::DOOR_PORT)),
+            "console=hvc0 ipv6.disable=1 MINIMALD_MIRROR_DOOR=7354"
+        );
+        assert_eq!(
+            kernel_cmdline(None, None, None, false, None),
+            "console=hvc0 ipv6.disable=1"
+        );
+        assert_eq!(
+            kernel_cmdline(Some("debug"), Some(7654), Some(3), true, Some(7354)),
+            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
+             MINIMALD_PUBLISH_GENERATION=3 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 \
+             MINIMALD_MIRROR_DOOR=7354 RUST_LOG=debug"
+        );
+    }
+
+    /// MIR-023: the door token is never dropped. A filter that overflows the
+    /// budget is skipped and the door stays; telemetry tokens that overflow
+    /// what remains are dropped as a group and the door stays; and what
+    /// remains is judged behind the door, so tokens that fit there cross.
+    #[test]
+    fn door_token_survives_a_full_command_line() {
+        let door = Some(mirror_client::DOOR_PORT);
+        let base = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true, door);
+        assert!(base.ends_with(" MINIMALD_MIRROR_DOOR=7354"), "{base}");
+        let line = kernel_cmdline(
+            Some(&"d".repeat(BOOT_LINE_BUDGET)),
+            Some(u16::MAX),
+            Some(u64::MAX),
+            true,
+            door,
+        );
+        assert_eq!(line, base, "the filter is dropped, the door stays");
+
+        let overflow =
+            vec![boot_token("MINIMAL_TELEMETRY", &"t".repeat(BOOT_LINE_BUDGET)).unwrap()];
+        assert_eq!(
+            with_guest_env(base.clone(), &overflow),
+            base,
+            "the telemetry tokens are dropped, the door stays"
+        );
+
+        let room = BOOT_LINE_BUDGET - base.len() - 1 - "MINIMAL_TELEMETRY=".len();
+        let fits = vec![boot_token("MINIMAL_TELEMETRY", &"t".repeat(room)).unwrap()];
+        let line = with_guest_env(base.clone(), &fits);
+        assert_eq!(line.len(), BOOT_LINE_BUDGET);
+        assert!(line.starts_with(&*base));
     }
 
     /// `widest_base_len`, the bound the budget proofs put on the line before
@@ -1337,7 +1456,7 @@ mod tests {
     /// outside what the proofs assume.
     #[test]
     fn widest_base_len_covers_every_base_token() {
-        let widest = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true);
+        let widest = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true, Some(u32::MAX));
         assert!(
             widest.len() <= widest_base_len(),
             "the widest base line is {} bytes, past widest_base_len() = {}: {widest}",
@@ -1355,13 +1474,13 @@ mod tests {
     #[test]
     fn kernel_cmdline_decides_the_filter_lengths_the_lab_probe_crashed_on() {
         for (port, generation) in [(None, None), (Some(u16::MAX), Some(u64::MAX))] {
-            let base = kernel_cmdline(None, port, generation, false);
+            let base = kernel_cmdline(None, port, generation, false, None);
             let crosses = "d".repeat(1600);
-            let line = kernel_cmdline(Some(&crosses), port, generation, false);
+            let line = kernel_cmdline(Some(&crosses), port, generation, false, None);
             assert!(line.ends_with(&crosses), "a 1600-byte filter was skipped");
             assert!(line.len() + LIBKRUN_CMDLINE_RESERVE < COMMAND_LINE_SIZE);
             assert_eq!(
-                kernel_cmdline(Some(&"d".repeat(1760)), port, generation, false),
+                kernel_cmdline(Some(&"d".repeat(1760)), port, generation, false, None),
                 base,
                 "a 1760-byte filter crossed"
             );
@@ -1644,7 +1763,7 @@ mod tests {
             "info\u{1}",
         ] {
             assert_eq!(
-                kernel_cmdline(Some(bad), None, None, false),
+                kernel_cmdline(Some(bad), None, None, false, None),
                 BASE_KERNEL_CMDLINE,
                 "{bad:?}"
             );
@@ -1658,7 +1777,7 @@ mod tests {
     #[test]
     fn the_boot_line_leaves_room_for_the_suffix_libkrun_appends() {
         assert_eq!(
-            kernel_cmdline(Some(&"d".repeat(2000)), None, None, false),
+            kernel_cmdline(Some(&"d".repeat(2000)), None, None, false, None),
             BASE_KERNEL_CMDLINE
         );
         let tokens = vec![format!("MINIMAL_OTEL_FILTER={}", "d".repeat(1990))];
@@ -1677,7 +1796,7 @@ mod tests {
         // answerer (NET-138), so a token carrying one would be an admitted
         // port with nothing behind it.
         let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654";
-        assert_eq!(kernel_cmdline(None, Some(7654), None, false), handed);
+        assert_eq!(kernel_cmdline(None, Some(7654), None, false, None), handed);
         assert!(
             !handed.contains("MINIMALD_ZONE_ANSWERER_PORT"),
             "the boot line must not carry a zone-answerer port: {handed}"
@@ -1685,17 +1804,17 @@ mod tests {
 
         // With both a filter and the port, the tokens share the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), None, false),
+            kernel_cmdline(Some("debug"), Some(7654), None, false, None),
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
         );
 
         // A filter that would push the whole line past the buffer is skipped
         // while the port still boots: the line keeps the handed port and
         // drops the filter, rather than corrupting a token the guest binds.
-        let port_only = kernel_cmdline(None, Some(7654), None, false);
+        let port_only = kernel_cmdline(None, Some(7654), None, false, None);
         let oversized = "d".repeat(COMMAND_LINE_SIZE - port_only.len() - GUEST_LOG_ENV.len() - 1);
         assert_eq!(
-            kernel_cmdline(Some(&oversized), Some(7654), None, false),
+            kernel_cmdline(Some(&oversized), Some(7654), None, false, None),
             port_only,
             "an oversized filter is skipped; the handed port still boots"
         );
@@ -1722,7 +1841,7 @@ mod tests {
         // T93: the boot's publish generation travels the same way the port
         // does, so the guest can echo it in every publish report.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), Some(42), false),
+            kernel_cmdline(Some("debug"), Some(7654), Some(42), false, None),
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
              MINIMALD_PUBLISH_GENERATION=42 RUST_LOG=debug"
         );
@@ -1743,16 +1862,16 @@ mod tests {
         // so the guest daemon runs the egress default its host was started
         // with. Unset, the token is absent — the guest runs the default.
         assert_eq!(
-            kernel_cmdline(None, None, None, false),
+            kernel_cmdline(None, None, None, false, None),
             "console=hvc0 ipv6.disable=1"
         );
         assert_eq!(
-            kernel_cmdline(None, None, None, true),
+            kernel_cmdline(None, None, None, true, None),
             "console=hvc0 ipv6.disable=1 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1"
         );
         // Beside the port and generation, the token shares the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), Some(42), true),
+            kernel_cmdline(Some("debug"), Some(7654), Some(42), true, None),
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
              MINIMALD_PUBLISH_GENERATION=42 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
         );
@@ -1766,10 +1885,13 @@ mod tests {
         ];
         // Relative to the base line, which upstream owns (it gained ipv6.disable=1).
         assert_eq!(
-            with_guest_env(kernel_cmdline(Some("info"), None, None, false), &tokens),
+            with_guest_env(
+                kernel_cmdline(Some("info"), None, None, false, None),
+                &tokens
+            ),
             format!(
                 "{} MINIMAL_TELEMETRY=1 MINIMAL_OTEL_FILTER=info,minimald::net=debug",
-                kernel_cmdline(Some("info"), None, None, false)
+                kernel_cmdline(Some("info"), None, None, false, None)
             )
         );
     }
@@ -1785,7 +1907,7 @@ mod tests {
             "MINIMAL_OTEL_TRACES_EXPORTER=none".to_string(),
             "TRACEPARENT=00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
         ];
-        let base = kernel_cmdline(Some("info"), None, None, false);
+        let base = kernel_cmdline(Some("info"), None, None, false, None);
         let line = with_guest_env(base.clone(), &tokens);
         let logged = loggable_boot_line(&line, &tokens);
         assert!(logged.starts_with(base.as_ref()), "{logged}");
@@ -1858,7 +1980,7 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| (*v).to_owned())
         };
-        let base = kernel_cmdline(Some("info"), Some(7654), Some(42), false);
+        let base = kernel_cmdline(Some("info"), Some(7654), Some(42), false, None);
 
         let tokens = crate::telemetry::guest_env(get, true, Some(7353), Some(TP));
         let on = with_guest_env(base.clone(), &tokens);
@@ -1910,8 +2032,8 @@ mod tests {
     #[test]
     fn no_guest_env_leaves_the_boot_line_byte_identical() {
         assert_eq!(
-            with_guest_env(kernel_cmdline(None, None, None, false), &[]),
-            kernel_cmdline(None, None, None, false)
+            with_guest_env(kernel_cmdline(None, None, None, false, None), &[]),
+            kernel_cmdline(None, None, None, false, None)
         );
     }
 
@@ -1922,13 +2044,13 @@ mod tests {
             format!("MINIMAL_OTEL_FILTER=info,{}=debug", "h".repeat(2100)),
         ];
         assert_eq!(
-            with_guest_env(kernel_cmdline(None, None, None, false), &big),
-            kernel_cmdline(None, None, None, false)
+            with_guest_env(kernel_cmdline(None, None, None, false, None), &big),
+            kernel_cmdline(None, None, None, false, None)
         );
 
         // At the boundary: tokens that fill the budget exactly cross; one
         // byte more drops them all, at the token boundary, never mid-value.
-        let base = kernel_cmdline(None, None, None, false);
+        let base = kernel_cmdline(None, None, None, false, None);
         let fill = |len: usize| {
             vec![
                 "MINIMAL_TELEMETRY=1".to_string(),

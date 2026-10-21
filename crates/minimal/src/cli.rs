@@ -111,6 +111,8 @@ pub enum Command {
     Bug(diag::BugArgs),
     /// Collect diagnostic bundles and send them for diagnosis
     Diag(diag::DiagArgs),
+    /// Mirror subcommands: the state of the laptop's mirror daemon, and stopping it
+    Mirror(MirrorArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
     #[cfg(feature = "remote-access")]
     Mesh(MeshArgs),
@@ -574,6 +576,44 @@ pub enum MeshCommand {
 pub struct MeshJoinArgs {
     /// Address of the remote minimald exposing the mesh (`host:port`)
     pub address: String,
+}
+
+/// The mirror daemon's subcommands (MIR-060, MIR-070). Neither starts the
+/// daemon: the commands that read a project do (MIR-020).
+#[derive(Debug, Args)]
+pub struct MirrorArgs {
+    #[command(subcommand)]
+    pub command: MirrorCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MirrorCommand {
+    /// Show the mirror daemon's state: its origins, its disk use and its repository copies
+    ///
+    /// Exits 0 when the daemon is running and 1 otherwise. Never starts it.
+    ///
+    /// Example:
+    ///
+    ///   min mirror status
+    #[command(verbatim_doc_comment)]
+    Status(MirrorStatusArgs),
+    /// Stop the mirror daemon
+    ///
+    /// Prints nothing when it stopped, and `mirror: stopped` when it was not
+    /// running. The next command that reads a project starts it again.
+    ///
+    /// Example:
+    ///
+    ///   min mirror stop
+    #[command(verbatim_doc_comment)]
+    Stop,
+}
+
+#[derive(Debug, Args)]
+pub struct MirrorStatusArgs {
+    /// Print the daemon's status as one JSON document
+    #[arg(long)]
+    pub json: bool,
 }
 
 // Shared arguments for all subcommands.

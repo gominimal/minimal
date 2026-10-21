@@ -156,6 +156,17 @@ fn run_vmm() -> Result<()> {
         .context("registering the guest telemetry door's vsock port")?;
     }
 
+    // The mirror door's vsock port (MIR-023): registered only when the
+    // supervisor started the mirror and handed its door socket, which is
+    // what the env names; every connection the guest daemon opens on the
+    // port then reaches the mirror's door.
+    if let Some(mirror_door_sock) =
+        std::env::var_os(crate::mirror_door::MIRROR_DOOR_SOCK_ENV).filter(|p| !p.is_empty())
+    {
+        ctx.add_vsock_port(mirror_client::DOOR_PORT, &mirror_door_sock)
+            .context("registering the mirror door's vsock port")?;
+    }
+
     // Host wall-clock updates (host→guest, `crate::timekeep`), macOS only.
     //
     // Best-effort: a VM that boots with a drifting clock beats one that does

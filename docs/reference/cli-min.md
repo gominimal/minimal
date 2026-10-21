@@ -659,6 +659,38 @@ daemon running).
 `stop` stays bare at the top level — a deliberate exception to the
 `min <noun> <verb>` convention: it acts on the daemon, not on any session.
 
+### `mirror status`, `mirror stop`
+
+```
+min mirror status [--json]
+min mirror stop
+```
+
+The mirror is a daemon, `minmirrord`, that keeps one copy per laptop of the
+cache objects and package repositories your commands fetch. Once the laptop
+was online with the mirror running, a new project and a new box come up with
+no connection. `min` starts it on demand before a command that reads a
+project, and every VM reads it through a door the VM host daemon opens. A
+box never reaches it. The `[mirror]` table of
+[`config.toml`](./loadouts.md#client-config) turns it off with
+`enabled = false`, in which case every fetch goes to its origin as before.
+
+`mirror status` prints the daemon's state and the path of its host socket.
+Then it prints one line per cache origin it contacted, with the last
+successful contact and the last failure, the store's use against its budget,
+and one line per repository copy with its heads and last refresh. It exits 0 when the daemon
+is running and 1 otherwise, and never starts the daemon. `--json` prints the
+daemon's status document instead.
+
+`mirror stop` stops the daemon and prints nothing. `min stop` leaves the
+mirror running: it outlives every VM and session daemon, and the next
+command that reads a project starts it again.
+
+When the daemon cannot start, the command that needed it fails with
+`the mirror did not start: <cause>.`, then
+`Run min mirror status to see its state.` and
+`Set [mirror] enabled = false in <config path> to fetch without it.`
+
 ### `loadout list` (alias: `ls`)
 
 ```

@@ -1,4 +1,5 @@
 use ::paths::DaemonAbsPath;
+use mirror_client::MirrorEndpoint;
 use russh::keys::key::safe_rng;
 use russh::keys::{PrivateKey, ssh_key::Error as KeyError};
 use serde::{Deserialize, Serialize};
@@ -586,16 +587,16 @@ impl ServerState {
              are granted from this host's reserved local range"
         );
 
-        // Build a daemon-scoped mctx config from what the daemon
-        // knows today (dirs). Additional flags (offline, stdlib
-        // override, num-parallel-builds) will thread through from
-        // the CLI as follow-up work; today the defaults hold.
-        let mctx_config = mctx::ConfigBuilder::new()
-            .with_cache_dir(minimal_cache_dir.as_utf8_path())
-            .with_state_dir(minimal_state_dir.as_utf8_path())
-            .with_daemon_id(daemon_id.clone())
-            .build()
-            .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
+        // Build a daemon-scoped mctx config from what the daemon knows
+        // today: the dirs, and the mirror door the VM host handed this
+        // boot, when it is one (MIR-024).
+        let mctx_config = daemon_mctx_config(
+            minimal_cache_dir.as_utf8_path(),
+            minimal_state_dir.as_utf8_path(),
+            daemon_id.clone(),
+            mirror_endpoint(config.in_microvm, crate::guest::handed_mirror_door()),
+        )
+        .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
 
         // Build the daemon-scoped mctx state once at startup: every session
         // stacks a per-session `Context` on it via `Context::from_daemon`.
@@ -631,6 +632,42 @@ impl ServerState {
             mesh: None,
         })
     }
+}
+
+/// The mirror a VM-hosted daemon reads its cache objects and repository
+/// copies through (MIR-024): the door the VM host handed on the boot line,
+/// dialled at the host's context id. A native daemon takes none here: it
+/// reads the host socket from `MINIMAL_MIRROR_SOCKET`, which the build
+/// context reads itself (MIR-021). No token, no mirror: the daemon fetches
+/// from the origins directly.
+fn mirror_endpoint(in_microvm: bool, handed_door: Option<u32>) -> Option<MirrorEndpoint> {
+    handed_door
+        .filter(|_| in_microvm)
+        .map(|port| MirrorEndpoint::Vsock {
+            cid: crate::net::VSOCK_HOST_CID,
+            port,
+        })
+}
+
+/// The daemon-scoped build context configuration: the dirs the daemon
+/// knows, its id, and the mirror its fetches go through when it has one.
+/// Additional flags (offline, stdlib override, num-parallel-builds) will
+/// thread through from the CLI as follow-up work; today the defaults hold.
+fn daemon_mctx_config(
+    cache_dir: &camino::Utf8Path,
+    state_dir: &camino::Utf8Path,
+    daemon_id: String,
+    mirror: Option<MirrorEndpoint>,
+) -> Result<mctx::Config, mctx::ConfigError> {
+    let builder = mctx::ConfigBuilder::new()
+        .with_cache_dir(cache_dir)
+        .with_state_dir(state_dir)
+        .with_daemon_id(daemon_id);
+    match mirror {
+        Some(endpoint) => builder.with_mirror(endpoint),
+        None => builder,
+    }
+    .build()
 }
 
 /// The subnet this daemon's [`SwitchClient`](crate::net::SwitchClient)
@@ -3682,6 +3719,52 @@ mod tests {
         })
         .await
         .expect("the hostname proxy must bind and report its port")
+    }
+
+    /// MIR-024: with the door token on the boot line, a VM-hosted daemon's
+    /// build context fetches through the door, dialled at the host's
+    /// context id on the handed port.
+    #[test]
+    fn guest_reads_cache_and_repos_through_door() {
+        let endpoint = mirror_endpoint(true, Some(mirror_client::DOOR_PORT));
+        assert_eq!(
+            endpoint,
+            Some(MirrorEndpoint::Vsock {
+                cid: crate::net::VSOCK_HOST_CID,
+                port: 7354,
+            })
+        );
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+        let config = daemon_mctx_config(
+            &root.join("cache"),
+            &root.join("state"),
+            "d0".to_string(),
+            endpoint.clone(),
+        )
+        .unwrap();
+        assert_eq!(config.mirror(), endpoint.as_ref());
+    }
+
+    /// MIR-024: without the token the daemon fetches from the origins
+    /// directly, and a native daemon takes no door even when one is in its
+    /// environment: its mirror is the host socket, read by the build
+    /// context itself (MIR-021).
+    #[test]
+    fn no_door_token_fetches_origins() {
+        assert_eq!(mirror_endpoint(true, None), None);
+        assert_eq!(mirror_endpoint(false, Some(mirror_client::DOOR_PORT)), None);
+        assert_eq!(crate::guest::handed_mirror_door(), None);
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+        let config = daemon_mctx_config(
+            &root.join("cache"),
+            &root.join("state"),
+            "d0".to_string(),
+            None,
+        )
+        .expect("a daemon without a mirror builds its context as today");
+        assert_eq!(config.mirror(), None);
     }
 
     /// T63 (NET-025, NET-138): a VM-hosted daemon binds the port its host

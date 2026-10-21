@@ -59,6 +59,9 @@ mctx.workspace = true
 mfile.workspace = true
 minimal-client.workspace = true
 minimald-rpc.workspace = true
+# The mirror daemon's client contract: its directories, lifecycle file and
+# on-demand start (`min mirror status`/`stop`, `ensure_mirror`).
+mirror-client.workspace = true
 mlog.workspace = true
 op.workspace = true
 paths.workspace = true

@@ -18,6 +18,9 @@ checkouts.workspace = true
 decode.workspace = true
 mctx.workspace = true
 mfile.workspace = true
+# A running mirror's host socket, when the client configuration enables it
+# (MIR-020): `mip` uses one and starts none.
+mirror-client.workspace = true
 op.workspace = true
 ot.workspace = true
 orchestrator.workspace = true

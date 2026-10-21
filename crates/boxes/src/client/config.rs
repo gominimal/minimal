@@ -3,8 +3,9 @@
 //!
 //! Small on purpose: today it carries the default loadouts the
 //! client applies when the user activates a session without naming
-//! any explicit ones, and the configurable session leader/subcommand
-//! keys (`[session-keys]`). Additional keys can be added as sections
+//! any explicit ones, the configurable session leader/subcommand
+//! keys (`[session-keys]`), and the mirror daemon's `[mirror]`
+//! table. Additional keys can be added as sections
 //! grow, but every new field should start with a
 //! `#[serde(default)]` so an old config keeps parsing after an
 //! upgrade.
@@ -34,6 +35,12 @@ pub struct Config {
     /// secrets.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// `[mirror]` section: whether the mirror daemon runs on this laptop
+    /// and what it keeps (spec MIR, O3). Its reader lives with the mirror's
+    /// client contract, so `mip` and the VM host daemon read the same
+    /// table without this crate.
+    #[serde(default)]
+    pub mirror: mirror_client::MirrorConfig,
 }
 
 /// The `[secrets]` section.
@@ -353,6 +360,36 @@ mod tests {
                 .secrets
                 .acknowledge_full_breadth_unenrolled
         );
+    }
+
+    /// The `[mirror]` table reads through the client configuration
+    /// (MIR-022): an opt-out is seen, an omitted table is the default
+    /// (enabled), and an unknown key in it is a parse error.
+    #[test]
+    fn mirror_table_reads_through_client_config() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r#"
+                [loadouts]
+                default_loadouts = ["helix"]
+
+                [mirror]
+                enabled = false
+                always = ["go"]
+            "#},
+        );
+        let cfg = read_config_file(&path).unwrap();
+        assert!(!cfg.mirror.enabled);
+        assert_eq!(cfg.mirror.always, vec!["go".to_string()]);
+        assert!(Config::default().mirror.enabled);
+
+        let path = write_file(dir.path(), "typo.toml", "[mirror]\nenable = false\n");
+        assert!(matches!(
+            read_config_file(&path).unwrap_err(),
+            ConfigError::Parse { .. }
+        ));
     }
 
     /// An unknown key in `[secrets]` is a parse error.

@@ -714,6 +714,19 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         None
     };
 
+    // The mirror door (MIR-023): the laptop's mirror daemon, started here on
+    // demand when the client configuration enables it, hands its door
+    // socket to the VMM child the same way, and the child bridges the
+    // guest's door port to it, so the guest daemon reads its cache objects
+    // and repository copies through the one mirror every VM shares. A
+    // mirror that is disabled or did not start leaves the VM without the
+    // door, warned with the cause, and the guest fetches from the origins
+    // directly.
+    let mirror_door = crate::mirror_door::open_mirror_door(
+        &crate::mirror_door::client_config_path(),
+        crate::state::state_dir_override().map(|dir| dir.as_utf8_path().as_std_path()),
+    );
+
     // The host answerer (NET-138): the box zone's answerer on the host
     // loopback, answering from this host-authored table — the same
     // semantics the native daemon's answerer gives, over the same shared
@@ -1006,6 +1019,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         cmd.env(name, path);
         if let Some(path) = guest_telemetry_door.as_ref() {
             cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
+        }
+        if let Some(path) = mirror_door.as_ref() {
+            cmd.env(crate::mirror_door::MIRROR_DOOR_SOCK_ENV, path);
         }
         cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
             // The node's proxy port travels to the guest through the VMM child's

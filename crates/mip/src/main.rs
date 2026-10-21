@@ -5,6 +5,7 @@ use anyhow::anyhow;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use mctx::{ConfigBuilder, Context, Error};
+use mirror_client::{MirrorConfig, MirrorDirs, MirrorEndpoint};
 use std::io;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
@@ -164,6 +165,22 @@ pub(crate) fn enforce_science_mode() -> Result<(), Error> {
     }
 }
 
+/// The host socket of the running mirror, when the `[mirror]` table of the
+/// client configuration file enables it (MIR-022) and its daemon is running
+/// (MIR-020); `None` fetches as today. Never starts the daemon.
+fn running_mirror() -> Result<Option<MirrorEndpoint>, Error> {
+    let config_path = paths::minimal_config_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("config.toml");
+    let table = MirrorConfig::read_table(&config_path).map_err(|e| Error::Other(anyhow!(e)))?;
+    if !table.enabled {
+        return Ok(None);
+    }
+    Ok(mirror_client::running(&MirrorDirs::resolve(None))
+        .map(|state| MirrorEndpoint::Unix(state.host_socket)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -222,6 +239,11 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     }
     if let Some(stdlib_dir) = global_args.stdlib_dir {
         config = config.with_stdlib_dir(stdlib_dir);
+    }
+    // A mirror `min` keeps up on this laptop serves the fetches (MIR-020);
+    // `mip` starts none, since it also runs on build servers and CI runners.
+    if let Some(endpoint) = running_mirror()? {
+        config = config.with_mirror(endpoint);
     }
     let config = config.build()?;
 

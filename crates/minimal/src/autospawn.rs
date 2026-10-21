@@ -6,7 +6,7 @@
 //! Linux (KVM); on any other target it is a no-op.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -18,6 +18,38 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use minvmd::lifecycle::Lifecycle;
+
+/// What a native daemon this module spawns is told about the mirror (MIR-021,
+/// MIR-022), decided by the caller without starting it. The VM host daemon
+/// reads the mirror for itself (MIR-023), so a minvmd spawn takes none of
+/// this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorHandoff {
+    /// `[mirror] enabled = false`: the daemon reads no mirror, whatever its
+    /// environment says.
+    Off,
+    /// The running mirror's host socket, passed as `MINIMAL_MIRROR_SOCKET`.
+    Socket(PathBuf),
+    /// The mirror is enabled but not running: the daemon keeps what its
+    /// environment says.
+    Inherit,
+}
+
+impl MirrorHandoff {
+    /// Puts the handoff on the daemon's command.
+    #[cfg(target_os = "linux")]
+    fn apply(&self, cmd: &mut Command) {
+        match self {
+            Self::Off => {
+                cmd.env_remove(mirror_client::SOCKET_ENV);
+            }
+            Self::Socket(path) => {
+                cmd.env(mirror_client::SOCKET_ENV, path);
+            }
+            Self::Inherit => {}
+        }
+    }
+}
 
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
 ///
@@ -304,26 +336,41 @@ pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> 
 ///   macOS minimald). `use_minvmd`/`minimal_dir` are ignored.
 /// - Linux: native minimald on the host (DM2) by default; the minvmd microVM
 ///   (DM1) when `use_minvmd` is set.
+///
+/// `mirror` is asked what a native daemon is told about the mirror only when
+/// one is spawned; the VM host daemon reads the mirror itself (MIR-023).
 #[cfg(target_os = "macos")]
-pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
-    let _ = use_minvmd;
+pub fn ensure_daemon_running(
+    use_minvmd: bool,
+    minimal_dir: Option<&Path>,
+    mirror: impl FnOnce() -> MirrorHandoff,
+) -> io::Result<()> {
+    let _ = (use_minvmd, mirror);
     ensure_minvmd_running(minimal_dir)
 }
 
 #[cfg(target_os = "linux")]
-pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+pub fn ensure_daemon_running(
+    use_minvmd: bool,
+    minimal_dir: Option<&Path>,
+    mirror: impl FnOnce() -> MirrorHandoff,
+) -> io::Result<()> {
     if use_minvmd {
         return ensure_minvmd_running(minimal_dir);
     }
     let sock = crate::client::resolve_socket_path(minimal_dir, false)
         .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
-    ensure_minimald_running(&sock, minimal_dir)
+    ensure_minimald_running(&sock, minimal_dir, mirror)
 }
 
 /// On targets without an auto-spawn backend, this is a no-op.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
-    let _ = (use_minvmd, minimal_dir);
+pub fn ensure_daemon_running(
+    use_minvmd: bool,
+    minimal_dir: Option<&Path>,
+    mirror: impl FnOnce() -> MirrorHandoff,
+) -> io::Result<()> {
+    let _ = (use_minvmd, minimal_dir, mirror);
     Ok(())
 }
 
@@ -407,8 +454,16 @@ fn minimald_socket_live(socket_path: &Path) -> bool {
 /// spawn `minimald run --detach --instance-num 0`. minimald daemonizes itself
 /// (setsid) and only returns once it is listening, so this fail-fasts on a
 /// non-zero exit.
+///
+/// The spawned daemon is told about the mirror as `mirror` decides (MIR-021):
+/// the host socket of a running mirror rides as `MINIMAL_MIRROR_SOCKET`,
+/// which the daemon's build context reads itself.
 #[cfg(target_os = "linux")]
-fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io::Result<()> {
+fn ensure_minimald_running(
+    socket_path: &Path,
+    minimal_dir: Option<&Path>,
+    mirror: impl FnOnce() -> MirrorHandoff,
+) -> io::Result<()> {
     if minimald_socket_live(socket_path) {
         tracing::debug!("native minimald already running (socket connectable)");
         return Ok(());
@@ -423,6 +478,7 @@ fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io
     if let Some(dir) = minimal_dir {
         cmd.arg("--minimal-state-dir").arg(dir);
     }
+    mirror().apply(&mut cmd);
     let output = cmd
         .args(["run", "--detach", "--instance-num", "0"])
         .output()

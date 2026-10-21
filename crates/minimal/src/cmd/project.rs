@@ -78,12 +78,19 @@ pub(crate) fn offer_mfile_scaffold(
         return Ok(());
     }
 
+    // The scaffold reads the project's upstream, so it fetches through the
+    // mirror like any project command (MIR-020); started only once the user
+    // has said yes, so a declined offer starts nothing.
+    let mirror = ensure_mirror(global)?;
     let config = if global.repo_dir.is_some() {
-        build_config(global).map_err(|e| anyhow::anyhow!("{e}"))?
+        build_config(global, mirror).map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
         let mut builder = mctx::ConfigBuilder::new();
         if let Some(dir) = &global.minimal_dir {
             builder = builder.with_state_dir(dir).with_cache_dir(dir);
+        }
+        if let Some(endpoint) = mirror {
+            builder = builder.with_mirror(endpoint);
         }
         builder
             .with_repo_dir(project_path.as_std_path())
@@ -141,14 +148,21 @@ pub(crate) fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
     }
 }
 
-/// Build an `mctx::Config` from the shared global args.
-pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
+/// Build an `mctx::Config` from the shared global args, fetching through
+/// `mirror` when the command has one ([`ensure_mirror`], MIR-020).
+pub fn build_config(
+    global: &GlobalArgs,
+    mirror: Option<MirrorEndpoint>,
+) -> Result<mctx::Config, mctx::Error> {
     let mut builder = mctx::ConfigBuilder::new();
     if let Some(dir) = &global.minimal_dir {
         builder = builder.with_state_dir(dir).with_cache_dir(dir);
     }
     if let Some(dir) = &global.repo_dir {
         builder = builder.with_repo_dir(dir);
+    }
+    if let Some(endpoint) = mirror {
+        builder = builder.with_mirror(endpoint);
     }
     Ok(builder.build()?)
 }
@@ -230,7 +244,8 @@ pub(crate) fn run_init_flow(
 
 /// Initialize a `minimal.toml` based on the source tree.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
-    let config = build_config(global)?;
+    let mirror = ensure_mirror(global).map_err(mctx::Error::Other)?;
+    let config = build_config(global, mirror)?;
     let outcome = run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)?;
     // stdout: the result line is `min init`'s scriptable output, so it
     // survives `min init > audit.log` while the preview and prompt above
@@ -254,7 +269,8 @@ pub(crate) fn should_warm_host_cache(use_minvmd: bool) -> bool {
 
 /// Add packages as dependencies to the project's `minimal.toml`.
 pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Error> {
-    let config = build_config(global)?;
+    let mirror = ensure_mirror(global).map_err(mctx::Error::Other)?;
+    let config = build_config(global, mirror.clone())?;
     let mut ctx = match mctx::Context::new(config) {
         Ok(ctx) => ctx,
         // A project with no `minimal.toml` cannot take a dependency, so offer
@@ -275,7 +291,7 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
                 }
             };
             offer_mfile_scaffold(&project_path, global, None).map_err(mctx::Error::Other)?;
-            match mctx::Context::new(build_config(global)?) {
+            match mctx::Context::new(build_config(global, mirror)?) {
                 Ok(ctx) => ctx,
                 Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
                     return Err(mctx::Error::Other(anyhow::anyhow!(
@@ -344,7 +360,8 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 /// local checkouts to match.
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
-    let config = build_config(global)?;
+    let mirror = ensure_mirror(global).map_err(mctx::Error::Other)?;
+    let config = build_config(global, mirror)?;
     let mut ctx = match mctx::Context::new(config) {
         Ok(ctx) => ctx,
         // Point a user with no `minimal.toml` at `min init`, matching the hint

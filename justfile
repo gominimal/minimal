@@ -703,7 +703,7 @@ test-root-integration: _nextest gvproxy
 # minvmd-build is LAST so its macOS codesign is the final touch on the binary.
 #
 # The unified session e2e against the VM-backed daemon. CI: the session e2e steps.
-e2e: _kvm artifacts gvproxy initramfs minimal-cli zoned-build minvmd-build
+e2e: _kvm artifacts gvproxy initramfs minimal-cli mirror-build zoned-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
 # CI: ci-linux-native.yml `native-daemon-e2e`.
@@ -725,20 +725,20 @@ test-lifecycle: (_need "jq" "brew install jq (or apt install jq)") _kvm artifact
 # iterations kills THIS checkout's live dev stack — not just the soak's own VMs.
 #
 # Nightly soak parity: N session-e2e reps; reaps between them — WILL kill your dev stack.
-soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+soak n="10": _kvm artifacts gvproxy initramfs minimal-cli mirror-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/soak-session-e2e.sh {{n}} "{{scratch}}/soak-logs"
 
 # Each pass uploads a 49 MiB project (~13 MB on the wire) and destroys its session.
 #
 # Bulk host→guest upload proof (#869): N `min session activate`s of a large, compressible project.
-bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli mirror-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
 
 # Mints N sessions CONCURRENTLY against one daemon (vs. the soak's N-serial reps),
 # then bulk-tears-down — the supervision-under-load surface of ci-strategy §6.
 #
 # Concurrency stress proof. CI: a non-fatal step in nightly-tests.yml `session-e2e-soak`.
-stress n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+stress n="5": _kvm artifacts gvproxy initramfs minimal-cli mirror-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/stress-session-e2e.sh {{n}}
 
 # ── stack bring-up ───────────────────────────────────────────────────────────

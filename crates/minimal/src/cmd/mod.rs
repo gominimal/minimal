@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt as _;
 // `ensure_version_match` is the round-trip form, for paths with no first RPC
 // of their own to carry it.
 use minimal_client::{ensure_version_match, ensure_version_reported, version_assertion};
+use mirror_client::{MirrorDirs, MirrorEndpoint};
 
 use crate::*;
 
@@ -26,6 +27,7 @@ mod box_spec;
 mod box_verbs;
 mod finalize_install;
 mod list;
+mod mirror;
 mod net;
 mod project;
 mod session;
@@ -41,6 +43,7 @@ pub use box_audit::AuditSelfUnsupportedUnenrolled;
 pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
+pub use mirror::*;
 pub use net::*;
 pub use project::*;
 pub use session::*;
@@ -241,6 +244,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
             diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
             diag::DiagCommand::Delete(args) => diag::cmd_diag_delete(args).await,
+        },
+        Some(Command::Mirror(MirrorArgs { command })) => match command {
+            MirrorCommand::Status(args) => cmd_mirror_status(&cli.global_args, args),
+            MirrorCommand::Stop => cmd_mirror_stop(&cli.global_args),
         },
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {
@@ -564,9 +571,37 @@ pub(crate) async fn list_sessions_version_gated(
 }
 
 /// Ensure the minimald daemon is running, autospawning it if necessary.
+///
+/// A native daemon this spawns is told about the mirror as the client
+/// configuration and the running mirror decide ([`mirror_handoff`]); the
+/// mirror itself is never started here. A command that reads a project
+/// starts it first, through [`ensure_mirror`], so the daemon it spawns finds
+/// it running.
 pub(crate) fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")
+    autospawn::ensure_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref(), || {
+        mirror_handoff(global)
+    })
+    .context("Failed to ensure the minimald daemon is running")
+}
+
+/// The mirror a command that reads a project fetches through (MIR-020):
+/// started if it is not running, waited for until it answers, bounded. `None`
+/// when the client configuration disables it (MIR-022), and the command then
+/// fetches as it does today. A mirror that does not start fails the command
+/// with the lines [`start_failure_lines`] gives.
+pub(crate) fn ensure_mirror(global: &GlobalArgs) -> Result<Option<MirrorEndpoint>, anyhow::Error> {
+    let config = crate::config::read_client_config(global)?;
+    if !config.mirror.enabled {
+        return Ok(None);
+    }
+    let dirs = MirrorDirs::resolve(global.minimal_dir.as_deref());
+    match mirror_client::ensure_running(&dirs) {
+        Ok(state) => Ok(Some(MirrorEndpoint::Unix(state.host_socket))),
+        Err(error) => {
+            let config_path = crate::config::resolve_minimal_config_dir(global).join("config.toml");
+            Err(anyhow::anyhow!(start_failure_lines(&error, &config_path)))
+        }
+    }
 }
 
 /// Prompt the user with a yes/no question on stderr.

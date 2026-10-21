@@ -112,6 +112,40 @@ pub fn handed_egress_deny_all_opt_out() -> bool {
     )
 }
 
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its mirror door (MIR-023, MIR-024): the vsock port on the
+/// host the laptop's mirror answers at. The one definition `minvmd`'s
+/// `vm.rs` writes from too.
+pub const HANDED_MIRROR_DOOR_TOKEN: &str = mirror_client::DOOR_TOKEN;
+
+/// The mirror door the VM host handed this boot, if it handed one
+/// (MIR-024): the port the daemon reads its cache objects and repository
+/// copies through. `None` when the boot carries no token — an older
+/// minvmd, a native run, or a host whose client configuration disables
+/// the mirror — and the daemon fetches from the origins directly. A token
+/// that carries no port is warned and read as absent: the door is a
+/// supply path with the origins behind it, not a port the host's tables
+/// name, so a broken handoff costs the mirror, never the boot.
+pub fn handed_mirror_door() -> Option<u32> {
+    parse_mirror_door(std::env::var(HANDED_MIRROR_DOOR_TOKEN).ok().as_deref())
+}
+
+/// Decodes a handed mirror door from its raw boot-token value.
+fn parse_mirror_door(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?;
+    match raw.trim().parse::<u32>() {
+        Ok(port) => Some(port),
+        Err(_) => {
+            tracing::warn!(
+                token = HANDED_MIRROR_DOOR_TOKEN,
+                value = raw,
+                "boot token carries no usable port; fetching from the origins directly"
+            );
+            None
+        }
+    }
+}
+
 /// A boot token the host put a port on that does not carry one (NET-025):
 /// present on the command line but not a port number. Surfaced, not
 /// swallowed: a handoff that arrived broken is a host or transport fault

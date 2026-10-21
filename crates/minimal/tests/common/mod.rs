@@ -11,6 +11,10 @@ use minimal::GlobalArgs;
 /// The UDS socket is placed at `<tempdir>/providers/local-minimald0/ssh.sock`
 /// so that `resolve_socket_path(Some(tempdir), false)` finds it (the native
 /// minimald provider dir the CLI resolves without `--provider local-minvmd`).
+/// The client configuration lives under `<tempdir>/config/minimal/`, so no
+/// test reads the developer's own; it disables the mirror, which a command
+/// that reads a project would otherwise start (MIR-020), and no mirror
+/// daemon is built for these tests.
 pub struct TestDaemon {
     /// The underlying minimald test server. Exposed so tests can create
     /// sessions directly via `server.state` or connect a `TestClient`.
@@ -35,6 +39,14 @@ impl TestDaemon {
         let sock = sock_dir.join("ssh.sock");
         server.listen_on_uds(&sock).await;
 
+        let config_dir = temp.path().join("config/minimal");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[mirror]\nenabled = false\n",
+        )
+        .unwrap();
+
         Self { server, temp }
     }
 
@@ -43,7 +55,7 @@ impl TestDaemon {
         GlobalArgs {
             repo_dir: None,
             minimal_dir: Some(self.temp.path().to_path_buf()),
-            config_dir: None,
+            config_dir: Some(self.temp.path().join("config")),
             provider: None,
             no_input: false,
             vm: None,

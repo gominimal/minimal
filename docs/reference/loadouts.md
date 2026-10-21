@@ -525,6 +525,25 @@ follow_symlinks  = false
 A missing file is equivalent to the defaults; unknown keys are rejected so
 a typo (`[loadout]` for `[loadouts]`) fails loudly.
 
+### The mirror {#mirror-config}
+
+The same file holds the `[mirror]` table, which the
+[mirror daemon](./cli-min.md#mirror-status-mirror-stop) and the commands
+that start it read:
+
+```toml
+[mirror]
+enabled = true
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Start the mirror on demand and read caches and package repositories through it. With `false`, every fetch goes to its origin as before |
+
+The table also accepts `max_disk`, `keep_unused_for`, `always`,
+`git_credentials` and `gcloud_buckets`. The daemon reads them and acts on
+none of them yet. The spec that defines them is `docs/specs/30-spec-mirror`.
+
 ### Session keys {#session-keys}
 
 The detach chord is configurable. The leader key (the chord that enters

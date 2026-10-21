@@ -647,6 +647,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         (task_env?, after)
     };
 
+    // The mirror first (MIR-020): a task run reads the project, and a native
+    // daemon spawned next is handed the running mirror's socket.
+    crate::ensure_mirror(global)?;
     crate::ensure_daemon(global)?;
 
     let config = minimald_rpc::BoxConfig {

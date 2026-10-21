@@ -78,6 +78,9 @@ diagnostics.workspace = true
 graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true
+# The door token's one definition, shared with the VM host daemon that writes
+# it (MIR-024).
+mirror-client.workspace = true
 minimald-rpc.workspace = true
 orchestrator.workspace = true
 op.workspace = true

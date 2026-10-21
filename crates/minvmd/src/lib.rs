@@ -21,6 +21,7 @@ pub mod guest_telemetry;
 pub mod image;
 pub mod lifecycle;
 pub mod metrics;
+pub mod mirror_door;
 pub mod net;
 pub(crate) mod rpc_client;
 pub mod sock;

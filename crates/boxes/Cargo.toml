@@ -12,6 +12,7 @@ common.workspace = true
 globset.workspace = true
 hex.workspace = true
 camino.workspace = true
+mirror-client.workspace = true
 nutype.workspace = true
 paths.workspace = true
 serde.workspace = true

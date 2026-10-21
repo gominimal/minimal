@@ -305,6 +305,9 @@ pub(crate) async fn activate_session(
         &project_secrets,
         full_breadth_acknowledged,
     )?;
+    // The mirror first (MIR-020): an activation reads the project, and a
+    // native daemon spawned next is handed the running mirror's socket.
+    ensure_mirror(global)?;
     ensure_daemon(global)?;
 
     // A session with no `--name` still deserves a typable handle, so mint

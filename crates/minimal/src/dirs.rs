@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use mirror_client::MirrorDirs;
+
 use crate::GlobalArgs;
 use crate::config::resolve_minimal_config_dir;
 #[cfg(feature = "remote-access")]
@@ -46,6 +48,7 @@ pub(crate) fn report(global: &GlobalArgs) -> String {
             .as_std_path()
             .to_path_buf(),
         provider: crate::client::client_provider_kind(global.use_minvmd()),
+        mirror: MirrorDirs::resolve(global.minimal_dir.as_deref()),
     };
     format_dir_rows(&build_dir_rows(&dirs))
 }
@@ -74,6 +77,9 @@ struct DirsLookup {
     /// The backend whose provider dir the CLI would connect to, so the SSH
     /// socket row names the right `providers/local-<kind>0` path.
     provider: paths::ProviderKind,
+    /// The mirror daemon's state under the state dir and its store under
+    /// the cache dir (MIR-044).
+    mirror: MirrorDirs,
 }
 
 /// Which top-level group the mesh-enrolment row prints under. Values
@@ -169,6 +175,13 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
             None,
         )
             .into_row(),
+        (
+            "State",
+            "Mirror state",
+            Some(dirs.mirror.state.clone()),
+            None,
+        )
+            .into_row(),
     ]);
     #[cfg(feature = "remote-access")]
     if dirs.mesh_group == MeshGroup::State {
@@ -183,6 +196,13 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
             "Cache",
             "Built artifacts",
             Some(dirs.cache.join("built")),
+            None,
+        )
+            .into_row(),
+        (
+            "Cache",
+            "Mirror store",
+            Some(dirs.mirror.store.clone()),
             None,
         )
             .into_row(),
@@ -283,8 +303,8 @@ impl IntoDirRow for (&'static str, &'static str, Option<PathBuf>, Option<String>
 mod tests {
     use super::*;
 
-    /// `build_dir_rows` produces the fixed layout [Config, State × 4,
-    /// Cache × 2] — plus a "Mesh enrolment" row under Config (the
+    /// `build_dir_rows` produces the fixed layout [Config × 3, State × 5,
+    /// Cache × 3] — plus a "Mesh enrolment" row under Config (the
     /// common case) only when the `remote-access` feature is compiled
     /// in — each with the right group tag, name, and derived path.
     /// Guards against a future edit that drops a row or shuffles
@@ -300,6 +320,10 @@ mod tests {
             state: PathBuf::from("/home/u/.local/state/minimal"),
             cache: PathBuf::from("/home/u/.cache/minimal"),
             provider: paths::ProviderKind::Minimald,
+            mirror: MirrorDirs::new(
+                PathBuf::from("/home/u/.local/state/minimal/mirror"),
+                PathBuf::from("/home/u/.cache/minimal/mirror"),
+            ),
         };
         let rows = build_dir_rows(&dirs);
         let shape: Vec<(&str, &str, String)> = rows
@@ -343,11 +367,21 @@ mod tests {
                 "SSH socket",
                 "/home/u/.local/state/minimal/providers/local-minimald0/ssh.sock".to_string(),
             ),
+            (
+                "State",
+                "Mirror state",
+                "/home/u/.local/state/minimal/mirror".to_string(),
+            ),
             ("Cache", "Cache dir", "/home/u/.cache/minimal".to_string()),
             (
                 "Cache",
                 "Built artifacts",
                 "/home/u/.cache/minimal/built".to_string(),
+            ),
+            (
+                "Cache",
+                "Mirror store",
+                "/home/u/.cache/minimal/mirror".to_string(),
             ),
         ];
         // Mesh enrolment prints under Config, right after "Loadouts
@@ -377,6 +411,7 @@ mod tests {
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
             provider: paths::ProviderKind::Minimald,
+            mirror: MirrorDirs::new(PathBuf::from("/s/mirror"), PathBuf::from("/x/mirror")),
         };
         let rows = build_dir_rows(&dirs);
         let daemon_logs = rows.iter().find(|r| r.name == "Daemon logs").unwrap();
@@ -400,6 +435,7 @@ mod tests {
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
             provider: paths::ProviderKind::Minimald,
+            mirror: MirrorDirs::new(PathBuf::from("/s/mirror"), PathBuf::from("/x/mirror")),
         };
         let native_sessions = build_dir_rows(&native)
             .into_iter()
@@ -417,6 +453,7 @@ mod tests {
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
             provider: paths::ProviderKind::Minvmd,
+            mirror: MirrorDirs::new(PathBuf::from("/s/mirror"), PathBuf::from("/x/mirror")),
         };
         let vm_sessions = build_dir_rows(&vm)
             .into_iter()
@@ -461,6 +498,7 @@ mod tests {
             state: PathBuf::from("/override"),
             cache: PathBuf::from("/x"),
             provider: paths::ProviderKind::Minimald,
+            mirror: MirrorDirs::new(PathBuf::from("/s/mirror"), PathBuf::from("/x/mirror")),
         };
         let rows = build_dir_rows(&dirs);
         let mesh = rows.iter().find(|r| r.name == "Mesh enrolment").unwrap();

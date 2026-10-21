@@ -2089,6 +2089,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let global = GlobalArgs {
             minimal_dir: Some(state.path().to_path_buf()),
+            config_dir: Some(crate::config::mirror_disabled_config_dir(state.path())),
             no_input: true,
             ..Default::default()
         };
@@ -2176,6 +2177,7 @@ mod tests {
         let global = GlobalArgs {
             provider: Some(Provider::LocalMinvmd),
             minimal_dir: Some(state.path().to_path_buf()),
+            config_dir: Some(crate::config::mirror_disabled_config_dir(state.path())),
             no_input: true,
             ..Default::default()
         };
