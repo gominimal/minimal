@@ -6,7 +6,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
@@ -874,11 +873,27 @@ impl Loader for DiskLoader {
             }
         }
 
-        let uuid = Uuid::now_v7();
-        record.id = SessionId(uuid);
+        // The box id is the record's one key. A box the VM host registered
+        // arrives with the id the host minted outside the VM, and the record
+        // is filed under it. Any other box gets an id minted here. A client
+        // never names the key: `record.id` is overwritten either way.
+        let id = record.box_id.unwrap_or_else(SessionId::mint);
+        if id.is_nil() || self.index.short_by_id(&id).is_some() {
+            tracing::warn!(
+                box_id = %id,
+                "refused to create a box record under an id a retained record already holds"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "box id {id} already names a box on this host, so this box was not created"
+                ),
+            ));
+        }
+        record.id = id;
 
-        let uuid_str = uuid.simple().to_string();
-        let mut short = uuid_str[uuid_str.len() - 5..].to_string();
+        let id_hex = id.simple();
+        let mut short = id_hex[id_hex.len() - 5..].to_string();
         // We got unlucky and the short name collided, 20 bits of entropy
         // so rare but very possible. Increment the short name past
         // any collisions in this case.
@@ -890,12 +905,11 @@ impl Loader for DiskLoader {
 
         self.write_record(&short, &record)?;
 
-        self.index
-            .insert(short.clone(), SessionId(uuid), record.name);
+        self.index.insert(short.clone(), id, record.name);
         self.flush_index()?;
 
         Ok(DiskBoxKey {
-            session_id: SessionId(uuid),
+            session_id: id,
             dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
     }
@@ -1177,6 +1191,7 @@ mod tests {
     use paths::HostAbsPath;
     use std::{collections::BTreeSet, io::ErrorKind};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn loader_dir(tmp: &TempDir) -> DaemonAbsPath {
         DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
@@ -1267,6 +1282,99 @@ mod tests {
         );
     }
 
+    /// A record written before the session id and the box id merged into
+    /// one type carries the record's id in the hyphenated form and the
+    /// host-handed id as 32 hex digits. The store reads it from disk under
+    /// the same id, and writes both fields back in the spelling they were
+    /// read in, so the file a newer daemon saves reads the same to an
+    /// older one.
+    #[test]
+    fn record_json_written_before_the_merge_round_trips() {
+        const OLD_ID: &str = "0190b3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b";
+        const OLD_BOX_ID: &str = "0190b3c45d6e7f809a1b2c3d4e5f6a7b";
+
+        // The pre-merge record: every other field as a record writes it,
+        // and the two ids spelled the way each type wrote them then.
+        let mut old = serde_json_lenient::to_value(sample_record()).unwrap();
+        old["id"] = serde_json_lenient::Value::String(OLD_ID.to_string());
+        old["box_id"] = serde_json_lenient::Value::String(OLD_BOX_ID.to_string());
+        let old_bytes = serde_json_lenient::to_vec(&old).unwrap();
+
+        // Read straight from the bytes: both spellings name the one id.
+        let read: Record = serde_json_lenient::from_slice(&old_bytes).unwrap();
+        let expected = SessionId::parse_str(OLD_ID).unwrap();
+        assert_eq!(read.id, expected);
+        assert_eq!(read.box_id, Some(expected), "the hex spelling reads as the same id");
+        assert_eq!(read.id.to_string(), OLD_ID);
+        assert_eq!(read.id.simple(), OLD_BOX_ID);
+        let rewritten = serde_json_lenient::to_value(&read).unwrap();
+        assert_eq!(rewritten, old, "a read and a write leave every field as it was");
+
+        // Read through the store, from a record planted on disk.
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let dir = root.as_utf8_path().join("sessions").join("a6a7b");
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        std::fs::write(dir.join("record.json").as_std_path(), &old_bytes).unwrap();
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader
+            .find_by_id(&expected)
+            .unwrap()
+            .expect("the old record is indexed under its id");
+        assert_eq!(key.id(), &expected);
+        let by_name = loader.find_by_name("my-session").unwrap().expect("found by name");
+        assert_eq!(by_name.id(), &expected, "a name resolves to the same id");
+        let got = loader.get(&key).unwrap().record().clone();
+        assert_eq!(got, read);
+
+        // Save it back and read the file: the same spellings, the same values.
+        loader.save(&key, &got).unwrap();
+        let saved: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(dir.join("record.json").as_std_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, old, "a saved record keeps the pre-merge bytes of both ids");
+    }
+
+    /// A box the VM host registered is filed under the id the host minted
+    /// for it: the record's key and its handed id are one id.
+    #[test]
+    fn create_keys_the_record_by_the_handed_box_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let handed = SessionId::mint();
+        let mut input = sample_record();
+        input.box_id = Some(handed);
+        let key = loader.create(input).unwrap();
+
+        assert_eq!(key.id(), &handed);
+        let stored = loader.get(&key).unwrap();
+        assert_eq!(stored.record().id, handed);
+        assert_eq!(stored.record().box_id, Some(handed));
+    }
+
+    /// A handed id that a retained record already names is refused, and
+    /// the store is unchanged (BEP-070).
+    #[test]
+    fn create_refuses_a_box_id_a_retained_record_holds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let handed = SessionId::mint();
+        let mut first = sample_record();
+        first.box_id = Some(handed);
+        loader.create(first).unwrap();
+
+        let mut second = sample_record();
+        second.name = Some("second".to_string());
+        second.box_id = Some(handed);
+        let err = loader.create(second).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(loader.keys().count(), 1, "the refused create adds nothing");
+        assert!(loader.find_by_name("second").unwrap().is_none());
+    }
+
     #[test]
     fn create_assigns_a_fresh_id_and_key_uuid_matches_stored_record() {
         let tmp = TempDir::new().unwrap();
@@ -1276,7 +1384,7 @@ mod tests {
         input.id = SessionId::nil();
         let key = loader.create(input).unwrap();
 
-        assert_ne!(key.id().0, Uuid::nil(), "create must overwrite caller id");
+        assert_ne!(*key.id().as_ref(), Uuid::nil(), "create must overwrite caller id");
         let stored = loader.get(&key).unwrap();
         assert_eq!(&stored.record().id, key.id());
     }
@@ -1508,7 +1616,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("host".to_string());
         std::fs::write(
             orphan_dir.join("record.json").as_std_path(),
@@ -1611,7 +1719,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("bad name/y".to_string());
         std::fs::write(
             orphan_dir.join("record.json").as_std_path(),
@@ -1641,7 +1749,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("dot.ted.name".to_string());
         std::fs::write(
             orphan_dir.join("record.json").as_std_path(),
@@ -1993,7 +2101,7 @@ mod tests {
         let before = loader.get(&key).unwrap().record().clone();
 
         let mut tampered = before.clone();
-        tampered.id = SessionId(uuid::Uuid::from_u128(0xCAFE_BABE));
+        tampered.id = SessionId::from(uuid::Uuid::from_u128(0xCAFE_BABE));
         tampered.username = Some("intruder".into());
 
         let err = loader.save(&key, &tampered).unwrap_err();
@@ -2084,7 +2192,7 @@ mod tests {
         // directly: a new session dir at the freed short with a
         // freshly-minted record id, then surface it to the loader by
         // re-opening (self-heal picks it up as an orphan).
-        let new_id = SessionId(uuid::Uuid::from_u128(0xFACE_FEED));
+        let new_id = SessionId::from(uuid::Uuid::from_u128(0xFACE_FEED));
         assert_ne!(new_id, stale_id, "test setup: ids must differ");
         let sessions_dir = loader_dir(&tmp).as_utf8_path().join("sessions");
         let dir = sessions_dir.join(&stale_short);
@@ -2166,7 +2274,7 @@ mod tests {
 
         // We can't make `create` reliably collide on the 20-bit short, so we
         // craft the on-disk state directly at the freed short.
-        let new_id = SessionId(uuid::Uuid::from_u128(0xFACE_FEED));
+        let new_id = SessionId::from(uuid::Uuid::from_u128(0xFACE_FEED));
         assert_ne!(new_id, *stale_key.id(), "test setup: ids must differ");
         let dir = loader_dir(tmp)
             .as_utf8_path()
@@ -2377,7 +2485,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         let record_file = orphan_dir.join("record.json");
         let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
         std::fs::write(record_file.as_std_path(), buf).unwrap();
@@ -2412,7 +2520,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("MY-SESSION".to_string());
         let record_file = orphan_dir.join("record.json");
         let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
