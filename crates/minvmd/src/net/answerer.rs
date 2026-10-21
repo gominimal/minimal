@@ -4753,12 +4753,12 @@ mod tests {
         let registered = RegisteredTables::new();
         registered.claim_own("a-node", &rows);
         assert_eq!(
-            registered.allocate("a-node", &box_zone_name("web")),
+            registered.allocate("a-node", &box_zone_name("web"), None),
             Ok(web.loopback_addr()),
             "the dormant creation's address is claimed for its own name"
         );
         let peer = registered
-            .allocate("a-node", &box_zone_name("peer"))
+            .allocate("a-node", &box_zone_name("peer"), None)
             .expect("a fresh name draws an address");
         assert_ne!(peer, web.loopback_addr());
     }

@@ -1569,6 +1569,8 @@ fn allocate_box_address(
     answerer: &AnswererStatus,
     name: &str,
 ) -> Result<std::net::Ipv4Addr, BoxControlReply> {
+    // None: a fresh registration has no earlier address to keep. Only a
+    // resume knows the address its box was created at.
     allocate_box_address_keeping(answerer, name, None)
 }
 
