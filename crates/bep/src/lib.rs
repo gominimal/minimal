@@ -14,6 +14,7 @@
 pub mod audit;
 pub mod ca;
 pub mod control;
+pub mod forward;
 pub mod handle;
 pub mod http;
 pub mod keys;
