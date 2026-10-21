@@ -968,8 +968,11 @@ where
 /// where no process inside the VM can predict or arrange it, and its row
 /// holds that id. On a VM guest the in-VM store still mints
 /// [`Record::id`] inside the VM, so there the box's id is
-/// [`Record::box_id`] until BOX-002 files the record under it. Both are
-/// this type. A client never presents one of its own.
+/// [`Record::box_id`] until
+/// <https://github.com/gominimal/minimal/issues/2397> files the record
+/// under it. That interim ends when `DiskLoader::create` keys a record by
+/// a handed `config.box_id` instead of minting one. Both are this type. A
+/// client never presents one of its own.
 ///
 /// Unique per creation by construction: a box recreated with the same
 /// name and the same addresses is a new box, and its id says so. Ids are
@@ -979,13 +982,15 @@ where
 /// acceptor that reads a delivered header refuses it like any other id
 /// the source's attachment does not hold.
 ///
-/// One id has one printed spelling: the hyphenated UUID form ([`Display`]
-/// and the default serde form), which is what a record on disk, a reply,
-/// a log line and `min ls` all show. The VM host's box control wire spells
-/// the same 16 bytes as 32 lowercase hex digits; its fields keep that
-/// spelling through [`box_id_hex`]. A reader accepts either spelling, so a
-/// record or a reply written before the two id types merged reads back as
-/// the same id.
+/// One id has one printed spelling for each surface. The hyphenated UUID
+/// form ([`Display`] and the default serde form) is what a record on disk,
+/// a reply, a log line and `min ls` all show. An audit record spells the
+/// same 16 bytes as 32 lowercase hex digits (`Uuid::simple`): the BEP
+/// audit `subject`, the ask audit record's `box_id` and every
+/// `box-admissions.log` line. The VM host's box control wire uses the same
+/// 32-hex spelling, and its fields keep it through [`box_id_hex`]. A
+/// reader accepts either spelling, so a record or a reply written before
+/// the two id types merged reads back as the same id.
 ///
 /// Ordered by its bytes, which for a `UUIDv7` is the order of its mint
 /// time: a map keyed by box id holds its boxes in creation order.
@@ -1216,7 +1221,9 @@ pub struct Record {
     /// The record's key: the id the store files this record under, and
     /// the id every event and reply names the box by. On a VM guest it is
     /// the in-VM store's key, not the id the VM host minted: that one is
-    /// [`Self::box_id`]. Written in the hyphenated form, and read in
+    /// [`Self::box_id`] until
+    /// <https://github.com/gominimal/minimal/issues/2397> files the record
+    /// under the handed id. Written in the hyphenated form, and read in
     /// either spelling.
     #[serde(default = "BoxId::nil")]
     pub id: BoxId,

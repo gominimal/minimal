@@ -1301,7 +1301,8 @@ impl BoxManager {
         // catches a name collision (`AlreadyExists`) before any actor exists.
         // On a VM guest the box id is the one the VM host handed in
         // `config.box_id`, and the in-VM store still mints the record key
-        // (BOX-002 files the record under the handed id). Elsewhere the
+        // (https://github.com/gominimal/minimal/issues/2397 files the
+        // record under the handed id). Elsewhere the
         // record key is the box id.
         let handed_box_id = config.box_id;
         let record = build_record(config, username, boxes::BoxState::Pending)?;

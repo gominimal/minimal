@@ -140,10 +140,12 @@ impl Attachment {
     }
 }
 
-/// A box id rendered for a log line or an audit record: the hyphenated
-/// UUID form, the same spelling `minimald` logs and a reply's id prints
+/// A box id rendered for a log line only: the hyphenated UUID form, the
+/// same spelling `minimald` logs and a reply's id prints
 /// ([`minimald_rpc::BoxId`]'s `Display`), so a tail can compare a line
-/// from each daemon for the same box.
+/// from each daemon for the same box. An audit record does not use it: it
+/// spells the id as 32 lowercase hex digits, the form
+/// `bep::listener::box_id_text` gives every BEP audit `subject`.
 pub(crate) struct BoxIdText<'a>(pub(crate) &'a BoxId);
 
 impl fmt::Display for BoxIdText<'_> {
