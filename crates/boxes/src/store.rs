@@ -1304,11 +1304,18 @@ mod tests {
         let read: Record = serde_json_lenient::from_slice(&old_bytes).unwrap();
         let expected = SessionId::parse_str(OLD_ID).unwrap();
         assert_eq!(read.id, expected);
-        assert_eq!(read.box_id, Some(expected), "the hex spelling reads as the same id");
+        assert_eq!(
+            read.box_id,
+            Some(expected),
+            "the hex spelling reads as the same id"
+        );
         assert_eq!(read.id.to_string(), OLD_ID);
         assert_eq!(read.id.simple(), OLD_BOX_ID);
         let rewritten = serde_json_lenient::to_value(&read).unwrap();
-        assert_eq!(rewritten, old, "a read and a write leave every field as it was");
+        assert_eq!(
+            rewritten, old,
+            "a read and a write leave every field as it was"
+        );
 
         // Read through the store, from a record planted on disk.
         let tmp = TempDir::new().unwrap();
@@ -1322,7 +1329,10 @@ mod tests {
             .unwrap()
             .expect("the old record is indexed under its id");
         assert_eq!(key.id(), &expected);
-        let by_name = loader.find_by_name("my-session").unwrap().expect("found by name");
+        let by_name = loader
+            .find_by_name("my-session")
+            .unwrap()
+            .expect("found by name");
         assert_eq!(by_name.id(), &expected, "a name resolves to the same id");
         let got = loader.get(&key).unwrap().record().clone();
         assert_eq!(got, read);
@@ -1333,7 +1343,10 @@ mod tests {
             &std::fs::read(dir.join("record.json").as_std_path()).unwrap(),
         )
         .unwrap();
-        assert_eq!(saved, old, "a saved record keeps the pre-merge bytes of both ids");
+        assert_eq!(
+            saved, old,
+            "a saved record keeps the pre-merge bytes of both ids"
+        );
     }
 
     /// A box the VM host registered is filed under the id the host minted
@@ -1384,7 +1397,11 @@ mod tests {
         input.id = SessionId::nil();
         let key = loader.create(input).unwrap();
 
-        assert_ne!(*key.id().as_ref(), Uuid::nil(), "create must overwrite caller id");
+        assert_ne!(
+            *key.id().as_ref(),
+            Uuid::nil(),
+            "create must overwrite caller id"
+        );
         let stored = loader.get(&key).unwrap();
         assert_eq!(&stored.record().id, key.id());
     }

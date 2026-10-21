@@ -1085,9 +1085,8 @@ impl<'de> Deserialize<'de> for BoxId {
 /// Reads a box id from either spelling. The error names both spellings,
 /// so a reader of a log line sees what a box id looks like.
 fn box_id_from_text(text: &str) -> Result<BoxId, String> {
-    BoxId::parse_str(text).map_err(|_| {
-        format!("a box id is a UUID or 32 hex digits (16 bytes); got `{text}`")
-    })
+    BoxId::parse_str(text)
+        .map_err(|_| format!("a box id is a UUID or 32 hex digits (16 bytes); got `{text}`"))
 }
 
 /// The serde adapter for a field whose wire spells a [`BoxId`] as 32
