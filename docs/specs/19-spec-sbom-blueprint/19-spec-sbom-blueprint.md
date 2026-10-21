@@ -293,7 +293,8 @@ developer running agent boxes; build-infra operator; auditor.
     every file import or export carries only its project-root-relative
     path and no absolute path, every copied purl has no qualifiers and no
     subpath, fields(imported(d)) ⊆ {name, version, purl, digests, tool name,
-    tool version} for every document d, for all credentials v in
+    tool version, location} for every document d, every imported location
+    reduced to scheme://host[:port], for all credentials v in
     credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where every v is at
     least 16 characters drawn so that no v is a substring of any declared
     input, package name or version of c, and planted_in_paths(c) plants one
