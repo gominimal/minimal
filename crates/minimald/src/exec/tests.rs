@@ -1029,14 +1029,16 @@ async fn lost_exec_client_kills_only_its_own_process() {
 }
 
 /// BOX-150: a plain exec, neither a PTY exec nor detached, ends when its
-/// client disconnects, and the box it ran in keeps running. The bridge
-/// drives a real child in the shim's place, as `BoxExec` spawns it. On
-/// client loss the daemon SIGTERMs the shim, which forwards it to the
-/// exec's process group (the `nsenter` tests prove that half). The daemon
-/// then waits, and SIGKILLs a shim that is still alive. This stand-in
+/// client disconnects. The bridge drives a real child in the shim's
+/// place, as `BoxExec` spawns it. On client loss the daemon SIGTERMs the
+/// shim, waits, and SIGKILLs a shim that is still alive. This stand-in
 /// traps and ignores SIGTERM, so the test sees each step: the SIGTERM
 /// lands, the wait runs its full length, and the SIGKILL ends the child.
-/// A separate process stands in for the box and must still run.
+///
+/// The shim forwards that SIGTERM to the exec's process group in
+/// `on_term_or_hup`. No test reaches that path yet: the `nsenter` tests
+/// send SIGKILL only. `exec_client_loss_ends_exec_keeps_box_record` in
+/// `end_to_end` proves that the box keeps running.
 #[tokio::test]
 async fn exec_client_loss_ends_exec_keeps_box() {
     use std::time::{Duration, Instant};
@@ -1044,13 +1046,6 @@ async fn exec_client_loss_ends_exec_keeps_box() {
     use tokio::time::timeout;
 
     use super::TokioProcess;
-
-    // The box: a long-lived process the exec does not own.
-    let mut box_process = tokio::process::Command::new("sleep")
-        .arg("600")
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawning the stand-in box");
 
     let dir = tempfile::tempdir().expect("a temp dir for the SIGTERM marker");
     let term_marker = dir.path().join("term");
@@ -1125,12 +1120,6 @@ async fn exec_client_loss_ends_exec_keeps_box() {
     // SAFETY: signal 0 only checks that the pid exists; it sends nothing.
     let alive = unsafe { libc::kill(exec_pid as libc::pid_t, 0) } == 0;
     assert!(!alive, "the SIGKILL ends an exec that ignores SIGTERM");
-
-    assert!(
-        box_process.try_wait().expect("polling the box").is_none(),
-        "the box keeps running after its exec's client is lost"
-    );
-    let _ = box_process.kill().await;
 }
 
 /// gominimal/inbox#813: a lost client on the *read* side — the SSH
@@ -2037,6 +2026,50 @@ mod end_to_end {
     /// from before the flag sent — keeps the box for whoever holds it.
     /// After the exec has returned, and the moment a stray destroy would
     /// have needed, the session is still listed.
+    /// BOX-150: when the client of a plain exec (no PTY, not detached)
+    /// disconnects, the daemon ends the exec and the box keeps running.
+    /// The client opens the exec and then drops its connection while the
+    /// exec is open or just after the daemon accepts it. A new client must
+    /// still find the session in the daemon's own list.
+    #[tokio::test]
+    async fn exec_client_loss_ends_exec_keeps_box_record() {
+        use std::time::Duration;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id =
+            active_session_with_echo_task(&server, &mut client, "plain-exec-client-loss").await;
+        let session_str = session_id.to_string();
+
+        // The client owns its connection, so aborting this task drops
+        // the connection with the exec still open.
+        let exec_task = tokio::spawn(async move {
+            client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::Argv(vec!["sleep".to_string(), "600".to_string()]).encode(),
+                    &[],
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        exec_task.abort();
+        let _ = exec_task.await;
+
+        // The client is gone. Give the moment a stray destroy would have
+        // needed before asserting.
+        let mut observer = server.connect().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let listed = observer.call::<minimald_rpc::ListSessions>(&()).await;
+        assert_eq!(
+            listed.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![session_id],
+            "losing a plain exec's client must not end its box; got {:?}",
+            listed.sessions,
+        );
+    }
+
     #[tokio::test]
     async fn run_box_survives_when_run_keeps_it() {
         let server = TestServer::new().await;
