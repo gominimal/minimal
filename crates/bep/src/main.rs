@@ -198,6 +198,13 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<(), String> {
 /// (<https://github.com/gominimal/minimal/issues/2440>). Until one can,
 /// every leaf is refused, and the proxy answers an admitted CONNECT with
 /// `502`.
+///
+/// This issuer is also the only thing that keeps `bep serve` off
+/// `proxy::relay`, which forwards requests with no per-request decision, no
+/// handle redemption and no admit audit record (Gatehouse §6.10). A signing
+/// Keychain key (#2440) alone does not lift this interim. `bep serve` must
+/// not reach `relay` until the redemption decision is wired into it, which
+/// is T11 (<https://github.com/gominimal/minimal/issues/2272>).
 struct NoSigningKey;
 
 impl LeafIssuer for NoSigningKey {
@@ -232,8 +239,11 @@ fn serve(args: &ServeArgs) -> Result<(), String> {
     })?;
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
-    // The store rules' authorities join the admitted set when the rules are
-    // read at start. Until then the GitHub module's host set is the set.
+    // The store rules' authorities join the admitted set when
+    // `[secret-store-rules]` is read at start, which is T25
+    // (https://github.com/gominimal/minimal/issues/2280). Until it lands the
+    // GitHub module's host set is the set, so a CONNECT to a registered store
+    // authority is refused and audited `off_module`.
     let proxy = Proxy::new(
         Admission::new(&[GITHUB], [("", 0); 0]),
         Arc::new(NoSigningKey),
@@ -254,7 +264,9 @@ fn serve(args: &ServeArgs) -> Result<(), String> {
         let control_socket = Control::bind(&control, Registry::default())
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
-            "no CA key can sign a leaf certificate yet, so every admitted CONNECT is answered 502"
+            "no CA key can sign a leaf certificate yet, so every admitted CONNECT is answered 502. \
+             A signing key (#2440) alone must not lift this: requests reach the upstream only \
+             after the redemption decision is wired into the relay (#2272)"
         );
         tracing::info!(
             listener = %args.listener.display(),

@@ -404,9 +404,15 @@ impl Proxy {
                 stream,
                 403,
                 "Forbidden",
-                &format!(
-                    "The Box Egress Proxy refused the {scheme}:// request to {host}. It sends requests to {host} over HTTPS only. Use https://{host}/ in place of {scheme}://{host}/."
-                ),
+                &if scheme == "https" {
+                    format!(
+                        "The Box Egress Proxy refused the https:// request to {host}. It carries https to {host} through CONNECT only."
+                    )
+                } else {
+                    format!(
+                        "The Box Egress Proxy refused the {scheme}:// request to {host}. It sends requests to {host} over HTTPS only. Use https://{host}/ in place of {scheme}://{host}/."
+                    )
+                },
             )
             .await;
             return Ended::Refused(UPSTREAM_NOT_TLS);
@@ -709,6 +715,15 @@ impl http::AuditSink for HeadAudit {
 /// The flow ends when it passes no bytes in either direction for `idle`.
 /// It also ends when the upstream closes: the request half then reads end
 /// of file from the box, so its blocking thread returns at once.
+///
+/// This forwards every request head with no per-request decision, no handle
+/// redemption and no admit audit record. Gatehouse §6.10 requires all three.
+/// `bep serve` must not reach this function until the redemption decision is
+/// wired into it, which is T11
+/// (<https://github.com/gominimal/minimal/issues/2272>). Today only the
+/// `NoSigningKey` issuer in `bep serve` keeps it off this path. A signing
+/// Keychain key (<https://github.com/gominimal/minimal/issues/2440>) alone
+/// does not lift that interim.
 async fn relay<B, U>(
     box_id: &str,
     boxed: B,
@@ -1318,6 +1333,24 @@ mod tests {
         .await;
         assert!(answer.starts_with("HTTP/1.1 403 Forbidden"), "{answer}");
         assert!(answer.contains("Use https://api.github.com/"), "{answer}");
+        assert_eq!(
+            h.audit.lock().unwrap().last().unwrap().marker.as_deref(),
+            Some(UPSTREAM_NOT_TLS)
+        );
+
+        // An https:// absolute-form target is refused the same way, and the
+        // message names CONNECT, not the URL the box already used.
+        let answer = exchange(
+            &h.proxy,
+            b"GET https://api.github.com/zen HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 403 Forbidden"), "{answer}");
+        assert!(
+            answer.contains("It carries https to api.github.com through CONNECT only."),
+            "{answer}"
+        );
+        assert!(!answer.contains("in place of"), "{answer}");
         assert_eq!(
             h.audit.lock().unwrap().last().unwrap().marker.as_deref(),
             Some(UPSTREAM_NOT_TLS)
