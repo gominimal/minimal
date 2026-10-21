@@ -69,7 +69,7 @@ Precedence, for when it exists: the closure entry decides first, and a
 recorded registry decides only for a package the closure holds no entry
 for; a package with an `artifact` entry has a digest whatever registry is
 recorded, and one with a `built-locally` or `non-redistributable` entry has
-that gap. Those are the only kinds a package can be. An upstream package
+that gap. Those are the only kinds an emitted component can have. An upstream package
 with no closure entry, or any package whose entry is of any other state
 (whatever registry is recorded for it: the entry decides first, and an
 entry the closure format does not define is a broken pin), is neither a
@@ -108,10 +108,11 @@ BEP). The Blueprint carries that label per axis (SBOM-006).
 package under SBOM-013's names, beside its artifact; a fixture box then emits
 validated CycloneDX 1.5 and minimal-valid SPDX 2.3 over it, byte-stable
 across regenerations against a fixture cache whose document bytes are
-fixed (the slice's guarantee is SBOM-001's unconditional one over that
-fixture; in production, while the pin records no bundle, SBOM-001's interim
-sub-bullet is the guarantee, and the slice's output carries the `partial`
-mark and the `no-bundle` reason). CycloneDX 1.5 is the SBOM format because it is the one
+fixed (the fixture is byte-stable because those bytes never change, which
+is SBOM-001's interim sub-bullet with an empty set of replaced documents,
+not its unconditional guarantee, since the fixture pins no bundle; in
+production the same interim sub-bullet is the guarantee, and the slice's
+output carries the `partial` mark and the `no-bundle` reason). CycloneDX 1.5 is the SBOM format because it is the one
 scanners read today; the 2.0 draft is used for the Blueprint only.
 
 ## Users and stories
