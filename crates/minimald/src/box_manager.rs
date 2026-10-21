@@ -81,9 +81,8 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
 /// with the network mode (R2.1) — so an invalid session is never
-/// written to the store. The `id` field is left as `nil`. At `create` the
-/// store files the record under the box id the VM host handed it
-/// (`config.box_id`), or mints one when no host handed an id.
+/// written to the store. The `id` field is left as `nil`; the store
+/// mints the record's box id at `create` time.
 ///
 /// The `CreateSession` handler always persists the record as
 /// `Pending`; the session actor's create flow promotes it to
@@ -1300,16 +1299,14 @@ impl BoxManager {
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
-        let handed_box_id = config.box_id.is_some();
         let record = build_record(config, username, boxes::BoxState::Pending)?;
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
-        // One id names the box from here on: the record's key, the session
-        // id every later line carries, and the id the VM host's row holds.
+        // One id names the box from here on: the record's key, and the
+        // session id every later line carries.
         tracing::info!(
             session_id = %session_id,
             box_id = %session_id,
-            handed_box_id,
             "filed the box record under its box id"
         );
 

@@ -63,15 +63,15 @@ pub use switch::bep_host::BoxId;
 /// attachment does not hold.
 ///
 /// The bytes are those of [`mint_record_box_id`]: the one box id type the
-/// in-VM daemon files the box's record under. The switch and the delivery
+/// in-VM daemon keys the box's record by. The switch and the delivery
 /// header carry the same 16 bytes.
 pub fn mint_box_id() -> BoxId {
     mint_record_box_id().to_bytes()
 }
 
-/// Mints the box id as the one box id type: the key the in-VM daemon files
-/// the box's record under, the id the registration reply hands back, and
-/// the id the attachment holds (BOX-002). [`mint_box_id`] is the same mint,
+/// Mints the box id as the one box id type: the type the in-VM daemon keys
+/// the box's record by, the id the registration reply hands back, and the
+/// id the attachment holds. [`mint_box_id`] is the same mint,
 /// in the 16 raw bytes the switch carries.
 #[must_use]
 pub fn mint_record_box_id() -> minimald_rpc::BoxId {
@@ -319,9 +319,8 @@ mod tests {
     use super::*;
 
     /// The VM host mints the one box id type: the minted id is the type a
-    /// box record is keyed by, so the id the host hands back is the key the
-    /// in-VM daemon files the record under. The raw bytes the switch
-    /// carries and the log spelling name the same id.
+    /// box record is keyed by. The raw bytes the switch carries and the
+    /// log spelling name the same id.
     #[test]
     fn minted_box_id_is_the_record_key_type() {
         let minted: minimald_rpc::BoxId = mint_record_box_id();

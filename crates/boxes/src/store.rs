@@ -873,23 +873,9 @@ impl Loader for DiskLoader {
             }
         }
 
-        // The box id is the record's one key. A box the VM host registered
-        // arrives with the id the host minted outside the VM, and the record
-        // is filed under it. Any other box gets an id minted here. A client
-        // never names the key: `record.id` is overwritten either way.
-        let id = record.box_id.unwrap_or_else(SessionId::mint);
-        if id.is_nil() || self.index.short_by_id(&id).is_some() {
-            tracing::warn!(
-                box_id = %id,
-                "refused to create a box record under an id a retained record already holds"
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "box id {id} already names a box on this host, so this box was not created"
-                ),
-            ));
-        }
+        // The box id is the record's one key, minted here: a client never
+        // names it, so `record.id` is overwritten whatever it held.
+        let id = SessionId::mint();
         record.id = id;
 
         let id_hex = id.simple();
@@ -1347,45 +1333,6 @@ mod tests {
             saved, old,
             "a saved record keeps the pre-merge bytes of both ids"
         );
-    }
-
-    /// A box the VM host registered is filed under the id the host minted
-    /// for it: the record's key and its handed id are one id.
-    #[test]
-    fn create_keys_the_record_by_the_handed_box_id() {
-        let tmp = TempDir::new().unwrap();
-        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
-
-        let handed = SessionId::mint();
-        let mut input = sample_record();
-        input.box_id = Some(handed);
-        let key = loader.create(input).unwrap();
-
-        assert_eq!(key.id(), &handed);
-        let stored = loader.get(&key).unwrap();
-        assert_eq!(stored.record().id, handed);
-        assert_eq!(stored.record().box_id, Some(handed));
-    }
-
-    /// A handed id that a retained record already names is refused, and
-    /// the store is unchanged (BEP-070).
-    #[test]
-    fn create_refuses_a_box_id_a_retained_record_holds() {
-        let tmp = TempDir::new().unwrap();
-        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
-
-        let handed = SessionId::mint();
-        let mut first = sample_record();
-        first.box_id = Some(handed);
-        loader.create(first).unwrap();
-
-        let mut second = sample_record();
-        second.name = Some("second".to_string());
-        second.box_id = Some(handed);
-        let err = loader.create(second).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(loader.keys().count(), 1, "the refused create adds nothing");
-        assert!(loader.find_by_name("second").unwrap().is_none());
     }
 
     #[test]

@@ -964,15 +964,14 @@ where
 /// reply names a box by, minted once per box outside the box's host VM,
 /// with its random fields from the host's OS CSPRNG (BEP-070): never a
 /// counter, never a digest of the box's facts, never anything a process
-/// inside the VM could predict or arrange. On a VM host the host-side
-/// registration mints it and hands it back, and the in-VM daemon files the
-/// record under it. Elsewhere the daemon's store mints it at creation. A
-/// client never presents one of its own.
+/// inside the VM could predict or arrange. The daemon's store mints a
+/// record's id at creation, and on a VM host the host-side registration
+/// mints the id its row holds. Both are this type. A client never presents
+/// one of its own.
 ///
 /// Unique per creation by construction: a box recreated with the same
 /// name and the same addresses is a new box, and its id says so. Ids are
-/// never reused — the store refuses a creation whose id a retained record
-/// already names — so a revocation scoped to an id stays scoped forever.
+/// never reused, so a revocation scoped to an id stays scoped forever.
 /// The all-zero id is not a mint's output and never names a live box: a
 /// record read without an id carries it until it is migrated, and the
 /// acceptor that reads a delivered header refuses it like any other id
@@ -1213,9 +1212,8 @@ impl HostIpEnforcement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// The box's id: the one key the store files this record under, and
-    /// the id every event and reply names the box by. On a VM host it is
-    /// the id the registration handed back ([`Self::box_id`]). Written in
-    /// the hyphenated form, and read in either spelling.
+    /// the id every event and reply names the box by. Written in the
+    /// hyphenated form, and read in either spelling.
     #[serde(default = "BoxId::nil")]
     pub id: BoxId,
     /// The name a user assigned to this session, if
