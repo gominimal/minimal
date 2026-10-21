@@ -1940,7 +1940,8 @@ impl PatchWalkBranch {
 
     /// Whether `dir` is on the branch `from`: walking it again is a cycle.
     fn holds(from: Option<&std::rc::Rc<Self>>, dir: &std::path::Path) -> bool {
-        std::iter::successors(from.map(std::rc::Rc::as_ref), |b| b.parent.as_deref()).any(|b| b.dir == dir)
+        std::iter::successors(from.map(std::rc::Rc::as_ref), |b| b.parent.as_deref())
+            .any(|b| b.dir == dir)
     }
 }
 
