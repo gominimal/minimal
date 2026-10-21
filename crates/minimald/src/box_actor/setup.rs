@@ -780,7 +780,7 @@ impl BoxActor {
     ///
     /// [`Config`]: mctx::Config
     pub(super) fn workspace_config(&self, wsp: &DaemonAbsPath) -> Result<mctx::Config, String> {
-        ConfigBuilder::new()
+        let builder = ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
             .with_state_dir(self.minimal_state_dir.as_utf8_path())
@@ -789,7 +789,8 @@ impl BoxActor {
             // task-exec path (via `MakeContext`) also feeds it, so task builds
             // surface on the same tracker even though only a mint renders it.
             .with_operation_tracker(self.tracker.clone())
-            .with_daemon_id(self.daemon_ctx.daemon_id().unwrap()) // always set under minimald
+            .with_daemon_id(self.daemon_ctx.daemon_id().unwrap()); // always set under minimald
+        through_daemon_mirror(builder, self.daemon_ctx.config())
             .build()
             .map_err(|e| mctx::Error::from(e).to_string())
     }
@@ -1019,5 +1020,75 @@ impl BoxActor {
                 Ok(true)
             }
         }
+    }
+}
+
+/// Carries the daemon's mirror into a box's build context (MIR-024): the
+/// cache objects and repository copies a box fetches go through the same
+/// door the daemon was handed, so a box never reaches an origin the daemon
+/// itself would not. A daemon without a mirror leaves the builder as it is,
+/// and the box fetches from the origins directly, as the daemon does.
+fn through_daemon_mirror(builder: ConfigBuilder, daemon: &mctx::Config) -> ConfigBuilder {
+    match daemon.mirror() {
+        Some(endpoint) => builder.with_mirror(endpoint.clone()),
+        None => builder,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::fetchers::AnyUrl;
+    use mirror_client::MirrorEndpoint;
+
+    /// MIR-024: a box's build context reads its cache objects through the
+    /// mirror the daemon was handed, not from the origin directly. The
+    /// daemon's context carries the door; every box context built from a
+    /// fresh builder has to carry it too, or `min add` inside the box
+    /// fetches past the mirror.
+    #[test]
+    fn box_context_reads_through_the_daemon_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = MirrorEndpoint::Vsock {
+            cid: 2,
+            port: mirror_client::DOOR_PORT,
+        };
+        let daemon = ConfigBuilder::new()
+            .with_cache_dir(tmp.path().join("cache"))
+            .with_state_dir(tmp.path().join("state"))
+            .with_daemon_id("test".to_string())
+            .with_mirror(endpoint.clone())
+            .build()
+            .unwrap();
+
+        let fresh = ConfigBuilder::new()
+            .with_cache_dir(tmp.path().join("cache"))
+            .with_state_dir(tmp.path().join("state"))
+            .with_daemon_id("test".to_string());
+        let config = through_daemon_mirror(fresh, &daemon).build().unwrap();
+        assert_eq!(config.mirror(), Some(&endpoint));
+        assert!(
+            matches!(config.remote_cache_url(), AnyUrl::Mirror(_)),
+            "the box reads the cache at its mount on the mirror"
+        );
+    }
+
+    /// A daemon without a mirror leaves the box context reading the
+    /// origins directly, as the daemon does.
+    #[test]
+    fn box_context_without_a_daemon_mirror_reads_the_origins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = ConfigBuilder::new()
+            .with_cache_dir(tmp.path().join("cache"))
+            .with_state_dir(tmp.path().join("state"))
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let fresh = ConfigBuilder::new()
+            .with_cache_dir(tmp.path().join("cache"))
+            .with_state_dir(tmp.path().join("state"))
+            .with_daemon_id("test".to_string());
+        let config = through_daemon_mirror(fresh, &daemon).build().unwrap();
+        assert_eq!(config.mirror(), None);
     }
 }
