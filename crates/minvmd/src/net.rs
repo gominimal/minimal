@@ -85,6 +85,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 pub(crate) mod dns_pins;
+pub(crate) mod drop_limiter;
 pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
