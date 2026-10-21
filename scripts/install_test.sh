@@ -1665,6 +1665,8 @@ stop" "$(cat "$HL8/stop.calls")" \
         grep -q "min stop --force" "$OUT"
     want_ok "with no terminal, the closing stop says it cannot ask (R5.5)" \
         grep -q "there is no terminal to confirm on" "$OUT"
+    want_err "the no-terminal closing stop does not suggest a rerun (R5.5)" \
+        grep -q "rerun with --force-stop" "$OUT"
     check "$h_minimald" "$(hash_file "$HL8/bin/minimald")" "the upgrade still completes (R5.5)"
 
     # The same mid-run session with a yes on the terminal: the closing stop

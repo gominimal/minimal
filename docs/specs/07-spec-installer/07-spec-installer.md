@@ -333,16 +333,19 @@ and prints nothing.
 This **post-swap stop** never ends a session without consent. A session can
 open in a respawned daemon while the run continues. The stop is graceful unless
 the run already has consent: `--force-stop`, `MINIMAL_INSTALL_FORCE_STOP`, or a
-yes to the pre-swap question. With consent it is `<bin>/min stop --force`. When
-the graceful stop refuses because sessions are live, the installer asks on the
+yes to the pre-swap question — and that yes covers only the sessions it listed
+at the time. Any session opened after it (or a failed listing of the live
+sessions) makes the stop graceful again for the sessions now live, so the
+installer asks again. With consent it is `<bin>/min stop --force`. When the
+graceful stop refuses because sessions are live, the installer asks on the
 terminal, as the pre-swap stop does, and a yes runs `stop --force`. On a no, or
 with no terminal, it leaves the daemon running. It tells the user to run
-`min stop` after those sessions end, or `min stop --force` to end them now. The
-upgrade still succeeds. A rerun cannot do this stop, because a rerun replaces
-nothing. Any other failure of the graceful stop falls through to
-`stop --force`, as the pre-swap stop does. When a `stop --force` of the
-post-swap stop fails, the installer says the old daemon can still be running
-and names `min stop --force`.
+`min stop` after those sessions end, or `min stop --force` to end them now —
+never to rerun the installer, which cannot do this stop, because a rerun
+replaces nothing. The upgrade still succeeds. Any other failure of the graceful
+stop falls through to `stop --force`, as the pre-swap stop does. When a
+`stop --force` of the post-swap stop fails, the installer says the old daemon
+can still be running and names `min stop --force`.
 
 The post-swap stop also runs when the run dies after the pre-swap stop, for
 example on a failed download or checksum of a later component. The installer

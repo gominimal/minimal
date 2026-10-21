@@ -852,7 +852,10 @@ sessions_live_msg='daemon has active sessions'
 # test harness can drive both answers). No terminal to ask on — CI, a
 # non-interactive shell — means nobody can consent: say so and let the caller
 # abort, rather than hang or silently destroy work. Returns non-zero when the
-# upgrade must not proceed.
+# upgrade must not proceed. The argument names the calling stop: `pre` (the
+# default) may tell the user to rerun with --force-stop, which works before
+# the swaps; `post` runs after them, where a rerun replaces nothing and could
+# never reach this stop, so it must not suggest one.
 confirm_force_stop() {
     _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
     say ""
@@ -860,8 +863,12 @@ confirm_force_stop() {
     "$bindir/min" ls >&2 </dev/null || true
     say ""
     if ! (exec <"$_tty") 2>/dev/null; then
-        say "there is no terminal to confirm on; rerun with --force-stop"
-        say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
+        if [ "${1:-pre}" = post ]; then
+            say "there is no terminal to confirm on."
+        else
+            say "there is no terminal to confirm on; rerun with --force-stop"
+            say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
+        fi
         return 1
     fi
     printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
@@ -1045,7 +1052,7 @@ stop_stale_daemon() {
         fi
         case "$_stop_out" in
             *"$sessions_live_msg"*)
-                if confirm_force_stop; then
+                if confirm_force_stop post; then
                     force_stop_stale "$_sv"
                     return 0
                 fi
