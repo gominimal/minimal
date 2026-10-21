@@ -538,26 +538,19 @@ impl BoxSession {
             // source the gate drops unconditionally (NET-085), so a box
             // whose own declared traffic is a positive control must hold one.
             let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress))?;
-            let req = CreateSessionRequest {
-                config: minimald_rpc::BoxConfig {
-                    name: Some(name),
-                    project_path: paths::HostAbsPath::try_new("/tmp")
-                        .map_err(|e| format!("project_path: {e}"))?,
-                    network,
-                    policy,
-                    // The addresses the registration handed back, so the
-                    // in-VM daemon attaches the box at its row's lease.
-                    task_addresses: Vec::new(),
-                    box_id: Some(box_id),
-                    box_addresses: Some(addresses),
-                    // The serde default, and what every non-`--no-hooks`
-                    // activation sends. This session only runs execs, so it
-                    // declares no hooks either way.
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            };
+            // Hooks stay on, the serde default and what every non-`--no-hooks`
+            // activation sends; this session only runs execs, so it declares
+            // no hooks either way.
+            let mut req = CreateSessionRequest::new(
+                name,
+                paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+                network,
+                policy,
+            );
+            // The addresses the registration handed back, so the in-VM
+            // daemon attaches the box at its row's lease.
+            req.config.box_id = Some(box_id);
+            req.config.box_addresses = Some(addresses);
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
