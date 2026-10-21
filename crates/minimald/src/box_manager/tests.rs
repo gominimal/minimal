@@ -527,6 +527,87 @@ async fn delete_during_resume_teardown_runs_the_destroy_hooks_once() {
     );
 }
 
+/// A resume teardown of a run-owned box whose record delete fails keeps
+/// its closed actor, so a later `DeleteSession` reaches that actor and
+/// removes the record without running the `on_destroy` hooks again. The
+/// store fails the record delete once. The hook appends one line per run
+/// to the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_after_a_failed_resume_teardown_runs_the_destroy_hooks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("echo ran >> {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    crate::store::test_faults::fail_next_delete(id);
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while crate::store::test_faults::delete_failure_armed(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resume's teardown never tried to delete the record",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Give the detached teardown time to finish after its failed delete,
+    // so an eviction on failure lands before the retry below.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "the failed delete must leave the record on disk",
+    );
+    assert_eq!(
+        restarted.running_count().await,
+        1,
+        "the failed teardown must keep its closed actor",
+    );
+
+    let hook_failures = restarted.delete_session(id).await.unwrap();
+    assert!(
+        hook_failures.is_empty(),
+        "the retry reported hook failures: {hook_failures:?}"
+    );
+
+    wait_for_record_gone(&restarted, id).await;
+    wait_for_no_actors(&restarted).await;
+    let lines = std::fs::read_to_string(&marker).expect("the on_destroy hook never ran");
+    assert_eq!(
+        lines.lines().count(),
+        1,
+        "the on_destroy hook must run exactly once across the retry, got {lines:?}",
+    );
+}
+
 /// The run-owned check takes only the boxes it marked: a plain
 /// session in the same store survives the restart and resumes as
 /// before, so the fix does not cost every session its restart.

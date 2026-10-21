@@ -1186,17 +1186,25 @@ impl BoxManager {
                                          box failed; the box is destroyed anyway",
                                     );
                                 }
+                                // A manager-initiated teardown does not
+                                // evict itself.
+                                if let Some(manager) = manager.upgrade() {
+                                    manager.evict(session_id).await;
+                                }
                             }
+                            // The destroy ended the actor, but its record
+                            // is still on disk. The closed actor stays in
+                            // `running`, so a later `DeleteSession` reaches
+                            // it, its destroy answers `Ok` with no hooks
+                            // run, and the fallback record delete removes
+                            // the record. Evicting here instead makes that
+                            // delete bring up a new actor, which runs the
+                            // `on_destroy` hooks a second time.
                             Err(error) => tracing::warn!(
                                 %error,
                                 "resume: destroying the run-owned box failed; \
-                                 leaving its record as it stands",
+                                 leaving its record for a later delete",
                             ),
-                        }
-                        // The destroy ended the actor either way, and a
-                        // manager-initiated teardown does not evict itself.
-                        if let Some(manager) = manager.upgrade() {
-                            manager.evict(session_id).await;
                         }
                     },
                 );
