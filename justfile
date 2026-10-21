@@ -64,11 +64,29 @@ export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS := env('MINVMD_LIFECYCLE_BOOT_TIMEOUT_
 default:
     @just --list
 
+# Installs nothing; each failed check prints the command that fixes it. The
+# list mirrors AGENTS.md §System dependencies.
+#
+# Check this host for the tools the recipes need, and print a fix for each gap.
+preflight:
+    @scripts/preflight.sh
+
+# `cross` runs the host's x86_64 Linux rustup toolchain inside its x86_64
+# image, and rustup refuses that toolchain on an arm64 Mac without
+# --force-non-host. Checking first turns rustup's install error into the fix.
+[macos]
+_preflight-cross:
+    @scripts/preflight.sh cross
+
+# Linux builds the initramfs natively when it can (scripts/build-initramfs.sh).
+[linux]
+_preflight-cross:
+
 # ── build & fetch ────────────────────────────────────────────────────────────
 #
 # Prereqs — macOS: `brew install slp/krun/libkrun zstd jq`.
 # Linux: a KVM host with kvm-group membership, Rust + protoc + jq + cpio + zstd.
-# See crates/minvmd/README.md for the manual bring-up.
+# `just preflight` checks them. See crates/minvmd/README.md for the manual bring-up.
 
 # Prebuilt from the public cache via the per-commit package index — nothing is
 # built or materialized locally (scripts/fetch-prebuilt.sh; pkgs commit pinned
@@ -104,7 +122,7 @@ gvproxy:
     @scripts/fetch-gvproxy.sh {{gvproxy}}
 
 # Cross-compile minimald → initramfs /init.
-initramfs:
+initramfs: _preflight-cross
     scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
 # Compiles the guest minimald here, then hands the binary to
@@ -447,8 +465,7 @@ test-ignored: _nextest
 #
 # clippy + tests for the Linux-only crates from a Mac (musl in Docker; not minvmd).
 [macos]
-test-cross: (_need "cross" "cargo install cross --locked")
-    @docker info >/dev/null 2>&1 || { echo "docker daemon not running (cross needs it) — start Docker Desktop or OrbStack" >&2; exit 1; }
+test-cross: _preflight-cross
     cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
     CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
 

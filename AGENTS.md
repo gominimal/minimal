@@ -112,6 +112,9 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
 
 ## System dependencies
 
+Run `just preflight` to check this host for everything below. Each failed
+check prints the command that fixes it.
+
 - **Rust**: pinned by [rust-toolchain.toml](rust-toolchain.toml) (rustup picks
   it up automatically; components `rustfmt` and `clippy`).
 - **protoc**: required by `crates/remote-proto/build.rs` (prost + tonic).
@@ -130,6 +133,12 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   Homebrew (`brew install slp/krun/libkrun`) for the VM recipes (`just up`,
   `just test-vm`, `just e2e`); `jq`, `zstd`, and `cpio` (`brew install jq zstd
   cpio`) for the `artifacts`/`initramfs` scripts those recipes run.
+  `just initramfs` and `just test-cross` build through `cross`, which needs
+  a running Docker daemon and the x86_64 Linux toolchain at the pinned
+  version. The cross-rs images are x86_64, and rustup installs that
+  toolchain on an arm64 Mac only with `--force-non-host`:
+  `rustup toolchain add <channel>-x86_64-unknown-linux-gnu --profile minimal
+  --force-non-host`.
 - **python3**, on any host: `just crates` runs it (stdlib only). The session e2e
   needs it too, because its interactive attaches run through a real pty
   ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)). Only a tty can
