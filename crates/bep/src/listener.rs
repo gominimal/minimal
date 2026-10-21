@@ -270,7 +270,7 @@ impl Listener {
         let handler = Arc::new(handler);
         let token = self.token;
         loop {
-            let (stream, _) = self.inner.accept().await?;
+            let stream = accept(&self.inner, "proxy listener").await?;
             let attachments = Arc::clone(&self.attachments);
             let handler = Arc::clone(&handler);
             tokio::spawn(async move {
@@ -345,15 +345,25 @@ pub async fn present(
 /// directory gets mode `0700` when this call creates it, and the socket
 /// gets mode `0600`. A stale socket at `path` is removed first.
 ///
+/// The socket is bound in a staging directory of mode `0700` beside `path`,
+/// given mode `0600`, and then renamed to `path`. So no other user can
+/// connect while the socket still has the umask's mode, even when the
+/// parent directory is wider than `0700`.
+///
 /// # Errors
 ///
-/// The I/O error of the directory, the removal, the bind or the mode change.
+/// The I/O error of the directory, the removal, the bind, the mode change
+/// or the rename.
 pub fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.exists()
-    {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGING: AtomicU64 = AtomicU64::new(0);
+
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !parent.exists() {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -370,9 +380,68 @@ pub fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    let staging = parent.join(format!(
+        ".bep-bind-{}-{}",
+        std::process::id(),
+        STAGING.fetch_add(1, Ordering::Relaxed)
+    ));
+    // A staging directory left by a process that had this pid is stale.
+    match std::fs::symlink_metadata(&staging) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&staging)?,
+        Ok(_) => std::fs::remove_file(&staging)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let staged = staging.join("s");
+    let bound = UnixListener::bind(&staged).and_then(|listener| {
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&staged, path)?;
+        Ok(listener)
+    });
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    bound
+}
+
+/// How long an accept loop waits after a transient accept error.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Accepts the next connection on `listener`. A transient error, such as a
+/// full descriptor table or a connection that the peer aborted, is logged
+/// with `socket` and retried after [`ACCEPT_BACKOFF`]. It does not end the
+/// accept loop.
+///
+/// # Errors
+///
+/// An accept error that is not transient.
+pub(crate) async fn accept(listener: &UnixListener, socket: &str) -> io::Result<UnixStream> {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => return Ok(stream),
+            Err(err) if transient(&err) => {
+                tracing::warn!(socket, error = %err, "an accept failed, retrying");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether an accept error passes: an aborted or reset connection, an
+/// interrupt, or a short supply of descriptors or memory.
+fn transient(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EPROTO)
+    )
 }
 
 #[cfg(test)]

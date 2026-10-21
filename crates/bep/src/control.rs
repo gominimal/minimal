@@ -132,7 +132,7 @@ impl Control {
     /// The accept's I/O error.
     pub async fn run(self) -> io::Result<()> {
         loop {
-            let (stream, _) = self.inner.accept().await?;
+            let stream = crate::listener::accept(&self.inner, "control socket").await?;
             let registry = Arc::clone(&self.registry);
             tokio::spawn(serve(stream, registry));
         }

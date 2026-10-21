@@ -68,6 +68,14 @@ pub const UPSTREAM_NOT_TLS: &str = "upstream_not_tls";
 /// How long a box's connection has to send its first request head.
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the upstream connection (resolve, TCP connect and TLS
+/// handshake) has, and how long the box's TLS handshake has.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a relayed flow can pass no bytes in either direction before the
+/// proxy closes it.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How long the proxy reuses one leaf for a host. A leaf is valid for seven
 /// days, so a reissue after one day keeps every served leaf well inside it.
 const LEAF_REUSE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -458,7 +466,15 @@ impl Proxy {
                 return Ended::Refused("leaf");
             }
         };
-        let upstream = match self.dial_upstream(&host, port).await {
+        let dialed = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.dial_upstream(&host, port))
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the connection timed out",
+                ))
+            });
+        let upstream = match dialed {
             Ok(upstream) => upstream,
             Err(err) => {
                 tracing::warn!(authority, error = %err, "the upstream connection failed");
@@ -480,17 +496,31 @@ impl Proxy {
             return Ended::Closed("box_closed");
         }
         // BEP-073: the box's leg offers `http/1.1` alone.
-        let boxed = match TlsAcceptor::from(server)
-            .accept(Prefixed::new(rest, stream))
-            .await
-        {
-            Ok(tls) => tls,
-            Err(err) => {
+        let accepted = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            TlsAcceptor::from(server).accept(Prefixed::new(rest, stream)),
+        )
+        .await;
+        let boxed = match accepted {
+            Ok(Ok(tls)) => tls,
+            Ok(Err(err)) => {
                 tracing::info!(authority, error = %err, "the box's TLS handshake failed");
                 return Ended::Refused("box_tls_handshake");
             }
+            Err(_) => {
+                tracing::info!(authority, "the box's TLS handshake timed out");
+                return Ended::Closed("box_tls_timeout");
+            }
         };
-        relay(box_id, boxed, upstream, &authority, Arc::clone(&self.audit)).await;
+        relay(
+            box_id,
+            boxed,
+            upstream,
+            &authority,
+            Arc::clone(&self.audit),
+            IDLE_TIMEOUT,
+        )
+        .await;
         Ended::Relayed
     }
 
@@ -675,18 +705,27 @@ impl http::AuditSink for HeadAudit {
 
 /// Relays one terminated flow: the request half through the strict
 /// forwarder, the response half as the upstream wrote it.
+///
+/// The flow ends when it passes no bytes in either direction for `idle`.
+/// It also ends when the upstream closes: the request half then reads end
+/// of file from the box, so its blocking thread returns at once.
 async fn relay<B, U>(
     box_id: &str,
     boxed: B,
     upstream: U,
     authority: &str,
     audit: Arc<dyn AuditWriter>,
+    idle: Duration,
 ) where
     B: AsyncRead + AsyncWrite + Send + 'static,
     U: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (box_read, mut box_write) = tokio::io::split(boxed);
-    let (mut up_read, up_write) = tokio::io::split(upstream);
+    let (up_read, up_write) = tokio::io::split(upstream);
+    let activity = Activity::new();
+    let done = tokio_util::sync::CancellationToken::new();
+    let box_read = Watched::new(box_read, &activity, &done, idle);
+    let mut up_read = Watched::new(up_read, &activity, &done, idle);
     let id = box_id.to_owned();
     let mut sink = HeadAudit {
         audit,
@@ -700,12 +739,110 @@ async fn relay<B, U>(
         reason
     });
     let responses = async {
-        let _ = tokio::io::copy(&mut up_read, &mut box_write).await;
+        let copied = tokio::io::copy(&mut up_read, &mut box_write).await;
+        if let Err(err) = copied
+            && err.kind() == io::ErrorKind::TimedOut
+        {
+            tracing::info!("the relayed flow was idle too long");
+        }
         let _ = box_write.shutdown().await;
+        done.cancel();
     };
     let (reason, ()) = tokio::join!(requests, responses);
     if let Ok(reason) = reason {
         tracing::debug!(rule = reason.rule(), "the request half ended");
+    }
+}
+
+/// The time of the last byte a relayed flow passed, in milliseconds since
+/// the flow started.
+#[derive(Clone)]
+struct Activity {
+    start: tokio::time::Instant,
+    last: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            last: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last
+            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn deadline(&self, idle: Duration) -> tokio::time::Instant {
+        let last = self.last.load(std::sync::atomic::Ordering::Relaxed);
+        self.start + Duration::from_millis(last) + idle
+    }
+}
+
+/// One read half of a relayed flow. A read records activity. A read fails
+/// with `TimedOut` when the flow passed no bytes for `idle`, and reads end
+/// of file once `done` is cancelled.
+struct Watched<R> {
+    inner: R,
+    activity: Activity,
+    idle: Duration,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    done: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+}
+
+impl<R> Watched<R> {
+    fn new(
+        inner: R,
+        activity: &Activity,
+        done: &tokio_util::sync::CancellationToken,
+        idle: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            activity: activity.clone(),
+            idle,
+            sleep: Box::pin(tokio::time::sleep_until(activity.deadline(idle))),
+            done: Box::pin(done.clone().cancelled_owned()),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Watched<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.done.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    self.activity.touch();
+                }
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {}
+        }
+        loop {
+            if self.sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let deadline = self.activity.deadline(self.idle);
+            if deadline <= tokio::time::Instant::now() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the flow was idle too long",
+                )));
+            }
+            self.sleep.as_mut().reset(deadline);
+        }
     }
 }
 
@@ -1214,4 +1351,43 @@ mod tests {
     }
 
     const H2_PREFACE_FULL: &[u8] = http::H2_PREFACE;
+
+    #[tokio::test]
+    async fn relay_ends_an_idle_flow_and_an_upstream_close() {
+        let audit: Arc<dyn AuditWriter> = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        // Neither side sends: the idle limit ends the flow.
+        let (boxed, _box_peer) = tokio::io::duplex(1024);
+        let (upstream, _up_peer) = tokio::io::duplex(1024);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            relay(
+                "b",
+                boxed,
+                upstream,
+                "github.com:443",
+                Arc::clone(&audit),
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("an idle flow ends at its idle limit");
+        // The upstream closes while the box stays open and silent: the
+        // request half ends with it, long before the idle limit.
+        let (boxed, _box_peer) = tokio::io::duplex(1024);
+        let (upstream, up_peer) = tokio::io::duplex(1024);
+        drop(up_peer);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            relay(
+                "b",
+                boxed,
+                upstream,
+                "github.com:443",
+                audit,
+                Duration::from_secs(3600),
+            ),
+        )
+        .await
+        .expect("the flow ends when the upstream closes");
+    }
 }

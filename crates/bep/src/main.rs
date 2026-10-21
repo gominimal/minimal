@@ -247,6 +247,10 @@ fn serve(args: &ServeArgs) -> Result<(), String> {
     runtime.block_on(async {
         let listener = Listener::bind(&args.listener, token, Arc::new(PeerAttested))
             .map_err(|err| format!("bep did not listen on {}: {err}", args.listener.display()))?;
+        // The proxy does not read this registry yet: it redeems no store
+        // handles until the store rules join the admitted set. Until a later
+        // task gives `Proxy` the same registry, a registration is kept here
+        // and has no effect on what the proxy admits.
         let control_socket = Control::bind(&control, Registry::default())
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
