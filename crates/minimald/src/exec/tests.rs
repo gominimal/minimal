@@ -1028,6 +1028,107 @@ async fn lost_exec_client_kills_only_its_own_process() {
     );
 }
 
+/// BOX-150: a plain exec, neither a PTY exec nor detached, ends when its
+/// client disconnects. The bridge drives a real child in the shim's
+/// place, as `BoxExec` spawns it. On client loss the daemon SIGTERMs the
+/// shim, waits, and SIGKILLs a shim that is still alive. This stand-in
+/// traps and ignores SIGTERM, so the test sees each step: the SIGTERM
+/// lands, the wait runs its full length, and the SIGKILL ends the child.
+///
+/// The shim forwards that SIGTERM to the exec's process group in
+/// `on_term_or_hup`. Three tests in `tests/netns_root_integration.rs`,
+/// gated by `MINIMALD_NETNS_TEST=1`, prove that path:
+/// `sigterm_to_the_shim_kills_the_injected_group` proves the SIGTERM
+/// forward, `a_group_member_that_traps_sigterm_runs_its_trap` proves the
+/// grace period, and
+/// `a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace`
+/// proves the group SIGKILL. This test proves only the daemon's fallback
+/// SIGKILL of a shim that does not exit.
+/// `exec_client_loss_ends_exec_keeps_box_record` in `end_to_end` proves
+/// that the box keeps running.
+#[tokio::test]
+async fn exec_client_loss_ends_exec_keeps_box() {
+    use std::time::{Duration, Instant};
+
+    use tokio::time::timeout;
+
+    use super::TokioProcess;
+
+    let dir = tempfile::tempdir().expect("a temp dir for the SIGTERM marker");
+    let term_marker = dir.path().join("term");
+    // The exec: records the SIGTERM and ignores it, so only a SIGKILL ends
+    // it. `ready` says the trap is installed.
+    let child = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"trap 'echo term > "$1"' TERM; echo ready; while :; do sleep 0.1; done"#,
+            "sh",
+        ])
+        .arg(&term_marker)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawning the stand-in exec");
+    let exec_pid = child.id().expect("a live child has a pid");
+    let process = TokioProcess::shim(child);
+    let stream = futures::stream::iter([Ok::<_, std::io::Error>(process)]);
+
+    // The client: stdin held open, stdout read, then the channel closes.
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
+    let (_client_stderr, mut bridge_stderr) = duplex(64 * 1024);
+    let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+    let bridge_task = crate::traced::spawn(async move {
+        bridge(
+            "test",
+            stream,
+            &mut bridge_stdin,
+            &mut bridge_stdout,
+            &mut bridge_stderr,
+            client_lost_rx,
+        )
+        .await
+    });
+
+    let mut ready = [0u8; 6];
+    timeout(
+        Duration::from_secs(10),
+        client_stdout.read_exact(&mut ready),
+    )
+    .await
+    .expect("the exec prints its ready marker")
+    .expect("reading the ready marker");
+    assert_eq!(&ready, b"ready\n");
+
+    let lost_at = Instant::now();
+    client_lost_tx.send(true).unwrap();
+
+    let exit = timeout(
+        crate::nsenter::SHIM_ESCALATION + Duration::from_secs(10),
+        bridge_task,
+    )
+    .await
+    .expect("a lost client must end the exec, not hang the bridge")
+    .unwrap();
+    let elapsed = lost_at.elapsed();
+
+    // A signalled child has no exit code, which the bridge reports as 1.
+    assert_eq!(exit, 1, "a plain exec ends when its client is lost");
+    let term = std::fs::read_to_string(&term_marker).unwrap_or_default();
+    assert_eq!(term, "term\n", "the exec is sent SIGTERM first");
+    assert!(
+        elapsed >= crate::nsenter::SHIM_ESCALATION,
+        "the daemon waits {:?} before the SIGKILL, ended after {elapsed:?}",
+        crate::nsenter::SHIM_ESCALATION,
+    );
+    // SAFETY: signal 0 only checks that the pid exists; it sends nothing.
+    let alive = unsafe { libc::kill(exec_pid as libc::pid_t, 0) } == 0;
+    assert!(!alive, "the SIGKILL ends an exec that ignores SIGTERM");
+}
+
 /// gominimal/inbox#813: a lost client on the *read* side — the SSH
 /// channel closes or its sender drops while the child is silent —
 /// must still kill the child. `make_reader()` used to reduce the
@@ -1924,6 +2025,62 @@ mod end_to_end {
         assert!(logged.contains(&session_str), "names the session: {logged}");
         assert!(logged.contains("echo_ok"), "names the exec: {logged}");
         assert!(logged.contains("exit=0"), "names the exit code: {logged}");
+    }
+
+    /// BOX-150: when the client of a plain exec (no PTY, not detached)
+    /// disconnects, the daemon ends the exec and the box keeps running.
+    /// The client opens the exec and then drops its connection while the
+    /// exec is open or just after the daemon accepts it. A new client must
+    /// still find the session in the daemon's own list.
+    #[tokio::test]
+    async fn exec_client_loss_ends_exec_keeps_box_record() {
+        use std::time::Duration;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id =
+            active_session_with_echo_task(&server, &mut client, "plain-exec-client-loss").await;
+        let session_str = session_id.to_string();
+
+        // The client owns its connection, so aborting this task drops
+        // the connection with the exec still open.
+        let exec_task = tokio::spawn(async move {
+            client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::Argv(vec!["sleep".to_string(), "600".to_string()]).encode(),
+                    &[],
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        exec_task.abort();
+        let _ = exec_task.await;
+
+        // The client is gone. Give the moment a stray destroy would have
+        // needed before asserting.
+        let mut observer = server.connect().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let listed = observer.call::<minimald_rpc::ListSessions>(&()).await;
+        assert_eq!(
+            listed.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![session_id],
+            "losing a plain exec's client must not end its box; got {:?}",
+            listed.sessions,
+        );
+        // A retained box that stopped stays in the list too, so the id
+        // alone does not prove that the box runs.
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("the session is listed");
+        assert_eq!(
+            entry.status,
+            boxes::BoxState::Active,
+            "losing a plain exec's client must leave its box running; got {entry:?}",
+        );
     }
 
     /// A task run that does not own its box leaves the session standing:
