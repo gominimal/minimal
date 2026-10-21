@@ -1,9 +1,116 @@
-use crate::{Checkout, Error, GitRef};
+use crate::{Checkout, Error, GitRef, scrubbed_remote};
+use common::fetchers::MirrorEndpoint;
+use common::mirror::{MirrorPath, RepoSlug};
+use mirror_client::blocking;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use tracing::trace;
+use tracing::{info, trace};
 
 const GIT_SEC_ARGS: [&str; 3] = ["--no-optional-locks", "-c", "core.hooksPath=/dev/null"];
+
+/// The refspec every fetch uses: the source's branch heads land under
+/// `refs/remotes/origin/*`, whichever source they come from.
+const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+
+/// The mirror a repository's copy is read from, in the form the endpoint
+/// serves it (spec MIR, O2): the host socket names the copy's path in the
+/// store, which git reads as a local repository; a guest door serves a
+/// bundle, which the guest downloads to a file and git reads from there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepoMirror {
+    /// The host socket: the mirror answers `path` with the copy's store path.
+    Path(MirrorEndpoint),
+    /// A guest door: the mirror answers `bundle`, downloaded to `file`.
+    Bundle {
+        endpoint: MirrorEndpoint,
+        file: PathBuf,
+    },
+}
+
+impl RepoMirror {
+    /// The form `endpoint` serves: a path over a Unix socket, a bundle over a
+    /// vsock door, which lands in `bundle_file`.
+    // On a platform without vsock no endpoint serves a bundle, so the file
+    // goes unused there.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    pub fn for_endpoint(endpoint: MirrorEndpoint, bundle_file: PathBuf) -> Self {
+        match endpoint {
+            MirrorEndpoint::Unix(_) => RepoMirror::Path(endpoint),
+            #[cfg(target_os = "linux")]
+            MirrorEndpoint::Vsock { .. } => RepoMirror::Bundle {
+                endpoint,
+                file: bundle_file,
+            },
+        }
+    }
+}
+
+/// Why the mirror gave no copy; the caller then fetches from the origin.
+#[derive(Debug, thiserror::Error)]
+enum NoCopy {
+    #[error(transparent)]
+    Request(#[from] blocking::Error),
+    #[error("the mirror answered {status}: {body}")]
+    Refused { status: u16, body: String },
+    #[error("the mirror answered a path that is not absolute: {0:?}")]
+    RelativePath(String),
+    #[error("the bundle could not be written: {0}")]
+    Write(#[from] std::io::Error),
+}
+
+/// The mirror's copy of one repository: set when a mirror is given and the
+/// repository URL is in the slug grammar (MIR-013).
+#[derive(Debug)]
+struct MirrorCopy {
+    mirror: RepoMirror,
+    slug: RepoSlug,
+}
+
+impl MirrorCopy {
+    /// Asks the mirror for the copy and returns what git fetches from: the
+    /// store path, or the bundle file once downloaded (MIR-010).
+    fn source(&self) -> Result<PathBuf, NoCopy> {
+        match &self.mirror {
+            RepoMirror::Path(endpoint) => {
+                let path = MirrorPath::GitPath {
+                    slug: self.slug.clone(),
+                }
+                .render();
+                let reply = blocking::get(endpoint, &path)?;
+                let body = reply.text();
+                if !(200..300).contains(&reply.status) {
+                    return Err(NoCopy::Refused {
+                        status: reply.status,
+                        body,
+                    });
+                }
+                let copy = PathBuf::from(&body);
+                if !copy.is_absolute() {
+                    return Err(NoCopy::RelativePath(body));
+                }
+                Ok(copy)
+            }
+            RepoMirror::Bundle { endpoint, file } => {
+                let path = MirrorPath::GitBundle {
+                    slug: self.slug.clone(),
+                }
+                .render();
+                if let Some(parent) = file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let reply = blocking::get_to_file(endpoint, &path, file)?;
+                if !(200..300).contains(&reply.status) {
+                    return Err(NoCopy::Refused {
+                        status: reply.status,
+                        body: reply.text(),
+                    });
+                }
+                Ok(file.clone())
+            }
+        }
+    }
+}
 
 /// A git repository of some remote.
 pub struct Repo {
@@ -11,13 +118,39 @@ pub struct Repo {
     bare: PathBuf,
     /// The remote URL of the repository.
     url: String,
+    /// The mirror's copy to fetch from, when a mirror is set and the URL is
+    /// in its grammar; the remote stays `url` either way (MIR-013).
+    copy: Option<MirrorCopy>,
 }
 
 impl Repo {
     /// Creates a new repository for the given URL and bare repository. The
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
+        Self::new_with_mirror(url, base, None)
+    }
+
+    /// As [`Self::new`], fetching through `mirror` when one is given and the
+    /// URL has the scheme `https`, no user information and no port (MIR-013).
+    /// Any other URL, and a mirror that holds no copy or does not answer,
+    /// fetches from the origin as [`Self::new`] does.
+    pub fn new_with_mirror<S: Into<String>, P: Into<PathBuf>>(
+        url: S,
+        base: P,
+        mirror: Option<RepoMirror>,
+    ) -> Result<Self, Error> {
         let url = url.into();
+        let copy = mirror.and_then(|mirror| match RepoSlug::from_repo_url(&url) {
+            Ok(slug) => Some(MirrorCopy { mirror, slug }),
+            Err(reason) => {
+                trace!(
+                    remote = %scrubbed_remote(&url),
+                    %reason,
+                    "repository is outside the mirror's grammar; fetching from its origin"
+                );
+                None
+            }
+        });
         // Absolute, because every git call below pairs `current_dir(base)`
         // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
         // that new working directory.
@@ -47,45 +180,112 @@ impl Repo {
                 return if remote != url {
                     Err(Error::InvalidPath)
                 } else {
-                    Ok(Self { url, bare: base })
+                    Ok(Self {
+                        url,
+                        bare: base,
+                        copy,
+                    })
                 };
             }
         }
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = base.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
 
-        // Clone the repository
+        let repo = Self {
+            url,
+            bare: base,
+            copy,
+        };
+        let cloned_from = repo.clone_bare()?;
+
+        // A bare clone writes only `refs/heads/*`; every branch lookup in this
+        // crate goes through `refs/remotes/origin/*`, so populate those now
+        // rather than leaving the first branch checkout to fail on a ref the
+        // clone never wrote. The source the clone came from serves the fetch
+        // too, so a guest does not download its bundle twice. A clone that
+        // cannot be fetched is not a usable cache entry: take the directory
+        // with the error.
+        if let Err(err) = repo.fetch_via(cloned_from.as_deref()) {
+            // The directory goes with the error; its own failure to go would
+            // add nothing to that error.
+            let _ = fs::remove_dir_all(&repo.bare);
+            return Err(err);
+        }
+        Ok(repo)
+    }
+
+    /// Asks the mirror for its copy. `None`, logged, when there is no mirror
+    /// for this URL, when the mirror holds no copy, or when it does not
+    /// answer: the caller then uses the origin, so the mirror never fails a
+    /// fetch (MIR-013).
+    fn copy_source(&self) -> Option<PathBuf> {
+        let copy = self.copy.as_ref()?;
+        match copy.source() {
+            Ok(source) => Some(source),
+            Err(reason) => {
+                info!(
+                    remote = %scrubbed_remote(&self.url),
+                    %reason,
+                    "the mirror gave no copy; fetching from the origin"
+                );
+                None
+            }
+        }
+    }
+
+    /// Clones the bare repository from the mirror's copy when it has one, and
+    /// from the origin otherwise. Returns the copy the clone came from, so
+    /// the caller can fetch from it too. A clone from the copy keeps the
+    /// original URL as the remote: the copy is where the bytes come from,
+    /// never the repository's identity (MIR-013).
+    fn clone_bare(&self) -> Result<Option<PathBuf>, Error> {
+        let dest = self.bare.to_str().ok_or(Error::InvalidPath)?;
+        if let Some(copy) = self.copy_source() {
+            let from_copy = copy
+                .to_str()
+                .ok_or(Error::InvalidPath)
+                .and_then(|source| self.run_clone(source, dest))
+                .and_then(|()| self.run_git_bare(vec!["remote", "set-url", "origin", &self.url]));
+            match from_copy {
+                Ok(_) => return Ok(Some(copy)),
+                Err(reason) => {
+                    info!(
+                        remote = %scrubbed_remote(&self.url),
+                        %reason,
+                        "clone from the mirror's copy failed; cloning from the origin"
+                    );
+                    // Whatever the failed clone left would make the origin
+                    // clone refuse the directory; a directory that is already
+                    // gone is the wanted state.
+                    let _ = fs::remove_dir_all(&self.bare);
+                }
+            }
+        }
+        self.run_clone(&self.url, dest).map(|()| None)
+    }
+
+    /// `git clone --quiet --bare <source> <dest>`.
+    fn run_clone(&self, source: &str, dest: &str) -> Result<(), Error> {
         let output = Command::new("git")
             .args(
                 GIT_SEC_ARGS
                     .into_iter()
                     .chain(["clone", "--quiet", "--bare"])
-                    .chain([url.as_str(), base.to_str().ok_or(Error::InvalidPath)?])
+                    .chain([source, dest])
                     .collect::<Vec<_>>(),
             )
             .output()?;
         if !output.status.success() {
             return Err(Error::GitCommandFailed {
                 command: "clone".to_string(),
-                stderr: scrub_stderr(&url, &output.stderr),
+                stderr: scrub_stderr(&self.url, &output.stderr),
                 status: output.status.to_string(),
             });
         }
-
-        // A bare clone writes only `refs/heads/*`; every branch lookup in this
-        // crate goes through `refs/remotes/origin/*`, so populate those now
-        // rather than leaving the first branch checkout to fail on a ref the
-        // clone never wrote. A clone that cannot be fetched is not a usable
-        // cache entry: take the directory with the error.
-        let mut repo = Self { url, bare: base };
-        if let Err(err) = repo.fetch() {
-            let _ = std::fs::remove_dir_all(&repo.bare);
-            return Err(err);
-        }
-        Ok(repo)
+        Ok(())
     }
 
     /// Returns the path to the bare git repository.
@@ -100,13 +300,42 @@ impl Repo {
 
     /// Fetches updates from the remote repository.
     ///
-    /// This updates the remote-tracking branches but does not modify any checkouts.
+    /// This updates the remote-tracking branches but does not modify any
+    /// checkouts. With a mirror, the update comes from its copy, asked for
+    /// afresh each time so a guest reads the newest bundle; the origin serves
+    /// when the mirror gives none (MIR-013).
     pub fn fetch(&mut self) -> Result<(), Error> {
+        self.fetch_via(self.copy_source().as_deref())
+    }
+
+    /// Fetches from `copy` when there is one, and from the origin when there
+    /// is none or the copy cannot be fetched.
+    fn fetch_via(&self, copy: Option<&Path>) -> Result<(), Error> {
+        if let Some(copy) = copy {
+            let from_copy = copy
+                .to_str()
+                .ok_or(Error::InvalidPath)
+                .and_then(|source| self.fetch_from(source));
+            match from_copy {
+                Ok(()) => return Ok(()),
+                Err(reason) => info!(
+                    remote = %scrubbed_remote(&self.url),
+                    %reason,
+                    "fetch from the mirror's copy failed; fetching from the origin"
+                ),
+            }
+        }
+        self.fetch_from("origin")
+    }
+
+    /// `git fetch --quiet <source> <refspec>`: `source` is the remote
+    /// `origin`, a copy's path or a bundle file.
+    fn fetch_from(&self, source: &str) -> Result<(), Error> {
         self.run_git_bare(
             GIT_SEC_ARGS
                 .into_iter()
                 .chain(["fetch", "--quiet"])
-                .chain(["origin", "+refs/heads/*:refs/remotes/origin/*"])
+                .chain([source, FETCH_REFSPEC])
                 .collect::<Vec<_>>(),
         )?;
         Ok(())
@@ -299,6 +528,7 @@ impl std::fmt::Debug for Repo {
         f.debug_struct("Repo")
             .field("url", &self.url)
             .field("bare", &self.bare)
+            .field("copy", &self.copy)
             .finish()
     }
 }

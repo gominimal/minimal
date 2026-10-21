@@ -18,6 +18,7 @@ thiserror.workspace = true
 
 common.workspace = true
 mfile.workspace = true
+mirror-client.workspace = true
 
 rand.workspace = true
 

@@ -3,6 +3,7 @@
 //! This crate provides abstractions for creating and maintaining checkouts of git repositories
 //! at specific versions.
 
+use common::fetchers::MirrorEndpoint;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
@@ -18,7 +19,7 @@ use tracing::{trace, warn};
 mod error;
 pub use error::Error;
 mod repo;
-pub use repo::Repo;
+pub use repo::{Repo, RepoMirror};
 
 /// Reference to a specific version in a git repository.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -314,24 +315,46 @@ pub struct Manager {
     /// rather than performing the network operation. Mirrors the value of
     /// `mctx::Config::is_offline` (i.e. `--offline`).
     offline: bool,
+    /// The mirror every repository in the slug grammar is fetched through
+    /// (MIR-013); `None` fetches every repository from its origin.
+    mirror: Option<MirrorEndpoint>,
 }
 
-impl Manager {
-    /// Initializes the checkouts manager in the given directory, returning a
-    /// thread-safe, cloneable handle to the manager instance.
-    pub fn new_in_dir<P: Into<PathBuf>>(base_dir: P) -> Result<ManagerHandle, Error> {
-        Self::new_in_dir_with_offline(base_dir, false)
+/// Builds a [`Manager`]: where its cache lives, whether it may reach the
+/// network, and the mirror it reads repository copies through.
+#[derive(Debug)]
+pub struct ManagerBuilder {
+    base_dir: PathBuf,
+    offline: bool,
+    mirror: Option<MirrorEndpoint>,
+}
+
+impl ManagerBuilder {
+    /// With `offline`, any operation that would require a clone or fetch
+    /// (new remote, or refresh of a known remote) surfaces as
+    /// [Error::OfflineCacheMiss] rather than performing the network
+    /// operation.
+    pub fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
     }
 
-    /// Same as [Self::new_in_dir], but with an `offline` flag. When `offline=true`,
-    /// any operation that would require a clone or fetch (new remote, or refresh of
-    /// a known remote) surfaces as [Error::OfflineCacheMiss] rather than performing
-    /// the network operation.
-    pub fn new_in_dir_with_offline<P: Into<PathBuf>>(
-        base_dir: P,
-        offline: bool,
-    ) -> Result<ManagerHandle, Error> {
-        let base_dir = base_dir.into();
+    /// Fetch every repository whose URL has the scheme `https`, no user
+    /// information and no port from the mirror at `endpoint` (MIR-013). A
+    /// Unix endpoint names each copy's path; a vsock endpoint serves bundles.
+    pub fn with_mirror(mut self, endpoint: MirrorEndpoint) -> Self {
+        self.mirror = Some(endpoint);
+        self
+    }
+
+    /// Initializes the checkouts manager, returning a thread-safe, cloneable
+    /// handle to the manager instance.
+    pub fn build(self) -> Result<ManagerHandle, Error> {
+        let Self {
+            base_dir,
+            offline,
+            mirror,
+        } = self;
         let db_path = base_dir.join("git").join("db");
         fs::create_dir_all(&db_path)?;
         fs::create_dir_all(base_dir.join("git").join("checkouts"))?;
@@ -342,10 +365,18 @@ impl Manager {
         // never sees it half written, and every mutating path re-reads the
         // registry under the lock before writing it back.
         let state = ManagerState::in_dir_or_default(&base_dir)?;
-        let mut repos = HashMap::new();
-        for (remote, id) in state.git_remotes.iter() {
-            repos.insert(id.clone(), Repo::new(remote, db_path.join(id))?);
-        }
+        let repos = state
+            .git_remotes
+            .iter()
+            .map(|(remote, id)| {
+                let repo = Repo::new_with_mirror(
+                    remote,
+                    db_path.join(id),
+                    repo_mirror(&base_dir, mirror.as_ref(), id),
+                )?;
+                Ok((id.clone(), repo))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
 
         // For now we depend on the git command line tool. Shelling out when git doesn't exist
         // gives an incomprehensible NotFound error, so lets explicitly check that git is in PATH
@@ -361,8 +392,50 @@ impl Manager {
             state,
             repos,
             offline,
+            mirror,
         };
         Ok(ManagerHandle(Arc::new(Mutex::new(manager))))
+    }
+}
+
+/// The mirror the repository under `id` reads its copy from, when one is
+/// set: a bundle, when the endpoint serves one, lands under
+/// `<base_dir>/git/bundles/<id>.bundle`.
+fn repo_mirror(base_dir: &Path, mirror: Option<&MirrorEndpoint>, id: &str) -> Option<RepoMirror> {
+    mirror.map(|endpoint| {
+        RepoMirror::for_endpoint(
+            endpoint.clone(),
+            base_dir
+                .join("git")
+                .join("bundles")
+                .join(format!("{id}.bundle")),
+        )
+    })
+}
+
+impl Manager {
+    /// A builder for the checkouts manager in the given directory.
+    pub fn builder<P: Into<PathBuf>>(base_dir: P) -> ManagerBuilder {
+        ManagerBuilder {
+            base_dir: base_dir.into(),
+            offline: false,
+            mirror: None,
+        }
+    }
+
+    /// Initializes the checkouts manager in the given directory, returning a
+    /// thread-safe, cloneable handle to the manager instance.
+    pub fn new_in_dir<P: Into<PathBuf>>(base_dir: P) -> Result<ManagerHandle, Error> {
+        Self::builder(base_dir).build()
+    }
+
+    /// Same as [Self::new_in_dir], but with an `offline` flag; see
+    /// [`ManagerBuilder::with_offline`].
+    pub fn new_in_dir_with_offline<P: Into<PathBuf>>(
+        base_dir: P,
+        offline: bool,
+    ) -> Result<ManagerHandle, Error> {
+        Self::builder(base_dir).with_offline(offline).build()
     }
 
     fn git_checkouts_dir(&self) -> PathBuf {
@@ -370,6 +443,10 @@ impl Manager {
     }
     fn git_bares_dir(&self) -> PathBuf {
         self.base_dir.join("git").join("db")
+    }
+    /// The mirror the repository under `id` reads its copy from, if any.
+    fn repo_mirror(&self, id: &str) -> Option<RepoMirror> {
+        repo_mirror(&self.base_dir, self.mirror.as_ref(), id)
     }
 
     /// Re-reads the registry, keeping every repo already opened. Called with
@@ -381,8 +458,12 @@ impl Manager {
         let db_path = self.git_bares_dir();
         for (remote, id) in self.state.git_remotes.iter() {
             if !self.repos.contains_key(id) {
-                self.repos
-                    .insert(id.clone(), Repo::new(remote, db_path.join(id))?);
+                let repo = Repo::new_with_mirror(
+                    remote,
+                    db_path.join(id),
+                    repo_mirror(&self.base_dir, self.mirror.as_ref(), id),
+                )?;
+                self.repos.insert(id.clone(), repo);
             }
         }
         Ok(())
@@ -547,7 +628,7 @@ impl Manager {
                 };
                 // Make repo
                 let (id, dir) = create_unique_id_and_dir(&self.git_bares_dir(), prefix)?;
-                let mut repo = Repo::new(remote, dir.clone())?;
+                let mut repo = Repo::new_with_mirror(remote, dir.clone(), self.repo_mirror(&id))?;
                 // Make checkout
                 let checkout_dir = tempdir_in(self.git_checkouts_dir())?.keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
@@ -1547,5 +1628,356 @@ mod tests {
             matches!(result, Err(crate::Error::InvalidPath)),
             "a cache of another remote is refused"
         );
+    }
+
+    /// A repository URL in the mirror's grammar whose host does not exist:
+    /// a fetch that reaches its origin fails, so success proves the mirror
+    /// served it.
+    const MIRRORED_URL: &str = "https://example.test/org/repo";
+    const PATH_REQUEST: &str = "/-/git/example.test/org/repo/-/path";
+    const BUNDLE_REQUEST: &str = "/-/git/example.test/org/repo/-/bundle";
+
+    /// A mirror on a Unix socket that answers each request with
+    /// `answer(path)` and records the paths it was asked for.
+    struct FakeMirror {
+        socket: PathBuf,
+        requests: Arc<Mutex<Vec<String>>>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl FakeMirror {
+        fn serve(answer: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixListener;
+
+            let dir = tempdir().unwrap();
+            let socket = dir.path().join("mirror.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    // Drain the headers; the client sends no body.
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap() == 0 || line.trim_end().is_empty() {
+                            break;
+                        }
+                    }
+                    seen.lock().unwrap().push(path.clone());
+                    stream.write_all(&answer(&path)).unwrap();
+                }
+            });
+            Self {
+                socket,
+                requests,
+                _dir: dir,
+            }
+        }
+
+        fn endpoint(&self) -> MirrorEndpoint {
+            MirrorEndpoint::Unix(self.socket.clone())
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// One HTTP/1.1 answer with a `Content-Length` body.
+    fn http_answer(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut answer = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(body);
+        answer
+    }
+
+    /// The 502 the mirror answers when it holds no copy (MIR-010).
+    fn no_copy_answer(url: &str) -> Vec<u8> {
+        http_answer(
+            "502 Bad Gateway",
+            "text/plain",
+            format!("the mirror could not copy {url}: origin unreachable\n").as_bytes(),
+        )
+    }
+
+    /// A bare clone of `src` at `dest`, as the mirror keeps one in its store.
+    fn make_bare_copy(src: &Path, dest: &Path) {
+        let output = std::process::Command::new("git")
+            .args(["clone", "--quiet", "--bare"])
+            .arg(src)
+            .arg(dest)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git clone --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The `remote.origin.url` a bare clone stores.
+    fn stored_remote(bare: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["config", "--local", "--get", "remote.origin.url"])
+            .current_dir(bare)
+            .env("GIT_DIR", bare)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "no remote.origin.url in the clone");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// MIR-013: a repository in the grammar is cloned and fetched from the
+    /// copy the mirror names, and git's remote stays the original URL.
+    #[test]
+    fn mirror_rewrite_fetches_from_copy() {
+        let (src, hash) = make_local_repo("main");
+        let store = tempdir().unwrap();
+        let copy = store
+            .path()
+            .join("git")
+            .join("example.test/org/repo")
+            .join("repo.git");
+        make_bare_copy(src.path(), &copy);
+        let copy_path = copy.to_str().unwrap().to_string();
+        let mirror = FakeMirror::serve(move |path| {
+            if path == PATH_REQUEST {
+                http_answer("200 OK", "text/plain", copy_path.as_bytes())
+            } else {
+                http_answer("404 Not Found", "text/plain", b"")
+            }
+        });
+        let base = tempdir().unwrap();
+        let mut handle = Manager::builder(base.path())
+            .with_mirror(mirror.endpoint())
+            .build()
+            .unwrap();
+
+        // The origin does not exist, so a checkout at the copy's commit can
+        // only have come from the copy.
+        let (checkout, rev) = handle
+            .checkout_of(MIRRORED_URL, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(rev, hash);
+        assert!(checkout.join("hello.txt").exists());
+        assert_eq!(mirror.requests(), vec![PATH_REQUEST.to_string()]);
+
+        // git's remote is the original URL, not the copy.
+        let id = handle
+            .0
+            .lock()
+            .unwrap()
+            .state
+            .git_remotes
+            .get(MIRRORED_URL)
+            .cloned()
+            .expect("registered under the original URL");
+        assert_eq!(
+            stored_remote(&base.path().join("git").join("db").join(id)),
+            MIRRORED_URL
+        );
+
+        // A later fetch asks for the copy again and reads it.
+        handle.update_remote(MIRRORED_URL).unwrap();
+        assert_eq!(mirror.requests(), vec![PATH_REQUEST.to_string(); 2]);
+    }
+
+    /// MIR-013: when the mirror answers that it holds no copy, the clone goes
+    /// to the original URL.
+    #[test]
+    fn no_copy_fetches_from_origin() {
+        let mirror = FakeMirror::serve(|_| no_copy_answer(MIRRORED_URL));
+        let base = tempdir().unwrap();
+        let mut handle = Manager::builder(base.path())
+            .with_mirror(mirror.endpoint())
+            .build()
+            .unwrap();
+
+        let err = handle
+            .checkout_of(MIRRORED_URL, GitRef::Branch("main".to_string()))
+            .unwrap_err();
+
+        // The mirror was asked once; the clone then went to the origin, and
+        // the error is git's about that origin.
+        assert_eq!(mirror.requests(), vec![PATH_REQUEST.to_string()]);
+        match err {
+            Error::GitCommandFailed {
+                command, stderr, ..
+            } => {
+                assert_eq!(command, "clone");
+                assert!(
+                    stderr.contains("example.test"),
+                    "git's error names the origin: {stderr}"
+                );
+            }
+            other => panic!("expected the origin clone's error, got {other:?}"),
+        }
+    }
+
+    /// MIR-013: the registry keys the repository by its original URL, on
+    /// disk and in memory, and a fresh manager finds the clone under it.
+    #[test]
+    fn rewrite_keeps_original_url_as_identity() {
+        let (src, hash) = make_local_repo("main");
+        let store = tempdir().unwrap();
+        let copy = store.path().join("repo.git");
+        make_bare_copy(src.path(), &copy);
+        let copy_path = copy.to_str().unwrap().to_string();
+        let mirror =
+            FakeMirror::serve(move |_| http_answer("200 OK", "text/plain", copy_path.as_bytes()));
+        let base = tempdir().unwrap();
+        let mut handle = Manager::builder(base.path())
+            .with_mirror(mirror.endpoint())
+            .build()
+            .unwrap();
+        let (checkout, _) = handle
+            .checkout_of(MIRRORED_URL, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        let manager = handle.0.lock().unwrap();
+        let id = manager
+            .state
+            .git_remotes
+            .get(MIRRORED_URL)
+            .expect("registered under the original URL");
+        assert_eq!(manager.state.repos[id].remote, MIRRORED_URL);
+        assert_eq!(manager.repos[id].url(), MIRRORED_URL);
+        let registry = fs::read_to_string(base.path().join("state.json")).unwrap();
+        assert!(registry.contains(MIRRORED_URL));
+        assert!(!registry.contains(copy.to_str().unwrap()));
+        drop(manager);
+
+        let mut again = Manager::builder(base.path())
+            .with_mirror(mirror.endpoint())
+            .build()
+            .unwrap();
+        let (checkout_again, rev) = again
+            .checkout_of(MIRRORED_URL, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(checkout_again, checkout);
+        assert_eq!(rev, hash);
+    }
+
+    /// MIR-013: another scheme, user information or a port puts a URL
+    /// outside the grammar; it is fetched from its origin and the mirror is
+    /// never asked.
+    #[test]
+    fn non_https_credentialed_and_ported_urls_bypass_the_mirror() {
+        let mirror = FakeMirror::serve(|_| http_answer("200 OK", "text/plain", b"/nowhere"));
+        let base = tempdir().unwrap();
+        let mut handle = Manager::builder(base.path())
+            .with_mirror(mirror.endpoint())
+            .build()
+            .unwrap();
+
+        // A `file://` origin is reachable: the checkout comes from it.
+        let (src, hash) = make_local_repo("main");
+        let file_url = format!("file://{}", src.path().display());
+        let (_, rev) = handle
+            .checkout_of(&file_url, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(rev, hash);
+
+        // These origins do not exist, so each clone fails as git's own error.
+        for url in [
+            "https://user:token@example.test/org/repo",
+            "https://example.test:8443/org/repo",
+        ] {
+            let err = handle
+                .checkout_of(url, GitRef::Branch("main".to_string()))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::GitCommandFailed { .. }),
+                "{url}: {err}"
+            );
+        }
+
+        assert!(
+            mirror.requests().is_empty(),
+            "the mirror saw {:?}",
+            mirror.requests()
+        );
+    }
+
+    /// MIR-010: a guest reads the copy as a bundle, downloaded before the
+    /// clone and again before each fetch.
+    #[test]
+    fn a_bundle_answer_clones_and_fetches_from_the_bundle() {
+        let (src, hash) = make_local_repo("main");
+        let store = tempdir().unwrap();
+        let bundle = store.path().join("repo.bundle");
+        let output = std::process::Command::new("git")
+            .args(["bundle", "create"])
+            .arg(&bundle)
+            .arg("--all")
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git bundle create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&bundle).unwrap();
+        let mirror = FakeMirror::serve(move |path| {
+            if path == BUNDLE_REQUEST {
+                http_answer("200 OK", "application/octet-stream", &bytes)
+            } else {
+                http_answer("404 Not Found", "text/plain", b"")
+            }
+        });
+        let base = tempdir().unwrap();
+        let file = base.path().join("git").join("bundles").join("repo.bundle");
+
+        let mut repo = Repo::new_with_mirror(
+            MIRRORED_URL,
+            base.path().join("git").join("db").join("repo"),
+            Some(RepoMirror::Bundle {
+                endpoint: mirror.endpoint(),
+                file: file.clone(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(repo.bare_revision().unwrap(), hash);
+        assert!(file.exists(), "the bundle was downloaded");
+        assert_eq!(stored_remote(repo.bare_repo_path()), MIRRORED_URL);
+        // The clone's own fetch read the bundle it had downloaded.
+        assert_eq!(mirror.requests(), vec![BUNDLE_REQUEST.to_string()]);
+        repo.fetch().unwrap();
+        assert_eq!(mirror.requests(), vec![BUNDLE_REQUEST.to_string(); 2]);
+    }
+
+    /// The form of the copy follows the endpoint: a path over the host
+    /// socket, a bundle through a door.
+    #[test]
+    fn the_endpoint_decides_the_copy_form() {
+        let file = PathBuf::from("/cache/git/bundles/repo.bundle");
+        let unix = MirrorEndpoint::Unix(PathBuf::from("/state/mirror/host.sock"));
+        assert_eq!(
+            RepoMirror::for_endpoint(unix.clone(), file.clone()),
+            RepoMirror::Path(unix)
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let door = MirrorEndpoint::Vsock { cid: 2, port: 7354 };
+            assert_eq!(
+                RepoMirror::for_endpoint(door.clone(), file.clone()),
+                RepoMirror::Bundle {
+                    endpoint: door,
+                    file
+                }
+            );
+        }
     }
 }

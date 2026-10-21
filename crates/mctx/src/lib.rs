@@ -383,7 +383,12 @@ impl DaemonContext {
             // `--offline` flips the VcsManager into offline mode: any clone or fetch
             // surfaces as Error::OfflineCacheMiss instead of attempting the network
             // operation. Pre-populate `vcs_dir()` for the workflow that needs this.
-            VcsManager::new_in_dir_with_offline(config.vcs_dir(), config.is_offline())?
+            // A mirror serves every repository copy the manager fetches (MIR-013).
+            let builder = VcsManager::builder(config.vcs_dir()).with_offline(config.is_offline());
+            match config.mirror() {
+                Some(endpoint) => builder.with_mirror(endpoint.clone()).build()?,
+                None => builder.build()?,
+            }
         };
         let cache = Cache::at_dir(config.built_cache_dir())
             .map_err(|e| Error::Other(anyhow!("initializing local cache: {}", e)))?;

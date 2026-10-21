@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::{env, fmt};
 
 use common::SpecOrigin;
+use common::fetchers::{AnyRespError, MirrorError};
 use graph::{Graph, PlanErr};
 
 /// The errors possible when driving top-level minimal APIs.
@@ -313,16 +314,19 @@ impl From<common::HardlinkError> for Error {
     }
 }
 
-impl From<rcache::Error<common::fetchers::AnyRespError>> for Error {
-    fn from(value: rcache::Error<common::fetchers::AnyRespError>) -> Self {
+impl From<rcache::Error<AnyRespError>> for Error {
+    fn from(value: rcache::Error<AnyRespError>) -> Self {
         Self::Other(rcache_cause(value))
     }
 }
 
+/// The line that sends the user to the mirror's state (MIR-063).
+const MIRROR_STATUS_LINE: &str = "Run min mirror status to see its state.";
+
 /// Renders an `rcache::Error` as a user-facing cause.
-fn rcache_cause(value: rcache::Error<common::fetchers::AnyRespError>) -> anyhow::Error {
-    // The two arms are NOT interchangeable, though they look it:
-    // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
+fn rcache_cause(value: rcache::Error<AnyRespError>) -> anyhow::Error {
+    // The `Config` and fallback arms are NOT interchangeable, though they
+    // look it: `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
     // Debug-formats itself — so the fallback arm renders a `Config` as
     // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
     // variant name and escaped quotes included. Destructuring `Config` and
@@ -331,7 +335,22 @@ fn rcache_cause(value: rcache::Error<common::fetchers::AnyRespError>) -> anyhow:
     // it replaced.
     match value {
         rcache::Error::Config(msg) => anyhow::anyhow!("{msg}"),
+        rcache::Error::Backend(AnyRespError::Mirror(e)) => anyhow::anyhow!("{}", mirror_cause(&e)),
         other => anyhow::anyhow!("{other}"),
+    }
+}
+
+/// A fetch through the mirror, as the user reads it (MIR-063). A mirror that
+/// did not answer, and a 502 it relayed from an origin it could not reach,
+/// name `min mirror status` on a second line. Any other answer is the
+/// mirror's own.
+fn mirror_cause(e: &MirrorError) -> String {
+    match e {
+        MirrorError::Connect { source, .. } => {
+            format!("the mirror did not answer: {source}.\n{MIRROR_STATUS_LINE}")
+        }
+        MirrorError::Status { status: 502, .. } => format!("{e}\n{MIRROR_STATUS_LINE}"),
+        other => other.to_string(),
     }
 }
 
@@ -339,7 +358,7 @@ fn rcache_cause(value: rcache::Error<common::fetchers::AnyRespError>) -> anyhow:
 /// a fixed context line, with `hint` in parentheses when the caller's user
 /// has a switch to name. Render it with `{:#}` to keep the cause.
 pub fn remote_cache_setup_error(
-    e: rcache::Error<common::fetchers::AnyRespError>,
+    e: rcache::Error<AnyRespError>,
     hint: Option<&str>,
 ) -> anyhow::Error {
     let cause = rcache_cause(e);
@@ -389,6 +408,66 @@ mod tests {
             format!("{err:#}"),
             "failed to set up the remote artifact cache \
              (pass --no-fetch to build without it): bad url",
+        );
+    }
+
+    fn through_mirror(e: MirrorError) -> Error {
+        Error::from(rcache::Error::Backend(AnyRespError::Mirror(e)))
+    }
+
+    /// MIR-063: a mirror that does not answer fails the fetch with the cause
+    /// on one line and the status command on the next.
+    #[test]
+    fn mirror_unanswered_names_status_command() {
+        let err = through_mirror(MirrorError::Connect {
+            endpoint: common::fetchers::MirrorEndpoint::Unix("/run/mirror/host.sock".into()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            ),
+        });
+        assert_eq!(
+            err.to_string(),
+            "the mirror did not answer: No such file or directory (os error 2).\n\
+             Run min mirror status to see its state.",
+        );
+    }
+
+    /// MIR-063: a 502 the mirror relayed reaches the user as the mirror
+    /// wrote it, with the status command after it. Any other status is the
+    /// mirror's own answer, and the setup error keeps the lines under its
+    /// context.
+    #[test]
+    fn mirror_502_body_reaches_the_user() {
+        let relayed = |status, body: &str| {
+            through_mirror(MirrorError::Status {
+                status,
+                body: body.to_string(),
+            })
+        };
+        assert_eq!(
+            relayed(
+                502,
+                "the mirror could not reach https://cache.minimal.dev/: connection refused"
+            )
+            .to_string(),
+            "the mirror could not reach https://cache.minimal.dev/: connection refused\n\
+             Run min mirror status to see its state.",
+        );
+        assert_eq!(relayed(404, "").to_string(), "the mirror answered 404");
+
+        let setup = remote_cache_setup_error(
+            rcache::Error::Backend(AnyRespError::Mirror(MirrorError::Status {
+                status: 502,
+                body: "the mirror could not reach https://cache.minimal.dev/: down".into(),
+            })),
+            None,
+        );
+        assert_eq!(
+            format!("{setup:#}"),
+            "failed to set up the remote artifact cache: \
+             the mirror could not reach https://cache.minimal.dev/: down\n\
+             Run min mirror status to see its state.",
         );
     }
 }

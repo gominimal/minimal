@@ -33,6 +33,7 @@ common.workspace = true
 checkouts.workspace = true
 graph.workspace = true
 mfile.workspace = true
+mirror-client.workspace = true
 op.workspace = true
 ot.workspace = true
 paths.workspace = true

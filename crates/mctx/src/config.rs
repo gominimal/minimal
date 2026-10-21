@@ -4,7 +4,8 @@ use std::{
 };
 
 use checkouts::ManagerHandle;
-use common::fetchers::{AnyUrl, GcsUrl, ReqwestUrl};
+use common::fetchers::{AnyUrl, GcsUrl, MirrorEndpoint, MirrorUrl, ReqwestUrl};
+use common::mirror::CacheOrigin;
 use ot::OpTracker;
 
 /// The errors possible in configuration or building a configuration.
@@ -82,6 +83,38 @@ fn parse_remote_cache_url(raw: &str) -> Result<(AnyUrl, Option<String>), ConfigE
     Ok((any, Some(bucket.to_string())))
 }
 
+/// The mirror `MINIMAL_MIRROR_SOCKET` names, when it is set and not empty
+/// (MIR-021).
+fn mirror_from_env() -> Option<MirrorEndpoint> {
+    std::env::var_os(mirror_client::SOCKET_ENV)
+        .filter(|path| !path.is_empty())
+        .map(|path| MirrorEndpoint::Unix(PathBuf::from(path)))
+}
+
+/// The location the reader fetches from: `location` itself, or, with a
+/// mirror, its origin's mount on that mirror (MIR-021). `raw` is the string
+/// `location` was parsed from. A `gs://` bucket and any `https` base outside
+/// the origin grammar stay direct in this slice.
+fn through_mirror(location: AnyUrl, raw: &str, mirror: Option<&MirrorEndpoint>) -> AnyUrl {
+    let Some(endpoint) = mirror else {
+        return location;
+    };
+    if !matches!(location, AnyUrl::Https(_)) {
+        return location;
+    }
+    match CacheOrigin::from_https_base(raw) {
+        Ok(origin) => {
+            let mount = MirrorUrl::cache_mount(endpoint.clone(), &origin);
+            tracing::info!(mirror = %endpoint, mount = %mount.path, "remote cache read through the mirror");
+            AnyUrl::Mirror(mount)
+        }
+        Err(reason) => {
+            tracing::info!(url = %raw, %reason, "remote cache read location is outside the mirror's grammar; reading it directly");
+            location
+        }
+    }
+}
+
 /// Builder for [Config].
 #[derive(Debug, Default, Clone)]
 pub struct ConfigBuilder {
@@ -99,6 +132,7 @@ pub struct ConfigBuilder {
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
     remote_cache_url: Option<String>,
+    mirror: Option<MirrorEndpoint>,
 }
 
 impl ConfigBuilder {
@@ -186,6 +220,13 @@ impl ConfigBuilder {
         self.remote_cache_url = Some(url);
         self
     }
+    /// Read the remote cache and every repository through the mirror at
+    /// `endpoint` (MIR-021, MIR-013). Without this, [`Self::build`] reads the
+    /// endpoint from `MINIMAL_MIRROR_SOCKET`.
+    pub fn with_mirror(mut self, endpoint: MirrorEndpoint) -> Self {
+        self.mirror = Some(endpoint);
+        self
+    }
 }
 
 impl ConfigBuilder {
@@ -226,6 +267,10 @@ impl ConfigBuilder {
         // forensics to attribute egress).
         tracing::info!(url = %read_raw, source = read_source, "remote cache read location");
         let (remote_cache_read, _) = parse_remote_cache_url(&read_raw)?;
+        // The mirror does not choose the cache: the location resolved above
+        // is read through the mirror at its origin's mount (MIR-021).
+        let mirror = self.mirror.or_else(mirror_from_env);
+        let remote_cache_read = through_mirror(remote_cache_read, read_raw.trim(), mirror.as_ref());
 
         Ok(Config {
             no_cache: self.no_cache.unwrap_or(false),
@@ -255,6 +300,7 @@ impl ConfigBuilder {
             remote_cache_url: configured_cache_url,
             remote_cache_read,
             remote_cache_write_bucket,
+            mirror,
         })
     }
 }
@@ -276,6 +322,7 @@ impl Config {
             vcs_manager: self.vcs_manager,
             ot: self.ot,
             remote_cache_url: self.remote_cache_url,
+            mirror: self.mirror,
         }
     }
 }
@@ -319,6 +366,9 @@ pub struct Config {
     /// The GCS bucket a *writer* uses; `None` when the configured location is an
     /// HTTPS mirror (writes then error — you can't write to a read mirror).
     remote_cache_write_bucket: Option<String>,
+    /// The mirror the reader and the checkouts fetch through, from
+    /// [`ConfigBuilder::with_mirror`] or `MINIMAL_MIRROR_SOCKET` (MIR-021).
+    mirror: Option<MirrorEndpoint>,
 }
 
 impl Config {
@@ -366,6 +416,11 @@ impl Config {
     /// configured location is an HTTPS read mirror (writes then error).
     pub fn remote_cache_write_bucket(&self) -> Option<&str> {
         self.remote_cache_write_bucket.as_deref()
+    }
+    /// The mirror every cache read and repository fetch goes through, when
+    /// one is set (MIR-021).
+    pub fn mirror(&self) -> Option<&MirrorEndpoint> {
+        self.mirror.as_ref()
     }
 
     pub(crate) fn built_cache_dir(&self) -> PathBuf {
@@ -568,5 +623,142 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRemoteCacheUrl(_)));
+    }
+
+    /// The guard the sibling tests apply before asserting on the reader: a
+    /// non-empty `MINIMAL_REMOTE_CACHE_URL` in the test process overrides it.
+    fn reader_env_override_unset() -> bool {
+        std::env::var("MINIMAL_REMOTE_CACHE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_none()
+    }
+
+    fn host_socket() -> MirrorEndpoint {
+        MirrorEndpoint::Unix(PathBuf::from("/run/user/1000/minimal/mirror/host.sock"))
+    }
+
+    /// MIR-021: `MINIMAL_MIRROR_SOCKET` names the host socket. A config built
+    /// without an endpoint reads it; an empty value is no mirror; an explicit
+    /// endpoint survives a round trip through the builder.
+    #[test]
+    fn mirror_socket_variable_selects_the_mirror() {
+        assert_eq!(mirror_client::SOCKET_ENV, "MINIMAL_MIRROR_SOCKET");
+        let socket = "/run/user/1000/minimal/mirror/host.sock";
+        // SAFETY: the suite runs under nextest, one process per test, so no
+        // other thread reads the environment while this one changes it.
+        unsafe { std::env::set_var(mirror_client::SOCKET_ENV, socket) };
+        let from_variable = ConfigBuilder::new().build();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(mirror_client::SOCKET_ENV, "") };
+        let from_empty_variable = ConfigBuilder::new().build();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(mirror_client::SOCKET_ENV) };
+
+        assert_eq!(
+            from_variable.unwrap().mirror(),
+            Some(&MirrorEndpoint::Unix(PathBuf::from(socket)))
+        );
+        assert_eq!(from_empty_variable.unwrap().mirror(), None);
+        assert_eq!(ConfigBuilder::new().build().unwrap().mirror(), None);
+
+        let explicit = ConfigBuilder::new()
+            .with_mirror(host_socket())
+            .build()
+            .unwrap();
+        assert_eq!(explicit.mirror(), Some(&host_socket()));
+        let round_tripped = explicit.into_builder().build().unwrap();
+        assert_eq!(round_tripped.mirror(), Some(&host_socket()));
+    }
+
+    /// MIR-021: an `https` location in the origin grammar is read at its
+    /// origin's mount on the mirror; the writer's bucket is untouched.
+    #[test]
+    fn cache_location_is_read_through_its_origin_mount() {
+        let socket = host_socket();
+        let default = parse_remote_cache_url(DEFAULT_REMOTE_CACHE_READ_URL)
+            .unwrap()
+            .0;
+        match through_mirror(default, DEFAULT_REMOTE_CACHE_READ_URL, Some(&socket)) {
+            AnyUrl::Mirror(u) => {
+                assert_eq!(u.endpoint, socket);
+                assert_eq!(u.path, "/-/c/cache.minimal.dev/-/");
+            }
+            other => panic!("expected the mirror mount, got {other:?}"),
+        }
+        let acme = "https://cache.acme.internal:8443/pkgs/";
+        match through_mirror(parse_remote_cache_url(acme).unwrap().0, acme, Some(&socket)) {
+            AnyUrl::Mirror(u) => assert_eq!(u.path, "/-/c/cache.acme.internal:8443/pkgs/-/"),
+            other => panic!("expected the mirror mount, got {other:?}"),
+        }
+        assert!(matches!(
+            through_mirror(parse_remote_cache_url(acme).unwrap().0, acme, None),
+            AnyUrl::Https(_)
+        ));
+
+        let cfg = ConfigBuilder::new().with_mirror(socket).build().unwrap();
+        assert_eq!(
+            cfg.remote_cache_write_bucket(),
+            Some(DEFAULT_REMOTE_CACHE_BUCKET)
+        );
+        if reader_env_override_unset() {
+            match cfg.remote_cache_url() {
+                AnyUrl::Mirror(u) => assert_eq!(u.path, "/-/c/cache.minimal.dev/-/"),
+                other => panic!("expected the mirror mount, got {other:?}"),
+            }
+        }
+    }
+
+    /// MIR-021: a `gs://` bucket and an `https` base outside the origin
+    /// grammar are read directly, mirror or not.
+    #[test]
+    fn location_outside_grammar_bypasses_mirror() {
+        let socket = host_socket();
+        for raw in [
+            "http://cache.example.com/",
+            "https://u:p@cache.example.com/",
+            "https://cache.example.com/-/x/",
+        ] {
+            let location = parse_remote_cache_url(raw).unwrap().0;
+            assert!(
+                matches!(
+                    through_mirror(location, raw, Some(&socket)),
+                    AnyUrl::Https(_)
+                ),
+                "{raw} stays direct"
+            );
+        }
+
+        let cfg = ConfigBuilder::new()
+            .with_remote_cache_url("gs://my-bucket".into())
+            .with_mirror(socket)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.remote_cache_write_bucket(), Some("my-bucket"));
+        if reader_env_override_unset() {
+            assert!(matches!(
+                cfg.remote_cache_url(),
+                AnyUrl::Gcs(g) if g.bucket == "projects/_/buckets/my-bucket"
+            ));
+        }
+    }
+
+    /// MIR-021: `--no-fetch` fetches no artifact, from the mirror or from an
+    /// origin; a mirror does not reopen the remote cache.
+    #[test]
+    fn no_fetch_skips_the_mirror_too() {
+        let no_fetch = ConfigBuilder::new()
+            .with_no_fetch(true)
+            .with_mirror(host_socket())
+            .build()
+            .unwrap();
+        assert!(!no_fetch.use_remote_cache());
+        assert_eq!(no_fetch.mirror(), Some(&host_socket()));
+
+        let fetching = ConfigBuilder::new()
+            .with_mirror(host_socket())
+            .build()
+            .unwrap();
+        assert!(fetching.use_remote_cache());
     }
 }
