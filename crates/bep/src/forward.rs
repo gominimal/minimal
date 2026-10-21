@@ -57,6 +57,15 @@ pub const FOREIGN_CREDENTIAL: &str = "foreign_credential";
 /// byte, which would split the header it goes into.
 pub const CREDENTIAL_NOT_HEADER_SAFE: &str = "credential_not_header_safe";
 
+/// The audit marker of a request with a sealed value in one `Authorization`
+/// header and another `Authorization` header beside it. The upstream can
+/// honour either header, so the request is refused.
+pub const MIXED_AUTHORIZATION: &str = "mixed_authorization";
+
+/// The audit marker of a substitution whose `Authorization` header is not in
+/// the request. [`carried`] gives the header, so this is not expected.
+pub const SEALED_HEADER_MISSING: &str = "sealed_header_missing";
+
 /// The size of one read on the response half.
 const RESPONSE_CHUNK: usize = 16 * 1024;
 
@@ -282,6 +291,8 @@ pub enum Carried {
     Sealed(SealedAt),
     /// An `Authorization` header with no sealed value in it.
     Foreign,
+    /// A sealed value, and another `Authorization` header beside it.
+    Mixed,
     /// No `Authorization` header.
     None,
 }
@@ -316,22 +327,29 @@ pub fn is_sealed(text: &str) -> bool {
 /// registered header of its own is #2292's (T28). Until then, a sealed value
 /// in any other header is not found, and the request is decided as plain.
 ///
-/// The first `Authorization` header with a sealed value is the one
-/// substituted. A second `Authorization` header with no sealed value is not
-/// refused: it goes upstream unchanged beside the substituted credential.
+/// A request with one `Authorization` header that holds a sealed value is
+/// [`Carried::Sealed`]. A sealed value beside any other `Authorization`
+/// header is [`Carried::Mixed`]: the upstream can honour either header, so
+/// the decision refuses it.
 #[must_use]
 pub fn carried(request: &Request) -> Carried {
-    let mut found = Carried::None;
+    let mut sealed = None;
+    let mut count = 0usize;
     for (index, header) in request.headers.iter().enumerate() {
         if !header.name.eq_ignore_ascii_case("authorization") {
             continue;
         }
-        if let Some(at) = sealed_in(index, &header.value) {
-            return Carried::Sealed(at);
+        count += 1;
+        if sealed.is_none() {
+            sealed = sealed_in(index, &header.value);
         }
-        found = Carried::Foreign;
     }
-    found
+    match (sealed, count) {
+        (Some(at), 1) => Carried::Sealed(at),
+        (Some(_), _) => Carried::Mixed,
+        (None, 0) => Carried::None,
+        (None, _) => Carried::Foreign,
+    }
 }
 
 fn sealed_in(header: usize, value: &[u8]) -> Option<SealedAt> {
@@ -373,7 +391,8 @@ fn sealed_in(header: usize, value: &[u8]) -> Option<SealedAt> {
 /// # Errors
 ///
 /// [`CREDENTIAL_NOT_HEADER_SAFE`] when `credential` holds a CR, LF or NUL
-/// byte. The request is then unchanged.
+/// byte, and [`SEALED_HEADER_MISSING`] when the request has no header at
+/// `at`. The request is then unchanged.
 pub fn substitute(
     request: &mut Request,
     at: &SealedAt,
@@ -399,10 +418,12 @@ pub fn substitute(
             Zeroizing::new(format!("Basic {}", STANDARD.encode(pair.as_bytes())))
         }
     };
-    if let Some(header) = request.headers.get_mut(at.header) {
-        header.value.zeroize();
-        header.value = value.as_bytes().to_vec();
-    }
+    let header = request
+        .headers
+        .get_mut(at.header)
+        .ok_or(SEALED_HEADER_MISSING)?;
+    header.value.zeroize();
+    header.value = value.as_bytes().to_vec();
     Ok(())
 }
 
@@ -541,13 +562,10 @@ impl Flow {
                         mapping,
                     } => {
                         if let Err(marker) = substitute(request, &at, &credential, self.validated) {
+                            // The module mapped the request, so the refusal
+                            // records the mapping (Gatehouse §6.10).
                             span.record("substitution", "refused");
-                            self.record(
-                                Outcome::Refuse,
-                                Some(marker),
-                                None,
-                                Mapping::ModuleUnmapped,
-                            );
+                            self.record(Outcome::Refuse, Some(marker), Some(identifier), mapping);
                             return Err(marker);
                         }
                         span.record("substitution", "substituted");
@@ -560,6 +578,18 @@ impl Flow {
                         Err(marker)
                     }
                 }
+            }
+            Carried::Mixed => {
+                // Nothing is redeemed: the upstream can honour the other
+                // `Authorization` header in place of the credential.
+                span.record("substitution", "refused");
+                self.record(
+                    Outcome::Refuse,
+                    Some(MIXED_AUTHORIZATION),
+                    None,
+                    Mapping::ModuleUnmapped,
+                );
+                Err(MIXED_AUTHORIZATION)
             }
             carried @ (Carried::Foreign | Carried::None) => {
                 // BEP-030: forwarded unmodified, and audited.
@@ -576,6 +606,10 @@ impl Flow {
         if marker == Check::OutsideDeclaredEgress.marker() {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because this box is not allowed to reach {authority}."
+            )
+        } else if marker == MIXED_AUTHORIZATION {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because it has more than one Authorization header. Send the sealed credential in one Authorization header."
             )
         } else if marker == Check::HostMismatch.marker() {
             format!(
@@ -1498,6 +1532,138 @@ mod tests {
             let header = String::from_utf8(req.headers[0].value.clone()).unwrap();
             assert_eq!(header, format!("Bearer {sealed}"));
         }
+    }
+
+    /// A redeemer that admits within `github_egress()`, with a mapped
+    /// resource and the credential it holds.
+    struct AdmitsWith(&'static str);
+
+    impl Redeemer for AdmitsWith {
+        fn egress(&self, _box_id: &str) -> Vec<Authority<String>> {
+            github_egress()
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &Authority<String>,
+            _request: &RequestAuthority<String>,
+            _sealed: &str,
+        ) -> Verdict {
+            Verdict::Admit {
+                credential: Zeroizing::new(self.0.to_owned()),
+                identifier: "github:member".to_owned(),
+                mapping: Mapping::Mapped {
+                    resource: "repo".to_owned(),
+                    permission: "read".to_owned(),
+                },
+            }
+        }
+    }
+
+    fn decide_with(
+        credential: &'static str,
+        authorizations: &[String],
+    ) -> (Result<(), &'static str>, Request, Vec<Decision>) {
+        let records = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        let audit: Arc<dyn AuditWriter> = records.clone();
+        let flow = Flow::new(
+            "b",
+            Authority {
+                host: "api.github.com".to_owned(),
+                port: 443,
+            },
+            audit,
+            Arc::new(AdmitsWith(credential)),
+            Validated::unchecked(()).proof(),
+        );
+        let mut headers = vec![http::Header {
+            name: "host".into(),
+            value: b"api.github.com".to_vec(),
+        }];
+        headers.extend(authorizations.iter().map(|value| http::Header {
+            name: "authorization".into(),
+            value: value.clone().into_bytes(),
+        }));
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers,
+            body: http::BodyFraming::None,
+        };
+        let got = flow.decide(&mut req);
+        let records = records.lock().unwrap().clone();
+        (got, req, records)
+    }
+
+    // A refusal after the module mapped the request records the identifier
+    // and the mapping (Gatehouse §6.10).
+    #[test]
+    fn unsafe_credential_refusal_records_the_mapping() {
+        let sealed = sealed_text();
+        let (got, req, records) = decide_with("ghs_a\r\nx: 1", &[format!("Bearer {sealed}")]);
+        assert_eq!(got, Err(CREDENTIAL_NOT_HEADER_SAFE));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(
+            records[0].marker.as_deref(),
+            Some(CREDENTIAL_NOT_HEADER_SAFE)
+        );
+        assert_eq!(records[0].identifier.as_deref(), Some("github:member"));
+        assert_eq!(
+            records[0].mapping,
+            Mapping::Mapped {
+                resource: "repo".to_owned(),
+                permission: "read".to_owned(),
+            }
+        );
+        let header = String::from_utf8(req.headers[1].value.clone()).unwrap();
+        assert_eq!(header, format!("Bearer {sealed}"));
+    }
+
+    // A sealed value beside another `Authorization` header is refused in
+    // either order, and nothing is substituted.
+    #[test]
+    fn sealed_beside_other_authorization_is_refused() {
+        let sealed = sealed_text();
+        let orders = [
+            ["token ghp_own".to_owned(), format!("Bearer {sealed}")],
+            [format!("Bearer {sealed}"), "token ghp_own".to_owned()],
+            [format!("Bearer {sealed}"), format!("Bearer {sealed}")],
+        ];
+        for order in orders {
+            let (got, req, records) = decide_with(REAL, &order);
+            assert_eq!(got, Err(MIXED_AUTHORIZATION), "{order:?}");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].outcome, Outcome::Refuse);
+            assert_eq!(records[0].marker.as_deref(), Some(MIXED_AUTHORIZATION));
+            for header in &req.headers[1..] {
+                let value = String::from_utf8(header.value.clone()).unwrap();
+                assert!(!value.contains(REAL), "{value}");
+            }
+        }
+    }
+
+    // A substitution with no header at its index changes nothing and fails.
+    #[test]
+    fn substitution_without_its_header_fails() {
+        let sealed = sealed_text();
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![http::Header {
+                name: "authorization".into(),
+                value: format!("Bearer {sealed}").into_bytes(),
+            }],
+            body: http::BodyFraming::None,
+        };
+        let Carried::Sealed(at) = carried(&req) else {
+            panic!("sealed");
+        };
+        req.headers.clear();
+        let got = substitute(&mut req, &at, REAL, Validated::unchecked(()).proof());
+        assert_eq!(got, Err(SEALED_HEADER_MISSING));
+        assert!(req.headers.is_empty());
     }
 
     // The box gets the 403 even when the upstream closes before or as the
