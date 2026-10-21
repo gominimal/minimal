@@ -42,10 +42,13 @@
 //!    For a store handle, the shell gives the handle's `upstream` as the
 //!    bound set and the rule's authorities as the current set, so checks 8
 //!    to 10 read them where they read a module's host sets (BEP-032).
+//!    Check 9 also reads the handle's `upstream` itself, so a bound set
+//!    wider than the handle never widens where the value goes.
 //! 8. The connection's port is a declared port of the module's current host
 //!    set for that hostname (BEP-031). A hostname outside the current set is
 //!    not credentialed, so check 10 refuses it.
-//! 9. The connection authority is in the value's bound host set (BEP-021).
+//! 9. The connection authority is in the value's bound host set and in the
+//!    handle's `upstream` (BEP-021, BEP-064).
 //! 10. The connection authority is in the module's current host set
 //!     (BEP-021).
 //! 11. The request's `Host` header, and the authority of an absolute-form
@@ -429,7 +432,10 @@ pub fn decide<B: PartialEq, H: PartialEq, I: PartialEq>(
         return Decision::Refuse(Check::OffPort);
     }
     // BEP-021: the authority is in the bound set and in the current set.
-    if !redemption.bound_set.contains(authority) {
+    // BEP-064: the handle's own upstream bounds the bound set too, so a
+    // bound set wider than the checked handle sends the value nowhere new.
+    if !redemption.bound_set.contains(authority) || !redemption.handle.upstream.contains(authority)
+    {
         return Decision::Refuse(Check::OutsideBoundSet);
     }
     if !current.contains(authority) {
@@ -525,6 +531,39 @@ mod tests {
         }
     }
 
+    /// BEP-021, BEP-064: a valid handle beside a wider bound set does not
+    /// widen where the value goes. An authority in the bound set and the
+    /// current set, but outside the handle's `upstream`, is refused.
+    #[test]
+    fn bound_set_wider_than_handle_upstream_is_refused() {
+        let other = Authority { host: 2, port: 443 };
+        let wide = Redemption {
+            bound_set: vec![API, other],
+            current_set: vec![API, other],
+            ..own(7)
+        };
+        assert!(wide.handle.check(wide.now).is_ok());
+        assert_eq!(
+            decide(&reached_unchanged(other, wide.clone())),
+            Decision::Refuse(Check::OutsideBoundSet)
+        );
+        assert_eq!(decide(&reached_unchanged(API, wide)), ADMITTED);
+    }
+
+    /// `redemption`, sent to `authority` with a pinned request and a
+    /// declared egress, with its handle as it is.
+    fn reached_unchanged(
+        authority: Authority<u8>,
+        redemption: Redemption<u8, u8, u8>,
+    ) -> Redemption<u8, u8, u8> {
+        Redemption {
+            authority,
+            request: pinned(authority),
+            egress: vec![authority],
+            ..redemption
+        }
+    }
+
     /// An origin-form request whose `Host` header is the connection's.
     const PINNED: RequestAuthority<u8> = RequestAuthority {
         host: Some(API),
@@ -554,15 +593,26 @@ mod tests {
     }
 
     /// `redemption`, sent to `authority` with a pinned request, from a box
-    /// whose declared egress admits `authority`.
+    /// whose declared egress admits `authority`. The handle's `upstream`, and
+    /// its rule's, take `authority` too, so the handle's verdict holds.
     fn reached(
         authority: Authority<u8>,
         redemption: Redemption<u8, u8, u8>,
     ) -> Redemption<u8, u8, u8> {
+        let mut handle = redemption.handle;
+        if !handle.upstream.contains(&authority) {
+            handle.upstream.push(authority);
+            if let Some(rule) = &mut handle.rule
+                && !rule.upstream.contains(&authority)
+            {
+                rule.upstream.push(authority);
+            }
+        }
         Redemption {
             authority,
             request: pinned(authority),
             egress: vec![authority],
+            handle,
             ..redemption
         }
     }
@@ -721,7 +771,10 @@ mod tests {
             ),
             (Check::StoreHandleInvalid, !handle_valid(&r.handle, r.now)),
             (Check::OffPort, credentialed && !r.current_set.contains(&a)),
-            (Check::OutsideBoundSet, !r.bound_set.contains(&a)),
+            (
+                Check::OutsideBoundSet,
+                !r.bound_set.contains(&a) || !r.handle.upstream.contains(&a),
+            ),
             (Check::OutsideCurrentSet, !r.current_set.contains(&a)),
             (Check::HostMismatch, !(host_pinned && target_pinned)),
         ]
@@ -1107,7 +1160,10 @@ mod tests {
             handle in any_handle(),
             now in 0u64..4_000,
         ) {
-            let r = Redemption {
+            // `reached` puts `API` in the handle's upstream, and in its
+            // rule's, so the handle's verdict is the same and only BEP-064
+            // decides.
+            let r = reached(API, Redemption {
                 now,
                 handle: handle.clone(),
                 unsealed: Unsealed::Opened {
@@ -1116,7 +1172,7 @@ mod tests {
                     expiry: u64::MAX,
                 },
                 ..own(1)
-            };
+            });
             let valid = handle.verified
                 && handle.bound
                 && now < handle.exp
@@ -1132,6 +1188,7 @@ mod tests {
                 prop_assert_eq!(Check::StoreHandleInvalid.marker(), "store_handle_invalid");
             }
             prop_assert_eq!(handle.check(now).is_ok(), valid);
+            prop_assert_eq!(r.handle.check(now).is_ok(), valid);
             admits_iff_every_check_passes(&r)?;
         }
     }
@@ -1557,10 +1614,13 @@ mod kani_proofs {
         let decision = decide(&r);
         if matches!(decision, Decision::Admit { .. }) {
             assert!(r.bound_set.contains(&r.authority));
+            assert!(r.handle.upstream.contains(&r.authority));
             assert!(r.current_set.contains(&r.authority));
         }
         if decision == Decision::Refuse(Check::OutsideBoundSet) {
-            assert!(!r.bound_set.contains(&r.authority));
+            assert!(
+                !r.bound_set.contains(&r.authority) || !r.handle.upstream.contains(&r.authority)
+            );
         }
         if decision == Decision::Refuse(Check::OutsideCurrentSet) {
             assert!(!r.current_set.contains(&r.authority));
@@ -1716,6 +1776,7 @@ mod kani_proofs {
                     && !r.revoked.contains(&box_id)
                     && handle_valid(&r.handle, r.now)
                     && r.bound_set.contains(&a)
+                    && r.handle.upstream.contains(&a)
                     && r.current_set.contains(&a)
                     && r.egress.contains(&a)
                     && r.request.host == Some(a)
