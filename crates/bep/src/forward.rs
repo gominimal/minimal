@@ -53,6 +53,10 @@ pub const UPSTREAM_TLS_INVALID: &str = "upstream_tls_invalid";
 /// (BEP-030).
 pub const FOREIGN_CREDENTIAL: &str = "foreign_credential";
 
+/// The audit marker of a redeemed credential that holds a CR, LF or NUL
+/// byte, which would split the header it goes into.
+pub const CREDENTIAL_NOT_HEADER_SAFE: &str = "credential_not_header_safe";
+
 /// The size of one read on the response half.
 const RESPONSE_CHUNK: usize = 16 * 1024;
 
@@ -365,12 +369,20 @@ fn sealed_in(header: usize, value: &[u8]) -> Option<SealedAt> {
 
 /// Puts `credential` in place of the sealed value at `at` (BEP-025). The
 /// proof says the upstream leg validated (BEP-055).
+///
+/// # Errors
+///
+/// [`CREDENTIAL_NOT_HEADER_SAFE`] when `credential` holds a CR, LF or NUL
+/// byte. The request is then unchanged.
 pub fn substitute(
     request: &mut Request,
     at: &SealedAt,
     credential: &str,
     _validated: ValidatedUpstream,
-) {
+) -> Result<(), &'static str> {
+    if credential.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err(CREDENTIAL_NOT_HEADER_SAFE);
+    }
     let value = match &at.form {
         Form::Token(scheme) => Zeroizing::new(format!("{scheme} {credential}")),
         Form::Bare => Zeroizing::new(credential.to_owned()),
@@ -391,6 +403,7 @@ pub fn substitute(
         header.value.zeroize();
         header.value = value.as_bytes().to_vec();
     }
+    Ok(())
 }
 
 /// The authorities a request names: its `Host` header and an absolute-form
@@ -527,7 +540,16 @@ impl Flow {
                         identifier,
                         mapping,
                     } => {
-                        substitute(request, &at, &credential, self.validated);
+                        if let Err(marker) = substitute(request, &at, &credential, self.validated) {
+                            span.record("substitution", "refused");
+                            self.record(
+                                Outcome::Refuse,
+                                Some(marker),
+                                None,
+                                Mapping::ModuleUnmapped,
+                            );
+                            return Err(marker);
+                        }
                         span.record("substitution", "substituted");
                         self.record(Outcome::Admit, None, Some(identifier), mapping);
                         Ok(())
@@ -696,6 +718,14 @@ pub async fn relay_responses<R, W>(
                 }
             }
         }
+    }
+    // The upstream can close before the refusal arrives: take one that is
+    // already sent, so the box sees the 403 and not a silent close.
+    if refusal.is_none()
+        && let Some(mut rx) = refused
+        && let Ok(got) = rx.try_recv()
+    {
+        refusal = Some(got);
     }
     match refusal {
         Some(refusal) => respond(client, 403, "Forbidden", &refusal.body).await,
@@ -1445,6 +1475,56 @@ mod tests {
         }
     }
 
+    // A credential with a line break or NUL would split the header it goes
+    // into, so the decision refuses the request and leaves it unchanged.
+    #[test]
+    fn credential_with_line_break_is_not_substituted() {
+        let sealed = sealed_text();
+        for bad in ["ghs_a\r\nx-injected: 1", "ghs_a\nb", "ghs_a\0b"] {
+            let mut req = Request {
+                method: "GET".into(),
+                target: "/".into(),
+                headers: vec![http::Header {
+                    name: "authorization".into(),
+                    value: format!("Bearer {sealed}").into_bytes(),
+                }],
+                body: http::BodyFraming::None,
+            };
+            let Carried::Sealed(at) = carried(&req) else {
+                panic!("sealed");
+            };
+            let got = substitute(&mut req, &at, bad, Validated::unchecked(()).proof());
+            assert_eq!(got, Err(CREDENTIAL_NOT_HEADER_SAFE), "{bad:?}");
+            let header = String::from_utf8(req.headers[0].value.clone()).unwrap();
+            assert_eq!(header, format!("Bearer {sealed}"));
+        }
+    }
+
+    // The box gets the 403 even when the upstream closes before or as the
+    // refusal arrives. `select!` picks a ready branch at random, so the loop
+    // takes both paths.
+    #[tokio::test]
+    async fn refusal_is_answered_after_upstream_closes() {
+        for _ in 0..64 {
+            let (mut up, mut up_far) = tokio::io::duplex(1024);
+            let (mut client, mut client_far) = tokio::io::duplex(4096);
+            let (tx, rx) = oneshot::channel();
+            tx.send(Refusal {
+                marker: Check::Undecryptable.marker(),
+                body: "refused".to_owned(),
+                after_forwarded: false,
+            })
+            .unwrap();
+            up_far.shutdown().await.unwrap();
+            drop(up_far);
+            relay_responses(&mut up, &mut client, rx).await;
+            drop(client);
+            let mut out = String::new();
+            client_far.read_to_string(&mut out).await.unwrap();
+            assert!(out.starts_with("HTTP/1.1 403 Forbidden"), "{out}");
+        }
+    }
+
     #[test]
     fn sealed_value_is_found_in_each_authorization_form() {
         let sealed = sealed_text();
@@ -1469,7 +1549,7 @@ mod tests {
                 panic!("{value}");
             };
             assert_eq!(at.value, sealed);
-            substitute(&mut req, &at, REAL, Validated::unchecked(()).proof());
+            substitute(&mut req, &at, REAL, Validated::unchecked(()).proof()).unwrap();
             let out = String::from_utf8(req.headers[0].value.clone()).unwrap();
             assert!(!out.contains(&sealed), "{out}");
         }

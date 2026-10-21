@@ -822,15 +822,19 @@ where
         let mut client = tokio_util::io::SyncIoBridge::new(box_read);
         let mut upstream = tokio_util::io::SyncIoBridge::new(up_write);
         let end = forward::forward_requests(&flow, &mut client, &mut upstream);
-        let _ = upstream.shutdown();
-        match end {
+        // Send the refusal before the shutdown: the upstream can close as
+        // soon as it reads end of file, and the response half must already
+        // hold the refusal then.
+        let rule = match end {
             HalfEnd::Closed(reason) => reason.rule(),
             HalfEnd::Refused(refusal) => {
                 let marker = refusal.marker;
                 let _ = refused_tx.send(refusal);
                 marker
             }
-        }
+        };
+        let _ = upstream.shutdown();
+        rule
     });
     let responses = async {
         forward::relay_responses(&mut up_read, &mut box_write, refused_rx).await;
