@@ -34,6 +34,10 @@ args.workspace = true
 nickel-lang-core.workspace = true
 
 bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 reqwest.workspace = true
 futures.workspace = true
 tokio.workspace = true
@@ -49,6 +53,7 @@ codespan-reporting.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+tokio-vsock.workspace = true
 
 [lints]
 workspace = true

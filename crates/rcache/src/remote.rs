@@ -208,6 +208,10 @@ impl RemoteCache<AnyBackend> {
                     .map_err(AnyRespError::Https)?;
                 AnyBackend::Https(client)
             }
+            // The mirror serves the same keys under its own mount, so the
+            // reader fetches them through its socket as it fetches from an
+            // https mirror: unauthenticated GETs, sha256-checked on arrival.
+            AnyUrl::Mirror(_) => AnyBackend::Mirror(common::fetchers::MirrorClient::new()),
         };
         Self::new(backend, url, index_dir, ot, source).await
     }

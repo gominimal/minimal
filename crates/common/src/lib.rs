@@ -5,6 +5,7 @@ pub mod fetchers;
 pub mod file_cache;
 pub mod fuzzy_search;
 pub mod jq;
+pub mod mirror;
 mod remote_storage;
 pub use remote_storage::RemoteStorage;
 

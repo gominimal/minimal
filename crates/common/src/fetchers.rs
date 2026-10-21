@@ -6,7 +6,15 @@ use google_cloud_storage::Error as GcsError;
 use google_cloud_storage::client::Storage;
 use reqwest::{Client, Error as ReqwestError, Request, Response, Url as UpstreamReqwestUrl};
 
+use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
+
+use crate::mirror::CacheOrigin;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
 
 /// Newtype of [reqwest::Url] to wire reqwest as a [FetchBackend].
 #[derive(Clone, Debug)]
@@ -293,11 +301,348 @@ impl FetchBackend for Storage {
 // keep using the concrete `Storage` backend (compare-and-swap needs GCS
 // object generations, which plain HTTPS doesn't expose).
 
-/// A [FetchUrl] over either a GCS bucket URL or a plain HTTPS URL.
+// ── The mirror transport ──────────────────────────────────────────────────────
+//
+// The mirror (spec MIR) answers HTTP/1.1 on a Unix socket on the host and on a
+// vsock door in a guest. Neither is a URL a reqwest client can dial, so the
+// mirror has a backend of its own: one hyper connection per request over the
+// stream the endpoint names, with the same `FetchBackend` surface the HTTPS
+// and GCS backends have, so the cache reader needs no second code path.
+
+/// Where a mirror listens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MirrorEndpoint {
+    /// A Unix socket on this machine: the host socket.
+    Unix(PathBuf),
+    /// A vsock door, dialled from inside a VM: the host's context id and the
+    /// door's port.
+    #[cfg(target_os = "linux")]
+    Vsock { cid: u32, port: u32 },
+}
+
+impl fmt::Display for MirrorEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MirrorEndpoint::Unix(path) => write!(f, "{}", path.display()),
+            #[cfg(target_os = "linux")]
+            MirrorEndpoint::Vsock { cid, port } => write!(f, "vsock:{cid}:{port}"),
+        }
+    }
+}
+
+/// A [FetchUrl] under a mirror: the endpoint and an absolute request path.
+/// Joining a key under a cache mount works as [`url::Url::join`] does under an
+/// `https` base, so the reader's keys land at `/-/c/<origin>/-/<key>`.
+#[derive(Clone, Debug)]
+pub struct MirrorUrl {
+    pub endpoint: MirrorEndpoint,
+    pub path: String,
+}
+
+impl MirrorUrl {
+    /// A URL at an absolute request path.
+    pub fn new(endpoint: MirrorEndpoint, path: impl Into<String>) -> Self {
+        Self {
+            endpoint,
+            path: path.into(),
+        }
+    }
+
+    /// The mount under which the mirror serves `origin`'s keys, the base a
+    /// cache reader joins keys under.
+    pub fn cache_mount(endpoint: MirrorEndpoint, origin: &CacheOrigin) -> Self {
+        Self::new(endpoint, origin.mount())
+    }
+}
+
+impl FetchUrl for MirrorUrl {
+    type JoinError = Infallible;
+
+    fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
+        let path = if input.starts_with('/') {
+            input.to_string()
+        } else {
+            let dir_end = self.path.rfind('/').map(|i| i + 1).unwrap_or(0);
+            format!("{}{input}", &self.path[..dir_end])
+        };
+        Ok(Self {
+            endpoint: self.endpoint.clone(),
+            path,
+        })
+    }
+
+    fn filename(&self) -> String {
+        match self.path.rfind('/') {
+            Some(idx) => self.path[idx + 1..].to_string(),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// What a fetch through the mirror can fail with.
+#[derive(Debug)]
+pub enum MirrorError {
+    /// The endpoint did not accept a connection: the mirror is not running,
+    /// or the door is not mapped.
+    Connect {
+        endpoint: MirrorEndpoint,
+        source: std::io::Error,
+    },
+    /// The HTTP exchange broke after the connection opened.
+    Transport(hyper::Error),
+    /// The request could not be built.
+    Request(http::Error),
+    /// The mirror answered a status outside 2xx; `body` is what it said, so a
+    /// 502 names the origin it could not reach (MIR-002).
+    Status { status: u16, body: String },
+}
+
+impl fmt::Display for MirrorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MirrorError::Connect { endpoint, source } => {
+                write!(f, "the mirror at {endpoint} did not answer: {source}")
+            }
+            MirrorError::Transport(e) => write!(f, "the mirror connection failed: {e}"),
+            MirrorError::Request(e) => write!(f, "the mirror request could not be built: {e}"),
+            MirrorError::Status { status, body } if body.is_empty() => {
+                write!(f, "the mirror answered {status}")
+            }
+            MirrorError::Status { body, .. } => f.write_str(body),
+        }
+    }
+}
+
+impl std::error::Error for MirrorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MirrorError::Connect { source, .. } => Some(source),
+            MirrorError::Transport(e) => Some(e),
+            MirrorError::Request(e) => Some(e),
+            MirrorError::Status { .. } => None,
+        }
+    }
+}
+
+/// A request to the mirror: its URL and method.
+#[derive(Debug)]
+pub struct MirrorRequest {
+    url: MirrorUrl,
+    method: hyper::Method,
+}
+
+impl MirrorRequest {
+    /// A `HEAD` request: the mirror fetches an unheld object as for a `GET`
+    /// and answers with the headers alone (MIR-002).
+    pub fn head(url: MirrorUrl) -> Self {
+        Self {
+            url,
+            method: hyper::Method::HEAD,
+        }
+    }
+}
+
+/// How many bytes of a non-2xx body the client keeps for the error.
+const ERROR_BODY_LIMIT: usize = 4096;
+
+/// A response from the mirror.
+#[derive(Debug)]
+pub struct MirrorResponse {
+    status: u16,
+    content_length: Option<u64>,
+    age: Option<u64>,
+    body: Option<Incoming>,
+    error_body: String,
+}
+
+impl MirrorResponse {
+    /// The `Age` header, which the mirror sets on a copy it served because it
+    /// could not reach the origin (MIR-004).
+    pub fn age(&self) -> Option<u64> {
+        self.age
+    }
+}
+
+impl FetchResponse for MirrorResponse {
+    type Error = MirrorError;
+
+    fn error_for_status(self) -> Result<Self, Self::Error> {
+        if self.is_success() {
+            Ok(self)
+        } else {
+            Err(MirrorError::Status {
+                status: self.status,
+                body: self.error_body,
+            })
+        }
+    }
+    fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+    fn status_code(&self) -> usize {
+        self.status as usize
+    }
+    fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    async fn bytes(mut self) -> Result<Bytes, Self::Error> {
+        let Some(body) = self.body.take() else {
+            return Ok(Bytes::new());
+        };
+        body.collect()
+            .await
+            .map(|collected| collected.to_bytes())
+            .map_err(MirrorError::Transport)
+    }
+
+    async fn chunk(&mut self) -> Result<Option<Bytes>, Self::Error> {
+        let Some(body) = self.body.as_mut() else {
+            return Ok(None);
+        };
+        loop {
+            match body.frame().await {
+                None => return Ok(None),
+                Some(Err(e)) => return Err(MirrorError::Transport(e)),
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        return Ok(Some(data));
+                    }
+                    // A trailer frame carries no data; read on.
+                }
+            }
+        }
+    }
+}
+
+/// The mirror's [FetchBackend]: one HTTP/1.1 connection per request over the
+/// endpoint's stream. Requests are local and few per object, so no pool.
+#[derive(Clone, Debug, Default)]
+pub struct MirrorClient {
+    _private: (),
+}
+
+impl MirrorClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+type MirrorSender = hyper::client::conn::http1::SendRequest<Empty<Bytes>>;
+
+async fn open_mirror_connection(endpoint: &MirrorEndpoint) -> Result<MirrorSender, MirrorError> {
+    let connect_err = |source| MirrorError::Connect {
+        endpoint: endpoint.clone(),
+        source,
+    };
+    match endpoint {
+        MirrorEndpoint::Unix(path) => {
+            let stream = tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(connect_err)?;
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(MirrorError::Transport)?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::debug!(error = %e, "mirror connection ended with an error");
+                }
+            });
+            Ok(sender)
+        }
+        #[cfg(target_os = "linux")]
+        MirrorEndpoint::Vsock { cid, port } => {
+            let stream =
+                tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(*cid, *port))
+                    .await
+                    .map_err(connect_err)?;
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(MirrorError::Transport)?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::debug!(error = %e, "mirror door connection ended with an error");
+                }
+            });
+            Ok(sender)
+        }
+    }
+}
+
+fn header_u64(headers: &http::HeaderMap, name: http::header::HeaderName) -> Option<u64> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
+impl FetchBackend for MirrorClient {
+    type Url = MirrorUrl;
+    type Request = MirrorRequest;
+    type Response = MirrorResponse;
+
+    fn get(
+        &self,
+        url: Self::Url,
+    ) -> Result<Self::Request, <Self::Response as FetchResponse>::Error> {
+        Ok(MirrorRequest {
+            url,
+            method: hyper::Method::GET,
+        })
+    }
+
+    async fn execute(
+        &self,
+        req: Self::Request,
+    ) -> Result<Self::Response, <Self::Response as FetchResponse>::Error> {
+        let mut sender = open_mirror_connection(&req.url.endpoint).await?;
+        let request = http::Request::builder()
+            .method(req.method)
+            .uri(req.url.path.as_str())
+            .header(http::header::HOST, "mirror")
+            .body(Empty::<Bytes>::new())
+            .map_err(MirrorError::Request)?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(MirrorError::Transport)?;
+        let status = response.status().as_u16();
+        let content_length = header_u64(response.headers(), http::header::CONTENT_LENGTH);
+        let age = header_u64(response.headers(), http::header::AGE);
+        let mut body = response.into_body();
+        let mut error_body = String::new();
+        if !(200..300).contains(&status) {
+            // The body of a refusal is the message; keep a bounded prefix so
+            // a 502 can name the origin the mirror could not reach.
+            let mut collected = BytesMut::new();
+            while collected.len() < ERROR_BODY_LIMIT {
+                match body.frame().await {
+                    None => break,
+                    Some(Err(e)) => return Err(MirrorError::Transport(e)),
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            collected.extend_from_slice(&data);
+                        }
+                    }
+                }
+            }
+            collected.truncate(ERROR_BODY_LIMIT);
+            error_body = String::from_utf8_lossy(&collected).trim_end().to_string();
+        }
+        Ok(MirrorResponse {
+            status,
+            content_length,
+            age,
+            body: Some(body),
+            error_body,
+        })
+    }
+}
+
+/// A [FetchUrl] over a GCS bucket URL, a plain HTTPS URL, or a path under
+/// the mirror.
 #[derive(Clone, Debug)]
 pub enum AnyUrl {
     Https(ReqwestUrl),
     Gcs(GcsUrl),
+    Mirror(MirrorUrl),
 }
 
 /// Join error for [AnyUrl].
@@ -305,6 +650,7 @@ pub enum AnyUrl {
 pub enum AnyJoinError {
     Https(url::ParseError),
     Gcs(()),
+    Mirror(Infallible),
 }
 
 impl FetchUrl for AnyUrl {
@@ -317,6 +663,10 @@ impl FetchUrl for AnyUrl {
                 .map(AnyUrl::Https)
                 .map_err(AnyJoinError::Https),
             AnyUrl::Gcs(u) => u.join(input).map(AnyUrl::Gcs).map_err(AnyJoinError::Gcs),
+            AnyUrl::Mirror(u) => u
+                .join(input)
+                .map(AnyUrl::Mirror)
+                .map_err(AnyJoinError::Mirror),
         }
     }
 
@@ -324,6 +674,7 @@ impl FetchUrl for AnyUrl {
         match self {
             AnyUrl::Https(u) => u.filename(),
             AnyUrl::Gcs(u) => u.filename(),
+            AnyUrl::Mirror(u) => u.filename(),
         }
     }
 }
@@ -333,6 +684,7 @@ impl FetchUrl for AnyUrl {
 pub enum AnyResponse {
     Https(Response),
     Gcs(Result<google_cloud_storage::read_object::ReadObjectResponse, GcsError>),
+    Mirror(MirrorResponse),
 }
 
 /// Error from an [AnyResponse] (or from constructing an [AnyBackend]).
@@ -340,6 +692,7 @@ pub enum AnyResponse {
 pub enum AnyRespError {
     Https(ReqwestError),
     Gcs(GcsError),
+    Mirror(MirrorError),
     /// The configured plain-HTTPS read URL could not be parsed.
     InvalidUrl(url::ParseError),
 }
@@ -355,6 +708,9 @@ impl FetchResponse for AnyResponse {
             AnyResponse::Gcs(r) => FetchResponse::error_for_status(r)
                 .map(AnyResponse::Gcs)
                 .map_err(AnyRespError::Gcs),
+            AnyResponse::Mirror(r) => FetchResponse::error_for_status(r)
+                .map(AnyResponse::Mirror)
+                .map_err(AnyRespError::Mirror),
         }
     }
 
@@ -362,6 +718,7 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::is_success(r),
             AnyResponse::Gcs(r) => FetchResponse::is_success(r),
+            AnyResponse::Mirror(r) => FetchResponse::is_success(r),
         }
     }
 
@@ -369,6 +726,7 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::status_code(r),
             AnyResponse::Gcs(r) => FetchResponse::status_code(r),
+            AnyResponse::Mirror(r) => FetchResponse::status_code(r),
         }
     }
 
@@ -376,6 +734,7 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::content_length(r),
             AnyResponse::Gcs(r) => FetchResponse::content_length(r),
+            AnyResponse::Mirror(r) => FetchResponse::content_length(r),
         }
     }
 
@@ -383,6 +742,7 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::bytes(r).await.map_err(AnyRespError::Https),
             AnyResponse::Gcs(r) => FetchResponse::bytes(r).await.map_err(AnyRespError::Gcs),
+            AnyResponse::Mirror(r) => FetchResponse::bytes(r).await.map_err(AnyRespError::Mirror),
         }
     }
 
@@ -390,6 +750,7 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::chunk(r).await.map_err(AnyRespError::Https),
             AnyResponse::Gcs(r) => FetchResponse::chunk(r).await.map_err(AnyRespError::Gcs),
+            AnyResponse::Mirror(r) => FetchResponse::chunk(r).await.map_err(AnyRespError::Mirror),
         }
     }
 
@@ -397,6 +758,7 @@ impl FetchResponse for AnyResponse {
         match self {
             AnyResponse::Https(r) => FetchResponse::generation(r),
             AnyResponse::Gcs(r) => FetchResponse::generation(r),
+            AnyResponse::Mirror(r) => FetchResponse::generation(r),
         }
     }
 }
@@ -408,6 +770,7 @@ impl FetchResponse for AnyResponse {
 pub enum AnyRequest {
     Https(Box<Request>),
     Gcs(Box<google_cloud_storage::builder::storage::ReadObject>),
+    Mirror(Box<MirrorRequest>),
 }
 
 /// A [FetchBackend] that is either the GCS client or a reqwest HTTPS client,
@@ -417,6 +780,7 @@ pub enum AnyRequest {
 pub enum AnyBackend {
     Https(Client),
     Gcs(Box<Storage>),
+    Mirror(MirrorClient),
 }
 
 impl FetchBackend for AnyBackend {
@@ -435,6 +799,9 @@ impl FetchBackend for AnyBackend {
             (AnyBackend::Gcs(s), AnyUrl::Gcs(u)) => FetchBackend::get(&**s, u)
                 .map(|r| AnyRequest::Gcs(Box::new(r)))
                 .map_err(AnyRespError::Gcs),
+            (AnyBackend::Mirror(m), AnyUrl::Mirror(u)) => FetchBackend::get(m, u)
+                .map(|r| AnyRequest::Mirror(Box::new(r)))
+                .map_err(AnyRespError::Mirror),
             // A RemoteCache is always built with a matching backend+url pair
             // (see RemoteCache::new_any_*), so a mismatch is a construction bug.
             _ => unreachable!("AnyBackend: url does not match backend variant"),
@@ -454,6 +821,10 @@ impl FetchBackend for AnyBackend {
                 .await
                 .map(AnyResponse::Gcs)
                 .map_err(AnyRespError::Gcs),
+            (AnyBackend::Mirror(m), AnyRequest::Mirror(r)) => FetchBackend::execute(m, *r)
+                .await
+                .map(AnyResponse::Mirror)
+                .map_err(AnyRespError::Mirror),
             _ => unreachable!("AnyBackend: request does not match backend variant"),
         }
     }
@@ -534,5 +905,151 @@ mod any_backend_tests {
         // never a silent wrong fetch.
         let backend = AnyBackend::Https(Client::new());
         let _ = backend.get(gcs("o"));
+    }
+}
+
+#[cfg(test)]
+mod mirror_backend_tests {
+    use super::*;
+    use http_body_util::Full;
+    use hyper::service::service_fn;
+
+    /// Serves three paths on a Unix socket: a 200 with a body, a 404 with a
+    /// body, and a 502 whose body is the mirror's refusal line.
+    async fn serve(socket: std::path::PathBuf) {
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|req: http::Request<Incoming>| async move {
+                    let (status, body) = match req.uri().path() {
+                        "/-/c/cache.example/-/index.shisha" => (200, "index-bytes"),
+                        "/-/c/cache.example/-/stale.shisha" => (200, "old"),
+                        "/boom" => (
+                            502,
+                            "the mirror could not reach https://cache.example/: down\n",
+                        ),
+                        _ => (404, "no such key"),
+                    };
+                    let mut response = http::Response::builder().status(status);
+                    if req.uri().path().ends_with("stale.shisha") {
+                        response = response.header(http::header::AGE, "120");
+                    }
+                    Ok::<_, Infallible>(
+                        response
+                            .body(Full::new(Bytes::from_static(body.as_bytes())))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    }
+
+    fn start() -> (tempfile::TempDir, MirrorEndpoint) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mirror.sock");
+        tokio::spawn(serve(socket.clone()));
+        (dir, MirrorEndpoint::Unix(socket))
+    }
+
+    async fn wait_for_socket(endpoint: &MirrorEndpoint) {
+        let MirrorEndpoint::Unix(path) = endpoint else {
+            unreachable!()
+        };
+        for _ in 0..50 {
+            if tokio::net::UnixStream::connect(path).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("test mirror did not come up");
+    }
+
+    #[tokio::test]
+    async fn get_through_the_socket_streams_the_body() {
+        let (_dir, endpoint) = start();
+        wait_for_socket(&endpoint).await;
+        let origin = CacheOrigin::from_https_base("https://cache.example/").unwrap();
+        let base = AnyUrl::Mirror(MirrorUrl::cache_mount(endpoint, &origin));
+        let backend = AnyBackend::Mirror(MirrorClient::new());
+        let req = backend.get(base.join("index.shisha").unwrap()).unwrap();
+        let mut resp = backend.execute(req).await.unwrap();
+        assert!(resp.is_success());
+        assert_eq!(resp.status_code(), 200);
+        assert_eq!(resp.content_length(), Some(11));
+        let mut got = Vec::new();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, b"index-bytes");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_body_becomes_the_error() {
+        let (_dir, endpoint) = start();
+        wait_for_socket(&endpoint).await;
+        let backend = MirrorClient::new();
+        let req = backend
+            .get(MirrorUrl::new(endpoint.clone(), "/boom"))
+            .unwrap();
+        let resp = backend.execute(req).await.unwrap();
+        assert_eq!(resp.status_code(), 502);
+        let err = resp.error_for_status().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the mirror could not reach https://cache.example/: down"
+        );
+        let req = backend.get(MirrorUrl::new(endpoint, "/nothing")).unwrap();
+        let resp = backend.execute(req).await.unwrap();
+        assert_eq!(resp.status_code(), 404);
+        assert!(!resp.is_success());
+    }
+
+    #[tokio::test]
+    async fn age_header_is_read_and_a_dead_socket_is_a_connect_error() {
+        let (_dir, endpoint) = start();
+        wait_for_socket(&endpoint).await;
+        let backend = MirrorClient::new();
+        let url = MirrorUrl::new(endpoint, "/-/c/cache.example/-/stale.shisha");
+        let resp = backend.execute(backend.get(url).unwrap()).await.unwrap();
+        assert_eq!(resp.age(), Some(120));
+        assert_eq!(resp.bytes().await.unwrap(), Bytes::from_static(b"old"));
+
+        let dead = MirrorEndpoint::Unix(std::path::PathBuf::from("/nonexistent/mirror.sock"));
+        let err = backend
+            .execute(backend.get(MirrorUrl::new(dead, "/x")).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MirrorError::Connect { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .starts_with("the mirror at /nonexistent/mirror.sock did not answer: ")
+        );
+    }
+
+    #[test]
+    fn mirror_url_joins_like_an_https_base() {
+        let endpoint = MirrorEndpoint::Unix(std::path::PathBuf::from("/s"));
+        let origin = CacheOrigin::from_https_base("https://cache.example/").unwrap();
+        let base = MirrorUrl::cache_mount(endpoint, &origin);
+        assert_eq!(base.path, "/-/c/cache.example/-/");
+        let obj = base.join("github.com/o/r/abc.closure.shisha").unwrap();
+        assert_eq!(
+            obj.path,
+            "/-/c/cache.example/-/github.com/o/r/abc.closure.shisha"
+        );
+        assert_eq!(obj.filename(), "abc.closure.shisha");
+        // Joining under a key, as Url::join would, replaces the last segment.
+        assert_eq!(
+            obj.join("x.zst").unwrap().path,
+            "/-/c/cache.example/-/github.com/o/r/x.zst"
+        );
+        assert_eq!(
+            base.join("/-/git/a/b/-/bundle").unwrap().path,
+            "/-/git/a/b/-/bundle"
+        );
     }
 }

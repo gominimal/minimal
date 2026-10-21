@@ -2085,6 +2085,10 @@ pub(crate) fn cache_host(location: &AnyUrl) -> String {
             host_field(https.host_str().unwrap_or_default(), https.port(), "https")
         }
         AnyUrl::Gcs(gcs) => gcs.bucket.clone(),
+        // A fetch through the mirror leaves this host over a Unix socket or a
+        // vsock door, never over the network; the record names the mirror's
+        // endpoint as the host it left for.
+        AnyUrl::Mirror(mirror) => format!("mirror:{}", mirror.endpoint),
     }
 }
 
