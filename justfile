@@ -33,11 +33,11 @@ native-dir   := scratch / "native-state"
 # The workspace doesn't compile natively on macOS (minimald/lcache/mctx are
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
-scope      := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "--workspace" }
+scope      := if os() == "macos" { "-p minvmd -p boxes -p bep -p minmirrord -p mirror-client" } else { "--workspace" }
 # The strict gate's scope on macOS: the same crates `clippy` and `test` already
 # use, because the Linux-only crates do not build there. The script reports any
 # changed crate this leaves out, so the scope is never silently narrower.
-strict-scope := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "" }
+strict-scope := if os() == "macos" { "-p minvmd -p boxes -p bep -p minmirrord -p mirror-client" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -182,6 +182,13 @@ app-bundle: zoned-build
 # Build the `min` CLI.
 minimal-cli:
     cargo build -p minimal --locked
+
+# `min` starts the mirror daemon on demand and looks for it beside its own
+# binary first, so a dev `min` under target/debug finds this one.
+#
+# Build minmirrord, the mirror daemon (spec MIR).
+mirror-build:
+    cargo build -p minmirrord --locked
 
 # Build a host-native (glibc) minimald (for `just up`).
 [linux]
@@ -755,7 +762,7 @@ _smoke *args:
 
 # Bring the stack up: Linux VM over Hypervisor.framework (`min ls` autospawns minvmd).
 [macos]
-up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+up: artifacts gvproxy initramfs minvmd-build minimal-cli mirror-build && (_smoke)
 
 # `just up` with the initramfs built from the cross toolchain on PATH rather than
 # through `cross` — see `initramfs-nodocker` for what that requires. The iteration
@@ -764,11 +771,11 @@ up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
 #
 # Bring the stack up, building the initramfs without a container.
 [macos]
-up-nodocker: artifacts gvproxy initramfs-nodocker minvmd-build minimal-cli && (_smoke)
+up-nodocker: artifacts gvproxy initramfs-nodocker minvmd-build minimal-cli mirror-build && (_smoke)
 
 # Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
 [linux]
-up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
+up: minimald-build minimal-cli mirror-build gvproxy && (_smoke "--minimal-dir" native-dir)
     #!/usr/bin/env sh
     set -eu
     sock="{{native-dir}}/providers/local-minimald0/ssh.sock"
