@@ -62,17 +62,19 @@ pub use switch::bep_host::BoxId;
 /// that reads a delivered header refuses it like any other id the source's
 /// attachment does not hold.
 ///
-/// The bytes are those of [`mint_record_box_id`]: the one box id type the
-/// in-VM daemon keys the box's record by. The switch and the delivery
-/// header carry the same 16 bytes.
+/// The bytes are those of [`mint_record_box_id`]: the one box id type
+/// every record names a box by. The in-VM daemon stores this id in the
+/// record's `box_id` field. The switch and the delivery header carry the
+/// same 16 bytes.
 pub fn mint_box_id() -> BoxId {
     mint_record_box_id().to_bytes()
 }
 
-/// Mints the box id as the one box id type: the type the in-VM daemon keys
-/// the box's record by, the id the registration reply hands back, and the
-/// id the attachment holds. [`mint_box_id`] is the same mint,
-/// in the 16 raw bytes the switch carries.
+/// Mints the box id as the one box id type: the type of the record's key,
+/// the id the registration reply hands back, and the id the attachment
+/// holds. The in-VM daemon stores it in the record's `box_id` field.
+/// [`mint_box_id`] is the same mint, in the 16 raw bytes the switch
+/// carries.
 #[must_use]
 pub fn mint_record_box_id() -> minimald_rpc::BoxId {
     minimald_rpc::BoxId::mint()
@@ -138,16 +140,15 @@ impl Attachment {
     }
 }
 
-/// A box id rendered for a log line: 32 lowercase hex digits, one fixed
-/// form every diagnostic that names a box id uses — the spelling the box
-/// control wire carries ([`minimald_rpc::BoxId::simple`]) and the one
-/// the proxy's delivery gives every audit record's subject — so a
-/// tail can compare two lines for the same box.
+/// A box id rendered for a log line or an audit record: the hyphenated
+/// UUID form, the same spelling `minimald` logs and a reply's id prints
+/// ([`minimald_rpc::BoxId`]'s `Display`), so a tail can compare a line
+/// from each daemon for the same box.
 pub(crate) struct BoxIdText<'a>(pub(crate) &'a BoxId);
 
 impl fmt::Display for BoxIdText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&minimald_rpc::BoxId::from_bytes(*self.0).simple())
+        fmt::Display::fmt(&minimald_rpc::BoxId::from_bytes(*self.0), f)
     }
 }
 
@@ -343,11 +344,8 @@ mod tests {
             "a later mint sorts after an earlier one"
         );
 
-        // The log spelling is the record key's hex spelling, the same one
-        // the delivery's audit subject uses.
-        assert_eq!(BoxIdText(&raw).to_string(), record_key.simple());
-        let hex: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(BoxIdText(&raw).to_string(), hex);
+        // The log spelling is the record key's own printed spelling.
+        assert_eq!(BoxIdText(&raw).to_string(), record_key.to_string());
         assert_eq!(
             minimald_rpc::BoxId::parse_str(&BoxIdText(&raw).to_string()).unwrap(),
             record_key

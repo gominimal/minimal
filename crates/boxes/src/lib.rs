@@ -960,14 +960,16 @@ where
     Ok(name.filter(|name| !name.is_empty()))
 }
 
-/// A box's identity: one `UUIDv7`, the one key every record, event and
-/// reply names a box by, minted once per box outside the box's host VM,
-/// with its random fields from the host's OS CSPRNG (BEP-070): never a
-/// counter, never a digest of the box's facts, never anything a process
-/// inside the VM could predict or arrange. The daemon's store mints a
-/// record's id at creation, and on a VM host the host-side registration
-/// mints the id its row holds. Both are this type. A client never presents
-/// one of its own.
+/// A box's identity: one `UUIDv7`, the one id type every record, event and
+/// reply names a box by, with its random fields from the OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts. The
+/// daemon's store mints a record's id ([`Record::id`]) at creation. On a
+/// VM host the host-side registration mints the box's id outside the VM,
+/// where no process inside the VM can predict or arrange it, and its row
+/// holds that id. On a VM guest the in-VM store still mints
+/// [`Record::id`] inside the VM, so there the box's id is
+/// [`Record::box_id`] until BOX-002 files the record under it. Both are
+/// this type. A client never presents one of its own.
 ///
 /// Unique per creation by construction: a box recreated with the same
 /// name and the same addresses is a new box, and its id says so. Ids are
@@ -1211,9 +1213,11 @@ impl HostIpEnforcement {
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// The box's id: the one key the store files this record under, and
-    /// the id every event and reply names the box by. Written in the
-    /// hyphenated form, and read in either spelling.
+    /// The record's key: the id the store files this record under, and
+    /// the id every event and reply names the box by. On a VM guest it is
+    /// the in-VM store's key, not the id the VM host minted: that one is
+    /// [`Self::box_id`]. Written in the hyphenated form, and read in
+    /// either spelling.
     #[serde(default = "BoxId::nil")]
     pub id: BoxId,
     /// The name a user assigned to this session, if

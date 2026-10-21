@@ -1299,15 +1299,19 @@ impl BoxManager {
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
+        // On a VM guest the box id is the one the VM host handed in
+        // `config.box_id`, and the in-VM store still mints the record key
+        // (BOX-002 files the record under the handed id). Elsewhere the
+        // record key is the box id.
+        let handed_box_id = config.box_id;
         let record = build_record(config, username, boxes::BoxState::Pending)?;
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
-        // One id names the box from here on: the record's key, and the
-        // session id every later line carries.
+        let box_id = handed_box_id.unwrap_or(session_id);
         tracing::info!(
             session_id = %session_id,
-            box_id = %session_id,
-            "filed the box record under its box id"
+            box_id = %box_id,
+            "filed the box record"
         );
 
         let mut seed = self.session_config(handle.clone());
