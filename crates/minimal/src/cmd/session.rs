@@ -8,7 +8,7 @@ pub(crate) use super::box_verbs::{
 
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
-    activate_session(global, args, true).await
+    activate_box(global, args, true).await
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths
@@ -65,7 +65,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     );
 
     let host_asks = host_asks_box(global, name.as_deref());
-    session_via_ssh(
+    box_via_ssh(
         &sock,
         id,
         None,
@@ -102,7 +102,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    session_via_ssh(&sock, r.id, wire, None, None).await
+    box_via_ssh(&sock, r.id, wire, None, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
@@ -133,7 +133,7 @@ pub async fn cmd_session_run(
         "found session"
     );
 
-    session_via_ssh(
+    box_via_ssh(
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone

@@ -17,7 +17,7 @@ pub(crate) fn should_announce_box(global: &GlobalArgs) -> bool {
 /// session is unnamed. The short id is the leading block of the UUID — enough
 /// to tell two same-named sessions built from the same directory apart without
 /// the full 36-character id.
-pub(crate) fn session_announce_label(id: &boxes::SessionId, name: Option<&str>) -> String {
+pub(crate) fn box_announce_label(id: &boxes::SessionId, name: Option<&str>) -> String {
     let id = id.to_string();
     let short = id.split('-').next().unwrap_or(&id);
     match name {
@@ -55,10 +55,7 @@ pub(crate) async fn resolve_attach_target_version_gated(
                 if should_announce_box(global) {
                     eprintln!(
                         "Attaching to session {} on VM {}",
-                        session_announce_label(
-                            &resolved.record.id,
-                            resolved.record.name.as_deref()
-                        ),
+                        box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
                         resolved.vm
                     );
                 }
@@ -94,7 +91,7 @@ pub(crate) fn resolve_smart_attach(
             if should_announce_box(global) {
                 eprintln!(
                     "Attaching to session {}{}",
-                    session_announce_label(&entry.id, entry.name.as_deref()),
+                    box_announce_label(&entry.id, entry.name.as_deref()),
                     crate::attach::created_from_suffix(&entry, &cwd)
                 );
             }
@@ -200,7 +197,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// Neither path returns normally: on success the error is a [`Handoff`]
 /// (exec ssh, or exit with the attach's status) that [`run`] finishes once
 /// the command's `cmd` span has ended, so callers return it untouched.
-pub(crate) async fn session_via_ssh(
+pub(crate) async fn box_via_ssh(
     sock: &std::path::Path,
     id: boxes::SessionId,
     wire: Option<String>,

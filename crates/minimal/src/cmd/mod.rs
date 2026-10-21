@@ -91,7 +91,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
 /// Neither returns, so neither can run inside the span: the span would never
 /// end, and every span under it (the client's and the daemon's) would parent
 /// to one the collector never sees. A command returns this as its error
-/// ([`session_via_ssh`]); [`run`] takes it back out once the span has ended
+/// ([`box_via_ssh`]); [`run`] takes it back out once the span has ended
 /// and finishes it there. It is the [`crate::task::TaskExit`] pattern: a
 /// status carried on the error path, never printed.
 #[derive(Debug)]

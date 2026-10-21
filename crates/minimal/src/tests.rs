@@ -269,7 +269,7 @@ fn every_daemon_connection_is_classified() {
             // the session is gone after, to withdraw its row or release a
             // `host_ip` name hold, and which live session holds a name a
             // re-hold took over; it builds nothing a skew could half-make.
-            "cmd/boxes/vm_host.rs::session_record_by = ungated",
+            "cmd/boxes/vm_host.rs::box_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -317,7 +317,7 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/boxes/create.rs::activate_session = asserts",
+            "cmd/boxes/create.rs::activate_box = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             "task.rs::cmd_task_run = asserts",
@@ -340,7 +340,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/boxes/create.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_box"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -965,10 +965,10 @@ fn display_with_home_tilde_abbreviates_only_under_home() {
 /// still distinguishable; an unnamed session falls back to the short id
 /// alone rather than the full 36-character UUID.
 #[test]
-fn session_announce_label_prefers_name_with_short_id() {
+fn box_announce_label_prefers_name_with_short_id() {
     let id = boxes::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
-    assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
-    assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
+    assert_eq!(box_announce_label(&id, Some("api")), "api (a1b2c3d4)");
+    assert_eq!(box_announce_label(&id, None), "a1b2c3d4");
 }
 
 /// A session created without `--name` gets a typable `<dir>-<hex>` handle:
@@ -1778,7 +1778,7 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/boxes/create.rs", "activate_session", 2),
+        ("src/cmd/boxes/create.rs", "activate_box", 2),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
@@ -1809,7 +1809,7 @@ fn both_creators_share_the_composition_failure_message() {
 fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/boxes/create.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_box"),
         ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "cmd_task_run"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),

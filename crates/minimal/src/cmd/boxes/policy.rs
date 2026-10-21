@@ -11,7 +11,7 @@ use super::*;
 ///
 /// The opt-out half of the scope is the caller's to check: the daemon, not
 /// the client, knows whether it set its opt-out (NET-077), so
-/// [`activate_session`] reads it off the create reply and stays silent for
+/// [`activate_box`] reads it off the create reply and stays silent for
 /// a box the default does not bind.
 pub fn deny_all_default_notice(phase: boxes::EgressDefaultPhase) -> Option<&'static str> {
     match phase {

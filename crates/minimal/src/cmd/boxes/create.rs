@@ -198,7 +198,7 @@ fn refuse_unhonourable_grants(
     Ok(())
 }
 
-/// One named step of [`activate_session`], in the order the activation runs
+/// One named step of [`activate_box`], in the order the activation runs
 /// them. Each step runs inside its own `activation_step` span, so a log read
 /// under `RUST_LOG=info` shows where an activation spent its time and which
 /// step ended it.
@@ -233,7 +233,7 @@ pub(crate) enum ActivationStep {
 }
 
 impl ActivationStep {
-    /// Every step, in the order [`activate_session`] runs them.
+    /// Every step, in the order [`activate_box`] runs them.
     #[cfg(test)]
     pub(crate) const ORDER: [Self; 13] = [
         Self::CheckArguments,
@@ -293,7 +293,7 @@ impl ActivationStep {
     }
 }
 
-pub(crate) async fn activate_session(
+pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
@@ -1556,7 +1556,7 @@ pub(crate) async fn activate_session(
         if should_announce_box(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, config.name.as_deref())
+                box_announce_label(&id, config.name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -1679,7 +1679,7 @@ mod tests {
             no_prompt: true,
             attach: false,
         };
-        let err = activate_session(&global, args, false)
+        let err = activate_box(&global, args, false)
             .await
             .expect_err("the grant box is refused");
         let refused = err
@@ -1736,7 +1736,7 @@ mod tests {
             no_prompt: true,
             attach: false,
         };
-        let err = activate_session(&global, args, false)
+        let err = activate_box(&global, args, false)
             .await
             .expect_err("the broken project file is refused");
         assert!(
@@ -1925,16 +1925,16 @@ mod activation_step_tests {
         }
     }
 
-    /// The step names [`super::activate_session`] runs, in source order.
-    fn steps_in_activate_session() -> Vec<String> {
+    /// The step names [`super::activate_box`] runs, in source order.
+    fn steps_in_activate_box() -> Vec<String> {
         let text = include_str!("create.rs");
         let start = text
-            .find("pub(crate) async fn activate_session(")
-            .expect("create.rs defines activate_session");
+            .find("pub(crate) async fn activate_box(")
+            .expect("create.rs defines activate_box");
         let body = &text[start..];
         let end = body
             .find("\nfn normalize_subnets(")
-            .expect("normalize_subnets follows activate_session");
+            .expect("normalize_subnets follows activate_box");
         // Comment lines name steps too; only code runs them.
         let body: String = body[..end]
             .lines()
@@ -1965,7 +1965,7 @@ mod activation_step_tests {
             .iter()
             .map(|step| format!("{step:?}"))
             .collect();
-        assert_eq!(steps_in_activate_session(), declared);
+        assert_eq!(steps_in_activate_box(), declared);
 
         // Each step opens its own span, and the failing step names itself
         // while its error passes through unchanged.
@@ -2021,7 +2021,7 @@ mod activation_step_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_steps_run_in_order_and_name_the_failing_step_in_activate_session() {
+    async fn activation_steps_run_in_order_and_name_the_failing_step_in_activate_box() {
         use clap::Parser as _;
         // A project path that does not exist ends the real activation in its
         // first step, before any daemon is started or contacted.
@@ -2032,7 +2032,7 @@ mod activation_step_tests {
         let subscriber = tracing_subscriber::registry().with(Capture(seen.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let error = super::activate_session(&crate::cli::GlobalArgs::default(), cli.args, false)
+        let error = super::activate_box(&crate::cli::GlobalArgs::default(), cli.args, false)
             .await
             .expect_err("a missing project path ends the activation");
         let expected = format!("Cannot resolve project path '{}'", missing.display());

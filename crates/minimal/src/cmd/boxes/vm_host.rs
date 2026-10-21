@@ -206,7 +206,7 @@ pub(crate) fn vm_host_answerer_start_line(
 /// Releases the zone hold a destroyed session's activation made, when the
 /// session registered no row (`box_addresses` is `None` — a `host_ip` box
 /// holds its name in place of a row): the destroy-side twin of the hold
-/// [`activate_session`] makes once the session is active. Best-effort and
+/// [`activate_box`] makes once the session is active. Best-effort and
 /// warn-only like the hold; a name no hold kept is the goal state already
 /// holding, so a `none` box's release changes nothing. The release names
 /// the session `id`, so it frees only that session's hold, never a newer
@@ -233,12 +233,12 @@ pub(super) async fn attached_box_record(
     sock: &std::path::Path,
     id: boxes::SessionId,
 ) -> anyhow::Result<Option<boxes::Record>> {
-    session_record_by(sock, minimald_rpc::GetSessionRecordRequest::Id(id)).await
+    box_record_by(sock, minimald_rpc::GetSessionRecordRequest::Id(id)).await
 }
 
 /// A session's record by `request`, bounded by [`BOX_CONTROL_TIMEOUT`]:
 /// `None` when no session answers to it.
-async fn session_record_by(
+async fn box_record_by(
     sock: &std::path::Path,
     request: minimald_rpc::GetSessionRecordRequest,
 ) -> anyhow::Result<Option<boxes::Record>> {
@@ -356,7 +356,7 @@ pub(crate) async fn rehold_held_name_before_attach(
         return;
     }
     if let Ok(None) = attached_box_record(sock, id).await {
-        let by_name = session_record_by(
+        let by_name = box_record_by(
             sock,
             minimald_rpc::GetSessionRecordRequest::Name(name.to_string()),
         )
@@ -2102,7 +2102,7 @@ mod tests {
             attach: false,
             ..bare_activate_args()
         };
-        activate_session(&global, args, false).await.expect(
+        activate_box(&global, args, false).await.expect(
             "a flagless activation reaches a session on the backend its kind \
              resolves to",
         );
@@ -2139,7 +2139,7 @@ mod tests {
     /// refuses the box's registration ends the activation with the refusal's
     /// cause — the session does not start with the box unregistered — and no
     /// session is left behind. The full activation is driven through
-    /// `activate_session`, so the path proven is the user's: the refusal
+    /// `activate_box`, so the path proven is the user's: the refusal
     /// surfaces as the session-start error, not as a warning beside a box
     /// that created anyway.
     #[tokio::test]
@@ -2187,7 +2187,7 @@ mod tests {
             attach: false,
             ..bare_activate_args()
         };
-        let error = activate_session(&global, args, false)
+        let error = activate_box(&global, args, false)
             .await
             .expect_err("a refused registration ends the activation");
         let rendered = format!("{error:#}");
