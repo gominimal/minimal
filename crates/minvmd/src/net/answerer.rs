@@ -395,6 +395,13 @@ struct RegisteredRow {
     address: Option<Ipv4Addr>,
     /// Whether the namespace the name names is running.
     live: bool,
+    /// Whether the row only claims its address and holds no name: a
+    /// dormant creation's, whose box is away and may resume at it
+    /// ([`zone_rows`]). Such a row answers nothing, and it never takes a
+    /// name from another node's row. Absent on the wire when false, so a
+    /// row from a sender that predates it reads as a named row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    address_only: bool,
 }
 
 /// The first line a node sends on the channel: who is connecting, and which
@@ -829,7 +836,9 @@ impl RegisteredTables {
         let mut claimed: Vec<(Ipv4Addr, String)> = Vec::new();
         for row in rows {
             let name = canonical(&row.name);
-            if reserved.contains(&name) {
+            // An address-only row holds no name, so the name rules below
+            // never refuse it: only its address is claimed.
+            if !row.address_only && reserved.contains(&name) {
                 refused.push(RefusedRow {
                     name: row.name,
                     reason: "the answerer holds this name itself".to_string(),
@@ -844,10 +853,11 @@ impl RegisteredTables {
             let holder = held.values().find_map(|held| {
                 held.rows
                     .iter()
-                    .any(|held_row| canonical(&held_row.name) == name)
+                    .any(|held_row| !held_row.address_only && canonical(&held_row.name) == name)
                     .then_some(held.node.as_str())
             });
-            if let Some(holder) = holder
+            if !row.address_only
+                && let Some(holder) = holder
                 && holder != node
             {
                 refused.push(RefusedRow {
@@ -1277,6 +1287,11 @@ impl HostAnswerer {
         }
         let mut refused: BTreeSet<String> = BTreeSet::new();
         for (connection, row) in self.registered.rows() {
+            // An address-only row claims an address in the book and
+            // answers nothing: it holds no name in the zone.
+            if row.address_only {
+                continue;
+            }
             let name = canonical(&row.name);
             if let Some(kept_by) = held.get(&name) {
                 refused.insert(name.clone());
@@ -2364,10 +2379,16 @@ fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io:
 /// held row — and a second VM's publish of it would only be refused as a
 /// clash, the by-construction refusal this exclusion takes out. The host's
 /// own name is in no table's view (the answerer holds it itself), so
-/// nothing else needs excluding here.
+/// nothing else needs excluding here. Beside the published rows fold the
+/// host's own dormant creations — boxes whose rows were withdrawn but whose
+/// creations kept their addresses ([`BoxRegistry::dormant_creation_rows`]).
+/// Each one travels as an address-only row: it answers nothing and holds no
+/// name, so it never wins a name from another node's live box. Its address
+/// is one the holder's book must keep claimed, or a fresh book hands it to
+/// a new box and the dormant box can never resume.
 fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
     let node = crate::box_registry::node_zone_name();
-    registry
+    let mut rows: Vec<_> = registry
         .zone_view()
         .rows()
         .filter(|(name, _)| **name != node)
@@ -2375,8 +2396,33 @@ fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
             name: name.to_string(),
             address: row.address,
             live: row.live,
+            address_only: false,
         })
-        .collect()
+        .collect();
+    for (name, address) in registry.dormant_creation_rows() {
+        if !in_box_range(address) {
+            continue;
+        }
+        let row_name = canonical(&name);
+        // A row that carries this address holds it already: a second claim
+        // at it would put two boxes on one loopback address. A row of the
+        // same name that carries an address holds the name's book entry.
+        // A name hold with no address claims nothing, so it does not stop
+        // the dormant creation's claim.
+        if rows.iter().any(|row| {
+            row.address == Some(address)
+                || (row.address.is_some() && canonical(&row.name) == row_name)
+        }) {
+            continue;
+        }
+        rows.push(RegisteredRow {
+            name,
+            address: Some(address),
+            live: false,
+            address_only: true,
+        });
+    }
+    rows
 }
 
 // ── the start ────────────────────────────────────────────────────────────────
@@ -3842,6 +3888,7 @@ mod tests {
             name: format!("{name}.{}", zone_answer::ZONE_APEX),
             address: Some(address),
             live: true,
+            address_only: false,
         }
     }
 
@@ -4162,11 +4209,13 @@ mod tests {
                         name: "lease.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(100, 64, 0, 10)),
                         live: true,
+                        address_only: false,
                     },
                     RegisteredRow {
                         name: "peer.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 10)),
                         live: true,
+                        address_only: false,
                     },
                 ],
             );
@@ -4254,16 +4303,19 @@ mod tests {
                         name: "web.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 99)),
                         live: true,
+                        address_only: false,
                     },
                     RegisteredRow {
                         name: "host.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 98)),
                         live: true,
+                        address_only: false,
                     },
                     RegisteredRow {
                         name: "peer.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 10)),
                         live: true,
+                        address_only: false,
                     },
                 ],
             );
@@ -4504,6 +4556,137 @@ mod tests {
             second_web,
             "the second daemon's own registration keeps its box name answering"
         );
+    }
+
+    /// A dormant creation keeps its loopback in the answerer's zone view —
+    /// a daemon restarted after the creation detached still claims the
+    /// address its earlier run handed out, and a fresh box's name draws an
+    /// address other than the dormant one — because the creation's resume
+    /// would otherwise hand its address to a second box.
+    #[test]
+    fn a_dormant_creation_keeps_its_loopback_in_the_zone_view() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(crate::box_registry::ClientBoxSpec {
+                name: "web".into(),
+                ingress_ports: vec![],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(registry.row_by_name("web").is_none(), "the row is gone");
+
+        let rows = zone_rows(&registry);
+        assert!(rows.contains(&RegisteredRow {
+            name: box_zone_name("web"),
+            address: Some(web.loopback_addr()),
+            live: false,
+            address_only: true,
+        }));
+        let registered = RegisteredTables::new();
+        registered.claim_own("a-node", &rows);
+        assert_eq!(
+            registered.allocate("a-node", &box_zone_name("web")),
+            Ok(web.loopback_addr()),
+            "the dormant creation's address is claimed for its own name"
+        );
+        let peer = registered
+            .allocate("a-node", &box_zone_name("peer"))
+            .expect("a fresh name draws an address");
+        assert_ne!(peer, web.loopback_addr());
+    }
+
+    /// A dormant creation's row claims its address and holds no name, so a
+    /// name hold with no address does not stop the claim, and a row that
+    /// already carries the address stops it: two rows on one loopback
+    /// address would each answer for it.
+    #[test]
+    fn a_dormant_creation_claims_only_an_address_no_row_carries() {
+        let registry = BoxRegistry::new(SUBNET);
+        let spec = |name: &str| crate::box_registry::ClientBoxSpec {
+            name: name.into(),
+            ingress_ports: vec![],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let web = registry
+            .register_client_box(spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        registry.hold_box_name("web", None);
+        let dormant = RegisteredRow {
+            name: box_zone_name("web"),
+            address: Some(web.loopback_addr()),
+            live: false,
+            address_only: true,
+        };
+        assert!(
+            zone_rows(&registry).contains(&dormant),
+            "a name hold with no address does not stop the dormant claim"
+        );
+
+        registry
+            .register_client_box_at(spec("peer"), web.loopback_addr())
+            .expect("a fresh box takes the dormant creation's address");
+        let rows = zone_rows(&registry);
+        assert!(
+            !rows.contains(&dormant),
+            "a row that carries the address keeps it alone: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.address == Some(web.loopback_addr()))
+                .count(),
+            1
+        );
+    }
+
+    /// A dormant creation's address-only row never takes a name from
+    /// another node's live box: at publish time the live row is accepted
+    /// under the name, and the zone answers it with the live box's
+    /// address. The dormant address stays claimed against the other node.
+    #[test]
+    fn an_address_only_row_wins_no_name_against_a_live_box() {
+        let registered = RegisteredTables::new();
+        let dormant = Ipv4Addr::new(127, 0, 64, 10);
+        let live = Ipv4Addr::new(127, 0, 64, 11);
+        let first = registered.install_validated(
+            1,
+            "a-node",
+            vec![RegisteredRow {
+                name: "web.min.internal".to_string(),
+                address: Some(dormant),
+                live: false,
+                address_only: true,
+            }],
+            &[],
+        );
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        let second = registered.install_validated(
+            2,
+            "b-node",
+            vec![published_row("web", live), published_row("api", dormant)],
+            &[],
+        );
+        assert_eq!(
+            second.held,
+            vec![published_row("web", live)],
+            "the live box keeps its name; the dormant address is not handed on"
+        );
+
+        let answerer = HostAnswerer::new(BoxRegistry::new(SUBNET), Arc::new(registered));
+        let view = answerer.zone_view();
+        let held: Vec<_> = view
+            .rows()
+            .filter(|(name, _)| *name == "web.min.internal")
+            .map(|(_, row)| row.address)
+            .collect();
+        assert_eq!(held, vec![Some(live)], "the zone answers the live box");
     }
 
     /// A port held by a process with no channel — a native minimald, a

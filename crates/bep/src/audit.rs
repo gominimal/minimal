@@ -28,6 +28,10 @@
 //! that a failed or interrupted append left without its newline. Such bytes
 //! never formed a record. [`AuditLog::open`] also takes an exclusive lock,
 //! so a second writer on the same path cannot fork the chain.
+//!
+//! [`LogReader`] is the client's read-only view of the log, across every
+//! segment in the log's directory ([`segments`]). `min box audit` reads
+//! through it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
@@ -475,6 +479,197 @@ impl AuditLog {
     }
 }
 
+/// The file name of segment `n` of a log: `audit-<n>.jsonl`. A log is the
+/// set of these files in one directory. The segment with the highest `n`
+/// is the active one, and a segment is never renamed, so a reader that
+/// tails the log can key its place on the path.
+pub fn segment_name(n: u64) -> String {
+    format!("audit-{n}.jsonl")
+}
+
+/// The segment number of `name`, or `None` when `name` is not a segment.
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("audit-")?
+        .strip_suffix(".jsonl")?
+        .parse()
+        .ok()
+}
+
+/// `~/.minimal/bep/audit`, the directory that holds the proxy's log on
+/// this host.
+///
+/// Interim: `min box audit` reads this directory directly, through
+/// [`LogReader`]. Un-enrolled, the architecture's audit paragraph and
+/// Gatehouse §6.10 put the read behind the proxy's local socket (ruled on
+/// gominimal/arch#137). The interim is tracked by
+/// <https://github.com/gominimal/minimal/issues/2459>. When the proxy
+/// serves the read there
+/// (<https://github.com/gominimal/minimal/issues/2463>), the client stops
+/// reading this directory.
+pub fn default_dir() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep/audit"))
+}
+
+/// Every segment of the log in `dir`, oldest first. A missing directory is
+/// an empty log.
+pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir.as_ref()) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(n) = entry.file_name().to_str().and_then(segment_number) {
+            found.push((n, entry.path()));
+        }
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, path)| path).collect())
+}
+
+/// One record a [`LogReader`] read, with its line as it is on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The parsed record.
+    pub record: Record,
+    /// The record's line, without the trailing newline.
+    pub line: String,
+}
+
+/// What one [`LogReader::read_new`] call read.
+#[derive(Debug, Default)]
+pub struct ReadBatch {
+    /// The records, in log order.
+    pub entries: Vec<Entry>,
+    /// The segments the call read new bytes from.
+    pub segments: Vec<PathBuf>,
+    /// The lines that did not parse as a record, and were skipped.
+    pub skipped: usize,
+}
+
+/// A read-only reader over the log in one directory, across every
+/// retained segment. The first [`read_new`](Self::read_new) call reads the
+/// whole log. Each later call reads only what the proxy appended since,
+/// so a caller can replay the log and then tail it.
+///
+/// Interim: the client reads the operator-owned log files directly, under
+/// file mode, in place of the read over the proxy's local socket. See
+/// <https://github.com/gominimal/minimal/issues/2459>. The flip is
+/// <https://github.com/gominimal/minimal/issues/2463>, when the proxy
+/// serves the read.
+#[derive(Debug)]
+pub struct LogReader {
+    dir: PathBuf,
+    /// For each segment, the file it was and the offset after its last
+    /// complete line read.
+    offsets: std::collections::BTreeMap<PathBuf, (Option<FileIdentity>, u64)>,
+}
+
+/// The device and inode of a file, so a segment replaced by another file of
+/// the same name is read again from its start.
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
+impl LogReader {
+    /// A reader over the log in `dir`. Nothing is read until
+    /// [`read_new`](Self::read_new).
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            offsets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The log's directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Reads every complete line appended since the last call, segment by
+    /// segment, oldest first. A line the proxy has not finished, which has
+    /// no newline yet, is left for the next call.
+    pub fn read_new(&mut self) -> io::Result<ReadBatch> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut out = ReadBatch::default();
+        for path in segments(&self.dir)? {
+            let (seen, start) = self.offsets.get(&path).copied().unwrap_or((None, 0));
+            let mut file = match File::open(&path) {
+                Ok(file) => file,
+                // Pruned between the listing and the open.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let metadata = file.metadata()?;
+            let len = metadata.len();
+            let identity = file_identity(&metadata);
+            // A segment that is another file now, or that is shorter than
+            // the place already read, was replaced or truncated. Read it
+            // again from its start.
+            let replaced = seen.is_some() && seen != identity;
+            let start = if replaced || len < start {
+                0
+            } else if start > 0 && !ends_line_at(&mut file, start)? {
+                // Where identity is unavailable, an offset that is not just
+                // after a newline means the file changed under the reader.
+                0
+            } else {
+                start
+            };
+            if len == start {
+                continue;
+            }
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+            if complete == 0 {
+                continue;
+            }
+            for raw in bytes[..complete].split(|&b| b == b'\n') {
+                let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+                if raw.is_empty() {
+                    continue;
+                }
+                let parsed = std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|line| Some((line, serde_json::from_str::<Record>(line).ok()?)));
+                match parsed {
+                    Some((line, record)) => out.entries.push(Entry {
+                        record,
+                        line: line.to_owned(),
+                    }),
+                    None => out.skipped += 1,
+                }
+            }
+            self.offsets
+                .insert(path.clone(), (identity, start + complete as u64));
+            out.segments.push(path);
+        }
+        Ok(out)
+    }
+}
+
+/// Whether the byte just before `offset` in `file` is a newline.
+fn ends_line_at(file: &mut File, offset: u64) -> io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(offset - 1))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)?;
+    Ok(byte[0] == b'\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +928,67 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(log);
         AuditLog::open(dir.log()).unwrap();
+    }
+
+    // A segment replaced by a shorter file is read again from its start,
+    // and is not skipped for the rest of a `--follow` run.
+    #[test]
+    fn log_reader_rereads_a_truncated_segment() {
+        let dir = TempDir::new();
+        let segment = dir.0.join(segment_name(1));
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        let mut reader = LogReader::new(&dir.0);
+        assert_eq!(reader.read_new().unwrap().entries.len(), 2);
+
+        fs::remove_file(&segment).unwrap();
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        let batch = reader.read_new().unwrap();
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.entries[0].record.upstream, "example.com:443");
+    }
+
+    // A segment replaced by a longer file between two reads is read from
+    // the start of the new file, not from the old offset.
+    #[test]
+    fn log_reader_rereads_a_replaced_longer_segment() {
+        let dir = TempDir::new();
+        let segment = dir.0.join(segment_name(1));
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        let mut reader = LogReader::new(&dir.0);
+        assert_eq!(reader.read_new().unwrap().entries.len(), 1);
+
+        // Keep the old file open so the new one cannot reuse its inode.
+        let old = segment.with_extension("old");
+        fs::rename(&segment, &old).unwrap();
+        let _hold = File::open(&old).unwrap();
+        let mut log = AuditLog::open(&segment).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&off_module()).unwrap();
+        drop(log);
+        assert!(fs::metadata(&segment).unwrap().len() > fs::metadata(&old).unwrap().len());
+        let batch = reader.read_new().unwrap();
+        assert_eq!(batch.skipped, 0);
+        let upstreams: Vec<_> = batch
+            .entries
+            .iter()
+            .map(|e| e.record.upstream.as_str())
+            .collect();
+        assert_eq!(
+            upstreams,
+            [
+                "api.github.com:443",
+                "api.github.com:443",
+                "example.com:443"
+            ]
+        );
     }
 
     // BEP-041: the descriptor carries O_APPEND and no truncate, and earlier
