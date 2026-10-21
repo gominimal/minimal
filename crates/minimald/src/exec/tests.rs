@@ -1036,9 +1036,16 @@ async fn lost_exec_client_kills_only_its_own_process() {
 /// lands, the wait runs its full length, and the SIGKILL ends the child.
 ///
 /// The shim forwards that SIGTERM to the exec's process group in
-/// `on_term_or_hup`. No test reaches that path yet: the `nsenter` tests
-/// send SIGKILL only. `exec_client_loss_ends_exec_keeps_box_record` in
-/// `end_to_end` proves that the box keeps running.
+/// `on_term_or_hup`. Three tests in `tests/netns_root_integration.rs`,
+/// gated by `MINIMALD_NETNS_TEST=1`, prove that path:
+/// `sigterm_to_the_shim_kills_the_injected_group` proves the SIGTERM
+/// forward, `a_group_member_that_traps_sigterm_runs_its_trap` proves the
+/// grace period, and
+/// `a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace`
+/// proves the group SIGKILL. This test proves only the daemon's fallback
+/// SIGKILL of a shim that does not exit.
+/// `exec_client_loss_ends_exec_keeps_box_record` in `end_to_end` proves
+/// that the box keeps running.
 #[tokio::test]
 async fn exec_client_loss_ends_exec_keeps_box() {
     use std::time::{Duration, Instant};
@@ -2020,12 +2027,6 @@ mod end_to_end {
         assert!(logged.contains("exit=0"), "names the exit code: {logged}");
     }
 
-    /// A task run that does not own its box leaves the session standing:
-    /// the daemon ends only what the run owns, and the unflagged
-    /// spelling — what `min session run` sends, and what every client
-    /// from before the flag sent — keeps the box for whoever holds it.
-    /// After the exec has returned, and the moment a stray destroy would
-    /// have needed, the session is still listed.
     /// BOX-150: when the client of a plain exec (no PTY, not detached)
     /// disconnects, the daemon ends the exec and the box keeps running.
     /// The client opens the exec and then drops its connection while the
@@ -2068,8 +2069,26 @@ mod end_to_end {
             "losing a plain exec's client must not end its box; got {:?}",
             listed.sessions,
         );
+        // A retained box that stopped stays in the list too, so the id
+        // alone does not prove that the box runs.
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("the session is listed");
+        assert_eq!(
+            entry.status,
+            boxes::BoxState::Active,
+            "losing a plain exec's client must leave its box running; got {entry:?}",
+        );
     }
 
+    /// A task run that does not own its box leaves the session standing:
+    /// the daemon ends only what the run owns, and the unflagged
+    /// spelling — what `min session run` sends, and what every client
+    /// from before the flag sent — keeps the box for whoever holds it.
+    /// After the exec has returned, and the moment a stray destroy would
+    /// have needed, the session is still listed.
     #[tokio::test]
     async fn run_box_survives_when_run_keeps_it() {
         let server = TestServer::new().await;
