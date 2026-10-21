@@ -20,6 +20,7 @@ members = [
     "crates/mip",
     "crates/minimal",
     "crates/minimal-client",
+    "crates/mirror-client",
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
@@ -276,6 +277,7 @@ decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }
 mctx = { path = "crates/mctx" }
 minimal-client = { path = "crates/minimal-client" }
+mirror-client = { path = "crates/mirror-client" }
 minimald-rpc = { path = "crates/minimald-rpc" }
 mlog = { path = "crates/mlog" }
 mfile = { path = "crates/mfile" }

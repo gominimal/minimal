@@ -4392,6 +4392,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirror-client"
+version = "0.0.1"
+dependencies = [
+ "common",
+ "libc",
+ "paths",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+ "vsock",
+]
+
+[[package]]
 name = "ml-kem"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
