@@ -228,7 +228,7 @@ developer running agent boxes; build-infra operator; auditor.
   - THE SYSTEM SHALL emit the Blueprint from the box's stored expanded spec
     (BOX-068) and SHALL carry two digests as document properties: the
     spec's posture-projection digest (BOX-071), which binds exactly the
-    §6.3.2 field set — `type.name`, `type.source`, `type.root`, and
+    §6.3.2 field set — `v`; `type.name`, `type.source`, `type.root`, and
     `type.registry` when the source is `org`; `network.mode`, `egress_dns` (the spec's
     `egress.allow_dns_hosts`), `egress_subnets` (`egress.allow_subnets`),
     `egress_deny_subnets` (`egress.deny_subnets`), `ingress_ports` and
