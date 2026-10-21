@@ -1,4 +1,5 @@
-//! The proxy's control socket: client key registrations (BEP-063).
+//! The proxy's control socket: client key registrations (BEP-063), and the
+//! boxes the proxy serves (BEP-020, BEP-022).
 //!
 //! The control socket is a unix socket of its own, separate from the
 //! listener that takes box connections ([`crate::listener`]). It is mode
@@ -15,6 +16,21 @@
 //! < {"ok":true,"kid":"<RFC 7638 thumbprint>"}
 //! ```
 //!
+//! The box's creator registers each box with its declared egress and its
+//! address stance when it creates the box, and forgets the box when it
+//! destroys it:
+//!
+//! ```text
+//! > {"op":"register_box","box_id":"<id>","egress":["github.com","api.github.com:443"],"stance":"own_ip"}
+//! < {"ok":true}
+//! > {"op":"forget_box","box_id":"<id>"}
+//! < {"ok":true}
+//! ```
+//!
+//! An egress authority is `host` or `host:port`, and a `host` with no port
+//! is port 443. The registration goes into the [`Boxes`] registry that the
+//! redeemer reads at each request.
+//!
 //! A request the proxy cannot do gets `{"ok":false,"error":"<why>"}`, and the
 //! connection stays open for the next line. The registered key goes into the
 //! [`ClientKeys`] registry that the proxy verifies store handles under.
@@ -29,7 +45,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::handle::ClientKeys;
+use crate::boxes::{BoxRegistry, Boxes, Stance};
+use crate::handle::{ClientKeys, parse_authority};
 use crate::listener::bind_owner_only;
 
 /// The longest request line the control socket reads.
@@ -48,6 +65,22 @@ pub enum Request {
         /// The SEC1 encoding of the P-256 public key, unpadded base64url.
         key: String,
     },
+    /// Register a box with its declared egress and its address stance. A
+    /// second registration of the same box replaces the first.
+    RegisterBox {
+        /// The box id.
+        box_id: String,
+        /// The authorities the box's declared egress admits, each `host` or
+        /// `host:port`.
+        egress: Vec<String>,
+        /// The box's address stance.
+        stance: Stance,
+    },
+    /// Forget a box, at its destroy.
+    ForgetBox {
+        /// The box id.
+        box_id: String,
+    },
 }
 
 /// One reply line.
@@ -64,6 +97,14 @@ pub struct Reply {
 }
 
 impl Reply {
+    fn done() -> Self {
+        Self {
+            ok: true,
+            kid: None,
+            error: None,
+        }
+    }
+
     fn refused(error: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -73,9 +114,10 @@ impl Reply {
     }
 }
 
-/// Does one request line against `registry`.
+/// Does one request line against the client key `registry` and the box
+/// registry `boxes`.
 #[must_use]
-pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>) -> Reply {
+pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> Reply {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(err) => return Reply::refused(format!("the request is not valid: {err}")),
@@ -101,6 +143,28 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>) -> Reply {
                 Err(_) => Reply::refused("the key is not a P-256 public key"),
             }
         }
+        Request::RegisterBox {
+            box_id,
+            egress,
+            stance,
+        } => {
+            if box_id.is_empty() {
+                return Reply::refused("the box id is empty");
+            }
+            let Some(egress) = egress
+                .iter()
+                .map(|a| parse_authority(a.trim().trim_end_matches('.')))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Reply::refused("an egress authority is not `host` or `host:port`");
+            };
+            boxes.register(&box_id, egress, stance);
+            Reply::done()
+        }
+        Request::ForgetBox { box_id } => {
+            boxes.forget(&box_id);
+            Reply::done()
+        }
     }
 }
 
@@ -109,6 +173,7 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>) -> Reply {
 pub struct Control {
     inner: UnixListener,
     registry: Registry,
+    boxes: BoxRegistry,
 }
 
 impl Control {
@@ -118,10 +183,11 @@ impl Control {
     /// # Errors
     ///
     /// The I/O error of the directory, the bind or the mode change.
-    pub fn bind(path: &Path, registry: Registry) -> io::Result<Self> {
+    pub fn bind(path: &Path, registry: Registry, boxes: BoxRegistry) -> io::Result<Self> {
         Ok(Self {
             inner: bind_owner_only(path)?,
             registry,
+            boxes,
         })
     }
 
@@ -134,13 +200,14 @@ impl Control {
         loop {
             let stream = crate::listener::accept(&self.inner, "control socket").await?;
             let registry = Arc::clone(&self.registry);
-            tokio::spawn(serve(stream, registry));
+            let boxes = Arc::clone(&self.boxes);
+            tokio::spawn(serve(stream, registry, boxes));
         }
     }
 }
 
 /// Serves one control connection, line by line.
-async fn serve(stream: UnixStream, registry: Registry) {
+async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
     let own = unsafe { libc::geteuid() };
@@ -171,7 +238,7 @@ async fn serve(stream: UnixStream, registry: Registry) {
             let _ = write_reply(&mut write, &Reply::refused("the request is too long")).await;
             return;
         }
-        let reply = handle_line(&line, &registry);
+        let reply = handle_line(&line, &registry, &boxes);
         if write_reply(&mut write, &reply).await.is_err() {
             return;
         }
@@ -196,7 +263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
         let registry = Registry::default();
-        let control = Control::bind(&path, Arc::clone(&registry)).unwrap();
+        let control = Control::bind(&path, Arc::clone(&registry), BoxRegistry::default()).unwrap();
         tokio::spawn(control.run());
 
         let key = p256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into()).unwrap();

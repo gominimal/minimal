@@ -261,7 +261,7 @@ fn serve(args: &ServeArgs) -> Result<(), String> {
         // handles until the store rules join the admitted set. Until a later
         // task gives `Proxy` the same registry, a registration is kept here
         // and has no effect on what the proxy admits.
-        let control_socket = Control::bind(&control, Registry::default())
+        let control_socket = Control::bind(&control, Registry::default(), Default::default())
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
             "no CA key can sign a leaf certificate yet, so every admitted CONNECT is answered 502. \
