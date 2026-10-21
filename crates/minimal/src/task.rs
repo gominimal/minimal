@@ -649,21 +649,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     crate::ensure_daemon(global)?;
 
-    let config = minimald_rpc::BoxConfig {
-        name: Some(task_box_name(&args.task, &crate::random_hex4())),
-        project_path: abs_path.clone(),
-        network: boxes::NetworkMode::HostNet,
-        policy: boxes::BoxPolicy::default(),
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        // Same default as an activate with no flags, matching the
-        // loadout handling below. `min task run` has no `--no-hooks` of
-        // its own; a `--keep` session is attachable later, so its hooks
-        // should behave like any other session's.
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
+    // Same default as an activate with no flags, matching the loadout
+    // handling below: `min task run` has no `--no-hooks` of its own, and a
+    // `--keep` session is attachable later, so its hooks behave like any
+    // other session's. The constructor turns them on.
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        task_box_name(&args.task, &crate::random_hex4()),
+        abs_path.clone(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    // Refused by a daemon of another build before it allocates anything;
+    // `None` under the skew override.
+    request.must_match_version = minimal_client::version_assertion();
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
@@ -711,21 +709,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // `GetVersion` ahead of it.
     let mut client = crate::connect_daemon_unchecked(global).await?;
 
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-    };
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     // The minted name can (rarely) collide; retry with fresh entropy on the
     // daemon's already-exists rejection, within the activate autogen budget.
-    let mut config = config;
     let mut attempts = 0u32;
     let created = loop {
         let resp = client
-            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                config: config.clone(),
-                // Refused by a daemon of another build before it allocates
-                // anything; `None` under the skew override.
-                must_match_version: minimal_client::version_assertion(),
-            })
+            .oneshot_rpc::<CreateSession>(request.clone())
             .await
             .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
         match resp {
@@ -733,7 +723,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             minimald_rpc::Errorable::Err { error } => {
                 if crate::should_retry_autogen(true, attempts, &error) {
                     attempts += 1;
-                    config.name = Some(task_box_name(&args.task, &crate::random_hex4()));
+                    request.config.name = Some(task_box_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
                 bail!("{error}");
@@ -745,7 +735,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
-    let session_name = config
+    let session_name = request
+        .config
         .name
         .clone()
         .expect("the task session is always named");
