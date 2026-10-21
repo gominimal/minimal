@@ -412,6 +412,38 @@ pub enum BoxCommand {
     /// the proxy's root certificate fingerprint, each secret with its hosts,
     /// the steering mode and the UDP 443 stance
     Spec(BoxSpecArgs),
+    /// Show what the local proxy recorded for one box: each request it
+    /// admitted or refused, each secret minted for the box, and the box's
+    /// revocation. A removed box's records stay readable by its id
+    Audit(BoxAuditArgs),
+}
+
+// BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("box_or_parent").required(true).args(["target", "parent"])))]
+pub struct BoxAuditArgs {
+    /// The box: its id, or its name. A name reads the running box of that
+    /// name, else the newest box created under it. `self` is the box this
+    /// command runs in
+    pub target: Option<String>,
+    /// Show the records of every child box of this box (an id, a name or
+    /// `self`) together, each record naming its box
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Write each record as one JSON line, as the proxy wrote it
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxAuditOutputFormat>,
+    /// Show the records so far, then keep showing new records as the proxy
+    /// writes them, until interrupted
+    #[arg(long)]
+    pub follow: bool,
+}
+
+/// The rendering `min box audit` writes, beside the text default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxAuditOutputFormat {
+    /// One JSON object for each record
+    Jsonl,
 }
 
 #[derive(Debug, Args)]
