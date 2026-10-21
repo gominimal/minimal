@@ -138,15 +138,16 @@ impl Attachment {
     }
 }
 
-/// A box id rendered for a log line: the one fixed form every diagnostic
-/// that names a box id uses — the spelling [`minimald_rpc::BoxId`]
-/// renders, which is the spelling the in-VM daemon's log and its record
-/// name the box by — so a tail can compare two lines for the same box.
+/// A box id rendered for a log line: 32 lowercase hex digits, one fixed
+/// form every diagnostic that names a box id uses — the spelling the box
+/// control wire carries ([`minimald_rpc::BoxId::simple`]) and the one
+/// the proxy's delivery gives every audit record's subject — so a
+/// tail can compare two lines for the same box.
 pub(crate) struct BoxIdText<'a>(pub(crate) &'a BoxId);
 
 impl fmt::Display for BoxIdText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&minimald_rpc::BoxId::from_bytes(*self.0), f)
+        f.write_str(&minimald_rpc::BoxId::from_bytes(*self.0).simple())
     }
 }
 
@@ -342,8 +343,11 @@ mod tests {
             "a later mint sorts after an earlier one"
         );
 
-        // The log spelling is the record key's own spelling.
-        assert_eq!(BoxIdText(&raw).to_string(), record_key.to_string());
+        // The log spelling is the record key's hex spelling, the same one
+        // the delivery's audit subject uses.
+        assert_eq!(BoxIdText(&raw).to_string(), record_key.simple());
+        let hex: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(BoxIdText(&raw).to_string(), hex);
         assert_eq!(
             minimald_rpc::BoxId::parse_str(&BoxIdText(&raw).to_string()).unwrap(),
             record_key
