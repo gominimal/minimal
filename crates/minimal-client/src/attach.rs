@@ -9,7 +9,14 @@
 use std::path::Path;
 
 use crate::HANDSHAKE_TIMEOUT;
-use crate::ask_dialog::{AskDialogEnd, render_ask_dialog};
+// AskWatch is deliberately NOT re-exported here. CodeRabbit asked to
+// `pub use crate::ask_dialog::AskWatch` to keep the historical
+// `attach::AskWatch` path, but minimal-client is an in-workspace crate,
+// nothing names that path, and `ask_dialog` is a `pub mod`, so the public
+// path is `minimal_client::ask_dialog::AskWatch`. The re-export was
+// withdrawn by the reviewer (PR #2341); restoring it would re-couple the
+// two modules this refactor split apart.
+use crate::ask_dialog::{AskDialogEnd, AskWatch, is_dismissal_of, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
 
@@ -318,72 +325,6 @@ pub struct HostAsks {
     /// Lines a dialog read off the subscription while it watched for its
     /// own dismissal, kept in order for the serving loop.
     held: std::collections::VecDeque<String>,
-}
-
-/// A dialog's view of the subscription while it is up: whether the host
-/// has taken its ask away. Every other line read here is held, in order,
-/// for the serving loop.
-pub struct AskWatch<'a> {
-    ask_id: minimald_rpc::AskId,
-    subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
-    held: &'a mut std::collections::VecDeque<String>,
-}
-
-impl<'a> AskWatch<'a> {
-    pub(crate) fn new(
-        ask_id: minimald_rpc::AskId,
-        subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
-        held: &'a mut std::collections::VecDeque<String>,
-    ) -> Self {
-        Self {
-            ask_id,
-            subscription,
-            held,
-        }
-    }
-
-    /// The subscription's socket, for a poll beside the terminal.
-    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd as _;
-        self.subscription.get_ref().as_fd()
-    }
-
-    /// Whether bytes already read off the socket are waiting: a poll of
-    /// the socket would not see them.
-    pub(crate) fn has_buffered(&self) -> bool {
-        !self.subscription.buffer().is_empty()
-    }
-
-    /// Read one line. `true` when it ends this dialog: the dismissal of
-    /// this ask, or the subscription ending, after which nothing this
-    /// attach records could count. Any other line is held.
-    pub(crate) fn take_line(&mut self) -> bool {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        match self.subscription.read_line(&mut line) {
-            Ok(0) | Err(_) => return true,
-            Ok(_) => {}
-        }
-        if is_dismissal_of(&line, self.ask_id) {
-            return true;
-        }
-        self.held.push_back(line);
-        false
-    }
-
-    /// Block until the host dismisses this ask or the subscription ends:
-    /// a dialog that never answers.
-    pub fn wait_dismissed(&mut self) {
-        while !self.take_line() {}
-    }
-}
-
-/// Whether `line` is the host's dismissal of `ask_id`.
-fn is_dismissal_of(line: &str, ask_id: minimald_rpc::AskId) -> bool {
-    matches!(
-        serde_json_lenient::from_str(line.trim()),
-        Ok(minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }) if id == ask_id
-    )
 }
 
 /// The terminal side of the ask dialog: the relay's suspend and resume, as

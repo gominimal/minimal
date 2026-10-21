@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::{SessionRpc, session_rpc_failed};
 use anyhow::Context as _;
 use boxes::{BoxPolicy, EffectiveBoxPolicy, NetworkMode, SessionId};
 use minimal_client::Client;
@@ -528,7 +529,7 @@ pub async fn activate(
                     must_match_version: minimal_client::version_assertion(),
                 })
                 .await
-                .context("CreateSession RPC failed")
+                .map_err(|error| session_rpc_failed(SessionRpc::CreateSession, error))
         })
     })
     .await?;
@@ -591,7 +592,7 @@ pub async fn activate(
                 contribution,
             })
             .await
-            .context("ConfigureLoadout RPC failed")?;
+            .map_err(|error| session_rpc_failed(SessionRpc::ConfigureLoadout, error))?;
         match configured {
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized) => {}
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {

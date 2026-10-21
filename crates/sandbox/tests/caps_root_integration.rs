@@ -11,6 +11,13 @@
 //!   does not clear — holding none of the capabilities no box may hold,
 //!   `CAP_NET_RAW` first.
 //!
+//! * `boxes_mount_a_nested_procfs` — the same open box, one more probe: a
+//!   process unshares a user, mount and pid namespace, as a nested sandbox
+//!   (`mip build` inside a box) does, and mounts a fresh procfs. The kernel
+//!   refuses that mount when the box's own `/proc` is not fully visible, for
+//!   example when a mount covers `/proc/sys`. The mount must succeed, so a
+//!   box keeps its nested sandboxes.
+//!
 //! These proofs launch a real box, which needs the unprivileged user namespace
 //! every sandbox starts by unsharing. A host that would deny it (stock Ubuntu
 //! 24.04 restricts it for unconfined processes) cannot run them at all, so they
@@ -134,12 +141,64 @@ fn announce_to_the_runner(proof: &str) {
 /// socket, which needs no capability and therefore still works. One `key:
 /// value` line per fact, parsed by the caller.
 const CAP_PROBE_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <sched.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+static int write_file(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return errno;
+    ssize_t len = (ssize_t)strlen(text);
+    int err = write(fd, text, len) == len ? 0 : errno;
+    close(fd);
+    return err;
+}
+
+/* Exits with the errno of the first step that failed, or 0. Status 255 is
+   kept for a step that failed with no errno to report. */
+static int nested_procfs_child(void) {
+    char map[64];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) != 0) return errno;
+    snprintf(map, sizeof map, "0 %u 1\n", (unsigned)uid);
+    int err = write_file("/proc/self/uid_map", map);
+    if (err) return err;
+    err = write_file("/proc/self/setgroups", "deny\n");
+    if (err) return err;
+    snprintf(map, sizeof map, "0 %u 1\n", (unsigned)gid);
+    err = write_file("/proc/self/gid_map", map);
+    if (err) return err;
+    pid_t init = fork();
+    if (init < 0) return errno;
+    if (init == 0) {
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) _exit(errno);
+        if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+            _exit(errno);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(init, &status, 0) != init) return errno;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+}
+
+static int nested_procfs_mount_errno(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) return errno;
+    if (child == 0) _exit(nested_procfs_child());
+    int status;
+    if (waitpid(child, &status, 0) != child) return errno;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+}
 
 int main(void) {
     FILE *status = fopen("/proc/self/status", "r");
@@ -160,6 +219,13 @@ int main(void) {
     int stream = socket(AF_INET, SOCK_STREAM, 0);
     printf("stream_socket_errno: %d\n", stream >= 0 ? 0 : errno);
     if (stream >= 0) close(stream);
+
+    /* Whether a nested sandbox can mount its own procfs: what hakoniwa
+       does inside a box. The child unshares a user, mount and pid namespace,
+       maps its uid and gid, and forks the new pid namespace's init, which
+       mounts a fresh procfs on its private /proc. The errno of that mount
+       comes back as the grandchild's exit status, 0 for a mount that took. */
+    printf("nested_procfs_mount_errno: %d\n", nested_procfs_mount_errno());
     return 0;
 }
 "#;
@@ -461,6 +527,37 @@ async fn boxes_lack_cap_net_raw() {
         libc::EAFNOSUPPORT,
         "a none box's family filter must still refuse the socket family \
          itself, seal and credentials together in the same launch"
+    );
+}
+
+/// A nested sandbox inside a box mounts a fresh procfs: hakoniwa does it for
+/// every container, so `mip build` inside a box depends on it. In a nested user
+/// namespace the kernel refuses that mount with `EPERM` unless a procfs in the
+/// box is fully visible, with no mount covering a non-empty directory in it.
+/// A read-only bind over `/proc/sys` is such a cover, the one container
+/// runtimes add, and it is why nested containers fail there. This proof keeps
+/// the box's `/proc` fully visible, whether a root or an unprivileged daemon
+/// launches the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boxes_mount_a_nested_procfs() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
+        eprintln!(
+            "skipping boxes_mount_a_nested_procfs: this host denies the \
+             unprivileged user namespace every sandbox starts by unsharing: \
+             {reason}"
+        );
+        return;
+    }
+    announce_to_the_runner("boxes_mount_a_nested_procfs");
+
+    let report = box_report(NetPlan::host()).await;
+    assert_eq!(
+        reported_errno(&report, "nested_procfs_mount_errno", "an open box"),
+        0,
+        "a process in a box must be able to mount a fresh procfs from a nested \
+         user namespace, as a nested sandbox does: the errno is from the \
+         unshare, the id maps or the mount, and EPERM from the mount means a \
+         mount covers part of the box's /proc"
     );
 }
 
