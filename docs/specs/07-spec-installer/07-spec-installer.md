@@ -316,9 +316,43 @@ them may raise the question — treating a bare failure as "sessions are live"
 would make every upgrade ask one. They fall through to the force stop, which
 remains unconditional for them.
 
-It is attempted **at most once per run**, and only from the path that actually
-replaces a file: a rerun where every component is already up to date, or a run
-that dies fetching or checksum-verifying, must leave a healthy daemon running.
+This pre-swap stop is attempted **at most once per run**, and only from the
+path that actually replaces a file: a rerun where every component is already up
+to date, or a run that dies fetching or checksum-verifying before the first
+executable is replaced, must leave a healthy daemon running.
+
+After the swaps, the installer stops a daemon once more if that daemon is on an
+older build. An attached client can autospawn a new daemon as soon as the
+pre-swap stop ends. That daemon runs from the binaries that the installer is
+replacing. An install can also start with no `min` on disk, so no pre-swap stop
+runs. The installer runs `<bin>/min version` with the newly installed `min`. It
+stops the daemon only when the daemon reports a version and that version is not
+the client's. When the versions match, or no daemon answers, it stops nothing
+and prints nothing.
+
+This **post-swap stop** never ends a session without consent. A session can
+open in a respawned daemon while the run continues. The stop is graceful unless
+the run already has consent: `--force-stop`, `MINIMAL_INSTALL_FORCE_STOP`, or a
+yes to the pre-swap question — and that yes covers only the sessions it listed
+at the time. Any session opened after it (or a failed listing of the live
+sessions) makes the stop graceful again for the sessions now live, so the
+installer asks again. With consent it is `<bin>/min stop --force`. When the
+graceful stop refuses because sessions are live, the installer asks on the
+terminal, as the pre-swap stop does, and a yes runs `stop --force`. On a no, or
+with no terminal, it leaves the daemon running. It tells the user to run
+`min stop` after those sessions end, or `min stop --force` to end them now —
+never to rerun the installer, which cannot do this stop, because a rerun
+replaces nothing. The upgrade still succeeds. Any other failure of the graceful
+stop falls through to `stop --force`, as the pre-swap stop does. When a
+`stop --force` of the post-swap stop fails, the installer says the old daemon
+can still be running and names `min stop --force`.
+
+The post-swap stop also runs when the run dies after the pre-swap stop, for
+example on a failed download or checksum of a later component. The installer
+runs it from its exit handler, so a daemon respawned from half-replaced
+binaries does not outlive the failed run. The exit handler runs it once the run
+replaces any executable. An up-to-date rerun and a data-only replacement
+replace no executable, so they do not run it from the exit handler.
 
 **R5.6**, A `kind = symlink` component places a symbolic link at `dest`
 pointing at `src` (the link target, see R3.1). The target is validated with
@@ -347,7 +381,23 @@ both hash columns in place of digests.
   up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
   are stale runs the on-disk `min` with exactly `stop`, once, however many
   components it replaces, never escalating to `--force` and never asking
-  anything when the graceful stop succeeds.
+  anything when the graceful stop succeeds and no daemon on an older build
+  answers after the swap.
+- **Test** (R5.5): a client that respawns the daemon from the binaries on disk
+  after each stop leaves a daemon on the old build. After a yes to the pre-swap
+  question, the run ends with exactly `stop`, `stop --force`, `stop --force`.
+  The daemon it leaves runs from the newly installed `minimald`.
+- **Test** (R5.5): the respawned daemon holds a session, and the run has no
+  consent and no terminal. The post-swap stop is then graceful only. The session
+  survives, the output names `min stop --force`, and the upgrade succeeds. With
+  a yes on the terminal, the run asks and ends with `stop`, `stop`,
+  `stop --force`.
+- **Test** (R5.5): a checksum failure on a component after the first
+  executable swap exits non-zero and still runs the post-swap stop. The daemon
+  it leaves runs from the newly installed `minimald`.
+- **Test** (R5.5): a reinstall with no `min` on disk over a daemon on an older
+  build reports that daemon and stops it gracefully. A daemon of the same build
+  is never stopped after the swap.
 - **Test** (R5.5): an installed `min` whose `stop` exits non-zero and writes to
   both stdout and stderr still yields exit 0, leaks neither stream into the
   installer's output, asks nothing, and completes the upgrade.
