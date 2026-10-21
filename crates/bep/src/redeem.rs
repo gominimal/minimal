@@ -1,4 +1,4 @@
-//! The redemption decision (BEP-019 to BEP-025, BEP-031, BEP-058).
+//! The redemption decision (BEP-019 to BEP-025, BEP-031, BEP-058, BEP-064).
 //!
 //! The proxy decides whether to redeem a sealed value in one pure function,
 //! [`decide`], over owned values. The TLS and socket shell does the I/O. It
@@ -30,23 +30,39 @@
 //!    [`crate::seal::open`] refuses as past its expiry is
 //!    [`Unsealed::Expired`], and this check refuses it too.
 //! 6. No revocation in force covers the value's box id (BEP-024, BEP-071).
-//! 7. The connection's port is a declared port of the module's current host
+//! 7. The member's handle passes [`crate::handle::Handle::check`]: its
+//!    signature verifies under a registered client key, its `sub` and
+//!    `node_id` equal the value's box id and Box Host, the clock is before
+//!    its expiry, its `upstream` is within the current rule and its `inject`
+//!    equals the rule's (BEP-064). A sign-in reference's rule is the module.
+//!    The shell reads the handle from the opened member with
+//!    [`crate::handle::read_opened`], so the handle is sealed with the value.
+//!    The member gives the handle's kind. A sealed member has no store kind
+//!    yet, so today every handle is a sign-in reference.
+//!    For a store handle, the shell gives the handle's `upstream` as the
+//!    bound set and the rule's authorities as the current set, so checks 8
+//!    to 10 read them where they read a module's host sets (BEP-032).
+//!    Check 9 also reads the handle's `upstream` itself, so a bound set
+//!    wider than the handle never widens where the value goes.
+//! 8. The connection's port is a declared port of the module's current host
 //!    set for that hostname (BEP-031). A hostname outside the current set is
-//!    not credentialed, so check 9 refuses it.
-//! 8. The connection authority is in the value's bound host set (BEP-021).
-//! 9. The connection authority is in the module's current host set
-//!    (BEP-021).
-//! 10. The request's `Host` header, and the authority of an absolute-form
+//!    not credentialed, so check 10 refuses it.
+//! 9. The connection authority is in the value's bound host set and in the
+//!    handle's `upstream` (BEP-021, BEP-064).
+//! 10. The connection authority is in the module's current host set
+//!     (BEP-021).
+//! 11. The request's `Host` header, and the authority of an absolute-form
 //!     request target, equal the connection authority (BEP-023).
 //!
 //! [`decide`] admits only when every check passes (BEP-025). The shell then
 //! substitutes the member's credential and forwards the request to the
 //! connection authority. A request that carries no sealed value goes to
-//! [`decide_plain`], which makes checks 4 and 10 alone. So the egress and
+//! [`decide_plain`], which makes checks 4 and 11 alone. So the egress and
 //! request-authority checks hold whether or not a request carries a value.
 
 use std::fmt;
 
+use crate::handle::{Handle, Inject};
 use crate::seal::{BoundField, Breadth, Mode, OpenError, Opened};
 
 /// What the shell found when it opened the sealed value.
@@ -177,8 +193,11 @@ pub struct Authority<H> {
 }
 
 /// One redemption, as the shell sees it.
+///
+/// `I` is the injection form of a store handle. The shell uses [`Inject`].
+/// A Kani harness uses `u8` ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Redemption<B, H> {
+pub struct Redemption<B, H, I = Inject> {
     /// The decryption fact, with the named box and the member's bounds.
     pub unsealed: Unsealed<B>,
     /// The box the connection's source resolves to.
@@ -214,6 +233,10 @@ pub struct Redemption<B, H> {
     pub request: RequestAuthority<H>,
     /// The authorities the sending box's declared egress admits (BEP-022).
     pub egress: Vec<Authority<H>>,
+    /// The member's handle, as [`crate::handle::read_opened`] found it
+    /// (BEP-064). The shell reads it from the same [`Opened`] that gave
+    /// [`Self::unsealed`], so it is the sealed member's own `jws`.
+    pub handle: Handle<H, I>,
 }
 
 /// The authorities a request names, beside the one it arrived on (BEP-023).
@@ -287,6 +310,9 @@ pub enum Check {
     /// The `Host` header or the request target names an authority other
     /// than the connection authority (BEP-023).
     HostMismatch,
+    /// The member's handle does not verify under a registered client key,
+    /// is past its expiry, or disagrees with its current rule (BEP-064).
+    StoreHandleInvalid,
 }
 
 impl Check {
@@ -305,6 +331,7 @@ impl Check {
             Self::OutsideCurrentSet => "outside_current_set",
             Self::OutsideDeclaredEgress => "outside_declared_egress",
             Self::HostMismatch => "host_mismatch",
+            Self::StoreHandleInvalid => "store_handle_invalid",
         }
     }
 }
@@ -333,7 +360,9 @@ pub enum Decision {
 
 /// Decides one redemption. Pure: the result depends only on `redemption`.
 #[must_use]
-pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Decision {
+pub fn decide<B: PartialEq, H: PartialEq, I: PartialEq>(
+    redemption: &Redemption<B, H, I>,
+) -> Decision {
     // BEP-019: only a value this host's key opens is redeemed.
     let (box_id, bounds, expiry) = match &redemption.unsealed {
         Unsealed::Undecryptable => return Decision::Refuse(Check::Undecryptable),
@@ -393,13 +422,20 @@ pub fn decide<B: PartialEq, H: PartialEq>(redemption: &Redemption<B, H>) -> Deci
     if redemption.revoked.contains(box_id) {
         return Decision::Refuse(Check::Revoked);
     }
+    // BEP-064: the handle verifies and agrees with its current rule.
+    if redemption.handle.check(redemption.now).is_err() {
+        return Decision::Refuse(Check::StoreHandleInvalid);
+    }
     // BEP-031: a credentialed hostname is reached only on a declared port.
     let current = &redemption.current_set;
     if current.iter().any(|a| a.host == authority.host) && !current.contains(authority) {
         return Decision::Refuse(Check::OffPort);
     }
     // BEP-021: the authority is in the bound set and in the current set.
-    if !redemption.bound_set.contains(authority) {
+    // BEP-064: the handle's own upstream bounds the bound set too, so a
+    // bound set wider than the checked handle sends the value nowhere new.
+    if !redemption.bound_set.contains(authority) || !redemption.handle.upstream.contains(authority)
+    {
         return Decision::Refuse(Check::OutsideBoundSet);
     }
     if !current.contains(authority) {
@@ -452,6 +488,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+    use crate::handle::Rule;
     use crate::seal::{Binding, Context, Member, MemberKind, MemberList, ProxyKey, open, seal};
 
     const BOUNDED: Bounds = Bounds {
@@ -463,7 +500,7 @@ mod tests {
     const API: Authority<u8> = Authority { host: 1, port: 443 };
 
     /// The facts after attribution, set so that every later check passes.
-    fn rest<B>() -> Redemption<B, u8> {
+    fn rest<B>() -> Redemption<B, u8, u8> {
         Redemption {
             unsealed: Unsealed::Undecryptable,
             attribution: Attribution::NoLiveBox,
@@ -475,6 +512,55 @@ mod tests {
             current_set: vec![API],
             request: PINNED,
             egress: vec![API],
+            handle: valid_handle(),
+        }
+    }
+
+    /// A handle that passes BEP-064 at every clock reading.
+    fn valid_handle() -> Handle<u8, u8> {
+        Handle {
+            verified: true,
+            bound: true,
+            exp: u64::MAX,
+            upstream: vec![API],
+            inject: None,
+            rule: Some(Rule {
+                upstream: vec![API],
+                inject: None,
+            }),
+        }
+    }
+
+    /// BEP-021, BEP-064: a valid handle beside a wider bound set does not
+    /// widen where the value goes. An authority in the bound set and the
+    /// current set, but outside the handle's `upstream`, is refused.
+    #[test]
+    fn bound_set_wider_than_handle_upstream_is_refused() {
+        let other = Authority { host: 2, port: 443 };
+        let wide = Redemption {
+            bound_set: vec![API, other],
+            current_set: vec![API, other],
+            ..own(7)
+        };
+        assert!(wide.handle.check(wide.now).is_ok());
+        assert_eq!(
+            decide(&reached_unchanged(other, wide.clone())),
+            Decision::Refuse(Check::OutsideBoundSet)
+        );
+        assert_eq!(decide(&reached_unchanged(API, wide)), ADMITTED);
+    }
+
+    /// `redemption`, sent to `authority` with a pinned request and a
+    /// declared egress, with its handle as it is.
+    fn reached_unchanged(
+        authority: Authority<u8>,
+        redemption: Redemption<u8, u8, u8>,
+    ) -> Redemption<u8, u8, u8> {
+        Redemption {
+            authority,
+            request: pinned(authority),
+            egress: vec![authority],
+            ..redemption
         }
     }
 
@@ -486,7 +572,7 @@ mod tests {
 
     /// An opened value for `named`, sent from `named`, that passes the
     /// source and bounds checks.
-    fn own(named: u8) -> Redemption<u8, u8> {
+    fn own(named: u8) -> Redemption<u8, u8, u8> {
         Redemption {
             unsealed: Unsealed::Opened {
                 box_id: named,
@@ -507,12 +593,26 @@ mod tests {
     }
 
     /// `redemption`, sent to `authority` with a pinned request, from a box
-    /// whose declared egress admits `authority`.
-    fn reached(authority: Authority<u8>, redemption: Redemption<u8, u8>) -> Redemption<u8, u8> {
+    /// whose declared egress admits `authority`. The handle's `upstream`, and
+    /// its rule's, take `authority` too, so the handle's verdict holds.
+    fn reached(
+        authority: Authority<u8>,
+        redemption: Redemption<u8, u8, u8>,
+    ) -> Redemption<u8, u8, u8> {
+        let mut handle = redemption.handle;
+        if !handle.upstream.contains(&authority) {
+            handle.upstream.push(authority);
+            if let Some(rule) = &mut handle.rule
+                && !rule.upstream.contains(&authority)
+            {
+                rule.upstream.push(authority);
+            }
+        }
         Redemption {
             authority,
             request: pinned(authority),
             egress: vec![authority],
+            handle,
             ..redemption
         }
     }
@@ -548,7 +648,7 @@ mod tests {
         ]
     }
 
-    fn any_redemption() -> impl Strategy<Value = Redemption<u8, u8>> {
+    fn any_redemption() -> impl Strategy<Value = Redemption<u8, u8, u8>> {
         (
             any_unsealed(),
             (0u8..3, 0u8..3).prop_map(|(source, sender)| match source {
@@ -566,6 +666,7 @@ mod tests {
                 prop::collection::vec(any_authority(), 0..=4),
             ),
             any_request(),
+            any_handle(),
         )
             .prop_map(
                 |(
@@ -577,6 +678,7 @@ mod tests {
                     authority,
                     (bound_set, current_set, egress),
                     request,
+                    handle,
                 )| Redemption {
                     unsealed,
                     attribution,
@@ -588,14 +690,38 @@ mod tests {
                     current_set,
                     request,
                     egress,
+                    handle,
                 },
             )
+    }
+
+    /// A handle: every key set's verdict, every expiry, every upstream set,
+    /// every injection form and every current rule, or none.
+    fn any_handle() -> impl Strategy<Value = Handle<u8, u8>> {
+        (
+            (any::<bool>(), any::<bool>()),
+            0u64..4_000,
+            prop::collection::vec(any_authority(), 0..=4),
+            prop::option::of(0u8..3),
+            prop::option::of((
+                prop::collection::vec(any_authority(), 0..=4),
+                prop::option::of(0u8..3),
+            )),
+        )
+            .prop_map(|((verified, bound), exp, upstream, inject, rule)| Handle {
+                verified,
+                bound,
+                exp,
+                upstream,
+                inject,
+                rule: rule.map(|(upstream, inject)| Rule { upstream, inject }),
+            })
     }
 
     /// The checks of BEP-019 to BEP-024, BEP-031 and BEP-058, written out
     /// one by one in their order, apart from [`decide`]. Each entry is a
     /// check and whether it fails.
-    fn failures(r: &Redemption<u8, u8>) -> Vec<(Check, bool)> {
+    fn failures(r: &Redemption<u8, u8, u8>) -> Vec<(Check, bool)> {
         let a = r.authority;
         let (opened, box_id, bounded, expiry) = match &r.unsealed {
             Unsealed::Opened {
@@ -643,11 +769,25 @@ mod tests {
                 Check::Revoked,
                 box_id.is_some_and(|b| r.revoked.contains(&b)),
             ),
+            (Check::StoreHandleInvalid, !handle_valid(&r.handle, r.now)),
             (Check::OffPort, credentialed && !r.current_set.contains(&a)),
-            (Check::OutsideBoundSet, !r.bound_set.contains(&a)),
+            (
+                Check::OutsideBoundSet,
+                !r.bound_set.contains(&a) || !r.handle.upstream.contains(&a),
+            ),
             (Check::OutsideCurrentSet, !r.current_set.contains(&a)),
             (Check::HostMismatch, !(host_pinned && target_pinned)),
         ]
+    }
+
+    /// BEP-064, written out apart from [`Handle::check`].
+    fn handle_valid(h: &Handle<u8, u8>, now: u64) -> bool {
+        h.verified
+            && h.bound
+            && now < h.exp
+            && h.rule.as_ref().is_some_and(|rule| {
+                h.upstream.iter().all(|a| rule.upstream.contains(a)) && h.inject == rule.inject
+            })
     }
 
     const ADMITTED: Decision = Decision::Admit {
@@ -1005,9 +1145,57 @@ mod tests {
         }
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// BEP-064: for every handle, every registered key set's verdict,
+        /// every clock reading and every current rule, a value that passes
+        /// every other check is admitted only when the signature verifies,
+        /// `sub` and `node_id` match the value,
+        /// the clock is before `exp`, `upstream` is a subset of the rule's
+        /// authorities and `inject` equals the rule's form. Otherwise the
+        /// refusal is `store_handle_invalid`.
+        #[test]
+        fn prop_store_handle_verified_against_current_rule(
+            handle in any_handle(),
+            now in 0u64..4_000,
+        ) {
+            // `reached` puts `API` in the handle's upstream, and in its
+            // rule's, so the handle's verdict is the same and only BEP-064
+            // decides.
+            let r = reached(API, Redemption {
+                now,
+                handle: handle.clone(),
+                unsealed: Unsealed::Opened {
+                    box_id: 1,
+                    bounds: BOUNDED,
+                    expiry: u64::MAX,
+                },
+                ..own(1)
+            });
+            let valid = handle.verified
+                && handle.bound
+                && now < handle.exp
+                && handle.rule.as_ref().is_some_and(|rule| {
+                    handle.upstream.iter().all(|a| rule.upstream.contains(a))
+                        && handle.inject == rule.inject
+                });
+            let decision = decide(&r);
+            if valid {
+                prop_assert_eq!(decision, ADMITTED);
+            } else {
+                prop_assert_eq!(decision, Decision::Refuse(Check::StoreHandleInvalid));
+                prop_assert_eq!(Check::StoreHandleInvalid.marker(), "store_handle_invalid");
+            }
+            prop_assert_eq!(handle.check(now).is_ok(), valid);
+            prop_assert_eq!(r.handle.check(now).is_ok(), valid);
+            admits_iff_every_check_passes(&r)?;
+        }
+    }
+
     /// The decision is `Admit` when no check in [`failures`] fails, and
     /// otherwise `Refuse` naming the first check that fails.
-    fn admits_iff_every_check_passes(r: &Redemption<u8, u8>) -> Result<(), TestCaseError> {
+    fn admits_iff_every_check_passes(r: &Redemption<u8, u8, u8>) -> Result<(), TestCaseError> {
         let first = failures(r).into_iter().find(|(_, failed)| *failed);
         let decision = decide(r);
         match first {
@@ -1205,6 +1393,7 @@ mod tests {
             Check::OutsideCurrentSet,
             Check::OutsideDeclaredEgress,
             Check::HostMismatch,
+            Check::StoreHandleInvalid,
         ]
         .map(Check::marker);
         assert_eq!(
@@ -1221,6 +1410,7 @@ mod tests {
                 "outside_current_set",
                 "outside_declared_egress",
                 "host_mismatch",
+                "store_handle_invalid",
             ]
         );
     }
@@ -1232,6 +1422,7 @@ mod kani_proofs {
         Attribution, Authority, Bounds, Check, Decision, Plain, Redemption, RequestAuthority,
         Unsealed, decide, decide_plain,
     };
+    use crate::handle::{Handle, Rule};
     use crate::seal::{Breadth, Mode};
 
     fn any_mode() -> Option<Mode> {
@@ -1318,7 +1509,27 @@ mod kani_proofs {
         }
     }
 
-    fn any_redemption() -> Redemption<u8, u8> {
+    /// A handle with at most four authorities, and its current rule or none.
+    fn any_handle() -> Handle<u8, u8> {
+        let inject = |pick: u8| if pick % 2 == 0 { None } else { Some(pick) };
+        Handle {
+            verified: kani::any(),
+            bound: kani::any(),
+            exp: kani::any(),
+            upstream: any_set(),
+            inject: inject(kani::any::<u8>() % 4),
+            rule: if kani::any() {
+                Some(Rule {
+                    upstream: any_set(),
+                    inject: inject(kani::any::<u8>() % 4),
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    fn any_redemption() -> Redemption<u8, u8, u8> {
         Redemption {
             unsealed: any_unsealed(),
             attribution: any_attribution(),
@@ -1330,6 +1541,7 @@ mod kani_proofs {
             current_set: any_set(),
             request: any_request(),
             egress: any_set(),
+            handle: any_handle(),
         }
     }
 
@@ -1402,10 +1614,13 @@ mod kani_proofs {
         let decision = decide(&r);
         if matches!(decision, Decision::Admit { .. }) {
             assert!(r.bound_set.contains(&r.authority));
+            assert!(r.handle.upstream.contains(&r.authority));
             assert!(r.current_set.contains(&r.authority));
         }
         if decision == Decision::Refuse(Check::OutsideBoundSet) {
-            assert!(!r.bound_set.contains(&r.authority));
+            assert!(
+                !r.bound_set.contains(&r.authority) || !r.handle.upstream.contains(&r.authority)
+            );
         }
         if decision == Decision::Refuse(Check::OutsideCurrentSet) {
             assert!(!r.current_set.contains(&r.authority));
@@ -1508,6 +1723,34 @@ mod kani_proofs {
         }
     }
 
+    /// BEP-064, written out apart from [`Handle::check`].
+    fn handle_valid(h: &Handle<u8, u8>, now: u64) -> bool {
+        h.verified
+            && h.bound
+            && now < h.exp
+            && h.rule.as_ref().is_some_and(|rule| {
+                h.upstream.iter().all(|a| rule.upstream.contains(a)) && h.inject == rule.inject
+            })
+    }
+
+    /// BEP-064: an admission has a handle whose signature verifies, whose
+    /// expiry is after the clock, whose `upstream` is within the current
+    /// rule and whose `inject` equals the rule's. A handle that fails any of
+    /// these is never admitted.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn kani_redeem_refuses_invalid_store_handle() {
+        let r = any_redemption();
+        let decision = decide(&r);
+        let valid = handle_valid(&r.handle, r.now);
+        if matches!(decision, Decision::Admit { .. }) {
+            assert!(valid);
+        }
+        if decision == Decision::Refuse(Check::StoreHandleInvalid) {
+            assert!(!valid);
+        }
+    }
+
     /// BEP-025: the decision admits exactly when every check passes.
     #[kani::proof]
     #[kani::unwind(6)]
@@ -1531,7 +1774,9 @@ mod kani_proofs {
                     && attributed
                     && r.now < expiry
                     && !r.revoked.contains(&box_id)
+                    && handle_valid(&r.handle, r.now)
                     && r.bound_set.contains(&a)
+                    && r.handle.upstream.contains(&a)
                     && r.current_set.contains(&a)
                     && r.egress.contains(&a)
                     && r.request.host == Some(a)
