@@ -294,12 +294,12 @@ impl Proxy {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (request, rest) =
-            match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await {
-                Err(_) => return Ended::Closed("head_timeout"),
-                Ok(Err(reason)) => return self.refuse_head(&mut stream, &reason).await,
-                Ok(Ok(head)) => head,
-            };
+        let (request, rest) = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await
+        {
+            Err(_) => return Ended::Closed("head_timeout"),
+            Ok(Err(reason)) => return self.refuse_head(&mut stream, &reason).await,
+            Ok(Ok(head)) => head,
+        };
         if let Some(word) = tunnel_refusal(&request) {
             respond(
                 &mut stream,
@@ -314,7 +314,9 @@ impl Proxy {
             return self.connect(box_id, stream, &request.target, rest).await;
         }
         if let Some((scheme, host, port)) = absolute_form(&request.target) {
-            return self.absolute(box_id, &mut stream, scheme, &host, port).await;
+            return self
+                .absolute(box_id, &mut stream, scheme, &host, port)
+                .await;
         }
         respond(
             &mut stream,
@@ -559,17 +561,19 @@ impl Ended {
 /// as an upgrade or by its well-known path.
 fn tunnel_refusal(request: &http::Request) -> Option<&'static str> {
     let upgrades: Vec<&[u8]> = request.header_values("upgrade").collect();
-    if upgrades
-        .iter()
-        .any(|v| v.split(|&b| b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"connect-udp")))
-        || request
-            .target
-            .to_ascii_lowercase()
-            .contains("/.well-known/masque/udp/")
+    if upgrades.iter().any(|v| {
+        v.split(|&b| b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"connect-udp"))
+    }) || request
+        .target
+        .to_ascii_lowercase()
+        .contains("/.well-known/masque/udp/")
     {
         return Some("connect_udp");
     }
-    if request.method == "CONNECT" && (!upgrades.is_empty() || request.header_values("protocol").next().is_some()) {
+    if request.method == "CONNECT"
+        && (!upgrades.is_empty() || request.header_values("protocol").next().is_some())
+    {
         return Some("extended_connect");
     }
     None
@@ -625,7 +629,10 @@ fn split_authority(text: &str) -> Option<(String, u16)> {
 /// The scheme, host and port of an absolute-form target. The port defaults
 /// to the scheme's.
 fn absolute_form(target: &str) -> Option<(&'static str, String, u16)> {
-    let lower = target.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
+    let lower = target
+        .get(..8)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     let (scheme, rest, default) = if lower.starts_with("http://") {
         ("http", &target[7..], 80)
     } else if lower.starts_with("https://") {
@@ -668,8 +675,13 @@ impl http::AuditSink for HeadAudit {
 
 /// Relays one terminated flow: the request half through the strict
 /// forwarder, the response half as the upstream wrote it.
-async fn relay<B, U>(box_id: &str, boxed: B, upstream: U, authority: &str, audit: Arc<dyn AuditWriter>)
-where
+async fn relay<B, U>(
+    box_id: &str,
+    boxed: B,
+    upstream: U,
+    authority: &str,
+    audit: Arc<dyn AuditWriter>,
+) where
     B: AsyncRead + AsyncWrite + Send + 'static,
     U: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -748,4 +760,458 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SigningKey as _};
+    use rustls::pki_types::CertificateDer;
+    use tokio::net::{TcpListener, UnixStream};
+    use tokio_rustls::LazyConfigAcceptor;
+    use zeroize::Zeroizing;
+
+    use super::*;
+    use crate::audit::{LogReader, segment_name};
+    use crate::ca::Union;
+    use crate::keys::{HeldKey, KeyError, Role};
+    use crate::listener::{Listener, PeerAttested, TOKEN_LEN};
+    use crate::module::GITHUB;
+    use crate::seal::ProxyPublicKey;
+
+    /// A software key in place of a keychain key.
+    struct TestKey {
+        role: Role,
+        pair: KeyPair,
+    }
+
+    impl HeldKey for TestKey {
+        fn role(&self) -> Role {
+            self.role
+        }
+        fn public(&self) -> ProxyPublicKey {
+            ProxyPublicKey::from_sec1_bytes(self.pair.public_key_raw()).unwrap()
+        }
+        fn exportable(&self) -> bool {
+            false
+        }
+        fn agree(&self, _peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            Err(KeyError::Store {
+                role: self.role,
+                detail: "a CA test key does no key agreement".into(),
+            })
+        }
+        fn probe(&self) -> Result<(), KeyError> {
+            Ok(())
+        }
+    }
+
+    impl CaKey for TestKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            self.pair.sign(msg).map_err(|err| KeyError::Store {
+                role: self.role,
+                detail: err.to_string(),
+            })
+        }
+    }
+
+    fn test_key(role: Role) -> &'static TestKey {
+        Box::leak(Box::new(TestKey {
+            role,
+            pair: KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap(),
+        }))
+    }
+
+    /// The interception CA, and its root for the box's trust store.
+    fn interception_ca() -> (Arc<dyn LeafIssuer>, CertificateDer<'static>) {
+        let ca = Ca::new(
+            test_key(Role::Root),
+            test_key(Role::Signing),
+            Union::new(&[GITHUB], [""; 0]),
+            SystemTime::now(),
+        )
+        .unwrap();
+        let root = ca.root().clone();
+        (Arc::new(Mutex::new(ca)), root)
+    }
+
+    /// A stand-in for `api.github.com`: a TLS server under a test CA that
+    /// offers `h2` and `http/1.1`. It records the ALPN list each client
+    /// offered and the protocol it negotiated, and answers each request
+    /// head with `200` and the body `ok`.
+    struct Upstream {
+        addr: SocketAddr,
+        roots: RootCertStore,
+        offered: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
+        negotiated: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+        heads: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn upstream() -> Upstream {
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = CertificateParams::new(vec!["api.github.com".to_owned()])
+            .unwrap()
+            .signed_by(&leaf_key, &Issuer::from_params(&ca_params, &ca_key))
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let mut config = ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), ALPN_HTTP11.to_vec()];
+        let config = Arc::new(config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let negotiated = Arc::new(Mutex::new(Vec::new()));
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let (o, n, h) = (offered.clone(), negotiated.clone(), heads.clone());
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (config, o, n, h) = (config.clone(), o.clone(), n.clone(), h.clone());
+                tokio::spawn(async move {
+                    let acceptor = rustls::server::Acceptor::default();
+                    let Ok(start) = LazyConfigAcceptor::new(acceptor, tcp).await else {
+                        return;
+                    };
+                    let alpn = start
+                        .client_hello()
+                        .alpn()
+                        .map(|list| list.map(<[u8]>::to_vec).collect())
+                        .unwrap_or_default();
+                    o.lock().unwrap().push(alpn);
+                    let Ok(mut tls) = start.into_stream(config).await else {
+                        return;
+                    };
+                    n.lock()
+                        .unwrap()
+                        .push(tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec));
+                    if let Ok((head, _)) = read_head(&mut tls).await {
+                        h.lock()
+                            .unwrap()
+                            .push(String::from_utf8(head.serialize()).unwrap());
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await;
+                    }
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        Upstream {
+            addr,
+            roots,
+            offered,
+            negotiated,
+            heads,
+        }
+    }
+
+    /// Every upstream name resolves to one address, and the calls are
+    /// counted.
+    struct To(SocketAddr, AtomicUsize);
+
+    impl Resolve for To {
+        fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![self.0])
+        }
+    }
+
+    const BOX: [u8; 16] = [0x42; 16];
+
+    fn delivery() -> Delivery {
+        Delivery {
+            box_id: BOX,
+            source: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 7), 40_000),
+            destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 3), 8118),
+        }
+    }
+
+    struct Harness {
+        proxy: Arc<Proxy>,
+        root: CertificateDer<'static>,
+        upstream: Upstream,
+        resolver: Arc<To>,
+        audit: Arc<Mutex<Vec<Decision>>>,
+    }
+
+    async fn harness_with(audit: Arc<dyn AuditWriter>) -> (Harness, Arc<dyn AuditWriter>) {
+        let upstream = upstream().await;
+        let (leaves, root) = interception_ca();
+        let resolver = Arc::new(To(upstream.addr, AtomicUsize::new(0)));
+        let proxy = Proxy::new(
+            Admission::new(&[GITHUB], [("vault.example.com", 443)]),
+            leaves,
+            upstream.roots.clone(),
+            resolver.clone(),
+            Arc::clone(&audit),
+        )
+        .unwrap();
+        (
+            Harness {
+                proxy: Arc::new(proxy),
+                root,
+                upstream,
+                resolver,
+                audit: Arc::new(Mutex::new(Vec::new())),
+            },
+            audit,
+        )
+    }
+
+    async fn harness() -> Harness {
+        let audit = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        let (mut h, _) = harness_with(audit.clone()).await;
+        h.audit = audit;
+        h
+    }
+
+    /// A box connection to the proxy, already admitted by the listener.
+    fn box_connection(proxy: &Arc<Proxy>) -> tokio::io::DuplexStream {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let proxy = Arc::clone(proxy);
+        tokio::spawn(async move { proxy.serve(delivery(), theirs).await });
+        ours
+    }
+
+    /// Everything the proxy answers to `bytes` before it closes.
+    async fn exchange(proxy: &Arc<Proxy>, bytes: &[u8]) -> String {
+        let mut stream = box_connection(proxy);
+        stream.write_all(bytes).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Reads a response head, byte by byte, so no TLS byte after it is taken.
+    async fn response_head<S: AsyncRead + Unpin>(stream: &mut S) -> String {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).unwrap()
+    }
+
+    fn box_tls(root: &CertificateDer<'static>, alpn: &[&[u8]]) -> tokio_rustls::TlsConnector {
+        let mut roots = RootCertStore::empty();
+        roots.add(root.clone()).unwrap();
+        let mut config = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    const CONNECT_GITHUB: &[u8] =
+        b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n";
+
+    // BEP-073: through the listener, a box's CONNECT to a GitHub host
+    // completes TLS with HTTP/1.1, the upstream is offered `http/1.1` alone,
+    // and a client that requires `h2` is refused at the handshake.
+    #[tokio::test]
+    async fn proxy_offers_http11_only_on_both_legs() {
+        let h = harness().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("listener.sock");
+        let token = [0x5a; TOKEN_LEN];
+        let listener = Listener::bind(&path, token, Arc::new(PeerAttested)).unwrap();
+        let proxy = Arc::clone(&h.proxy);
+        tokio::spawn(listener.run(move |delivery, stream| {
+            let proxy = Arc::clone(&proxy);
+            async move { proxy.serve(delivery, stream).await }
+        }));
+
+        // The switch peer's delivery, then the box's own bytes.
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(&token).await.unwrap();
+        stream.write_all(&delivery().emit()).await.unwrap();
+        stream.write_all(CONNECT_GITHUB).await.unwrap();
+        let head = response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+
+        // The box offers `h2, http/1.1`, as curl and most clients do.
+        let name = ServerName::try_from("api.github.com").unwrap();
+        let mut tls = box_tls(&h.root, &[b"h2", ALPN_HTTP11])
+            .connect(name.clone(), stream)
+            .await
+            .expect("the box's TLS completes under the interception root");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(ALPN_HTTP11));
+        tls.write_all(b"GET /zen HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+            .await
+            .unwrap();
+        let answer = response_head(&mut tls).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+
+        // The upstream leg offered `http/1.1` alone, and got it.
+        assert_eq!(
+            *h.upstream.offered.lock().unwrap(),
+            [vec![ALPN_HTTP11.to_vec()]]
+        );
+        assert_eq!(
+            *h.upstream.negotiated.lock().unwrap(),
+            [Some(ALPN_HTTP11.to_vec())]
+        );
+        assert_eq!(
+            *h.upstream.heads.lock().unwrap(),
+            ["GET /zen HTTP/1.1\r\nhost: api.github.com\r\n\r\n"]
+        );
+
+        // A client that requires `h2` gets a handshake refusal.
+        let mut stream = box_connection(&h.proxy);
+        stream.write_all(CONNECT_GITHUB).await.unwrap();
+        assert!(
+            response_head(&mut stream)
+                .await
+                .starts_with("HTTP/1.1 200 ")
+        );
+        let refused = box_tls(&h.root, &[b"h2"]).connect(name, stream).await;
+        assert!(refused.is_err(), "an h2-only client completed TLS");
+    }
+
+    // BEP-029: a CONNECT or an absolute-form request outside the modules'
+    // host sets and the registered store authorities is refused, nothing
+    // is dialed, and the audit log records it `off_module` for the box.
+    #[tokio::test]
+    async fn request_outside_modules_is_refused_off_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(dir.path().join(segment_name(0))).unwrap();
+        let (h, _) = harness_with(Arc::new(Mutex::new(log))).await;
+
+        let requests: [&[u8]; 3] = [
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            // A module host on a port outside its authority.
+            b"CONNECT api.github.com:8443 HTTP/1.1\r\nHost: api.github.com:8443\r\n\r\n",
+            b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        ];
+        for request in requests {
+            let answer = exchange(&h.proxy, request).await;
+            assert!(answer.starts_with("HTTP/1.1 403 Forbidden"), "{answer}");
+            assert!(answer.contains("is not one"), "{answer}");
+        }
+        assert_eq!(h.resolver.1.load(Ordering::SeqCst), 0);
+
+        // What `min box audit <box>` reads.
+        let entries = LogReader::new(dir.path()).read_new().unwrap().entries;
+        let records: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.record.subject.as_str(),
+                    e.record.upstream.as_str(),
+                    e.record.decision,
+                    e.record.marker.as_deref(),
+                )
+            })
+            .collect();
+        let subject = "42".repeat(16);
+        assert_eq!(
+            records,
+            [
+                (
+                    subject.as_str(),
+                    "example.com:443",
+                    Outcome::Refuse,
+                    Some(OFF_MODULE)
+                ),
+                (
+                    subject.as_str(),
+                    "api.github.com:8443",
+                    Outcome::Refuse,
+                    Some(OFF_MODULE)
+                ),
+                (
+                    subject.as_str(),
+                    "example.com:80",
+                    Outcome::Refuse,
+                    Some(OFF_MODULE)
+                ),
+            ]
+        );
+
+        // The admitted set is the module host sets and the store authorities.
+        let admission = Admission::new(&[GITHUB], [("Vault.Example.com.", 443)]);
+        assert!(admission.admits("api.github.com", 443));
+        assert!(admission.admits("vault.example.com", 443));
+        assert!(!admission.admits("vault.example.com", 8443));
+        assert!(!admission.admits("example.com", 443));
+    }
+
+    // BEP-075: CONNECT and absolute-form requests are taken over HTTP/1.1
+    // only, and Extended CONNECT and `connect-udp` are refused in either
+    // form.
+    #[tokio::test]
+    async fn connect_and_absolute_form_accepted_over_http11_only() {
+        let h = harness().await;
+
+        let mut stream = box_connection(&h.proxy);
+        stream.write_all(CONNECT_GITHUB).await.unwrap();
+        let head = response_head(&mut stream).await;
+        assert_eq!(head, "HTTP/1.1 200 Connection Established\r\n\r\n");
+        drop(stream);
+
+        // An absolute-form request is read and decided: plain HTTP to a
+        // credentialed host is refused `upstream_not_tls`.
+        let answer = exchange(
+            &h.proxy,
+            b"GET http://api.github.com/zen HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 403 Forbidden"), "{answer}");
+        assert!(answer.contains("Use https://api.github.com/"), "{answer}");
+        assert_eq!(
+            h.audit.lock().unwrap().last().unwrap().marker.as_deref(),
+            Some(UPSTREAM_NOT_TLS)
+        );
+
+        // HTTP/1.1 only, in both forms.
+        for request in [
+            &b"CONNECT api.github.com:443 HTTP/1.0\r\nHost: api.github.com:443\r\n\r\n"[..],
+            b"GET http://example.com/ HTTP/1.0\r\nHost: example.com\r\n\r\n",
+        ] {
+            let answer = exchange(&h.proxy, request).await;
+            assert!(answer.starts_with("HTTP/1.1 505 "), "{answer}");
+        }
+        // The HTTP/2 prior-knowledge preface is closed with no answer.
+        assert_eq!(exchange(&h.proxy, H2_PREFACE_FULL).await, "");
+
+        // Extended CONNECT and `connect-udp`, in either form.
+        for request in [
+            &b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nProtocol: websocket\r\n\r\n"[..],
+            b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nUpgrade: connect-udp\r\n\r\n",
+            b"GET /.well-known/masque/udp/192.0.2.6/443/ HTTP/1.1\r\nHost: proxy\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n",
+            b"GET http://example.com/.well-known/masque/udp/192.0.2.6/443/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        ] {
+            let answer = exchange(&h.proxy, request).await;
+            assert!(answer.starts_with("HTTP/1.1 501 "), "{answer}");
+        }
+
+        // An origin-form request is not a proxy request.
+        let answer = exchange(&h.proxy, b"GET / HTTP/1.1\r\nHost: proxy\r\n\r\n").await;
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    }
+
+    const H2_PREFACE_FULL: &[u8] = http::H2_PREFACE;
 }

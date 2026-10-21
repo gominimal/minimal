@@ -213,7 +213,8 @@ mod tests {
             .await
             .unwrap();
         let mut lines = BufReader::new(read).lines();
-        let first: Reply = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let first: Reply =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         let kid = first.kid.expect("the registration names its kid");
         assert!(first.ok);
         assert!(registry.read().unwrap().contains(&kid));

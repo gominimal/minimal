@@ -487,7 +487,11 @@ mod tests {
         let (path, admitted) = counting_listener(dir.path(), Arc::new(holds)).await;
         let mut other = delivery();
         other.box_id = [0x43; 16];
-        assert!(answer(&path, &presentation(&TOKEN, &other)).await.is_empty());
+        assert!(
+            answer(&path, &presentation(&TOKEN, &other))
+                .await
+                .is_empty()
+        );
         assert_eq!(admitted.load(Ordering::SeqCst), 0);
         assert_eq!(
             answer(&path, &presentation(&TOKEN, &delivery())).await,
