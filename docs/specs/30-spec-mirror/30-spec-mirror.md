@@ -328,7 +328,7 @@ The switch is the user-space network the VM host daemon runs for boxes, as [NET]
     tier:   T0
     verify: cargo nextest run -p mctx no_fetch_skips_the_mirror_too
 
-- **MIR-022** WHERE the client configuration file sets `[mirror] enabled = false` THE SYSTEM SHALL fetch from the upstream as it does today, without starting the mirror daemon, setting the variables or serving the door.
+- **MIR-022** WHERE the client configuration file sets `[mirror] enabled = false` THE SYSTEM SHALL fetch from the upstream as it does today, which means a stopped mirror daemon, unset variables and a closed door.
   tier:     T0
   verify:   cargo nextest run -p minimal mirror_disabled_leaves_fetch_paths_unchanged
   - THE SYSTEM SHALL read the `[mirror]` table from the client configuration file in `mip` and in the VM host daemon as well as in `min`.
