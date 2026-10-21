@@ -13,10 +13,13 @@
 
 pub mod audit;
 pub mod ca;
+pub mod control;
 pub mod handle;
 pub mod http;
 pub mod keys;
+pub mod listener;
 pub mod module;
+pub mod proxy;
 pub mod publish;
 pub mod redeem;
 pub mod seal;
