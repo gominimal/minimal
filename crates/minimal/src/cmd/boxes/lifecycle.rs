@@ -116,17 +116,17 @@ pub(crate) fn destroy_gate(
 /// Best-effort fetch of the session's at-risk report for the destroy
 /// confirm. Any failure — RPC error, timeout, a daemon predating the RPC —
 /// reads as `None` (unknowable), and the confirm renders without a listing.
-pub(crate) async fn session_delta(
+pub(crate) async fn box_delta(
     client: &mut client::Client,
     id: boxes::SessionId,
 ) -> Option<minimald_rpc::SessionDeltaResponse> {
     /// Client-side ceiling on the fetch. The daemon bounds each of its
     /// computations at 5 s; this sits just above so a slow-but-healthy
     /// answer still lands while a wedged daemon cannot stall the confirm.
-    const SESSION_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+    const BOX_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
     use minimald_rpc::{SessionDelta, SessionDeltaRequest};
     tokio::time::timeout(
-        SESSION_DELTA_TIMEOUT,
+        BOX_DELTA_TIMEOUT,
         client.oneshot_rpc::<SessionDelta>(SessionDeltaRequest { id }),
     )
     .await
@@ -134,7 +134,7 @@ pub(crate) async fn session_delta(
     .ok()
 }
 
-pub(crate) async fn destroy_all_sessions(
+pub(crate) async fn destroy_all_boxes(
     global: &GlobalArgs,
     client: &mut client::Client,
     force: bool,
@@ -175,7 +175,7 @@ pub(crate) async fn destroy_all_sessions(
             .ok()
             .and_then(|resp| resp.record)
             .and_then(|record| record.box_addresses);
-        if let Err(error) = destroy_session(
+        if let Err(error) = destroy_box(
             client,
             global,
             session.id,
@@ -201,7 +201,7 @@ pub(crate) async fn destroy_all_sessions(
     Ok(())
 }
 
-pub(crate) async fn destroy_session(
+pub(crate) async fn destroy_box(
     client: &mut client::Client,
     global: &GlobalArgs,
     id: boxes::SessionId,
@@ -534,19 +534,19 @@ mod tests {
         let global = GlobalArgs::default();
 
         // The first destroy wins the race.
-        destroy_session(&mut client, &global, id, Some("web"), None, false)
+        destroy_box(&mut client, &global, id, Some("web"), None, false)
             .await
             .expect("the first destroy succeeds");
 
         // The loser is told the session is already gone: under `--force`
         // that is the goal state, reported and not a failure.
-        destroy_session(&mut client, &global, id, Some("web"), None, true)
+        destroy_box(&mut client, &global, id, Some("web"), None, true)
             .await
             .expect("a forced destroy of a destroyed session succeeds");
 
         // Without `--force` the same answer is an error — one that names
         // the session rather than forwarding the daemon's internals.
-        let err = destroy_session(&mut client, &global, id, Some("web"), None, false)
+        let err = destroy_box(&mut client, &global, id, Some("web"), None, false)
             .await
             .expect_err("an unforced destroy of a destroyed session fails");
         assert!(

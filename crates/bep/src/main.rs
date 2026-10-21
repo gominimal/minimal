@@ -6,14 +6,28 @@
 //! other key, so it works when the proxy itself does not start. After the
 //! replacement it publishes the new public key, so a mint stops sealing to
 //! the old one.
+//!
+//! `bep serve` starts the proxy the same way, then serves box connections on
+//! the listener socket ([`bep::listener`]) and client key registrations on
+//! the control socket ([`bep::control`]). It reads the per-boot token from
+//! standard input.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use bep::keys::{self, KeyStore, ReplaceError, Role};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use bep::audit::{self, AuditLog};
+use bep::ca::{CaError, Leaf};
+use bep::control::{Control, Registry};
+use bep::keys::{self, KeyError, KeyStore, ReplaceError, Role};
+use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
+use bep::module::GITHUB;
+use bep::proxy::{self, Admission, LeafIssuer, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 /// Runs the box egress proxy on this host.
 #[derive(Debug, Parser)]
@@ -28,6 +42,28 @@ struct Args {
     /// [default: ~/.minimal/bep/identity.json]
     #[arg(long, value_name = "PATH")]
     identity: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Start the proxy and serve box connections. Give the connection token
+    /// on standard input, as 64 hex digits.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    /// The socket that box connections arrive on.
+    #[arg(long, value_name = "PATH")]
+    listener: PathBuf,
+
+    /// The socket that takes key registrations from `min`.
+    /// [default: ~/.minimal/bep/control.sock]
+    #[arg(long, value_name = "PATH")]
+    control: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -65,9 +101,19 @@ fn run<S: KeyStore>(store: &S, args: &Args) -> ExitCode {
         }
     };
     if let Some(role) = args.replace_key {
+        if args.command.is_some() {
+            eprintln!(
+                "`bep --replace-key` and `bep serve` do not run together. Run `bep --replace-key {role}` first, then `bep serve`."
+            );
+            return ExitCode::FAILURE;
+        }
         return replace_key(store, role, &path);
     }
-    match start(store, &path) {
+    let started = start(store, &path).and_then(|()| match &args.command {
+        Some(Command::Serve(serve_args)) => serve(serve_args),
+        None => Ok(()),
+    });
+    match started {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
@@ -145,6 +191,120 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     tracing::info!(path = %path.display(), "published the proxy identity");
     Ok(())
+}
+
+/// The leaf issuer `bep serve` has today. The root and signing CA keys are
+/// in the Keychain, but no Keychain key can sign a certificate yet
+/// (<https://github.com/gominimal/minimal/issues/2440>). Until one can,
+/// every leaf is refused, and the proxy answers an admitted CONNECT with
+/// `502`.
+///
+/// This issuer is also the only thing that keeps `bep serve` off
+/// `proxy::relay`, which forwards requests with no per-request decision, no
+/// handle redemption and no admit audit record (Gatehouse §6.10). A signing
+/// Keychain key (#2440) alone does not lift this interim. `bep serve` must
+/// not reach `relay` until the redemption decision is wired into it, which
+/// is T11 (<https://github.com/gominimal/minimal/issues/2272>).
+struct NoSigningKey;
+
+impl LeafIssuer for NoSigningKey {
+    fn issue(&self, _hostname: &str, _now: SystemTime) -> Result<Leaf, CaError> {
+        Err(CaError::Key(KeyError::Store {
+            role: Role::Signing,
+            detail: "the Keychain key cannot sign certificates in this version of bep".into(),
+        }))
+    }
+}
+
+/// `bep serve`: the listener and the control socket, until one fails.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn serve(args: &ServeArgs) -> Result<(), String> {
+    let token = read_token(io::stdin().lock())?;
+    let control = args
+        .control
+        .clone()
+        .or_else(|| std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock")))
+        .ok_or("bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.")?;
+    let dir = audit::default_dir()
+        .ok_or("bep did not find your home directory, which holds the audit log.")?;
+    let segment = audit::segments(&dir)
+        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?
+        .pop()
+        .unwrap_or_else(|| dir.join(audit::segment_name(0)));
+    let log = AuditLog::open(&segment).map_err(|err| {
+        format!(
+            "bep did not open the audit log {}: {err}",
+            segment.display()
+        )
+    })?;
+    let roots = proxy::native_roots()
+        .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
+    // The store rules' authorities join the admitted set when
+    // `[secret-store-rules]` is read at start, which is T25
+    // (https://github.com/gominimal/minimal/issues/2280). Until it lands the
+    // GitHub module's host set is the set, so a CONNECT to a registered store
+    // authority is refused and audited `off_module`.
+    let proxy = Proxy::new(
+        Admission::new(&[GITHUB], [("", 0); 0]),
+        Arc::new(NoSigningKey),
+        roots,
+        Arc::new(SystemResolver),
+        Arc::new(Mutex::new(log)),
+    )
+    .map_err(|err| err.to_string())?;
+    let proxy = Arc::new(proxy);
+    let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+    runtime.block_on(async {
+        let listener = Listener::bind(&args.listener, token, Arc::new(PeerAttested))
+            .map_err(|err| format!("bep did not listen on {}: {err}", args.listener.display()))?;
+        // The proxy does not read this registry yet: it redeems no store
+        // handles until the store rules join the admitted set. Until a later
+        // task gives `Proxy` the same registry, a registration is kept here
+        // and has no effect on what the proxy admits.
+        let control_socket = Control::bind(&control, Registry::default())
+            .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
+        tracing::warn!(
+            "no CA key can sign a leaf certificate yet, so every admitted CONNECT is answered 502. \
+             A signing key (#2440) alone must not lift this: requests reach the upstream only \
+             after the redemption decision is wired into the relay (#2272)"
+        );
+        tracing::info!(
+            listener = %args.listener.display(),
+            control = %control.display(),
+            audit = %segment.display(),
+            "the proxy is serving"
+        );
+        let served = tokio::select! {
+            served = listener.run(move |delivery, stream| {
+                let proxy = Arc::clone(&proxy);
+                async move { proxy.serve(delivery, stream).await }
+            }) => served,
+            served = control_socket.run() => served,
+        };
+        served.map_err(|err| format!("bep stopped serving: {err}"))
+    })
+}
+
+/// The per-boot token, 64 hex digits on the first line of `input`.
+fn read_token(mut input: impl io::BufRead) -> Result<[u8; TOKEN_LEN], String> {
+    let refused = || {
+        format!(
+            "bep serve did not get its connection token. Give it on standard input, as {} hex digits.",
+            TOKEN_LEN * 2
+        )
+    };
+    let mut line = String::new();
+    input.read_line(&mut line).map_err(|_| refused())?;
+    let hex = line.trim();
+    if hex.len() != TOKEN_LEN * 2 || !hex.is_ascii() {
+        return Err(refused());
+    }
+    let mut token = [0u8; TOKEN_LEN];
+    for (byte, pair) in token.iter_mut().zip(hex.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).map_err(|_| refused())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| refused())?;
+    }
+    Ok(token)
 }
 
 fn identity_path(args: &Args) -> Result<PathBuf, &'static str> {
