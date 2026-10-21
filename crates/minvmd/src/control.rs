@@ -5406,7 +5406,7 @@ mod tests {
                 "the audit records {outcome}: {audit}"
             );
         }
-        let box_id = format!(r#""box_id":"{}""#, web.box_id);
+        let box_id = format!(r#""box_id":"{}""#, web.box_id.simple());
         for line in audit
             .lines()
             .filter(|line| !line.contains("refused_unknown_id"))
