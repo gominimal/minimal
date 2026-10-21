@@ -343,7 +343,9 @@ pub async fn present(
 
 /// Binds a unix socket at `path` that only this user can reach: the parent
 /// directory gets mode `0700` when this call creates it, and the socket
-/// gets mode `0600`. A stale socket at `path` is removed first.
+/// gets mode `0600`. A stale socket at `path` is removed first. A socket
+/// is stale when a connect to it is refused. A socket that takes the
+/// connect belongs to a running process, and the bind fails.
 ///
 /// The socket is bound in a staging directory of mode `0700` beside `path`,
 /// given mode `0600`, and then renamed to `path`. So no other user can
@@ -352,8 +354,9 @@ pub async fn present(
 ///
 /// # Errors
 ///
-/// The I/O error of the directory, the removal, the bind, the mode change
-/// or the rename.
+/// [`io::ErrorKind::AddrInUse`] when the socket at `path` is not stale.
+/// Otherwise the I/O error of the directory, the removal, the bind, the
+/// mode change or the rename.
 pub fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -370,7 +373,35 @@ pub fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
             .create(parent)?;
     }
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            // A socket that still takes connections belongs to a running
+            // process. Only a socket that refuses them is stale.
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("{} is in use by another process", path.display()),
+                    ));
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    match std::fs::remove_file(path) {
+                        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                        _ => {}
+                    }
+                }
+                Err(err) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("{} is not stale: {err}", path.display()),
+                    ));
+                }
+            }
+        }
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -566,6 +597,20 @@ mod tests {
             answer(&path, &presentation(&TOKEN, &delivery())).await,
             b"admitted"
         );
+    }
+
+    // A second bind at the path of a live socket fails, and the first
+    // listener keeps the path. A socket nobody listens on is stale.
+    #[tokio::test]
+    async fn second_bind_at_a_live_socket_is_addr_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/listener.sock");
+        let first = bind_owner_only(&path).unwrap();
+        let err = bind_owner_only(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(first);
+        drop(bind_owner_only(&path).unwrap());
     }
 
     #[test]
