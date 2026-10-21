@@ -13,8 +13,10 @@
 //! - An absolute-form request (`GET http://host/...`) is plain HTTP. No v1
 //!   authority is plain HTTP, so the proxy refuses it: `upstream_not_tls`
 //!   for a credentialed host, and `off_module` for any other host.
-//! - Extended CONNECT and `connect-udp`, in either form, are refused. So is
-//!   an origin-form request, which is not a proxy request.
+//! - Extended CONNECT and `connect-udp`, in either form, are refused with
+//!   `501`. When the authority is outside the admitted set, the audit log
+//!   also records it `off_module`. An origin-form request is refused too,
+//!   because it is not a proxy request.
 //! - A head that is not HTTP/1.1 is refused. A flow that opens with the
 //!   HTTP/2 prior-knowledge preface is closed (BEP-074).
 //!
@@ -309,6 +311,20 @@ impl Proxy {
             Ok(Ok(head)) => head,
         };
         if let Some(word) = tunnel_refusal(&request) {
+            // BEP-029: a tunnel request outside the admitted set is an
+            // audited `off_module` refusal, though its answer stays `501`.
+            let target = if request.method == "CONNECT" {
+                split_authority(&request.target)
+            } else {
+                absolute_form(&request.target).map(|(_, host, port)| (host, port))
+            };
+            if let Some((host, port)) = target {
+                let authority = format!("{host}:{port}");
+                tracing::Span::current().record("authority", authority.as_str());
+                if !self.admission.admits(&host, port) {
+                    self.audit_refusal(box_id, &authority, OFF_MODULE);
+                }
+            }
             respond(
                 &mut stream,
                 501,
@@ -1367,15 +1383,33 @@ mod tests {
         // The HTTP/2 prior-knowledge preface is closed with no answer.
         assert_eq!(exchange(&h.proxy, H2_PREFACE_FULL).await, "");
 
-        // Extended CONNECT and `connect-udp`, in either form.
-        for request in [
-            &b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nProtocol: websocket\r\n\r\n"[..],
-            b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nUpgrade: connect-udp\r\n\r\n",
-            b"GET /.well-known/masque/udp/192.0.2.6/443/ HTTP/1.1\r\nHost: proxy\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n",
-            b"GET http://example.com/.well-known/masque/udp/192.0.2.6/443/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        // Extended CONNECT and `connect-udp`, in either form. A request to
+        // an admitted authority leaves no record. One outside the admitted
+        // set is also audited `off_module`.
+        let off_module = |authority: &str| {
+            let audit = h.audit.lock().unwrap();
+            let last = audit.last().unwrap();
+            assert_eq!(last.authority, authority);
+            assert_eq!(last.outcome, Outcome::Refuse);
+            assert_eq!(last.marker.as_deref(), Some(OFF_MODULE));
+        };
+        for (request, record) in [
+            (&b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nProtocol: websocket\r\n\r\n"[..], None),
+            (b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nUpgrade: connect-udp\r\n\r\n", None),
+            (b"GET /.well-known/masque/udp/192.0.2.6/443/ HTTP/1.1\r\nHost: proxy\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n", None),
+            (b"GET http://example.com/.well-known/masque/udp/192.0.2.6/443/ HTTP/1.1\r\nHost: example.com\r\n\r\n", Some("example.com:80")),
+            (b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProtocol: websocket\r\n\r\n", Some("example.com:443")),
         ] {
+            let before = h.audit.lock().unwrap().len();
             let answer = exchange(&h.proxy, request).await;
             assert!(answer.starts_with("HTTP/1.1 501 "), "{answer}");
+            match record {
+                None => assert_eq!(h.audit.lock().unwrap().len(), before, "{answer}"),
+                Some(authority) => {
+                    assert_eq!(h.audit.lock().unwrap().len(), before + 1, "{answer}");
+                    off_module(authority);
+                }
+            }
         }
 
         // An origin-form request is not a proxy request.
