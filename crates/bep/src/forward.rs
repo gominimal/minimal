@@ -22,9 +22,10 @@
 //!
 //! The proxy has no proxy key, box registry or sign-in yet. So
 //! [`Unwired`], the redeemer [`crate::proxy::Proxy::new`] installs, refuses
-//! every sealed value as [`Check::Undecryptable`]. It gives the admitted set
-//! as each box's egress, because the proxy does not yet know a box's
-//! declared egress.
+//! every sealed value as [`Check::Undecryptable`]. It declares no egress for
+//! any box, so [`redeem::decide_plain`] refuses every unsealed request as
+//! [`Check::OutsideDeclaredEgress`]. Issue #2483 wires the real redeemer and
+//! each box's declared egress into `bep serve`.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -92,8 +93,10 @@ impl<S> Validated<S> {
 pub enum UpstreamError {
     /// The name did not resolve, the connection failed, or it timed out.
     Unreachable(io::Error),
-    /// The TLS handshake failed: the chain or the hostname did not validate
-    /// against the host trust store, or the upstream ended the handshake.
+    /// The TLS handshake failed in TLS: the chain or the hostname did not
+    /// validate against the host trust store, or the upstream sent a TLS
+    /// alert. An upstream that closes the connection during the handshake
+    /// gives an io error, and so [`UpstreamError::Unreachable`].
     Invalid(rustls::Error),
 }
 
@@ -188,6 +191,10 @@ pub trait Redeemer: Send + Sync {
 
     /// Decides one request that carries `sealed`, on a flow to `authority`
     /// (BEP-025).
+    ///
+    /// The forwarder applies none of [`redeem::decide_plain`]'s checks to a
+    /// sealed request. So an implementation carries every BEP-025 check
+    /// itself, the declared egress and the request authority included.
     fn redeem(
         &self,
         box_id: &str,
@@ -198,23 +205,15 @@ pub trait Redeemer: Send + Sync {
 }
 
 /// The redeemer of a proxy with no proxy key: it refuses every sealed value,
-/// and gives the admitted set as each box's egress.
-#[derive(Debug, Clone, Default)]
-pub struct Unwired {
-    egress: Vec<Authority<String>>,
-}
-
-impl Unwired {
-    /// A redeemer that gives `egress` for every box.
-    #[must_use]
-    pub fn new(egress: Vec<Authority<String>>) -> Self {
-        Self { egress }
-    }
-}
+/// and declares no egress for any box. Issue #2483 replaces it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Unwired;
 
 impl Redeemer for Unwired {
     fn egress(&self, _box_id: &str) -> Vec<Authority<String>> {
-        self.egress.clone()
+        // No box's declared egress is known yet, so none is admitted
+        // (Gatehouse §6.10 step 3).
+        Vec::new()
     }
 
     fn redeem(
@@ -289,6 +288,14 @@ pub fn is_sealed(text: &str) -> bool {
 }
 
 /// The credential `request` carries in its `Authorization` headers.
+///
+/// Only `Authorization` is searched. A store reference injected in a
+/// registered header of its own is #2292's (T28). Until then, a sealed value
+/// in any other header is not found, and the request is decided as plain.
+///
+/// The first `Authorization` header with a sealed value is the one
+/// substituted. A second `Authorization` header with no sealed value is not
+/// refused: it goes upstream unchanged beside the substituted credential.
 #[must_use]
 pub fn carried(request: &Request) -> Carried {
     let mut found = Carried::None;
@@ -837,6 +844,38 @@ mod tests {
         TestUpstream { addr, heads, bytes }
     }
 
+    /// The declared egress of the test box: the GitHub host set.
+    fn github_egress() -> Vec<Authority<String>> {
+        GITHUB
+            .hosts
+            .iter()
+            .map(|a| Authority {
+                host: a.host.to_owned(),
+                port: a.port,
+            })
+            .collect()
+    }
+
+    /// A redeemer whose box declares the GitHub host set as its egress, and
+    /// that refuses every sealed value, as [`Unwired`] does.
+    struct Declared;
+
+    impl Redeemer for Declared {
+        fn egress(&self, _box_id: &str) -> Vec<Authority<String>> {
+            github_egress()
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &Authority<String>,
+            _request: &RequestAuthority<String>,
+            _sealed: &str,
+        ) -> Verdict {
+            Verdict::Refuse(Check::Undecryptable.marker())
+        }
+    }
+
     /// A redeemer that admits every sealed value with [`REAL`], and counts
     /// its calls.
     #[derive(Default)]
@@ -844,7 +883,7 @@ mod tests {
 
     impl Redeemer for Admitting {
         fn egress(&self, _box_id: &str) -> Vec<Authority<String>> {
-            Admission::new(&[GITHUB], [("", 0); 0]).authorities()
+            github_egress()
         }
 
         fn redeem(
@@ -960,7 +999,13 @@ mod tests {
         let (chain, key) = ca.leaf("api.github.com", false);
         let up = test_upstream(chain, key, Answer::Ok).await;
         let dir = tempfile::tempdir().unwrap();
-        let s = setup(ca.roots(), up.addr, audit_log(&dir), None, None);
+        let s = setup(
+            ca.roots(),
+            up.addr,
+            audit_log(&dir),
+            Some(Arc::new(Declared)),
+            None,
+        );
 
         let (head, tls) = tunnel(&s, "api.github.com").await;
         let mut tls = tls.unwrap_or_else(|| panic!("{head}"));
@@ -989,6 +1034,47 @@ mod tests {
                 ),
                 ("api.github.com:443".to_owned(), Outcome::Admit, None),
             ]
+        );
+    }
+
+    // Gatehouse §6.10 step 3: an unsealed request to a host the box's
+    // declared egress does not list is refused. The default redeemer
+    // declares no egress, so a valid upstream gets no application byte.
+    #[tokio::test]
+    async fn unsealed_request_outside_box_egress_is_refused() {
+        let ca = UpstreamCa::new();
+        let (chain, key) = ca.leaf("api.github.com", false);
+        let up = test_upstream(chain, key, Answer::Ok).await;
+        let dir = tempfile::tempdir().unwrap();
+        let s = setup(ca.roots(), up.addr, audit_log(&dir), None, None);
+
+        let (head, tls) = tunnel(&s, "api.github.com").await;
+        let mut tls = tls.unwrap_or_else(|| panic!("{head}"));
+        tls.write_all(b"GET /zen HTTP/1.1\r\nhost: api.github.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut out))
+            .await
+            .unwrap()
+            .ok();
+        let answer = String::from_utf8(out).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 403 Forbidden"), "{answer}");
+        assert!(
+            answer.contains("not allowed to reach api.github.com:443"),
+            "{answer}"
+        );
+        drop(tls);
+
+        assert_eq!(up.bytes.load(Ordering::SeqCst), 0);
+        assert!(up.heads.lock().unwrap().is_empty());
+        assert_eq!(
+            audited(dir.path()),
+            [(
+                "api.github.com:443".to_owned(),
+                Outcome::Refuse,
+                Some(Check::OutsideDeclaredEgress.marker().to_owned())
+            )]
         );
     }
 
@@ -1091,7 +1177,7 @@ mod tests {
         let release = Arc::new(Notify::new());
         let up = test_upstream(chain, key, Answer::Stream(release.clone())).await;
         let audit: Arc<dyn AuditWriter> = Arc::new(Mutex::new(Vec::<Decision>::new()));
-        let s = setup(ca.roots(), up.addr, audit, None, None);
+        let s = setup(ca.roots(), up.addr, audit, Some(Arc::new(Declared)), None);
 
         let (head, tls) = tunnel(&s, "api.github.com").await;
         let mut tls = tls.unwrap_or_else(|| panic!("{head}"));

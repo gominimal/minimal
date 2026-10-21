@@ -137,23 +137,6 @@ impl Admission {
             .any(|a| a.host == host)
             || self.store.iter().any(|(h, _)| *h == host)
     }
-
-    /// Every admitted `host:port`.
-    #[must_use]
-    pub fn authorities(&self) -> Vec<redeem::Authority<String>> {
-        self.modules
-            .iter()
-            .flat_map(|module| module.hosts)
-            .map(|a| redeem::Authority {
-                host: a.host.to_owned(),
-                port: a.port,
-            })
-            .chain(self.store.iter().map(|(host, port)| redeem::Authority {
-                host: host.clone(),
-                port: *port,
-            }))
-            .collect()
-    }
 }
 
 fn normal_host(host: &str) -> String {
@@ -293,7 +276,10 @@ impl Proxy {
     /// A proxy that admits `admission`, issues leaves from `leaves`, and
     /// validates upstreams against `upstream_roots`. The interception root
     /// of `leaves` is taken out of `upstream_roots` (BEP-055). The decision
-    /// is [`Unwired`] until [`Proxy::with_redeemer`] replaces it.
+    /// is [`Unwired`] until [`Proxy::with_redeemer`] replaces it. [`Unwired`]
+    /// declares no egress for any box, so it refuses every request inside a
+    /// tunnel. Issue #2483 wires the real redeemer and each box's declared
+    /// egress into `bep serve`.
     ///
     /// # Errors
     ///
@@ -322,7 +308,7 @@ impl Proxy {
             .with_no_client_auth();
         // BEP-073: the upstream leg is HTTP/1.1 too.
         upstream.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
-        let redeemer = Arc::new(Unwired::new(admission.authorities()));
+        let redeemer: Arc<dyn Redeemer> = Arc::new(Unwired);
         Ok(Self {
             admission,
             leaves,
@@ -1175,6 +1161,33 @@ pub(crate) mod tests {
         audit: Arc<Mutex<Vec<Decision>>>,
     }
 
+    /// A redeemer whose box declares the GitHub host set as its egress. It
+    /// refuses every sealed value.
+    struct DeclaresGithub;
+
+    impl Redeemer for DeclaresGithub {
+        fn egress(&self, _box_id: &str) -> Vec<redeem::Authority<String>> {
+            GITHUB
+                .hosts
+                .iter()
+                .map(|a| redeem::Authority {
+                    host: a.host.to_owned(),
+                    port: a.port,
+                })
+                .collect()
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &redeem::Authority<String>,
+            _request: &redeem::RequestAuthority<String>,
+            _sealed: &str,
+        ) -> forward::Verdict {
+            forward::Verdict::Refuse(redeem::Check::Undecryptable.marker())
+        }
+    }
+
     async fn harness_with(audit: Arc<dyn AuditWriter>) -> (Harness, Arc<dyn AuditWriter>) {
         let upstream = upstream().await;
         let (leaves, root) = interception_ca();
@@ -1186,7 +1199,8 @@ pub(crate) mod tests {
             resolver.clone(),
             Arc::clone(&audit),
         )
-        .unwrap();
+        .unwrap()
+        .with_redeemer(Arc::new(DeclaresGithub));
         (
             Harness {
                 proxy: Arc::new(proxy),
@@ -1520,7 +1534,7 @@ pub(crate) mod tests {
                 port: 443,
             },
             Arc::clone(audit),
-            Arc::new(Unwired::default()),
+            Arc::new(Unwired),
             upstream.proof(),
         )
     }
