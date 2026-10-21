@@ -9,10 +9,11 @@
 //!   path substitutes a credential, or forwards a request, on a leg that did
 //!   not validate. A leg that fails validation is refused, and the audit log
 //!   records it [`UPSTREAM_TLS_INVALID`].
-//! - Each parsed request goes to the decision. A request that carries a
-//!   sealed value goes to the [`Redeemer`]. On an admit, the forwarder puts
-//!   the credential in place of the sealed value. A request that carries no
-//!   sealed value goes to [`redeem::decide_plain`], and on `Ok` it goes
+//! - Each parsed request goes to the decision. Every request first goes to
+//!   [`redeem::decide_plain`], which checks the box's declared egress and the
+//!   request authority. Then a request that carries a sealed value goes to
+//!   the [`Redeemer`]. On an admit, the forwarder puts the credential in
+//!   place of the sealed value. A request that carries no sealed value goes
 //!   upstream unchanged (BEP-030). Its audit record is marked
 //!   [`FOREIGN_CREDENTIAL`] when it carries an `Authorization` header of its
 //!   own.
@@ -93,20 +94,37 @@ impl<S> Validated<S> {
 pub enum UpstreamError {
     /// The name did not resolve, the connection failed, or it timed out.
     Unreachable(io::Error),
-    /// The TLS handshake failed in TLS: the chain or the hostname did not
-    /// validate against the host trust store, or the upstream sent a TLS
-    /// alert. An upstream that closes the connection during the handshake
-    /// gives an io error, and so [`UpstreamError::Unreachable`].
+    /// The chain or the hostname did not validate against the host trust
+    /// store, or the upstream presented no certificate.
     Invalid(rustls::Error),
+    /// The TLS handshake failed for a reason other than the certificate: the
+    /// upstream sent a TLS alert, or offered nothing this proxy accepts. An
+    /// upstream that closes the connection during the handshake gives an io
+    /// error, and so [`UpstreamError::Unreachable`].
+    Handshake(rustls::Error),
 }
 
 impl UpstreamError {
-    /// The audit marker, when the failure is an audited refusal.
+    /// Sorts a TLS error: a certificate error is [`UpstreamError::Invalid`],
+    /// and every other one is [`UpstreamError::Handshake`].
+    fn from_tls(err: rustls::Error) -> Self {
+        match err {
+            rustls::Error::InvalidCertificate(_)
+            | rustls::Error::NoCertificatesPresented
+            | rustls::Error::UnsupportedNameType => Self::Invalid(err),
+            _ => Self::Handshake(err),
+        }
+    }
+}
+
+impl UpstreamError {
+    /// The audit marker, when the failure is an audited refusal. A leg whose
+    /// handshake did not complete did not validate either (BEP-055).
     #[must_use]
     pub fn marker(&self) -> Option<&'static str> {
         match self {
             Self::Unreachable(_) => None,
-            Self::Invalid(_) => Some(UPSTREAM_TLS_INVALID),
+            Self::Invalid(_) | Self::Handshake(_) => Some(UPSTREAM_TLS_INVALID),
         }
     }
 }
@@ -115,7 +133,7 @@ impl std::fmt::Display for UpstreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(err) => write!(f, "{err}"),
-            Self::Invalid(err) => write!(f, "{err}"),
+            Self::Invalid(err) | Self::Handshake(err) => write!(f, "{err}"),
         }
     }
 }
@@ -132,8 +150,9 @@ impl From<io::Error> for UpstreamError {
 ///
 /// # Errors
 ///
-/// [`UpstreamError::Invalid`] when the handshake fails in TLS, and
-/// [`UpstreamError::Unreachable`] when the connection fails.
+/// [`UpstreamError::Invalid`] when the certificate does not validate,
+/// [`UpstreamError::Handshake`] when the handshake fails for another TLS
+/// reason, and [`UpstreamError::Unreachable`] when the connection fails.
 pub async fn validate<IO>(
     connector: &TlsConnector,
     host: &str,
@@ -151,7 +170,7 @@ where
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<rustls::Error>())
                 .cloned();
-            Err(tls.map_or(UpstreamError::Unreachable(err), UpstreamError::Invalid))
+            Err(tls.map_or(UpstreamError::Unreachable(err), UpstreamError::from_tls))
         }
     }
 }
@@ -192,9 +211,9 @@ pub trait Redeemer: Send + Sync {
     /// Decides one request that carries `sealed`, on a flow to `authority`
     /// (BEP-025).
     ///
-    /// The forwarder applies none of [`redeem::decide_plain`]'s checks to a
-    /// sealed request. So an implementation carries every BEP-025 check
-    /// itself, the declared egress and the request authority included.
+    /// The forwarder applies [`redeem::decide_plain`]'s checks, the declared
+    /// egress and the request authority, before it calls this. An
+    /// implementation carries the other BEP-025 checks.
     fn redeem(
         &self,
         box_id: &str,
@@ -479,13 +498,29 @@ impl Flow {
     ///
     /// The audit marker of a refusal.
     pub fn decide(&self, request: &mut Request) -> Result<(), &'static str> {
-        let named = request_authority(request);
         let span = tracing::Span::current();
+        // The egress and request-authority checks hold for every request,
+        // sealed or not, before any redeemer sees it (BEP-022, BEP-023).
+        let plain = Plain {
+            authority: self.authority.clone(),
+            request: request_authority(request),
+            egress: self.redeemer.egress(&self.box_id),
+        };
+        if let Err(check) = redeem::decide_plain(&plain) {
+            span.record("substitution", "refused");
+            self.record(
+                Outcome::Refuse,
+                Some(check.marker()),
+                None,
+                Mapping::ModuleUnmapped,
+            );
+            return Err(check.marker());
+        }
         match carried(request) {
             Carried::Sealed(at) => {
                 match self
                     .redeemer
-                    .redeem(&self.box_id, &self.authority, &named, &at.value)
+                    .redeem(&self.box_id, &self.authority, &plain.request, &at.value)
                 {
                     Verdict::Admit {
                         credential,
@@ -505,21 +540,6 @@ impl Flow {
                 }
             }
             carried @ (Carried::Foreign | Carried::None) => {
-                let plain = Plain {
-                    authority: self.authority.clone(),
-                    request: named,
-                    egress: self.redeemer.egress(&self.box_id),
-                };
-                if let Err(check) = redeem::decide_plain(&plain) {
-                    span.record("substitution", "refused");
-                    self.record(
-                        Outcome::Refuse,
-                        Some(check.marker()),
-                        None,
-                        Mapping::ModuleUnmapped,
-                    );
-                    return Err(check.marker());
-                }
                 // BEP-030: forwarded unmodified, and audited.
                 let marker = (carried == Carried::Foreign).then_some(FOREIGN_CREDENTIAL);
                 span.record("substitution", marker.unwrap_or("passthrough"));
@@ -1311,6 +1331,116 @@ mod tests {
                     records,
                     vec![(authority, Outcome::Refuse, Some(UPSTREAM_TLS_INVALID.to_owned()))]
                 );
+            }
+        }
+    }
+
+    /// A redeemer that admits every sealed value, counts its calls, and
+    /// declares `egress` for the box.
+    struct AdmitsWithin(Vec<Authority<String>>, AtomicUsize);
+
+    impl Redeemer for AdmitsWithin {
+        fn egress(&self, _box_id: &str) -> Vec<Authority<String>> {
+            self.0.clone()
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &Authority<String>,
+            _request: &RequestAuthority<String>,
+            _sealed: &str,
+        ) -> Verdict {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Verdict::Admit {
+                credential: Zeroizing::new(REAL.to_owned()),
+                identifier: "github:member".to_owned(),
+                mapping: Mapping::ModuleUnmapped,
+            }
+        }
+    }
+
+    // BEP-055: only a certificate error says the certificate did not
+    // validate. An alert from the upstream is a failed handshake, and both
+    // are audited `upstream_tls_invalid`.
+    #[test]
+    fn only_certificate_errors_are_invalid() {
+        let invalid = UpstreamError::from_tls(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ));
+        assert!(matches!(invalid, UpstreamError::Invalid(_)));
+        let alert = UpstreamError::from_tls(rustls::Error::AlertReceived(
+            rustls::AlertDescription::NoApplicationProtocol,
+        ));
+        assert!(matches!(alert, UpstreamError::Handshake(_)));
+        assert_eq!(invalid.marker(), Some(UPSTREAM_TLS_INVALID));
+        assert_eq!(alert.marker(), Some(UPSTREAM_TLS_INVALID));
+    }
+
+    // BEP-022, BEP-023: the forwarder checks the declared egress and the
+    // Host pin of a sealed request before the redeemer sees it, so a
+    // redeemer that admits everything still substitutes nothing outside them.
+    #[test]
+    fn sealed_request_outside_egress_or_host_is_not_redeemed() {
+        let sealed = sealed_text();
+        let request = |host: &str| Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: host.as_bytes().to_vec(),
+                },
+                http::Header {
+                    name: "authorization".into(),
+                    value: format!("Bearer {sealed}").into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        let cases = [
+            (
+                Vec::new(),
+                "api.github.com",
+                Err(Check::OutsideDeclaredEgress.marker()),
+            ),
+            (
+                github_egress(),
+                "github.com",
+                Err(Check::HostMismatch.marker()),
+            ),
+            (github_egress(), "api.github.com", Ok(())),
+        ];
+        for (egress, host, expected) in cases {
+            let redeemer = Arc::new(AdmitsWithin(egress, AtomicUsize::new(0)));
+            let records = Arc::new(Mutex::new(Vec::<Decision>::new()));
+            let audit: Arc<dyn AuditWriter> = records.clone();
+            let flow = Flow::new(
+                "b",
+                Authority {
+                    host: "api.github.com".to_owned(),
+                    port: 443,
+                },
+                audit,
+                redeemer.clone(),
+                Validated::unchecked(()).proof(),
+            );
+            let mut req = request(host);
+            assert_eq!(flow.decide(&mut req), expected, "{host}");
+            let header = String::from_utf8(req.headers[1].value.clone()).unwrap();
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            match expected {
+                Ok(()) => {
+                    assert_eq!(redeemer.1.load(Ordering::SeqCst), 1);
+                    assert_eq!(header, format!("Bearer {REAL}"));
+                    assert_eq!(records[0].outcome, Outcome::Admit);
+                }
+                Err(marker) => {
+                    assert_eq!(redeemer.1.load(Ordering::SeqCst), 0, "{host}");
+                    assert!(header.contains(&sealed), "{header}");
+                    assert_eq!(records[0].marker.as_deref(), Some(marker));
+                }
             }
         }
     }

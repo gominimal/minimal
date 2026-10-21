@@ -555,17 +555,30 @@ impl Proxy {
                 tracing::Span::current().record("upstream_tls", "valid");
                 upstream
             }
-            Err(err @ UpstreamError::Invalid(_)) => {
+            Err(err @ (UpstreamError::Invalid(_) | UpstreamError::Handshake(_))) => {
                 // BEP-055: nothing goes on a leg that did not validate.
-                tracing::Span::current().record("upstream_tls", "invalid");
-                tracing::warn!(authority, error = %err, "the upstream certificate did not validate");
+                let (outcome, log, reason) = if matches!(err, UpstreamError::Invalid(_)) {
+                    (
+                        "invalid",
+                        "the upstream certificate did not validate",
+                        "the server's certificate did not validate against this computer's trusted certificates",
+                    )
+                } else {
+                    (
+                        "handshake_failed",
+                        "the upstream TLS handshake failed",
+                        "the TLS handshake with the server failed",
+                    )
+                };
+                tracing::Span::current().record("upstream_tls", outcome);
+                tracing::warn!(authority, error = %err, "{log}");
                 self.audit_refusal(box_id, &authority, forward::UPSTREAM_TLS_INVALID);
                 respond(
                     &mut stream,
                     502,
                     "Bad Gateway",
                     &format!(
-                        "The Box Egress Proxy refused the connection to {authority}, because the server's certificate did not validate against this computer's trusted certificates."
+                        "The Box Egress Proxy refused the connection to {authority}, because {reason}."
                     ),
                 )
                 .await;
