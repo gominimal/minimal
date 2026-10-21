@@ -63,7 +63,10 @@ else
   else
     echo "build-initramfs: cross build ($TARGET)" >&2
     command -v cross >/dev/null || cargo install cross --locked
-    cross "$@"
+    # The cross-rs images are amd64-only. cross builds its pre-build image
+    # without --platform, and Docker Desktop on arm64 then fails with "no match
+    # for platform in manifest" (OrbStack falls back to amd64 on its own).
+    DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" cross "$@"
   fi
   BIN="$ROOT/target/$TARGET/initramfs/minimald"
   [ -x "$BIN" ] || { echo "minimald not built at $BIN" >&2; exit 1; }

@@ -466,8 +466,8 @@ test-ignored: _nextest
 # clippy + tests for the Linux-only crates from a Mac (musl in Docker; not minvmd).
 [macos]
 test-cross: _preflight-cross
-    cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
-    CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
+    DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
+    DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
 
 # commitlint is not replicated by `just ci`; `just hooks` installs its local
 # twin as the commit-msg hook (scripts/git-hooks/commit-msg) for this clone,
