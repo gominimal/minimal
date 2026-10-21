@@ -1510,3 +1510,55 @@ async fn start_materialize_rejects_an_unknown_output_by_name() {
         "the error must name the output that was asked for, got {err}"
     );
 }
+
+/// The manager's holder of live boxes keeps them in the time order of
+/// their box ids, which is the order they were created in. A box the VM
+/// host handed an id to is held under that id, in the same order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creation_order_holder_follows_box_id_time_order() {
+    let (_state, _cache, mngr) = manager().await;
+
+    let mut created = Vec::new();
+    for n in 0..3 {
+        let mut config = sample_config();
+        config.name = Some(format!("box-{n}"));
+        created.push(mngr.create_session(config, None).await.unwrap());
+        // A clock tick between creates, so each id's timestamp is its own.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let handed = SessionId::mint();
+    let mut config = sample_config();
+    config.name = Some("handed".to_string());
+    config.box_id = Some(handed);
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, handed, "a handed box id is the record's key");
+    created.push(id);
+
+    let (send, recv) = Responder::channel();
+    let _ = mngr.sender.send(ManagerMessage::RunningIds(send)).await;
+    let held = recv.await.unwrap().unwrap();
+    assert_eq!(held, created, "the holder keeps creation order");
+
+    let stamps: Vec<_> = held
+        .iter()
+        .map(|id| {
+            let uuid: &uuid::Uuid = id.as_ref();
+            assert_eq!(uuid.get_version_num(), 7, "every box id is a UUIDv7");
+            uuid.get_timestamp()
+                .expect("a UUIDv7 carries its mint time")
+                .to_unix()
+        })
+        .collect();
+    assert!(
+        stamps.windows(2).all(|w| w[0] <= w[1]),
+        "the holder's order is the ids' time order: {stamps:?}"
+    );
+    for id in &created {
+        let record = mngr
+            .get_record(BoxKeyPredicate::Id(*id))
+            .await
+            .unwrap()
+            .expect("each created box has a record");
+        assert_eq!(record.id, *id, "the record is keyed by the box id");
+    }
+}
