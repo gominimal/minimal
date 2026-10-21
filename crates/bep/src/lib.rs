@@ -24,6 +24,7 @@ pub mod module;
 pub mod proxy;
 pub mod publish;
 pub mod redeem;
+pub mod redeemer;
 pub mod seal;
 pub mod signin;
 pub mod upstream;

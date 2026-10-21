@@ -21,12 +21,12 @@
 //!   it arrives, and flushes it. It does not wait for the response to
 //!   complete (BEP-N01).
 //!
-//! The proxy has no proxy key, box registry or sign-in yet. So
-//! [`Unwired`], the redeemer [`crate::proxy::Proxy::new`] installs, refuses
-//! every sealed value as [`Check::Undecryptable`]. It declares no egress for
-//! any box, so [`redeem::decide_plain`] refuses every unsealed request as
-//! [`Check::OutsideDeclaredEgress`]. Issue #2483 wires the real redeemer and
-//! each box's declared egress into `bep serve`.
+//! [`Unwired`], the redeemer [`crate::proxy::Proxy::new`] installs, is the
+//! test default. It refuses every sealed value as [`Check::Undecryptable`],
+//! and declares no egress for any box, so [`redeem::decide_plain`] refuses
+//! every unsealed request as [`Check::OutsideDeclaredEgress`]. `bep serve`
+//! installs the real redeemer, [`crate::redeemer::BoxRedeemer`], which reads
+//! each box's declared egress from the boxes the control socket registers.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -237,7 +237,8 @@ pub trait Redeemer: Send + Sync {
 }
 
 /// The redeemer of a proxy with no proxy key: it refuses every sealed value,
-/// and declares no egress for any box. Issue #2483 replaces it.
+/// and declares no egress for any box. It is the test default. `bep serve`
+/// installs [`crate::redeemer::BoxRedeemer`] in its place.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Unwired;
 
