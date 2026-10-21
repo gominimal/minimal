@@ -229,7 +229,7 @@ pub(crate) async fn release_held_box_name(
 /// host reads it twice — before the attach, for the pair the box's row was
 /// registered with, and after, to tell whether the attach ended in a
 /// daemon-side destroy ([`release_held_name_after_attach`]).
-pub(super) async fn attached_session_record(
+pub(super) async fn attached_box_record(
     sock: &std::path::Path,
     id: boxes::SessionId,
 ) -> anyhow::Result<Option<boxes::Record>> {
@@ -259,7 +259,7 @@ async fn session_record_by(
 /// attach on a VM-backed host has ended with the session gone: the
 /// shell-exit prompt's Delete destroys the session daemon-side, so neither
 /// `min session attach` nor `activate --attach` passes through
-/// [`destroy_session`], and this is the release that destroy would have
+/// [`destroy_box`], and this is the release that destroy would have
 /// made — the row's withdrawal (T66) for a box that registered one, whose
 /// pair `box_addresses` was read off the record before the attach, and the
 /// name hold's release for one that did not. The lookup and the release
@@ -284,7 +284,7 @@ pub(crate) async fn release_held_name_after_attach(
     name: &str,
     box_addresses: Option<boxes::BoxAddresses>,
 ) {
-    match attached_session_record(sock, id).await {
+    match attached_box_record(sock, id).await {
         Ok(None) => match box_addresses {
             // The record carries no box id, so the pair is the proof.
             Some(addresses) => {
@@ -355,7 +355,7 @@ pub(crate) async fn rehold_held_name_before_attach(
     if !hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), true).await {
         return;
     }
-    if let Ok(None) = attached_session_record(sock, id).await {
+    if let Ok(None) = attached_box_record(sock, id).await {
         let by_name = session_record_by(
             sock,
             minimald_rpc::GetSessionRecordRequest::Name(name.to_string()),
@@ -1691,7 +1691,7 @@ mod tests {
             project.path().to_str().unwrap(),
         )
         .await;
-        let record = attached_session_record(&ssh_sock, id)
+        let record = attached_box_record(&ssh_sock, id)
             .await
             .expect("the lookup does not fail")
             .expect("the session's record is read");
@@ -1769,7 +1769,7 @@ mod tests {
             project.path().to_str().unwrap(),
         )
         .await;
-        let record = attached_session_record(&ssh_sock, gone)
+        let record = attached_box_record(&ssh_sock, gone)
             .await
             .expect("the lookup does not fail")
             .expect("the session's record is read");
@@ -1849,7 +1849,7 @@ mod tests {
             project.path().to_str().unwrap(),
         )
         .await;
-        let record = attached_session_record(&ssh_sock, id)
+        let record = attached_box_record(&ssh_sock, id)
             .await
             .expect("the lookup does not fail")
             .expect("the session's record is read");

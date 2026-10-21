@@ -1553,7 +1553,7 @@ pub(crate) async fn activate_session(
         // bare id printed to stdout above is the scripting contract, while this
         // stderr line tells an interactive operator which session they just
         // created and are entering.
-        if should_announce_session(global) {
+        if should_announce_box(global) {
             eprintln!(
                 "Created session {}",
                 session_announce_label(&id, config.name.as_deref())

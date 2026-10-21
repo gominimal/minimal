@@ -97,7 +97,7 @@ fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Pat
 /// reduced to the session-name alphabet by the same sanitizer the activate
 /// autogen path uses, and the caller supplies the hex so a collision retry
 /// can re-mint with fresh entropy.
-fn task_session_name(task: &str, hex: &str) -> String {
+fn task_box_name(task: &str, hex: &str) -> String {
     format!("task-{}-{hex}", crate::sanitize_name_component(task))
 }
 
@@ -408,8 +408,8 @@ impl Drop for TaskRunInterrupt {
 
 fn arm_task_run_interrupt(
     global: &GlobalArgs,
-    session_id: boxes::SessionId,
-    session_name: String,
+    box_id: boxes::SessionId,
+    box_name: String,
     keep: bool,
 ) -> TaskRunInterrupt {
     let sock =
@@ -424,12 +424,12 @@ fn arm_task_run_interrupt(
         }
         if keep {
             eprintln!(
-                "\nInterrupted; session {session_name} kept — attach with: \
-                 min session attach {session_name}"
+                "\nInterrupted; session {box_name} kept — attach with: \
+                 min session attach {box_name}"
             );
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted; destroying session {session_name}…");
+        eprintln!("\nInterrupted; destroying session {box_name}…");
         // The whole connect-and-destroy is bounded by the same 10-second
         // cleanup ceiling as `best_effort_destroy` — the interrupt may well
         // mean the daemon is already wedged — and raced against a second
@@ -446,19 +446,19 @@ fn arm_task_run_interrupt(
             {
                 use minimald_rpc::{DestroySession, DestroySessionRequest};
                 let _ = client
-                    .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
+                    .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: box_id })
                     .await;
             }
             // The run's own return never comes on this path, so the release
             // it owes is made here, inside the same bound.
-            release_task_name_hold(control_sock, session_id, &session_name, false).await;
+            release_task_name_hold(control_sock, box_id, &box_name, false).await;
         };
         tokio::select! {
             res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
                 if res.is_err() {
                     eprintln!(
                         "DestroySession timed out after {CLEANUP_TIMEOUT:?}; the session may \
-                         still be present (run `min session destroy {session_name}` to clean \
+                         still be present (run `min session destroy {box_name}` to clean \
                          up manually)"
                     );
                 }
@@ -650,7 +650,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     crate::ensure_daemon(global)?;
 
     let config = minimald_rpc::BoxConfig {
-        name: Some(task_session_name(&args.task, &crate::random_hex4())),
+        name: Some(task_box_name(&args.task, &crate::random_hex4())),
         project_path: abs_path.clone(),
         network: boxes::NetworkMode::HostNet,
         policy: boxes::BoxPolicy::default(),
@@ -733,7 +733,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             minimald_rpc::Errorable::Err { error } => {
                 if crate::should_retry_autogen(true, attempts, &error) {
                     attempts += 1;
-                    config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
+                    config.name = Some(task_box_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
                 bail!("{error}");
@@ -971,9 +971,9 @@ mod tests {
     /// pushed through the same sanitizer as the activate autogen so it
     /// always clears `validate_session_name`.
     #[test]
-    fn task_session_name_sanitizes_the_task_stem() {
-        assert_eq!(task_session_name("build", "9c1e"), "task-build-9c1e");
-        assert_eq!(task_session_name("My Task!", "4f2a"), "task-mytask-4f2a");
+    fn task_box_name_sanitizes_the_task_stem() {
+        assert_eq!(task_box_name("build", "9c1e"), "task-build-9c1e");
+        assert_eq!(task_box_name("My Task!", "4f2a"), "task-mytask-4f2a");
     }
 
     /// The hidden `min run` redirect names both canonical forms — the host

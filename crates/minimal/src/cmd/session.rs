@@ -165,7 +165,7 @@ pub async fn cmd_session_policy(
     // the text walk answers with a message only — and because the text
     // rendering is not touched at all.
     if args.output == Some(PolicyOutputFormat::Json) {
-        return session_policy_as_json(global, &args.session).await;
+        return box_policy_as_json(global, &args.session).await;
     }
 
     ensure_daemon(global)?;
@@ -179,14 +179,14 @@ pub async fn cmd_session_policy(
     let record = resolve_session(&mut client, &args.session).await?;
     // The follow-up lookups go by the resolved id, so a session named by an
     // id prefix reaches the same session they do.
-    let session = record.id.to_string();
+    let box_id = record.id.to_string();
 
     // The daemon resolves the effective egress (NET-074/NET-077), because
     // the rollout phase and its opt-out are the daemon's own facts; built
     // here rather than through a `SessionLookup` conversion so the request
     // types stay the rpc crate's, where the wire contract lives.
     use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
-    let lookup = match SessionLookup::parse(&session) {
+    let lookup = match SessionLookup::parse(&box_id) {
         SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
         SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
     };
@@ -205,7 +205,7 @@ pub async fn cmd_session_policy(
     // enforcement row, silently: the row is an optional fact beside the
     // declaration, and the same silence is what a session that is not
     // host-address already prints.
-    let facts_lookup = match SessionLookup::parse(&session) {
+    let facts_lookup = match SessionLookup::parse(&box_id) {
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
@@ -226,7 +226,7 @@ pub async fn cmd_session_policy(
     // shared fetch: warn on stderr and print no section — the JSON
     // rendering below degrades differently, saying the unknown in the
     // document instead.
-    let live = fetch_live_ingress_degrading(&mut client, &session).await;
+    let live = fetch_live_ingress_degrading(&mut client, &box_id).await;
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
@@ -457,21 +457,21 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
     let mut client = connect_daemon(global).await?;
 
     if args.all {
-        return destroy_all_sessions(global, &mut client, args.force).await;
+        return destroy_all_boxes(global, &mut client, args.force).await;
     }
 
-    let session = args
+    let box_name = args
         .session
         .as_deref()
         .context("a session or --all is required")?;
-    let record = resolve_session(&mut client, session).await?;
+    let record = resolve_session(&mut client, box_name).await?;
 
     // Under --force the at-risk fetch is skipped outright — the gate is
     // bypassed regardless, so there is nothing to ask the daemon for.
     let at_risk = if args.force {
         AtRiskState::Clean
     } else {
-        assess_at_risk(session_delta(&mut client, record.id).await)
+        assess_at_risk(box_delta(&mut client, record.id).await)
     };
     match destroy_gate(
         args.force,
@@ -486,7 +486,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
                     println!("{line}");
                 }
             }
-            let label = record.name.as_deref().unwrap_or(session);
+            let label = record.name.as_deref().unwrap_or(box_name);
             if !confirm(
                 &format!("Destroy session {label}? This permanently deletes all in-session files."),
                 false,
@@ -497,7 +497,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         }
     }
 
-    destroy_session(
+    destroy_box(
         &mut client,
         global,
         record.id,

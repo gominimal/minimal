@@ -8,7 +8,7 @@ use minimal_client::box_registration::resume_box_row;
 /// before handing off to the interactive shell. Suppressed under `--no-input`
 /// and when stderr is not a terminal, so scripted and CI callers — which read
 /// the session id from stdout — see nothing extra.
-pub(crate) fn should_announce_session(global: &GlobalArgs) -> bool {
+pub(crate) fn should_announce_box(global: &GlobalArgs) -> bool {
     !global.no_input && std::io::stderr().is_terminal()
 }
 
@@ -52,7 +52,7 @@ pub(crate) async fn resolve_attach_target_version_gated(
             Some(resolved) => {
                 // The operator never chose the VM the way they chose the
                 // session, so tell them which one they're landing in.
-                if should_announce_session(global) {
+                if should_announce_box(global) {
                     eprintln!(
                         "Attaching to session {} on VM {}",
                         session_announce_label(
@@ -91,7 +91,7 @@ pub(crate) fn resolve_smart_attach(
             // Unambiguous auto-resolve: the operator never chose this session,
             // so tell them which one they're landing in. The picker path below
             // needs no such line — the selection is its own confirmation.
-            if should_announce_session(global) {
+            if should_announce_box(global) {
                 eprintln!(
                     "Attaching to session {}{}",
                     session_announce_label(&entry.id, entry.name.as_deref()),
@@ -226,7 +226,7 @@ pub(crate) async fn session_via_ssh(
     // back, and the in-VM daemon's own row check decides the launch.
     let mut record_unreadable = false;
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
-        Some(_) => match attached_session_record(sock, id).await {
+        Some(_) => match attached_box_record(sock, id).await {
             Ok(record) => record,
             Err(error) => {
                 tracing::warn!(
