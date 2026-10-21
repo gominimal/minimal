@@ -170,6 +170,7 @@ pub trait LeafIssuer: Send + Sync {
     fn issue(&self, hostname: &str, now: SystemTime) -> Result<Leaf, CaError>;
 
     /// The interception root, which the upstream leg never trusts (BEP-055).
+    /// `None` only for an issuer that issues no leaves.
     fn root(&self) -> Option<CertificateDer<'static>> {
         None
     }
@@ -296,7 +297,8 @@ impl Proxy {
     ///
     /// # Errors
     ///
-    /// When rustls refuses its default protocol versions.
+    /// When rustls refuses its default protocol versions, or when the
+    /// interception root of `leaves` is not a certificate rustls can parse.
     pub fn new(
         admission: Admission,
         leaves: Arc<dyn LeafIssuer>,
@@ -306,12 +308,13 @@ impl Proxy {
     ) -> Result<Self, rustls::Error> {
         let mut upstream_roots = upstream_roots;
         if let Some(root) = leaves.root() {
+            // Fail closed: a root that cannot be parsed cannot be removed,
+            // so the proxy refuses to start rather than trust it (BEP-055).
             let mut interception = RootCertStore::empty();
-            if interception.add(root).is_ok() {
-                upstream_roots
-                    .roots
-                    .retain(|anchor| !interception.roots.contains(anchor));
-            }
+            interception.add(root)?;
+            upstream_roots
+                .roots
+                .retain(|anchor| !interception.roots.contains(anchor));
         }
         let mut upstream = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()?
@@ -1201,6 +1204,38 @@ pub(crate) mod tests {
         let (mut h, _) = harness_with(audit.clone()).await;
         h.audit = audit;
         h
+    }
+
+    /// An issuer whose interception root is not a certificate.
+    struct UnparsableRoot;
+
+    impl LeafIssuer for UnparsableRoot {
+        fn issue(&self, _hostname: &str, _now: SystemTime) -> Result<Leaf, CaError> {
+            Err(CaError::Key(KeyError::Store {
+                role: Role::Signing,
+                detail: "this test issuer issues no leaves".into(),
+            }))
+        }
+        fn root(&self) -> Option<CertificateDer<'static>> {
+            Some(CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]))
+        }
+    }
+
+    // BEP-055: a root the proxy cannot take out of the upstream roots stops
+    // the proxy, so the upstream leg never trusts it.
+    #[test]
+    fn upstream_tls_refuses_to_start_when_interception_root_unparsable() {
+        let result = Proxy::new(
+            Admission::new(&[GITHUB], [("vault.example.com", 443)]),
+            Arc::new(UnparsableRoot),
+            RootCertStore::empty(),
+            Arc::new(To(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+                AtomicUsize::new(0),
+            )),
+            Arc::new(Mutex::new(Vec::<Decision>::new())),
+        );
+        assert!(result.is_err());
     }
 
     /// A box connection to the proxy, already admitted by the listener.
