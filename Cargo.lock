@@ -860,6 +860,7 @@ version = "0.0.1"
 dependencies = [
  "common",
  "mfile",
+ "mirror-client",
  "rand 0.10.3",
  "serde",
  "serde_json_lenient",
@@ -3970,6 +3971,7 @@ dependencies = [
  "indoc",
  "lcache",
  "mfile",
+ "mirror-client",
  "op",
  "orchestrator",
  "ot",
@@ -4286,6 +4288,36 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "minmirrord"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "common",
+ "futures",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "mirror-client",
+ "mlog",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

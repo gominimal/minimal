@@ -23,6 +23,7 @@ members = [
     "crates/mirror-client",
     "crates/minimald",
     "crates/minimald-rpc",
+    "crates/minmirrord",
     "crates/minvmd",
     "crates/minzoned",
     "crates/mlog",
