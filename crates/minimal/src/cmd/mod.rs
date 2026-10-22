@@ -818,19 +818,6 @@ fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) 
     )
 }
 
-/// The stderr line activation prints for a declared TCP host port that
-/// another process holds on the daemon's machine. The daemon finds the
-/// port and reports it in the finalize reply. Nothing retries the bind:
-/// each command that starts a process in the session fails until the
-/// holder frees the port, so the line says that and offers the way out.
-fn host_port_in_use_warning(port: u16) -> String {
-    format!(
-        "warning: host port {port} is already in use on the host. \
-         Commands in this session will fail until that port is free. \
-         To use another host port, activate again with --ingress <other>:<internal>."
-    )
-}
-
 /// Upload the composition's patches and external hook scripts (if
 /// any) and finalize the session. The session is `Materializing` at
 /// entry; `Active` on success. On upload/finalize failure the session
@@ -869,7 +856,6 @@ pub(crate) async fn upload_and_finalize(
             FinalizeSessionRequest {
                 session_id,
                 report_shared_port_collisions: true,
-                report_host_ports_in_use: true,
             },
             hook_budget,
         )
@@ -911,24 +897,6 @@ pub(crate) async fn upload_and_finalize(
             // log — a user reading a green activate would never know.
             for collision in &ok.shared_port_collisions {
                 eprintln!("{}", shared_port_collision_warning(collision));
-            }
-            // A declared host port another process holds fails every
-            // spawn until it is free. The activation still succeeds, so this
-            // line is the first place the person reads about it.
-            //
-            // Review asked (PR #2352, r4338460080) to remove this loop,
-            // `host_port_in_use_warning`, and the
-            // `host_ports_in_use`/`report_host_ports_in_use` wire fields —
-            // contingent on making finalize fail on a held port, which was
-            // declined at the daemon's probe (setup.rs,
-            // r4338460073): the probe is a predictive warning, and the
-            // bind it predicts already fails the first spawn with the
-            // named-port error. With finalize still warning, this loop is
-            // the only surface that reports the held port before the
-            // user's first command fails, on native hosts where the
-            // daemon's namespace is the one that matters. It stays.
-            for port in &ok.host_ports_in_use {
-                eprintln!("{}", host_port_in_use_warning(*port));
             }
             Ok(())
         }
@@ -1274,21 +1242,6 @@ mod tests {
              box does not get it. To use the port, create one of the two boxes \
              again with a different external port, e.g. --ingress \
              <other>:<internal>."
-        );
-    }
-
-    /// The activation-time line for a declared host port another process
-    /// holds: it names the port, says that commands fail until the port is
-    /// free, and offers the same `--ingress <other>:<internal>` way out the
-    /// collision line offers.
-    #[test]
-    fn host_port_in_use_warning_names_the_port_and_the_way_out() {
-        let line = super::host_port_in_use_warning(18999);
-        assert_eq!(
-            line,
-            "warning: host port 18999 is already in use on the host. \
-             Commands in this session will fail until that port is free. \
-             To use another host port, activate again with --ingress <other>:<internal>."
         );
     }
 }

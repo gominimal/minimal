@@ -1139,11 +1139,6 @@ async fn serve_finalize_session(
                     if !req.report_shared_port_collisions {
                         response.shared_port_collisions.clear();
                     }
-                    // Same gate for the taken host ports, for the same
-                    // reason: only a client that asked is answered with them.
-                    if !req.report_host_ports_in_use {
-                        response.host_ports_in_use.clear();
-                    }
                     Errorable::Ok(response)
                 }
                 Err(e) => Errorable::Err {

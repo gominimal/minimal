@@ -1922,14 +1922,6 @@ pub struct FinalizeSessionRequest {
     /// older daemon reads is unchanged — it ignores the key either way.
     #[serde(default, skip_serializing_if = "is_false")]
     pub report_shared_port_collisions: bool,
-    /// The client decodes
-    /// [`FinalizeSessionResponse::host_ports_in_use`], so the daemon may
-    /// fill it. Same gating and same serde-defaults as
-    /// [`Self::report_shared_port_collisions`]: an older client's request
-    /// reads as `false`, an older daemon's reply omits the key, and only a
-    /// client that asks is answered with the list.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub report_host_ports_in_use: bool,
 }
 
 /// Serde helper: omit a `false` request flag, so the request matches the one
@@ -1978,16 +1970,6 @@ pub struct FinalizeSessionResponse {
     /// field would refuse the reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_port_collisions: Vec<SharedPortCollision>,
-    /// The declared TCP host ports another process on the daemon's host
-    /// already holds at the box's published address, found by the daemon
-    /// at activation. Each one fails the box's spawns until it is free, so
-    /// the client warns about it now. Filled only when the request set
-    /// [`FinalizeSessionRequest::report_host_ports_in_use`], for the same
-    /// `deny_unknown_fields` reason as [`Self::shared_port_collisions`].
-    /// Serde-defaulted and omitted when empty, so a reply from a daemon that
-    /// predates the field decodes the same as one with nothing to report.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub host_ports_in_use: Vec<u16>,
 }
 
 /// A declared ingress port the box yields because another box at the same

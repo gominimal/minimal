@@ -4584,7 +4584,6 @@ async fn create_session_with(
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
             report_shared_port_collisions: false,
-            report_host_ports_in_use: false,
         })
         .await
     {

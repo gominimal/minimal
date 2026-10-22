@@ -1841,7 +1841,6 @@ mod end_to_end {
             .call::<FinalizeSession>(&FinalizeSessionRequest {
                 session_id,
                 report_shared_port_collisions: false,
-                report_host_ports_in_use: false,
             })
             .await
         {

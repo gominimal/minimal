@@ -1475,7 +1475,6 @@ kill "$peer" 2>/dev/null
             .call::<FinalizeSession>(&FinalizeSessionRequest {
                 session_id,
                 report_shared_port_collisions: false,
-                report_host_ports_in_use: false,
             })
             .await
         {

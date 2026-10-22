@@ -133,31 +133,6 @@ fn shared_port_collisions_are_omitted_when_empty() {
     );
 }
 
-/// `host_ports_in_use` is omitted from the wire when empty, so a
-/// client that predates the field still decodes the common success
-/// payload. When the daemon reports ports, they round-trip.
-#[test]
-fn host_ports_in_use_is_omitted_when_empty() {
-    let wire =
-        serde_json_lenient::to_string(&FinalizeSessionResponse::default()).expect("must serialize");
-    assert!(
-        !wire.contains("host_ports_in_use"),
-        "an empty list must not be serialized, got {wire:?}"
-    );
-
-    let reported = FinalizeSessionResponse {
-        host_ports_in_use: vec![18999],
-        ..Default::default()
-    };
-    let wire = serde_json_lenient::to_string(&reported).expect("must serialize");
-    assert!(
-        wire.contains("host_ports_in_use"),
-        "a reported port must be serialized, got {wire:?}"
-    );
-    let back: FinalizeSessionResponse = serde_json_lenient::from_str(&wire).expect("must decode");
-    assert_eq!(back.host_ports_in_use, [18999], "the ports must round-trip");
-}
-
 /// A client and a daemon on either side of the
 /// `report_shared_port_collisions` flag still finalize. An older
 /// client's request (no flag) reads as not asking, so a newer daemon
@@ -180,7 +155,6 @@ fn finalize_collision_report_survives_version_skew_both_ways() {
     let not_asking = FinalizeSessionRequest {
         session_id: id,
         report_shared_port_collisions: false,
-        report_host_ports_in_use: false,
     };
     assert_eq!(
         serde_json_lenient::to_string(&not_asking).expect("must serialize"),
@@ -191,7 +165,6 @@ fn finalize_collision_report_survives_version_skew_both_ways() {
     let asking = FinalizeSessionRequest {
         session_id: id,
         report_shared_port_collisions: true,
-        report_host_ports_in_use: false,
     };
     let wire = serde_json_lenient::to_string(&asking).expect("must serialize");
     assert!(

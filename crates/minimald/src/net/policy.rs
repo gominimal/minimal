@@ -467,10 +467,12 @@ pub fn host_ports_in_use(
 }
 
 /// The error [`apply_ingress`] returns for a declared port another process
-/// already holds on the host. A person reads it at every failed command, so
+/// already holds on the host, and the error a finalize returns when
+/// [`host_ports_in_use`] finds one. A person reads it at the failed
+/// activation or command, so
 /// it names the port and the next step; the forwarder's own refusal is in
 /// the warn line [`apply_ingress`] logs, not here.
-fn address_in_use_error(port: u16) -> io::Error {
+pub fn address_in_use_error(port: u16) -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrInUse,
         format!(
