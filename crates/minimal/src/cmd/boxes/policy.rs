@@ -11,7 +11,7 @@ use super::*;
 ///
 /// The opt-out half of the scope is the caller's to check: the daemon, not
 /// the client, knows whether it set its opt-out (NET-077), so
-/// [`activate_session`] reads it off the create reply and stays silent for
+/// [`activate_box`] reads it off the create reply and stays silent for
 /// a box the default does not bind.
 pub fn deny_all_default_notice(phase: boxes::EgressDefaultPhase) -> Option<&'static str> {
     match phase {
@@ -835,9 +835,9 @@ impl PolicyJsonFailure {
 /// as a claim that the box published nothing.
 async fn fetch_live_ingress(
     client: &mut client::Client,
-    session: &str,
+    box_name: &str,
 ) -> Result<Vec<minimald_rpc::LiveMapping>, String> {
-    let live_lookup = match SessionLookup::parse(session) {
+    let live_lookup = match SessionLookup::parse(box_name) {
         SessionLookup::Id(id) => minimald_rpc::GetLiveIngressRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetLiveIngressRequest::Name(n),
     };
@@ -863,9 +863,9 @@ async fn fetch_live_ingress(
 /// the one rendering that may put it there.
 pub(crate) async fn fetch_live_ingress_degrading(
     client: &mut client::Client,
-    session: &str,
+    box_name: &str,
 ) -> Vec<minimald_rpc::LiveMapping> {
-    fetch_live_ingress(client, session)
+    fetch_live_ingress(client, box_name)
         .await
         .unwrap_or_else(|warning| {
             eprintln!("warning: {warning}");
@@ -881,9 +881,9 @@ pub(crate) async fn fetch_live_ingress_degrading(
 /// renderings degrade differently (see [`fetch_live_ingress`]): the
 /// document says the unknown itself, so nothing is printed for it on a
 /// stderr the error object has alone.
-async fn session_policy_json_inputs(
+async fn box_policy_json_inputs(
     global: &GlobalArgs,
-    session: &str,
+    box_name: &str,
 ) -> Result<
     (
         boxes::Record,
@@ -904,19 +904,19 @@ async fn session_policy_json_inputs(
     // lookup the text walk uses, with the failure kinds told apart where
     // they can be: an RPC the daemon never answered is no daemon to ask;
     // a lookup that answered with nothing is the not-found itself.
-    let resp = get_session_record(&mut client, session)
+    let resp = get_session_record(&mut client, box_name)
         .await
         .map_err(|error| match error.downcast_ref::<AmbiguousIdPrefix>() {
             Some(ambiguous) => PolicyJsonFailure::SessionNotFound(ambiguous.to_string()),
             None => PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")),
         })?;
-    let record = named_record(resp.record, session)
+    let record = named_record(resp.record, box_name)
         .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
     // By the resolved id, as the text walk does.
-    let session = &record.id.to_string();
+    let box_id = &record.id.to_string();
 
     use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
-    let lookup = match SessionLookup::parse(session) {
+    let lookup = match SessionLookup::parse(box_id) {
         SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
         SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
     };
@@ -925,13 +925,13 @@ async fn session_policy_json_inputs(
         .await
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
-    let live = fetch_live_ingress(&mut client, session).await;
+    let live = fetch_live_ingress(&mut client, box_id).await;
     // The listen publishes the audit log refused (NET-046) and the yielded
     // shared-address ports (NET-129), from the runtime facts the text walk
     // reads them from. Optional facts: a daemon that cannot answer — an older
     // build, a session mid-teardown — leaves both keys out, as a box with
     // nothing to say does.
-    let facts_lookup = match SessionLookup::parse(session) {
+    let facts_lookup = match SessionLookup::parse(box_id) {
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
@@ -967,12 +967,12 @@ async fn session_policy_json_inputs(
 /// `main`'s machine-mode error emitter — keyed on the output mode, shared
 /// by every command that takes `-o json` — writes, so the error path is
 /// one mechanism rather than a per-command one.
-pub(crate) async fn session_policy_as_json(
+pub(crate) async fn box_policy_as_json(
     global: &GlobalArgs,
-    session: &str,
+    box_name: &str,
 ) -> Result<(), anyhow::Error> {
     let (record, policy, live, unaudited_listen_ports, shared_port_collisions) =
-        match session_policy_json_inputs(global, session).await {
+        match box_policy_json_inputs(global, box_name).await {
             Ok(inputs) => inputs,
             Err(failure) => return Err(failure.machine_failure().into()),
         };

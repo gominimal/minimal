@@ -501,37 +501,40 @@ pub async fn activate(
     // the reply echoes back — not a `GetVersion` ahead of them. Activation is
     // the one path where an extra round trip is felt, and the create can carry
     // the check for free.
-    let config = BoxConfig {
-        name,
-        project_path: project_path.clone(),
+    let mut request = CreateSessionRequest::new(
+        String::new(),
+        project_path.clone(),
         network,
-        policy: BoxPolicy::default(),
-        // An own-address box on a VM-backed host is handed its addresses by
-        // the registration [`create_registering`] makes first.
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        // Same default as an activate with no flags: the dashboard
-        // has no `--no-hooks` of its own, and a session created here
-        // is attachable later like any other.
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
-    let undeclared_own_ip = config.network == NetworkMode::OwnIp && config.policy.egress.is_none();
-    let (created, mut row) = create_registering(sock, config, &mut client, |client, config| {
-        Box::pin(async move {
-            client
-                .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                    config,
-                    // A daemon of another build refuses this before it
-                    // allocates anything; `None` under the skew override,
-                    // which is how an operator still gets through.
-                    must_match_version: minimal_client::version_assertion(),
-                })
-                .await
-                .map_err(|error| session_rpc_failed(SessionRpc::CreateSession, error))
-        })
-    })
+        BoxPolicy::default(),
+    );
+    // The form can leave the box unnamed. [`create_registering`] names it
+    // when it registers, and otherwise the daemon does. An own-address box on
+    // a VM-backed host is handed its addresses by that registration. Hooks
+    // stay on, the same default as an activate with no flags: the dashboard
+    // has no `--no-hooks` of its own, and a session created here is
+    // attachable later like any other.
+    request.config.name = name;
+    // A daemon of another build refuses this before it allocates anything;
+    // `None` under the skew override, which is how an operator still gets
+    // through.
+    request.must_match_version = minimal_client::version_assertion();
+    let undeclared_own_ip =
+        request.config.network == NetworkMode::OwnIp && request.config.policy.egress.is_none();
+    let (created, mut row) = create_registering(
+        sock,
+        request.config.clone(),
+        &mut client,
+        |client, config| {
+            let mut request = request.clone();
+            request.config = config;
+            Box::pin(async move {
+                client
+                    .oneshot_rpc::<CreateSession>(request)
+                    .await
+                    .map_err(|error| session_rpc_failed(SessionRpc::CreateSession, error))
+            })
+        },
+    )
     .await?;
     // A daemon that predates the field ignored the assertion and echoes no
     // version; that silence is itself the skew. Refuse now — before the
@@ -940,20 +943,18 @@ mod tests {
 
     /// The dashboard's create config for an own-address box in `dir`.
     fn own_ip_config(dir: &Path, name: Option<&str>) -> BoxConfig {
-        BoxConfig {
-            name: name.map(str::to_string),
-            project_path: paths::HostAbsPath::try_new(
+        let mut config = CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(
                 camino::Utf8PathBuf::from_path_buf(dir.join("web-app")).unwrap(),
             )
             .unwrap(),
-            network: NetworkMode::OwnIp,
-            policy: BoxPolicy::default(),
-            task_addresses: Vec::new(),
-            box_id: None,
-            box_addresses: None,
-            hooks_enabled: true,
-            attrs: Default::default(),
-        }
+            NetworkMode::OwnIp,
+            BoxPolicy::default(),
+        )
+        .config;
+        config.name = name.map(str::to_string);
+        config
     }
 
     fn created() -> minimald_rpc::CreateSessionResponse {
