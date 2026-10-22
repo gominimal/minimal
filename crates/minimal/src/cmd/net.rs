@@ -85,7 +85,7 @@ pub async fn cmd_net_forward(
     let mut sigterm = signal_stream(SignalKind::terminate());
     let mut sighup = signal_stream(SignalKind::hangup());
 
-    let label = session_announce_label(&record.id, record.name.as_deref());
+    let label = box_announce_label(&record.id, record.name.as_deref());
     eprintln!(
         "Forwarding localhost:{local_port} → 127.0.0.1:{box_port} in session {label}. \
          Ctrl-C to stop."
