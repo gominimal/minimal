@@ -334,7 +334,9 @@ fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Re
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
             "no CA key can sign a leaf certificate yet (#2440), so every admitted CONNECT is answered 502. \
-             No creator registers a box's declared egress yet. \
+             No creator registers a box's declared egress yet, so every box is refused outside_declared_egress. \
+             A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
+             A store-handle member is not admitted until #2280 lands. \
              No revocation is in force until #2277 and #2290 land"
         );
         tracing::info!(
@@ -406,6 +408,7 @@ mod tests {
 
     const INSTANCE: &str = "0123456789abcdef0123456789abcdef";
     const TOKEN: &str = "ghu_serve_token";
+    const BOX: &str = "0190f0e0a1b2c3d4e5f60718293a4b5c";
 
     /// A sealing key held in memory, in place of the Keychain's.
     struct TestKey(SecretKey);
@@ -503,7 +506,7 @@ mod tests {
         let registered = ask(
             &mut stream,
             &Request::RegisterBox {
-                box_id: "b1".into(),
+                box_id: BOX.into(),
                 egress: vec!["api.github.com".into()],
                 stance: Stance::OwnIp,
             },
@@ -515,7 +518,7 @@ mod tests {
             host: "api.github.com".to_owned(),
             port: 443,
         };
-        assert_eq!(wiring.redeemer.egress("b1"), vec![api.clone()]);
+        assert_eq!(wiring.redeemer.egress(BOX), vec![api.clone()]);
 
         // The value and its handle name this proxy's sealing key
         // fingerprint as the Box Host.
@@ -523,7 +526,7 @@ mod tests {
         let jws = handle::sign(
             &client,
             &Claims {
-                sub: "b1".into(),
+                sub: BOX.into(),
                 node_id: node.clone(),
                 store: GITHUB.id.into(),
                 id: INSTANCE.into(),
@@ -537,7 +540,7 @@ mod tests {
         let sealed = seal::seal(
             &sealing,
             &Context {
-                box_id: "b1".into(),
+                box_id: BOX.into(),
                 host: node,
                 module: GITHUB.id.into(),
                 host_set_version: GITHUB.host_set_version,
@@ -561,23 +564,17 @@ mod tests {
             host: Some(api.clone()),
             target: None,
         };
-        match wiring.redeemer.redeem("b1", &api, &request, &sealed) {
+        match wiring.redeemer.redeem(BOX, &api, &request, &sealed) {
             Verdict::Admit { credential, .. } => assert_eq!(credential.as_str(), TOKEN),
             Verdict::Refuse(marker) => panic!("refused {marker}"),
         }
 
         // At destroy the box is forgotten, and its value is refused.
-        let forgot = ask(
-            &mut stream,
-            &Request::ForgetBox {
-                box_id: "b1".into(),
-            },
-        )
-        .await;
+        let forgot = ask(&mut stream, &Request::ForgetBox { box_id: BOX.into() }).await;
         assert!(forgot.ok, "{forgot:?}");
-        assert!(wiring.redeemer.egress("b1").is_empty());
+        assert!(wiring.redeemer.egress(BOX).is_empty());
         assert!(matches!(
-            wiring.redeemer.redeem("b1", &api, &request, &sealed),
+            wiring.redeemer.redeem(BOX, &api, &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
     }
