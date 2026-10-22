@@ -192,7 +192,8 @@ async fn run() -> ExitCode {
 /// The exit code a failed run ends with, from the architecture's reserved
 /// codes ("Exit codes"): 3 when the activation refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
-/// `minimal.toml` invalid (`minimal::ProjectFileInvalid`), 7 when the VM host could not
+/// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
+/// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
 /// be reached to register or resume an own-address box's row (provider/host
 /// unreachable, #1790), 8 when the host refused the registration for want
 /// of addresses (insufficient resources), and 1, the unspecified error,
@@ -205,6 +206,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     }
     // An invalid project `minimal.toml` refuses the activation with exit 3.
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
+        return 3;
+    }
+    // BEP-007: a GitHub grant the box cannot receive in its environment.
+    if e.downcast_ref::<minimal::GrantNotDelivered>().is_some() {
         return 3;
     }
     if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
@@ -874,6 +879,17 @@ mod tests {
             text.contains("does not allow: uploads.github.com, codeload.github.com."),
             "{text}"
         );
+    }
+
+    /// BEP-007: a GitHub grant the box cannot receive ends the run with
+    /// exit 3, through the context the activation adds over it.
+    #[test]
+    fn an_undeliverable_grant_ends_with_exit_3() {
+        let refused = minimal::GrantNotDelivered::NotSealed {
+            grant: "GH_TOKEN".into(),
+        };
+        let e = anyhow::Error::new(refused).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
     }
 
     /// Exit codes: an invalid project `minimal.toml` ends the run with

@@ -106,6 +106,46 @@ impl std::error::Error for ProjectFileInvalid {
     }
 }
 
+/// A GitHub grant the box cannot receive in its environment (BEP-007). The
+/// creation is refused with exit 3, before the box exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantNotDelivered {
+    /// The grant's name is not a POSIX environment variable name, so it
+    /// cannot name a variable in the box.
+    InvalidName {
+        /// The grant's name, as the project file declares it.
+        grant: String,
+    },
+    /// The mint gave the grant no sealed value, so its variable would be
+    /// empty in the box.
+    NotSealed {
+        /// The grant's name.
+        grant: String,
+    },
+}
+
+impl std::fmt::Display for GrantNotDelivered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName { grant } => write!(
+                f,
+                "Cannot create the box: the secret {grant:?} in [session.secrets] in \
+                 {name} is not a valid environment variable name. A name uses only \
+                 capital letters, digits and underscores, and does not start with a \
+                 digit. Rename the secret, then create the box again.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::NotSealed { grant } => write!(
+                f,
+                "Cannot create the box: no sealed value was made for its GitHub grant \
+                 {grant}, so {grant} would be empty in the box. No box was created."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GrantNotDelivered {}
+
 /// The project's `[session.network.bep]` settings and `[session.secrets]`
 /// grants. Only a missing project file reads as empty. A file that exists
 /// but does not load refuses the activation, so a broken file can never
@@ -252,6 +292,18 @@ pub(crate) fn check_github_grants(
     let grants = github_grant_names(secrets);
     if grants.is_empty() {
         return Ok(grants);
+    }
+    // BEP-007: each grant's name becomes a variable in the box's
+    // environment, so a name that is not one is refused before anything
+    // is created.
+    if let Some(grant) = grants
+        .iter()
+        .find(|grant| boxes::core::primitives::StrictVarName::try_new(grant.as_str()).is_err())
+    {
+        return Err(GrantNotDelivered::InvalidName {
+            grant: grant.clone(),
+        }
+        .into());
     }
     boxes::core::bep::require_proxy(secrets, proxy_present)?;
     let signed_in = sign_in_held(keychain)?;
@@ -403,10 +455,10 @@ fn sealed_deliveries(
         .iter()
         .map(|grant| {
             let Some(minted) = minted.iter().find(|minted| &minted.grant == grant) else {
-                bail!(
-                    "Cannot start the box: no sealed value was made for its GitHub grant \
-                     {grant}, so {grant} would be empty in the box."
-                );
+                return Err(GrantNotDelivered::NotSealed {
+                    grant: grant.clone(),
+                }
+                .into());
             };
             Ok(boxes::SealedDelivery {
                 variable: grant.clone(),
@@ -1932,9 +1984,47 @@ mod tests {
         let error = sealed_deliveries(&grants, &[minted("GH_TOKEN", "sealed-one")])
             .expect_err("a grant with no sealed value is refused");
         assert_eq!(
+            error.downcast_ref::<GrantNotDelivered>(),
+            Some(&GrantNotDelivered::NotSealed {
+                grant: "GITHUB_TOKEN".to_string(),
+            })
+        );
+        assert_eq!(
             error.to_string(),
-            "Cannot start the box: no sealed value was made for its GitHub grant \
-             GITHUB_TOKEN, so GITHUB_TOKEN would be empty in the box."
+            "Cannot create the box: no sealed value was made for its GitHub grant \
+             GITHUB_TOKEN, so GITHUB_TOKEN would be empty in the box. No box was created."
+        );
+    }
+
+    /// BEP-007: a GitHub grant's name becomes a variable in the box's
+    /// environment, so a name that is not a POSIX variable name is refused
+    /// before the proxy or the sign-in is checked.
+    #[test]
+    fn a_grant_whose_name_is_not_a_variable_name_is_refused() {
+        let grant: boxes::core::bep::SecretGrant =
+            toml::from_str("source = \"broker\"\nscopes = [\"github:user-token\"]").unwrap();
+        let keychain = bep::signin::MemoryKeychain::default();
+        for name in ["X=1; touch /tmp/owned #", "gh_token", "1TOKEN"] {
+            let secrets = boxes::core::bep::SecretGrants::from([(name.to_string(), grant.clone())]);
+            let error = check_github_grants(&secrets, false, &keychain)
+                .expect_err("a name that is not a variable name is refused");
+            assert_eq!(
+                error.downcast_ref::<GrantNotDelivered>(),
+                Some(&GrantNotDelivered::InvalidName {
+                    grant: name.to_string(),
+                }),
+                "{name}"
+            );
+        }
+        let secrets = boxes::core::bep::SecretGrants::from([("X=1; cmd #".to_string(), grant)]);
+        assert_eq!(
+            check_github_grants(&secrets, false, &keychain)
+                .unwrap_err()
+                .to_string(),
+            "Cannot create the box: the secret \"X=1; cmd #\" in [session.secrets] in \
+             minimal.toml is not a valid environment variable name. A name uses only \
+             capital letters, digits and underscores, and does not start with a digit. \
+             Rename the secret, then create the box again."
         );
     }
 
