@@ -625,7 +625,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         let master = {
             set_nonblocking(master.as_raw_fd())?;
             let file = unsafe { std::fs::File::from_raw_fd(master.into_raw_fd()) };
-            AsyncFd::new(file)?
+            // SAFETY: `file` owns the pty master fd, and the `AsyncFd` owns
+            // `file`, so the fd stays open and unchanged while it is registered.
+            unsafe { AsyncFd::register(file) }?
         };
 
         let mut host = Host {
