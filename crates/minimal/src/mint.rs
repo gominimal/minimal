@@ -202,6 +202,7 @@ impl ClientKey {
 
 /// One connection to the proxy's control socket.
 pub struct ControlClient {
+    path: PathBuf,
     stream: BufReader<UnixStream>,
 }
 
@@ -230,6 +231,7 @@ impl ControlClient {
             .set_write_timeout(Some(timeout))
             .map_err(not_running)?;
         Ok(Self {
+            path: path.to_owned(),
             stream: BufReader::new(stream),
         })
     }
@@ -519,7 +521,23 @@ pub fn mint_and_register(
         });
     }
 
-    control.register_box(&box_id, &grant_box.egress, grant_box.stance)?;
+    if let Err(error) = control.register_box(&box_id, &grant_box.egress, grant_box.stance) {
+        // BEP-003: a reply that fails, a read timeout for one, can follow a
+        // box the proxy stored. That connection can still carry the late
+        // reply, so the forget goes over a new one.
+        if !matches!(error, MintError::NotRunning { .. }) {
+            let forgot = ControlClient::connect_with_timeout(&control.path, FORGET_TIMEOUT)
+                .and_then(|mut fresh| fresh.forget_box(&box_id));
+            if let Err(forget) = forgot {
+                tracing::warn!(
+                    box_id = %box_id,
+                    error = %forget,
+                    "the proxy did not forget the box after its registration failed"
+                );
+            }
+        }
+        return Err(error);
+    }
     // BEP-063: the key is registered before a handle signed under it is
     // delivered. It goes last, so no failed step leaves it registered.
     if let Err(error) = control.register_client_key(key) {
@@ -544,7 +562,10 @@ pub fn mint_and_register(
 /// that withdraws a key. The flip is T27
 /// (https://github.com/gominimal/minimal/issues/2288).
 ///
-/// The forget runs only on a failed or interrupted creation. Inside a
+/// The forget runs only on a failed creation. A Ctrl-C ends the process
+/// in `std::process::exit`, which runs no destructor, so it leaves the box
+/// at the proxy until the box's destroy forgets it
+/// (https://github.com/gominimal/minimal/issues/2277). Inside a
 /// tokio runtime it runs on a blocking thread, so it never holds up a
 /// runtime worker. It waits at most [`FORGET_TIMEOUT`] for each read and
 /// write.
@@ -594,7 +615,9 @@ impl Drop for ProxyRegistration {
         };
         match tokio::runtime::Handle::try_current() {
             // The runtime waits for its blocking threads before it shuts
-            // down, so an interrupt does not lose the forget.
+            // down, so a runtime shutdown does not lose the forget. A
+            // Ctrl-C exits the process with no drop, and #2277 forgets
+            // that box at its destroy.
             Ok(runtime) => drop(runtime.spawn_blocking(forget)),
             Err(_) => forget(),
         }

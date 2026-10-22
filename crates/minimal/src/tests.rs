@@ -298,11 +298,6 @@ fn every_daemon_connection_is_classified() {
             "dash/rpc.rs::connect_missing = gated",
             "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
-            // Not a daemon connection: a grant box's registration, dropped
-            // before the creation finished, forgets the box at the Box Egress
-            // Proxy over its control socket. The proxy is not the daemon, and
-            // the daemon's build is not in question here.
-            "mint.rs::drop = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
             // the selected daemon — but connections all the same, and the
@@ -310,6 +305,7 @@ fn every_daemon_connection_is_classified() {
             // what the tests assert rather than a decision they make.
             // Not a product path, and not the daemon: the mint tests' own
             // connections to a test Box Egress Proxy's control socket.
+            "tests.rs::a_failed_box_reply_forgets_the_box_again = ungated",
             "tests.rs::a_refused_client_key_forgets_the_box_again = ungated",
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
@@ -4167,6 +4163,78 @@ mod mint_tests {
             *ops.lock().unwrap(),
             ["register_box", "register_client_key", "forget_box"]
         );
+        assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    /// A control socket that stores each box it is asked to register and
+    /// then closes the connection with no reply. Every other request gets
+    /// the proxy's answer. Gives the socket, its boxes and the requests.
+    fn serve_dropping_box_replies() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BoxRegistry,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let boxes = BoxRegistry::default();
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
+        std::thread::spawn(move || {
+            let clients = std::sync::RwLock::new(bep::handle::ClientKeys::new());
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let request: bep::control::Request =
+                        serde_json_lenient::from_str(&line).unwrap();
+                    let op = match request {
+                        bep::control::Request::RegisterClientKey { .. } => "register_client_key",
+                        bep::control::Request::RegisterBox { .. } => "register_box",
+                        bep::control::Request::ForgetBox { .. } => "forget_box",
+                    };
+                    served_ops.lock().unwrap().push(op.to_owned());
+                    let reply = bep::control::handle_line(&line, &clients, &served_boxes);
+                    if op == "register_box" {
+                        // The box is stored, and the reply never comes.
+                        break;
+                    }
+                    let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                    answer.push('\n');
+                    writer.write_all(answer.as_bytes()).unwrap();
+                    line.clear();
+                }
+            }
+        });
+        (dir, path, boxes, ops)
+    }
+
+    // BEP-003: a registration whose reply fails can still leave the box
+    // stored at the proxy. The mint forgets it again over a new connection,
+    // and registers no client key.
+    #[test]
+    fn a_failed_box_reply_forgets_the_box_again() {
+        let (_, identity) = proxy();
+        let (_dir, path, boxes, ops) = serve_dropping_box_replies();
+        let mut control = ControlClient::connect(&path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Control(_)), "{err}");
+        assert_eq!(*ops.lock().unwrap(), ["register_box", "forget_box"]);
         assert!(boxes.get(BOX_HEX).is_none());
     }
 
