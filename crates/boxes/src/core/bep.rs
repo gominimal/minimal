@@ -28,6 +28,10 @@ use crate::{EgressPolicy, NetworkMode};
 /// The exit code of a box spec that the activation refuses.
 pub const REFUSAL_EXIT_CODE: u8 = 3;
 
+/// The defined error of a box with a GitHub grant that is created while no
+/// GitHub sign-in is held (BEP-003).
+pub const GITHUB_SIGN_IN_REQUIRED: &str = "github_sign_in_required";
+
 /// How a box's credentialed traffic reaches the proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -362,6 +366,12 @@ pub enum BepRefusal {
         /// The narrower scopes it declares.
         scopes: Vec<String>,
     },
+    /// BEP-003: a GitHub grant while no GitHub sign-in is held. Its defined
+    /// error is [`GITHUB_SIGN_IN_REQUIRED`].
+    SignInRequired {
+        /// The GitHub grants, in name order.
+        grants: Vec<String>,
+    },
 }
 
 impl BepRefusal {
@@ -375,6 +385,16 @@ impl BepRefusal {
             Self::NoResolver { .. } => "BEP-017",
             Self::InstallationUnenrolled { .. } => "BEP-056",
             Self::NarrowScopesUnenrolled { .. } => "BEP-057",
+            Self::SignInRequired { .. } => "BEP-003",
+        }
+    }
+
+    /// The refusal's defined error, for a refusal that has one.
+    #[must_use]
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::SignInRequired { .. } => Some(GITHUB_SIGN_IN_REQUIRED),
+            _ => None,
         }
     }
 
@@ -390,6 +410,7 @@ impl BepRefusal {
             Self::NarrowScopesUnenrolled { .. } => {
                 "secrets.scopes, config [secrets] acknowledge_full_breadth_unenrolled"
             }
+            Self::SignInRequired { .. } => "secrets",
         }
     }
 }
@@ -437,6 +458,12 @@ impl fmt::Display for BepRefusal {
                  acknowledge_full_breadth_unenrolled = true in [secrets] in your \
                  config.toml. Run `min dirs` to find that file.",
                 scopes.join(", ")
+            ),
+            // The task fixes this wording.
+            Self::SignInRequired { .. } => write!(
+                f,
+                "This box declares a GitHub grant, and no GitHub sign-in is held on this \
+                 machine. Run `min auth login`, then create the box again."
             ),
         }
     }
@@ -625,6 +652,36 @@ pub fn check_activation(
     })
 }
 
+/// Refuses a box spec with a GitHub grant when no GitHub sign-in is held
+/// (BEP-003). `signed_in` says whether the host holds a sign-in. The caller
+/// reads it from the sign-in item's metadata, and nothing here asks for a
+/// sign-in. Logs one debug line when it refuses.
+///
+/// # Errors
+///
+/// [`ActivationRefused`] with one [`BepRefusal::SignInRequired`] when
+/// `secrets` holds a GitHub grant and `signed_in` is false.
+pub fn require_sign_in(secrets: &SecretGrants, signed_in: bool) -> Result<(), ActivationRefused> {
+    let grants: Vec<String> = secrets
+        .iter()
+        .filter(|(_, grant)| grant.is_github())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if signed_in || grants.is_empty() {
+        return Ok(());
+    }
+    let refusal = BepRefusal::SignInRequired { grants };
+    tracing::debug!(
+        rule = refusal.rule(),
+        fields = refusal.fields(),
+        code = GITHUB_SIGN_IN_REQUIRED,
+        "box spec refused at creation: no GitHub sign-in is held"
+    );
+    Err(ActivationRefused {
+        refusals: vec![refusal],
+    })
+}
+
 fn normalize_host(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -657,6 +714,40 @@ mod tests {
 
     fn grants(grant: SecretGrant) -> SecretGrants {
         BTreeMap::from([("GH_TOKEN".to_string(), grant)])
+    }
+
+    // BEP-003: a GitHub grant with no sign-in held fails with the defined
+    // error and the fixed text, and exits as a refused box spec.
+    #[test]
+    fn creation_without_sign_in_fails_with_defined_error() {
+        let secrets = grants(github_grant(None));
+        let refused = require_sign_in(&secrets, false).unwrap_err();
+        assert_eq!(
+            refused.refusals,
+            [BepRefusal::SignInRequired {
+                grants: vec!["GH_TOKEN".into()]
+            }]
+        );
+        assert_eq!(refused.refusals[0].code(), Some(GITHUB_SIGN_IN_REQUIRED));
+        assert_eq!(GITHUB_SIGN_IN_REQUIRED, "github_sign_in_required");
+        assert_eq!(refused.exit_code(), REFUSAL_EXIT_CODE);
+        assert_eq!(
+            refused.to_string(),
+            "This box declares a GitHub grant, and no GitHub sign-in is held on this machine. \
+             Run `min auth login`, then create the box again."
+        );
+
+        // A held sign-in, or a box with no GitHub grant, is not refused.
+        assert!(require_sign_in(&secrets, true).is_ok());
+        let client_env = grants(SecretGrant {
+            source: GrantSource::ClientEnv,
+            scopes: vec!["github:user-token".into()],
+            mode: None,
+        });
+        assert!(require_sign_in(&client_env, false).is_ok());
+        assert!(require_sign_in(&SecretGrants::new(), false).is_ok());
+        // Another refusal has no defined error.
+        assert_eq!(BepRefusal::SteeringOffWithProxyEnv.code(), None);
     }
 
     fn egress_with(hosts: &[&str]) -> EgressPolicy {
