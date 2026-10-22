@@ -1156,11 +1156,12 @@ impl BoxManager {
             // surviving run client's `DeleteSession`, reaches this actor
             // rather than bringing up a second one.
             //
-            // TODO(gominimal/inbox#731, spec 29 BOX-154): this reap of a
-            // `running` record is an interim. The architecture keeps such a
-            // record on restart and sets it to `stopped` (BOX-154, and
-            // BOX-012 reaps only `pending` and `materializing`). When BOX
-            // lands, a restart marks a run's box stopped and keeps it.
+            // TODO(gominimal/inbox#731, BOX-012/BOX-154): this reap of a
+            // run's `running` record at restart is an interim against
+            // architecture line 495: a restart sets an orphaned `running`
+            // record to `stopped` and keeps it (spec 29 BOX-154). BOX-012
+            // reaps only `pending` and `materializing`. The flip sets the
+            // record to `stopped` and keeps it.
             if record.ends_with_run {
                 tracing::info!(
                     session_id = %session_id,

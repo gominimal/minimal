@@ -1269,9 +1269,11 @@ pub struct Record {
     /// on other hosts the mark is written and never read). Defaults to
     /// `false` for every record that predates the field.
     ///
-    /// The destroy on restart is an interim. The architecture keeps a
-    /// `running` record on restart and sets it to `stopped` (spec 29
-    /// BOX-154). gominimal/inbox#731 owns the move to that rule.
+    /// The destroy of a run's `running` record at restart is an interim
+    /// against architecture line 495: a restart sets an orphaned
+    /// `running` record to `stopped` and keeps it (spec 29 BOX-012,
+    /// BOX-154). gominimal/inbox#731 owns the flip. The flip sets the
+    /// record to `stopped` and keeps it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ends_with_run: bool,
 
