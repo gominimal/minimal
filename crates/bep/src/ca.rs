@@ -67,7 +67,9 @@ const ORGANIZATION: &str = "Minimal";
 /// How far before `now` each certificate starts, for clock skew.
 const BACKDATE: Duration = Duration::from_secs(60 * 60);
 const DAY: u64 = 24 * 60 * 60;
-const ROOT_VALIDITY: Duration = Duration::from_secs(10 * 365 * DAY);
+// BEP-005, OQ3: one constant gives the root's validity and each member's
+// expiry.
+const ROOT_VALIDITY: Duration = Duration::from_secs(crate::publish::ROOT_VALIDITY_SECS);
 const SIGNING_VALIDITY: Duration = Duration::from_secs(365 * DAY);
 const LEAF_VALIDITY: Duration = Duration::from_secs(7 * DAY);
 

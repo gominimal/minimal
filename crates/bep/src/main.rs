@@ -165,8 +165,11 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // BEP-005: only a new root key starts a known validity. A new sealing or
+    // signing key leaves the root's end as the previous identity gave it.
+    let root_made_at = (role == Role::Root).then(unix_now);
     let identity = Identity::after_replacement(store, role, &key, previous.as_ref())
-        .with_root_validity(previous.as_ref(), unix_now());
+        .with_root_validity(previous.as_ref(), root_made_at);
     match identity.publish(path) {
         Ok(()) => {
             tracing::info!(path = %path.display(), "published the proxy identity");
@@ -195,11 +198,15 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, Strin
         Err(err) => return Err(err.to_string()),
     };
     let published = previous.as_ref().map(Identity::roles).unwrap_or_default();
+    // BEP-005: the store keeps no creation time. A root key that the store
+    // does not hold before `keys::load` is one this start generates, so its
+    // validity starts now. A root key loaded from the store has an unknown
+    // age, and its end rides the identity while the root key stays the same.
+    let root_absent = matches!(store.find(Role::Root), Ok(None));
     let loaded = keys::load(store, &published).map_err(|err| err.to_string())?;
-    // BEP-005: the root's validity end rides the identity from one start to
-    // the next, while the root key stays the same.
+    let root_made_at = root_absent.then(unix_now);
     Identity::of(&loaded)
-        .with_root_validity(previous.as_ref(), unix_now())
+        .with_root_validity(previous.as_ref(), root_made_at)
         .publish(path)
         .map_err(|err| err.to_string())?;
     tracing::info!(path = %path.display(), "published the proxy identity");
@@ -352,7 +359,8 @@ fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Re
             "no CA key can sign a leaf certificate yet (#2440), so every admitted CONNECT is answered 502. \
              A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
              A store-handle member is not admitted until #2280 lands. \
-             No revocation is in force until #2277 and #2290 land"
+             No revocation is in force until #2277 and #2290 land. \
+             Nothing forgets a destroyed box's declared egress until #2277 lands."
         );
         tracing::info!(
             listener = %args.listener.display(),
