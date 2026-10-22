@@ -6,8 +6,8 @@
 //! 1. reads the sending box's attribution and declared egress from the box
 //!    registry ([`crate::boxes`]),
 //! 2. opens the value under this host's proxy key, bound to the box that
-//!    the attribution names, or to each live box of the `host_ip` cohort in
-//!    turn ([`Unsealed::from_open`]),
+//!    the attribution names, or to the `host_ip` cohort box that the value
+//!    names, in one open ([`Unsealed::from_open`]),
 //! 3. reads the member's handle and verifies it under the registered client
 //!    keys ([`handle::read_opened`]),
 //! 4. gives the facts and the revocations it holds to [`redeem::decide`],
@@ -146,6 +146,39 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         )
     }
 
+    /// The cohort box to bind the one open of `sealed` to.
+    ///
+    /// The value's protected header names its box in `sub`. The header is
+    /// not yet authenticated here, but the open authenticates it: an open
+    /// bound to a box that the value does not carry fails as
+    /// [`Unsealed::OtherBox`]. When `sub` names no cohort box, or the header
+    /// does not parse, the target is the first cohort box. That open
+    /// classifies the value as every cohort open does: other box, or the
+    /// error that precedes the box check. `None` means the cohort is empty.
+    fn cohort_target(cohort: &[String], sealed: &str) -> Option<String> {
+        let carried = Self::carried_box(sealed);
+        carried
+            .filter(|id| cohort.contains(id))
+            .or_else(|| cohort.first().cloned())
+    }
+
+    /// The `sub` member of the protected header of `sealed`, read with no
+    /// key and no check. Only [`Self::cohort_target`] reads it.
+    fn carried_box(sealed: &str) -> Option<String> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        #[derive(serde::Deserialize)]
+        struct Sub {
+            sub: String,
+        }
+        if sealed.len() > seal::MAX_SEALED_LEN {
+            return None;
+        }
+        let header = URL_SAFE_NO_PAD.decode(sealed.split('.').next()?).ok()?;
+        serde_json::from_slice::<Sub>(&header).ok().map(|h| h.sub)
+    }
+
     /// The decryption fact for one open. An open error that no check of
     /// [`redeem::decide`] names is refused as undecryptable: the proxy
     /// cannot read the value.
@@ -183,19 +216,17 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 let (unsealed, opened) = Self::unsealed(self.open(sender, sealed, now));
                 (unsealed, opened, false)
             }
-            // The cohort's shared address names no single box, so the open
-            // is bound to each live `host_ip` box in turn.
-            Attribution::HostIpCohort => {
-                let mut found = (Unsealed::OtherBox, None, false);
-                for member in self.boxes.cohort() {
+            // The cohort's shared address names no single box. The open is
+            // bound once, to the cohort box the value's header names, so a
+            // request costs one key agreement whatever the cohort's size.
+            Attribution::HostIpCohort => match Self::cohort_target(&self.boxes.cohort(), sealed) {
+                None => (Unsealed::OtherBox, None, false),
+                Some(member) => {
                     let (unsealed, opened) = Self::unsealed(self.open(&member, sealed, now));
-                    if unsealed != Unsealed::OtherBox {
-                        found = (unsealed, opened, true);
-                        break;
-                    }
+                    let named = unsealed != Unsealed::OtherBox;
+                    (unsealed, opened, named)
                 }
-                found
-            }
+            },
             Attribution::NoLiveBox => {
                 let (unsealed, opened) = Self::unsealed(self.open(box_id, sealed, now));
                 (unsealed, opened, false)
@@ -372,8 +403,8 @@ mod tests {
     const INSTANCE: &str = "0123456789abcdef0123456789abcdef";
     const TOKEN: &str = "ghu_the_real_token";
 
-    struct World {
-        redeemer: Arc<BoxRedeemer<MemoryKey, MemoryKeychain>>,
+    struct World<K = MemoryKey> {
+        redeemer: Arc<BoxRedeemer<K, MemoryKeychain>>,
         boxes: BoxRegistry,
         revocations: Revocations,
         sealing: seal::ProxyPublicKey,
@@ -399,8 +430,13 @@ mod tests {
     }
 
     fn new_world() -> World {
+        new_world_with(|key| key)
+    }
+
+    /// A world whose sealing key is `wrap` of a fresh memory key.
+    fn new_world_with<K: HeldKey>(wrap: impl FnOnce(MemoryKey) -> K) -> World<K> {
         let store = MemoryStore::default();
-        let key = store.generate(Role::Sealing).unwrap();
+        let key = wrap(store.generate(Role::Sealing).unwrap());
         let sealing = key.public();
         let client = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
         let mut keys = ClientKeys::new();
@@ -445,7 +481,7 @@ mod tests {
     }
 
     /// A value sealed for `box_id` on this node, with a sign-in member.
-    fn sealed_for(world: &World, box_id: &str, expiry: u64, version: u32) -> String {
+    fn sealed_for<K>(world: &World<K>, box_id: &str, expiry: u64, version: u32) -> String {
         let jws = handle::sign(
             &world.client,
             &Claims {
@@ -615,6 +651,65 @@ mod tests {
             world.redeemer.redeem("b1", &api(), &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    /// A sealing key that counts its key agreements.
+    struct Counting {
+        inner: MemoryKey,
+        agreements: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HeldKey for Counting {
+        fn role(&self) -> Role {
+            self.inner.role()
+        }
+        fn public(&self) -> seal::ProxyPublicKey {
+            self.inner.public()
+        }
+        fn exportable(&self) -> bool {
+            self.inner.exportable()
+        }
+        fn agree(
+            &self,
+            peer: &seal::ProxyPublicKey,
+        ) -> Result<Zeroizing<Vec<u8>>, crate::keys::KeyError> {
+            self.agreements
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.agree(peer)
+        }
+        fn probe(&self) -> Result<(), crate::keys::KeyError> {
+            self.inner.probe()
+        }
+    }
+
+    #[test]
+    fn host_ip_cohort_value_is_opened_once() {
+        let agreements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&agreements);
+        let world = new_world_with(move |inner| Counting {
+            inner,
+            agreements: counter,
+        });
+        for id in ["c0", "c1", "c2", "c3", "c4"] {
+            world.boxes.register(id, github(), Stance::HostIp);
+        }
+        let request = RequestAuthority {
+            host: Some(api()),
+            target: None,
+        };
+        let count = || agreements.swap(0, std::sync::atomic::Ordering::SeqCst);
+
+        // The last cohort box in order: the old loop paid five agreements.
+        let sealed = sealed_for(&world, "c4", NOW + 600, GITHUB.host_set_version);
+        let verdict = world.redeemer.redeem("c0", &api(), &request, &sealed);
+        assert!(matches!(verdict, Verdict::Admit { .. }));
+        assert_eq!(count(), 1);
+
+        // A value for a box outside the cohort pays one agreement too.
+        let sealed = sealed_for(&world, "other", NOW + 600, GITHUB.host_set_version);
+        let verdict = world.redeemer.redeem("c0", &api(), &request, &sealed);
+        assert!(matches!(verdict, Verdict::Refuse(m) if m == Check::CrossBox.marker()));
+        assert_eq!(count(), 1);
     }
 
     /// One scenario for the property test.
