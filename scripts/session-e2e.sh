@@ -738,8 +738,11 @@ elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1 \
   :
 else
   min_cli_dir=""
+  # A dir counts only with BOTH halves of the pair: a shared target dir can
+  # hold a 'min' from an earlier build and no daemon, and taking it skips the
+  # build below and dies at the daemon gate.
   for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-    if [ -x "$d/min" ]; then
+    if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
       min_cli_dir="$d"
       break
     fi
@@ -758,7 +761,7 @@ else
   # instead of the run dying at the CLI gate with a build instruction the
   # caller cannot read mid-verify.
   if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
-    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    echo "no usable 'min' and '$min_daemon' pair on PATH or under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
     # copies into place (beside min). It builds in its own invocation, as
     # `just zoned-build` does: beside `-p minvmd`, cargo would unify
@@ -768,7 +771,7 @@ else
         && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
         >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-        if [ -x "$d/min" ]; then
+        if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
           min_cli_dir="$d"
           break
         fi
