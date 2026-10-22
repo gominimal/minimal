@@ -852,13 +852,23 @@ async fn cleanup_after_failed_finalize(
     /// the daemon may then orphan. The user's Ctrl-C is the bound; this only
     /// keeps the timer finite.
     const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    /// With no terminal on stdin (CI, a script) nobody presses Ctrl-C, so
+    /// the wait is bounded here instead and ends unknown: the row stays, the
+    /// daemon still settles the session, and the warning says how to see
+    /// what became of it.
+    const UNATTENDED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let deadline = if std::io::stdin().is_terminal() {
+        CLEANUP_DEADLINE
+    } else {
+        UNATTENDED_DEADLINE
+    };
     let answer = {
         let call = client.oneshot_rpc_with_deadline::<DestroySession>(
             minimald_rpc::DestroySessionRequest {
                 id: session_id,
                 only_if_unfinalized: true,
             },
-            CLEANUP_DEADLINE,
+            deadline,
         );
         tokio::pin!(call);
         let note = tokio::time::sleep(NOTE_AFTER);
