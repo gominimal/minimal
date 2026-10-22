@@ -421,8 +421,15 @@ impl BoxActor {
         // Kept before the launcher consumes `attach_env`: the launch folds
         // these into the shell's environment, and the host keeps them so it
         // can layer them onto everything it later runs in the session and
-        // republish them for the shell to re-read.
-        let connection_env = attach_env.connection_env();
+        // republish them for the shell to re-read. BEP-007: the grants'
+        // sealed values join this layer here, so the shell's launch
+        // environment holds them before its entrypoint runs.
+        let mut attach_env = attach_env;
+        let connection_env = box_runtime::place_launch_deliveries(
+            &mut attach_env,
+            record.id,
+            &box_runtime::launch_deliveries(&record),
+        );
         let launcher = self
             .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
             .await?;

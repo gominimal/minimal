@@ -133,6 +133,8 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
     }
 }
 
@@ -410,8 +412,19 @@ async fn destroy_tears_down_a_running_session() {
         .await
         .unwrap()
         .expect("session should resolve");
+    assert!(
+        !handle.is_destroying(),
+        "a session nobody destroys is not destroying",
+    );
 
     mngr.delete_session(id).await.unwrap();
+
+    // The handle an exec holds sees the destroy, which is how the
+    // exec knows to tell its client why the command stopped.
+    assert!(
+        handle.is_destroying(),
+        "the destroy did not mark the session's handle destroying",
+    );
 
     // The destroy cascade completed: the record is gone, and a fresh
     // get_session no longer resolves the (now removed) session.
@@ -429,6 +442,300 @@ async fn destroy_tears_down_a_running_session() {
         "the session should no longer resolve after destroy"
     );
     drop(handle);
+}
+
+/// A destroy that waits on its actor must not hold the mainloop. Here
+/// the wait is an `on_destroy` hook that sleeps; in the lab (710d) it
+/// was the reap of a session whose actor sat inside a stalled
+/// package-graph clone after its client gave up, and `min ls` queued
+/// behind it for 70 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_destroy_does_not_hold_the_mainloop() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 5".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    // Measure once the destroy holds the session (its hook then runs
+    // on the teardown task).
+    until_claimed(&mngr, id).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), mngr.list())
+        .await
+        .expect("`list` queued behind a destroy that was waiting on its actor")
+        .unwrap();
+    assert!(
+        !destroy.is_finished(),
+        "the destroy hook should still be running"
+    );
+
+    let hook_failures = destroy.await.unwrap().unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record should be gone after destroy"
+    );
+}
+
+/// Shutdown waits out a teardown in flight: the destroy runs on a task of
+/// its own, and its hook and record delete end before the state volume
+/// is quiesced, so neither races the unmount. The hook sleeps, so a
+/// shutdown that did not wait would return in milliseconds with the
+/// destroy still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_a_teardown_in_flight() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    until_claimed(&mngr, id).await;
+    let started = std::time::Instant::now();
+    mngr.shutdown(false)
+        .await
+        .expect("a teardown in flight does not refuse an unforced shutdown");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "shutdown returned before the destroy hook could have ended"
+    );
+    // The destroy answered before shutdown returned: its result is
+    // already in, so the join does not wait.
+    let hook_failures = tokio::time::timeout(std::time::Duration::from_millis(500), destroy)
+        .await
+        .expect("shutdown returned with the teardown still running")
+        .unwrap()
+        .unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+}
+
+/// A resume during a teardown brings up nothing for it: the record is
+/// still there (it outlives the actor by the teardown's length) and has
+/// no actor in `running`, which is what resume looks for, but the
+/// session is being destroyed, not idle. Without the tearing-down check a
+/// resume mid-teardown started a second actor on the record the first
+/// was about to delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_during_a_teardown_does_not_bring_the_session_up() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    until_claimed(&mngr, id).await;
+    let resumed = mngr.resume_active_sessions().await.unwrap();
+    assert_eq!(resumed, 0, "a session being torn down is not resumed");
+    assert!(
+        mngr.get_composition(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down has no composition to read, as it has no record"
+    );
+    assert!(
+        !destroy.is_finished(),
+        "the destroy hook should still be running"
+    );
+
+    let hook_failures = destroy.await.unwrap().unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone after the destroy, not resurrected by the resume"
+    );
+}
+
+/// A session being torn down is gone to everyone else: a second destroy
+/// in the window is refused, a resolve finds nothing, and the
+/// `on_destroy` hook runs once. With the teardown off the mainloop the
+/// window is real (the first review of #2224 found it): without the
+/// tearing-down set, the second destroy brought up a fresh actor from
+/// the still-present record and ran the hook again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_destroy_during_a_teardown_runs_no_hook_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("sleep 2; echo ran >> {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let first = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.delete_session(id).await })
+    };
+    // Once the first destroy holds the session.
+    until_claimed(&mngr, id).await;
+
+    let second = mngr.delete_session(id).await;
+    assert!(
+        matches!(&second, Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy),
+        "a second destroy during the teardown should be refused, got {second:?}"
+    );
+    assert!(
+        mngr.get_session(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down should resolve to nothing"
+    );
+    assert!(
+        mngr.list().await.unwrap().iter().all(|s| s.id != id),
+        "a session being torn down should not be listed"
+    );
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down should have no record to read"
+    );
+
+    first.await.unwrap().unwrap();
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(ran.lines().count(), 1, "the destroy hook ran {ran:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record should be gone after destroy"
+    );
+}
+
+/// A create whose name is held by a session still being torn down says
+/// so, rather than reporting a plain collision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_during_a_teardown_names_the_destroy() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let destroying = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.delete_session(id).await })
+    };
+    until_claimed(&mngr, id).await;
+
+    let err = mngr
+        .create_session(sample_config(), None)
+        .await
+        .expect_err("the name is still held by the session being destroyed");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        err.to_string().contains("still being destroyed"),
+        "the error should name the destroy: {err}"
+    );
+    destroying.await.unwrap().unwrap();
+}
+
+/// Waits until a destroy has claimed `id`: from that moment the
+/// listing no longer shows it (a session in the tearing-down set is
+/// gone to it), so a test can act on the teardown window itself rather
+/// than on a guess at how long reaching it takes.
+async fn until_claimed(mngr: &BoxManagerHandle, id: SessionId) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while mngr.list().await.unwrap().iter().any(|s| s.id == id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the destroy never claimed the session");
 }
 
 /// Destroying an unknown ID is a `NotFound` error.
@@ -1552,4 +1859,98 @@ async fn creation_order_holder_follows_box_id_time_order() {
             .expect("each created box has a record");
         assert_eq!(record.id, *id, "the record is keyed by the box id");
     }
+}
+
+/// BEP-007: the sealed values a create request carries ride the box's
+/// stored record, and a host launch takes them from it, so every launch,
+/// after a daemon restart included, places them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_deliveries_ride_the_record_to_the_host_params() {
+    let (_state, _cache, mngr) = manager().await;
+    let deliveries = vec![
+        boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: "v1.sealed-one".to_string(),
+        },
+        boxes::SealedDelivery {
+            variable: "GITHUB_TOKEN".to_string(),
+            sealed: "v1.sealed-two".to_string(),
+        },
+    ];
+    let config = minimald_rpc::BoxConfig {
+        sealed_deliveries: deliveries.clone(),
+        ..sample_config()
+    };
+    let id = mngr.create_session(config, None).await.unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.sealed_deliveries, deliveries);
+    assert_eq!(crate::box_runtime::launch_deliveries(&record), deliveries);
+
+    // The `GetSessionRecord` reply for the grant box carries no sealed
+    // value, on the wire or in the record, while the store keeps them.
+    let reply = crate::rpc::session_record_response(Some(record.clone()));
+    let replied = reply.record.as_ref().expect("the reply carries the record");
+    assert!(replied.sealed_deliveries.is_empty(), "{replied:?}");
+    assert_eq!(replied.id, record.id);
+    let wire = serde_json_lenient::to_string(&reply).unwrap();
+    assert!(
+        !wire.contains("v1.sealed-one") && !wire.contains("sealed_deliveries"),
+        "{wire}"
+    );
+    let stored = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the store still has the record");
+    assert_eq!(stored.sealed_deliveries, deliveries);
+
+    // A box with no grant carries none.
+    let id = mngr
+        .create_session(
+            minimald_rpc::BoxConfig {
+                name: Some("no-grant".to_string()),
+                ..sample_config()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert!(crate::box_runtime::launch_deliveries(&record).is_empty());
+
+    // A grant whose name is not a variable name is refused, and no record
+    // is stored for it.
+    let err = mngr
+        .create_session(
+            minimald_rpc::BoxConfig {
+                name: Some("bad-grant".to_string()),
+                sealed_deliveries: vec![boxes::SealedDelivery {
+                    variable: "X=1; touch /tmp/owned #".to_string(),
+                    sealed: "v1.sealed-three".to_string(),
+                }],
+                ..sample_config()
+            },
+            None,
+        )
+        .await
+        .expect_err("a grant name that is not a variable name is refused");
+    assert!(
+        err.to_string()
+            .contains("not a valid environment variable name"),
+        "{err}"
+    );
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Name("bad-grant".to_string()))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

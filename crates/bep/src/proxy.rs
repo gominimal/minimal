@@ -30,11 +30,18 @@
 //! gets a handshake refusal. The upstream leg validates the upstream's chain
 //! against the host trust store that [`Proxy::new`] takes.
 //!
+//! The upstream leg must validate before the proxy answers `200`
+//! (BEP-055). A leg that fails TLS validation is refused with `502`, and the
+//! audit log records it `upstream_tls_invalid`. The interception root is
+//! taken out of the upstream roots, so a chain under it never validates.
+//!
 //! Inside the tunnel, the request half goes through
-//! [`crate::http::forward_requests`], so the upstream gets the canonical
-//! serialization of each head. The response half is copied to the box as
-//! the upstream wrote it. The sealed-value redemption is not part of this
-//! shell yet.
+//! [`crate::forward::forward_requests`]. Each parsed request goes to the
+//! decision: a sealed value to the [`Redeemer`], an unsealed request through
+//! unchanged (BEP-030). The upstream gets the canonical serialization of
+//! each head. The response half goes through
+//! [`crate::forward::relay_responses`], which relays each chunk as it
+//! arrives (BEP-N01).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -45,7 +52,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -54,9 +61,11 @@ use tracing::Instrument as _;
 
 use crate::audit::{AuditLog, Decision, Kind, Mapping, Outcome};
 use crate::ca::{Ca, CaError, CaKey, Leaf};
+use crate::forward::{self, Flow, HalfEnd, Redeemer, Unwired, UpstreamError, Validated};
 use crate::http::{self, CloseReason, Parse};
 use crate::listener::Delivery;
 use crate::module::Module;
+use crate::redeem;
 
 /// The one ALPN protocol both TLS legs offer.
 pub const ALPN_HTTP11: &[u8] = b"http/1.1";
@@ -142,6 +151,12 @@ pub trait LeafIssuer: Send + Sync {
     ///
     /// The CA's refusal.
     fn issue(&self, hostname: &str, now: SystemTime) -> Result<Leaf, CaError>;
+
+    /// The interception root, which the upstream leg never trusts (BEP-055).
+    /// `None` only for an issuer that issues no leaves.
+    fn root(&self) -> Option<CertificateDer<'static>> {
+        None
+    }
 }
 
 impl<K: CaKey + Sync> LeafIssuer for Mutex<Ca<'static, K>> {
@@ -149,6 +164,15 @@ impl<K: CaKey + Sync> LeafIssuer for Mutex<Ca<'static, K>> {
         self.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .issue_leaf(hostname, now)
+    }
+
+    fn root(&self) -> Option<CertificateDer<'static>> {
+        Some(
+            self.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .root()
+                .clone(),
+        )
     }
 }
 
@@ -225,7 +249,7 @@ pub fn native_roots() -> io::Result<RootCertStore> {
     Ok(roots)
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
@@ -236,6 +260,7 @@ pub struct Proxy {
     upstream_tls: TlsConnector,
     resolver: Arc<dyn Resolve>,
     audit: Arc<dyn AuditWriter>,
+    redeemer: Arc<dyn Redeemer>,
     servers: Mutex<HashMap<String, (Instant, Arc<ServerConfig>)>>,
 }
 
@@ -249,11 +274,17 @@ impl fmt::Debug for Proxy {
 
 impl Proxy {
     /// A proxy that admits `admission`, issues leaves from `leaves`, and
-    /// validates upstreams against `upstream_roots`.
+    /// validates upstreams against `upstream_roots`. The interception root
+    /// of `leaves` is taken out of `upstream_roots` (BEP-055). The decision
+    /// is [`Unwired`] until [`Proxy::with_redeemer`] replaces it. [`Unwired`]
+    /// declares no egress for any box, so it refuses every request inside a
+    /// tunnel. Issue #2483 wires the real redeemer and each box's declared
+    /// egress into `bep serve`.
     ///
     /// # Errors
     ///
-    /// When rustls refuses its default protocol versions.
+    /// When rustls refuses its default protocol versions, or when the
+    /// interception root of `leaves` is not a certificate rustls can parse.
     pub fn new(
         admission: Admission,
         leaves: Arc<dyn LeafIssuer>,
@@ -261,24 +292,45 @@ impl Proxy {
         resolver: Arc<dyn Resolve>,
         audit: Arc<dyn AuditWriter>,
     ) -> Result<Self, rustls::Error> {
+        let mut upstream_roots = upstream_roots;
+        if let Some(root) = leaves.root() {
+            // Fail closed: a root that cannot be parsed cannot be removed,
+            // so the proxy refuses to start rather than trust it (BEP-055).
+            let mut interception = RootCertStore::empty();
+            interception.add(root)?;
+            upstream_roots
+                .roots
+                .retain(|anchor| !interception.roots.contains(anchor));
+        }
         let mut upstream = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()?
             .with_root_certificates(upstream_roots)
             .with_no_client_auth();
         // BEP-073: the upstream leg is HTTP/1.1 too.
         upstream.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+        let redeemer: Arc<dyn Redeemer> = Arc::new(Unwired);
         Ok(Self {
             admission,
             leaves,
             upstream_tls: TlsConnector::from(Arc::new(upstream)),
             resolver,
             audit,
+            redeemer,
             servers: Mutex::new(HashMap::new()),
         })
     }
 
+    /// This proxy, with `redeemer` as its per-request decision.
+    #[must_use]
+    pub fn with_redeemer(mut self, redeemer: Arc<dyn Redeemer>) -> Self {
+        self.redeemer = redeemer;
+        self
+    }
+
     /// Serves one admitted box connection. The span carries the box id, the
-    /// authority the box asked for, and the outcome.
+    /// authority the box asked for, the upstream's validation outcome, the
+    /// last substitution decision, and the outcome. It never carries a
+    /// credential.
     pub async fn serve<S>(&self, delivery: Delivery, stream: S)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -289,6 +341,8 @@ impl Proxy {
             box_id = %box_id,
             source = %delivery.source,
             authority = tracing::field::Empty,
+            upstream_tls = tracing::field::Empty,
+            substitution = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
         async {
@@ -491,14 +545,46 @@ impl Proxy {
         let dialed = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.dial_upstream(&host, port))
             .await
             .unwrap_or_else(|_| {
-                Err(io::Error::new(
+                Err(UpstreamError::Unreachable(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "the connection timed out",
-                ))
+                )))
             });
         let upstream = match dialed {
-            Ok(upstream) => upstream,
-            Err(err) => {
+            Ok(upstream) => {
+                tracing::Span::current().record("upstream_tls", "valid");
+                upstream
+            }
+            Err(err @ (UpstreamError::Invalid(_) | UpstreamError::Handshake(_))) => {
+                // BEP-055: nothing goes on a leg that did not validate.
+                let (outcome, log, reason) = if matches!(err, UpstreamError::Invalid(_)) {
+                    (
+                        "invalid",
+                        "the upstream certificate did not validate",
+                        "the server's certificate did not validate against this computer's trusted certificates",
+                    )
+                } else {
+                    (
+                        "handshake_failed",
+                        "the upstream TLS handshake failed",
+                        "the TLS handshake with the server failed",
+                    )
+                };
+                tracing::Span::current().record("upstream_tls", outcome);
+                tracing::warn!(authority, error = %err, "{log}");
+                self.audit_refusal(box_id, &authority, forward::UPSTREAM_TLS_INVALID);
+                respond(
+                    &mut stream,
+                    502,
+                    "Bad Gateway",
+                    &format!(
+                        "The Box Egress Proxy refused the connection to {authority}, because {reason}."
+                    ),
+                )
+                .await;
+                return Ended::Refused(forward::UPSTREAM_TLS_INVALID);
+            }
+            Err(UpstreamError::Unreachable(err)) => {
                 tracing::warn!(authority, error = %err, "the upstream connection failed");
                 respond(
                     &mut stream,
@@ -534,15 +620,17 @@ impl Proxy {
                 return Ended::Closed("box_tls_timeout");
             }
         };
-        relay(
+        let flow = Flow::new(
             box_id,
-            boxed,
-            upstream,
-            &authority,
+            redeem::Authority {
+                host: host.clone(),
+                port,
+            },
             Arc::clone(&self.audit),
-            IDLE_TIMEOUT,
-        )
-        .await;
+            Arc::clone(&self.redeemer),
+            upstream.proof(),
+        );
+        relay(flow, boxed, upstream, IDLE_TIMEOUT).await;
         Ended::Relayed
     }
 
@@ -550,16 +638,14 @@ impl Proxy {
         &self,
         host: &str,
         port: u16,
-    ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    ) -> Result<Validated<tokio_rustls::client::TlsStream<TcpStream>>, UpstreamError> {
         let resolver = Arc::clone(&self.resolver);
         let name = host.to_owned();
         let addrs = tokio::task::spawn_blocking(move || resolver.resolve(&name, port))
             .await
             .map_err(io::Error::other)??;
         let tcp = TcpStream::connect(&addrs[..]).await?;
-        let server_name = ServerName::try_from(host.to_owned())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        self.upstream_tls.connect(server_name, tcp).await
+        forward::validate(&self.upstream_tls, host, tcp).await
     }
 
     /// The TLS server side for `host`, with a leaf the CA issued for it. A
@@ -658,7 +744,12 @@ async fn read_head<S: AsyncRead + Unpin>(
 }
 
 /// Writes one refusal and closes the write half.
-async fn respond<S: AsyncWrite + Unpin>(stream: &mut S, status: u16, reason: &str, body: &str) {
+pub(crate) async fn respond<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    body: &str,
+) {
     let body = format!("{body}\n");
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -680,7 +771,7 @@ fn split_authority(text: &str) -> Option<(String, u16)> {
 
 /// The scheme, host and port of an absolute-form target. The port defaults
 /// to the scheme's.
-fn absolute_form(target: &str) -> Option<(&'static str, String, u16)> {
+pub(crate) fn absolute_form(target: &str) -> Option<(&'static str, String, u16)> {
     let lower = target
         .get(..8)
         .map(str::to_ascii_lowercase)
@@ -704,84 +795,54 @@ fn absolute_form(target: &str) -> Option<(&'static str, String, u16)> {
     }
 }
 
-/// The audit sink for the heads inside a tunnel: a refused head is a
-/// decision record with its marker.
-struct HeadAudit {
-    audit: Arc<dyn AuditWriter>,
-    authority: String,
-}
-
-impl http::AuditSink for HeadAudit {
-    fn record(&mut self, event: http::AuditEvent) {
-        self.audit.write(&Decision {
-            kind: Kind::Decision,
-            box_id: event.box_id,
-            authority: self.authority.clone(),
-            identifier: None,
-            mapping: Mapping::ModuleUnmapped,
-            outcome: Outcome::Refuse,
-            marker: Some(event.marker.to_owned()),
-        });
-    }
-}
-
-/// Relays one terminated flow: the request half through the strict
-/// forwarder, the response half as the upstream wrote it.
+/// Relays one terminated flow: each request through the decision and the
+/// strict forwarder, each response chunk as the upstream writes it.
 ///
 /// The flow ends when it passes no bytes in either direction for `idle`.
 /// It also ends when the upstream closes: the request half then reads end
 /// of file from the box, so its blocking thread returns at once.
 ///
-/// This forwards every request head with no per-request decision, no handle
-/// redemption and no admit audit record. Gatehouse §6.10 requires all three.
-/// `bep serve` must not reach this function until the redemption decision is
-/// wired into it, which is T11
-/// (<https://github.com/gominimal/minimal/issues/2272>). Today only the
-/// `NoSigningKey` issuer in `bep serve` keeps it off this path. A signing
-/// Keychain key (<https://github.com/gominimal/minimal/issues/2440>) alone
-/// does not lift that interim.
-async fn relay<B, U>(
-    box_id: &str,
-    boxed: B,
-    upstream: U,
-    authority: &str,
-    audit: Arc<dyn AuditWriter>,
-    idle: Duration,
-) where
+/// The leg is a [`Validated`] stream, so a request reaches only an upstream
+/// whose chain and hostname validated (BEP-055).
+async fn relay<B, U>(flow: Flow, boxed: B, upstream: Validated<U>, idle: Duration)
+where
     B: AsyncRead + AsyncWrite + Send + 'static,
     U: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (box_read, mut box_write) = tokio::io::split(boxed);
-    let (up_read, up_write) = tokio::io::split(upstream);
+    let (up_read, up_write) = tokio::io::split(upstream.into_inner());
     let activity = Activity::new();
     let done = tokio_util::sync::CancellationToken::new();
     let box_read = Watched::new(box_read, &activity, &done, idle);
     let mut up_read = Watched::new(up_read, &activity, &done, idle);
-    let id = box_id.to_owned();
-    let mut sink = HeadAudit {
-        audit,
-        authority: authority.to_owned(),
-    };
+    let (refused_tx, refused_rx) = tokio::sync::oneshot::channel();
+    let span = tracing::Span::current();
     let requests = tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         let mut client = tokio_util::io::SyncIoBridge::new(box_read);
         let mut upstream = tokio_util::io::SyncIoBridge::new(up_write);
-        let reason = http::forward_requests(&id, &mut client, &mut upstream, &mut sink);
+        let end = forward::forward_requests(&flow, &mut client, &mut upstream);
+        // Send the refusal before the shutdown: the upstream can close as
+        // soon as it reads end of file, and the response half must already
+        // hold the refusal then.
+        let rule = match end {
+            HalfEnd::Closed(reason) => reason.rule(),
+            HalfEnd::Refused(refusal) => {
+                let marker = refusal.marker;
+                let _ = refused_tx.send(refusal);
+                marker
+            }
+        };
         let _ = upstream.shutdown();
-        reason
+        rule
     });
     let responses = async {
-        let copied = tokio::io::copy(&mut up_read, &mut box_write).await;
-        if let Err(err) = copied
-            && err.kind() == io::ErrorKind::TimedOut
-        {
-            tracing::info!("the relayed flow was idle too long");
-        }
-        let _ = box_write.shutdown().await;
+        forward::relay_responses(&mut up_read, &mut box_write, refused_rx).await;
         done.cancel();
     };
-    let (reason, ()) = tokio::join!(requests, responses);
-    if let Ok(reason) = reason {
-        tracing::debug!(rule = reason.rule(), "the request half ended");
+    let (ended, ()) = tokio::join!(requests, responses);
+    if let Ok(rule) = ended {
+        tracing::debug!(rule, "the request half ended");
     }
 }
 
@@ -931,12 +992,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SigningKey as _};
-    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::ServerName;
     use tokio::net::{TcpListener, UnixStream};
     use tokio_rustls::LazyConfigAcceptor;
     use zeroize::Zeroizing;
@@ -993,7 +1054,7 @@ mod tests {
     }
 
     /// The interception CA, and its root for the box's trust store.
-    fn interception_ca() -> (Arc<dyn LeafIssuer>, CertificateDer<'static>) {
+    pub(crate) fn interception_ca() -> (Arc<dyn LeafIssuer>, CertificateDer<'static>) {
         let ca = Ca::new(
             test_key(Role::Root),
             test_key(Role::Signing),
@@ -1090,7 +1151,7 @@ mod tests {
 
     /// Every upstream name resolves to one address, and the calls are
     /// counted.
-    struct To(SocketAddr, AtomicUsize);
+    pub(crate) struct To(pub(crate) SocketAddr, pub(crate) AtomicUsize);
 
     impl Resolve for To {
         fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
@@ -1101,7 +1162,7 @@ mod tests {
 
     const BOX: [u8; 16] = [0x42; 16];
 
-    fn delivery() -> Delivery {
+    pub(crate) fn delivery() -> Delivery {
         Delivery {
             box_id: BOX,
             source: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 7), 40_000),
@@ -1117,6 +1178,33 @@ mod tests {
         audit: Arc<Mutex<Vec<Decision>>>,
     }
 
+    /// A redeemer whose box declares the GitHub host set as its egress. It
+    /// refuses every sealed value.
+    struct DeclaresGithub;
+
+    impl Redeemer for DeclaresGithub {
+        fn egress(&self, _box_id: &str) -> Vec<redeem::Authority<String>> {
+            GITHUB
+                .hosts
+                .iter()
+                .map(|a| redeem::Authority {
+                    host: a.host.to_owned(),
+                    port: a.port,
+                })
+                .collect()
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &redeem::Authority<String>,
+            _request: &redeem::RequestAuthority<String>,
+            _sealed: &str,
+        ) -> forward::Verdict {
+            forward::Verdict::Refuse(redeem::Check::Undecryptable.marker())
+        }
+    }
+
     async fn harness_with(audit: Arc<dyn AuditWriter>) -> (Harness, Arc<dyn AuditWriter>) {
         let upstream = upstream().await;
         let (leaves, root) = interception_ca();
@@ -1128,7 +1216,8 @@ mod tests {
             resolver.clone(),
             Arc::clone(&audit),
         )
-        .unwrap();
+        .unwrap()
+        .with_redeemer(Arc::new(DeclaresGithub));
         (
             Harness {
                 proxy: Arc::new(proxy),
@@ -1148,8 +1237,40 @@ mod tests {
         h
     }
 
+    /// An issuer whose interception root is not a certificate.
+    struct UnparsableRoot;
+
+    impl LeafIssuer for UnparsableRoot {
+        fn issue(&self, _hostname: &str, _now: SystemTime) -> Result<Leaf, CaError> {
+            Err(CaError::Key(KeyError::Store {
+                role: Role::Signing,
+                detail: "this test issuer issues no leaves".into(),
+            }))
+        }
+        fn root(&self) -> Option<CertificateDer<'static>> {
+            Some(CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]))
+        }
+    }
+
+    // BEP-055: a root the proxy cannot take out of the upstream roots stops
+    // the proxy, so the upstream leg never trusts it.
+    #[test]
+    fn upstream_tls_refuses_to_start_when_interception_root_unparsable() {
+        let result = Proxy::new(
+            Admission::new(&[GITHUB], [("vault.example.com", 443)]),
+            Arc::new(UnparsableRoot),
+            RootCertStore::empty(),
+            Arc::new(To(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+                AtomicUsize::new(0),
+            )),
+            Arc::new(Mutex::new(Vec::<Decision>::new())),
+        );
+        assert!(result.is_err());
+    }
+
     /// A box connection to the proxy, already admitted by the listener.
-    fn box_connection(proxy: &Arc<Proxy>) -> tokio::io::DuplexStream {
+    pub(crate) fn box_connection(proxy: &Arc<Proxy>) -> tokio::io::DuplexStream {
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let proxy = Arc::clone(proxy);
         tokio::spawn(async move { proxy.serve(delivery(), theirs).await });
@@ -1169,7 +1290,7 @@ mod tests {
     }
 
     /// Reads a response head, byte by byte, so no TLS byte after it is taken.
-    async fn response_head<S: AsyncRead + Unpin>(stream: &mut S) -> String {
+    pub(crate) async fn response_head<S: AsyncRead + Unpin>(stream: &mut S) -> String {
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
             let mut byte = [0u8; 1];
@@ -1181,7 +1302,10 @@ mod tests {
         String::from_utf8(head).unwrap()
     }
 
-    fn box_tls(root: &CertificateDer<'static>, alpn: &[&[u8]]) -> tokio_rustls::TlsConnector {
+    pub(crate) fn box_tls(
+        root: &CertificateDer<'static>,
+        alpn: &[&[u8]],
+    ) -> tokio_rustls::TlsConnector {
         let mut roots = RootCertStore::empty();
         roots.add(root.clone()).unwrap();
         let mut config = ClientConfig::builder_with_provider(provider())
@@ -1193,7 +1317,7 @@ mod tests {
         tokio_rustls::TlsConnector::from(Arc::new(config))
     }
 
-    const CONNECT_GITHUB: &[u8] =
+    pub(crate) const CONNECT_GITHUB: &[u8] =
         b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n";
 
     // BEP-073: through the listener, a box's CONNECT to a GitHub host
@@ -1419,20 +1543,32 @@ mod tests {
 
     const H2_PREFACE_FULL: &[u8] = http::H2_PREFACE;
 
+    fn flow<U>(audit: &Arc<dyn AuditWriter>, upstream: &Validated<U>) -> Flow {
+        Flow::new(
+            "b",
+            redeem::Authority {
+                host: "github.com".to_owned(),
+                port: 443,
+            },
+            Arc::clone(audit),
+            Arc::new(Unwired),
+            upstream.proof(),
+        )
+    }
+
     #[tokio::test]
     async fn relay_ends_an_idle_flow_and_an_upstream_close() {
         let audit: Arc<dyn AuditWriter> = Arc::new(Mutex::new(Vec::<Decision>::new()));
         // Neither side sends: the idle limit ends the flow.
         let (boxed, _box_peer) = tokio::io::duplex(1024);
         let (upstream, _up_peer) = tokio::io::duplex(1024);
+        let upstream = Validated::unchecked(upstream);
         tokio::time::timeout(
             Duration::from_secs(10),
             relay(
-                "b",
+                flow(&audit, &upstream),
                 boxed,
                 upstream,
-                "github.com:443",
-                Arc::clone(&audit),
                 Duration::from_millis(200),
             ),
         )
@@ -1443,14 +1579,13 @@ mod tests {
         let (boxed, _box_peer) = tokio::io::duplex(1024);
         let (upstream, up_peer) = tokio::io::duplex(1024);
         drop(up_peer);
+        let upstream = Validated::unchecked(upstream);
         tokio::time::timeout(
             Duration::from_secs(10),
             relay(
-                "b",
+                flow(&audit, &upstream),
                 boxed,
                 upstream,
-                "github.com:443",
-                audit,
                 Duration::from_secs(3600),
             ),
         )

@@ -47,6 +47,16 @@ impl PublishedKey {
     }
 }
 
+/// How long the root CA is valid, counted from the root key's creation.
+///
+/// OQ3: the root's validity is an open question
+/// (<https://github.com/gominimal/arch/issues/85>). Until it is answered the
+/// root is valid for ten years. The interception CA issues its root
+/// certificate with this validity (`ROOT_VALIDITY` in [`crate::ca`] is
+/// defined from it). Its end is the expiry of every sign-in reference a mint
+/// makes (BEP-005).
+pub const ROOT_VALIDITY_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
 /// The published identity: one entry per key role.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Identity {
@@ -62,6 +72,11 @@ pub struct Identity {
     /// The signing CA key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing: Option<PublishedKey>,
+    /// When the root CA's validity ends, in seconds since the Unix epoch:
+    /// the root key's creation time plus [`ROOT_VALIDITY_SECS`]. A mint
+    /// reads it as the expiry of each member (BEP-005).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_not_after: Option<u64>,
 }
 
 /// Why a published identity was not used.
@@ -97,6 +112,13 @@ pub enum PublishError {
         /// The error.
         source: io::Error,
     },
+    /// The identity does not say when the root CA's validity ends. An
+    /// identity that an older `bep` published has no such entry, and a
+    /// restart keeps it unset while the root key stays the same.
+    #[error(
+        "The proxy's published identity does not say when its root certificate expires. Run `bep --replace-key root` to make a new root key with a known expiry, then start `bep serve` again."
+    )]
+    NoRootValidity,
     /// The value was not sealed.
     #[error("The value was not sealed: {0}")]
     Seal(#[from] SealError),
@@ -109,7 +131,54 @@ impl Identity {
             sealing: Some(PublishedKey::of(&keys.sealing.public())),
             root: Some(PublishedKey::of(&keys.root.public())),
             signing: Some(PublishedKey::of(&keys.signing.public())),
+            root_not_after: None,
         }
+    }
+
+    /// This identity with the end of the root CA's validity.
+    ///
+    /// The key store keeps no creation time, so the end is taken only from
+    /// a known one. `root_made_at` is the root key's creation time, in
+    /// seconds since the Unix epoch, when the caller made the root key
+    /// itself. The validity then ends [`ROOT_VALIDITY_SECS`] later.
+    /// Otherwise, when `previous` names the same root key, its end is kept.
+    /// In every other case the end stays unset. An identity with no root
+    /// entry gets no end.
+    ///
+    /// A root key of unknown age, such as one loaded from the store with no
+    /// identity file or one that an older `bep` published with no end, can
+    /// be older than now. An end counted from now can then be later than
+    /// the root's real end. So a mint refuses the identity until the root
+    /// key is replaced.
+    #[must_use]
+    pub fn with_root_validity(
+        mut self,
+        previous: Option<&Self>,
+        root_made_at: Option<u64>,
+    ) -> Self {
+        let kid = self.root.as_ref().map(|root| root.kid.as_str());
+        let same_root = previous.filter(|previous| {
+            kid.is_some() && previous.root.as_ref().map(|r| r.kid.as_str()) == kid
+        });
+        self.root_not_after = match (kid, root_made_at, same_root) {
+            (None, _, _) => None,
+            (Some(_), Some(made_at), _) => Some(made_at.saturating_add(ROOT_VALIDITY_SECS)),
+            (Some(_), None, Some(previous)) => previous.root_not_after,
+            (Some(_), None, None) => None,
+        };
+        self
+    }
+
+    /// When the root CA's validity ends, in seconds since the Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`PublishError::NotAKey`] naming the root role when the identity has
+    /// no usable root key, and [`PublishError::NoRootValidity`] when it does
+    /// not carry the end.
+    pub fn root_not_after(&self) -> Result<u64, PublishError> {
+        self.key(Role::Root)?;
+        self.root_not_after.ok_or(PublishError::NoRootValidity)
     }
 
     /// The identity to publish after `role` was replaced by `key`.
@@ -144,6 +213,9 @@ impl Identity {
             sealing: entry(Role::Sealing),
             root: entry(Role::Root),
             signing: entry(Role::Signing),
+            // The caller adds the end with `with_root_validity`, from the
+            // root key's creation time when it is known.
+            root_not_after: None,
         }
     }
 
@@ -576,5 +648,100 @@ mod tests {
             .seal(&context(&republished), &members())
             .unwrap();
         assert!(restarted.sealing.open(&fresh, &binding()).is_ok());
+    }
+
+    // BEP-005, OQ3: the identity carries the end of the root's validity, the
+    // root key's creation plus the fixed default, from one start to the next.
+    #[test]
+    fn published_identity_carries_the_root_validity_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let store = MemoryStore::default();
+        let created = 1_700_000_000;
+
+        // The first start makes the root key, so its validity starts then.
+        let keys = load(&store, &[]).unwrap();
+        Identity::of(&keys)
+            .with_root_validity(None, Some(created))
+            .publish(&path)
+            .unwrap();
+        let first = Identity::read(&path).unwrap();
+        assert_eq!(first.root_not_after, Some(created + ROOT_VALIDITY_SECS));
+        assert_eq!(
+            first.root_not_after().unwrap(),
+            created + ROOT_VALIDITY_SECS
+        );
+        drop(keys);
+
+        // A later start with the same root key keeps the end.
+        let restarted = load(&store, &Role::ALL).unwrap();
+        let later = Identity::of(&restarted).with_root_validity(Some(&first), None);
+        assert_eq!(later.root_not_after, first.root_not_after);
+        drop(restarted);
+
+        // A replaced root key starts a new validity.
+        let replaced_at = created + 2 * 86_400;
+        let new = replace(&store, Role::Root).unwrap();
+        let after = Identity::after_replacement(&store, Role::Root, &new, Some(&first))
+            .with_root_validity(Some(&first), Some(replaced_at));
+        assert_eq!(after.root_not_after, Some(replaced_at + ROOT_VALIDITY_SECS));
+
+        // A replaced sealing key leaves the root's end as it was.
+        let sealing = replace(&store, Role::Sealing).unwrap();
+        let resealed = Identity::after_replacement(&store, Role::Sealing, &sealing, Some(&after))
+            .with_root_validity(Some(&after), None);
+        assert_eq!(resealed.root_not_after, after.root_not_after);
+
+        // An identity from an older `bep` has no end, and a mint refuses it.
+        let old: Identity = serde_json::from_str(
+            &serde_json::to_string(&Identity {
+                root_not_after: None,
+                ..first
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = old.root_not_after().unwrap_err();
+        assert!(matches!(err, PublishError::NoRootValidity), "{err}");
+
+        // A restart with the same root key does not give such an identity
+        // an end, because the root key's creation time is unknown.
+        let upgraded = Identity {
+            root_not_after: None,
+            ..resealed
+        };
+        let restarted = load(&store, &Role::ALL).unwrap();
+        let republished = Identity::of(&restarted).with_root_validity(Some(&upgraded), None);
+        assert_eq!(republished.root_not_after, None);
+        assert!(matches!(
+            republished.root_not_after(),
+            Err(PublishError::NoRootValidity)
+        ));
+        drop(restarted);
+
+        // Its next root replacement starts a known validity.
+        let replaced_again = replaced_at + 3 * 86_400;
+        let root = replace(&store, Role::Root).unwrap();
+        let renewed = Identity::after_replacement(&store, Role::Root, &root, Some(&upgraded))
+            .with_root_validity(Some(&upgraded), Some(replaced_again));
+        assert_eq!(
+            renewed.root_not_after,
+            Some(replaced_again + ROOT_VALIDITY_SECS)
+        );
+
+        // With no identity file, a start that loads the root key from the
+        // store does not know its age, so the identity gets no end.
+        std::fs::remove_file(&path).unwrap();
+        let loaded = load(&store, &[]).unwrap();
+        Identity::of(&loaded)
+            .with_root_validity(None, None)
+            .publish(&path)
+            .unwrap();
+        let unknown = Identity::read(&path).unwrap();
+        assert_eq!(unknown.root_not_after, None);
+        assert!(matches!(
+            unknown.root_not_after(),
+            Err(PublishError::NoRootValidity)
+        ));
     }
 }

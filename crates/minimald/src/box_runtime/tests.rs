@@ -6948,3 +6948,156 @@ async fn shell_exit_keep_item_names_the_restored_registration_for_a_registered_b
         "both prompts keep the Delete item"
     );
 }
+
+/// BEP-007: a grant's sealed value is placed in the grant's environment
+/// variable, over any value the session's environment held there, and is
+/// the only value the variable holds: in the published per-attach files the
+/// shell re-reads before every command, and in what the host runs in the
+/// box. A box with no grant gets no such variable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_value_is_placed_in_its_grant_variable_only() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    const PLAINTEXT: &str = "ghp_plaintexttoken";
+    let tmp = tempfile::tempdir().unwrap();
+    let home =
+        DaemonAbsPath::try_new(camino::Utf8PathBuf::try_from(tmp.path().to_path_buf()).unwrap())
+            .unwrap();
+    let paths = BoxPaths {
+        home: home.clone(),
+        ..test_paths()
+    };
+    // A value already in the variable is the one a delivery must replace.
+    // The launch places the deliveries before the host is built, the way
+    // `launch_host` does.
+    let mut attach_env = AttachEnv {
+        inherited: vec![],
+        connection: vec![
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
+        ],
+    };
+    let connection_env = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    let (host, _handle) = Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths,
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env,
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+
+    // The shell's half: the files it re-reads before every command.
+    let json = std::fs::read_to_string(home.sub_path_unchecked(ATTACH_ENV_JSON_REL).as_str())
+        .expect("the build publishes the per-attach environment");
+    let published: ConnectionEnv = serde_json_lenient::from_str(&json).expect("{json}");
+    assert_eq!(published.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(
+        published.get("TERM").map(String::as_str),
+        Some("xterm-256color")
+    );
+    assert_eq!(published.len(), 2, "nothing else is placed: {published:?}");
+    for rel in [ATTACH_ENV_SH_REL, ATTACH_ENV_FISH_REL, ATTACH_ENV_JSON_REL] {
+        let body = std::fs::read_to_string(home.sub_path_unchecked(rel).as_str()).unwrap();
+        assert!(body.contains(SEALED), "{rel}: {body}");
+        assert!(
+            !body.contains(PLAINTEXT),
+            "{rel} holds the plaintext: {body}"
+        );
+    }
+
+    // The host's half: what it runs in the box sees the sealed value.
+    let output = host
+        .command_in_session("sh", ["-c", "printenv GH_TOKEN"], Default::default())
+        .expect("a host-side command under test")
+        .output()
+        .expect("printenv runs");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), SEALED);
+
+    // A box with no grant places nothing.
+    let mut env = ConnectionEnv::new();
+    place_sealed_deliveries(&mut env, boxes::SessionId::nil(), &[]);
+    assert!(env.is_empty(), "{env:?}");
+
+    // A name that is not a variable name places nothing: it would be
+    // shell code in the file the box's shell sources.
+    place_sealed_deliveries(
+        &mut env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "X=1; touch /tmp/owned #".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert!(env.is_empty(), "{env:?}");
+}
+
+/// BEP-007: the `AttachEnv` a launch hands the launcher holds each grant's
+/// sealed value, so the shell's launch environment has it before its
+/// entrypoint runs. The connection layer sits above the composition, so the
+/// sealed value wins over a composition value in the same variable.
+#[test]
+fn sealed_value_reaches_the_shell_launch_environment() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    let mut attach_env = AttachEnv {
+        inherited: vec![("LANG".to_string(), "C.UTF-8".to_string())],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert_eq!(kept.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(attach_env.connection_env(), kept);
+    assert!(
+        attach_env
+            .connection
+            .contains(&("GH_TOKEN".to_string(), SEALED.to_string())),
+        "{:?}",
+        attach_env.connection
+    );
+    let env = layer_session_env(
+        session_baseline_env("box-1", None),
+        attach_env.inherited.clone(),
+        vec![("GH_TOKEN".to_string(), "from-the-composition".to_string())],
+        attach_env.connection.clone(),
+    );
+    assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+    assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+
+    // A box with no grant changes nothing in the launch environment.
+    let mut plain = AttachEnv {
+        inherited: vec![],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(&mut plain, boxes::SessionId::nil(), &[]);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        plain.connection,
+        vec![("TERM".to_string(), "xterm-256color".to_string())]
+    );
+}

@@ -269,6 +269,64 @@ pub(crate) struct HostParams {
     pub name_marker: Option<NameMarker>,
 }
 
+/// The sealed values a host launch of the box places in its environment
+/// (BEP-007): the ones its record holds, which the create copied from the
+/// request. [`place_launch_deliveries`] places them.
+pub(crate) fn launch_deliveries(record: &boxes::Record) -> Vec<boxes::SealedDelivery> {
+    record.sealed_deliveries.clone()
+}
+
+/// Places the grants' sealed values in a launch's connection layer
+/// (BEP-007), before the launcher builds the shell from `attach_env`, so the
+/// values exist before the shell's entrypoint runs. Returns the placed
+/// connection layer for the host to keep, layer onto what it runs in the box
+/// and republish for the shell to re-read. Logs once per variable, through
+/// [`place_sealed_deliveries`].
+pub(crate) fn place_launch_deliveries(
+    attach_env: &mut AttachEnv,
+    session_id: boxes::SessionId,
+    deliveries: &[boxes::SealedDelivery],
+) -> ConnectionEnv {
+    let mut connection_env = attach_env.connection_env();
+    place_sealed_deliveries(&mut connection_env, session_id, deliveries);
+    attach_env.connection = connection_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    connection_env
+}
+
+/// Places each grant's sealed value in the grant's environment variable
+/// (BEP-007), over any value `env` held there, so the variable holds the
+/// sealed value and nothing else. The daemon never holds a plaintext token:
+/// a sealed value is all a create request carries. Logs one debug line per
+/// variable, naming the box and the variable, never the value.
+pub(crate) fn place_sealed_deliveries(
+    env: &mut ConnectionEnv,
+    session_id: boxes::SessionId,
+    deliveries: &[boxes::SealedDelivery],
+) {
+    for delivery in deliveries {
+        // The create refuses such a name. A record that holds one anyway
+        // places nothing, because the name is written unquoted into the
+        // file the box's shell sources.
+        if boxes::core::primitives::StrictVarName::try_new(delivery.variable.as_str()).is_err() {
+            tracing::warn!(
+                session_id = %session_id,
+                variable = ?delivery.variable,
+                "skipped a grant's sealed value: its name is not a variable name"
+            );
+            continue;
+        }
+        env.insert(delivery.variable.clone(), delivery.sealed.clone());
+        tracing::debug!(
+            session_id = %session_id,
+            variable = %delivery.variable,
+            "placed a grant's sealed value in the box environment"
+        );
+    }
+}
+
 /// The host's half of the name lifecycle (NET-128): the registry and the
 /// stable session id, so the host can mark its box's name running when it
 /// starts and stopped when it exits. Held by [`HostParams`] and copied into

@@ -260,18 +260,30 @@ async fn serve_get_session_record(
     GetSessionRecord
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
-            Ok(GetSessionRecordResponse {
-                daemon_version: Some(OWN_VERSION.to_string()),
-                record: mngr
-                    .get_record(match req {
-                        GetSessionRecordRequest::Id(id) => BoxKeyPredicate::Id(id),
-                        GetSessionRecordRequest::Name(name) => BoxKeyPredicate::Name(name),
-                    })
-                    .await
-                    .map_err(|e| ConnectionError::Internal(e.to_string()))?,
-            })
+            let record = mngr
+                .get_record(match req {
+                    GetSessionRecordRequest::Id(id) => BoxKeyPredicate::Id(id),
+                    GetSessionRecordRequest::Name(name) => BoxKeyPredicate::Name(name),
+                })
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            Ok(session_record_response(record))
         })
         .await
+}
+
+/// The [`GetSessionRecord`] reply for a stored record. The reply never
+/// carries the box's sealed values (BEP-007): only the daemon's own launch
+/// reads them, so a daemon client does not read another box's values. The
+/// store keeps them.
+pub(crate) fn session_record_response(record: Option<boxes::Record>) -> GetSessionRecordResponse {
+    GetSessionRecordResponse {
+        daemon_version: Some(OWN_VERSION.to_string()),
+        record: record.map(|mut record| {
+            record.sealed_deliveries.clear();
+            record
+        }),
+    }
 }
 
 /// Stand-in for `session_name` on the lifecycle records when the session

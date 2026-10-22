@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use boxes::SessionId;
@@ -29,6 +31,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 // Every task this module spawns carries the caller's span (TEL-022): the
@@ -59,6 +62,12 @@ use crate::{
 /// stream; the bridge handles them uniformly.
 pub trait Exec: Send + 'static {
     type Process: Process;
+
+    /// Whether a destroy of the box ends this exec's process. True for a
+    /// process inside the box, which the destroy's host teardown stops.
+    /// False for a process outside the box — on the daemon's host, or in a
+    /// task's own sandbox — which outlives it.
+    const ENDED_BY_BOX_DESTROY: bool = true;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>>;
 }
@@ -153,6 +162,11 @@ fn task_start_dir(
 
 impl Exec for TaskExec {
     type Process = TaskProcess;
+
+    // A task runs in a sandbox of its own, beside the box rather than in
+    // it: the destroy's host teardown (`BoxActor::stop_running`) does not
+    // stop it, so a task that ends during a destroy was not ended by it.
+    const ENDED_BY_BOX_DESTROY: bool = false;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
@@ -806,6 +820,10 @@ pub struct TokioExec {
 impl Exec for TokioExec {
     type Process = TokioProcess;
 
+    // The process runs on the daemon's host, not in the box, so the
+    // destroy's host teardown does not stop it.
+    const ENDED_BY_BOX_DESTROY: bool = false;
+
     fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
@@ -1075,13 +1093,14 @@ impl<S: Exec> ExecTask<S> {
 
         let stream = self.exec.exec(self.session.clone());
         let mngr = self.serv.sessions_manager().await;
-        let exit_status = bridge_noting_shutdown(
+        let exit_status = bridge_noting_reason(
             self.channel_id,
             stream,
             &mut stdin_rx,
             &mut w,
             &mut e,
             client_lost_rx,
+            destroy_signal::<S>(|| self.session.destroy_signal()),
             || mngr.is_shutting_down(),
         )
         .await;
@@ -1102,20 +1121,111 @@ impl<S: Exec> ExecTask<S> {
 /// client is told why its command stopped rather than handed a bare 137.
 const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
 
-/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
-/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+/// The line an exec the session's destroy ended leaves on stderr, for the
+/// same reason: the client is told why its command stopped, not handed a
+/// bare 137 with nothing on the wire to explain it.
+const DESTROYED_NOTICE: &[u8] = b"the session was destroyed; the command was stopped\n";
+
+/// The destroy token the bridge watches for an exec of kind `S`.
 ///
-/// `shutting_down` is asked once the bridge returns. It reads the sessions
-/// manager's shutdown state, which is set before the manager stops any box,
-/// rather than the server's shutdown token, which is cancelled only after the
-/// manager is done and so after the command is already gone.
-async fn bridge_noting_shutdown<S, P, R, W, E>(
+/// Only an exec whose process the destroy ends gets one
+/// ([`Exec::ENDED_BY_BOX_DESTROY`]). A process outside the box outlives the
+/// destroy, so the bridge does not stop it and does not name the destroy.
+fn destroy_signal<S: Exec>(token: impl FnOnce() -> CancellationToken) -> Option<CancellationToken> {
+    S::ENDED_BY_BOX_DESTROY.then(token)
+}
+
+/// The notice an exec leaves on stderr when it ends.
+///
+/// A daemon shutdown comes first. It names a command that ended with a
+/// kill-shaped status. The destroy notice names only a command that the
+/// bridge stopped because the destroy token fired.
+fn exit_notice(
+    shutting_down: bool,
+    exit_status: u32,
+    stopped_by_destroy: bool,
+) -> Option<&'static [u8]> {
+    if shutting_down && exit_status >= KILLED_STATUS_MIN {
+        Some(SHUTDOWN_NOTICE)
+    } else if stopped_by_destroy {
+        Some(DESTROYED_NOTICE)
+    } else {
+        None
+    }
+}
+
+/// The lowest exit status that is kill-shaped: `128 + signo` is how a
+/// signal-terminated command reports, in the shell convention.
+const KILLED_STATUS_MIN: u32 = 128;
+
+/// A [`Process`] that the bridge stops when the box's destroy starts.
+///
+/// `wait` races the inner process against the destroy token. When the
+/// token fires first, it calls `start_kill` and sets `stopped`. Then it
+/// waits for the inner process to end. A process that already ended wins
+/// the race, so a command that exits on its own never sets `stopped`.
+struct StoppedOnDestroy<P> {
+    inner: P,
+    destroyed: CancellationToken,
+    stopped: Arc<AtomicBool>,
+}
+
+impl<P: Process> Process for StoppedOnDestroy<P> {
+    type Stdin = P::Stdin;
+    type Stdout = P::Stdout;
+    type Stderr = P::Stderr;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        self.inner.take_stdio()
+    }
+
+    // Cancel-safe: the inner `wait` is, and `stopped` is set before the
+    // next await point.
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        if !self.stopped.load(Ordering::SeqCst) {
+            tokio::select! {
+                biased;
+                status = self.inner.wait() => return status,
+                () = self.destroyed.cancelled() => {
+                    self.stopped.store(true, Ordering::SeqCst);
+                    tracing::info!("exec: session destroy started; stopping the command");
+                    if let Err(err) = self.inner.start_kill() {
+                        tracing::warn!(error = %err, "exec: failed to stop the command for the destroy");
+                    }
+                }
+            }
+        }
+        self.inner.wait().await
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        self.inner.start_kill()
+    }
+}
+
+/// Runs [`bridge`] and writes the notice for why the command ended to `e`
+/// before it returns the exit status. The status always passes through.
+///
+/// `destroyed` is the box's destroy token, for an exec whose process the
+/// destroy ends. When it fires while a command runs, the bridge stops the
+/// command and notes the destroy. A command that exits on its own, with
+/// any status, gets no destroy notice.
+///
+/// `shutting_down` is asked once the bridge returns, and only for a
+/// kill-shaped status (128 or more, the shell convention for a signal).
+/// The sessions manager sets its shutdown state before it stops any box.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bridge's own arguments, plus the two reasons it can name"
+)]
+async fn bridge_noting_reason<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
     client_lost: watch::Receiver<bool>,
+    destroyed: Option<CancellationToken>,
     shutting_down: impl FnOnce() -> bool,
 ) -> u32
 where
@@ -1125,9 +1235,34 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
-    if shutting_down() {
-        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let exit_status = match destroyed {
+        Some(destroyed) => {
+            let stopped = Arc::clone(&stopped);
+            let stream = stream.map(move |process| {
+                process.map(|inner| StoppedOnDestroy {
+                    inner,
+                    destroyed: destroyed.clone(),
+                    stopped: Arc::clone(&stopped),
+                })
+            });
+            bridge(channel_id, stream, r, w, e, client_lost).await
+        }
+        None => bridge(channel_id, stream, r, w, e, client_lost).await,
+    };
+    // A shutdown stops a command only by tearing down what runs it: a
+    // box exec is SIGKILLed with the container and the injection shim
+    // reports `128 + signo`, and a task exec is killed through its
+    // handle. A command that ends on its own during a shutdown — a
+    // graceful exit, a failure — was not stopped by it, so only a
+    // kill-shaped status (see `KILLED_STATUS_MIN`) gets the notice.
+    // Nothing the shutdown stops is silenced: every exec kind it stops
+    // reports a status of 128 or more. (The host-side git exec is
+    // signalled by nothing here — a signal-terminated `TokioProcess`
+    // maps to 1 — and it is the one kind the shutdown never stops.)
+    let shutting_down = exit_status >= KILLED_STATUS_MIN && shutting_down();
+    if let Some(notice) = exit_notice(shutting_down, exit_status, stopped.load(Ordering::SeqCst)) {
+        let _ = e.write_all(notice).await;
     }
     exit_status
 }
@@ -2748,6 +2883,7 @@ pub(crate) mod testing {
         exit: Mutex<Option<i32>>,
         notify: Notify,
         kill_requested: AtomicBool,
+        exit_on_kill: Mutex<Option<i32>>,
     }
 
     /// Test-side handle for driving and observing a [`MockProcess`].
@@ -2766,6 +2902,12 @@ pub(crate) mod testing {
             // which sidesteps the "set exit before bridge polls wait"
             // race that would otherwise leave the bridge hanging.
             self.inner.notify.notify_one();
+        }
+
+        /// Set the code the mock process reports once `start_kill` is
+        /// called. Without it a killed mock reports no numeric code.
+        pub async fn exit_on_kill(&self, code: i32) {
+            *self.inner.exit_on_kill.lock().await = Some(code);
         }
 
         /// Whether the bridge has called `start_kill` on the process.
@@ -2856,7 +2998,7 @@ pub(crate) mod testing {
                 // shell would report it as signal termination). Model
                 // that as `Ok(None)` so the bridge maps it to exit 1.
                 if self.ctrl.inner.kill_requested.load(Ordering::SeqCst) {
-                    return Ok(None);
+                    return Ok(*self.ctrl.inner.exit_on_kill.lock().await);
                 }
                 self.ctrl.inner.notify.notified().await;
             }

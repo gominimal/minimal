@@ -32,8 +32,21 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 mod helpers;
+
+/// How many sessions may run their `on_destroy` hooks at once, daemon-wide.
+/// A destroy used to run on the session manager's loop, one at a time; off
+/// it (inbox#710) nothing else bounds how many sandboxed hook runs a caller
+/// that destroys many sessions at once can drive. Past this a destroy waits
+/// for a slot, its session still in the manager's tearing-down set.
+const DESTROY_HOOK_RUNS_MAX: usize = 4;
+
+/// The slots [`DESTROY_HOOK_RUNS_MAX`] counts.
+static DESTROY_HOOK_RUNS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(DESTROY_HOOK_RUNS_MAX);
+
 // The per-message span names: a file of its own, because the daemon's refusal guard scans the
 // string literals of this module's files for RPC names (crates/minimal/src/tests.rs), and span
 // names are not refusals. The guard skips kind.rs.
@@ -513,6 +526,11 @@ pub struct BoxActor {
     /// the session.
     weak_self: WeakBoxHandle,
 
+    /// Cancelled once a destroy of this session proceeds, before the destroy
+    /// stops the host. Shared with every [`BoxHandle`], so a command the
+    /// destroy ends can tell (see [`BoxHandle::is_destroying`]).
+    destroying: CancellationToken,
+
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
@@ -574,6 +592,7 @@ impl BoxActor {
         receiver: crate::traced::Receiver<BoxMessage>,
         inner: BoxInner,
         weak_self: WeakBoxHandle,
+        destroying: CancellationToken,
     ) -> Self {
         let BoxActorConfig {
             minimal_state_dir,
@@ -606,6 +625,7 @@ impl BoxActor {
             creator,
             manager,
             weak_self,
+            destroying,
             // No host yet; the first launch sets this. `Interactive` is the
             // conservative default — it is the one value that never licenses
             // a respawn.
@@ -709,6 +729,7 @@ impl BoxActor {
         };
 
         let (sender, receiver) = crate::traced::channel(8);
+        let destroying = CancellationToken::new();
         // One line per session start (NET-074/NET-076/NET-077): the rollout
         // phase this build ships, the daemon's opt-out state, and the
         // effective egress they leave this box with. The declaration
@@ -751,8 +772,8 @@ impl BoxActor {
         }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
-        let weak_self = WeakBoxHandle(sender.downgrade());
-        let actor = Self::assemble(conf, receiver, inner, weak_self);
+        let weak_self = WeakBoxHandle(sender.downgrade(), destroying.clone());
+        let actor = Self::assemble(conf, receiver, inner, weak_self, destroying.clone());
 
         // Register the PTask hostname before the actor goes live, so the
         // route exists by the time the caller can observe the session
@@ -778,7 +799,7 @@ impl BoxActor {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(BoxHandle(sender))
+        Ok(BoxHandle(sender, destroying))
     }
 
     /// The async task which handles interactions with the session.
@@ -1013,6 +1034,14 @@ impl BoxActor {
                 // shell has already gone. Failures are reported back to the
                 // destroying client, never obeyed: a session must stay
                 // destroyable whatever its hooks do.
+                //
+                // A slot of [`DESTROY_HOOK_RUNS`] is held across the hook run
+                // only, and only when there are hooks to run.
+                let hook_slot = if self.has_hooks_for(crate::hooks::HookEvent::Destroy) {
+                    DESTROY_HOOK_RUNS.acquire().await.ok()
+                } else {
+                    None
+                };
                 let hook_failures: Vec<String> = self
                     .run_hooks_headless(crate::hooks::HookEvent::Destroy)
                     .await
@@ -1027,6 +1056,13 @@ impl BoxActor {
                         line
                     })
                     .collect();
+                // Cancelled immediately before `stop_running`, which is what
+                // ends the session's commands, so a command that ends there
+                // can see why. Not before the hooks: they can take seconds,
+                // and a command that finishes on its own meanwhile was not
+                // stopped by the destroy.
+                self.destroying.cancel();
+                drop(hook_slot);
                 self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable

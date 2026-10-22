@@ -259,6 +259,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min` registers a GitHub grant box
+            // with the Box Egress Proxy over its control socket. The proxy is
+            // not the daemon, and the daemon's build is not in question here.
+            "cmd/boxes/create.rs::mint_grants = ungated",
             // Not a product path: the destroy-race test's own connection to
             // the harness daemon. The destroy it drives sends no gated RPC —
             // the race's loser just reports what the daemon said — so the
@@ -299,8 +303,17 @@ fn every_daemon_connection_is_classified() {
             // the selected daemon — but connections all the same, and the
             // paths they drive are the gated ones above, so the label records
             // what the tests assert rather than a decision they make.
+            // Not a product path, and not the daemon: the mint tests' own
+            // connections to a test Box Egress Proxy's control socket.
+            "tests.rs::a_failed_box_reply_forgets_the_box_again = ungated",
+            "tests.rs::a_refused_client_key_forgets_the_box_again = ungated",
+            "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
+            "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
         ]
     );
 }
@@ -3735,4 +3748,625 @@ fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
         match_id_prefix(&entries, "beefcafe").unwrap(),
         Some(entries[2].id)
     );
+}
+
+/// The GitHub grant mint and the box's registration with the proxy
+/// (BEP-003, BEP-005).
+mod mint_tests {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use bep::boxes::{BoxRegistry, Stance};
+    use bep::control::{Control, Registry};
+    use bep::module::GITHUB;
+    use bep::publish::{Identity, PublishedKey};
+    use bep::seal::{Binding, Breadth, MemberKind, Mode, ProxyKey, ProxyPublicKey};
+    use bep::signin::{Completed, Flow, Keychain as _, Material, MemoryKeychain, store_sign_in};
+
+    use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
+
+    const BOX_ID: &str = "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f5";
+    const BOX_HEX: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+    const NOW: u64 = 1_800_000_000;
+    const ROOT_END: u64 = 2_000_000_000;
+
+    fn published(key: &ProxyPublicKey) -> PublishedKey {
+        PublishedKey {
+            public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
+            kid: key.kid(),
+        }
+    }
+
+    /// A proxy's sealing key and the identity it publishes.
+    fn proxy() -> (ProxyKey, Identity) {
+        let sealing = ProxyKey::generate().unwrap();
+        let root = ProxyKey::generate().unwrap();
+        let identity = Identity {
+            sealing: Some(published(&sealing.public())),
+            root: Some(published(&root.public())),
+            signing: Some(published(&ProxyKey::generate().unwrap().public())),
+            root_not_after: Some(ROOT_END),
+        };
+        (sealing, identity)
+    }
+
+    fn signed_in() -> MemoryKeychain {
+        let keychain = MemoryKeychain::default();
+        store_sign_in(
+            &keychain,
+            &Completed {
+                account: "octocat".into(),
+                flow: Flow::Device,
+                material: Material {
+                    instance: String::new(),
+                    access_token: "ghu_secret_token_value".into(),
+                    refresh_token: "ghr_secret_refresh_value".into(),
+                },
+                token_expires_at: NOW + 3_600,
+                refresh_expires_at: NOW + 86_400,
+            },
+        )
+        .unwrap();
+        keychain
+    }
+
+    fn grant_box(stance: Stance) -> GrantBox {
+        GrantBox {
+            box_id: BOX_ID.into(),
+            grants: vec!["GH_TOKEN".into()],
+            egress: vec![
+                "github.com".into(),
+                "api.github.com".into(),
+                "uploads.github.com".into(),
+                "codeload.github.com".into(),
+            ],
+            stance,
+        }
+    }
+
+    /// A control socket served on its own runtime, with its registries.
+    struct Served {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        clients: Registry,
+        boxes: BoxRegistry,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    fn serve() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let clients = Registry::default();
+        let boxes = BoxRegistry::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async { Control::bind(&path, Arc::clone(&clients), Arc::clone(&boxes)) })
+            .unwrap();
+        runtime.spawn(control.run());
+        Served {
+            _dir: dir,
+            path,
+            clients,
+            boxes,
+            _runtime: runtime,
+        }
+    }
+
+    // BEP-005: the member is a sign-in reference under the client's key,
+    // with no token, the module's authorities, no injection form, and the
+    // root's validity end as its expiry.
+    #[test]
+    fn local_member_is_a_sign_in_reference_expiring_with_the_root() {
+        let (sealing, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let key = ClientKey::generate().unwrap();
+
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &key,
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].grant, "GH_TOKEN");
+        assert_eq!(minted[0].expiry, ROOT_END);
+        // The sealed value carries no token, in any part.
+        assert!(!minted[0].sealed.contains("ghu_"));
+        assert!(!minted[0].sealed.contains("ghr_"));
+
+        // The value opens for this box on the proxy that publishes the key.
+        let node = sealing.public().kid();
+        let opened = bep::seal::open(
+            &sealing,
+            &minted[0].sealed,
+            &Binding {
+                box_id: BOX_HEX.into(),
+                host: node.clone(),
+                module: GITHUB.id.into(),
+                now: NOW + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(opened.context.box_id, BOX_HEX);
+        assert_eq!(opened.context.host, node);
+        assert_eq!(opened.context.module, "github");
+        assert_eq!(opened.context.host_set_version, GITHUB.host_set_version);
+        assert_eq!(opened.context.mode, Mode::User);
+        assert_eq!(opened.context.iat, NOW);
+        assert_eq!(opened.context.expiry, ROOT_END);
+        assert_eq!(opened.member.kind, MemberKind::SignIn);
+        assert_eq!(opened.member.breadth, Breadth::Full);
+        assert_eq!(opened.member.exp, Some(ROOT_END));
+
+        // The handle verifies under the client key the mint registered.
+        let registered = served.clients.read().unwrap().clone();
+        assert!(registered.contains(&key.kid()));
+        let claims = bep::handle::verify(&opened.member.jws, &registered).unwrap();
+        assert_eq!(claims.sub, BOX_HEX);
+        assert_eq!(claims.node_id, node);
+        assert_eq!(claims.store, "github");
+        assert_eq!(claims.id, instance);
+        let upstream: Vec<String> = GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect();
+        assert_eq!(claims.upstream, upstream);
+        assert_eq!(claims.inject, None);
+        assert_eq!(claims.iat, NOW);
+        assert_eq!(claims.exp, ROOT_END);
+        assert_eq!(claims.jti.len(), 32);
+        assert!(!opened.member.jws.contains("ghu_"));
+
+        // A handle signed under a key the proxy never registered does not
+        // verify.
+        let other = bep::handle::ClientKeys::new();
+        assert!(bep::handle::verify(&opened.member.jws, &other).is_err());
+    }
+
+    // BEP-005: an identity with no root validity end mints nothing, and
+    // registers nothing.
+    #[test]
+    fn an_identity_with_no_root_validity_mints_nothing() {
+        let (_, identity) = proxy();
+        let identity = Identity {
+            root_not_after: None,
+            ..identity
+        };
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Identity { .. }), "{err}");
+        assert!(served.boxes.get(BOX_HEX).is_none());
+    }
+
+    // BEP-003: the proxy holds the box's declared egress and its stance
+    // after the mint. With no sign-in held, nothing is registered.
+    #[test]
+    fn grant_box_registers_its_declared_egress_with_the_proxy() {
+        let (_, identity) = proxy();
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+
+        mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::HostIp),
+            NOW,
+        )
+        .unwrap();
+        let held = served.boxes.get(BOX_HEX).expect("the proxy holds the box");
+        let egress: Vec<(String, u16)> = held
+            .egress
+            .iter()
+            .map(|authority| (authority.host.clone(), authority.port))
+            .collect();
+        assert_eq!(
+            egress,
+            [
+                ("github.com".to_owned(), 443),
+                ("api.github.com".to_owned(), 443),
+                ("uploads.github.com".to_owned(), 443),
+                ("codeload.github.com".to_owned(), 443),
+            ]
+        );
+        assert_eq!(held.stance, Stance::HostIp);
+
+        // With no sign-in held the creation fails with the defined error's
+        // text, and the proxy gets no registration.
+        let other = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let err = mint_and_register(
+            &MemoryKeychain::default(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &GrantBox {
+                box_id: other.into(),
+                ..grant_box(Stance::OwnIp)
+            },
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::NoSignIn));
+        assert!(err.to_string().contains("Run `min auth login`"), "{err}");
+        assert!(served.boxes.get(other).is_none());
+
+        // A box registration the proxy refuses leaves no client key
+        // registered.
+        let refused_key = ClientKey::generate().unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &refused_key,
+            &GrantBox {
+                box_id: other.into(),
+                egress: vec![".".into()],
+                ..grant_box(Stance::OwnIp)
+            },
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert!(served.boxes.get(other).is_none());
+        assert!(!served.clients.read().unwrap().contains(&refused_key.kid()));
+
+        // Nothing answers on a socket no proxy serves.
+        let gone = served.path.with_file_name("none.sock");
+        let err = ControlClient::connect(&gone).err().unwrap();
+        assert!(matches!(err, MintError::NotRunning { .. }), "{err}");
+    }
+
+    // BEP-003: a creation that fails after the mint leaves no declared
+    // egress at the proxy. A creation that finishes keeps it.
+    #[test]
+    fn grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails() {
+        use crate::mint::ProxyRegistration;
+        let (_, identity) = proxy();
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let mut mint = |box_id: &str| {
+            mint_and_register(
+                &signed_in(),
+                &identity,
+                std::path::Path::new("identity.json"),
+                &mut control,
+                &ClientKey::generate().unwrap(),
+                &GrantBox {
+                    box_id: box_id.into(),
+                    ..grant_box(Stance::OwnIp)
+                },
+                NOW,
+            )
+            .unwrap();
+        };
+
+        // A failed creation drops its registration, and the proxy forgets
+        // the box.
+        mint(BOX_HEX);
+        assert!(served.boxes.get(BOX_HEX).is_some());
+        drop(ProxyRegistration::new(served.path.clone(), BOX_HEX).unwrap());
+        assert!(served.boxes.get(BOX_HEX).is_none());
+
+        // A finished creation keeps its registration.
+        let kept = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f7";
+        mint(kept);
+        ProxyRegistration::new(served.path.clone(), kept)
+            .unwrap()
+            .keep();
+        assert!(served.boxes.get(kept).is_some());
+
+        // A drop inside a runtime forgets the box on a blocking thread, and
+        // the runtime waits for it before it shuts down.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            drop(ProxyRegistration::new(served.path.clone(), kept).unwrap());
+        });
+        drop(runtime);
+        assert!(served.boxes.get(kept).is_none());
+
+        // A drop with no proxy to tell does not panic.
+        let gone = served.path.with_file_name("none.sock");
+        drop(ProxyRegistration::new(gone, kept).unwrap());
+    }
+
+    /// A control socket that registers and forgets boxes as the proxy does,
+    /// and refuses every client key. Gives the socket and its boxes.
+    fn serve_refusing_keys() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BoxRegistry,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let boxes = BoxRegistry::default();
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
+        std::thread::spawn(move || {
+            let clients = Arc::new(std::sync::RwLock::new(bep::handle::ClientKeys::new()));
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                served_ops.lock().unwrap().push("connect".to_owned());
+                // The proxy serves each connection on its own task.
+                let (clients, served_boxes, served_ops) = (
+                    Arc::clone(&clients),
+                    Arc::clone(&served_boxes),
+                    Arc::clone(&served_ops),
+                );
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        let request: bep::control::Request =
+                            serde_json_lenient::from_str(&line).unwrap();
+                        let op = match request {
+                            bep::control::Request::RegisterClientKey { .. } => {
+                                "register_client_key"
+                            }
+                            bep::control::Request::RegisterBox { .. } => "register_box",
+                            bep::control::Request::ForgetBox { .. } => "forget_box",
+                        };
+                        served_ops.lock().unwrap().push(op.to_owned());
+                        let reply = if op == "register_client_key" {
+                            bep::control::Reply {
+                                ok: false,
+                                kid: None,
+                                error: Some("the key is not a P-256 public key".into()),
+                            }
+                        } else {
+                            bep::control::handle_line(&line, &clients, &served_boxes)
+                        };
+                        let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                        answer.push('\n');
+                        writer.write_all(answer.as_bytes()).unwrap();
+                        line.clear();
+                    }
+                });
+            }
+        });
+        (dir, path, boxes, ops)
+    }
+
+    // BEP-063: a client key the proxy refuses leaves no box registered
+    // either. The box is registered first and forgotten again, over a new
+    // connection.
+    #[test]
+    fn a_refused_client_key_forgets_the_box_again() {
+        let (_, identity) = proxy();
+        let (_dir, path, boxes, ops) = serve_refusing_keys();
+        let mut control = ControlClient::connect(&path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert_eq!(
+            *ops.lock().unwrap(),
+            [
+                "connect",
+                "register_box",
+                "register_client_key",
+                "connect",
+                "forget_box"
+            ]
+        );
+        assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    /// A control socket that stores each box it is asked to register and
+    /// then closes the connection with no reply. Every other request gets
+    /// the proxy's answer. Gives the socket, its boxes and the requests.
+    fn serve_dropping_box_replies() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BoxRegistry,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let boxes = BoxRegistry::default();
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
+        std::thread::spawn(move || {
+            let clients = std::sync::RwLock::new(bep::handle::ClientKeys::new());
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let request: bep::control::Request =
+                        serde_json_lenient::from_str(&line).unwrap();
+                    let op = match request {
+                        bep::control::Request::RegisterClientKey { .. } => "register_client_key",
+                        bep::control::Request::RegisterBox { .. } => "register_box",
+                        bep::control::Request::ForgetBox { .. } => "forget_box",
+                    };
+                    served_ops.lock().unwrap().push(op.to_owned());
+                    let reply = bep::control::handle_line(&line, &clients, &served_boxes);
+                    if op == "register_box" {
+                        // The box is stored, and the reply never comes.
+                        break;
+                    }
+                    let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                    answer.push('\n');
+                    writer.write_all(answer.as_bytes()).unwrap();
+                    line.clear();
+                }
+            }
+        });
+        (dir, path, boxes, ops)
+    }
+
+    // BEP-003: a registration whose reply fails can still leave the box
+    // stored at the proxy. The mint forgets it again over a new connection,
+    // and registers no client key.
+    #[test]
+    fn a_failed_box_reply_forgets_the_box_again() {
+        let (_, identity) = proxy();
+        let (_dir, path, boxes, ops) = serve_dropping_box_replies();
+        let mut control = ControlClient::connect(&path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Control(_)), "{err}");
+        assert_eq!(*ops.lock().unwrap(), ["register_box", "forget_box"]);
+        assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    fn github_secrets() -> boxes::core::bep::SecretGrants {
+        std::collections::BTreeMap::from([(
+            "GH_TOKEN".to_owned(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["github:user-token".into()],
+                mode: None,
+            },
+        )])
+    }
+
+    fn refusal(err: &anyhow::Error) -> &boxes::core::bep::ActivationRefused {
+        err.downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .unwrap_or_else(|| panic!("not a refused box spec: {err}"))
+    }
+
+    // Gatehouse §6.2: where no node-local proxy exists, a GitHub grant is
+    // refused with `gatehouse_unenrolled_node` and exit 5, even with a
+    // sign-in held. `github_sign_in_required` is only for a host that has a
+    // proxy.
+    #[test]
+    fn a_grant_box_with_no_proxy_is_refused_as_an_unenrolled_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.json");
+        let control = dir.path().join("control.sock");
+        assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        assert!(!crate::cmd::proxy_present(None, None));
+
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), false, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+        assert_eq!(
+            boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+            "gatehouse_unenrolled_node"
+        );
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and no Box Egress \
+             Proxy serves boxes on this machine. Remove the grant from the [secrets] table in \
+             minimal.toml, then create the box again."
+        );
+        // With no sign-in held either, the missing proxy is what is refused.
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), false, &MemoryKeychain::default())
+                .unwrap_err();
+        assert_eq!(
+            refusal(&err).refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+
+        // With a proxy, no sign-in held is refused with its own error.
+        std::fs::write(&identity, "{}").unwrap();
+        std::fs::write(&control, "").unwrap();
+        assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), true, &MemoryKeychain::default())
+                .unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GITHUB_SIGN_IN_REQUIRED)
+        );
+        assert_eq!(refused.exit_code(), 3);
+        // With a proxy and a sign-in, the grants pass. A box with no GitHub
+        // grant is never refused.
+        assert_eq!(
+            crate::cmd::check_github_grants(&github_secrets(), true, &signed_in()).unwrap(),
+            ["GH_TOKEN"]
+        );
+        assert!(
+            crate::cmd::check_github_grants(&Default::default(), false, &MemoryKeychain::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Gatehouse §6.2: a grant box with no box id or no stance is refused
+    // with `gatehouse_unenrolled_node`, and does not start with a grant that
+    // resolves to nothing.
+    #[test]
+    fn a_grant_box_with_no_box_id_or_stance_is_refused_as_an_unenrolled_node() {
+        let grants = vec!["GH_TOKEN".to_owned()];
+        let refused =
+            crate::cmd::grant_box_facts(&grants, None, boxes::NetworkMode::OwnIp).unwrap_err();
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+        assert_eq!(refused.exit_code(), 5);
+        let refused =
+            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::NoNet)
+                .unwrap_err();
+        assert_eq!(refused.exit_code(), 5);
+
+        assert_eq!(
+            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::HostNet)
+                .unwrap(),
+            Some((BOX_ID.to_owned(), Stance::HostIp))
+        );
+        // A box with no GitHub grant needs neither.
+        assert_eq!(
+            crate::cmd::grant_box_facts(&[], None, boxes::NetworkMode::NoNet).unwrap(),
+            None
+        );
+    }
 }
