@@ -5264,7 +5264,7 @@ fn gate_verdict(
     // Once the host exposures close by default, that is wider than the
     // announced phase's alias reach, which admits no port. The bound must
     // also admit the configured host exposures (TCP and UDP) once they
-    // exist.
+    // exist. gominimal/inbox#1144 and gominimal/inbox#1147 own that work.
     if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
         if let Some(dst) = summary.destination()
             && dst == table.subnet().host_alias().octets()

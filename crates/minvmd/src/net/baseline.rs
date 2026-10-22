@@ -170,9 +170,11 @@ pub(crate) const REGISTRY_CACHE_FETCH_PROTOCOL: u8 = IPPROTO_TCP;
 /// listener serves a registry or a cache there yet, and the daemon's own
 /// fetches go to `cache.minimal.dev`, not to the alias. When that listener
 /// lands, this list must be read from the listener's stack, the way
-/// `switch::bep_host::PROXY_PORT` is. The change that flips
-/// [`NODE_BASELINE_PHASE`] to [`NodeBaselinePhase::InForce`] must have a
-/// real listener feeding this list; with no listener, the list is empty.
+/// `switch::bep_host::PROXY_PORT` is. `[443]` is the planned port, and no
+/// listener serves it. While [`NODE_BASELINE_PHASE`] is
+/// [`NodeBaselinePhase::Announced`], only the in-force tests exercise this
+/// list. The endpoint-configuration change (#1786) replaces it with the
+/// listener's port, or with an empty list if no listener exists.
 pub(crate) const REGISTRY_CACHE_FETCH_PORTS: [u16; 1] = [443];
 
 /// The node-plane baseline set: the categories in force, each with the
