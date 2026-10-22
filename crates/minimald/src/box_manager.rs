@@ -1734,7 +1734,9 @@ impl BoxManager {
                 ));
                 // Finished tasks leave the set on their own; their join
                 // handles leave it here, so the set holds only the live ones.
-                while self.teardowns.try_join_next().is_some() {}
+                while let Some(joined) = self.teardowns.try_join_next() {
+                    log_teardown_join(joined);
+                }
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {
@@ -1777,7 +1779,9 @@ impl BoxManager {
                     // bounded by its own hooks' timeouts. That wait is the
                     // price of the cap, and it ends: no slot is held past
                     // its run.
-                    while self.teardowns.join_next().await.is_some() {}
+                    while let Some(joined) = self.teardowns.join_next().await {
+                        log_teardown_join(joined);
+                    }
                     // Release the cache's held-open alog fd: it lives on the
                     // state volume, and a surviving write-open fd there makes
                     // the post-drain quiesce (R2.1 syncfs + unmount) fail
@@ -1802,6 +1806,15 @@ impl BoxManager {
                 self.running.remove(&id);
             }
         }
+    }
+}
+
+/// A teardown task that ended by a panic or a cancel took its responder
+/// with it, so its caller saw a closed channel and nothing said why: the
+/// join error is the only record of it, so it goes to the log.
+fn log_teardown_join(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = joined {
+        tracing::error!(error = %e, "a session teardown task did not finish on its own");
     }
 }
 
