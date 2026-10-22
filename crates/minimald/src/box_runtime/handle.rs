@@ -248,6 +248,25 @@ impl HostHandle {
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         (Self { sender }, WedgedMailbox(receiver))
     }
+
+    /// A handle to a host that answers every attrs probe at once (with
+    /// default attrs) and ignores everything else: a live host, as far as a
+    /// listing can tell.
+    pub(crate) fn answering_attrs() -> Self {
+        let (sender, mut receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
+        crate::traced::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if let Message::GetAttrs(reply) = message {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "a prober that went away needs no answer"
+                    )]
+                    let _ = reply.send(HostAttrs::default());
+                }
+            }
+        });
+        Self { sender }
+    }
 }
 
 impl HostHandle {
