@@ -3866,9 +3866,9 @@ mod mint_tests {
     fn grant_box_create_request_carries_the_published_root_certificate() {
         use crate::cmd::{grant_root_certificate, hand_grants};
 
-        let der = b"0\x82\x01\x0a a root certificate's DER".to_vec();
-        let pem = bep::publish::certificate_pem(&der);
         let (_, identity) = proxy();
+        let root_key = identity.key(bep::keys::Role::Root).unwrap();
+        let pem = bep::publish::certificate_pem(&certificate_der(&root_key.to_sec1_bytes()));
         let identity = Identity {
             root_certificate: Some(pem.clone()),
             ..identity
@@ -3895,9 +3895,12 @@ mod mint_tests {
         assert_eq!(request.config.sealed_deliveries.len(), 1);
         assert_eq!(request.config.sealed_deliveries[0].variable, "GH_TOKEN");
 
-        // An identity that an older `bep` published has no certificate, and
-        // one with a broken certificate has none that the box can trust.
-        for root_certificate in [None, Some("not a certificate".to_string())] {
+        // An identity that an older `bep` published has no certificate, one
+        // with a broken certificate has none that the box can trust, and a
+        // certificate under another key is not the published root's.
+        let foreign = ProxyKey::generate().unwrap().public().to_sec1_bytes();
+        let foreign = bep::publish::certificate_pem(&certificate_der(&foreign));
+        for root_certificate in [None, Some("not a certificate".to_string()), Some(foreign)] {
             let identity = Identity {
                 root_certificate,
                 ..published.clone()
@@ -3918,6 +3921,48 @@ mod mint_tests {
         let mut plain = create_request();
         hand_grants(&mut plain, &[], &[], None).unwrap();
         assert_eq!(plain.config.root_certificate, None);
+    }
+
+    /// A certificate's DER, in the shape of the one `bep` issues, whose
+    /// subject public key is `point`, an uncompressed P-256 point. Only the
+    /// structure up to the subject key is real.
+    fn certificate_der(point: &[u8]) -> Vec<u8> {
+        fn element(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+            let content = parts.concat();
+            let mut out = vec![tag];
+            match u16::try_from(content.len()).unwrap() {
+                len @ 0..0x80 => out.push(u8::try_from(len).unwrap()),
+                len @ 0x80..0x100 => out.extend([0x81, u8::try_from(len).unwrap()]),
+                len => {
+                    out.push(0x82);
+                    out.extend(len.to_be_bytes());
+                }
+            }
+            out.extend(content);
+            out
+        }
+        const P256: &[u8] = &[
+            0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+            0xce, 0x3d, 0x03, 0x01, 0x07,
+        ];
+        let algorithm = element(0x30, &[P256]);
+        let key = element(0x03, &[&[0], point]);
+        let spki = element(0x30, &[&algorithm, &key]);
+        let name = element(0x30, &[&element(0x31, &[])]);
+        let tbs = element(
+            0x30,
+            &[
+                &element(0xa0, &[&element(0x02, &[&[2]])]),
+                &element(0x02, &[&[1]]),
+                &element(0x30, &[]),
+                &name,
+                &element(0x30, &[]),
+                &name,
+                &spki,
+                &element(0xa3, &[&[0; 200]]),
+            ],
+        );
+        element(0x30, &[&tbs, &element(0x30, &[]), &element(0x03, &[&[0]])])
     }
 
     fn create_request() -> minimald_rpc::CreateSessionRequest {

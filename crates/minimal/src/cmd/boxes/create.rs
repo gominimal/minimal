@@ -331,21 +331,88 @@ pub(crate) fn grant_box_facts(
 
 /// The root certificate a GitHub grant box trusts: the PEM that the
 /// proxy's published identity carries (BEP-011, BEP-072). An identity that
-/// carries none, or one that is not a PEM certificate, is refused, so no
-/// grant box starts without the root it needs.
+/// carries none, one that is not a PEM certificate, or one whose subject
+/// key is not the published root key is refused, so no grant box starts
+/// without the root it needs, and none trusts a stale or foreign root.
 pub(crate) fn grant_root_certificate(
     identity: &bep::publish::Identity,
 ) -> Result<String, anyhow::Error> {
-    match identity.root_certificate_der() {
-        Ok(_) => identity
-            .root_certificate
-            .clone()
-            .ok_or_else(no_root_certificate),
-        Err(error) => {
-            tracing::debug!(%error, "the published identity carries no usable root certificate");
-            Err(no_root_certificate())
-        }
+    let der = identity.root_certificate_der().map_err(|error| {
+        tracing::debug!(%error, "the published identity carries no usable root certificate");
+        no_root_certificate()
+    })?;
+    let root = identity
+        .key(bep::keys::Role::Root)
+        .map_err(|error| {
+            tracing::debug!(%error, "the published identity carries no usable root key");
+            no_root_certificate()
+        })?
+        .to_sec1_bytes();
+    if !certificate_carries_key(&der, &root) {
+        tracing::debug!("the published root certificate does not carry the published root key");
+        return Err(no_root_certificate());
     }
+    identity
+        .root_certificate
+        .clone()
+        .ok_or_else(no_root_certificate)
+}
+
+/// Whether `der`, a DER X.509 certificate, carries `point`, an uncompressed
+/// SEC1 P-256 point, as its subject public key. It reads only the
+/// structure up to the SubjectPublicKeyInfo. The name constraints and the
+/// signature are the proxy's to issue and the box's TLS stack to check.
+fn certificate_carries_key(der: &[u8], point: &[u8]) -> bool {
+    // AlgorithmIdentifier content: id-ecPublicKey, prime256v1.
+    const P256_ALGORITHM: &[u8] = &[
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
+        0x3d, 0x03, 0x01, 0x07,
+    ];
+    let spki = (|| {
+        let (certificate, _) = der_element(der, 0x30)?;
+        let (tbs, _) = der_element(certificate, 0x30)?;
+        // The version is explicit and optional.
+        let mut fields = der_element(tbs, 0xa0).map_or(tbs, |(_, rest)| rest);
+        // serialNumber, signature, issuer, validity, subject.
+        for tag in [0x02, 0x30, 0x30, 0x30, 0x30] {
+            fields = der_element(fields, tag)?.1;
+        }
+        der_element(fields, 0x30).map(|(spki, _)| spki)
+    })();
+    let Some(spki) = spki else {
+        return false;
+    };
+    let Some((algorithm, rest)) = der_element(spki, 0x30) else {
+        return false;
+    };
+    let Some((key, rest)) = der_element(rest, 0x03) else {
+        return false;
+    };
+    algorithm == P256_ALGORITHM && rest.is_empty() && key.split_first() == Some((&0, point))
+}
+
+/// The content of the DER element at the start of `input` when its tag is
+/// `tag`, and the bytes after it.
+fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (&found, input) = input.split_first()?;
+    if found != tag {
+        return None;
+    }
+    let (&first, input) = input.split_first()?;
+    let (len, input) = if first < 0x80 {
+        (usize::from(first), input)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > 4 || input.len() < count {
+            return None;
+        }
+        let (bytes, input) = input.split_at(count);
+        let len = bytes
+            .iter()
+            .fold(0usize, |len, &byte| (len << 8) | usize::from(byte));
+        (len, input)
+    };
+    (input.len() >= len).then(|| input.split_at(len))
 }
 
 /// The refusal of a GitHub grant box whose proxy publishes no root
