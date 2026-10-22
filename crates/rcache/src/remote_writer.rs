@@ -58,6 +58,10 @@ const NOT_FOUND: u16 = 404;
 /// would either redo work or upload divergent state. Construct one writer
 /// per upload session and consume it via [Self::finish_uploads].
 ///
+/// [Self::upload] takes `&self`, so one writer serves concurrent uploads: the
+/// blob writes run in parallel and each records its entry for the single
+/// index commit.
+///
 /// Generic over the GCS backend stub so tests can inject a mock via
 /// [`google_cloud_storage::client::Storage::from_stub`] and exercise the
 /// CAS retry loop end-to-end through the public API. Production code
@@ -80,7 +84,8 @@ pub struct RemoteCacheWriter<S: StubStorage + 'static = DefaultStorage> {
     fetched_generation: i64,
 
     /// `(spec_hash, sha256)` entries to merge into the index on finish.
-    pending: Vec<(SpecHash, [u8; 32])>,
+    /// Locked only to push, never across an await.
+    pending: std::sync::Mutex<Vec<(SpecHash, [u8; 32])>>,
 
     #[allow(dead_code)]
     ot: Option<OpTracker>,
@@ -130,7 +135,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             base,
             fetched_index,
             fetched_generation,
-            pending: Vec::new(),
+            pending: std::sync::Mutex::new(Vec::new()),
             ot,
         }
     }
@@ -144,7 +149,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
     /// The index update is deferred to [Self::finish_uploads].
     #[tracing::instrument(skip_all, err)]
     pub async fn upload(
-        &mut self,
+        &self,
         spec_hash: &SpecHash,
         artifact: (std::fs::File, [u8; 32]),
     ) -> Result<bool, Error<GcsError>> {
@@ -178,7 +183,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             // tarball — are the common case here, and rewriting them from
             // parallel uploaders trips GCS's per-object mutation rate limit.
             // Still pending: the index may not map this spec hash to it yet.
-            self.pending.push((spec_hash.clone(), sha256));
+            self.push_pending(spec_hash, sha256);
             return Ok(false);
         }
 
@@ -217,7 +222,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
                     // nothing left to write, and not writing spares the hot name
                     // another mutation.
                     if self.object_present(&object, local_len, local_crc32c).await {
-                        self.pending.push((spec_hash.clone(), sha256));
+                        self.push_pending(spec_hash, sha256);
                         return Ok(false);
                     }
                 }
@@ -226,7 +231,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
                 // One last look before giving up, as after every other 429.
                 Err(e) if e.http_status_code() == Some(TOO_MANY_REQUESTS) => {
                     if self.object_present(&object, local_len, local_crc32c).await {
-                        self.pending.push((spec_hash.clone(), sha256));
+                        self.push_pending(spec_hash, sha256);
                         return Ok(false);
                     }
                     return Err(Error::Backend(e));
@@ -235,7 +240,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             }
         }
 
-        self.pending.push((spec_hash.clone(), sha256));
+        self.push_pending(spec_hash, sha256);
         Ok(true)
     }
 
@@ -255,6 +260,13 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             Ok(stat) if stat.object().size as u64 == len
                 && stat.object().checksums.as_ref().and_then(|c| c.crc32c) == Some(crc32c)
         )
+    }
+
+    fn push_pending(&self, spec_hash: &SpecHash, sha256: [u8; 32]) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((spec_hash.clone(), sha256));
     }
 
     /// Commit the merged index back to GCS with compare-and-swap semantics.
@@ -279,6 +291,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             pending,
             ot: _,
         } = self;
+        let pending = pending.into_inner().unwrap_or_else(|e| e.into_inner());
 
         let mut attempt: u32 = 0;
         loop {
@@ -602,11 +615,11 @@ mod tests {
         mock.expect_open_object()
             .times(1)
             .returning(|_, _| existing(&[7u8; 18]));
-        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(!wrote, "a present object is not written again");
-        assert_eq!(writer.pending.len(), 1);
+        assert_eq!(writer.pending.lock().unwrap().len(), 1);
     }
 
     /// An object under this name at the artifact's length but with other
@@ -627,11 +640,11 @@ mod tests {
             .return_once(|_p: Payload<gcs::streaming_source::FileSource>, _, _| {
                 Ok(Object::default())
             });
-        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(wrote, "an object with other bytes is written over");
-        assert_eq!(writer.pending.len(), 1);
+        assert_eq!(writer.pending.lock().unwrap().len(), 1);
     }
 
     /// A 429 retried writes the whole file again, even when the failed attempt
@@ -670,7 +683,7 @@ mod tests {
                 *captured.lock().unwrap() = Some(p);
                 Ok(Object::default())
             });
-        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(wrote);
         let mut payload = sent.lock().unwrap().take().expect("the retry wrote");
@@ -715,11 +728,11 @@ mod tests {
             .times(1)
             .in_sequence(&mut seq)
             .returning(|_, _| existing(&[7u8; 18]));
-        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(!wrote, "the other uploader's write stands");
-        assert_eq!(writer.pending.len(), 1);
+        assert_eq!(writer.pending.lock().unwrap().len(), 1);
     }
 
     /// Out of retries on a 429 with no object under the name by the last
@@ -748,7 +761,7 @@ mod tests {
                 .in_sequence(&mut seq)
                 .returning(|_, _| Err(http_404_error()));
         }
-        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let err = writer
             .upload(&spec(), (file, [1u8; 32]))
@@ -758,7 +771,10 @@ mod tests {
             matches!(&err, Error::Backend(e) if e.http_status_code() == Some(TOO_MANY_REQUESTS)),
             "the 429 is surfaced: {err:?}"
         );
-        assert!(writer.pending.is_empty(), "nothing is staged for the index");
+        assert!(
+            writer.pending.lock().unwrap().is_empty(),
+            "nothing is staged for the index"
+        );
     }
 
     /// A 429 is another uploader writing this same content: when the object
@@ -781,11 +797,11 @@ mod tests {
             .times(1)
             .in_sequence(&mut seq)
             .returning(|_, _| existing(&[7u8; 18]));
-        let mut writer = writer_from_mock(mock, IndexFile::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let (file, _shared) = artifact(&[7u8; 18]);
         let wrote = writer.upload(&spec(), (file, [1u8; 32])).await.unwrap();
         assert!(!wrote, "the other uploader's write stands");
-        assert_eq!(writer.pending.len(), 1);
+        assert_eq!(writer.pending.lock().unwrap().len(), 1);
     }
 
     /// Single attempt with no contention writes once and is done.
