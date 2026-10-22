@@ -11558,6 +11558,94 @@ proof_bep_second_box_needs_no_sign_in() {
   echo "::endgroup::"
 }
 
+# Sealed-value placement proof (BEP-007): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and each box's GH_TOKEN holds a sealed value and no
+# plaintext token. Each box's value names its own box, so the two differ.
+# The case looks for a plaintext token by its GitHub shape (ghp_, gho_, ghu_,
+# ghs_, ghr_ or github_pat_) in the box's whole environment. The same gates
+# as the second-box proof above record a lane without the proxy as NOT RUN.
+proof_bep_box_env_holds_sealed_value_only() {
+  echo "::group::GitHub grant boxes: the grant's variable holds a sealed value only"
+  # This proof reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  bep_control="$HOME/.minimal/bep/control.sock"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run bep_box_env_holds_sealed_value_only "the Box Egress Proxy runs on macOS only"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$bep_status" != "Signed in to GitHub"* ]]; then
+    not_run bep_box_env_holds_sealed_value_only "no GitHub sign-in on this machine: run 'min auth login' first"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ ! -S "$bep_control" ]; then
+    not_run bep_box_env_holds_sealed_value_only "the Box Egress Proxy is not running: no $bep_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  bep_values=""
+  for bep_name in e2e-bep-env-first e2e-bep-env-second; do
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-env-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-env-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-env-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-env-$bep_name.err"
+      fail
+    fi
+    bep_sid="$(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+    bep_sids="$bep_sids $bep_sid"
+    if ! mnl session exec "$bep_sid" sh -c 'env' \
+      >"$WORK/bep-env-$bep_name.env" 2>"$WORK/bep-env-$bep_name.exec.err"; then
+      echo "::error::'min session exec' in the GitHub grant box $bep_name failed"
+      cat "$WORK/bep-env-$bep_name.exec.err" 2>/dev/null || true
+      fail
+    fi
+    # The value itself is never printed: the transcript names only its length.
+    bep_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/bep-env-$bep_name.env" | tr -d '\r' | head -n1)"
+    if [ -z "$bep_value" ]; then
+      echo "::error::the GitHub grant box $bep_name has no value in GH_TOKEN"
+      fail
+    fi
+    if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/bep-env-$bep_name.env"; then
+      echo "::error::the environment of the GitHub grant box $bep_name holds a plaintext GitHub token"
+      fail
+    fi
+    case " $bep_values " in
+      *" $bep_value "*)
+        echo "::error::the GitHub grant box $bep_name holds the same GH_TOKEN value as an earlier box, so the value does not name its box"
+        fail
+        ;;
+    esac
+    bep_values="$bep_values $bep_value"
+    rm -f "$WORK/bep-env-$bep_name.env"
+    echo "$bep_name: GH_TOKEN holds a sealed value (${#bep_value} characters), and no plaintext token"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "Sealed-value placement proof OK (two grant boxes started headless, each GH_TOKEN a sealed value of its own)"
+  echo "::endgroup::"
+}
+
 proof_github_only_allowlist() {
   echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
@@ -22826,6 +22914,7 @@ case "${1:-}" in
     proof_two_named_vms_on_one_machine
     proof_github_only_allowlist
     proof_bep_second_box_needs_no_sign_in
+    proof_bep_box_env_holds_sealed_value_only
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -22881,7 +22970,8 @@ case "${1:-}" in
     | escape_reaches_only_declared_union \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
-    | bep_second_box_needs_no_sign_in)
+    | bep_second_box_needs_no_sign_in \
+    | bep_box_env_holds_sealed_value_only)
     "proof_$1"
     ;;
   *)
@@ -22917,6 +23007,7 @@ case "${1:-}" in
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
+    echo "         bep_box_env_holds_sealed_value_only"
     exit 2
     ;;
 esac
