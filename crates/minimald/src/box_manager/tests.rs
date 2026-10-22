@@ -133,6 +133,8 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
     }
 }
 
@@ -1520,4 +1522,52 @@ async fn start_materialize_rejects_an_unknown_output_by_name() {
         err.to_string().contains("no-such-output"),
         "the error must name the output that was asked for, got {err}"
     );
+}
+
+/// BEP-007: the sealed values a create request carries ride the box's
+/// stored record, and a host launch takes them from it, so every launch,
+/// after a daemon restart included, places them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_deliveries_ride_the_record_to_the_host_params() {
+    let (_state, _cache, mngr) = manager().await;
+    let deliveries = vec![
+        boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: "v1.sealed-one".to_string(),
+        },
+        boxes::SealedDelivery {
+            variable: "GITHUB_TOKEN".to_string(),
+            sealed: "v1.sealed-two".to_string(),
+        },
+    ];
+    let config = minimald_rpc::BoxConfig {
+        sealed_deliveries: deliveries.clone(),
+        ..sample_config()
+    };
+    let id = mngr.create_session(config, None).await.unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.sealed_deliveries, deliveries);
+    assert_eq!(crate::box_runtime::launch_deliveries(&record), deliveries);
+
+    // A box with no grant carries none.
+    let id = mngr
+        .create_session(
+            minimald_rpc::BoxConfig {
+                name: Some("no-grant".to_string()),
+                ..sample_config()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert!(crate::box_runtime::launch_deliveries(&record).is_empty());
 }

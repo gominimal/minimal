@@ -344,6 +344,78 @@ fn mint_grants(
     Ok((minted, Some(registration)))
 }
 
+/// Mints the box's GitHub grants for the box id `request` carries, and puts
+/// each grant's sealed value on the request for the box's launches to place
+/// (BEP-005, BEP-007). Does nothing for a box with no GitHub grant. No box
+/// exists yet, so a failure only withdraws the row the box's registration
+/// bought (T66).
+async fn mint_into_request(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    github_grants: &[String],
+    control_sock: Option<std::path::PathBuf>,
+) -> Result<Option<crate::mint::ProxyRegistration>, anyhow::Error> {
+    let grants = github_grants.to_vec();
+    let box_id = request.config.box_id.map(|box_id| box_id.to_string());
+    let egress = request
+        .config
+        .policy
+        .egress
+        .as_ref()
+        .and_then(|egress| egress.allow_dns_hosts.clone())
+        .unwrap_or_default();
+    let network = request.config.network;
+    // The mint blocks on the proxy's control socket and the host keychain,
+    // so it runs off the runtime's workers.
+    let minted = tokio::task::spawn_blocking(move || mint_grants(grants, box_id, egress, network))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|minted| minted)
+        .and_then(|(minted, registration)| {
+            Ok((sealed_deliveries(github_grants, &minted)?, registration))
+        });
+    match minted {
+        Ok((deliveries, registration)) => {
+            request.config.sealed_deliveries = deliveries;
+            Ok(registration)
+        }
+        Err(error) => {
+            withdraw_box_row(
+                control_sock,
+                request.config.name.as_deref(),
+                request.config.box_addresses,
+                request.config.box_id,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+/// The create request's sealed deliveries: one for each GitHub grant, in
+/// the grants' order, each holding the value the mint sealed for it
+/// (BEP-007). A grant the mint gave no sealed value is refused by name, so
+/// a box never starts with that grant's variable empty.
+fn sealed_deliveries(
+    grants: &[String],
+    minted: &[crate::mint::Minted],
+) -> Result<Vec<boxes::SealedDelivery>, anyhow::Error> {
+    grants
+        .iter()
+        .map(|grant| {
+            let Some(minted) = minted.iter().find(|minted| &minted.grant == grant) else {
+                bail!(
+                    "Cannot start the box: no sealed value was made for its GitHub grant \
+                     {grant}, so {grant} would be empty in the box."
+                );
+            };
+            Ok(boxes::SealedDelivery {
+                variable: grant.clone(),
+                sealed: minted.sealed.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// One named step of [`activate_box`], in the order the activation runs
 /// them. Each step runs inside its own `activation_step` span, so a log read
 /// under `RUST_LOG=info` shows where an activation spent its time and which
@@ -364,11 +436,11 @@ pub(crate) enum ActivationStep {
     ConnectDaemon,
     /// The box's registration with the VM host daemon.
     RegisterBox,
+    /// The GitHub grants' sign-in references, sealed onto the create
+    /// request, and the box's registration with the Box Egress Proxy.
+    MintGrants,
     /// The `CreateSession` call and its version gate.
     CreateSession,
-    /// The GitHub grants' sign-in references, and the box's registration
-    /// with the Box Egress Proxy.
-    MintGrants,
     /// The session-start lines printed once the session exists.
     ReportStart,
     /// The project file upload into the session workspace.
@@ -392,8 +464,8 @@ impl ActivationStep {
         Self::PlanUpload,
         Self::ConnectDaemon,
         Self::RegisterBox,
-        Self::CreateSession,
         Self::MintGrants,
+        Self::CreateSession,
         Self::ReportStart,
         Self::UploadFiles,
         Self::ComposeLoadout,
@@ -851,6 +923,24 @@ pub(crate) async fn activate_box(
         return Err(refused.into());
     }
 
+    // BEP-005/007: each GitHub grant's sign-in reference is minted for the
+    // id the registration handed, before the create, so the create request
+    // carries each sealed value for every launch of the box to place in its
+    // grant's environment variable. A failure withdraws the row the
+    // registration bought (T66). An autogen collision below re-registers
+    // under a new id, and mints again for it.
+    // The proxy's hold on the box: dropped by a later step's failure, it
+    // forgets the box's declared egress there. It is kept once the session
+    // is active. A Ctrl-C exits the process with no drop, so it leaves the
+    // box at the proxy until the box's destroy forgets it (#2277).
+    let mut proxy_registration = ActivationStep::MintGrants
+        .run(mint_into_request(
+            &mut request,
+            &github_grants,
+            control_sock.clone(),
+        ))
+        .await?;
+
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     // An autogen name can (rarely) collide with an existing session built
     // from the same directory; on the daemon's already-exists rejection,
@@ -935,6 +1025,15 @@ pub(crate) async fn activate_box(
                             request.config.box_id = registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id);
+                            // The sealed values name the abandoned id, so the
+                            // new one gets its own (BEP-007). The replaced
+                            // registration forgets the old id at the proxy.
+                            proxy_registration = mint_into_request(
+                                &mut request,
+                                &github_grants,
+                                control_sock.clone(),
+                            )
+                            .await?;
                             continue;
                         }
                         // A create failure that is not a retryable autogen collision
@@ -976,68 +1075,6 @@ pub(crate) async fn activate_box(
         })
         .await?;
     let id = created.id;
-    // BEP-005: each GitHub grant's sign-in reference is minted for the id
-    // the box now holds, after the create's retries settled it. A failure
-    // abandons the activation and its row the same way a create failure
-    // does (T66).
-    // The proxy's hold on the box: dropped by a later step's failure, it
-    // forgets the box's declared egress there. It is kept once the session
-    // is active. A Ctrl-C exits the process with no drop, so it leaves the
-    // box at the proxy until the box's destroy forgets it (#2277).
-    let proxy_registration = ActivationStep::MintGrants
-        .run(async {
-            let box_id = registered
-                .as_ref()
-                .and_then(|registration| registration.box_id);
-            let grants = github_grants.clone();
-            let egress = request
-                .config
-                .policy
-                .egress
-                .as_ref()
-                .and_then(|egress| egress.allow_dns_hosts.clone())
-                .unwrap_or_default();
-            let network = request.config.network;
-            // The mint blocks on the proxy's control socket and the host
-            // keychain, so it runs off the runtime's workers.
-            let minted = tokio::task::spawn_blocking(move || {
-                mint_grants(
-                    grants,
-                    box_id.map(|box_id| box_id.to_string()),
-                    egress,
-                    network,
-                )
-            })
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|minted| minted);
-            match minted {
-                // Interim: the sealed values are dropped, so the grant's
-                // environment variable stays empty until BEP-007 delivers
-                // them. The flip is T42
-                // (https://github.com/gominimal/minimal/issues/2488).
-                Ok((minted, registration)) => {
-                    drop(minted);
-                    Ok(registration)
-                }
-                Err(error) => {
-                    // The session `CreateSession` just made is not finalized, and
-                    // the interrupt guard is not armed yet. Destroy it so `min ls`
-                    // does not keep a half-made session, as the finalize failure
-                    // does, and withdraw its row (T66).
-                    best_effort_destroy(&mut client, id).await;
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        request.config.name.as_deref(),
-                        request.config.box_addresses,
-                        box_id,
-                    )
-                    .await;
-                    Err(error)
-                }
-            }
-        })
-        .await?;
     ActivationStep::ReportStart
         .run(async {
             // The registration's own half of the session-start output (T66): one line
@@ -1857,6 +1894,48 @@ mod tests {
         }
         refuse_dynamic_ingress_off_own_ip(OwnIp, Some(DynamicIngress::Allow), Some((8000, 8443)))
             .expect("an own-IP box keeps its dynamic declaration");
+    }
+
+    /// BEP-007: each grant's sealed value goes on the create request under
+    /// the grant's variable, and a grant left with no sealed value is
+    /// refused by name.
+    #[test]
+    fn sealed_deliveries_follow_the_grants_and_refuse_a_missing_one() {
+        let minted = |grant: &str, sealed: &str| crate::mint::Minted {
+            grant: grant.to_string(),
+            sealed: zeroize::Zeroizing::new(sealed.to_string()),
+            expiry: 0,
+        };
+        let grants = vec!["GH_TOKEN".to_string(), "GITHUB_TOKEN".to_string()];
+        let deliveries = sealed_deliveries(
+            &grants,
+            &[
+                minted("GITHUB_TOKEN", "sealed-two"),
+                minted("GH_TOKEN", "sealed-one"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            deliveries,
+            [
+                boxes::SealedDelivery {
+                    variable: "GH_TOKEN".to_string(),
+                    sealed: "sealed-one".to_string(),
+                },
+                boxes::SealedDelivery {
+                    variable: "GITHUB_TOKEN".to_string(),
+                    sealed: "sealed-two".to_string(),
+                },
+            ]
+        );
+
+        let error = sealed_deliveries(&grants, &[minted("GH_TOKEN", "sealed-one")])
+            .expect_err("a grant with no sealed value is refused");
+        assert_eq!(
+            error.to_string(),
+            "Cannot start the box: no sealed value was made for its GitHub grant \
+             GITHUB_TOKEN, so GITHUB_TOKEN would be empty in the box."
+        );
     }
 
     #[test]

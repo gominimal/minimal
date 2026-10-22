@@ -1224,6 +1224,7 @@ mod tests {
             box_id: None,
             host_row_bound: true,
             bound_ports: std::collections::BTreeSet::new(),
+            sealed_deliveries: Vec::new(),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),

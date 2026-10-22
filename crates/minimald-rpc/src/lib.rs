@@ -509,6 +509,19 @@ pub struct BoxConfig {
     /// state is the host's verdict, never a caller's assertion.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
+    /// The sealed value of each of the box's GitHub grants (BEP-007), as
+    /// the creating client minted them for [`Self::box_id`]. The daemon
+    /// copies them into the box's record, and every launch places each one
+    /// in its grant's environment variable. Empty for a box with no grant.
+    /// A daemon that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed_deliveries: Vec<boxes::SealedDelivery>,
+    /// The Box Egress Proxy's root certificate, PEM-encoded, for the box to
+    /// trust. `None` until the proxy publishes the certificate
+    /// (<https://github.com/gominimal/minimal/issues/2437>), and the daemon
+    /// reads nothing from it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_certificate: Option<String>,
 }
 
 /// Serde default for [`BoxConfig::hooks_enabled`]. See
@@ -1671,7 +1684,8 @@ impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
-    /// addresses, hooks on, no attrs, and no version assertion.
+    /// addresses, hooks on, no attrs, no sealed deliveries, no root
+    /// certificate, and no version assertion.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1689,6 +1703,8 @@ impl CreateSessionRequest {
                 box_addresses: None,
                 hooks_enabled: default_hooks_enabled(),
                 attrs: Default::default(),
+                sealed_deliveries: Vec::new(),
+                root_certificate: None,
             },
             must_match_version: None,
         }

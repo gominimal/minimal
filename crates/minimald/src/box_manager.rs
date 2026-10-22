@@ -118,6 +118,9 @@ fn build_record(
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // BEP-007: the grants' sealed values ride the record, so every host
+        // launch of the box, after a daemon restart included, places them.
+        sealed_deliveries: config.sealed_deliveries,
         attrs: config.attrs,
     };
     record

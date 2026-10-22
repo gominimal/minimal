@@ -479,6 +479,8 @@ impl BoxActor {
                 // they write to and the process whose namespaces they join.
                 composition: self.composition(),
                 connection_env,
+                // BEP-007: every launch places the grants' sealed values.
+                sealed_deliveries: box_runtime::launch_deliveries(&record),
                 // The host owns the box's name-lifecycle half (NET-128): its
                 // `mainloop` marks the name running on the way in and stopped
                 // on the way out, so a shared-address name answers NODATA while

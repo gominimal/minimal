@@ -204,6 +204,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -264,6 +265,7 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -414,6 +416,7 @@ impl FloodedAttach {
                 session_id: boxes::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
+                sealed_deliveries: Vec::new(),
                 #[cfg(target_os = "linux")]
                 name_marker: None,
             },
@@ -669,6 +672,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -732,6 +736,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -783,6 +788,7 @@ async fn a_kill_tells_the_binding_nothing() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -826,6 +832,7 @@ async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1301,6 +1308,7 @@ async fn get_attrs_tracks_title_and_io_times() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1379,6 +1387,7 @@ async fn kill_tears_down_host_and_reaps_process() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1485,6 +1494,7 @@ async fn exit_releases_the_network() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1541,6 +1551,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1644,6 +1655,7 @@ async fn stale_binding_generation_input_is_discarded() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1778,6 +1790,7 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 session_id: boxes::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
+                sealed_deliveries: Vec::new(),
                 #[cfg(target_os = "linux")]
                 name_marker: None,
             },
@@ -6325,6 +6338,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -6947,4 +6961,87 @@ async fn shell_exit_keep_item_names_the_restored_registration_for_a_registered_b
         registered.contains(delete) && unregistered.contains(delete),
         "both prompts keep the Delete item"
     );
+}
+
+/// BEP-007: a grant's sealed value is placed in the grant's environment
+/// variable, over any value the session's environment held there, and is
+/// the only value the variable holds: in the published per-attach files the
+/// shell re-reads before every command, and in what the host runs in the
+/// box. A box with no grant gets no such variable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_value_is_placed_in_its_grant_variable_only() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    const PLAINTEXT: &str = "ghp_plaintexttoken";
+    let tmp = tempfile::tempdir().unwrap();
+    let home =
+        DaemonAbsPath::try_new(camino::Utf8PathBuf::try_from(tmp.path().to_path_buf()).unwrap())
+            .unwrap();
+    let paths = BoxPaths {
+        home: home.clone(),
+        ..test_paths()
+    };
+    // A value already in the variable is the one a delivery must replace.
+    let connection_env: ConnectionEnv = [
+        ("TERM".to_string(), "xterm-256color".to_string()),
+        ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let (host, _handle) = Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths,
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env,
+            sealed_deliveries: vec![boxes::SealedDelivery {
+                variable: "GH_TOKEN".to_string(),
+                sealed: SEALED.to_string(),
+            }],
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+
+    // The shell's half: the files it re-reads before every command.
+    let json = std::fs::read_to_string(home.sub_path_unchecked(ATTACH_ENV_JSON_REL).as_str())
+        .expect("the build publishes the per-attach environment");
+    let published: ConnectionEnv = serde_json_lenient::from_str(&json).expect("{json}");
+    assert_eq!(published.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(
+        published.get("TERM").map(String::as_str),
+        Some("xterm-256color")
+    );
+    assert_eq!(published.len(), 2, "nothing else is placed: {published:?}");
+    for rel in [ATTACH_ENV_SH_REL, ATTACH_ENV_FISH_REL, ATTACH_ENV_JSON_REL] {
+        let body = std::fs::read_to_string(home.sub_path_unchecked(rel).as_str()).unwrap();
+        assert!(body.contains(SEALED), "{rel}: {body}");
+        assert!(
+            !body.contains(PLAINTEXT),
+            "{rel} holds the plaintext: {body}"
+        );
+    }
+
+    // The host's half: what it runs in the box sees the sealed value.
+    let output = host
+        .command_in_session("sh", ["-c", "printenv GH_TOKEN"], Default::default())
+        .expect("a host-side command under test")
+        .output()
+        .expect("printenv runs");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), SEALED);
+
+    // A box with no grant places nothing.
+    let mut env = ConnectionEnv::new();
+    place_sealed_deliveries(&mut env, boxes::SessionId::nil(), &[]);
+    assert!(env.is_empty(), "{env:?}");
 }

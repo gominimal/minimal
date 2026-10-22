@@ -396,6 +396,7 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            sealed_deliveries: Vec::new(),
             attrs: Default::default(),
         }
     }

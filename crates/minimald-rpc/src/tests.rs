@@ -490,6 +490,13 @@ fn create_session_request_round_trips() {
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
+            // Non-empty, so a fixture cannot round-trip green with the
+            // deliveries and the certificate left off the wire.
+            sealed_deliveries: vec![boxes::SealedDelivery {
+                variable: "GH_TOKEN".into(),
+                sealed: "sealed-value".into(),
+            }],
+            root_certificate: Some("-----BEGIN CERTIFICATE-----".into()),
         },
         must_match_version: Some("0.6.0".into()),
     };
@@ -520,6 +527,8 @@ fn create_request_constructor_round_trips() {
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),
+                sealed_deliveries: Vec::new(),
+                root_certificate: None,
             },
             must_match_version: None,
         }
