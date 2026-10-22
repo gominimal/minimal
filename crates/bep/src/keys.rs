@@ -487,6 +487,16 @@ mod keychain {
         }
     }
 
+    // #2440: the root and signing CA keys sign certificates in the keychain,
+    // so the private half never leaves it.
+    impl crate::ca::CaKey for KeychainKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            self.key
+                .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, msg)
+                .map_err(|err| use_error(self.role, &err))
+        }
+    }
+
     impl HeldKey for KeychainKey {
         fn role(&self) -> Role {
             self.role
@@ -799,6 +809,24 @@ pub(crate) mod memory {
         }
     }
 
+    impl crate::ca::CaKey for MemoryKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            use p256::ecdsa::signature::Signer as _;
+            if self.locked {
+                return Err(broken(self.role));
+            }
+            if self.refused {
+                return Err(KeyError::Refused {
+                    role: self.role,
+                    detail: "refused".into(),
+                });
+            }
+            let signature: p256::ecdsa::Signature =
+                p256::ecdsa::SigningKey::from(&self.secret).sign(msg);
+            Ok(signature.to_der().as_bytes().to_vec())
+        }
+    }
+
     fn broken(role: Role) -> KeyError {
         KeyError::Store {
             role,
@@ -1051,6 +1079,59 @@ mod tests {
 
         let err = replace(&store, Role::Sealing).unwrap_err();
         assert!(matches!(err, ReplaceError::Generate(_)), "{err}");
+    }
+
+    // #2440, BEP-013: the store-held root key signs the root certificate,
+    // and the signing CA key signs below it. A refused root key issues none.
+    #[test]
+    fn keychain_root_key_signs_the_root_certificate() {
+        use std::time::{Duration, SystemTime};
+
+        use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+        use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+
+        use crate::ca::{Ca, CaError, Union, issue_root};
+        use crate::module::GITHUB;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let store = MemoryStore::default();
+        let keys = load(&store, &[]).unwrap();
+        let union = Union::new(&[GITHUB], [""; 0]);
+        let root = issue_root(&keys.root, union.clone(), now).unwrap();
+        let ca = Ca::with_root(&keys.root, &keys.signing, root.clone(), now).unwrap();
+        let leaf = ca.issue_leaf("api.github.com", now).unwrap();
+
+        let anchor = CertificateDer::from(root.der().to_vec());
+        let anchors = [anchor_from_trusted_cert(&anchor).unwrap()];
+        let ee = EndEntityCert::try_from(&leaf.chain[0]).unwrap();
+        let time = UnixTime::since_unix_epoch(now.duration_since(SystemTime::UNIX_EPOCH).unwrap());
+        ee.verify_for_usage(
+            &[webpki::ring::ECDSA_P256_SHA256],
+            &anchors,
+            &leaf.chain[1..],
+            time,
+            KeyUsage::server_auth(),
+            None,
+            None,
+        )
+        .expect("the chain validates against the root the root key signed");
+        ee.verify_is_valid_for_subject_name(&ServerName::try_from("api.github.com").unwrap())
+            .unwrap();
+
+        // A root key the store refuses issues no root, and says so by role.
+        store.refuse(Role::Root);
+        let refused = store.find(Role::Root).unwrap().unwrap();
+        let err = issue_root(&refused, union, now).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CaError::Key(KeyError::Refused {
+                    role: Role::Root,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
