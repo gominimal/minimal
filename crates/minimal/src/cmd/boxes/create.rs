@@ -198,6 +198,97 @@ fn refuse_unhonourable_grants(
     Ok(())
 }
 
+/// The names of the project's GitHub grants, in name order.
+fn github_grant_names(secrets: &boxes::core::bep::SecretGrants) -> Vec<String> {
+    secrets
+        .iter()
+        .filter(|(_, grant)| grant.is_github())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether the host keychain holds a GitHub sign-in. Reads the item's
+/// metadata only, which carries no token and asks for nothing.
+fn sign_in_held(keychain: &dyn bep::signin::Keychain) -> Result<bool, anyhow::Error> {
+    keychain
+        .metadata()
+        .map(|held| held.is_some())
+        .map_err(|error| crate::mint::MintError::SignIn(error).into())
+}
+
+/// The proxy's name for the box's address stance. A box with no network
+/// has none, and the activation refuses it a grant (BEP-009). The enum is
+/// non-exhaustive, and a mode added later has no stance until it says one.
+fn proxy_stance(network: boxes::NetworkMode) -> Option<bep::boxes::Stance> {
+    match network {
+        boxes::NetworkMode::OwnIp => Some(bep::boxes::Stance::OwnIp),
+        boxes::NetworkMode::HostNet => Some(bep::boxes::Stance::HostIp),
+        _ => None,
+    }
+}
+
+/// Mints each GitHub grant's sign-in reference for the box `box_id`, and
+/// registers the box's declared egress and stance with the Box Egress
+/// Proxy (BEP-005). Does nothing for a box with no GitHub grant.
+///
+/// A box with no id gets nothing: a native host and a daemon that predates
+/// box ids hand none back, and no proxy serves those boxes.
+fn mint_grants(
+    grants: &[String],
+    box_id: Option<String>,
+    policy: &boxes::BoxPolicy,
+    network: boxes::NetworkMode,
+) -> Result<Vec<crate::mint::Minted>, anyhow::Error> {
+    use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
+    if grants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (Some(box_id), Some(stance)) = (box_id, proxy_stance(network)) else {
+        tracing::debug!(
+            grants = grants.len(),
+            "no box id or no network, so no GitHub sign-in reference is minted"
+        );
+        return Ok(Vec::new());
+    };
+    let (Some(identity_path), Some(control_path)) =
+        (crate::mint::identity_path(), crate::mint::control_path())
+    else {
+        bail!(
+            "Cannot start the box: it declares a GitHub grant, and no home directory was found, \
+             which holds the Box Egress Proxy's keys."
+        );
+    };
+    let identity =
+        bep::publish::Identity::read(&identity_path).map_err(|error| MintError::Identity {
+            path: identity_path.clone(),
+            error,
+        })?;
+    let mut control = ControlClient::connect(&control_path)?;
+    let key = ClientKey::generate()?;
+    let grant_box = GrantBox {
+        box_id,
+        grants: grants.to_vec(),
+        egress: policy
+            .egress
+            .as_ref()
+            .and_then(|egress| egress.allow_dns_hosts.clone())
+            .unwrap_or_default(),
+        stance,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    Ok(mint_and_register(
+        &bep::signin::HostKeychain,
+        &identity,
+        &identity_path,
+        &mut control,
+        &key,
+        &grant_box,
+        now,
+    )?)
+}
+
 /// One named step of [`activate_box`], in the order the activation runs
 /// them. Each step runs inside its own `activation_step` span, so a log read
 /// under `RUST_LOG=info` shows where an activation spent its time and which
@@ -220,6 +311,9 @@ pub(crate) enum ActivationStep {
     RegisterBox,
     /// The `CreateSession` call and its version gate.
     CreateSession,
+    /// The GitHub grants' sign-in references, and the box's registration
+    /// with the Box Egress Proxy.
+    MintGrants,
     /// The session-start lines printed once the session exists.
     ReportStart,
     /// The project file upload into the session workspace.
@@ -235,7 +329,7 @@ pub(crate) enum ActivationStep {
 impl ActivationStep {
     /// Every step, in the order [`activate_box`] runs them.
     #[cfg(test)]
-    pub(crate) const ORDER: [Self; 13] = [
+    pub(crate) const ORDER: [Self; 14] = [
         Self::CheckArguments,
         Self::CheckProject,
         Self::StartDaemon,
@@ -244,6 +338,7 @@ impl ActivationStep {
         Self::ConnectDaemon,
         Self::RegisterBox,
         Self::CreateSession,
+        Self::MintGrants,
         Self::ReportStart,
         Self::UploadFiles,
         Self::ComposeLoadout,
@@ -262,6 +357,7 @@ impl ActivationStep {
             Self::ConnectDaemon => "connect_daemon",
             Self::RegisterBox => "register_box",
             Self::CreateSession => "create_session",
+            Self::MintGrants => "mint_grants",
             Self::ReportStart => "report_start",
             Self::UploadFiles => "upload_files",
             Self::ComposeLoadout => "compose_loadout",
@@ -374,7 +470,7 @@ pub(crate) async fn activate_box(
     // reach the create (the flag requires its mode). Nothing set keeps
     // `None`: the deny-all default, which the policy module evaluates the
     // same as an explicit deny.
-    let policy = ActivationStep::CheckProject
+    let (policy, github_grants) = ActivationStep::CheckProject
         .run(async {
             let has_ingress = !port_mappings.is_empty()
                 || args.dynamic_ingress.is_some()
@@ -413,7 +509,14 @@ pub(crate) async fn activate_box(
                 &project_secrets,
                 full_breadth_acknowledged,
             )?;
-            Ok::<_, anyhow::Error>(policy)
+            // BEP-003: a GitHub grant needs a held sign-in. Only the item's
+            // metadata is read, and nothing asks for a sign-in.
+            let github_grants = github_grant_names(&project_secrets);
+            if !github_grants.is_empty() {
+                let signed_in = sign_in_held(&bep::signin::HostKeychain)?;
+                boxes::core::bep::require_sign_in(&project_secrets, signed_in)?;
+            }
+            Ok::<_, anyhow::Error>((policy, github_grants))
         })
         .await?;
     ActivationStep::StartDaemon
@@ -798,6 +901,41 @@ pub(crate) async fn activate_box(
         })
         .await?;
     let id = created.id;
+    // BEP-005: each GitHub grant's sign-in reference is minted for the id
+    // the box now holds, after the create's retries settled it. A failure
+    // abandons the activation and its row the same way a create failure
+    // does (T66).
+    ActivationStep::MintGrants
+        .run(async {
+            let box_id = registered
+                .as_ref()
+                .and_then(|registration| registration.box_id);
+            let minted = mint_grants(
+                &github_grants,
+                box_id.map(|box_id| box_id.to_string()),
+                &request.config.policy,
+                request.config.network,
+            );
+            match minted {
+                // The sealed values reach the box's environment with
+                // BEP-007, which is not built yet.
+                Ok(minted) => {
+                    drop(minted);
+                    Ok(())
+                }
+                Err(error) => {
+                    withdraw_box_row(
+                        control_sock.clone(),
+                        request.config.name.as_deref(),
+                        request.config.box_addresses,
+                        box_id,
+                    )
+                    .await;
+                    Err(error)
+                }
+            }
+        })
+        .await?;
     ActivationStep::ReportStart
         .run(async {
             // The registration's own half of the session-start output (T66): one line

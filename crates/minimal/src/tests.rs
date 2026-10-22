@@ -3736,3 +3736,272 @@ fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
         Some(entries[2].id)
     );
 }
+
+/// The GitHub grant mint and the box's registration with the proxy
+/// (BEP-003, BEP-005).
+mod mint_tests {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use bep::boxes::{BoxRegistry, Stance};
+    use bep::control::{Control, Registry};
+    use bep::module::GITHUB;
+    use bep::publish::{Identity, PublishedKey};
+    use bep::seal::{Binding, Breadth, MemberKind, Mode, ProxyKey, ProxyPublicKey};
+    use bep::signin::{Completed, Flow, Keychain as _, Material, MemoryKeychain, store_sign_in};
+
+    use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
+
+    const BOX_ID: &str = "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f5";
+    const BOX_HEX: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+    const NOW: u64 = 1_800_000_000;
+    const ROOT_END: u64 = 2_000_000_000;
+
+    fn published(key: &ProxyPublicKey) -> PublishedKey {
+        PublishedKey {
+            public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
+            kid: key.kid(),
+        }
+    }
+
+    /// A proxy's sealing key and the identity it publishes.
+    fn proxy() -> (ProxyKey, Identity) {
+        let sealing = ProxyKey::generate().unwrap();
+        let root = ProxyKey::generate().unwrap();
+        let identity = Identity {
+            sealing: Some(published(&sealing.public())),
+            root: Some(published(&root.public())),
+            signing: Some(published(&ProxyKey::generate().unwrap().public())),
+            root_not_after: Some(ROOT_END),
+        };
+        (sealing, identity)
+    }
+
+    fn signed_in() -> MemoryKeychain {
+        let keychain = MemoryKeychain::default();
+        store_sign_in(
+            &keychain,
+            &Completed {
+                account: "octocat".into(),
+                flow: Flow::Device,
+                material: Material {
+                    instance: String::new(),
+                    access_token: "ghu_secret_token_value".into(),
+                    refresh_token: "ghr_secret_refresh_value".into(),
+                },
+                token_expires_at: NOW + 3_600,
+                refresh_expires_at: NOW + 86_400,
+            },
+        )
+        .unwrap();
+        keychain
+    }
+
+    fn grant_box(stance: Stance) -> GrantBox {
+        GrantBox {
+            box_id: BOX_ID.into(),
+            grants: vec!["GH_TOKEN".into()],
+            egress: vec![
+                "github.com".into(),
+                "api.github.com".into(),
+                "uploads.github.com".into(),
+                "codeload.github.com".into(),
+            ],
+            stance,
+        }
+    }
+
+    /// A control socket served on its own runtime, with its registries.
+    struct Served {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        clients: Registry,
+        boxes: BoxRegistry,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    fn serve() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let clients = Registry::default();
+        let boxes = BoxRegistry::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async { Control::bind(&path, Arc::clone(&clients), Arc::clone(&boxes)) })
+            .unwrap();
+        runtime.spawn(control.run());
+        Served {
+            _dir: dir,
+            path,
+            clients,
+            boxes,
+            _runtime: runtime,
+        }
+    }
+
+    // BEP-005: the member is a sign-in reference under the client's key,
+    // with no token, the module's authorities, no injection form, and the
+    // root's validity end as its expiry.
+    #[test]
+    fn local_member_is_a_sign_in_reference_expiring_with_the_root() {
+        let (sealing, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let key = ClientKey::generate().unwrap();
+
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &key,
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].grant, "GH_TOKEN");
+        assert_eq!(minted[0].expiry, ROOT_END);
+        // The sealed value carries no token, in any part.
+        assert!(!minted[0].sealed.contains("ghu_"));
+        assert!(!minted[0].sealed.contains("ghr_"));
+
+        // The value opens for this box on the proxy that publishes the key.
+        let node = sealing.public().kid();
+        let opened = bep::seal::open(
+            &sealing,
+            &minted[0].sealed,
+            &Binding {
+                box_id: BOX_HEX.into(),
+                host: node.clone(),
+                module: GITHUB.id.into(),
+                now: NOW + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(opened.context.box_id, BOX_HEX);
+        assert_eq!(opened.context.host, node);
+        assert_eq!(opened.context.module, "github");
+        assert_eq!(opened.context.host_set_version, GITHUB.host_set_version);
+        assert_eq!(opened.context.mode, Mode::User);
+        assert_eq!(opened.context.iat, NOW);
+        assert_eq!(opened.context.expiry, ROOT_END);
+        assert_eq!(opened.member.kind, MemberKind::SignIn);
+        assert_eq!(opened.member.breadth, Breadth::Full);
+        assert_eq!(opened.member.exp, Some(ROOT_END));
+
+        // The handle verifies under the client key the mint registered.
+        let registered = served.clients.read().unwrap().clone();
+        assert!(registered.contains(&key.kid()));
+        let claims = bep::handle::verify(&opened.member.jws, &registered).unwrap();
+        assert_eq!(claims.sub, BOX_HEX);
+        assert_eq!(claims.node_id, node);
+        assert_eq!(claims.store, "github");
+        assert_eq!(claims.id, instance);
+        let upstream: Vec<String> = GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect();
+        assert_eq!(claims.upstream, upstream);
+        assert_eq!(claims.inject, None);
+        assert_eq!(claims.iat, NOW);
+        assert_eq!(claims.exp, ROOT_END);
+        assert_eq!(claims.jti.len(), 32);
+        assert!(!opened.member.jws.contains("ghu_"));
+
+        // A handle signed under a key the proxy never registered does not
+        // verify.
+        let other = bep::handle::ClientKeys::new();
+        assert!(bep::handle::verify(&opened.member.jws, &other).is_err());
+    }
+
+    // BEP-005: an identity with no root validity end mints nothing, and
+    // registers nothing.
+    #[test]
+    fn an_identity_with_no_root_validity_mints_nothing() {
+        let (_, identity) = proxy();
+        let identity = Identity {
+            root_not_after: None,
+            ..identity
+        };
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Identity { .. }), "{err}");
+        assert!(served.boxes.get(BOX_HEX).is_none());
+    }
+
+    // BEP-003: the proxy holds the box's declared egress and its stance
+    // after the mint. With no sign-in held, nothing is registered.
+    #[test]
+    fn grant_box_registers_its_declared_egress_with_the_proxy() {
+        let (_, identity) = proxy();
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+
+        mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::HostIp),
+            NOW,
+        )
+        .unwrap();
+        let held = served.boxes.get(BOX_HEX).expect("the proxy holds the box");
+        let egress: Vec<(String, u16)> = held
+            .egress
+            .iter()
+            .map(|authority| (authority.host.clone(), authority.port))
+            .collect();
+        assert_eq!(
+            egress,
+            [
+                ("github.com".to_owned(), 443),
+                ("api.github.com".to_owned(), 443),
+                ("uploads.github.com".to_owned(), 443),
+                ("codeload.github.com".to_owned(), 443),
+            ]
+        );
+        assert_eq!(held.stance, Stance::HostIp);
+
+        // With no sign-in held the creation fails with the defined error's
+        // text, and the proxy gets no registration.
+        let other = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let err = mint_and_register(
+            &MemoryKeychain::default(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &GrantBox {
+                box_id: other.into(),
+                ..grant_box(Stance::OwnIp)
+            },
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::NoSignIn));
+        assert!(err.to_string().contains("Run `min auth login`"), "{err}");
+        assert!(served.boxes.get(other).is_none());
+
+        // Nothing answers on a socket no proxy serves.
+        let gone = served.path.with_file_name("none.sock");
+        let err = ControlClient::connect(&gone).err().unwrap();
+        assert!(matches!(err, MintError::NotRunning { .. }), "{err}");
+    }
+}
