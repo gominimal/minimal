@@ -118,6 +118,10 @@ fn build_record(
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // Written by the create itself, never later: a box that ends with
+        // its run is marked from its first record, so no restart can land
+        // in a window where it reads as a plain session (NET-131).
+        ends_with_run: config.ends_with_run,
         attrs: config.attrs,
     };
     record
@@ -1134,6 +1138,79 @@ impl BoxManager {
                     continue;
                 }
             };
+            // A box that ends with its run dies with it even when the
+            // daemon did not (NET-131): the create marked the record, so a
+            // daemon death at any point after the create leaves the mark
+            // set. Destroying here is the same teardown a finished run's
+            // own box-end takes, so the box's `on_destroy` hooks run and
+            // its record is removed. The status and network filter below
+            // never sees it: a run box can hold any status the run's
+            // launch left it in.
+            //
+            // The actor comes up without registering the box's name, so
+            // it never takes over a name another box routes. The hooks
+            // run off the manager's message handling: each can take up to
+            // its timeout, and daemon startup and every queued RPC must
+            // not wait on them. The actor sits in `running` until they
+            // end, so an RPC naming the box in that window, such as the
+            // surviving run client's `DeleteSession`, reaches this actor
+            // rather than bringing up a second one.
+            //
+            // TODO(gominimal/inbox#731, BOX-012/BOX-154): this reap of a
+            // run's `running` record at restart is an interim against
+            // architecture line 495: a restart sets an orphaned `running`
+            // record to `stopped` and keeps it (spec 29 BOX-154). BOX-012
+            // reaps only `pending` and `materializing`. The flip sets the
+            // record to `stopped` and keeps it.
+            if record.ends_with_run {
+                tracing::info!(
+                    session_id = %session_id,
+                    session_name = record.name.as_deref().unwrap_or("<anonymous>"),
+                    "resume: destroying a run's box instead of resuming it \
+                     (its run ended with the daemon)",
+                );
+                let actor = self.start_box_teardown(session_id, &handle, false).await;
+                let manager = self.weak_self.clone();
+                crate::traced::spawn_detached(
+                    tracing::info_span!(
+                        parent: None,
+                        "resume_run_owned_teardown",
+                        session_id = %session_id
+                    ),
+                    async move {
+                        match Self::finish_box_teardown(actor, handle).await {
+                            Ok(hook_failures) => {
+                                for failure in hook_failures {
+                                    tracing::warn!(
+                                        %failure,
+                                        "resume: an on_destroy hook of the run-owned \
+                                         box failed; the box is destroyed anyway",
+                                    );
+                                }
+                                // A manager-initiated teardown does not
+                                // evict itself.
+                                if let Some(manager) = manager.upgrade() {
+                                    manager.evict(session_id).await;
+                                }
+                            }
+                            // The destroy ended the actor, but its record
+                            // is still on disk. The closed actor stays in
+                            // `running`, so a later `DeleteSession` reaches
+                            // it, its destroy answers `Ok` with no hooks
+                            // run, and the fallback record delete removes
+                            // the record. Evicting here instead makes that
+                            // delete bring up a new actor, which runs the
+                            // `on_destroy` hooks a second time.
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "resume: destroying the run-owned box failed; \
+                                 leaving its record for a later delete",
+                            ),
+                        }
+                    },
+                );
+                continue;
+            }
             if !matches!(record.status, boxes::BoxState::Active)
                 || !matches!(
                     record.network,
@@ -1209,6 +1286,103 @@ impl BoxManager {
         Ok(resumed)
     }
 
+    /// Tears a box down through its actor, then removes its record: the
+    /// `DeleteSession` path. The resume's teardown of a box that ends with
+    /// its run takes the same two halves, [`Self::start_box_teardown`] and
+    /// [`Self::finish_box_teardown`], so both end a box exactly one way.
+    ///
+    /// Teardown belongs to the actor, so an idle session gets one brought
+    /// up rather than having its record deleted out from under it. That
+    /// used to be a fair shortcut — "nothing to undo" — but a session's
+    /// `on_destroy` hooks run on this path, and skipping the actor skips
+    /// them silently for any session whose actor has been reaped (every
+    /// session, after a daemon restart).
+    ///
+    /// Spawning is cheap: the actor reads its record and composition, and
+    /// only mints a sandbox if there are destroy hooks to run in one.
+    async fn destroy_box_record(
+        &mut self,
+        id: SessionId,
+        handle: BoxRecordHandle,
+    ) -> Result<Vec<String>, BoxManagerError> {
+        let actor = self.start_box_teardown(id, &handle, true).await;
+        let destroyed = Self::finish_box_teardown(actor, handle).await;
+        // The destroy ends the actor whatever it answers.
+        self.running.remove(&id);
+        destroyed
+    }
+
+    /// The manager's half of a teardown: the box's actor in `running`, or one
+    /// brought up from its record and put in `running`. The actor stays there
+    /// until its caller removes or evicts it once the teardown ends, so an
+    /// RPC naming the box meanwhile reaches the same actor; its mailbox is
+    /// closed after the destroy, so a second destroy answers `Ok` with no
+    /// hooks run. `None` when the actor refuses to come up, and the record is
+    /// then removed without its hooks. `registers_name` is the bring-up's
+    /// [`BoxActorConfig::registers_name`]: `false` for the resume's
+    /// teardown, whose actor must not take over another box's name.
+    async fn start_box_teardown(
+        &mut self,
+        id: SessionId,
+        handle: &BoxRecordHandle,
+        registers_name: bool,
+    ) -> Option<BoxHandle> {
+        if let Some(hnd) = self.running.get(&id) {
+            return Some(hnd.clone());
+        }
+        let mut config = self.session_config(handle.clone());
+        config.registers_name = registers_name;
+        match BoxActor::run(config).await {
+            Ok(hnd) => {
+                self.running.insert(id, hnd.clone());
+                Some(hnd)
+            }
+            // A record the actor refuses to come up on — a
+            // restart-orphaned `Materializing` one is the known case —
+            // must still be destroyable, so fall through to deleting it
+            // directly. A box that cannot be torn down is worse than one
+            // torn down without its hooks.
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "could not start the session to run its destroy hooks; \
+                     removing its record without them",
+                );
+                None
+            }
+        }
+    }
+
+    /// The half of a teardown that waits on the box's `on_destroy` hooks.
+    /// It holds nothing of the manager's, so the resume can run it off the
+    /// manager's own message handling. Answers the hook failures.
+    async fn finish_box_teardown(
+        actor: Option<BoxHandle>,
+        handle: BoxRecordHandle,
+    ) -> Result<Vec<String>, BoxManagerError> {
+        match actor {
+            Some(hnd) => {
+                let hook_failures = hnd.destroy().await?;
+                // Belt-and-braces: a dead actor (self-terminated but not
+                // yet evicted) reads as `Ok` above, and may have died
+                // *without* deleting its record (its own delete failed).
+                // Remove any leftover; `NotFound` is the normal
+                // already-deleted case.
+                if let Err(e) = handle.delete().await
+                    && e.kind() != NotFound
+                {
+                    return Err(e);
+                }
+                Ok(hook_failures)
+            }
+            None => {
+                handle.delete().await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
     /// The spawn-time config for a session actor backing `record`. The one
     /// place the daemon-scoped dependencies are gathered, so the create and
     /// bring-up-from-disk paths can't hand their actors different worlds.
@@ -1222,6 +1396,7 @@ impl BoxManager {
             manager: self.weak_self.clone(),
             deny_all_opt_out: self.deny_all_opt_out,
             creator: None,
+            registers_name: true,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -1479,58 +1654,7 @@ impl BoxManager {
                                     ),
                                 )
                             })?;
-                    // Teardown belongs to the actor, so an idle session gets
-                    // one brought up rather than having its record deleted
-                    // out from under it. That used to be a fair shortcut —
-                    // "nothing to undo" — but a session's `on_destroy` hooks
-                    // now run on this path, and skipping the actor skipped
-                    // them silently for any session whose actor had been
-                    // reaped (every session, after a daemon restart).
-                    //
-                    // Spawning is cheap: the actor reads its record and
-                    // composition, and only mints a sandbox if there are
-                    // destroy hooks to run in one.
-                    let actor = match self.running.remove(&id) {
-                        Some(hnd) => Some(hnd),
-                        None => match BoxActor::run(self.session_config(handle.clone())).await {
-                            Ok(hnd) => Some(hnd),
-                            // A record the actor refuses to come up on — a
-                            // restart-orphaned `Materializing` one is the
-                            // known case — must still be destroyable, so
-                            // fall through to deleting it directly. A
-                            // session that cannot be torn down is worse
-                            // than one torn down without its hooks.
-                            Err(e) => {
-                                tracing::warn!(
-                                    session_id = %id,
-                                    error = %e,
-                                    "could not start the session to run its destroy hooks; \
-                                     removing its record without them",
-                                );
-                                None
-                            }
-                        },
-                    };
-                    match actor {
-                        Some(hnd) => {
-                            let hook_failures = hnd.destroy().await?;
-                            // Belt-and-braces: a dead actor (self-terminated
-                            // but not yet evicted) reads as `Ok` above, and
-                            // may have died *without* deleting its record
-                            // (its own delete failed). Remove any leftover;
-                            // `NotFound` is the normal already-deleted case.
-                            if let Err(e) = handle.delete().await
-                                && e.kind() != NotFound
-                            {
-                                return Err(e);
-                            }
-                            Ok(hook_failures)
-                        }
-                        None => {
-                            handle.delete().await?;
-                            Ok(Vec::new())
-                        }
-                    }
+                    self.destroy_box_record(id, handle).await
                 })
                 .await
             }

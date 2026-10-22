@@ -659,6 +659,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
+    // The box ends with this run unless `--keep` retains it: marked at
+    // create, so a daemon restart before or during the run destroys it
+    // rather than resuming it (NET-131).
+    request.config.ends_with_run = !args.keep;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
     request.must_match_version = minimal_client::version_assertion();

@@ -498,6 +498,14 @@ pub struct BoxConfig {
     /// so a client that predates the field gets hooks, not silence.
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
+    /// Whether the box ends with the one `min task run` it is created for
+    /// (NET-131): set by a run without `--keep`, and persisted onto the
+    /// record as [`boxes::Record::ends_with_run`] by the create itself, so
+    /// a daemon restart at any point after the create destroys the box
+    /// rather than resuming it. Defaults to `false`, which is every other
+    /// create and every client that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
     /// session's record. The daemon writes none of its own: NET-079's
     /// per-box enforcement is a daemon-owned launch record, carried on the
@@ -1671,7 +1679,8 @@ impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
-    /// addresses, hooks on, no attrs, and no version assertion.
+    /// addresses, hooks on, not ended with a run, no attrs, and no version
+    /// assertion.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1688,6 +1697,7 @@ impl CreateSessionRequest {
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: default_hooks_enabled(),
+                ends_with_run: false,
                 attrs: Default::default(),
             },
             must_match_version: None,

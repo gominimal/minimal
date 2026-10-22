@@ -132,6 +132,7 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         box_id: None,
         box_addresses: None,
         hooks_enabled: true,
+        ends_with_run: false,
         attrs: Default::default(),
     }
 }
@@ -354,6 +355,364 @@ async fn destroying_an_idle_session_goes_through_its_actor() {
             .unwrap()
             .is_none(),
         "the record should be gone after destroy"
+    );
+}
+
+/// `sample_config` for a box created for a `min task run` without
+/// `--keep`: marked to end with its run from its create.
+fn run_owned_config() -> minimald_rpc::BoxConfig {
+    let mut config = sample_config();
+    config.ends_with_run = true;
+    config
+}
+
+/// Waits for the resume's detached teardown of `id` to remove its
+/// record. The resume returns before the teardown ends, by design.
+///
+/// A read that lands while the teardown deletes the record can find
+/// the index entry and then miss the record, and answers `NotFound`
+/// rather than `None`. Both mean the record is gone.
+async fn wait_for_record_gone(mngr: &BoxManagerHandle, id: SessionId) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match mngr.get_record(BoxKeyPredicate::Id(id)).await {
+            Ok(None) => break,
+            Err(error) if error.kind() == NotFound => break,
+            Ok(Some(_)) => {}
+            Err(error) => panic!("reading the run-owned box's record failed: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run-owned box's record should be gone after the resume"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A box marked run-owned is destroyed by the restart's resume, not
+/// resumed: the run it was minted for is over the moment the daemon
+/// that accepted it died, and bringing the box back would strand it
+/// `Active` forever. The teardown goes through the actor — the same
+/// path `DeleteSession` takes — so the box's `on_destroy` hooks run,
+/// which the marker file stands in for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_destroys_a_run_owned_box_instead_of_resuming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("echo ran > {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // A second manager over the same store: a daemon restart's view,
+    // holding a box whose run died with the first daemon.
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart",
+    );
+    wait_for_record_gone(&restarted, id).await;
+    assert!(
+        marker.exists(),
+        "destroying the run-owned box on resume skipped its on_destroy hook",
+    );
+    wait_for_no_actors(&restarted).await;
+}
+
+/// Waits for the manager to hold `count` actors. The resume's teardown
+/// evicts its actor only after the actor has deleted the record and
+/// answered, so the record goes first.
+async fn wait_for_actor_count(mngr: &BoxManagerHandle, count: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mngr.running_count().await != count {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits for the manager to hold no actor.
+async fn wait_for_no_actors(mngr: &BoxManagerHandle) {
+    wait_for_actor_count(mngr, 0, "the destroyed box must leave no actor behind").await;
+}
+
+/// A `DeleteSession` that lands while the resume's teardown of a run-owned
+/// box runs its `on_destroy` hooks reaches the teardown's own actor, so
+/// the hooks run once. The realistic sender is the surviving `min task run`
+/// client on Ctrl-C. The hook marks its start, then waits, so the delete
+/// lands inside it, and appends one line per run to the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_during_resume_teardown_runs_the_destroy_hooks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = dir.path().join("started");
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!(
+                            "touch {}; sleep 3; echo ran >> {}",
+                            started.display(),
+                            marker.display()
+                        ),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resume's teardown never started the on_destroy hook",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    match restarted.delete_session(id).await {
+        Ok(hook_failures) => assert!(
+            hook_failures.is_empty(),
+            "the delete reported hook failures: {hook_failures:?}"
+        ),
+        // The teardown won the race to the record; still one run.
+        Err(error) if error.kind() == NotFound => {}
+        Err(error) => panic!("deleting the box during its resume teardown failed: {error}"),
+    }
+
+    wait_for_record_gone(&restarted, id).await;
+    wait_for_no_actors(&restarted).await;
+    let lines = std::fs::read_to_string(&marker).expect("the on_destroy hook never ran");
+    assert_eq!(
+        lines.lines().count(),
+        1,
+        "the on_destroy hook must run exactly once, got {lines:?}",
+    );
+}
+
+/// A resume teardown of a run-owned box whose record delete fails keeps
+/// its closed actor, so a later `DeleteSession` reaches that actor and
+/// removes the record without running the `on_destroy` hooks again. The
+/// store fails the record delete once. The hook appends one line per run
+/// to the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_after_a_failed_resume_teardown_runs_the_destroy_hooks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("echo ran >> {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    crate::store::test_faults::fail_next_delete(id);
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while crate::store::test_faults::delete_failure_armed(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resume's teardown never tried to delete the record",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Give the detached teardown time to finish after its failed delete,
+    // so an eviction on failure lands before the retry below.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "the failed delete must leave the record on disk",
+    );
+    assert_eq!(
+        restarted.running_count().await,
+        1,
+        "the failed teardown must keep its closed actor",
+    );
+
+    let hook_failures = restarted.delete_session(id).await.unwrap();
+    assert!(
+        hook_failures.is_empty(),
+        "the retry reported hook failures: {hook_failures:?}"
+    );
+
+    wait_for_record_gone(&restarted, id).await;
+    wait_for_no_actors(&restarted).await;
+    let lines = std::fs::read_to_string(&marker).expect("the on_destroy hook never ran");
+    assert_eq!(
+        lines.lines().count(),
+        1,
+        "the on_destroy hook must run exactly once across the retry, got {lines:?}",
+    );
+}
+
+/// The run-owned check takes only the boxes it marked: a plain
+/// session in the same store survives the restart and resumes as
+/// before, so the fix does not cost every session its restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_still_resumes_a_plain_session_beside_a_run_owned_one() {
+    let (state, cache, mngr) = manager().await;
+    let marked = create_active_session_with(&mngr, run_owned_config()).await;
+    let mut keeper_config = sample_config();
+    keeper_config.name = Some("keeper".to_string());
+    let keeper = create_active_session_with(&mngr, keeper_config).await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+
+    assert_eq!(resumed, 1, "exactly the plain session should resume");
+    wait_for_record_gone(&restarted, marked).await;
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(keeper))
+            .await
+            .unwrap()
+            .is_some(),
+        "the plain session's record should survive the resume"
+    );
+    wait_for_actor_count(
+        &restarted,
+        1,
+        "the plain session should have its actor back",
+    )
+    .await;
+}
+
+/// The create writes the run-owned mark on the record itself, so the
+/// mark is there before any task starts, and a fresh manager over the
+/// same store (a restart's) reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_persists_the_run_owned_mark_on_the_record() {
+    let (state, cache, mngr) = manager().await;
+    let marked = create_active_session_with(&mngr, run_owned_config()).await;
+    let mut plain_config = sample_config();
+    plain_config.name = Some("plain".to_string());
+    let plain = create_active_session_with(&mngr, plain_config).await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let read = |id| {
+        let restarted = &restarted;
+        async move {
+            restarted
+                .get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("the record must survive the create")
+        }
+    };
+    assert!(
+        read(marked).await.ends_with_run,
+        "a run-owned create must mark its record",
+    );
+    assert!(
+        !read(plain).await.ends_with_run,
+        "a plain create must leave its record unmarked",
+    );
+}
+
+/// The resume's teardown of a run-owned box leaves alone the route of
+/// a box with the same name that the same resume brought back. Both
+/// boxes are unnamed, with projects that share the basename "app", so
+/// both derive the registry name "app". The plain box is the older
+/// one, so the resume registers its route first.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_teardown_keeps_the_route_of_a_same_named_box() {
+    let (state, cache, mngr) = manager().await;
+    let plain_project = TempDir::new().unwrap();
+    let plain_dir = plain_project.path().join("app");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    let run_project = TempDir::new().unwrap();
+    let run_dir = run_project.path().join("app");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    let mut config = sample_config();
+    config.name = None;
+    config.network = boxes::NetworkMode::HostNet;
+    config.project_path = HostAbsPath::try_new(plain_dir.to_str().unwrap()).unwrap();
+    let plain = create_active_session_with(&mngr, config).await;
+
+    let mut config = run_owned_config();
+    config.name = None;
+    config.network = boxes::NetworkMode::HostNet;
+    config.project_path = HostAbsPath::try_new(run_dir.to_str().unwrap()).unwrap();
+    let marked = create_active_session_with(&mngr, config).await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(resumed, 1, "exactly the plain box should resume");
+    wait_for_record_gone(&restarted, marked).await;
+
+    assert!(
+        restarted
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .name_held_by(plain, "app"),
+        "the run-owned box's teardown must not take over or withdraw \
+         the resumed box's route",
     );
 }
 
