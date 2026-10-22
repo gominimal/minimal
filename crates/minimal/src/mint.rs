@@ -44,6 +44,10 @@ use zeroize::Zeroizing;
 /// How long a control socket request waits for the proxy.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the forget of a failed creation waits for the proxy. It is
+/// short, so a stuck proxy does not hold up the end of the creation.
+const FORGET_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// `~/.minimal/bep/identity.json`, where the proxy publishes its keys.
 #[must_use]
 pub fn identity_path() -> Option<PathBuf> {
@@ -208,16 +212,22 @@ impl ControlClient {
     ///
     /// [`MintError::NotRunning`] when nothing answers there.
     pub fn connect(path: &Path) -> Result<Self, MintError> {
+        Self::connect_with_timeout(path, CONTROL_TIMEOUT)
+    }
+
+    /// Connects to the control socket at `path`, and waits at most
+    /// `timeout` for each read and write.
+    fn connect_with_timeout(path: &Path, timeout: Duration) -> Result<Self, MintError> {
         let not_running = |error| MintError::NotRunning {
             path: path.to_owned(),
             error,
         };
         let stream = UnixStream::connect(path).map_err(not_running)?;
         stream
-            .set_read_timeout(Some(CONTROL_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(not_running)?;
         stream
-            .set_write_timeout(Some(CONTROL_TIMEOUT))
+            .set_write_timeout(Some(timeout))
             .map_err(not_running)?;
         Ok(Self {
             stream: BufReader::new(stream),
@@ -531,8 +541,13 @@ pub fn mint_and_register(
 /// behind (BEP-003).
 ///
 /// The client's key stays registered: the control socket has no request
-/// that withdraws a key. The drop blocks on the control socket, and it
-/// runs only on a failed or interrupted creation.
+/// that withdraws a key. The flip is T27
+/// (https://github.com/gominimal/minimal/issues/2288).
+///
+/// The forget runs only on a failed or interrupted creation. Inside a
+/// tokio runtime it runs on a blocking thread, so it never holds up a
+/// runtime worker. It waits at most [`FORGET_TIMEOUT`] for each read and
+/// write.
 #[must_use = "a dropped registration forgets the box at the proxy"]
 #[derive(Debug)]
 pub struct ProxyRegistration {
@@ -565,14 +580,23 @@ impl Drop for ProxyRegistration {
         let Some(box_id) = self.box_id.take() else {
             return;
         };
-        let forgot = ControlClient::connect(&self.control_path)
-            .and_then(|mut control| control.forget_box(&box_id));
-        if let Err(error) = forgot {
-            tracing::warn!(
-                box_id = %box_id,
-                error = %error,
-                "the proxy did not forget the box after its creation failed"
-            );
+        let control_path = std::mem::take(&mut self.control_path);
+        let forget = move || {
+            let forgot = ControlClient::connect_with_timeout(&control_path, FORGET_TIMEOUT)
+                .and_then(|mut control| control.forget_box(&box_id));
+            if let Err(error) = forgot {
+                tracing::warn!(
+                    box_id = %box_id,
+                    error = %error,
+                    "the proxy did not forget the box after its creation failed"
+                );
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            // The runtime waits for its blocking threads before it shuts
+            // down, so an interrupt does not lose the forget.
+            Ok(runtime) => drop(runtime.spawn_blocking(forget)),
+            Err(_) => forget(),
         }
     }
 }

@@ -4082,6 +4082,15 @@ mod mint_tests {
             .keep();
         assert!(served.boxes.get(kept).is_some());
 
+        // A drop inside a runtime forgets the box on a blocking thread, and
+        // the runtime waits for it before it shuts down.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            drop(ProxyRegistration::new(served.path.clone(), kept).unwrap());
+        });
+        drop(runtime);
+        assert!(served.boxes.get(kept).is_none());
+
         // A drop with no proxy to tell does not panic.
         let gone = served.path.with_file_name("none.sock");
         drop(ProxyRegistration::new(gone, kept).unwrap());
