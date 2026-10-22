@@ -419,6 +419,7 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardown
@@ -994,6 +995,7 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
+  [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
   [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
@@ -11649,6 +11651,102 @@ proof_bep_box_env_holds_sealed_value_only() {
   done
   rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
   echo "Sealed-value placement proof OK (two grant boxes started headless, each GH_TOKEN a sealed value of its own)"
+  echo "::endgroup::"
+}
+
+# Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
+# is proxy_env starts on an own-address credentialed lane, and its
+# environment points at the Box Egress Proxy. The two cases share one box
+# start. The lane needs a switch, so a target without one records the case
+# as NOT RUN. The box declares no grant, so the case needs no sign-in and no
+# running proxy: it reads the variables, never a connection through them.
+# $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
+bep_proxy_env_box_env() {
+  local pe_case="$1" pe_sid pe_out
+  PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlpenv.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\nno_proxy = ["e2e-direct.example", "10.0.0.0/8"]\n'
+  } > "$PROXY_ENV_SEED_DIR/minimal.toml"
+  mkdir "$PROXY_ENV_SEED_DIR/.git"
+  pe_out="$(cd "$PROXY_ENV_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$pe_case" | tr '_' '-' | cut -c1-40)" \
+    --network own_ip --credentialed-upstream \
+    </dev/null 2>"$WORK/$pe_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    echo "--- stdout ---"; printf '%s\n' "$pe_out"
+    echo "--- stderr ---"; cat "$WORK/$pe_case.err" 2>/dev/null || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  }
+  pe_sid="$(printf '%s\n' "$pe_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$pe_sid" sh -c 'env' \
+    >"$WORK/$pe_case.env" 2>"$WORK/$pe_case.exec.err"; then
+    echo "::error::'min session exec' in the proxy_env box failed"
+    cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  fi
+  tr -d '\r' <"$WORK/$pe_case.env" >"$WORK/$pe_case.env.tmp" && mv "$WORK/$pe_case.env.tmp" "$WORK/$pe_case.env"
+  mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+  rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+}
+
+# The value of variable $2 in the env dump $1, or nothing.
+bep_env_value() {
+  sed -n "s/^$2=//p" "$1" | head -n1
+}
+
+proof_bep_proxy_env_and_no_proxy_are_set() {
+  echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_https pe_http pe_no
+  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set
+  pe_env="$WORK/bep_proxy_env_and_no_proxy_are_set.env"
+  pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
+  pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
+  pe_no="$(bep_env_value "$pe_env" NO_PROXY)"
+  # The proxy's address is the switch subnet's broadcast - 3, and its
+  # listener port is 8118 (boxes::core::egress::PROXY_LISTENER_PORT).
+  if ! [[ "$pe_https" =~ ^http://100\.64\.[0-9]+\.[0-9]+:8118$ ]]; then
+    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the proxy's address on the switch at port 8118"
+    fail
+  fi
+  if [ "$pe_http" != "$pe_https" ]; then
+    echo "::error::the proxy_env box's HTTP_PROXY is '${pe_http:-<unset>}', not its HTTPS_PROXY '$pe_https'"
+    fail
+  fi
+  if [ "$pe_no" != ".min.internal,host.min.internal,localhost,127.0.0.1,e2e-direct.example,10.0.0.0/8" ]; then
+    echo "::error::the proxy_env box's NO_PROXY is '${pe_no:-<unset>}', not the local zone, loopback and the seed's no_proxy entries"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: HTTPS_PROXY=HTTP_PROXY=$pe_https, NO_PROXY=$pe_no"
+  echo "::endgroup::"
+}
+
+proof_bep_proxy_env_sets_node_use_env_proxy() {
+  echo "::group::proxy_env box: NODE_USE_ENV_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_node
+  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy
+  pe_env="$WORK/bep_proxy_env_sets_node_use_env_proxy.env"
+  pe_node="$(bep_env_value "$pe_env" NODE_USE_ENV_PROXY)"
+  if [ "$pe_node" != "1" ]; then
+    echo "::error::the proxy_env box's NODE_USE_ENV_PROXY is '${pe_node:-<unset>}', not 1"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: NODE_USE_ENV_PROXY=1"
   echo "::endgroup::"
 }
 
@@ -22921,6 +23019,8 @@ case "${1:-}" in
     proof_github_only_allowlist
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
+    proof_bep_proxy_env_and_no_proxy_are_set
+    proof_bep_proxy_env_sets_node_use_env_proxy
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -22977,7 +23077,9 @@ case "${1:-}" in
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
     | bep_second_box_needs_no_sign_in \
-    | bep_box_env_holds_sealed_value_only)
+    | bep_box_env_holds_sealed_value_only \
+    | bep_proxy_env_and_no_proxy_are_set \
+    | bep_proxy_env_sets_node_use_env_proxy)
     "proof_$1"
     ;;
   *)
@@ -23014,6 +23116,7 @@ case "${1:-}" in
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
+    echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     exit 2
     ;;
 esac
