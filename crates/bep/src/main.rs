@@ -165,7 +165,9 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match Identity::after_replacement(store, role, &key, previous.as_ref()).publish(path) {
+    let identity = Identity::after_replacement(store, role, &key, previous.as_ref())
+        .with_root_validity(previous.as_ref(), unix_now());
+    match identity.publish(path) {
         Ok(()) => {
             tracing::info!(path = %path.display(), "published the proxy identity");
             println!("Published the new public key to {}.", path.display());
@@ -187,19 +189,28 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, Strin
     // BEP-060: a role the identity names had a key before, so the start
     // refuses when the store lost it. With no file, `keys::load` still
     // refuses a lost key when the store holds a key for another role.
-    let published = match Identity::read(path) {
-        Ok(identity) => identity.roles(),
-        Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            Vec::new()
-        }
+    let previous = match Identity::read(path) {
+        Ok(identity) => Some(identity),
+        Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => None,
         Err(err) => return Err(err.to_string()),
     };
+    let published = previous.as_ref().map(Identity::roles).unwrap_or_default();
     let loaded = keys::load(store, &published).map_err(|err| err.to_string())?;
+    // BEP-005: the root's validity end rides the identity from one start to
+    // the next, while the root key stays the same.
     Identity::of(&loaded)
+        .with_root_validity(previous.as_ref(), unix_now())
         .publish(path)
         .map_err(|err| err.to_string())?;
     tracing::info!(path = %path.display(), "published the proxy identity");
     Ok(loaded)
+}
+
+/// The time now, in seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// The leaf issuer `bep serve` has today. The root and signing CA keys are
@@ -242,12 +253,11 @@ where
 {
     let node = sealing.public().kid();
     let clients = Registry::default();
-    // Interim: no creator registers a box's declared egress yet, so every
-    // box is refused `outside_declared_egress`. T14
-    // (https://github.com/gominimal/minimal/issues/2273) sends `register_box`
-    // at create, in `crates/minimal/src/cmd/boxes/create.rs`. T20
-    // (https://github.com/gominimal/minimal/issues/2277) sends `forget_box`
-    // at destroy, in `crates/minvmd/src/box_registry.rs`. Those two are the flip.
+    // `min` sends `register_box` when it creates a box with a GitHub grant
+    // (`crates/minimal/src/cmd/boxes/create.rs`). Interim: nothing sends
+    // `forget_box` at destroy until T20
+    // (https://github.com/gominimal/minimal/issues/2277), in
+    // `crates/minvmd/src/box_registry.rs`.
     let boxes = BoxRegistry::default();
     // Interim: `BoxRedeemer::new` starts with no revocation in force, and
     // nothing here gives it one. T20
@@ -340,7 +350,6 @@ fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Re
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
             "no CA key can sign a leaf certificate yet (#2440), so every admitted CONNECT is answered 502. \
-             No creator registers a box's declared egress yet (#2273 at create, #2277 at destroy), so every box is refused outside_declared_egress. \
              A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
              A store-handle member is not admitted until #2280 lands. \
              No revocation is in force until #2277 and #2290 land"
