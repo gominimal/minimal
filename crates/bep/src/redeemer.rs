@@ -10,7 +10,7 @@
 //!    turn ([`Unsealed::from_open`]),
 //! 3. reads the member's handle and verifies it under the registered client
 //!    keys ([`handle::read_opened`]),
-//! 4. gives the facts and the revocations in force to [`redeem::decide`],
+//! 4. gives the facts and the revocations it holds to [`redeem::decide`],
 //! 5. and on an admit only, resolves the sign-in reference to the member's
 //!    credential from the sign-in item in the host keychain.
 //!
@@ -88,8 +88,16 @@ struct Facts {
 impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     /// A redeemer that opens values under `key` for Box Host `node` and
     /// `module`. It verifies handles under `clients`, reads each box from
-    /// `boxes`, and resolves sign-in references from `keychain`. No
-    /// revocation is in force, and the clock is the system clock.
+    /// `boxes`, and resolves sign-in references from `keychain`. The clock
+    /// is the system clock.
+    ///
+    /// Interim: the redeemer starts with no revocation in force, and in
+    /// `bep serve` nothing writes one. T20
+    /// (<https://github.com/gominimal/minimal/issues/2277>) records
+    /// revocations over the control socket. T33
+    /// (<https://github.com/gominimal/minimal/issues/2290>) restores them
+    /// from every retained audit segment at start, the BEP-068
+    /// restore-on-start sub-requirement. Those two are the flip.
     #[must_use]
     pub fn new(
         key: K,
@@ -153,6 +161,13 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     }
 
     /// Gathers the facts [`redeem::decide`] reads for one request.
+    ///
+    /// The revoked set is what [`Self::with_revocations`] gave, which is
+    /// empty in `bep serve` until T20 (#2277) and T33 (#2290) land. The
+    /// store rules are empty until T25
+    /// (<https://github.com/gominimal/minimal/issues/2280>) reads
+    /// `[secret-store-rules]`, so this redeemer never admits a
+    /// store-handle member yet.
     fn facts(
         &self,
         box_id: &str,
@@ -204,6 +219,9 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 } else {
                     Vec::new()
                 };
+                // Interim: no store rules until T25 (#2280) reads
+                // `[secret-store-rules]`, so a store-handle member is not
+                // admitted here.
                 let rules: &[StoreRule] = &[];
                 let read = {
                     let clients = self.clients.read().unwrap_or_else(PoisonError::into_inner);
@@ -261,6 +279,12 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 return None;
             }
         };
+        // Interim: a token that is `Standing::RenewsAtProxy` is refused here,
+        // and the request is refused `github_sign_in_required`. BEP-069
+        // renews the token at the proxy before it is substituted. T24
+        // (https://github.com/gominimal/minimal/issues/2279) wires that
+        // renewal, and is the flip. Until then the refusal stands, while
+        // `min auth status` tells the user that the token renews at the proxy.
         if metadata.instance != instance || metadata.standing(now) != Standing::Live {
             return None;
         }

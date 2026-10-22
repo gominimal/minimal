@@ -208,9 +208,8 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, Strin
 /// every leaf is refused, and the proxy answers an admitted CONNECT with
 /// `502`.
 ///
-/// The redemption decision is wired into `bep serve` now ([`wire`]), so
-/// each request inside a tunnel goes to it before anything goes upstream.
-/// A signing Keychain key (#2440) alone is what this issuer still waits for.
+/// This issuer signs no leaf, so no tunnel opens and no request inside one
+/// reaches the redeemer that [`wire`] installs.
 struct NoSigningKey;
 
 impl LeafIssuer for NoSigningKey {
@@ -244,6 +243,17 @@ where
     let node = sealing.public().kid();
     let clients = Registry::default();
     let boxes = BoxRegistry::default();
+    // Interim: `BoxRedeemer::new` starts with no revocation in force, and
+    // nothing here gives it one. T20
+    // (https://github.com/gominimal/minimal/issues/2277) records revocations
+    // over the control socket. T33
+    // (https://github.com/gominimal/minimal/issues/2290) restores them from
+    // every retained audit segment at start, the BEP-068 restore-on-start
+    // sub-requirement. Those two are the flip.
+    //
+    // Interim: the redeemer reads no store rules until T25
+    // (https://github.com/gominimal/minimal/issues/2280) reads
+    // `[secret-store-rules]`, so a store-handle member is never admitted yet.
     let redeemer = Arc::new(BoxRedeemer::new(
         sealing,
         node,
@@ -323,8 +333,9 @@ fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Re
             .control(&control)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
-            "no CA key can sign a leaf certificate yet, so every admitted CONNECT is answered 502. \
-             The redemption decision is wired, so a signing key (#2440) alone lifts this"
+            "no CA key can sign a leaf certificate yet (#2440), so every admitted CONNECT is answered 502. \
+             No creator registers a box's declared egress yet. \
+             No revocation is in force until #2277 and #2290 land"
         );
         tracing::info!(
             listener = %args.listener.display(),
