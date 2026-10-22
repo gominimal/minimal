@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 mod helpers;
 // The per-message span names: a file of its own, because the daemon's refusal guard scans the
@@ -513,6 +514,11 @@ pub struct BoxActor {
     /// the session.
     weak_self: WeakBoxHandle,
 
+    /// Cancelled once a destroy of this session proceeds, before the destroy
+    /// stops the host. Shared with every [`BoxHandle`], so a command the
+    /// destroy ends can tell (see [`BoxHandle::is_destroying`]).
+    destroying: CancellationToken,
+
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
@@ -574,6 +580,7 @@ impl BoxActor {
         receiver: crate::traced::Receiver<BoxMessage>,
         inner: BoxInner,
         weak_self: WeakBoxHandle,
+        destroying: CancellationToken,
     ) -> Self {
         let BoxActorConfig {
             minimal_state_dir,
@@ -606,6 +613,7 @@ impl BoxActor {
             creator,
             manager,
             weak_self,
+            destroying,
             // No host yet; the first launch sets this. `Interactive` is the
             // conservative default — it is the one value that never licenses
             // a respawn.
@@ -709,6 +717,7 @@ impl BoxActor {
         };
 
         let (sender, receiver) = crate::traced::channel(8);
+        let destroying = CancellationToken::new();
         // One line per session start (NET-074/NET-076/NET-077): the rollout
         // phase this build ships, the daemon's opt-out state, and the
         // effective egress they leave this box with. The declaration
@@ -751,8 +760,8 @@ impl BoxActor {
         }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
-        let weak_self = WeakBoxHandle(sender.downgrade());
-        let actor = Self::assemble(conf, receiver, inner, weak_self);
+        let weak_self = WeakBoxHandle(sender.downgrade(), destroying.clone());
+        let actor = Self::assemble(conf, receiver, inner, weak_self, destroying.clone());
 
         // Register the PTask hostname before the actor goes live, so the
         // route exists by the time the caller can observe the session
@@ -778,7 +787,7 @@ impl BoxActor {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(BoxHandle(sender))
+        Ok(BoxHandle(sender, destroying))
     }
 
     /// The async task which handles interactions with the session.
@@ -1027,6 +1036,12 @@ impl BoxActor {
                         line
                     })
                     .collect();
+                // Cancelled immediately before `stop_running`, which is what
+                // ends the session's commands, so a command that ends there
+                // can see why. Not before the hooks: they can take seconds,
+                // and a command that finishes on its own meanwhile was not
+                // stopped by the destroy.
+                self.destroying.cancel();
                 self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable

@@ -410,8 +410,19 @@ async fn destroy_tears_down_a_running_session() {
         .await
         .unwrap()
         .expect("session should resolve");
+    assert!(
+        !handle.is_destroying(),
+        "a session nobody destroys is not destroying",
+    );
 
     mngr.delete_session(id).await.unwrap();
+
+    // The handle an exec holds sees the destroy, which is how the
+    // exec knows to tell its client why the command stopped.
+    assert!(
+        handle.is_destroying(),
+        "the destroy did not mark the session's handle destroying",
+    );
 
     // The destroy cascade completed: the record is gone, and a fresh
     // get_session no longer resolves the (now removed) session.

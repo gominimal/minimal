@@ -1,7 +1,11 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 use super::testing::{MockEndpoints, build_mock, build_mock_seq};
-use super::{bridge, bridge_noting_shutdown};
+use super::{
+    BoxExec, SHUTDOWN_NOTICE, TaskExec, TokioExec, bridge, bridge_noting_reason, destroy_signal,
+    exit_notice,
+};
+use tokio_util::sync::CancellationToken;
 
 /// A never-firing client-loss signal for tests that exercise the
 /// bridge without modelling a disconnect.
@@ -870,13 +874,14 @@ async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
         let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
 
         let bridge_task = crate::traced::spawn(async move {
-            let exit = bridge_noting_shutdown(
+            let exit = bridge_noting_reason(
                 "test",
                 process,
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                None,
                 || shutting_down,
             )
             .await;
@@ -904,6 +909,229 @@ async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
             err,
             expected,
             "shutting down: {shutting_down}; stderr was {:?}",
+            String::from_utf8_lossy(&err),
+        );
+    }
+}
+
+/// An exec the session's destroy ends is told why the same way: the
+/// bridge stops the command when the destroy token fires, and the
+/// notice lands on stderr after whatever the command itself wrote
+/// there. The command's own status still passes through. One that
+/// ends with no destroy gets no notice.
+#[tokio::test]
+async fn an_exec_ended_by_destroy_writes_the_notice_to_stderr() {
+    for destroying in [true, false] {
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                mut stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+        let destroyed = CancellationToken::new();
+
+        let token = destroyed.clone();
+        let bridge_task = crate::traced::spawn(async move {
+            let exit = bridge_noting_reason(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+                Some(token),
+                || false,
+            )
+            .await;
+            (exit, bridge_stderr)
+        });
+
+        stderr_writer.write_all(b"err!").await.unwrap();
+        drop(stderr_writer);
+        drop(stdout_writer);
+        // What a box killed by the destroy's host teardown reports:
+        // 128 + SIGKILL.
+        if destroying {
+            ctrl.exit_on_kill(137).await;
+            destroyed.cancel();
+        } else {
+            ctrl.signal_exit(137).await;
+        }
+
+        let (exit, bridge_stderr) = bridge_task.await.unwrap();
+        assert_eq!(exit, 137, "the command's own status passes through");
+        assert_eq!(ctrl.was_killed(), destroying, "the bridge stops it");
+        drop(bridge_stderr);
+
+        let mut err = Vec::new();
+        client_stderr.read_to_end(&mut err).await.unwrap();
+        let expected: &[u8] = if destroying {
+            b"err!the session was destroyed; the command was stopped\n"
+        } else {
+            b"err!"
+        };
+        assert_eq!(
+            err,
+            expected,
+            "destroying: {destroying}; stderr was {:?}",
+            String::from_utf8_lossy(&err),
+        );
+    }
+}
+
+/// Only an exec whose process the destroy stops gets the destroy token.
+/// A task runs in a sandbox of its own that the destroy does not stop,
+/// so a task ending 137 during a destroy is not stopped by the bridge
+/// and gets no notice. A shutdown still names every kind.
+#[tokio::test]
+async fn a_task_ending_during_a_destroy_gets_no_destroy_notice() {
+    let destroyed = CancellationToken::new();
+    assert!(destroy_signal::<BoxExec>(|| destroyed.clone()).is_some());
+    assert!(destroy_signal::<TaskExec>(|| destroyed.clone()).is_none());
+    assert!(destroy_signal::<TokioExec>(|| destroyed.clone()).is_none());
+    assert_eq!(exit_notice(true, 137, false), Some(SHUTDOWN_NOTICE));
+    assert_eq!(exit_notice(false, 137, false), None);
+
+    let (
+        process,
+        MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer,
+            mut stderr_writer,
+            ctrl,
+        },
+    ) = build_mock();
+    let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+    drop(closed_stdin_w);
+    let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+    let token = destroy_signal::<TaskExec>(|| destroyed.clone());
+    let bridge_task = crate::traced::spawn(async move {
+        let exit = bridge_noting_reason(
+            "test",
+            process,
+            &mut bridge_stdin,
+            &mut bridge_stdout,
+            &mut bridge_stderr,
+            client_lost(),
+            token,
+            || false,
+        )
+        .await;
+        (exit, bridge_stderr)
+    });
+
+    stderr_writer.write_all(b"err!").await.unwrap();
+    drop(stderr_writer);
+    drop(stdout_writer);
+    destroyed.cancel();
+    ctrl.signal_exit(137).await;
+
+    let (exit, bridge_stderr) = bridge_task.await.unwrap();
+    assert_eq!(exit, 137, "the task's own status passes through");
+    assert!(!ctrl.was_killed(), "the destroy does not stop a task");
+    drop(bridge_stderr);
+
+    let mut err = Vec::new();
+    client_stderr.read_to_end(&mut err).await.unwrap();
+    assert_eq!(
+        err,
+        b"err!",
+        "stderr was {:?}",
+        String::from_utf8_lossy(&err),
+    );
+}
+
+/// A command that exits on its own during a destroy was not stopped by
+/// it, so it gets no destroy notice, whatever its status. A self-exit
+/// of 130 is the case a status check alone cannot tell from a kill.
+/// During a shutdown, only a kill-shaped status (128 or more) gets the
+/// shutdown notice. The command's own status always passes through.
+#[tokio::test]
+async fn an_exec_that_exits_on_its_own_gets_no_notice() {
+    for (status, shutting_down, noticed) in [
+        (0, false, false),
+        (1, false, false),
+        (127, false, false),
+        (128, false, false),
+        (130, false, false),
+        (143, false, false),
+        (0, true, false),
+        (127, true, false),
+        (128, true, true),
+        (143, true, true),
+    ] {
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                mut stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+        let destroyed = CancellationToken::new();
+
+        let token = destroyed.clone();
+        let bridge_task = crate::traced::spawn(async move {
+            let exit = bridge_noting_reason(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+                Some(token),
+                || shutting_down,
+            )
+            .await;
+            (exit, bridge_stderr)
+        });
+
+        stderr_writer.write_all(b"err!").await.unwrap();
+        drop(stderr_writer);
+        drop(stdout_writer);
+        // The command exits on its own, and the destroy token fires
+        // after it: the destroy is under way when the bridge sees it.
+        ctrl.signal_exit(status).await;
+        destroyed.cancel();
+
+        let (exit, bridge_stderr) = bridge_task.await.unwrap();
+        assert_eq!(
+            exit, status as u32,
+            "the command's own status passes through"
+        );
+        assert!(
+            !ctrl.was_killed(),
+            "status: {status}; the bridge stops nothing"
+        );
+        drop(bridge_stderr);
+
+        let mut err = Vec::new();
+        client_stderr.read_to_end(&mut err).await.unwrap();
+        let expected: &[u8] = if noticed {
+            b"err!minimald is shutting down; the command was stopped\n"
+        } else {
+            b"err!"
+        };
+        assert_eq!(
+            err,
+            expected,
+            "status: {status}; shutting down: {shutting_down}; stderr was {:?}",
             String::from_utf8_lossy(&err),
         );
     }
