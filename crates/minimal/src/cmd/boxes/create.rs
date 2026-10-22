@@ -198,7 +198,7 @@ fn refuse_unhonourable_grants(
     Ok(())
 }
 
-/// One named step of [`activate_session`], in the order the activation runs
+/// One named step of [`activate_box`], in the order the activation runs
 /// them. Each step runs inside its own `activation_step` span, so a log read
 /// under `RUST_LOG=info` shows where an activation spent its time and which
 /// step ended it.
@@ -233,7 +233,7 @@ pub(crate) enum ActivationStep {
 }
 
 impl ActivationStep {
-    /// Every step, in the order [`activate_session`] runs them.
+    /// Every step, in the order [`activate_box`] runs them.
     #[cfg(test)]
     pub(crate) const ORDER: [Self; 13] = [
         Self::CheckArguments,
@@ -293,7 +293,7 @@ impl ActivationStep {
     }
 }
 
-pub(crate) async fn activate_session(
+pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
@@ -438,18 +438,13 @@ pub(crate) async fn activate_session(
     // lands just before the create (T66): the registration is the last
     // fallible client-side step, so a loadout, policy, or hook failure
     // between here and there never strands a row on the host.
-    let mut config = minimald_rpc::BoxConfig {
-        name: Some(session_name),
-        project_path: abs_path.clone(),
-        network,
-        policy,
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        hooks_enabled: !args.no_hooks,
-        ends_with_run: false,
-        attrs: Default::default(),
-    };
+    let mut request =
+        minimald_rpc::CreateSessionRequest::new(session_name, abs_path.clone(), network, policy);
+    request.config.hooks_enabled = !args.no_hooks;
+    // The version gate: a daemon of another build refuses the create
+    // outright, before it allocates anything to tear down. `None` under the
+    // skew override, which is what lets an operator proceed.
+    request.must_match_version = version_assertion();
 
     let (
         policy_path,
@@ -594,9 +589,10 @@ pub(crate) async fn activate_session(
             // even when this enumeration is skipped.
             match list_sessions_version_gated(&mut client).await {
                 Ok(existing_sessions) => {
-                    if let Some(warning) =
-                        duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
-                    {
+                    if let Some(warning) = duplicate_session_warning(
+                        &existing_sessions.sessions,
+                        &request.config.project_path,
+                    ) {
                         eprintln!("{warning}");
                     }
                 }
@@ -649,12 +645,13 @@ pub(crate) async fn activate_session(
             let registered = register_box_reminting_autogen(
                 kind,
                 global.minimal_dir.as_deref(),
-                config.network,
-                config
+                request.config.network,
+                request
+                    .config
                     .name
                     .as_mut()
                     .expect("the session name is minted before the create"),
-                &config.policy,
+                &request.config.policy,
                 autogen,
                 &mut attempts,
                 || autogen_session_name(&utf8_path, &random_hex4()),
@@ -662,23 +659,21 @@ pub(crate) async fn activate_session(
             .await?;
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
-            config.box_addresses = registered
+            request.config.box_addresses = registered
                 .as_ref()
                 .map(|registration| registration.addresses);
-            config.task_addresses = registered
+            request.config.task_addresses = registered
                 .as_ref()
                 .map(|registration| registration.task_addresses.clone())
                 .unwrap_or_default();
-            config.box_id = registered
+            request.config.box_id = registered
                 .as_ref()
                 .and_then(|registration| registration.box_id);
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
 
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-    };
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     // An autogen name can (rarely) collide with an existing session built
     // from the same directory; on the daemon's already-exists rejection,
     // re-mint the hex suffix and retry a bounded number of times. A
@@ -688,16 +683,7 @@ pub(crate) async fn activate_session(
     let created = ActivationStep::CreateSession
         .run(async {
             let created = loop {
-                let resp = client
-                    .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                        config: config.clone(),
-                        // The version gate: a daemon of another build refuses this
-                        // call outright, before it has allocated anything to tear
-                        // down. `None` under the skew override, which is what lets an
-                        // operator proceed.
-                        must_match_version: version_assertion(),
-                    })
-                    .await;
+                let resp = client.oneshot_rpc::<CreateSession>(request.clone()).await;
                 let resp = match resp {
                     Ok(resp) => resp,
                     // A transport failure abandons the activation and the row its
@@ -706,8 +692,8 @@ pub(crate) async fn activate_session(
                     Err(error) => {
                         withdraw_box_row(
                             control_sock.clone(),
-                            config.name.as_deref(),
-                            config.box_addresses,
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
@@ -727,8 +713,8 @@ pub(crate) async fn activate_session(
                             // bought for a session this create never made.
                             withdraw_box_row(
                                 control_sock.clone(),
-                                config.name.as_deref(),
-                                config.box_addresses,
+                                request.config.name.as_deref(),
+                                request.config.box_addresses,
                                 registered
                                     .as_ref()
                                     .and_then(|registration| registration.box_id),
@@ -736,7 +722,8 @@ pub(crate) async fn activate_session(
                             .await;
                             // The abandoned row's lease goes with it, uncommitted.
                             drop(registered.take());
-                            config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
+                            request.config.name =
+                                Some(autogen_session_name(&utf8_path, &random_hex4()));
                             // A registered box's row carries the name it was
                             // registered under (T66), so the re-mint re-registers;
                             // the abandoned row is withdrawn above, by its id, which
@@ -752,22 +739,22 @@ pub(crate) async fn activate_session(
                             registered = register_box_reminting_autogen(
                                 kind,
                                 global.minimal_dir.as_deref(),
-                                config.network,
-                                config.name.as_mut().expect("just re-minted"),
-                                &config.policy,
+                                request.config.network,
+                                request.config.name.as_mut().expect("just re-minted"),
+                                &request.config.policy,
                                 autogen,
                                 &mut attempts,
                                 || autogen_session_name(&utf8_path, &random_hex4()),
                             )
                             .await?;
-                            config.box_addresses = registered
+                            request.config.box_addresses = registered
                                 .as_ref()
                                 .map(|registration| registration.addresses);
-                            config.task_addresses = registered
+                            request.config.task_addresses = registered
                                 .as_ref()
                                 .map(|registration| registration.task_addresses.clone())
                                 .unwrap_or_default();
-                            config.box_id = registered
+                            request.config.box_id = registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id);
                             continue;
@@ -776,8 +763,8 @@ pub(crate) async fn activate_session(
                         // abandons the activation and its row the same way.
                         withdraw_box_row(
                             control_sock.clone(),
-                            config.name.as_deref(),
-                            config.box_addresses,
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
@@ -798,8 +785,8 @@ pub(crate) async fn activate_session(
                 // row; the withdrawal rides out with the error (T66).
                 withdraw_box_row(
                     control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
+                    request.config.name.as_deref(),
+                    request.config.box_addresses,
                     registered
                         .as_ref()
                         .and_then(|registration| registration.box_id),
@@ -824,12 +811,12 @@ pub(crate) async fn activate_session(
             // `none` box with no switch address — prints nothing: it has no row to
             // name. Keyed on the provider kind the registration itself keyed on, never
             // on `use_minvmd()`, so the flagless VM-backed host prints it too.
-            if let Some(addresses) = config.box_addresses.as_ref() {
+            if let Some(addresses) = request.config.box_addresses.as_ref() {
                 eprintln!(
                     "{}",
                     box_registered_start_line(
                         hostname_proxy_vm(kind),
-                        config.name.as_deref().unwrap_or("-"),
+                        request.config.name.as_deref().unwrap_or("-"),
                         addresses,
                     )
                 );
@@ -1055,7 +1042,7 @@ pub(crate) async fn activate_session(
             };
             if let Some(surface) = surface {
                 let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
-                let box_name = config.name.as_deref().unwrap_or("-");
+                let box_name = request.config.name.as_deref().unwrap_or("-");
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(
@@ -1089,8 +1076,8 @@ pub(crate) async fn activate_session(
             // create reply above, and an opted-out daemon's box keeps allow-all and
             // needs no note. Printed after the session exists and before the work
             // on it, so it is not lost above a failed activate's output.
-            if config.network == minimald_rpc::NetworkMode::OwnIp
-                && config.policy.egress.is_none()
+            if request.config.network == minimald_rpc::NetworkMode::OwnIp
+                && request.config.policy.egress.is_none()
                 && created.deny_all_opt_out != Some(true)
                 && let Some(note) = deny_all_default_notice(boxes::EGRESS_DEFAULT_PHASE)
             {
@@ -1222,8 +1209,8 @@ pub(crate) async fn activate_session(
                     // row its registration bought goes with it (T66).
                     withdraw_box_row(
                         control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
+                        request.config.name.as_deref(),
+                        request.config.box_addresses,
                         registered
                             .as_ref()
                             .and_then(|registration| registration.box_id),
@@ -1268,8 +1255,8 @@ pub(crate) async fn activate_session(
                 Err(error) => {
                     withdraw_box_row(
                         control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
+                        request.config.name.as_deref(),
+                        request.config.box_addresses,
                         registered
                             .as_ref()
                             .and_then(|registration| registration.box_id),
@@ -1290,8 +1277,8 @@ pub(crate) async fn activate_session(
                     // The session cannot compose and is abandoned with its row (T66).
                     withdraw_box_row(
                         control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
+                        request.config.name.as_deref(),
+                        request.config.box_addresses,
                         registered
                             .as_ref()
                             .and_then(|registration| registration.box_id),
@@ -1334,8 +1321,8 @@ pub(crate) async fn activate_session(
                                 // the path failed after registering.
                                 withdraw_box_row(
                                     control_sock.clone(),
-                                    config.name.as_deref(),
-                                    config.box_addresses,
+                                    request.config.name.as_deref(),
+                                    request.config.box_addresses,
                                     registered
                                         .as_ref()
                                         .and_then(|registration| registration.box_id),
@@ -1355,8 +1342,8 @@ pub(crate) async fn activate_session(
                         // path failed after registering.
                         withdraw_box_row(
                             control_sock.clone(),
-                            config.name.as_deref(),
-                            config.box_addresses,
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
@@ -1380,8 +1367,8 @@ pub(crate) async fn activate_session(
                         // its row (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            config.name.as_deref(),
-                            config.box_addresses,
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
@@ -1434,8 +1421,8 @@ pub(crate) async fn activate_session(
                         // withdrawn with it (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            config.name.as_deref(),
-                            config.box_addresses,
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
@@ -1489,8 +1476,8 @@ pub(crate) async fn activate_session(
                 best_effort_destroy(&mut client, id).await;
                 withdraw_box_row(
                     control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
+                    request.config.name.as_deref(),
+                    request.config.box_addresses,
                     registered
                         .as_ref()
                         .and_then(|registration| registration.box_id),
@@ -1538,8 +1525,8 @@ pub(crate) async fn activate_session(
     ActivationStep::HoldName
         .run(async {
             if kind == paths::ProviderKind::Minvmd
-                && config.network == boxes::NetworkMode::HostNet
-                && let Some(name) = config.name.as_deref()
+                && request.config.network == boxes::NetworkMode::HostNet
+                && let Some(name) = request.config.name.as_deref()
             {
                 hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
             }
@@ -1554,10 +1541,10 @@ pub(crate) async fn activate_session(
         // bare id printed to stdout above is the scripting contract, while this
         // stderr line tells an interactive operator which session they just
         // created and are entering.
-        if should_announce_session(global) {
+        if should_announce_box(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, config.name.as_deref())
+                box_announce_label(&id, request.config.name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -1680,7 +1667,7 @@ mod tests {
             no_prompt: true,
             attach: false,
         };
-        let err = activate_session(&global, args, false)
+        let err = activate_box(&global, args, false)
             .await
             .expect_err("the grant box is refused");
         let refused = err
@@ -1737,7 +1724,7 @@ mod tests {
             no_prompt: true,
             attach: false,
         };
-        let err = activate_session(&global, args, false)
+        let err = activate_box(&global, args, false)
             .await
             .expect_err("the broken project file is refused");
         assert!(
@@ -1926,16 +1913,16 @@ mod activation_step_tests {
         }
     }
 
-    /// The step names [`super::activate_session`] runs, in source order.
-    fn steps_in_activate_session() -> Vec<String> {
+    /// The step names [`super::activate_box`] runs, in source order.
+    fn steps_in_activate_box() -> Vec<String> {
         let text = include_str!("create.rs");
         let start = text
-            .find("pub(crate) async fn activate_session(")
-            .expect("create.rs defines activate_session");
+            .find("pub(crate) async fn activate_box(")
+            .expect("create.rs defines activate_box");
         let body = &text[start..];
         let end = body
             .find("\nfn normalize_subnets(")
-            .expect("normalize_subnets follows activate_session");
+            .expect("normalize_subnets follows activate_box");
         // Comment lines name steps too; only code runs them.
         let body: String = body[..end]
             .lines()
@@ -1966,7 +1953,7 @@ mod activation_step_tests {
             .iter()
             .map(|step| format!("{step:?}"))
             .collect();
-        assert_eq!(steps_in_activate_session(), declared);
+        assert_eq!(steps_in_activate_box(), declared);
 
         // Each step opens its own span, and the failing step names itself
         // while its error passes through unchanged.
@@ -2022,7 +2009,7 @@ mod activation_step_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_steps_run_in_order_and_name_the_failing_step_in_activate_session() {
+    async fn activation_steps_run_in_order_and_name_the_failing_step_in_activate_box() {
         use clap::Parser as _;
         // A project path that does not exist ends the real activation in its
         // first step, before any daemon is started or contacted.
@@ -2033,7 +2020,7 @@ mod activation_step_tests {
         let subscriber = tracing_subscriber::registry().with(Capture(seen.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let error = super::activate_session(&crate::cli::GlobalArgs::default(), cli.args, false)
+        let error = super::activate_box(&crate::cli::GlobalArgs::default(), cli.args, false)
             .await
             .expect_err("a missing project path ends the activation");
         let expected = format!("Cannot resolve project path '{}'", missing.display());
