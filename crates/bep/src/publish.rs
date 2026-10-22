@@ -112,9 +112,10 @@ pub enum PublishError {
         source: io::Error,
     },
     /// The identity does not say when the root CA's validity ends. An
-    /// identity that an older `bep` published has no such entry.
+    /// identity that an older `bep` published has no such entry, and a
+    /// restart keeps it unset while the root key stays the same.
     #[error(
-        "The proxy's published identity does not say when its root certificate expires. Start `bep` to publish it again."
+        "The proxy's published identity does not say when its root certificate expires. Run `bep --replace-key root` to make a new root key with a known expiry, then start `bep serve` again."
     )]
     NoRootValidity,
     /// The value was not sealed.
@@ -141,16 +142,23 @@ impl Identity {
     /// seconds since the Unix epoch, and its validity ends
     /// [`ROOT_VALIDITY_SECS`] later. An identity with no root entry gets no
     /// end.
+    ///
+    /// When `previous` names the same root key with no end, an older `bep`
+    /// published it, and the root key's creation time is unknown. The key
+    /// can be older than `now`, so an end counted from `now` can be later
+    /// than the root's real end. The end stays unset, and a mint refuses
+    /// the identity until the root key is replaced.
     #[must_use]
     pub fn with_root_validity(mut self, previous: Option<&Self>, now: u64) -> Self {
         let kid = self.root.as_ref().map(|root| root.kid.as_str());
-        let carried = previous
-            .filter(|previous| {
-                kid.is_some() && previous.root.as_ref().map(|r| r.kid.as_str()) == kid
-            })
-            .and_then(|previous| previous.root_not_after);
-        self.root_not_after =
-            kid.map(|_| carried.unwrap_or_else(|| now.saturating_add(ROOT_VALIDITY_SECS)));
+        let same_root = previous.filter(|previous| {
+            kid.is_some() && previous.root.as_ref().map(|r| r.kid.as_str()) == kid
+        });
+        self.root_not_after = match (kid, same_root) {
+            (None, _) => None,
+            (Some(_), Some(previous)) => previous.root_not_after,
+            (Some(_), None) => Some(now.saturating_add(ROOT_VALIDITY_SECS)),
+        };
         self
     }
 
@@ -688,5 +696,31 @@ mod tests {
         .unwrap();
         let err = old.root_not_after().unwrap_err();
         assert!(matches!(err, PublishError::NoRootValidity), "{err}");
+
+        // A restart with the same root key does not give such an identity
+        // an end, because the root key's creation time is unknown.
+        let upgraded = Identity {
+            root_not_after: None,
+            ..resealed
+        };
+        let restarted = load(&store, &Role::ALL).unwrap();
+        let republished =
+            Identity::of(&restarted).with_root_validity(Some(&upgraded), replaced_at + 2 * 86_400);
+        assert_eq!(republished.root_not_after, None);
+        assert!(matches!(
+            republished.root_not_after(),
+            Err(PublishError::NoRootValidity)
+        ));
+        drop(restarted);
+
+        // Its next root replacement starts a known validity.
+        let replaced_again = replaced_at + 3 * 86_400;
+        let root = replace(&store, Role::Root).unwrap();
+        let renewed = Identity::after_replacement(&store, Role::Root, &root, Some(&upgraded))
+            .with_root_validity(Some(&upgraded), replaced_again);
+        assert_eq!(
+            renewed.root_not_after,
+            Some(replaced_again + ROOT_VALIDITY_SECS)
+        );
     }
 }
