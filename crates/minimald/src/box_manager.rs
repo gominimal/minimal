@@ -1349,6 +1349,7 @@ impl BoxManager {
         // catches a name collision (`AlreadyExists`) before any actor exists.
         let record = build_record(config, username, boxes::BoxState::Pending)?;
         let name = record.name.clone();
+        let retry = record.clone();
         let handle = match self.store.create(record).await {
             Ok(handle) => handle,
             // The name may be held by a session whose destroy is still
@@ -1360,27 +1361,22 @@ impl BoxManager {
                 // The teardown runs beside this mainloop, so it can end
                 // between the collision and the re-read: a record gone by
                 // then was a session destroyed meanwhile, and the name is
-                // free now.
-                return Err(match name {
-                    Some(name) => match self.name_is_being_destroyed(&name).await {
-                        Some(true) => BoxManagerError::new(
+                // free now, so take it. Once: a second collision is a
+                // session created meanwhile, which is a plain collision.
+                let Some(name) = name else { return Err(e) };
+                match self.name_is_being_destroyed(&name).await {
+                    Some(true) => {
+                        return Err(BoxManagerError::new(
                             std::io::ErrorKind::AlreadyExists,
                             format!(
-                                "a session named `{name}` is still being destroyed; \
-                                 try again once it is gone"
+                                "a session named `{name}` is still being destroyed; run \
+                                 `min session activate --name {name}` again once it is gone"
                             ),
-                        ),
-                        None => BoxManagerError::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "a session named `{name}` was being destroyed as this one \
-                                 was created, and is gone now; try again"
-                            ),
-                        ),
-                        Some(false) => e,
-                    },
-                    None => e,
-                });
+                        ));
+                    }
+                    None => self.store.create(retry).await?,
+                    Some(false) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         };
