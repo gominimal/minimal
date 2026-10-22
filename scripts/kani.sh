@@ -10,8 +10,9 @@
 # decrypt, a misattributed source, a member without bounds, an authority
 # outside either host set, an off-port connection, an expired or revoked
 # value, an authority outside the box's declared egress and a request
-# whose Host differs from its connection are refused, and the decision
-# admits exactly when every check passes).
+# whose Host differs from its connection are refused, a store handle
+# that does not verify or disagrees with its current rule is refused, and
+# the decision admits exactly when every check passes).
 #
 # Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
@@ -277,4 +278,4 @@ expect boxes 10
 expect rcache 3
 expect mlog 9
 expect minvmd 5
-expect bep 9
+expect bep 10

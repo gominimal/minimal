@@ -39,7 +39,7 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 "found session"
             );
             let host_asks = super::session::host_asks_box(global, entry.name.as_deref());
-            session_via_ssh(
+            box_via_ssh(
                 &sock,
                 entry.id,
                 None,
@@ -57,7 +57,7 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         // keystroke into a session must not detour into config authoring.
         SmartAttach::CreateForCwd | SmartAttach::NoSessions => {
             drop(client);
-            activate_session(global, bare_activate_args(), false).await
+            activate_box(global, bare_activate_args(), false).await
         }
     }
 }
