@@ -22,6 +22,7 @@ impl BoxMessage {
             Self::IsBusy { .. } => "IsBusy",
             Self::Stop { .. } => "Stop",
             Self::Destroy { .. } => "Destroy",
+            Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::GetRecord { .. } => "GetRecord",
             Self::GetNetSwitch { .. } => "GetNetSwitch",
             Self::GetDenyAllOptOut(_) => "GetDenyAllOptOut",
@@ -48,6 +49,8 @@ impl BoxMessage {
             Self::CheckPackagesAtFinalize(..) => "CheckPackagesAtFinalize",
             #[cfg(test)]
             Self::ForgetComposedGraphNames(_) => "ForgetComposedGraphNames",
+            #[cfg(test)]
+            Self::HoldUntil(..) => "HoldUntil",
         }
     }
 }

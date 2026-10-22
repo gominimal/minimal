@@ -412,11 +412,31 @@ impl BoxManagerHandle {
     /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
     pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, BoxManagerError> {
+        self.delete(id, false).await.map(Option::unwrap_or_default)
+    }
+
+    /// [`Self::delete_session`] for a session that has not finished
+    /// activating: `Ok(None)`, with the session left as it is, when it had —
+    /// decided by the session after any finalize already in flight. The
+    /// cleanup a client or the connection-close reap sends for an activation
+    /// that was given up on (inbox#690).
+    pub async fn delete_session_if_unfinalized(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<Vec<String>>, BoxManagerError> {
+        self.delete(id, true).await
+    }
+
+    async fn delete(
+        &self,
+        id: SessionId,
+        only_if_unfinalized: bool,
+    ) -> Result<Option<Vec<String>>, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .sender
-            .send(ManagerMessage::DeleteSession(id, send))
+            .send(ManagerMessage::DeleteSession(id, only_if_unfinalized, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
     }

@@ -738,6 +738,126 @@ async fn until_claimed(mngr: &BoxManagerHandle, id: SessionId) {
     .expect("the destroy never claimed the session");
 }
 
+/// A cleanup destroy (`only_if_unfinalized`) keeps a session that
+/// finished activating and destroys one that did not (inbox#690).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleanup_destroy_keeps_a_finished_session() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let kept = mngr.delete_session_if_unfinalized(id).await.unwrap();
+    assert!(kept.is_none(), "an Active session should be kept");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "a kept session keeps its record"
+    );
+    assert_eq!(mngr.list().await.unwrap().len(), 1, "and is listed");
+
+    let (_state, _cache, pending_mngr, pending, _response) = create_pending_session().await;
+    let destroyed = pending_mngr
+        .delete_session_if_unfinalized(pending)
+        .await
+        .unwrap();
+    assert!(
+        destroyed.is_some(),
+        "an unfinished session should be destroyed"
+    );
+    assert!(
+        pending_mngr
+            .get_record(BoxKeyPredicate::Id(pending))
+            .await
+            .unwrap()
+            .is_none(),
+        "the destroyed session's record should be gone"
+    );
+}
+
+/// The race inbox#690 is about, pinned: a cleanup destroy queued in the
+/// session's mailbox behind a finalize that is still running waits for
+/// it, and keeps the session it finished. While the cleanup is in
+/// flight the session is in the tearing-down set: a second destroy is
+/// refused, and a listing skips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleanup_destroy_queued_behind_a_running_finalize_keeps_the_session() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let handle = session(&mngr, id).await;
+    assert!(
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("an empty loadout configures")
+            .is_none(),
+        "an empty loadout needs no verdict"
+    );
+
+    // The actor is held, so the finalize and then the cleanup queue in
+    // its mailbox in that order: the finalize is the one "still running".
+    let release = handle.hold_for_test().await;
+    let finalize = crate::traced::spawn({
+        let handle = handle.clone();
+        async move { handle.finalize().await }
+    });
+    handle.until_queued(1).await;
+    let cleanup = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.delete_session_if_unfinalized(id).await }
+    });
+    handle.until_queued(2).await;
+
+    let second = mngr
+        .delete_session(id)
+        .await
+        .expect_err("a second destroy while the cleanup is in flight is refused");
+    assert_eq!(second.kind(), ErrorKind::ResourceBusy);
+    assert!(
+        mngr.list().await.unwrap().is_empty(),
+        "a session a cleanup is in flight for is not listed"
+    );
+
+    release.send(()).expect("the actor is held");
+    finalize
+        .await
+        .unwrap()
+        .expect("the finalize ahead of the cleanup succeeds");
+    let kept = cleanup.await.unwrap().unwrap();
+    assert!(
+        kept.is_none(),
+        "the cleanup keeps the session the finalize finished"
+    );
+    let listed = mngr.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "the kept session is listed again");
+    assert_eq!(listed[0].status, boxes::BoxState::Active);
+}
+
+/// A cleanup destroy that does destroy — the session never finished —
+/// leaves a listing whole: the session is skipped while its actor
+/// deletes the record, and gone after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_survives_a_cleanup_destroy_of_an_unfinished_session() {
+    let (_state, _cache, mngr, id, _response) = create_pending_session().await;
+    let handle = session(&mngr, id).await;
+    let release = handle.hold_for_test().await;
+    let cleanup = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.delete_session_if_unfinalized(id).await }
+    });
+    handle.until_queued(1).await;
+    assert!(mngr.list().await.unwrap().is_empty());
+    release.send(()).expect("the actor is held");
+    let destroyed = cleanup.await.unwrap().unwrap();
+    assert!(destroyed.is_some(), "an unfinished session is destroyed");
+    assert!(mngr.list().await.unwrap().is_empty());
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// Destroying an unknown ID is a `NotFound` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroy_unknown_id_errors() {

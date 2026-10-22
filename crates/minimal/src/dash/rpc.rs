@@ -388,9 +388,15 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
 /// destroy` does.
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
     let record = record_of(provider, id).await;
-    match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
-        .await
-        .context("DestroySession RPC failed")?
+    match timed::<DestroySession>(
+        &mut provider.client,
+        DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        },
+    )
+    .await
+    .context("DestroySession RPC failed")?
     {
         Errorable::Ok(_) => {
             if let Some(record) = record {

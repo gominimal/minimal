@@ -523,6 +523,40 @@ impl BoxHandle {
         recv.await.unwrap_or(false)
     }
 
+    /// Test-only: holds the actor in a message until the returned sender
+    /// fires or drops (see [`BoxMessage::HoldUntil`]). Returns once the
+    /// actor is in the hold.
+    #[cfg(test)]
+    pub(crate) async fn hold_for_test(&self) -> oneshot::Sender<()> {
+        let (entered, entered_recv) = oneshot::channel();
+        let (release, release_recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(BoxMessage::HoldUntil(entered, release_recv))
+            .await;
+        entered_recv
+            .await
+            .expect("the session actor should enter the hold");
+        release
+    }
+
+    /// Test-only: waits until `n` messages are queued in this session's
+    /// mailbox, behind the one being handled.
+    #[cfg(test)]
+    pub(crate) async fn until_queued(&self, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while self.0.queued() < n {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{n} messages never queued in the session's mailbox"));
+    }
+
     /// Test-only: turn on the finalize package check for this session,
     /// bounded by `deadline` (see [`BoxMessage::CheckPackagesAtFinalize`]
     /// and [`PACKAGE_CHECK_DEADLINE`]).
@@ -603,6 +637,19 @@ impl BoxHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(BoxMessage::Destroy(send)).await;
         recv.await.unwrap_or(Ok(Vec::new()))
+    }
+
+    /// [`Self::destroy`], only if the session has not finished activating:
+    /// `Ok(None)` when it had, and it is left as it is. The actor decides
+    /// after whatever is ahead of this in its mailbox — a finalize in flight
+    /// included. A dead actor reads as destroyed, as for [`Self::destroy`].
+    pub(crate) async fn destroy_if_unfinalized(
+        &self,
+    ) -> Result<Option<Vec<String>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(BoxMessage::DestroyIfUnfinalized(send)).await;
+        recv.await.unwrap_or(Ok(Some(Vec::new())))
     }
 
     /// This session's host, launching one with nothing bound to it if the

@@ -3943,7 +3943,10 @@ async fn destroy_session_removes_it_from_get_and_list() {
     let session_id = fresh_session(&mut client).await;
 
     let resp = client
-        .call::<DestroySession>(&DestroySessionRequest { id: session_id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id: session_id,
+            only_if_unfinalized: false,
+        })
         .await;
     assert_eq!(resp, Errorable::Ok(DestroySessionResponse::default()));
 
@@ -3970,6 +3973,7 @@ async fn destroy_session_errors_for_unknown_id() {
     let resp = client
         .call::<DestroySession>(&DestroySessionRequest {
             id: SessionId::nil(),
+            only_if_unfinalized: false,
         })
         .await;
 

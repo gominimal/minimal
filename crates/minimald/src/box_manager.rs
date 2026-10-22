@@ -205,7 +205,9 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<Vec<String>>),
+    /// Destroy a session; with `true`, only if it has not finished
+    /// activating (`None` when it was kept).
+    DeleteSession(SessionId, bool, Responder<Option<Vec<String>>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
@@ -1087,11 +1089,12 @@ impl BoxManager {
             return Ok(None);
         };
         let session_id = *handle.id();
-        if let Some(h) = self.running.get(&session_id) {
-            return Ok(Some(h.clone()));
-        }
         // Being torn down: the record outlives the actor by the length of
         // its teardown task, and a session in that window is gone, not idle.
+        // Checked before `running`: a cleanup destroy leaves its actor there
+        // while the actor decides (it may keep the session), and a handle
+        // given out meanwhile would queue behind that destroy, against a
+        // session the system may have ended by the time it is served.
         if self
             .tearing_down
             .lock()
@@ -1099,6 +1102,9 @@ impl BoxManager {
             .contains(&session_id)
         {
             return Ok(None);
+        }
+        if let Some(h) = self.running.get(&session_id) {
+            return Ok(Some(h.clone()));
         }
         // Not running, start it! The find above is an await, so a teardown
         // can delete the record and leave the tearing-down set before the
@@ -1598,7 +1604,7 @@ impl BoxManager {
             // actor was inside a stalled package-graph clone parked `min ls`
             // for the rest of the clone's connect timeout (70 s in the lab,
             // 710d).
-            ManagerMessage::DeleteSession(id, r) => {
+            ManagerMessage::DeleteSession(id, only_if_unfinalized, r) => {
                 if self.in_shutdown.is_cancelled() {
                     r.handle(async {
                         Err(BoxManagerError::new(
@@ -1630,6 +1636,96 @@ impl BoxManager {
                         return;
                     }
                 };
+                // A destroy only for an unfinished session (inbox#690) goes
+                // to a live actor unclaimed: the actor decides, after any
+                // finalize ahead of it in its mailbox, and evicts itself if
+                // it destroys. An idle session has no finalize in flight, so
+                // its record answers: a finished one is kept, an unfinished
+                // one takes the unconditional path below.
+                if only_if_unfinalized {
+                    let busy = self
+                        .tearing_down
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&id);
+                    if busy {
+                        r.handle(async {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ResourceBusy,
+                                format!(
+                                    "a destroy of session `{}` is already in flight; if the \
+                                     session is still listed once it ends, destroy it again",
+                                    id.as_ref()
+                                ),
+                            ))
+                        })
+                        .await;
+                        return;
+                    }
+                    if let Some(hnd) = self.running.get(&id).cloned() {
+                        // In the tearing-down set until the actor answers, as
+                        // an unconditional destroy is for its whole teardown:
+                        // a second destroy is refused rather than queued
+                        // behind this one (where it would destroy a session
+                        // this one reports kept), a listing skips the
+                        // session rather than reading a record the actor may
+                        // be deleting, and a resolve finds nothing (the actor
+                        // stays in `running`, unclaimed, since the session
+                        // may be kept; the set is what hides it). A kept
+                        // session leaves the set with the answer, and is
+                        // listed and resolved again.
+                        let tearing_down = Arc::clone(&self.tearing_down);
+                        let handle = handle.clone();
+                        tearing_down
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(id);
+                        let span = tracing::Span::current();
+                        self.teardowns.spawn(tracing::Instrument::instrument(
+                            async move {
+                                let _release = TearingDown {
+                                    set: tearing_down,
+                                    id,
+                                };
+                                r.handle(async {
+                                    let answer = hnd.destroy_if_unfinalized().await?;
+                                    // Belt-and-braces, as on the unconditional
+                                    // path: a dead actor (self-terminated, not
+                                    // yet evicted) reads as destroyed above,
+                                    // and may have died without deleting its
+                                    // record. Only a destroyed answer removes
+                                    // a leftover: a kept session's record is
+                                    // the session. `NotFound` is the normal,
+                                    // already-deleted case.
+                                    if answer.is_some()
+                                        && let Err(e) = handle.delete().await
+                                        && e.kind() != NotFound
+                                    {
+                                        return Err(e);
+                                    }
+                                    Ok(answer)
+                                })
+                                .await;
+                            },
+                            span,
+                        ));
+                        while let Some(joined) = self.teardowns.try_join_next() {
+                            log_teardown_join(joined);
+                        }
+                        return;
+                    }
+                    match handle.record().await {
+                        Ok(record) if record.status == boxes::BoxState::Active => {
+                            r.handle(async { Ok(None) }).await;
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            r.handle(async { Err(e) }).await;
+                            return;
+                        }
+                    }
+                }
                 // One teardown per session: a second destroy that lands
                 // while the first runs is refused rather than brought up
                 // as a fresh actor whose hooks would run again.
@@ -1642,7 +1738,11 @@ impl BoxManager {
                     r.handle(async {
                         Err(std::io::Error::new(
                             std::io::ErrorKind::ResourceBusy,
-                            format!("session `{}` is already being destroyed", id.as_ref()),
+                            format!(
+                                "a destroy of session `{}` is already in flight; if the \
+                                 session is still listed once it ends, destroy it again",
+                                id.as_ref()
+                            ),
                         ))
                     })
                     .await;
@@ -1737,11 +1837,11 @@ impl BoxManager {
                                     {
                                         return Err(e);
                                     }
-                                    Ok(hook_failures)
+                                    Ok(Some(hook_failures))
                                 }
                                 None => {
                                     handle.delete().await?;
-                                    Ok(Vec::new())
+                                    Ok(Some(Vec::new()))
                                 }
                             }
                         })

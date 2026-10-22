@@ -2119,7 +2119,10 @@ async fn destroy_session(
 ) -> minimald_rpc::DestroySessionResponse {
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
-        .call::<DestroySession>(&DestroySessionRequest { id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
     {
         Errorable::Ok(resp) => resp,
@@ -3838,7 +3841,10 @@ async fn destroyed_box_name_is_nxdomain() {
 
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
-        .call::<DestroySession>(&DestroySessionRequest { id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
     {
         Errorable::Ok(_) => {}

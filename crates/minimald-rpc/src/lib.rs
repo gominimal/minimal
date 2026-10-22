@@ -2053,6 +2053,13 @@ pub struct DestroySession;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestroySessionRequest {
     pub id: SessionId,
+    /// Destroy the session only if it has not finished activating (record
+    /// not yet `Active`), decided by the session itself after any finalize
+    /// already in flight: the destroy a client sends to clean up an
+    /// activation it gave up on (inbox#690). Absent, as from a client that
+    /// predates it, the destroy is unconditional, as it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_if_unfinalized: bool,
 }
 
 /// How a [`DestroySession`] for an id the daemon holds no record of opens:
@@ -2081,6 +2088,10 @@ pub struct DestroySessionResponse {
     /// declared and what happened, followed by its captured output tail
     /// on the lines after, when there is any.
     pub hook_failures: Vec<String>,
+    /// The destroy was `only_if_unfinalized` and the session had finished:
+    /// it was kept, and is live. Only ever set in answer to such a request,
+    /// so a client that predates the flag never sees it.
+    pub kept: bool,
 }
 
 /// [`DestroySessionResponse`] on the wire: `null` (the old unit shape)
@@ -2100,6 +2111,8 @@ enum DestroySessionResponseWire {
 struct DestroySessionResponseFields {
     #[serde(default)]
     hook_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    kept: bool,
 }
 
 impl From<DestroySessionResponseWire> for DestroySessionResponse {
@@ -2108,6 +2121,7 @@ impl From<DestroySessionResponseWire> for DestroySessionResponse {
             DestroySessionResponseWire::Unit(()) => Self::default(),
             DestroySessionResponseWire::Fields(f) => Self {
                 hook_failures: f.hook_failures,
+                kept: f.kept,
             },
         }
     }
@@ -2115,11 +2129,12 @@ impl From<DestroySessionResponseWire> for DestroySessionResponse {
 
 impl From<DestroySessionResponse> for DestroySessionResponseWire {
     fn from(resp: DestroySessionResponse) -> Self {
-        if resp.hook_failures.is_empty() {
+        if resp.hook_failures.is_empty() && !resp.kept {
             Self::Unit(())
         } else {
             Self::Fields(DestroySessionResponseFields {
                 hook_failures: resp.hook_failures,
+                kept: resp.kept,
             })
         }
     }

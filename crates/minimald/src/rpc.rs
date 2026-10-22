@@ -1218,14 +1218,33 @@ async fn serve_destroy_session(
                 .ok()
                 .flatten()
                 .and_then(|record| record.name);
-            match mngr.delete_session(req.id).await {
-                Ok(hook_failures) => {
+            let outcome = if req.only_if_unfinalized {
+                mngr.delete_session_if_unfinalized(req.id).await
+            } else {
+                mngr.delete_session(req.id).await.map(Some)
+            };
+            match outcome {
+                Ok(Some(hook_failures)) => {
                     tracing::info!(
                         session_id = %req.id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session destroyed"
                     );
-                    Ok(Errorable::Ok(DestroySessionResponse { hook_failures }))
+                    Ok(Errorable::Ok(DestroySessionResponse {
+                        hook_failures,
+                        kept: false,
+                    }))
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        session_id = %req.id,
+                        session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        "kept the session a cleanup destroy was sent for: it finished activating"
+                    );
+                    Ok(Errorable::Ok(DestroySessionResponse {
+                        hook_failures: Vec::new(),
+                        kept: true,
+                    }))
                 }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
@@ -2883,7 +2902,13 @@ mod trace_tests {
             .unwrap()
             .id;
         client
-            .call_with_env::<DestroySession>(&env(), &DestroySessionRequest { id })
+            .call_with_env::<DestroySession>(
+                &env(),
+                &DestroySessionRequest {
+                    id,
+                    only_if_unfinalized: false,
+                },
+            )
             .await
             .unwrap();
 

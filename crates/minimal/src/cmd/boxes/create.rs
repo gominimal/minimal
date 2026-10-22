@@ -2,7 +2,9 @@
 //! checks to the start line.
 
 use super::*;
-use minimal_client::box_registration::{finalize_holding_lease, register_box_reminting_autogen};
+use minimal_client::box_registration::{
+    CleanupOutcome, register_box_reminting_autogen, settle_lease_after_cleanup,
+};
 
 /// The session-start line for a box the activation registered with the VM
 /// host daemon (T66): the one line the start output owes the registration,
@@ -1777,42 +1779,65 @@ pub(crate) async fn activate_box(
     // from `<workspace>/patches/`. Dedup by sandbox destination:
     // the composer's post-gate check guarantees any duplicates
     // are exact matches (same source), so collapsing is safe.
+    // A Ctrl-C during the finalize tears the activation down. The cleanup
+    // after a finalize that failed settles the session and its row itself
+    // and handles a Ctrl-C of its own (`cleanup_after_failed_finalize`), so
+    // the activation's interrupt handler is disarmed before it: left armed,
+    // it would withdraw the row whatever the cleanup found, a live box's
+    // included.
+    let mut interrupt_guard = Some(interrupt_guard);
     ActivationStep::Finalize
         .run(async {
             minimal_client::dedup_patch_uploads(&mut collected_patches);
-            // The registration's lease is held across the finalize and committed
-            // only once the session is active: until then an activation that dies
-            // leaves the VM host daemon to withdraw the row on the lease's close.
+            // The registration's lease is held across the finalize and, when
+            // that fails, across the cleanup destroy too: only the destroy's
+            // answer says whether a box is live behind the row (inbox#690).
+            // Until the lease is committed, an activation that dies leaves
+            // the VM host daemon to withdraw the row on the lease's close.
             let lease = registered
                 .as_mut()
                 .and_then(|registration| registration.lease.take());
-            if let Err(e) = finalize_holding_lease(
-                lease,
-                upload_and_finalize(
-                    &mut client,
-                    id,
-                    &collected_patches,
-                    &hook_scripts,
-                    finalize_hook_budget,
-                ),
+            if let Err(e) = upload_and_finalize(
+                &mut client,
+                id,
+                &collected_patches,
+                &hook_scripts,
+                finalize_hook_budget,
             )
             .await
             {
+                drop(interrupt_guard.take());
                 // Best-effort teardown: the session is stuck in
                 // Materializing on the daemon. Destroy it so the operator's
                 // `min ls` doesn't fill with half-finalized sessions, and
-                // withdraw the row the registration bought with it (T66).
-                best_effort_destroy(&mut client, id).await;
-                withdraw_box_row(
-                    control_sock.clone(),
-                    request.config.name.as_deref(),
-                    request.config.box_addresses,
-                    registered
-                        .as_ref()
-                        .and_then(|registration| registration.box_id),
-                )
-                .await;
+                // withdraw the row the registration bought with it (T66),
+                // unless the session finished first and was kept, or may
+                // have been.
+                let outcome = best_effort_destroy(&mut client, id, true).await;
+                if !settle_lease_after_cleanup(lease, outcome).await {
+                    withdraw_box_row(
+                        control_sock.clone(),
+                        request.config.name.as_deref(),
+                        request.config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
+                    )
+                    .await;
+                }
+                // A kept session is active: it gets the `host_ip` name hold
+                // an activation that succeeded makes below.
+                if outcome == CleanupOutcome::Kept
+                    && kind == paths::ProviderKind::Minvmd
+                    && request.config.network == boxes::NetworkMode::HostNet
+                    && let Some(name) = request.config.name.as_deref()
+                {
+                    hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
+                }
                 return Err(e);
+            }
+            if let Some(lease) = lease {
+                lease.commit().await;
             }
             Ok::<_, anyhow::Error>(())
         })
@@ -1821,7 +1846,7 @@ pub(crate) async fn activate_box(
     // The session is `Active` now — a Ctrl-C must no longer tear it down
     // (the attach hand-off below and the user's own session are fair game
     // for interrupts, but not this cleanup).
-    drop(interrupt_guard);
+    drop(interrupt_guard.take());
     if let Some(registration) = proxy_registration {
         registration.keep();
     }

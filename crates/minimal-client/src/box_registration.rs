@@ -189,6 +189,43 @@ pub async fn finalize_holding_lease<T>(
     finalized
 }
 
+/// What a cleanup destroy did with a session whose finalize failed
+/// (`DestroySessionRequest::only_if_unfinalized`, inbox#690).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    /// The session was destroyed: nothing runs behind its row.
+    Destroyed,
+    /// The session finished activating first and was kept: it is live.
+    Kept,
+    /// The daemon did not say: the destroy failed, or the user stopped
+    /// waiting while it was still in flight, so a box may be live.
+    Unknown,
+}
+
+/// Settles a registration's lease once the cleanup destroy after a failed
+/// finalize has answered, the lease having been held across both. A
+/// destroyed session's lease is dropped uncommitted, and the VM host daemon
+/// withdraws its row on the close. A kept session is live, and one whose
+/// outcome is unknown may be, so their lease is committed and the row
+/// stays: a row with no box behind it costs its addresses until the
+/// session is destroyed, while a live box with no row has a name that does
+/// not resolve and addresses the host may hand to another box. Returns
+/// whether the row was kept.
+pub async fn settle_lease_after_cleanup(lease: Option<BoxLease>, outcome: CleanupOutcome) -> bool {
+    match outcome {
+        CleanupOutcome::Destroyed => {
+            drop(lease);
+            false
+        }
+        CleanupOutcome::Kept | CleanupOutcome::Unknown => {
+            if let Some(lease) = lease {
+                lease.commit().await;
+            }
+            true
+        }
+    }
+}
+
 /// What a successful registration with the VM host daemon hands the
 /// activating client back (T66, NET-133): the addresses the create request
 /// carries, and the box's own id when the daemon's reply named one — the
@@ -955,5 +992,47 @@ mod tests {
         finalize_holding_lease(None, async { Ok(()) })
             .await
             .expect("a registration with no lease finalizes as ever");
+    }
+
+    /// After a failed finalize, the lease follows the cleanup destroy's
+    /// answer (inbox#690): a destroyed session's lease closes uncommitted,
+    /// the close the daemon withdraws the row on; a kept session's lease,
+    /// and one whose outcome is unknown, is committed, so a box that is or
+    /// may be live keeps its row.
+    #[tokio::test]
+    async fn the_lease_follows_the_cleanup_destroys_answer() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let commit = format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE);
+
+        for (outcome, row_kept, seen_after) in [
+            (CleanupOutcome::Destroyed, false, ""),
+            (CleanupOutcome::Kept, true, commit.as_str()),
+            (CleanupOutcome::Unknown, true, commit.as_str()),
+        ] {
+            let (client, accepted) = tokio::join!(
+                tokio::net::UnixStream::connect(&sock_path),
+                listener.accept()
+            );
+            let lease = BoxLease {
+                stream: client.expect("the lease connects"),
+            };
+            let mut daemon = accepted.expect("the daemon side accepts").0;
+            assert_eq!(
+                settle_lease_after_cleanup(Some(lease), outcome).await,
+                row_kept,
+                "{outcome:?}: whether the row stays"
+            );
+            let mut seen = String::new();
+            daemon.read_to_string(&mut seen).await.unwrap();
+            assert_eq!(seen, seen_after, "{outcome:?}: what the daemon saw");
+        }
+        assert!(
+            !settle_lease_after_cleanup(None, CleanupOutcome::Destroyed).await,
+            "with no lease, a destroyed session's row is the caller's to withdraw"
+        );
     }
 }
