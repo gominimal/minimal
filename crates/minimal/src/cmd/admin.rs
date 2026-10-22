@@ -4,6 +4,15 @@ use super::*;
 ///
 /// Intended for use as an SSH `ProxyCommand`: ssh writes to our stdin and
 /// reads from our stdout, while we bridge both directions to the UDS.
+/// Without an explicit socket path, ensures the selected daemon is running
+/// and resolves its socket. An owner PID or lock enables the lifetime watch
+/// described by [`owner_gone`]; detecting owner loss closes the socket and
+/// returns successfully.
+///
+/// # Errors
+///
+/// Propagates daemon startup, socket resolution, connection, and bridge I/O
+/// errors. Broken-pipe errors during copying are treated as normal termination.
 pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyhow::Error> {
     let socket_path = match args.socket {
         Some(socket_path) => socket_path,
@@ -29,10 +38,16 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
     .await
 }
 
-/// Bridges stdio to the daemon until either side closes or, when an owner is
-/// named, until that owner is gone ([`owner_gone`]). Returning drops the
-/// bridge and with it the daemon socket: the close the daemon acts on for a
-/// lost client.
+/// Bridges stdio to the daemon, watching for owner loss when `owner` or
+/// `lock` is supplied (see [`owner_gone`]). With neither, waits only for
+/// [`proxy_bridge`], which drains daemon output after stdin closes.
+/// Detecting owner loss cancels the bridge and returns `Ok(())`, closing
+/// the daemon socket without waiting for pending output.
+///
+/// # Errors
+///
+/// Propagates bridge copy and socket shutdown errors if the bridge finishes
+/// first; broken-pipe copy errors are treated as normal termination.
 async fn proxy_while_owner_lives<I, O>(
     stream: tokio::net::UnixStream,
     stdin: I,
@@ -79,6 +94,12 @@ const OWNER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// `kill(pid, 0)` finds nothing or, on Linux, when the process is a zombie
 /// (`EPERM` is alive). A pid that does not fit a `pid_t` names no process
 /// and reads as gone.
+///
+/// Checks immediately, then every 250 ms. When `lock` is supplied, ignores
+/// the PID and resolves if the file cannot be opened for any reason or its
+/// lock can be acquired; lock-acquisition errors keep the watch running.
+/// With no lock and no usable PID, resolves immediately. Filesystem and
+/// process-probe errors are handled by the watch and do not reach callers.
 async fn owner_gone(pid: Option<u32>, lock: Option<PathBuf>) {
     let pid = pid.and_then(|pid| i32::try_from(pid).ok().map(nix::unistd::Pid::from_raw));
     loop {
@@ -103,6 +124,8 @@ async fn owner_gone(pid: Option<u32>, lock: Option<PathBuf>) {
 
 /// Whether a pid no longer names a live process: nothing answers to it, or
 /// (Linux) it is a zombie, exited and not yet reaped by its parent.
+/// Signal-probe errors other than `ESRCH` do not establish process loss;
+/// an unreadable or unrecognized Linux proc status is also inconclusive.
 fn pid_gone(pid: nix::unistd::Pid) -> bool {
     if matches!(
         nix::sys::signal::kill(pid, None),
@@ -123,10 +146,12 @@ fn pid_gone(pid: nix::unistd::Pid) -> bool {
     false
 }
 
-/// Whether the owner's lock can be taken: its file gone, or its `flock`
-/// free. A free lock's file is unlinked while this process still holds the
-/// lock, then released, so no other process can lock that path in between
-/// and lose it to this unlink.
+/// Returns `true` if the owner's lock file cannot be opened for any reason
+/// or its exclusive `flock` can be acquired. Any lock-acquisition error
+/// returns `false`.
+///
+/// On acquiring the lock, attempts to unlink its file while still holding
+/// the lock, then releases it. An unlink failure does not change the result.
 fn owner_lock_is_free(path: &std::path::Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return true;

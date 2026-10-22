@@ -81,24 +81,6 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
     }
 }
 
-/// Build the `ssh` command that attaches to session `id` via the daemon
-/// socket at `sock`.
-///
-/// `wire` is an already-encoded [`minimald_rpc::exec`] request, or `None` for
-/// the interactive shell. Callers name their own form — [`remote_command`] for
-/// a user's argv, [`minimald_rpc::exec::ExecRequest::TaskRun`] for a task — so
-/// this function never has to guess what a caller meant.
-///
-/// The interactive path (`wire: None`) forces a PTY with `-tt` — the
-/// daemon's shell_request handler mints the PTY-backed session shell. Its
-/// callers run the command through [`run_interactive_attach`], which owns
-/// the user's terminal and relays it to ssh over a local pty.
-///
-/// `session_keys` negotiates the configurable detach/forward chord per
-/// channel: when `Some`, each resolved key is sent as an env var (with a
-/// matching `SendEnv` option) the daemon reads back alongside
-/// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
-/// for non-interactive exec channels, which have no detach.
 /// The exclusive lock this process holds for the proxies it drives, taken
 /// once and kept for the process's life; see [`hold_owner_lock`].
 static OWNER_LOCK: std::sync::OnceLock<(std::path::PathBuf, nix::fcntl::Flock<std::fs::File>)> =
@@ -212,6 +194,34 @@ fn sweep_stale_owner_locks(dir: &Path) {
     }
 }
 
+/// Build the `ssh` command that attaches to session `id` via the daemon
+/// socket at `sock`.
+///
+/// `wire` is an already-encoded [`minimald_rpc::exec`] request, or `None` for
+/// the interactive shell. Callers name their own form — [`remote_command`] for
+/// a user's argv, [`minimald_rpc::exec::ExecRequest::TaskRun`] for a task — so
+/// this function never has to guess what a caller meant.
+///
+/// The interactive path (`wire: None`) forces a PTY with `-tt` — the
+/// daemon's shell_request handler mints the PTY-backed session shell. Its
+/// callers run the command through [`run_interactive_attach`], which owns
+/// the user's terminal and relays it to ssh over a local pty.
+///
+/// `session_keys` negotiates the configurable detach/forward chord per
+/// channel: when `Some`, each resolved key is sent as an env var (with a
+/// matching `SendEnv` option) the daemon reads back alongside
+/// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
+/// for non-interactive exec channels, which have no detach.
+///
+/// Returns the command without spawning ssh. Configures the proxy to close
+/// when this process exits, using a process-lifetime owner lock when available
+/// and a PID watch otherwise. Preparing the lock may create files beside
+/// `sock` and remove stale owner lock files; lock failures use the PID fallback.
+///
+/// # Errors
+///
+/// Returns an error if the current executable cannot be located or `sock`
+/// has no parent from which an SSH host alias can be derived.
 pub fn attach_command(
     sock: &Path,
     id: boxes::SessionId,
