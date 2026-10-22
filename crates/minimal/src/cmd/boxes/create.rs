@@ -1020,6 +1020,11 @@ pub(crate) async fn activate_box(
                     Ok(registration)
                 }
                 Err(error) => {
+                    // The session `CreateSession` just made is not finalized, and
+                    // the interrupt guard is not armed yet. Destroy it so `min ls`
+                    // does not keep a half-made session, as the finalize failure
+                    // does, and withdraw its row (T66).
+                    best_effort_destroy(&mut client, id).await;
                     withdraw_box_row(
                         control_sock.clone(),
                         request.config.name.as_deref(),
