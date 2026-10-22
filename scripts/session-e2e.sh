@@ -11624,6 +11624,12 @@ proof_bep_box_env_holds_sealed_value_only() {
       echo "::error::the GitHub grant box $bep_name has no value in GH_TOKEN"
       fail
     fi
+    # A sealed value is a compact JWE, header..iv.ciphertext.tag, the form
+    # bep::seal returns.
+    if ! [[ "$bep_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+      echo "::error::the GH_TOKEN value of the GitHub grant box $bep_name is not a sealed value: it is not in the compact JWE form header..iv.ciphertext.tag"
+      fail
+    fi
     if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/bep-env-$bep_name.env"; then
       echo "::error::the environment of the GitHub grant box $bep_name holds a plaintext GitHub token"
       fail
