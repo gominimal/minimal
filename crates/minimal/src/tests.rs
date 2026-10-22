@@ -308,8 +308,9 @@ fn every_daemon_connection_is_classified() {
 /// Every `CreateSession` this crate sends states, in the request itself,
 /// whether it asserts the daemon's build.
 ///
-/// The struct field makes omitting the decision a compile error; this
-/// makes answering it "no" a visible one. Every session-creating path
+/// The constructor leaves the assertion off, so each site sets
+/// `must_match_version` itself; this makes a site that does not set it a
+/// visible one. Every session-creating path
 /// asserts — they are the ones #1251 is about — and the inventory is what
 /// stops another from quietly passing `None`.
 #[test]
@@ -320,6 +321,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activate_box = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
+            // Not a create the dashboard sends: the unit tests' own-address
+            // config, which only a fake create closure receives.
+            "dash/rpc.rs::own_ip_config = asserts nothing",
             "task.rs::cmd_task_run = asserts",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
@@ -472,16 +476,77 @@ fn source_inventory(
 /// build.
 fn create_site_inventory(manifest_dir: &str) -> Vec<String> {
     // Built by concatenation so this scanner does not match itself.
-    const NEEDLE: &str = concat!("CreateSession", "Request {");
+    const NEEDLE: &str = concat!("CreateSession", "Request::new(");
     source_inventory(
         manifest_dir,
         &[NEEDLE],
         &[
-            "must_match_version: version_assertion()",
-            "must_match_version: minimal_client::version_assertion()",
+            ".must_match_version = version_assertion()",
+            ".must_match_version = minimal_client::version_assertion()",
         ],
         ("asserts", "asserts nothing"),
     )
+}
+
+/// Every line under `<crate>/src` and `<crate>/tests` that spells a create
+/// request, or its box config, as a struct literal. A function's return
+/// type (`-> BoxConfig {`) is not a literal and does not count.
+fn create_literal_sites(manifest_dir: &str) -> Vec<String> {
+    // Built by concatenation so this scanner does not match itself.
+    const NEEDLES: [&str; 2] = [
+        concat!("CreateSession", "Request {"),
+        concat!("Box", "Config {"),
+    ];
+    let root = std::path::Path::new(manifest_dir);
+    let mut files = crate_sources(manifest_dir).1;
+    let mut stack = vec![root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut sites = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("source file must be readable");
+        let rel = path
+            .strip_prefix(root)
+            .expect("scanned under the crate")
+            .to_string_lossy()
+            .into_owned();
+        for (i, line) in text.lines().enumerate() {
+            for needle in NEEDLES {
+                let literal = line
+                    .match_indices(needle)
+                    .any(|(at, _)| !line[..at].trim_end().ends_with("->"));
+                if literal {
+                    sites.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+    }
+    sites
+}
+
+/// Every create request this crate builds, product path or test, goes
+/// through `CreateSessionRequest::new`. A literal spells out every field the
+/// constructor already fills, so a new field means editing each copy; the
+/// constructor keeps that to one place.
+#[test]
+fn cli_create_requests_use_the_constructor() {
+    assert_eq!(
+        create_literal_sites(env!("CARGO_MANIFEST_DIR")),
+        Vec::<String>::new(),
+        "build these with CreateSessionRequest::new and set the fields that differ"
+    );
 }
 
 /// Attributes every direct `Client` connection under `<crate>/src` to the
@@ -2691,32 +2756,22 @@ async fn create_box_on(
     name: &str,
 ) -> boxes::SessionId {
     use minimald_rpc::{
-        BoxConfig, ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-        Errorable, FinalizeSession, FinalizeSessionRequest,
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest, Errorable,
+        FinalizeSession, FinalizeSessionRequest,
     };
 
     let mut client = server.connect().await;
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().expect("the test cwd"))
             .expect("UTF-8");
-    let id = match client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: BoxConfig {
-                name: Some(name.to_string()),
-                project_path: paths::HostAbsPath::try_new(project_path)
-                    .expect("the test cwd as a host path"),
-                network: boxes::NetworkMode::NoNet,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: minimal_client::version_assertion(),
-        })
-        .await
-    {
+    let mut request = CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new(project_path).expect("the test cwd as a host path"),
+        boxes::NetworkMode::NoNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.must_match_version = minimal_client::version_assertion();
+    let id = match client.call::<CreateSession>(&request).await {
         Errorable::Ok(created) => created.id,
         Errorable::Err { error } => panic!("CreateSession failed: {error}"),
     };
