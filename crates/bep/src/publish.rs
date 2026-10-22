@@ -186,7 +186,9 @@ impl Identity {
     }
 
     /// Issues the root certificate under `root_key`, constrained to
-    /// `union`, and gives this identity with it beside the certificate. A
+    /// `union`, and gives this identity with it beside the certificate. The
+    /// certificate ends no later than [`Self::root_not_after`], so call
+    /// [`Self::with_root_validity`] first. A
     /// start and a root key replacement publish the identity it gives.
     ///
     /// # Errors
@@ -198,7 +200,12 @@ impl Identity {
         union: Union,
         now: std::time::SystemTime,
     ) -> Result<(Self, RootCertificate), CaError> {
-        let root = ca::issue_root(root_key, union, now)?;
+        // BEP-005: the certificate ends no later than the root key's
+        // validity, which counts from the key's creation, not from now.
+        let ends = self
+            .root_not_after
+            .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        let root = ca::issue_root_until(root_key, union, now, ends)?;
         Ok((self.with_root_certificate(root.der()), root))
     }
 

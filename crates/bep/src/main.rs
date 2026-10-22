@@ -312,6 +312,10 @@ fn root_refusal(err: CaError) -> String {
              If the keychain is locked, unlock it and run `bep` again. \
              If it stays refused, run `bep --replace-key root` to make a new root key. Boxes created before then must be re-created."
         ),
+        CaError::RootExpired(at) => format!(
+            "The proxy did not start: the root CA expired at {at}. \
+             Run `bep --replace-key root` to make a new root key. Boxes created before then must be re-created."
+        ),
         other => format!("The proxy did not start: {other}."),
     }
 }

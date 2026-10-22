@@ -348,9 +348,33 @@ pub fn issue_root<K: CaKey>(
     union: Union,
     now: SystemTime,
 ) -> Result<RootCertificate, CaError> {
+    issue_root_until(root_key, union, now, None)
+}
+
+/// Issues the root certificate as [`issue_root`] does, and ends it no later
+/// than `ends` when that is known. A start passes the root key's published
+/// validity end, so each issue under one root key keeps the end counted
+/// from the key's creation (BEP-005).
+///
+/// # Errors
+///
+/// As [`issue_root`], and [`CaError::RootExpired`] when `now` is at or past
+/// `ends`.
+pub fn issue_root_until<K: CaKey>(
+    root_key: &K,
+    union: Union,
+    now: SystemTime,
+    ends: Option<SystemTime>,
+) -> Result<RootCertificate, CaError> {
     check_key(root_key, Role::Root)?;
     let signer = Signer::new(root_key);
-    let params = root_params(&union, now)?;
+    let mut params = root_params(&union, now)?;
+    if let Some(ends) = ends.map(OffsetDateTime::from) {
+        if OffsetDateTime::from(now) >= ends {
+            return Err(CaError::RootExpired(ends));
+        }
+        params.not_after = params.not_after.min(ends);
+    }
     let der = params
         .self_signed(&signer)
         .map_err(|err| signer.error(err))?
@@ -578,7 +602,9 @@ impl<'k, K: CaKey> Ca<'k, K> {
         if union == self.union {
             return Ok(false);
         }
-        let params = root_params(&union, now)?;
+        let mut params = root_params(&union, now)?;
+        // The same root key keeps the same validity end.
+        params.not_after = params.not_after.min(self.root_expiry);
         let root = params
             .self_signed(&self.root_key)
             .map_err(|err| self.root_key.error(err))?
@@ -1100,6 +1126,34 @@ mod tests {
         let (_, validity, _) = tlv(rest);
         let (_, _, after) = tlv(validity);
         tlv(after).1.to_vec()
+    }
+
+    // BEP-005: a start issues the root under the key's validity end, which
+    // counts from the key's creation. A later start keeps the same end.
+    #[test]
+    fn root_certificate_ends_at_the_root_key_validity_end() {
+        let (root_key, signing_key) = keys();
+        let union = Union::new(&[GITHUB], [""; 0]);
+        let ends = now() + Duration::from_secs(86_400);
+        let first = issue_root_until(&root_key, union.clone(), now(), Some(ends)).unwrap();
+        let later = now() + Duration::from_secs(3_600);
+        let again = issue_root_until(&root_key, union.clone(), later, Some(ends)).unwrap();
+        assert_eq!(not_after(first.der()), not_after(again.der()));
+        let rolling = issue_root(&root_key, union.clone(), later).unwrap();
+        assert_ne!(not_after(first.der()), not_after(rolling.der()));
+
+        // The signing CA and a re-issued root keep the end.
+        let mut ca = Ca::with_root(&root_key, &signing_key, first.clone(), now()).unwrap();
+        assert_eq!(not_after(ca.signing()), not_after(first.der()));
+        let changed = Union::new(&[GITHUB], ["api.anthropic.com:443"]);
+        assert!(ca.reissue_root(changed, later).unwrap());
+        assert_eq!(not_after(ca.root()), not_after(first.der()));
+
+        // A root key past its end issues no certificate.
+        assert!(matches!(
+            issue_root_until(&root_key, union, ends, Some(ends)),
+            Err(CaError::RootExpired(_))
+        ));
     }
 
     #[test]
