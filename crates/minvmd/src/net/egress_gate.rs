@@ -5393,6 +5393,18 @@ fn gate_verdict(
     // port, a gap the in-force phase still has to close
     // (gominimal/inbox#1147).
     let box_row = src != table.subnet().daemon_ip().octets();
+    // A non-first IPv4 fragment carries no readable L4 port — `summarize`
+    // reports destination port 0 for it — so it fails the exposure match
+    // and the gate drops it, never admits it: a fragmented UDP datagram to
+    // an exposed port dies at its later fragments. Reviewer ask
+    // (CodeRabbit, PR #2331) was to associate later fragments with their
+    // admitted first fragment, or defer the port check to reassembly.
+    // Declined: the verdict path is stateless and allocation-free by
+    // design — every input comes from the one frame being judged — and
+    // fragment association would add per-flow state here (or reassembly
+    // elsewhere) to recover a packet whose failure mode is a drop, not an
+    // exposure: deny-by-default keeps the safe direction. Tracked as
+    // follow-up work with the in-force scoping (gominimal/inbox#1147).
     let transport_port = matches!(
         summary.protocol(),
         Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
