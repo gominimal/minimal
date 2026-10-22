@@ -130,6 +130,9 @@ mod tests {
     use crate::control::{self, Request};
     use crate::handle::ClientKeys;
 
+    const BOX: &str = "0190f0e0a1b2c3d4e5f60718293a4b5c";
+    const OTHER: &str = "0190f0e0a1b2c3d4e5f60718293a4b5d";
+
     fn line(request: &Request) -> String {
         serde_json::to_string(request).unwrap()
     }
@@ -147,7 +150,7 @@ mod tests {
         let boxes = Boxes::new();
         let reply = control::handle_line(
             &line(&Request::RegisterBox {
-                box_id: "b1".into(),
+                box_id: BOX.into(),
                 egress: vec!["api.github.com".into(), "GitHub.com:8443".into()],
                 stance: Stance::OwnIp,
             }),
@@ -156,19 +159,19 @@ mod tests {
         );
         assert!(reply.ok, "{reply:?}");
         assert_eq!(
-            boxes.egress("b1"),
+            boxes.egress(BOX),
             vec![
                 authority("api.github.com", 443),
                 authority("github.com", 8443)
             ]
         );
-        assert_eq!(boxes.attribution("b1"), Attribution::OwnIp("b1".into()));
-        assert!(boxes.egress("b2").is_empty());
+        assert_eq!(boxes.attribution(BOX), Attribution::OwnIp(BOX.into()));
+        assert!(boxes.egress(OTHER).is_empty());
 
         // A new registration decides the next read.
         let reply = control::handle_line(
             &line(&Request::RegisterBox {
-                box_id: "b1".into(),
+                box_id: BOX.into(),
                 egress: vec!["codeload.github.com".into()],
                 stance: Stance::HostIp,
             }),
@@ -177,16 +180,16 @@ mod tests {
         );
         assert!(reply.ok, "{reply:?}");
         assert_eq!(
-            boxes.egress("b1"),
+            boxes.egress(BOX),
             vec![authority("codeload.github.com", 443)]
         );
-        assert_eq!(boxes.attribution("b1"), Attribution::HostIpCohort);
-        assert_eq!(boxes.cohort(), vec!["b1".to_owned()]);
+        assert_eq!(boxes.attribution(BOX), Attribution::HostIpCohort);
+        assert_eq!(boxes.cohort(), vec![BOX.to_owned()]);
 
         // An authority that does not parse refuses the whole registration.
         let reply = control::handle_line(
             &line(&Request::RegisterBox {
-                box_id: "b1".into(),
+                box_id: BOX.into(),
                 egress: vec!["github.com:notaport".into()],
                 stance: Stance::OwnIp,
             }),
@@ -195,16 +198,50 @@ mod tests {
         );
         assert!(!reply.ok);
         assert_eq!(
-            boxes.egress("b1"),
+            boxes.egress(BOX),
             vec![authority("codeload.github.com", 443)]
         );
+
+        // An uppercase or hyphenated id is stored in the listener's form.
+        let reply = control::handle_line(
+            &line(&Request::RegisterBox {
+                box_id: "0190F0E0-A1B2-C3D4-E5F6-0718293A4B5D".into(),
+                egress: vec!["github.com".into()],
+                stance: Stance::OwnIp,
+            }),
+            &keys,
+            &boxes,
+        );
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(boxes.egress(OTHER), vec![authority("github.com", 443)]);
+
+        // An id that is not 32 hex digits is refused, and registers nothing.
+        for bad in [
+            "",
+            "b1",
+            "0190f0e0a1b2c3d4e5f60718293a4b5",
+            "0190f0e0a1b2c3d4e5f60718293a4b5g",
+        ] {
+            let reply = control::handle_line(
+                &line(&Request::RegisterBox {
+                    box_id: bad.into(),
+                    egress: vec!["github.com".into()],
+                    stance: Stance::OwnIp,
+                }),
+                &keys,
+                &boxes,
+            );
+            assert!(!reply.ok, "{bad:?} was registered");
+            assert!(boxes.get(bad).is_none());
+        }
     }
 
     #[test]
     fn forgotten_box_is_refused_no_live_box() {
         let keys = RwLock::new(ClientKeys::new());
         let boxes = Boxes::new();
-        boxes.register("b1", vec![authority("github.com", 443)], Stance::OwnIp);
+        boxes.register(BOX, vec![authority("github.com", 443)], Stance::OwnIp);
+        // An id that is not 32 hex digits is refused, and forgets nothing.
         let reply = control::handle_line(
             &line(&Request::ForgetBox {
                 box_id: "b1".into(),
@@ -212,15 +249,23 @@ mod tests {
             &keys,
             &boxes,
         );
+        assert!(!reply.ok);
+        assert_eq!(boxes.egress(BOX), vec![authority("github.com", 443)]);
+        // The uppercase form of the id forgets the box.
+        let reply = control::handle_line(
+            &line(&Request::ForgetBox {
+                box_id: BOX.to_ascii_uppercase(),
+            }),
+            &keys,
+            &boxes,
+        );
         assert!(reply.ok, "{reply:?}");
-        assert_eq!(boxes.attribution("b1"), Attribution::NoLiveBox);
-        assert!(boxes.egress("b1").is_empty());
+        assert_eq!(boxes.attribution(BOX), Attribution::NoLiveBox);
+        assert!(boxes.egress(BOX).is_empty());
         assert!(boxes.cohort().is_empty());
         // Forgetting a box that is not registered is not an error.
         let reply = control::handle_line(
-            &line(&Request::ForgetBox {
-                box_id: "b1".into(),
-            }),
+            &line(&Request::ForgetBox { box_id: BOX.into() }),
             &keys,
             &boxes,
         );

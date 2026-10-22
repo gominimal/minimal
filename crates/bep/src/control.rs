@@ -27,6 +27,10 @@
 //! < {"ok":true}
 //! ```
 //!
+//! A box id is 32 hex digits, or a UUID with its hyphens. The proxy stores it
+//! as 32 lowercase hex digits, the form the listener names the box by, and
+//! refuses any other text.
+//!
 //! An egress authority is `host` or `host:port`, and a `host` with no port
 //! is port 443. The registration goes into the [`Boxes`] registry that the
 //! redeemer reads at each request.
@@ -129,6 +133,21 @@ fn parse_egress(text: &str) -> Option<Authority<String>> {
     Some(authority)
 }
 
+/// The box id in the form the listener names a box by: 32 lowercase hex
+/// digits, [`crate::listener::box_id_text`]. Uppercase digits are lowered and
+/// a hyphenated UUID loses its hyphens. `None` for any other text.
+fn normalise_box_id(text: &str) -> Option<String> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    let digits: String = if bytes.len() == 36 && [8, 13, 18, 23].iter().all(|&i| bytes[i] == b'-') {
+        text.chars().filter(|&c| c != '-').collect()
+    } else {
+        text.to_owned()
+    };
+    (digits.len() == 32 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| digits.to_ascii_lowercase())
+}
+
 /// Does one request line against the client key `registry` and the box
 /// registry `boxes`.
 #[must_use]
@@ -163,9 +182,9 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> 
             egress,
             stance,
         } => {
-            if box_id.is_empty() {
-                return Reply::refused("the box id is empty");
-            }
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
             let Some(egress) = egress
                 .iter()
                 .map(|a| parse_egress(a))
@@ -177,6 +196,9 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> 
             Reply::done()
         }
         Request::ForgetBox { box_id } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
             boxes.forget(&box_id);
             Reply::done()
         }
