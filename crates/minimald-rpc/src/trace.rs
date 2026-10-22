@@ -196,8 +196,7 @@ fn lower_hex<const N: usize>(s: &[u8]) -> Option<[u8; N]> {
         return None;
     }
     let mut out = [0u8; N];
-    for (byte, pair) in out.iter_mut().zip(s.chunks_exact(2)) {
-        let &[hi, lo] = pair else { return None };
+    for (byte, &[hi, lo]) in out.iter_mut().zip(s.as_chunks::<2>().0) {
         *byte = (nibble(hi)? << 4) | nibble(lo)?;
     }
     Some(out)
