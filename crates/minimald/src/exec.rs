@@ -10,7 +10,7 @@ use std::fmt::Display;
 use std::io;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use boxes::SessionId;
@@ -23,8 +23,10 @@ use russh::{
     Channel, ChannelId,
     server::{Msg, Session},
 };
+use std::collections::VecDeque;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
+
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
@@ -61,6 +63,13 @@ use crate::{
 /// Setup errors and per-spawn errors both surface as `Err` items in the
 /// stream; the bridge handles them uniformly.
 pub trait Exec: Send + 'static {
+    /// What the bridge does with input arriving after the current command
+    /// closed its stdin: dropped for a single program, kept for the next in
+    /// a sequence (the default).
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Keep
+    }
+
     type Process: Process;
 
     /// Whether a destroy of the box ends this exec's process. True for a
@@ -824,6 +833,13 @@ impl Exec for TokioExec {
     // destroy's host teardown does not stop it.
     const ENDED_BY_BOX_DESTROY: bool = false;
 
+    /// One program (`git receive-pack`, `git upload-pack`): input it leaves
+    /// unread after closing its stdin has no other reader, as for a
+    /// session exec.
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
+
     fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
@@ -917,6 +933,12 @@ const SESSION_SHELL: &str = "/usr/bin/bash";
 
 impl Exec for BoxExec {
     type Process = TokioProcess;
+
+    /// One program: input it leaves unread after closing its stdin has no
+    /// other reader.
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
@@ -1083,37 +1105,84 @@ impl<S: Exec> ExecTask<S> {
         // indefinitely (gominimal/inbox#813).
         // An in-memory pipe: unlike pipe(2) it cannot fail (no fds to run
         // out of), and dropping the pump's half still gives the bridge EOF.
-        let (stdin_tx, mut stdin_rx) = tokio::io::duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = watch::channel(false);
+        let held = HeldInput::new(HeldInputLimits::for_daemon());
+        let mut stdin_r = HeldInputReader(Arc::clone(&held));
+        let (end_tx, end_rx) = watch::channel(None);
+        let unread = self.exec.unread_stdin();
 
         let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
             rs.wait().await.map(|msg| (msg, rs))
         }));
-        let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
+        let pump = spawn(pump_channel_input(msgs, held, end_tx));
 
         let stream = self.exec.exec(self.session.clone());
         let mngr = self.serv.sessions_manager().await;
-        let exit_status = bridge_noting_reason(
+        let (exit_status, late_start) = bridge_noting_reason(
             self.channel_id,
             stream,
-            &mut stdin_rx,
+            &mut stdin_r,
             &mut w,
             &mut e,
-            client_lost_rx,
+            end_rx.clone(),
+            unread,
             destroy_signal::<S>(|| self.session.destroy_signal()),
             || mngr.is_shutting_down(),
         )
         .await;
 
         pump.abort();
+        // Awaited to its end, so no push of the pump's is still in flight
+        // when the reader is dropped and the held input is cleared; an
+        // aborted task joins as cancelled, which is the expected outcome.
+        if let Err(err) = pump.await
+            && !err.is_cancelled()
+        {
+            tracing::warn!(error = %err, "exec: the input pump ended abnormally");
+        }
+        // The notice names the bound; a command that happened to finish on
+        // its own in the same instant still gets it, which is the rarer
+        // wrong of the two (the other being no notice for an ended exec).
+        let notice = match *end_rx.borrow() {
+            Some(ExecEnd::InputHeldOver(bound)) => Some(held_input_notice(bound)),
+            Some(ExecEnd::InputHeldUnstarted(bound)) => Some(unstarted_input_notice(bound)),
+            Some(ExecEnd::ClientLost) | None => None,
+        };
+        if let Some(notice) = notice
+            && e.write_all(notice.as_bytes()).await.is_err()
+        {
+            tracing::debug!("exec: the held-input notice was not written; the client is gone");
+        }
         let _ = w.flush().await;
         let _ = e.flush().await;
 
-        drop(stdin_rx);
+        drop(stdin_r);
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        // An exec that ended while its command was still starting has
+        // answered its client already; the command that start yields, if it
+        // ever does, is ended here rather than left running unbridged.
+        if let Some(mut late) = late_start {
+            reap_late_start(&mut late).await;
+        }
         exit_status
+    }
+}
+
+/// Ends the command a start already in flight yields, once it does: the exec
+/// it was for ended while it was starting ([`bridge_until_end`]). Takes one
+/// item only, the start that was pending, so no further command of a
+/// sequence is started. A start that never returns keeps this waiting, with
+/// the client already answered and its channel closed.
+async fn reap_late_start<S, P>(stream: &mut S)
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+{
+    if let Some(Ok(mut process)) = stream.next().await {
+        tracing::info!("exec: a command started after its exec had ended; ending it");
+        let _ = process.start_kill();
+        let _ = process.wait().await;
     }
 }
 
@@ -1166,7 +1235,9 @@ const KILLED_STATUS_MIN: u32 = 128;
 /// the race, so a command that exits on its own never sets `stopped`.
 struct StoppedOnDestroy<P> {
     inner: P,
-    destroyed: CancellationToken,
+    /// `None` for a process the destroy does not stop: `wait` is then the
+    /// inner wait, and `stopped` is never set.
+    destroyed: Option<CancellationToken>,
     stopped: Arc<AtomicBool>,
 }
 
@@ -1182,11 +1253,13 @@ impl<P: Process> Process for StoppedOnDestroy<P> {
     // Cancel-safe: the inner `wait` is, and `stopped` is set before the
     // next await point.
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        if !self.stopped.load(Ordering::SeqCst) {
+        if let Some(destroyed) = &self.destroyed
+            && !self.stopped.load(Ordering::SeqCst)
+        {
             tokio::select! {
                 biased;
                 status = self.inner.wait() => return status,
-                () = self.destroyed.cancelled() => {
+                () = destroyed.cancelled() => {
                     self.stopped.store(true, Ordering::SeqCst);
                     tracing::info!("exec: session destroy started; stopping the command");
                     if let Err(err) = self.inner.start_kill() {
@@ -1216,40 +1289,46 @@ impl<P: Process> Process for StoppedOnDestroy<P> {
 /// The sessions manager sets its shutdown state before it stops any box.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the bridge's own arguments, plus the two reasons it can name"
+    reason = "the channel's three halves, the three ways an exec ends, and the shutdown probe"
 )]
-async fn bridge_noting_reason<S, P, R, W, E>(
-    channel_id: impl Display + Clone,
+async fn bridge_noting_reason<C, S, P, R, W, E, F>(
+    channel_id: C,
     stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
-    client_lost: watch::Receiver<bool>,
+    client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
     destroyed: Option<CancellationToken>,
-    shutting_down: impl FnOnce() -> bool,
-) -> u32
+    shutting_down: F,
+) -> (
+    u32,
+    Option<impl Stream<Item = io::Result<StoppedOnDestroy<P>>> + Unpin + use<C, S, P, R, W, E, F>>,
+)
 where
+    C: Display + Clone,
+    F: FnOnce() -> bool,
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
     let stopped = Arc::new(AtomicBool::new(false));
-    let exit_status = match destroyed {
-        Some(destroyed) => {
-            let stopped = Arc::clone(&stopped);
-            let stream = stream.map(move |process| {
-                process.map(|inner| StoppedOnDestroy {
-                    inner,
-                    destroyed: destroyed.clone(),
-                    stopped: Arc::clone(&stopped),
-                })
-            });
-            bridge(channel_id, stream, r, w, e, client_lost).await
-        }
-        None => bridge(channel_id, stream, r, w, e, client_lost).await,
+    // Every process is wrapped, with or without a token, so the stream the
+    // bridge hands back for a late start has one type either way.
+    let stream = {
+        let stopped = Arc::clone(&stopped);
+        stream.map(move |process| {
+            process.map(|inner| StoppedOnDestroy {
+                inner,
+                destroyed: destroyed.clone(),
+                stopped: Arc::clone(&stopped),
+            })
+        })
     };
+    let (exit_status, late_start) =
+        bridge_until_end(channel_id, stream, r, w, e, client_lost, unread).await;
     // A shutdown stops a command only by tearing down what runs it: a
     // box exec is SIGKILLed with the container and the injection shim
     // reports `128 + signo`, and a task exec is killed through its
@@ -1264,38 +1343,512 @@ where
     if let Some(notice) = exit_notice(shutting_down, exit_status, stopped.load(Ordering::SeqCst)) {
         let _ = e.write_all(notice).await;
     }
-    exit_status
+    (exit_status, late_start)
 }
 
-/// Forwards the SSH channel's read half into the exec's stdin pipe and
-/// reports when the client is gone.
+/// How much of an exec's input the daemon holds for a command that is not
+/// reading it, before the exec is ended instead (gominimal/inbox#1089, the
+/// second half of #866; Eugeny/russh#730).
 ///
-/// `Data` is written to `stdin`. `Eof` closes `stdin` (the child sees
-/// EOF) but keeps watching the channel: `min task run` from a terminal
-/// half-closes stdin straight away, so a disconnect almost always
-/// arrives *after* EOF and must still be seen. `Close`, or the end of
-/// `msgs` (the channel's sender dropped with the connection), sets
-/// `client_lost` to `true` and returns.
-async fn pump_channel_input<M, W>(mut msgs: M, stdin: W, client_lost: watch::Sender<bool>)
-where
+/// russh grants the client's send window on receipt and gives the server
+/// no way to hold it back, so the client is never slowed down from here:
+/// what the command has not read is held in the daemon or the connection
+/// hangs. At this much the pump stops taking from the channel, which parks
+/// the connection for a bounded time: until the command starts (at most
+/// [`EXEC_INPUT_UNSTARTED`]), and then
+/// for at most [`EXEC_INPUT_STALL`] without it reading a byte, after which
+/// the exec ends with a notice on its stderr ([`held_input_notice`]), an
+/// active reject rather than a hang.
+const EXEC_INPUT_HELD_MAX: usize = 256 * 1024 * 1024;
+
+/// How long a running command may leave its held input at a bound without
+/// reading any of it before the exec ends. While the pump waits it takes
+/// nothing from the channel, so the connection is parked for at most this
+/// long per bound hit. A command that reads at least a byte within each
+/// such window releases it and is never ended; one that reads nothing for
+/// a whole window is. The window counts this exec's own reads only: another
+/// exec's release never restarts it. At the daemon bound an exec holding
+/// input of its own is the one ended; one that holds nothing waits for the
+/// others, up to [`EXEC_INPUT_STARVED`].
+const EXEC_INPUT_STALL: Duration = Duration::from_secs(10);
+
+/// How long an exec that holds no input of its own waits at the daemon bound
+/// for the execs that do. Each of those is ended within its own stall unless
+/// it reads, so the wait is normally short; but execs that each read a byte
+/// per window keep the budget full forever, and the waiting exec's channel —
+/// with the connection behind it — would be parked as long. Past this the
+/// waiting exec ends with the daemon-bound notice instead.
+const EXEC_INPUT_STARVED: Duration = Duration::from_secs(60);
+
+/// How long the pump waits at a bound for a command that has not started.
+/// A fast client puts the cap in flight before a cold box has spawned the
+/// command, and that wait normally ends with the start; this bounds it for
+/// a spawn that never returns. Past it the held input is released, the pump
+/// lets go of the channel (so the connection is no longer parked), and the
+/// exec is ended with [`ExecEnd::InputHeldUnstarted`] at once: the bridge
+/// races each start against the exec's end ([`bridge_until_end`]), and the
+/// command a late start yields is ended when it comes ([`reap_late_start`]).
+const EXEC_INPUT_UNSTARTED: Duration = Duration::from_secs(300);
+
+/// The most unread exec input this daemon holds across all its execs. The
+/// per-exec cap alone would let N stalled execs hold N times it in a guest
+/// with bounded memory; past this total the exec that would cross it ends,
+/// the same way, and the others are untouched.
+const EXEC_INPUT_HELD_DAEMON_MAX: usize = 512 * 1024 * 1024;
+
+/// Unread exec input held across this daemon's execs, in bytes.
+static EXEC_INPUT_HELD_DAEMON: AtomicUsize = AtomicUsize::new(0);
+
+/// Woken whenever any exec releases held input: a pump waiting at the
+/// daemon bound is waiting on other execs, so their releases must reach it.
+static EXEC_INPUT_PROGRESS: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Which bound an exec's held input crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldBound {
+    /// The exec's own cap ([`EXEC_INPUT_HELD_MAX`]).
+    Exec,
+    /// The daemon's total ([`EXEC_INPUT_HELD_DAEMON_MAX`]).
+    Daemon,
+}
+
+/// Why the bridge ends an exec before its command is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecEnd {
+    /// The SSH client is gone (channel close, or the sender dropped with
+    /// the connection).
+    ClientLost,
+    /// Input held for a command that was not reading it crossed a bound.
+    InputHeldOver(HeldBound),
+    /// Input reached a bound before the command started, and the command
+    /// had still not started when [`EXEC_INPUT_UNSTARTED`] ran out.
+    InputHeldUnstarted(HeldBound),
+}
+
+/// What the bridge does with input that arrives while the current command
+/// has closed its stdin: for a single program there is nobody else to read
+/// it, so it is read and dropped (it is not held against the command); for
+/// a sequence it is kept for the next command, and a command that closes
+/// its stdin and runs on while input keeps coming is bounded like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnreadStdin {
+    Discard,
+    Keep,
+}
+
+/// The bounds on input held for a command that is not reading it: one for
+/// the exec, one for the daemon as a whole (shared through `daemon_held`).
+#[derive(Clone, Copy)]
+struct HeldInputLimits {
+    per_exec: usize,
+    daemon: usize,
+    daemon_held: &'static AtomicUsize,
+    /// Woken on every release into `daemon_held`, by any exec.
+    daemon_progress: &'static tokio::sync::Notify,
+    /// The stall a running command is allowed at a bound.
+    stall: Duration,
+    /// The wait an exec holding nothing is allowed at the daemon bound.
+    starved: Duration,
+    /// The wait at a bound for a command that has not started.
+    unstarted: Duration,
+}
+
+impl HeldInputLimits {
+    fn for_daemon() -> Self {
+        Self {
+            per_exec: EXEC_INPUT_HELD_MAX,
+            daemon: EXEC_INPUT_HELD_DAEMON_MAX,
+            daemon_held: &EXEC_INPUT_HELD_DAEMON,
+            daemon_progress: &EXEC_INPUT_PROGRESS,
+            stall: EXEC_INPUT_STALL,
+            starved: EXEC_INPUT_STARVED,
+            unstarted: EXEC_INPUT_UNSTARTED,
+        }
+    }
+}
+
+/// The line an exec gets on its stderr when its command had not started by
+/// the end of the wait at a bound ([`ExecEnd::InputHeldUnstarted`]).
+fn unstarted_input_notice(bound: HeldBound) -> String {
+    let mib = |n: usize| n / (1024 * 1024);
+    let waited = EXEC_INPUT_UNSTARTED.as_secs();
+    match bound {
+        HeldBound::Exec => format!(
+            "minimald: this command had not started {waited} s after its input reached the {} MiB \
+             minimald holds for one exec, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_MAX)
+        ),
+        HeldBound::Daemon => format!(
+            "minimald: this command had not started {waited} s after unread exec input across \
+             this daemon's execs reached {} MiB, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_DAEMON_MAX)
+        ),
+    }
+}
+
+/// The line an exec whose held input crossed a bound gets on its stderr;
+/// the numbers are the caps themselves, so a retuned cap cannot leave the
+/// notice behind.
+fn held_input_notice(bound: HeldBound) -> String {
+    let mib = |n: usize| n / (1024 * 1024);
+    match bound {
+        HeldBound::Exec => format!(
+            "minimald: {} MiB of this command's input was still unread; minimald holds no more \
+             than that for one exec, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_MAX)
+        ),
+        HeldBound::Daemon => format!(
+            "minimald: unread exec input across this daemon's execs reached {} MiB and stayed \
+             there, so this exec could take no more of its input and was ended\n",
+            mib(EXEC_INPUT_HELD_DAEMON_MAX)
+        ),
+    }
+}
+
+/// Input taken off the SSH channel and not yet read by the command. The
+/// pump pushes as packets arrive; the bridge reads through
+/// [`HeldInputReader`]; every byte is charged to the exec's and the daemon's
+/// held counts from push to read (or to [`HeldInput::clear`]), so the counts
+/// are the memory this holds, in `Vec`s rather than russh's power-of-two
+/// locked buffers.
+struct HeldInput {
+    inner: std::sync::Mutex<HeldInner>,
+    waker: futures::task::AtomicWaker,
+    held: AtomicUsize,
+    limits: HeldInputLimits,
+    /// Set once nothing will read what arrives: pushes are dropped uncharged.
+    discarding: std::sync::atomic::AtomicBool,
+    /// Set once the command is running: a bound is then a stall, not a wait.
+    started: std::sync::atomic::AtomicBool,
+    /// Woken when bytes are released, the queue is cleared, or the command
+    /// starts: what a pump waiting at a bound needs to try again.
+    progress: tokio::sync::Notify,
+}
+
+struct HeldInner {
+    chunks: VecDeque<Vec<u8>>,
+    /// Bytes of the front chunk already read.
+    offset: usize,
+    /// No more pushes: the reader reports EOF once the chunks are read.
+    eof: bool,
+}
+
+impl HeldInput {
+    fn new(limits: HeldInputLimits) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(HeldInner {
+                chunks: VecDeque::new(),
+                offset: 0,
+                eof: false,
+            }),
+            waker: futures::task::AtomicWaker::new(),
+            held: AtomicUsize::new(0),
+            limits,
+            discarding: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicBool::new(false),
+            progress: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Charges and queues `data`, or refuses it (charging nothing) with the
+    /// bound it would cross. Once the rest is to be discarded it is dropped
+    /// here, uncharged.
+    fn push(&self, data: &[u8]) -> Result<(), HeldBound> {
+        let n = data.len();
+        if n == 0 || self.discarding.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let exec_total = self.held.fetch_add(n, Ordering::AcqRel) + n;
+        let daemon_total = self.limits.daemon_held.fetch_add(n, Ordering::AcqRel) + n;
+        let over = if exec_total > self.limits.per_exec {
+            Some(HeldBound::Exec)
+        } else if daemon_total > self.limits.daemon {
+            Some(HeldBound::Daemon)
+        } else {
+            None
+        };
+        if let Some(bound) = over {
+            self.release(n);
+            return Err(bound);
+        }
+        self.lock().chunks.push_back(data.to_vec());
+        self.waker.wake();
+        Ok(())
+    }
+
+    fn release(&self, n: usize) {
+        self.held.fetch_sub(n, Ordering::AcqRel);
+        self.limits.daemon_held.fetch_sub(n, Ordering::AcqRel);
+        self.progress.notify_waiters();
+        self.limits.daemon_progress.notify_waiters();
+    }
+
+    /// Bytes this exec holds unread.
+    fn held_bytes(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// The command is running: from here a bound is a stall, not a wait for
+    /// the start. The permit is stored, so a pump that reaches the bound
+    /// first is not missed.
+    fn command_started(&self) {
+        self.started.store(true, Ordering::Release);
+        self.progress.notify_one();
+    }
+
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// No more input will arrive; what is queued is still read, then EOF.
+    fn close(&self) {
+        self.lock().eof = true;
+        self.waker.wake();
+    }
+
+    /// Drops everything queued, releasing it from both counts at once, and
+    /// closes: the reader sees EOF.
+    fn clear(&self) {
+        // From here nothing is read: a push that races this (the pump is
+        // aborted, not awaited to its end) must not be charged either.
+        self.discarding.store(true, Ordering::Release);
+        let dropped = {
+            let mut g = self.lock();
+            let queued: usize = g.chunks.iter().map(Vec::len).sum();
+            let dropped = queued.saturating_sub(g.offset);
+            g.chunks.clear();
+            g.offset = 0;
+            g.eof = true;
+            dropped
+        };
+        self.release(dropped);
+        self.waker.wake();
+    }
+
+    /// Nothing will read what arrives from here on: what is queued is
+    /// dropped and released, later pushes are dropped uncharged, and the
+    /// reader sees EOF. A single program that closed its stdin is not held
+    /// to input it will never read, however fast the client sends it.
+    fn discard_rest(&self) {
+        self.discarding.store(true, Ordering::Release);
+        self.clear();
+    }
+
+    #[cfg(test)]
+    fn discarding(&self) -> bool {
+        self.discarding.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HeldInput {
+    /// Whatever this exec still counts leaves the daemon's total with it:
+    /// no path may leave the shared budget overstated.
+    fn drop(&mut self) {
+        let left = self.held.swap(0, Ordering::AcqRel);
+        if left > 0 {
+            self.limits.daemon_held.fetch_sub(left, Ordering::AcqRel);
+            self.limits.daemon_progress.notify_waiters();
+        }
+    }
+}
+
+/// Where the bridge reads a command's input from.
+trait ExecInput: AsyncRead + Unpin {
+    /// The command is running and can read from here on.
+    fn command_started(&mut self) {}
+    /// Nothing will read what arrives from here on; stop holding it.
+    fn discard_rest(&mut self) {}
+}
+
+impl ExecInput for HeldInputReader {
+    fn command_started(&mut self) {
+        self.0.command_started();
+    }
+    fn discard_rest(&mut self) {
+        self.0.discard_rest();
+    }
+}
+
+#[cfg(test)]
+impl ExecInput for tokio::io::DuplexStream {}
+
+/// The bridge's stdin: reads the held input in order, releasing each byte
+/// from the counts as it is read; EOF once the pump has closed the input
+/// (or cleared it) and the queue is empty. Dropping it clears what is left.
+struct HeldInputReader(Arc<HeldInput>);
+
+impl AsyncRead for HeldInputReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let held = &self.0;
+        let mut g = held.lock();
+        let offset = g.offset;
+        let taken = g.chunks.front().map(|front| {
+            let avail = front.get(offset..).unwrap_or_default();
+            let n = avail.len().min(buf.remaining());
+            buf.put_slice(avail.get(..n).unwrap_or_default());
+            (n, offset + n >= front.len())
+        });
+        let read = if let Some((n, done)) = taken {
+            if done {
+                g.chunks.pop_front();
+                g.offset = 0;
+            } else {
+                g.offset += n;
+            }
+            Some(n)
+        } else if g.eof {
+            Some(0)
+        } else {
+            // Registered under the lock, so a push that lands after the
+            // check cannot slip between it and the registration.
+            held.waker.register(cx.waker());
+            None
+        };
+        drop(g);
+        match read {
+            Some(n) => {
+                held.release(n);
+                std::task::Poll::Ready(Ok(()))
+            }
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for HeldInputReader {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Takes the SSH channel's read half off the channel as it arrives into
+/// `held` (the bridge reads it from there) and reports how the exec is to
+/// end, if the client goes or the held input crosses a bound.
+///
+/// The channel is read without ever waiting on the command. russh delivers
+/// each packet by awaiting a bounded per-channel queue, and a session loop
+/// parked on that queue delivers nothing to *any* channel, including this
+/// command's own output, whose draining is what lets the command read its
+/// stdin again (gominimal/inbox#1089, Eugeny/russh#730). So `Data` is
+/// queued, bounded per exec and for the daemon as a whole
+/// ([`HeldInputLimits`]): past either, the queue is cleared (its bytes
+/// released at once), the command sees EOF, and `end` carries the bound so
+/// the bridge ends the exec under that reason.
+///
+/// `Eof` closes the held input (the command sees EOF once it has read what
+/// is queued) but keeps watching the channel: `min task run` from a
+/// terminal half-closes stdin straight away, so a disconnect almost always
+/// arrives *after* EOF and must still be seen. `Close`, or the end of `msgs`
+/// (the channel's sender dropped with the connection), sends
+/// [`ExecEnd::ClientLost`] and returns.
+async fn pump_channel_input<M>(
+    mut msgs: M,
+    held: Arc<HeldInput>,
+    end: watch::Sender<Option<ExecEnd>>,
+) where
     M: Stream<Item = russh::ChannelMsg> + Unpin,
-    W: AsyncWrite + Unpin,
 {
-    let mut stdin = Some(stdin);
+    let mut open = true;
     loop {
         match msgs.next().await {
             Some(russh::ChannelMsg::Data { data }) => {
-                // A failed write means the pipe's read end is gone; drop
-                // the data but keep watching for a disconnect.
-                if let Some(w) = stdin.as_mut()
-                    && w.write_all(&data).await.is_err()
-                {
-                    stdin = None;
+                if !open {
+                    continue;
+                }
+                // At a bound the pump stops taking from the channel, which
+                // parks the connection behind russh's buffer, for a bounded
+                // time: until the command starts (a fast client puts the cap
+                // in flight before a command spawns), up to `unstarted`, and once it runs, for
+                // at most `stall` without this exec reading a byte, or, for
+                // an exec that holds nothing at the daemon bound, `starved`.
+                // The window restarts only on this exec's own reads; another
+                // exec's release wakes the pump to retry, at the daemon bound
+                // only, and leaves the window where it was.
+                let mut since = tokio::time::Instant::now();
+                let unstarted_from = since;
+                let mut starved_warned = false;
+                loop {
+                    let bound = match held.push(&data) {
+                        Ok(()) => break,
+                        Err(bound) => bound,
+                    };
+                    if !held.started() {
+                        tokio::select! {
+                            _ = held.progress.notified() => {}
+                            _ = held.limits.daemon_progress.notified() => {}
+                            () = tokio::time::sleep_until(unstarted_from + held.limits.unstarted) => {
+                                tracing::warn!(
+                                    ?bound,
+                                    waited_ms = u64::try_from(held.limits.unstarted.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "exec: the command had not started when the wait at an input bound ran out; ending the exec",
+                                );
+                                held.clear();
+                                end.send_replace(Some(ExecEnd::InputHeldUnstarted(bound)));
+                                return;
+                            }
+                        }
+                        since = tokio::time::Instant::now();
+                        continue;
+                    }
+                    let daemon_bound = matches!(bound, HeldBound::Daemon);
+                    // The daemon's budget is full of other execs' input and
+                    // this one holds nothing: it is not the one not reading,
+                    // and it waits for them, up to `starved`.
+                    let starved = daemon_bound && held.held_bytes() == 0;
+                    if starved && !starved_warned {
+                        starved_warned = true;
+                        tracing::warn!(
+                            daemon = held.limits.daemon,
+                            "exec: the daemon's input budget is held by other execs; this one waits for it",
+                        );
+                    }
+                    let allowed = if starved {
+                        held.limits.starved
+                    } else {
+                        held.limits.stall
+                    };
+                    tokio::select! {
+                        _ = held.progress.notified() => {
+                            since = tokio::time::Instant::now();
+                            continue;
+                        }
+                        _ = held.limits.daemon_progress.notified(), if daemon_bound => continue,
+                        () = tokio::time::sleep_until(since + allowed) => {}
+                    }
+                    tracing::warn!(
+                        ?bound,
+                        starved,
+                        per_exec = held.limits.per_exec,
+                        daemon = held.limits.daemon,
+                        waited_ms = u64::try_from(allowed.as_millis()).unwrap_or(u64::MAX),
+                        "exec: the command's input stayed at a bound for the whole window; ending the exec",
+                    );
+                    held.clear();
+                    end.send_replace(Some(ExecEnd::InputHeldOver(bound)));
+                    return;
                 }
             }
-            Some(russh::ChannelMsg::Eof) => stdin = None,
+            Some(russh::ChannelMsg::Eof) => {
+                open = false;
+                held.close();
+            }
             Some(russh::ChannelMsg::Close) | None => {
-                let _ = client_lost.send(true);
+                // Released at once, as the bound-over path does: nothing of
+                // a gone client's is held against the daemon's budget while
+                // its command is still being ended.
+                held.clear();
+                end.send_replace(Some(ExecEnd::ClientLost));
                 return;
             }
             Some(_) => {}
@@ -1324,25 +1877,86 @@ where
 ///
 /// Returns the SSH-encoded exit code of the last process run (or 0 if
 /// the stream was empty).
+#[cfg(test)]
 async fn bridge<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: ExecInput,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    bridge_until_end(channel_id, stream, r, w, e, client_lost, unread)
+        .await
+        .0
+}
+
+/// Resolves once the exec's end is set; never, if its sender is gone with
+/// none set. Reads with `borrow`, not `borrow_and_update`, so the end stays
+/// unseen for the `changed()` of [`bridge_one`] in the race where a command
+/// starts in the same instant.
+async fn until_ended(end: &mut watch::Receiver<Option<ExecEnd>>) {
+    loop {
+        if end.borrow().is_some() {
+            return;
+        }
+        if end.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// [`bridge`], and the stream back when the exec's end came while a command
+/// was still starting. The wait for each command's start is raced against
+/// the end ([`ExecEnd`]), so an exec whose client goes, or whose input's
+/// wait at a bound runs out ([`ExecEnd::InputHeldUnstarted`]), ends at once
+/// rather than once a spawn that may never return does. It reports exit 1,
+/// as a spawn that fails does. The start in flight lives in the stream, not
+/// in the abandoned `next()`, so the caller can finish it later and end
+/// what it yields ([`reap_late_start`]): dropping it instead could orphan a
+/// task's sandboxed child.
+async fn bridge_until_end<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     mut stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
-    mut client_lost: watch::Receiver<bool>,
-) -> u32
+    mut client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
+) -> (u32, Option<S>)
 where
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
     let mut stdin_open = true;
     let mut last_exit: u32 = 0;
     loop {
-        let process = match stream.next().await {
+        let next = tokio::select! {
+            // A command that starts in the same instant as the end is
+            // bridged, and `bridge_one` ends it at once.
+            biased;
+            next = stream.next() => next,
+            () = until_ended(&mut client_lost) => {
+                tracing::warn!(
+                    %channel_id,
+                    end = ?*client_lost.borrow(),
+                    "exec: ended while its command was starting; the start is ended when it returns",
+                );
+                return (1, Some(stream));
+            }
+        };
+        let process = match next {
             Some(Ok(p)) => p,
             None => break,
             Some(Err(err)) => {
@@ -1357,6 +1971,7 @@ where
                 break;
             }
         };
+        r.command_started();
         last_exit = bridge_one(
             channel_id.clone(),
             process,
@@ -1365,16 +1980,17 @@ where
             e,
             &mut stdin_open,
             &mut client_lost,
+            unread,
         )
         .await;
         // `changed()` fires once per transition, so a later step would
         // never see a disconnect an earlier step already consumed: a child
         // that exits 0 just as the client goes must still end the sequence.
-        if last_exit != 0 || *client_lost.borrow() {
+        if last_exit != 0 || client_lost.borrow().is_some() {
             break;
         }
     }
-    last_exit
+    (last_exit, None)
 }
 
 /// Drives one [`Process`] to completion: pumps `r → child stdin` and
@@ -1431,6 +2047,10 @@ where
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
 /// sees immediate EOF on its stdin without re-reading from `r`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel's three halves, the sequence's stdin state, and the two ways an exec ends"
+)]
 async fn bridge_one<P, R, W, E>(
     channel_id: impl Display,
     mut process: P,
@@ -1438,11 +2058,12 @@ async fn bridge_one<P, R, W, E>(
     w: &mut W,
     e: &mut E,
     stdin_open: &mut bool,
-    client_lost: &mut watch::Receiver<bool>,
+    client_lost: &mut watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
 ) -> u32
 where
     P: Process,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -1485,7 +2106,13 @@ where
             // most one chunk the child has not accepted is ever queued.
             // `select!` evaluates every gate before it builds any branch
             // future, so a gate may borrow what a future later holds.
-            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() && pending.is_none() => {
+            // With `UnreadStdin::Discard` the held input is told to drop
+            // the rest once the command's stdin is found closed (the write
+            // branch), and the read goes on only to see the EOF that gives:
+            // a single program has no other reader, and input it never
+            // reads must not be held against it.
+            read_res = r.read(&mut stdin_buf), if *stdin_open && pending.is_none()
+                && (child_stdin.is_some() || unread == UnreadStdin::Discard) => {
                 match read_res {
                     Ok(0) => {
                         *stdin_open = false;
@@ -1502,7 +2129,9 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        pending = Some((stdin_buf[..n].to_vec(), 0));
+                        if child_stdin.is_some() {
+                            pending = Some((stdin_buf.get(..n).unwrap_or_default().to_vec(), 0));
+                        }
                     }
                 }
             }
@@ -1525,6 +2154,9 @@ where
                         );
                         child_stdin = None;
                         pending = None;
+                        if unread == UnreadStdin::Discard {
+                            r.discard_rest();
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1533,6 +2165,9 @@ where
                         );
                         child_stdin = None;
                         pending = None;
+                        if unread == UnreadStdin::Discard {
+                            r.discard_rest();
+                        }
                     }
                     Ok(n) => {
                         let (data, offset) = pending.as_mut().expect("gated on a pending write");
@@ -1598,11 +2233,21 @@ where
             res = client_lost.changed(), if client_watch_open => {
                 if res.is_err() {
                     client_watch_open = false;
-                } else if *client_lost.borrow() {
-                    tracing::warn!(
-                        %channel_id,
-                        "exec: ssh client disconnected; killing child",
-                    );
+                } else if let Some(end) = *client_lost.borrow() {
+                    match end {
+                        ExecEnd::ClientLost => tracing::warn!(
+                            %channel_id,
+                            "exec: ssh client disconnected; killing child",
+                        ),
+                        ExecEnd::InputHeldOver(bound) => tracing::warn!(
+                            %channel_id, ?bound,
+                            "exec: the command's unread input crossed a bound; ending the exec",
+                        ),
+                        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
+                            %channel_id, ?bound,
+                            "exec: the command started after its wait at an input bound ran out; ending the exec",
+                        ),
+                    }
                     ssh_write_failed = true;
                 }
             }
@@ -1672,7 +2317,7 @@ where
                 status = process.wait() => status,
                 // Reduced to a bool in the branch: the `watch::Ref` it
                 // yields is not `Send` and must not live across the wait.
-                lost = async { client_lost.wait_for(|lost| *lost).await.is_ok() } => {
+                lost = async { client_lost.wait_for(|end| end.is_some()).await.is_ok() } => {
                     if lost {
                         tracing::warn!(
                             %channel_id,
