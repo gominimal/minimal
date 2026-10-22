@@ -4491,30 +4491,17 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
     let mut client = daemon.server.connect().await;
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
-    let config = minimald_rpc::BoxConfig {
-        name: Some(name.to_string()),
-        project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
-        network: boxes::NetworkMode::NoNet,
-        policy: Default::default(),
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
-
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
         CreateSessionRequest,
     };
-    let id = client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config,
-            must_match_version: None,
-        })
-        .await
-        .unwrap()
-        .id;
+    let request = CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new(project_path).unwrap(),
+        boxes::NetworkMode::NoNet,
+        Default::default(),
+    );
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
     daemon
         .server
         .seed_workspace_mfile(id, "[session.vars]\nRUST_LOG = \"info\"\n")
@@ -4567,29 +4554,12 @@ async fn create_session_with(
 ) -> SessionId {
     let mut client = daemon.server.connect().await;
 
-    let config = minimald_rpc::BoxConfig {
-        name: Some(name.to_string()),
-        project_path,
-        network,
-        policy,
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
-
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
         FinalizeSession, FinalizeSessionRequest,
     };
-    let id = match client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config,
-            must_match_version: None,
-        })
-        .await
-    {
+    let request = CreateSessionRequest::new(name, project_path, network, policy);
+    let id = match client.call::<CreateSession>(&request).await {
         minimald_rpc::Errorable::Ok(r) => r.id,
         minimald_rpc::Errorable::Err { error } => {
             panic!("CreateSession failed: {error}")
