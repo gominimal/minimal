@@ -259,6 +259,17 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a product path: the destroy-race test's own connection to
+            // the harness daemon. The destroy it drives sends no gated RPC —
+            // the race's loser just reports what the daemon said — so the
+            // harness connection carries no gate to record.
+            "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/boxes/vm_host.rs::box_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -271,28 +282,17 @@ fn every_daemon_connection_is_classified() {
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
-            // Not a product path: the destroy-race test's own connection to
-            // the harness daemon. The destroy it drives sends no gated RPC —
-            // the race's loser just reports what the daemon said — so the
-            // harness connection carries no gate to record.
-            "cmd/session.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
-            // A read-only lookup around an attach the gated `cmd_attach`
-            // already made: it reads the box's pair before, and asks whether
-            // the session is gone after, to withdraw its row or release a
-            // `host_ip` name hold, and which live session holds a name a
-            // re-hold took over; it builds nothing a skew could half-make.
-            "cmd/session.rs::session_record_by = ungated",
             // The dashboard's activation is the same multi-step mutation as
             // `cmd_session`'s, so it carries the same gate on its own create.
-            // Its two discovery probes stay open on purpose: they list a skewed
-            // VM precisely so an operator still sees its boxes (see `dash::rpc`).
+            // Its two discovery connections are gated too: the dashboard opens
+            // on the same terms `min ls` does (see `dash::rpc`).
             "dash/rpc.rs::activate = gated",
-            "dash/rpc.rs::connect_missing = ungated",
-            "dash/rpc.rs::discover = ungated",
+            "dash/rpc.rs::connect_missing = gated",
+            "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -308,8 +308,9 @@ fn every_daemon_connection_is_classified() {
 /// Every `CreateSession` this crate sends states, in the request itself,
 /// whether it asserts the daemon's build.
 ///
-/// The struct field makes omitting the decision a compile error; this
-/// makes answering it "no" a visible one. Every session-creating path
+/// The constructor leaves the assertion off, so each site sets
+/// `must_match_version` itself; this makes a site that does not set it a
+/// visible one. Every session-creating path
 /// asserts — they are the ones #1251 is about — and the inventory is what
 /// stops another from quietly passing `None`.
 #[test]
@@ -317,9 +318,12 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/session.rs::activate_session = asserts",
+            "cmd/boxes/create.rs::activate_box = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
+            // Not a create the dashboard sends: the unit tests' own-address
+            // config, which only a fake create closure receives.
+            "dash/rpc.rs::own_ip_config = asserts nothing",
             "task.rs::cmd_task_run = asserts",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
@@ -340,7 +344,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_box"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -472,16 +476,77 @@ fn source_inventory(
 /// build.
 fn create_site_inventory(manifest_dir: &str) -> Vec<String> {
     // Built by concatenation so this scanner does not match itself.
-    const NEEDLE: &str = concat!("CreateSession", "Request {");
+    const NEEDLE: &str = concat!("CreateSession", "Request::new(");
     source_inventory(
         manifest_dir,
         &[NEEDLE],
         &[
-            "must_match_version: version_assertion()",
-            "must_match_version: minimal_client::version_assertion()",
+            ".must_match_version = version_assertion()",
+            ".must_match_version = minimal_client::version_assertion()",
         ],
         ("asserts", "asserts nothing"),
     )
+}
+
+/// Every line under `<crate>/src` and `<crate>/tests` that spells a create
+/// request, or its box config, as a struct literal. A function's return
+/// type (`-> BoxConfig {`) is not a literal and does not count.
+fn create_literal_sites(manifest_dir: &str) -> Vec<String> {
+    // Built by concatenation so this scanner does not match itself.
+    const NEEDLES: [&str; 2] = [
+        concat!("CreateSession", "Request {"),
+        concat!("Box", "Config {"),
+    ];
+    let root = std::path::Path::new(manifest_dir);
+    let mut files = crate_sources(manifest_dir).1;
+    let mut stack = vec![root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut sites = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("source file must be readable");
+        let rel = path
+            .strip_prefix(root)
+            .expect("scanned under the crate")
+            .to_string_lossy()
+            .into_owned();
+        for (i, line) in text.lines().enumerate() {
+            for needle in NEEDLES {
+                let literal = line
+                    .match_indices(needle)
+                    .any(|(at, _)| !line[..at].trim_end().ends_with("->"));
+                if literal {
+                    sites.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+    }
+    sites
+}
+
+/// Every create request this crate builds, product path or test, goes
+/// through `CreateSessionRequest::new`. A literal spells out every field the
+/// constructor already fills, so a new field means editing each copy; the
+/// constructor keeps that to one place.
+#[test]
+fn cli_create_requests_use_the_constructor() {
+    assert_eq!(
+        create_literal_sites(env!("CARGO_MANIFEST_DIR")),
+        Vec::<String>::new(),
+        "build these with CreateSessionRequest::new and set the fields that differ"
+    );
 }
 
 /// Attributes every direct `Client` connection under `<crate>/src` to the
@@ -965,10 +1030,10 @@ fn display_with_home_tilde_abbreviates_only_under_home() {
 /// still distinguishable; an unnamed session falls back to the short id
 /// alone rather than the full 36-character UUID.
 #[test]
-fn session_announce_label_prefers_name_with_short_id() {
+fn box_announce_label_prefers_name_with_short_id() {
     let id = boxes::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
-    assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
-    assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
+    assert_eq!(box_announce_label(&id, Some("api")), "api (a1b2c3d4)");
+    assert_eq!(box_announce_label(&id, None), "a1b2c3d4");
 }
 
 /// A session created without `--name` gets a typable `<dir>-<hex>` handle:
@@ -1778,7 +1843,7 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 2),
+        ("src/cmd/boxes/create.rs", "activate_box", 2),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
@@ -1809,7 +1874,7 @@ fn both_creators_share_the_composition_failure_message() {
 fn daemon_refusals_print_without_rpc_names() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/boxes/create.rs", "activate_box"),
         ("src/cmd/session.rs", "cmd_rename"),
         ("src/task.rs", "cmd_task_run"),
         ("src/cmd/mod.rs", "submit_verdict_and_wait"),
@@ -1840,43 +1905,67 @@ fn daemon_refusals_print_without_rpc_names() {
     // no log-only RPC name left to exempt. The RPC names stay legitimate
     // in type paths and comments, which the scan does not read. A literal
     // is tracked across lines — the refusals are wrapped with `\` — so a
-    // continuation line with no quote of its own is still read.
-    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/box_actor.rs"))
-        .expect("readable daemon source");
-    let mut in_literal = false;
-    for (number, line) in daemon.lines().enumerate() {
-        if !in_literal && line.trim_start().starts_with("//") {
-            continue;
+    // continuation line with no quote of its own is still read. The
+    // module is `box_actor.rs` and its `box_actor/` files. `kind.rs` holds
+    // span names, not refusals, and `tests.rs` is the module's tests.
+    let actor_dir = manifest.join("../minimald/src/box_actor");
+    let mut sources = vec![manifest.join("../minimald/src/box_actor.rs")];
+    for entry in std::fs::read_dir(&actor_dir).expect("readable daemon module dir") {
+        let path = entry.expect("readable dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".rs") && name != "kind.rs" && name != "tests.rs" {
+            sources.push(path);
         }
-        let in_string = in_literal || line.contains('"');
-        // Toggle on every unescaped quote, so the state at the line's end
-        // says whether the next line continues a literal.
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => in_literal = !in_literal,
-                _ => {}
+    }
+    assert!(
+        sources.len() > 1,
+        "the daemon's session module files moved; update this scan"
+    );
+    for source in sources {
+        let shown = source
+            .strip_prefix(manifest.join(".."))
+            .unwrap_or(&source)
+            .display()
+            .to_string();
+        let daemon = std::fs::read_to_string(&source).expect("readable daemon source");
+        let mut in_literal = false;
+        for (number, line) in daemon.lines().enumerate() {
+            if !in_literal && line.trim_start().starts_with("//") {
+                continue;
             }
-        }
-        if !in_string {
-            continue;
-        }
-        for rpc in [
-            "CreateSession",
-            "ConfigureLoadout",
-            "SubmitVerdict",
-            "FinalizeSession",
-            "RenameSession",
-            "WorkspacePatchesTarZst",
-        ] {
-            assert!(
-                !line.contains(rpc),
-                "minimald/src/box_actor.rs:{}: a string names the {rpc} RPC: {line}",
-                number + 1
-            );
+            let in_string = in_literal || line.contains('"');
+            // Toggle on every unescaped quote, so the state at the line's end
+            // says whether the next line continues a literal.
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_literal = !in_literal,
+                    _ => {}
+                }
+            }
+            if !in_string {
+                continue;
+            }
+            for rpc in [
+                "CreateSession",
+                "ConfigureLoadout",
+                "SubmitVerdict",
+                "FinalizeSession",
+                "RenameSession",
+                "WorkspacePatchesTarZst",
+            ] {
+                assert!(
+                    !line.contains(rpc),
+                    "{shown}:{}: a string names the {rpc} RPC: {line}",
+                    number + 1
+                );
+            }
         }
     }
 }
@@ -2667,32 +2756,22 @@ async fn create_box_on(
     name: &str,
 ) -> boxes::SessionId {
     use minimald_rpc::{
-        BoxConfig, ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-        Errorable, FinalizeSession, FinalizeSessionRequest,
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest, Errorable,
+        FinalizeSession, FinalizeSessionRequest,
     };
 
     let mut client = server.connect().await;
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().expect("the test cwd"))
             .expect("UTF-8");
-    let id = match client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: BoxConfig {
-                name: Some(name.to_string()),
-                project_path: paths::HostAbsPath::try_new(project_path)
-                    .expect("the test cwd as a host path"),
-                network: boxes::NetworkMode::NoNet,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: minimal_client::version_assertion(),
-        })
-        .await
-    {
+    let mut request = CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new(project_path).expect("the test cwd as a host path"),
+        boxes::NetworkMode::NoNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.must_match_version = minimal_client::version_assertion();
+    let id = match client.call::<CreateSession>(&request).await {
         Errorable::Ok(created) => created.id,
         Errorable::Err { error } => panic!("CreateSession failed: {error}"),
     };
@@ -3118,50 +3197,6 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
         elapsed < std::time::Duration::from_secs(1),
         "a stopped VM's stale socket must not charge the listing its \
          connect-retry window ({elapsed:?})"
-    );
-}
-
-/// The fallback listing's control-sock gate keys on the backend the daemon
-/// connection resolves through, never on `use_minvmd()` — the same rule every
-/// other VM-backed gate keys on: the flag is how Linux asks for the VM host,
-/// while macOS reaches it with no flag at all, so a gate keyed on the flag
-/// would find no control socket for exactly the host whose every invocation
-/// is VM-backed, and the one entry `min ls` falls back to there would carry
-/// no answerer state to read.
-#[test]
-fn fallback_listing_control_sock_keys_on_provider_kind() {
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let sock = state.path().join("ssh.sock");
-    // The unflagged invocation resolves through the platform's default
-    // backend, so the expectation is that backend's — `client_provider_kind`'s
-    // own reading, whatever host this runs on: on Linux the native backend
-    // hosts no VM host daemon, while macOS has no native backend at all and
-    // every invocation is minvmd-backed, flag or no flag.
-    let unflagged = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-    assert_eq!(
-        fallback_control_sock(&unflagged, &sock).is_some(),
-        client::client_provider_kind(false) == paths::ProviderKind::Minvmd,
-        "an unflagged fallback carries a control socket exactly when the \
-         backend it resolves through is minvmd"
-    );
-    // `--provider local-minvmd` asks for the VM host whatever the platform's
-    // default backend is, so the fallback always resolves the control socket
-    // beside the daemon socket it just listed through.
-    let control = fallback_control_sock(&vm_globals(state.path(), None), &sock)
-        .expect("`--provider local-minvmd` always resolves a control socket");
-    assert_eq!(
-        control,
-        sock.parent()
-            .unwrap()
-            .join(minvmd::control::CONTROL_SOCK_FILE),
-        "the control socket sits beside the daemon socket the listing resolved"
     );
 }
 

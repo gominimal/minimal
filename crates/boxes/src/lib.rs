@@ -325,25 +325,28 @@ impl IngressPolicy {
 /// traffic is steered through — is this box's infrastructure, reached at the
 /// proxy's own address on the switch whatever the box's egress rules say.
 ///
-/// The declaration carries no fields of its own yet, and that is the point:
-/// the steering table and the credential grants that derive a box's
-/// credentialed upstream set are the Box Egress Proxy document's field
-/// schema, and this is the minimum of it the networking requirement binds
-/// here — the fact itself, which is all the host-side row needs to hold the
-/// box's lane open to the proxy's address. A policy that carries `Some`
-/// declaration puts its box on a credentialed lane; one that carries `None`
-/// declares nothing, and its box's frames to the proxy's address are refused
-/// under the box-to-host default-deny, never decided by its egress rules.
-/// When the proxy document lands it extends this declaration, and the row
-/// the fact fills is already waiting for it.
+/// The declaration carries the Box Egress Proxy settings: the
+/// `[network.bep]` table and the `[secrets]` grants
+/// ([`core::bep`]). Both default to empty and are skipped when empty, so a
+/// declaration with no settings serializes as `{}`, exactly as it did before
+/// the settings existed, and an old `{}` reads as no settings. A policy that
+/// carries `Some` declaration puts its box on a credentialed lane; one that
+/// carries `None` declares nothing, and its box's frames to the proxy's
+/// address are refused under the box-to-host default-deny, never decided by
+/// its egress rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-// An empty table today, so an unknown field would be one the proxy document
-// has not bound here yet — refused like every other field the policy schemas
-// do not know (the same `deny_unknown_fields` [`BoxPolicy`] carries),
-// rather than silently ignored into a shape no reader can tell from the
-// minimum.
+// An unknown field is one the proxy document has not bound here — refused
+// like every other field the policy schemas do not know (the same
+// `deny_unknown_fields` [`BoxPolicy`] carries), rather than silently ignored.
 #[serde(deny_unknown_fields)]
-pub struct CredentialedUpstream {}
+pub struct CredentialedUpstream {
+    /// The `[network.bep]` settings: steering, `proxy_env` and `no_proxy`.
+    #[serde(default, skip_serializing_if = "core::bep::BepSettings::is_empty")]
+    pub bep: core::bep::BepSettings,
+    /// The `[secrets]` grants, by the environment variable each lands in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: core::bep::SecretGrants,
+}
 
 impl CredentialedUpstream {
     /// Whether a declared lane takes effect in a box of this network mode:
@@ -1537,8 +1540,15 @@ mod tests {
         .expect("a policy carrying the declaration must parse");
         assert_eq!(
             declared.credentialed_upstream,
-            Some(CredentialedUpstream {}),
+            Some(CredentialedUpstream::default()),
             "the declaration is carried on the policy, not swallowed"
+        );
+        // An empty declaration still serializes as `{}`: the settings are
+        // skipped when empty, so it reads as it did before they existed.
+        assert!(
+            serde_json_lenient::to_string(&declared)
+                .unwrap()
+                .contains(r#""credentialed_upstream":{}"#)
         );
         // And it round-trips with the policy that carries it, so the host
         // the registration reaches reads the same lane the client declared.
@@ -1563,15 +1573,14 @@ mod tests {
              the field existed, got: {json}"
         );
 
-        // The minimum holds no fields of its own: a steering setting the
-        // proxy document will bind is refused until that document lands,
-        // never silently dropped from a declaration that cannot carry it.
+        // The settings live under `bep` and `secrets`: a field outside them
+        // is refused, never silently dropped.
         assert!(
             serde_json_lenient::from_str::<BoxPolicy>(
                 r#"{"egress":null,"ingress":null,"credentialed_upstream":{"steering":"dns"}}"#
             )
             .is_err(),
-            "a field the minimum does not hold is refused, not ignored"
+            "a field the declaration does not hold is refused, not ignored"
         );
     }
 

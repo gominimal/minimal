@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::{SessionRpc, session_rpc_failed};
 use anyhow::Context as _;
 use boxes::{BoxPolicy, EffectiveBoxPolicy, NetworkMode, SessionId};
 use minimal_client::Client;
@@ -138,34 +139,41 @@ fn push_candidate(candidates: &mut Vec<(String, PathBuf)>, label: String, sock: 
 /// Probe both known socket paths and connect to each reachable daemon.
 /// Sockets that don't exist are skipped without a connect attempt, so
 /// discovery never pays the connect-retry delay for a down provider.
-pub async fn discover(minimal_dir: Option<&Path>) -> Vec<Provider> {
+///
+/// Each connection is version-gated like `min ls`'s: the dashboard's create
+/// path (`activate`) is a multi-step mutation, and opening on a skewed pair
+/// is refused before the TUI takes over the terminal. The override var
+/// downgrades each refusal to a warning, as everywhere else.
+pub async fn discover(minimal_dir: Option<&Path>) -> Result<Vec<Provider>, anyhow::Error> {
     let mut providers = Vec::new();
     for (label, sock) in probe_candidates(minimal_dir) {
         if !sock.exists() {
             continue;
         }
-        // Deliberately not version-gated: the dashboard is read-only until the
-        // user acts, it renders each provider's version in the sidebar, and a
-        // skewed daemon is precisely when an operator needs to see (and be able
-        // to destroy) the sessions on it. The one multi-step mutation the TUI
-        // drives, `activate`, gates on its own connection instead.
-        match Client::connect(&sock).await {
-            Ok(client) => providers.push(Provider {
+        let mut client = match Client::connect(&sock).await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(provider = label, error = %e, "socket present but daemon unreachable");
+                continue;
+            }
+        };
+        match minimal_client::ensure_version_match(&mut client).await {
+            Ok(()) => providers.push(Provider {
                 label,
                 sock,
                 client,
             }),
-            Err(e) => {
-                tracing::warn!(provider = label, error = %e, "socket present but daemon unreachable");
-            }
+            Err(e) => return Err(e.context(format!("provider {label}"))),
         }
     }
-    providers
+    Ok(providers)
 }
 
 /// Connect to any canonical provider not already served, so a daemon that
 /// (re)appears mid-run joins the dashboard. Each attempt is bounded by
-/// [`CONNECT_TIMEOUT`] so a wedged acceptor can't stall the UI loop.
+/// [`CONNECT_TIMEOUT`] so a wedged acceptor can't stall the UI loop. A
+/// provider whose build is skewed is skipped with a warning rather than
+/// joined, but never fails the loop for the providers already listed.
 pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<&Path>) {
     for (label, sock) in probe_candidates(minimal_dir) {
         if providers.iter().any(|p| p.label == label || p.sock == sock) {
@@ -174,24 +182,31 @@ pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<
         if !sock.exists() {
             continue;
         }
-        // Deliberately not version-gated, for the same reason as `discover`:
-        // a provider that reappears mid-run must still be listable.
-        match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(&sock)).await {
-            Ok(Ok(client)) => {
-                tracing::info!(provider = label, "provider connected");
-                providers.push(Provider {
-                    label,
-                    sock,
-                    client,
-                });
-            }
+        let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(&sock)).await {
+            Ok(Ok(client)) => client,
             Ok(Err(e)) => {
                 tracing::debug!(provider = label, error = %e, "provider reconnect failed");
+                continue;
             }
             Err(_) => {
                 tracing::debug!(provider = label, "provider reconnect timed out");
+                continue;
             }
+        };
+        // Version-gated like `discover`, but a skewed provider that appears
+        // mid-run must not kill the dashboard the other providers are still
+        // serving, so the refusal skips it — the warning it logged is the
+        // operator's cue to `min stop --force` and reopen.
+        if let Err(e) = minimal_client::ensure_version_match(&mut client).await {
+            tracing::warn!(provider = label, error = %e, "provider build is skewed");
+            continue;
         }
+        tracing::info!(provider = label, "provider connected");
+        providers.push(Provider {
+            label,
+            sock,
+            client,
+        });
     }
 }
 
@@ -486,37 +501,40 @@ pub async fn activate(
     // the reply echoes back — not a `GetVersion` ahead of them. Activation is
     // the one path where an extra round trip is felt, and the create can carry
     // the check for free.
-    let config = BoxConfig {
-        name,
-        project_path: project_path.clone(),
+    let mut request = CreateSessionRequest::new(
+        String::new(),
+        project_path.clone(),
         network,
-        policy: BoxPolicy::default(),
-        // An own-address box on a VM-backed host is handed its addresses by
-        // the registration [`create_registering`] makes first.
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        // Same default as an activate with no flags: the dashboard
-        // has no `--no-hooks` of its own, and a session created here
-        // is attachable later like any other.
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
-    let undeclared_own_ip = config.network == NetworkMode::OwnIp && config.policy.egress.is_none();
-    let (created, mut row) = create_registering(sock, config, &mut client, |client, config| {
-        Box::pin(async move {
-            client
-                .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                    config,
-                    // A daemon of another build refuses this before it
-                    // allocates anything; `None` under the skew override,
-                    // which is how an operator still gets through.
-                    must_match_version: minimal_client::version_assertion(),
-                })
-                .await
-                .context("CreateSession RPC failed")
-        })
-    })
+        BoxPolicy::default(),
+    );
+    // The form can leave the box unnamed. [`create_registering`] names it
+    // when it registers, and otherwise the daemon does. An own-address box on
+    // a VM-backed host is handed its addresses by that registration. Hooks
+    // stay on, the same default as an activate with no flags: the dashboard
+    // has no `--no-hooks` of its own, and a session created here is
+    // attachable later like any other.
+    request.config.name = name;
+    // A daemon of another build refuses this before it allocates anything;
+    // `None` under the skew override, which is how an operator still gets
+    // through.
+    request.must_match_version = minimal_client::version_assertion();
+    let undeclared_own_ip =
+        request.config.network == NetworkMode::OwnIp && request.config.policy.egress.is_none();
+    let (created, mut row) = create_registering(
+        sock,
+        request.config.clone(),
+        &mut client,
+        |client, config| {
+            let mut request = request.clone();
+            request.config = config;
+            Box::pin(async move {
+                client
+                    .oneshot_rpc::<CreateSession>(request)
+                    .await
+                    .map_err(|error| session_rpc_failed(SessionRpc::CreateSession, error))
+            })
+        },
+    )
     .await?;
     // A daemon that predates the field ignored the assertion and echoes no
     // version; that silence is itself the skew. Refuse now — before the
@@ -577,7 +595,7 @@ pub async fn activate(
                 contribution,
             })
             .await
-            .context("ConfigureLoadout RPC failed")?;
+            .map_err(|error| session_rpc_failed(SessionRpc::ConfigureLoadout, error))?;
         match configured {
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized) => {}
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {
@@ -925,20 +943,18 @@ mod tests {
 
     /// The dashboard's create config for an own-address box in `dir`.
     fn own_ip_config(dir: &Path, name: Option<&str>) -> BoxConfig {
-        BoxConfig {
-            name: name.map(str::to_string),
-            project_path: paths::HostAbsPath::try_new(
+        let mut config = CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new(
                 camino::Utf8PathBuf::from_path_buf(dir.join("web-app")).unwrap(),
             )
             .unwrap(),
-            network: NetworkMode::OwnIp,
-            policy: BoxPolicy::default(),
-            task_addresses: Vec::new(),
-            box_id: None,
-            box_addresses: None,
-            hooks_enabled: true,
-            attrs: Default::default(),
-        }
+            NetworkMode::OwnIp,
+            BoxPolicy::default(),
+        )
+        .config;
+        config.name = name.map(str::to_string);
+        config
     }
 
     fn created() -> minimald_rpc::CreateSessionResponse {
@@ -1482,21 +1498,21 @@ mod tests {
 #[cfg(test)]
 mod version_gate_tests {
     /// The dashboard opens three daemon connections, and #1251's gate reached
-    /// none of them. Only `activate` runs a multi-step mutation, so only it is
-    /// gated; the two discovery connections stay open on purpose and must say
-    /// so, since a reader who finds an ungated connect has no other way to tell
-    /// an audited decision from an oversight.
+    /// none of them. `activate` and the two discovery connections are all
+    /// gated now — the dashboard opens on the same terms `min ls` does, and a
+    /// provider that reappears mid-run with a skewed build joins only under
+    /// the override.
     ///
     /// Asserted as an inventory rather than a count, so adding, removing, or
     /// reclassifying a connection fails here and forces the same judgement.
     #[test]
-    fn only_the_activation_path_is_version_gated() {
+    fn every_dashboard_connection_is_version_gated() {
         assert_eq!(
             connect_site_inventory(),
             [
                 "activate = gated",
-                "connect_missing = ungated (explained)",
-                "discover = ungated (explained)",
+                "connect_missing = gated",
+                "discover = gated",
             ]
         );
     }

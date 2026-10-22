@@ -3282,20 +3282,12 @@ async fn own_ip_default_deny_all() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some("own-ip-bare".to_string()),
-                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-                network: boxes::NetworkMode::OwnIp,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: None,
-        })
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "own-ip-bare",
+            paths::HostAbsPath::try_new("/uwu").unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        ))
         .await
         .unwrap();
     let logged = capture.contents();
@@ -3331,31 +3323,23 @@ async fn own_ip_default_deny_all() {
 /// An own-address session's config: a box that declares one published port —
 /// the ingress a publish is made of (NET-010) — under the session `name`.
 fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
-    minimald_rpc::CreateSessionRequest {
-        config: minimald_rpc::BoxConfig {
-            name: Some(name.to_string()),
-            project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-            network: boxes::NetworkMode::OwnIp,
-            policy: boxes::BoxPolicy {
-                egress: None,
-                ingress: Some(boxes::IngressPolicy {
-                    port_mappings: vec![boxes::PortMapping {
-                        external_port: 18080,
-                        internal_port: 80,
-                        proto: boxes::IpProto::Tcp,
-                    }],
-                    ..Default::default()
-                }),
-                credentialed_upstream: None,
-            },
-            task_addresses: Vec::new(),
-            box_id: None,
-            box_addresses: None,
-            hooks_enabled: true,
-            attrs: Default::default(),
+    minimald_rpc::CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new("/uwu").unwrap(),
+        boxes::NetworkMode::OwnIp,
+        boxes::BoxPolicy {
+            egress: None,
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: boxes::IpProto::Tcp,
+                }],
+                ..Default::default()
+            }),
+            credentialed_upstream: None,
         },
-        must_match_version: None,
-    }
+    )
 }
 
 /// The same request with the hand a real creator sends: the registration's
@@ -7241,21 +7225,21 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
 
     // Present, name not yet registered (a first finalize): the hand.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         Some(hand)
     );
     // Absent: the hand is not vouched for, so the interim stands.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
         None
     );
     // Only an interim publish with a hand behind it moves.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
         None
     );
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
         None
     );
 
@@ -7264,7 +7248,7 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
     reg.register_own_ip(me, "promo", BTreeSet::new());
     assert!(reg.name_held_by(me, "promo"));
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         Some(hand)
     );
 
@@ -7280,7 +7264,7 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
     reg.register_own_ip(other, "promo", BTreeSet::new());
     assert!(reg.name_held_by(other, "promo"));
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         None
     );
 }
@@ -7837,20 +7821,12 @@ async fn create_logs_dynamic_ingress() {
         .await
         .unwrap();
     client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some("dyn-bare-logged".to_string()),
-                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-                network: boxes::NetworkMode::OwnIp,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: None,
-        })
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "dyn-bare-logged",
+            paths::HostAbsPath::try_new("/uwu").unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        ))
         .await
         .unwrap();
 

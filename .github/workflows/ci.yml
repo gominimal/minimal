@@ -119,7 +119,7 @@ jobs:
         timeout-minutes: 30
         steps:
             - name: Free Disk Space
-              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+              uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -221,7 +221,7 @@ jobs:
               with:
                   persist-credentials: false
             - name: Install zizmor
-              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+              uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
               with:
                   tool: zizmor@1.30.1
             - name: actionlint (workflow lint)
