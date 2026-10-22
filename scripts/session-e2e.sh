@@ -11516,7 +11516,10 @@ proof_bep_second_box_needs_no_sign_in() {
     return 0
   fi
   if [ ! -S "$bep_control" ]; then
-    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy is not running: no $bep_control"
+    # Nothing starts 'bep serve' on any lane until T18
+    # (https://github.com/gominimal/minimal/issues/2275) runs the proxy beside
+    # gvproxy.
+    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy is not running: no $bep_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
     echo "::endgroup::"
     return 0
   fi
