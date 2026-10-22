@@ -41,7 +41,7 @@ impl BoxMessage {
             #[cfg(test)]
             Self::PeekPendingAsks(_) => "PeekPendingAsks",
             #[cfg(test)]
-            Self::Park(_) => "Park",
+            Self::Park(..) => "Park",
             #[cfg(test)]
             Self::PeekComposition { .. } => "PeekComposition",
             #[cfg(test)]

@@ -246,9 +246,11 @@ enum BoxMessage {
     /// was merely created isn't busy — nothing is in flight to strand.
     IsBusy(oneshot::Sender<bool>),
     /// Test-only: park the actor for the duration, holding its mailbox the
-    /// way a long inline message does.
+    /// way a long inline message does. The sender is answered as the park
+    /// begins, so a test knows every earlier message, and the publish that
+    /// follows it, is done.
     #[cfg(test)]
-    Park(std::time::Duration),
+    Park(std::time::Duration, oneshot::Sender<()>),
     /// Shutdown-stop: kill the host (if any), withdraw the hostname, and stop
     /// the actor — the on-disk record is kept.
     Stop(oneshot::Sender<()>),
@@ -1040,7 +1042,12 @@ impl BoxActor {
                 let _ = r.send(self.rename(new_name).await);
             }
             #[cfg(test)]
-            BoxMessage::Park(d) => {
+            BoxMessage::Park(d, entered) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the parker may already be gone; the park still runs"
+                )]
+                let _ = entered.send(());
                 tokio::time::sleep(d).await;
             }
             BoxMessage::IsBusy(r) => {

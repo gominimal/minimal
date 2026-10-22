@@ -873,9 +873,9 @@ async fn a_listing_does_not_wait_on_a_parked_actor() {
         .unwrap()
         .expect("session should resolve");
 
+    // Returns once the actor is inside the park: every earlier message, and
+    // its post-message publish, is done.
     handle.park_for(std::time::Duration::from_secs(3)).await;
-    // Let the actor take the park before measuring.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let started = std::time::Instant::now();
     let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
         .await
@@ -905,8 +905,8 @@ async fn a_parked_actors_live_host_is_still_listed() {
         .expect("session should resolve");
 
     handle.park_for(std::time::Duration::from_secs(3)).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // Published while the actor is parked, as a host it had before would be.
+    // Published while the actor is parked (park_for returns once it is), as
+    // a host it had before would be: nothing overwrites it until the park ends.
     handle.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
     let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
         .await

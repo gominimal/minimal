@@ -261,13 +261,19 @@ impl BoxHandle {
 
     /// Test-only: parks the actor for `d`, the shape of a message that holds
     /// its mailbox (a clone inside `ConfigureLoadout`, an inline attach).
+    /// Returns once the actor is inside the park, so every earlier message
+    /// and the slot publish after it are done.
     #[cfg(test)]
     pub(crate) async fn park_for(&self, d: std::time::Duration) {
+        let (entered, entered_recv) = oneshot::channel();
         #[expect(
             clippy::let_underscore_must_use,
-            reason = "a gone actor cannot be parked, and the test's assertion says so"
+            reason = "a gone actor cannot be parked, and the recv below says so"
         )]
-        let _ = self.0.send(BoxMessage::Park(d)).await;
+        let _ = self.0.send(BoxMessage::Park(d, entered)).await;
+        entered_recv
+            .await
+            .expect("the session actor should enter the park");
     }
 
     /// Returns the workspace's at-risk report (what a destroy would lose),
