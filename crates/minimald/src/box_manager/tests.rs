@@ -1553,6 +1553,24 @@ async fn sealed_deliveries_ride_the_record_to_the_host_params() {
     assert_eq!(record.sealed_deliveries, deliveries);
     assert_eq!(crate::box_runtime::launch_deliveries(&record), deliveries);
 
+    // The `GetSessionRecord` reply for the grant box carries no sealed
+    // value, on the wire or in the record, while the store keeps them.
+    let reply = crate::rpc::session_record_response(Some(record.clone()));
+    let replied = reply.record.as_ref().expect("the reply carries the record");
+    assert!(replied.sealed_deliveries.is_empty(), "{replied:?}");
+    assert_eq!(replied.id, record.id);
+    let wire = serde_json_lenient::to_string(&reply).unwrap();
+    assert!(
+        !wire.contains("v1.sealed-one") && !wire.contains("sealed_deliveries"),
+        "{wire}"
+    );
+    let stored = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the store still has the record");
+    assert_eq!(stored.sealed_deliveries, deliveries);
+
     // A box with no grant carries none.
     let id = mngr
         .create_session(
