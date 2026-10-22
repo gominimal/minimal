@@ -1083,8 +1083,15 @@ impl BoxManager {
         {
             return Ok(None);
         }
-        // Not running, start it!
-        let h = BoxActor::run(self.session_config(handle)).await?;
+        // Not running, start it! The find above is an await, so a teardown
+        // can delete the record and leave the tearing-down set before the
+        // check that follows it; the actor then fails to read a record that
+        // is gone, and that is "no such session" to the caller, not an error.
+        let h = match BoxActor::run(self.session_config(handle)).await {
+            Ok(h) => h,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
         self.running.insert(session_id, h.clone());
         Ok(Some(h))
     }
