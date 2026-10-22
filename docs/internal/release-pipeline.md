@@ -160,19 +160,25 @@ Bring the fixes that landed on `release/X.Y.Z` back to `main`. `main` moves
 while a release is out, so a port that waits costs more than one that does
 not.
 
-The promotion created the tag on GitHub, so fetch it first. `--force`
-replaces a stale local tag of the same name. If the release commit is
+In this step, `release/X.Y.Z` is the branch from step 2. A hotfix keeps
+the branch of the release that it fixes: 0.7.1 went out from
+`release/0.7.0`, so its port reads `release/0.7.0`. Compare the branch, not
+the tag. A fix can land on the branch after the tag, and the tag does not
+contain it.
+
+The promotion created the tag on GitHub, so fetch it with the branch.
+`--force` replaces a stale local tag of the same name. If the branch is
 already on `main`, there is nothing to port:
 
 ```sh
-git fetch --force origin main tag vX.Y.Z
-git merge-base --is-ancestor vX.Y.Z origin/main && echo "already on main"
+git fetch --force origin main release/X.Y.Z tag vX.Y.Z
+git merge-base --is-ancestor origin/release/X.Y.Z origin/main && echo "already on main"
 ```
 
 List the branch commits that have no identical patch on `main`:
 
 ```sh
-git cherry -v origin/main vX.Y.Z | grep '^+'
+git cherry -v origin/main origin/release/X.Y.Z | grep '^+'
 ```
 
 The list holds the version bumps, and also each cherry-pick whose conflicts
