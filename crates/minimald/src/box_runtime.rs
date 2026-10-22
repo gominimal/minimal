@@ -327,6 +327,85 @@ pub(crate) fn place_sealed_deliveries(
     }
 }
 
+/// The `NO_PROXY` entries every box whose environment points at the proxy
+/// carries (BEP-012), ahead of the box's own `[network.bep] no_proxy`
+/// entries: the local zone and loopback, so in-box and peer traffic never
+/// goes through the proxy.
+const NO_PROXY_DEFAULTS: [&str; 4] = [
+    ".min.internal",
+    "host.min.internal",
+    "localhost",
+    "127.0.0.1",
+];
+
+/// The proxy variables a launch of the box sets (BEP-012), in a fixed order:
+/// `HTTPS_PROXY` and `HTTP_PROXY` at the Box Egress Proxy's listener on
+/// `subnet`, `NO_PROXY`, and `NODE_USE_ENV_PROXY=1`, which Node's built-in
+/// `fetch` needs before it reads the other three.
+///
+/// Empty unless the box's steering is `proxy_env` or `both`, or its
+/// `[network.bep] proxy_env` is true. Also empty when the box declares no
+/// credentialed upstream, or its network mode puts the lane out of effect:
+/// such a box cannot reach the proxy's address, so the variables would send
+/// all of its HTTP traffic to an address that drops it.
+pub(crate) fn launch_proxy_env(
+    record: &boxes::Record,
+    subnet: switch::SwitchSubnet,
+) -> Vec<(String, String)> {
+    use boxes::core::bep::Steering;
+    let Some(upstream) = record.policy.credentialed_upstream.as_ref() else {
+        return Vec::new();
+    };
+    let bep = &upstream.bep;
+    let steered =
+        matches!(bep.resolved_steering(), Steering::ProxyEnv | Steering::Both) || bep.proxy_env;
+    if !steered || !boxes::CredentialedUpstream::in_effect(record.network) {
+        return Vec::new();
+    }
+    let proxy = format!(
+        "http://{}:{}",
+        subnet.box_egress_proxy_address(),
+        boxes::core::egress::PROXY_LISTENER_PORT
+    );
+    let no_proxy = NO_PROXY_DEFAULTS
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .chain(bep.no_proxy.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        ("HTTPS_PROXY".to_string(), proxy.clone()),
+        ("HTTP_PROXY".to_string(), proxy),
+        ("NO_PROXY".to_string(), no_proxy),
+        ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
+    ]
+}
+
+/// Places the proxy variables (BEP-012) in a launch's connection layer, over
+/// any value the layer held there, so the shell's launch environment and
+/// everything the host runs in the box carry them. Call it before
+/// [`place_launch_deliveries`], which keeps the layer it reads. Logs one
+/// debug line for the box, naming the variables set.
+pub(crate) fn place_launch_proxy_env(
+    attach_env: &mut AttachEnv,
+    session_id: boxes::SessionId,
+    vars: &[(String, String)],
+) {
+    if vars.is_empty() {
+        return;
+    }
+    for (name, value) in vars {
+        attach_env.connection.retain(|(k, _)| k != name);
+        attach_env.connection.push((name.clone(), value.clone()));
+    }
+    let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
+    tracing::debug!(
+        session_id = %session_id,
+        variables = %names.join(","),
+        "set the proxy variables in the box environment"
+    );
+}
+
 /// The host's half of the name lifecycle (NET-128): the registry and the
 /// stable session id, so the host can mark its box's name running when it
 /// starts and stopped when it exits. Held by [`HostParams`] and copied into
@@ -1623,3 +1702,143 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
 
 #[cfg(test)]
 mod tests;
+
+// BEP-012: which boxes get the proxy variables, and what each one holds.
+#[cfg(test)]
+mod proxy_env_tests {
+    use super::*;
+    use boxes::core::bep::{BepSettings, Steering};
+
+    fn record(network: NetworkMode, bep: Option<BepSettings>) -> boxes::Record {
+        boxes::Record {
+            id: boxes::SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network,
+            policy: boxes::BoxPolicy {
+                credentialed_upstream: bep.map(|bep| boxes::CredentialedUpstream {
+                    bep,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: boxes::BoxState::default(),
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: None,
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            sealed_deliveries: Vec::new(),
+            attrs: BTreeMap::new(),
+        }
+    }
+
+    fn steering(steering: Steering) -> BepSettings {
+        BepSettings {
+            steering: Some(steering),
+            ..BepSettings::default()
+        }
+    }
+
+    fn get<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        vars.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn proxy_env_and_no_proxy_are_set() {
+        let bep = BepSettings {
+            no_proxy: vec!["example.internal".to_string(), "10.0.0.0/8".to_string()],
+            ..steering(Steering::ProxyEnv)
+        };
+        let vars = launch_proxy_env(
+            &record(NetworkMode::OwnIp, Some(bep)),
+            switch::DEFAULT_SUBNET,
+        );
+        assert_eq!(
+            get(&vars, "HTTPS_PROXY"),
+            Some("http://100.64.255.252:8118")
+        );
+        assert_eq!(get(&vars, "HTTP_PROXY"), Some("http://100.64.255.252:8118"));
+        assert_eq!(
+            get(&vars, "NO_PROXY"),
+            Some(".min.internal,host.min.internal,localhost,127.0.0.1,example.internal,10.0.0.0/8")
+        );
+        assert_eq!(get(&vars, "NODE_USE_ENV_PROXY"), Some("1"));
+        assert_eq!(vars.len(), 4, "{vars:?}");
+    }
+
+    #[test]
+    fn proxy_env_follows_steering_and_the_proxy_env_setting() {
+        for bep in [
+            steering(Steering::ProxyEnv),
+            steering(Steering::Both),
+            BepSettings {
+                proxy_env: true,
+                ..steering(Steering::Dns)
+            },
+        ] {
+            let vars = launch_proxy_env(
+                &record(NetworkMode::OwnIp, Some(bep.clone())),
+                switch::DEFAULT_SUBNET,
+            );
+            assert_eq!(get(&vars, "NODE_USE_ENV_PROXY"), Some("1"), "{bep:?}");
+        }
+        for bep in [
+            BepSettings::default(),
+            steering(Steering::Dns),
+            steering(Steering::Off),
+        ] {
+            let vars = launch_proxy_env(
+                &record(NetworkMode::OwnIp, Some(bep.clone())),
+                switch::DEFAULT_SUBNET,
+            );
+            assert!(vars.is_empty(), "{bep:?}: {vars:?}");
+        }
+        // No credentialed upstream, or a network mode with no lane.
+        assert!(
+            launch_proxy_env(&record(NetworkMode::OwnIp, None), switch::DEFAULT_SUBNET).is_empty()
+        );
+        assert!(
+            launch_proxy_env(
+                &record(NetworkMode::HostNet, Some(steering(Steering::ProxyEnv))),
+                switch::DEFAULT_SUBNET,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn proxy_env_reaches_the_connection_layer_over_an_old_value() {
+        let mut attach_env = AttachEnv {
+            inherited: vec![],
+            connection: vec![
+                ("TERM".to_string(), "xterm-256color".to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://elsewhere:3128".to_string(),
+                ),
+            ],
+        };
+        let vars = launch_proxy_env(
+            &record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv))),
+            switch::DEFAULT_SUBNET,
+        );
+        place_launch_proxy_env(&mut attach_env, boxes::SessionId::nil(), &vars);
+        let kept = place_launch_deliveries(&mut attach_env, boxes::SessionId::nil(), &[]);
+        assert_eq!(
+            kept.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://100.64.255.252:8118")
+        );
+        assert_eq!(
+            kept.get("NODE_USE_ENV_PROXY").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(kept.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(kept.len(), 5, "{kept:?}");
+    }
+}
