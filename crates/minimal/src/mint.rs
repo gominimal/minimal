@@ -150,6 +150,11 @@ impl std::error::Error for MintError {}
 
 /// The client's handle-signing key, made for one creation and held in
 /// memory only.
+///
+/// Interim: a new key for each creation. The flip is T27
+/// (https://github.com/gominimal/minimal/issues/2288), which keeps the
+/// client's one local key and registers it with the proxy at first use and
+/// across proxy restarts.
 pub struct ClientKey(SigningKey);
 
 impl fmt::Debug for ClientKey {
@@ -264,6 +269,23 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Tells the proxy to forget the box `box_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the request.
+    pub fn forget_box(&mut self, box_id: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::ForgetBox {
+                box_id: box_id.to_owned(),
+            },
+            "the box's removal",
+        )?;
+        tracing::debug!(box_id, "withdrew the box's declared egress from the proxy");
+        Ok(())
+    }
+
     /// Registers the box `box_id` with its declared egress and its address
     /// stance.
     ///
@@ -364,7 +386,8 @@ pub struct Minted {
     /// The grant: the environment variable the value is for.
     pub grant: String,
     /// The sealed value. Interim: nothing delivers it into the box until
-    /// BEP-007 places it in the grant's environment variable.
+    /// BEP-007 places it in the grant's environment variable. The flip is
+    /// T42 (https://github.com/gominimal/minimal/issues/2488).
     #[cfg_attr(not(test), allow(dead_code))]
     pub sealed: Zeroizing<String>,
     /// The member's expiry, in seconds since the Unix epoch: the end of the
@@ -401,7 +424,9 @@ pub struct GrantBox {
 /// since the Unix epoch.
 ///
 /// The client's key is registered last, after every other step succeeded,
-/// so a failed mint leaves no key the proxy trusts and no box uses. The
+/// so a failed mint leaves no key the proxy trusts and no box uses. When
+/// the key's registration fails, the box is forgotten again, so a failed
+/// mint leaves neither a key nor a box behind. The
 /// sealed values leave this process only after this function returns, so
 /// no handle is delivered under a key the proxy does not know. Nothing
 /// here asks for a sign-in: the keychain gives the item's metadata only.
@@ -487,6 +512,15 @@ pub fn mint_and_register(
     control.register_box(&box_id, &grant_box.egress, grant_box.stance)?;
     // BEP-063: the key is registered before a handle signed under it is
     // delivered. It goes last, so no failed step leaves it registered.
-    control.register_client_key(key)?;
+    if let Err(error) = control.register_client_key(key) {
+        if let Err(forget) = control.forget_box(&box_id) {
+            tracing::warn!(
+                box_id = %box_id,
+                error = %forget,
+                "the proxy did not forget the box after its key was refused"
+            );
+        }
+        return Err(error);
+    }
     Ok(minted)
 }

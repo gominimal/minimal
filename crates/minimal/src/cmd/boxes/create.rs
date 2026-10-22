@@ -227,27 +227,69 @@ fn proxy_stance(network: boxes::NetworkMode) -> Option<bep::boxes::Stance> {
     }
 }
 
-/// Mints each GitHub grant's sign-in reference for the box `box_id`, and
-/// registers the box's declared egress and stance with the Box Egress
-/// Proxy (BEP-005). Does nothing for a box with no GitHub grant.
+/// Whether a node-local Box Egress Proxy serves boxes on this host: the
+/// proxy published its identity at `identity`, and its control socket is
+/// at `control`. A missing home directory gives neither path.
+pub(crate) fn proxy_present(
+    identity: Option<&std::path::Path>,
+    control: Option<&std::path::Path>,
+) -> bool {
+    identity.is_some_and(std::path::Path::exists) && control.is_some_and(std::path::Path::exists)
+}
+
+/// Checks a box spec's GitHub grants at creation, and gives their names.
 ///
-/// A box with no id gets nothing: a native host and a daemon that predates
-/// box ids hand none back, and no proxy serves those boxes.
-fn mint_grants(
+/// Where no node-local proxy serves boxes, a GitHub grant is refused with
+/// `gatehouse_unenrolled_node` (Gatehouse §6.2). Only on a host that has
+/// one is a grant with no held sign-in refused with
+/// `github_sign_in_required` (BEP-003). Only the sign-in item's metadata
+/// is read, and nothing asks for a sign-in.
+pub(crate) fn check_github_grants(
+    secrets: &boxes::core::bep::SecretGrants,
+    proxy_present: bool,
+    keychain: &dyn bep::signin::Keychain,
+) -> Result<Vec<String>, anyhow::Error> {
+    let grants = github_grant_names(secrets);
+    if grants.is_empty() {
+        return Ok(grants);
+    }
+    boxes::core::bep::require_proxy(secrets, proxy_present)?;
+    let signed_in = sign_in_held(keychain)?;
+    boxes::core::bep::require_sign_in(secrets, signed_in)?;
+    Ok(grants)
+}
+
+/// The facts a GitHub grant box is registered with the proxy under: its
+/// box id and its address stance. A native host and a daemon that predates
+/// box ids give no id, and no proxy serves those boxes. A grant there is
+/// refused with `gatehouse_unenrolled_node`, and never resolves to nothing.
+pub(crate) fn grant_box_facts(
     grants: &[String],
     box_id: Option<String>,
-    policy: &boxes::BoxPolicy,
+    network: boxes::NetworkMode,
+) -> Result<Option<(String, bep::boxes::Stance)>, boxes::core::bep::ActivationRefused> {
+    if grants.is_empty() {
+        return Ok(None);
+    }
+    match (box_id, proxy_stance(network)) {
+        (Some(box_id), Some(stance)) => Ok(Some((box_id, stance))),
+        _ => Err(boxes::core::bep::unenrolled_node(grants.to_vec())),
+    }
+}
+
+/// Mints each GitHub grant's sign-in reference for the box `box_id`, and
+/// registers the box's declared egress and stance with the Box Egress
+/// Proxy (BEP-005). Does nothing for a box with no GitHub grant, and
+/// refuses a grant box with no id or no stance. It blocks on the control
+/// socket, so the activation runs it on a blocking thread.
+fn mint_grants(
+    grants: Vec<String>,
+    box_id: Option<String>,
+    egress: Vec<String>,
     network: boxes::NetworkMode,
 ) -> Result<Vec<crate::mint::Minted>, anyhow::Error> {
     use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
-    if grants.is_empty() {
-        return Ok(Vec::new());
-    }
-    let (Some(box_id), Some(stance)) = (box_id, proxy_stance(network)) else {
-        tracing::debug!(
-            grants = grants.len(),
-            "no box id or no network, so no GitHub sign-in reference is minted"
-        );
+    let Some((box_id, stance)) = grant_box_facts(&grants, box_id, network)? else {
         return Ok(Vec::new());
     };
     let (Some(identity_path), Some(control_path)) =
@@ -267,12 +309,8 @@ fn mint_grants(
     let key = ClientKey::generate()?;
     let grant_box = GrantBox {
         box_id,
-        grants: grants.to_vec(),
-        egress: policy
-            .egress
-            .as_ref()
-            .and_then(|egress| egress.allow_dns_hosts.clone())
-            .unwrap_or_default(),
+        grants,
+        egress,
         stance,
     };
     let now = std::time::SystemTime::now()
@@ -509,13 +547,16 @@ pub(crate) async fn activate_box(
                 &project_secrets,
                 full_breadth_acknowledged,
             )?;
-            // BEP-003: a GitHub grant needs a held sign-in. Only the item's
-            // metadata is read, and nothing asks for a sign-in.
-            let github_grants = github_grant_names(&project_secrets);
-            if !github_grants.is_empty() {
-                let signed_in = sign_in_held(&bep::signin::HostKeychain)?;
-                boxes::core::bep::require_sign_in(&project_secrets, signed_in)?;
-            }
+            // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
+            // proxy, and then a held sign-in. Only the item's metadata is
+            // read, and nothing asks for a sign-in.
+            let identity = crate::mint::identity_path();
+            let control = crate::mint::control_path();
+            let github_grants = check_github_grants(
+                &project_secrets,
+                proxy_present(identity.as_deref(), control.as_deref()),
+                &bep::signin::HostKeychain,
+            )?;
             Ok::<_, anyhow::Error>((policy, github_grants))
         })
         .await?;
@@ -775,6 +816,23 @@ pub(crate) async fn activate_box(
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
+    // Gatehouse §6.2: a GitHub grant box with no box id or no stance has no
+    // proxy to serve its grant. It is refused before the create, and the
+    // row the registration bought is withdrawn (T66).
+    if let Err(refused) = grant_box_facts(
+        &github_grants,
+        request.config.box_id.map(|box_id| box_id.to_string()),
+        request.config.network,
+    ) {
+        withdraw_box_row(
+            control_sock.clone(),
+            request.config.name.as_deref(),
+            request.config.box_addresses,
+            request.config.box_id,
+        )
+        .await;
+        return Err(refused.into());
+    }
 
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     // An autogen name can (rarely) collide with an existing session built
@@ -910,15 +968,33 @@ pub(crate) async fn activate_box(
             let box_id = registered
                 .as_ref()
                 .and_then(|registration| registration.box_id);
-            let minted = mint_grants(
-                &github_grants,
-                box_id.map(|box_id| box_id.to_string()),
-                &request.config.policy,
-                request.config.network,
-            );
+            let grants = github_grants.clone();
+            let egress = request
+                .config
+                .policy
+                .egress
+                .as_ref()
+                .and_then(|egress| egress.allow_dns_hosts.clone())
+                .unwrap_or_default();
+            let network = request.config.network;
+            // The mint blocks on the proxy's control socket and the host
+            // keychain, so it runs off the runtime's workers.
+            let minted = tokio::task::spawn_blocking(move || {
+                mint_grants(
+                    grants,
+                    box_id.map(|box_id| box_id.to_string()),
+                    egress,
+                    network,
+                )
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|minted| minted);
             match minted {
-                // The sealed values reach the box's environment with
-                // BEP-007, which is not built yet.
+                // Interim: the sealed values are dropped, so the grant's
+                // environment variable stays empty until BEP-007 delivers
+                // them. The flip is T42
+                // (https://github.com/gominimal/minimal/issues/2488).
                 Ok(minted) => {
                     drop(minted);
                     Ok(())

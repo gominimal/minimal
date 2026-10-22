@@ -305,6 +305,7 @@ fn every_daemon_connection_is_classified() {
             // what the tests assert rather than a decision they make.
             // Not a product path, and not the daemon: the mint tests' own
             // connections to a test Box Egress Proxy's control socket.
+            "tests.rs::a_refused_client_key_forgets_the_box_again = ungated",
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
@@ -4034,5 +4035,190 @@ mod mint_tests {
         let gone = served.path.with_file_name("none.sock");
         let err = ControlClient::connect(&gone).err().unwrap();
         assert!(matches!(err, MintError::NotRunning { .. }), "{err}");
+    }
+
+    /// A control socket that registers and forgets boxes as the proxy does,
+    /// and refuses every client key. Gives the socket and its boxes.
+    fn serve_refusing_keys() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BoxRegistry,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let boxes = BoxRegistry::default();
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
+        std::thread::spawn(move || {
+            let clients = std::sync::RwLock::new(bep::handle::ClientKeys::new());
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let request: bep::control::Request = serde_json_lenient::from_str(&line).unwrap();
+                let op = match request {
+                    bep::control::Request::RegisterClientKey { .. } => "register_client_key",
+                    bep::control::Request::RegisterBox { .. } => "register_box",
+                    bep::control::Request::ForgetBox { .. } => "forget_box",
+                };
+                served_ops.lock().unwrap().push(op.to_owned());
+                let reply = if op == "register_client_key" {
+                    bep::control::Reply {
+                        ok: false,
+                        kid: None,
+                        error: Some("the key is not a P-256 public key".into()),
+                    }
+                } else {
+                    bep::control::handle_line(&line, &clients, &served_boxes)
+                };
+                let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                answer.push('\n');
+                writer.write_all(answer.as_bytes()).unwrap();
+                line.clear();
+            }
+        });
+        (dir, path, boxes, ops)
+    }
+
+    // BEP-063: a client key the proxy refuses leaves no box registered
+    // either. The box is registered first and forgotten again.
+    #[test]
+    fn a_refused_client_key_forgets_the_box_again() {
+        let (_, identity) = proxy();
+        let (_dir, path, boxes, ops) = serve_refusing_keys();
+        let mut control = ControlClient::connect(&path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert_eq!(
+            *ops.lock().unwrap(),
+            ["register_box", "register_client_key", "forget_box"]
+        );
+        assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    fn github_secrets() -> boxes::core::bep::SecretGrants {
+        std::collections::BTreeMap::from([(
+            "GH_TOKEN".to_owned(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["github:user-token".into()],
+                mode: None,
+            },
+        )])
+    }
+
+    fn refusal(err: &anyhow::Error) -> &boxes::core::bep::ActivationRefused {
+        err.downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .unwrap_or_else(|| panic!("not a refused box spec: {err}"))
+    }
+
+    // Gatehouse §6.2: where no node-local proxy exists, a GitHub grant is
+    // refused with `gatehouse_unenrolled_node` and exit 5, even with a
+    // sign-in held. `github_sign_in_required` is only for a host that has a
+    // proxy.
+    #[test]
+    fn a_grant_box_with_no_proxy_is_refused_as_an_unenrolled_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.json");
+        let control = dir.path().join("control.sock");
+        assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        assert!(!crate::cmd::proxy_present(None, None));
+
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), false, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+        assert_eq!(
+            boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+            "gatehouse_unenrolled_node"
+        );
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and no Box Egress \
+             Proxy serves boxes on this machine. Remove the grant from the [secrets] table in \
+             minimal.toml, then create the box again."
+        );
+        // With no sign-in held either, the missing proxy is what is refused.
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), false, &MemoryKeychain::default())
+                .unwrap_err();
+        assert_eq!(
+            refusal(&err).refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+
+        // With a proxy, no sign-in held is refused with its own error.
+        std::fs::write(&identity, "{}").unwrap();
+        std::fs::write(&control, "").unwrap();
+        assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), true, &MemoryKeychain::default())
+                .unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GITHUB_SIGN_IN_REQUIRED)
+        );
+        assert_eq!(refused.exit_code(), 3);
+        // With a proxy and a sign-in, the grants pass. A box with no GitHub
+        // grant is never refused.
+        assert_eq!(
+            crate::cmd::check_github_grants(&github_secrets(), true, &signed_in()).unwrap(),
+            ["GH_TOKEN"]
+        );
+        assert!(
+            crate::cmd::check_github_grants(&Default::default(), false, &MemoryKeychain::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Gatehouse §6.2: a grant box with no box id or no stance is refused
+    // with `gatehouse_unenrolled_node`, and does not start with a grant that
+    // resolves to nothing.
+    #[test]
+    fn a_grant_box_with_no_box_id_or_stance_is_refused_as_an_unenrolled_node() {
+        let grants = vec!["GH_TOKEN".to_owned()];
+        let refused =
+            crate::cmd::grant_box_facts(&grants, None, boxes::NetworkMode::OwnIp).unwrap_err();
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+        assert_eq!(refused.exit_code(), 5);
+        let refused =
+            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::NoNet)
+                .unwrap_err();
+        assert_eq!(refused.exit_code(), 5);
+
+        assert_eq!(
+            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::HostNet)
+                .unwrap(),
+            Some((BOX_ID.to_owned(), Stance::HostIp))
+        );
+        // A box with no GitHub grant needs neither.
+        assert_eq!(
+            crate::cmd::grant_box_facts(&[], None, boxes::NetworkMode::NoNet).unwrap(),
+            None
+        );
     }
 }
