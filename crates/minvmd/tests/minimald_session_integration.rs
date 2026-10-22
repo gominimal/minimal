@@ -276,26 +276,17 @@ async fn run_session_exec(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let req = CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some(format!("minvmd-e2e-{uniq:x}")),
-                project_path: paths::HostAbsPath::try_new("/tmp")
-                    .map_err(|e| format!("project_path: {e}"))?,
-                network: boxes::NetworkMode::default(),
-                policy: Default::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                // The serde default, and what every non-`--no-hooks`
-                // activation sends. This session only runs an exec, so
-                // it declares no hooks either way.
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            // The guest daemon is built from this same tree by the harness, so
-            // there is no skew to assert against; the gate has its own tests.
-            must_match_version: None,
-        };
+        // Hooks stay on, the serde default and what every non-`--no-hooks`
+        // activation sends; this session only runs an exec, so it declares
+        // no hooks either way. No version assertion: the guest daemon is
+        // built from this same tree by the harness, so there is no skew to
+        // assert against, and the gate has its own tests.
+        let req = CreateSessionRequest::new(
+            format!("minvmd-e2e-{uniq:x}"),
+            paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+            boxes::NetworkMode::default(),
+            Default::default(),
+        );
         let body =
             serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
