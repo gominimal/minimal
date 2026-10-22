@@ -524,3 +524,55 @@ pub fn mint_and_register(
     }
     Ok(minted)
 }
+
+/// A box the proxy holds for a creation that has not finished. Dropped
+/// before [`ProxyRegistration::keep`], it tells the proxy to forget the
+/// box, so a creation that fails after the mint leaves no declared egress
+/// behind (BEP-003).
+///
+/// The client's key stays registered: the control socket has no request
+/// that withdraws a key. The drop blocks on the control socket, and it
+/// runs only on a failed or interrupted creation.
+#[must_use = "a dropped registration forgets the box at the proxy"]
+#[derive(Debug)]
+pub struct ProxyRegistration {
+    control_path: PathBuf,
+    box_id: Option<String>,
+}
+
+impl ProxyRegistration {
+    /// A registration of the box `box_id` with the proxy that serves
+    /// `control_path`.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::BoxId`] when `box_id` is not a box id.
+    pub fn new(control_path: PathBuf, box_id: &str) -> Result<Self, MintError> {
+        Ok(Self {
+            control_path,
+            box_id: Some(box_id_hex(box_id)?),
+        })
+    }
+
+    /// Keeps the box at the proxy: the creation finished.
+    pub fn keep(mut self) {
+        self.box_id = None;
+    }
+}
+
+impl Drop for ProxyRegistration {
+    fn drop(&mut self) {
+        let Some(box_id) = self.box_id.take() else {
+            return;
+        };
+        let forgot = ControlClient::connect(&self.control_path)
+            .and_then(|mut control| control.forget_box(&box_id));
+        if let Err(error) = forgot {
+            tracing::warn!(
+                box_id = %box_id,
+                error = %error,
+                "the proxy did not forget the box after its creation failed"
+            );
+        }
+    }
+}

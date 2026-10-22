@@ -281,16 +281,26 @@ pub(crate) fn grant_box_facts(
 /// registers the box's declared egress and stance with the Box Egress
 /// Proxy (BEP-005). Does nothing for a box with no GitHub grant, and
 /// refuses a grant box with no id or no stance. It blocks on the control
-/// socket, so the activation runs it on a blocking thread.
+/// socket, so the activation runs it on a blocking thread. The
+/// registration it gives forgets the box at the proxy when it is dropped
+/// before the creation finishes.
 fn mint_grants(
     grants: Vec<String>,
     box_id: Option<String>,
     egress: Vec<String>,
     network: boxes::NetworkMode,
-) -> Result<Vec<crate::mint::Minted>, anyhow::Error> {
-    use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
+) -> Result<
+    (
+        Vec<crate::mint::Minted>,
+        Option<crate::mint::ProxyRegistration>,
+    ),
+    anyhow::Error,
+> {
+    use crate::mint::{
+        ClientKey, ControlClient, GrantBox, MintError, ProxyRegistration, mint_and_register,
+    };
     let Some((box_id, stance)) = grant_box_facts(&grants, box_id, network)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let (Some(identity_path), Some(control_path)) =
         (crate::mint::identity_path(), crate::mint::control_path())
@@ -313,18 +323,25 @@ fn mint_grants(
         egress,
         stance,
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    Ok(mint_and_register(
+    // A clock before the epoch gives no issue time, so the mint stops
+    // rather than signing handles issued at zero.
+    let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        bail!(
+            "Cannot start the box: it declares a GitHub grant, and the system clock reads a \
+             time before 1970. Set the system clock, then create the box again."
+        );
+    };
+    let minted = mint_and_register(
         &bep::signin::HostKeychain,
         &identity,
         &identity_path,
         &mut control,
         &key,
         &grant_box,
-        now,
-    )?)
+        since.as_secs(),
+    )?;
+    let registration = ProxyRegistration::new(control_path, &grant_box.box_id)?;
+    Ok((minted, Some(registration)))
 }
 
 /// One named step of [`activate_box`], in the order the activation runs
@@ -963,7 +980,10 @@ pub(crate) async fn activate_box(
     // the box now holds, after the create's retries settled it. A failure
     // abandons the activation and its row the same way a create failure
     // does (T66).
-    ActivationStep::MintGrants
+    // The proxy's hold on the box: dropped by a later step's failure or an
+    // interrupt, it forgets the box's declared egress there. It is kept
+    // once the session is active.
+    let proxy_registration = ActivationStep::MintGrants
         .run(async {
             let box_id = registered
                 .as_ref()
@@ -995,9 +1015,9 @@ pub(crate) async fn activate_box(
                 // environment variable stays empty until BEP-007 delivers
                 // them. The flip is T42
                 // (https://github.com/gominimal/minimal/issues/2488).
-                Ok(minted) => {
+                Ok((minted, registration)) => {
                     drop(minted);
-                    Ok(())
+                    Ok(registration)
                 }
                 Err(error) => {
                     withdraw_box_row(
@@ -1707,6 +1727,9 @@ pub(crate) async fn activate_box(
     // (the attach hand-off below and the user's own session are fair game
     // for interrupts, but not this cleanup).
     drop(interrupt_guard);
+    if let Some(registration) = proxy_registration {
+        registration.keep();
+    }
 
     // The `host_ip` interim: the box shares the node's own row, so its name
     // is held in the zone with no row behind it and answers NODATA instead

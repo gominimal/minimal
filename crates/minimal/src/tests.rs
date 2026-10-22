@@ -4037,6 +4037,50 @@ mod mint_tests {
         assert!(matches!(err, MintError::NotRunning { .. }), "{err}");
     }
 
+    // BEP-003: a creation that fails after the mint leaves no declared
+    // egress at the proxy. A creation that finishes keeps it.
+    #[test]
+    fn grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails() {
+        use crate::mint::ProxyRegistration;
+        let (_, identity) = proxy();
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let mut mint = |box_id: &str| {
+            mint_and_register(
+                &signed_in(),
+                &identity,
+                std::path::Path::new("identity.json"),
+                &mut control,
+                &ClientKey::generate().unwrap(),
+                &GrantBox {
+                    box_id: box_id.into(),
+                    ..grant_box(Stance::OwnIp)
+                },
+                NOW,
+            )
+            .unwrap();
+        };
+
+        // A failed creation drops its registration, and the proxy forgets
+        // the box.
+        mint(BOX_HEX);
+        assert!(served.boxes.get(BOX_HEX).is_some());
+        drop(ProxyRegistration::new(served.path.clone(), BOX_HEX).unwrap());
+        assert!(served.boxes.get(BOX_HEX).is_none());
+
+        // A finished creation keeps its registration.
+        let kept = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f7";
+        mint(kept);
+        ProxyRegistration::new(served.path.clone(), kept)
+            .unwrap()
+            .keep();
+        assert!(served.boxes.get(kept).is_some());
+
+        // A drop with no proxy to tell does not panic.
+        let gone = served.path.with_file_name("none.sock");
+        drop(ProxyRegistration::new(gone, kept).unwrap());
+    }
+
     /// A control socket that registers and forgets boxes as the proxy does,
     /// and refuses every client key. Gives the socket and its boxes.
     fn serve_refusing_keys() -> (
