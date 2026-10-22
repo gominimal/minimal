@@ -3787,6 +3787,7 @@ mod mint_tests {
             root: Some(published(&root.public())),
             signing: Some(published(&ProxyKey::generate().unwrap().public())),
             root_not_after: Some(ROOT_END),
+            root_certificate: None,
         };
         (sealing, identity)
     }
@@ -3855,6 +3856,77 @@ mod mint_tests {
             boxes,
             _runtime: runtime,
         }
+    }
+
+    // BEP-072, BEP-011: a grant box's create request carries the root
+    // certificate the proxy published, beside each grant's sealed value. A
+    // grant box whose proxy publishes none is refused with a message that
+    // names `bep`, and a box with no grant carries no root.
+    #[test]
+    fn grant_box_create_request_carries_the_published_root_certificate() {
+        use crate::cmd::{grant_root_certificate, hand_grants};
+
+        let der = b"0\x82\x01\x0a a root certificate's DER".to_vec();
+        let pem = bep::publish::certificate_pem(&der);
+        let (_, identity) = proxy();
+        let identity = Identity {
+            root_certificate: Some(pem.clone()),
+            ..identity
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        identity.publish(&path).unwrap();
+        let published = Identity::read(&path).unwrap();
+
+        let root = grant_root_certificate(&published).unwrap();
+        assert_eq!(root, pem);
+        let grants = vec!["GH_TOKEN".to_string()];
+        let minted = vec![crate::mint::Minted {
+            grant: "GH_TOKEN".into(),
+            sealed: zeroize::Zeroizing::new("sealed-value".into()),
+            expiry: ROOT_END,
+        }];
+        let mut request = create_request();
+        hand_grants(&mut request, &grants, &minted, Some(root)).unwrap();
+        assert_eq!(
+            request.config.root_certificate.as_deref(),
+            Some(pem.as_str())
+        );
+        assert_eq!(request.config.sealed_deliveries.len(), 1);
+        assert_eq!(request.config.sealed_deliveries[0].variable, "GH_TOKEN");
+
+        // An identity that an older `bep` published has no certificate, and
+        // one with a broken certificate has none that the box can trust.
+        for root_certificate in [None, Some("not a certificate".to_string())] {
+            let identity = Identity {
+                root_certificate,
+                ..published.clone()
+            };
+            let error = grant_root_certificate(&identity).unwrap_err().to_string();
+            assert!(error.contains("no root certificate"), "{error}");
+            assert!(error.contains("Run `bep`"), "{error}");
+        }
+        let mut refused = create_request();
+        let error = hand_grants(&mut refused, &grants, &minted, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Run `bep`"), "{error}");
+        assert_eq!(refused.config.root_certificate, None);
+        assert!(refused.config.sealed_deliveries.is_empty());
+
+        // A box with no GitHub grant carries no root.
+        let mut plain = create_request();
+        hand_grants(&mut plain, &[], &[], None).unwrap();
+        assert_eq!(plain.config.root_certificate, None);
+    }
+
+    fn create_request() -> minimald_rpc::CreateSessionRequest {
+        minimald_rpc::CreateSessionRequest::new(
+            "grant-box",
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        )
     }
 
     // BEP-005: the member is a sign-in reference under the client's key,

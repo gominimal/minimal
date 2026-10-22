@@ -329,30 +329,92 @@ pub(crate) fn grant_box_facts(
     }
 }
 
+/// The root certificate a GitHub grant box trusts: the PEM that the
+/// proxy's published identity carries (BEP-011, BEP-072). An identity that
+/// carries none, or one that is not a PEM certificate, is refused, so no
+/// grant box starts without the root it needs.
+pub(crate) fn grant_root_certificate(
+    identity: &bep::publish::Identity,
+) -> Result<String, anyhow::Error> {
+    match identity.root_certificate_der() {
+        Ok(_) => identity
+            .root_certificate
+            .clone()
+            .ok_or_else(no_root_certificate),
+        Err(error) => {
+            tracing::debug!(%error, "the published identity carries no usable root certificate");
+            Err(no_root_certificate())
+        }
+    }
+}
+
+/// The refusal of a GitHub grant box whose proxy publishes no root
+/// certificate.
+fn no_root_certificate() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy has \
+         published no root certificate for the box to trust. Run `bep` to publish it, then \
+         create the box again."
+    )
+}
+
+/// What the grant mint hands to the create request: each grant's sealed
+/// value, the proxy's root certificate, and the box's registration with
+/// the proxy.
+pub(crate) struct MintedGrants {
+    /// Each grant's sealed value.
+    pub minted: Vec<crate::mint::Minted>,
+    /// The proxy's root certificate, PEM.
+    pub root_certificate: Option<String>,
+    /// The box's registration with the proxy.
+    pub registration: Option<crate::mint::ProxyRegistration>,
+}
+
+/// Puts what the mint gave on the create request: one sealed delivery for
+/// each grant (BEP-007) and the proxy's root certificate for the box to
+/// trust (BEP-072). A box with no GitHub grant gets neither.
+pub(crate) fn hand_grants(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    grants: &[String],
+    minted: &[crate::mint::Minted],
+    root_certificate: Option<String>,
+) -> Result<(), anyhow::Error> {
+    let deliveries = sealed_deliveries(grants, minted)?;
+    let root_certificate = if grants.is_empty() {
+        None
+    } else {
+        // A grant box with no root is refused before the mint, and this
+        // keeps the refusal on every path to the request.
+        Some(root_certificate.ok_or_else(no_root_certificate)?)
+    };
+    request.config.sealed_deliveries = deliveries;
+    request.config.root_certificate = root_certificate;
+    Ok(())
+}
+
 /// Mints each GitHub grant's sign-in reference for the box `box_id`, and
 /// registers the box's declared egress and stance with the Box Egress
 /// Proxy (BEP-005). Does nothing for a box with no GitHub grant, and
-/// refuses a grant box with no id or no stance. It blocks on the control
-/// socket, so the activation runs it on a blocking thread. The
-/// registration it gives forgets the box at the proxy when it is dropped
-/// before the creation finishes.
+/// refuses a grant box with no id or no stance, or one whose proxy
+/// publishes no root certificate. It blocks on the control socket, so the
+/// activation runs it on a blocking thread. The registration it gives
+/// forgets the box at the proxy when it is dropped before the creation
+/// finishes.
 fn mint_grants(
     grants: Vec<String>,
     box_id: Option<String>,
     egress: Vec<String>,
     network: boxes::NetworkMode,
-) -> Result<
-    (
-        Vec<crate::mint::Minted>,
-        Option<crate::mint::ProxyRegistration>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
         ClientKey, ControlClient, GrantBox, MintError, ProxyRegistration, mint_and_register,
     };
     let Some((box_id, stance)) = grant_box_facts(&grants, box_id, network)? else {
-        return Ok((Vec::new(), None));
+        return Ok(MintedGrants {
+            minted: Vec::new(),
+            root_certificate: None,
+            registration: None,
+        });
     };
     let (Some(identity_path), Some(control_path)) =
         (crate::mint::identity_path(), crate::mint::control_path())
@@ -367,6 +429,9 @@ fn mint_grants(
             path: identity_path.clone(),
             error,
         })?;
+    // BEP-072: refused before the box registers, so a refusal leaves nothing
+    // at the proxy.
+    let root_certificate = grant_root_certificate(&identity)?;
     let mut control = ControlClient::connect(&control_path)?;
     let key = ClientKey::generate()?;
     let grant_box = GrantBox {
@@ -393,12 +458,16 @@ fn mint_grants(
         since.as_secs(),
     )?;
     let registration = ProxyRegistration::new(control_path, &grant_box.box_id)?;
-    Ok((minted, Some(registration)))
+    Ok(MintedGrants {
+        minted,
+        root_certificate: Some(root_certificate),
+        registration: Some(registration),
+    })
 }
 
 /// Mints the box's GitHub grants for the box id `request` carries, and puts
 /// each grant's sealed value on the request for the box's launches to place
-/// (BEP-005, BEP-007). Does nothing for a box with no GitHub grant. No box
+/// (BEP-005, BEP-007), with the proxy's root certificate (BEP-072). Does nothing for a box with no GitHub grant. No box
 /// exists yet, so a failure only withdraws the row the box's registration
 /// bought (T66).
 async fn mint_into_request(
@@ -422,14 +491,17 @@ async fn mint_into_request(
         .await
         .map_err(anyhow::Error::from)
         .and_then(|minted| minted)
-        .and_then(|(minted, registration)| {
-            Ok((sealed_deliveries(github_grants, &minted)?, registration))
+        .and_then(|minted| {
+            hand_grants(
+                request,
+                github_grants,
+                &minted.minted,
+                minted.root_certificate,
+            )?;
+            Ok(minted.registration)
         });
     match minted {
-        Ok((deliveries, registration)) => {
-            request.config.sealed_deliveries = deliveries;
-            Ok(registration)
-        }
+        Ok(registration) => Ok(registration),
         Err(error) => {
             withdraw_box_row(
                 control_sock,
