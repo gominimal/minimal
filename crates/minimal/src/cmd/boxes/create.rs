@@ -980,9 +980,10 @@ pub(crate) async fn activate_box(
     // the box now holds, after the create's retries settled it. A failure
     // abandons the activation and its row the same way a create failure
     // does (T66).
-    // The proxy's hold on the box: dropped by a later step's failure or an
-    // interrupt, it forgets the box's declared egress there. It is kept
-    // once the session is active.
+    // The proxy's hold on the box: dropped by a later step's failure, it
+    // forgets the box's declared egress there. It is kept once the session
+    // is active. A Ctrl-C exits the process with no drop, so it leaves the
+    // box at the proxy until the box's destroy forgets it (#2277).
     let proxy_registration = ActivationStep::MintGrants
         .run(async {
             let box_id = registered
