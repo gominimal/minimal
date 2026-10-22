@@ -341,6 +341,8 @@ fn every_create_session_asserts_the_daemon_build() {
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
             "tests.rs::create_box_on = asserts",
+            // Not a client path: the mint unit tests' create-request fixture.
+            "tests.rs::create_request = asserts",
         ]
     );
 }
@@ -3763,6 +3765,7 @@ mod mint_tests {
     use bep::publish::{Identity, PublishedKey};
     use bep::seal::{Binding, Breadth, MemberKind, Mode, ProxyKey, ProxyPublicKey};
     use bep::signin::{Completed, Flow, Keychain as _, Material, MemoryKeychain, store_sign_in};
+    use minimald_rpc::CreateSessionRequest;
 
     use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
 
@@ -3965,13 +3968,15 @@ mod mint_tests {
         element(0x30, &[&tbs, &element(0x30, &[]), &element(0x03, &[&[0]])])
     }
 
-    fn create_request() -> minimald_rpc::CreateSessionRequest {
-        minimald_rpc::CreateSessionRequest::new(
+    fn create_request() -> CreateSessionRequest {
+        let mut request = CreateSessionRequest::new(
             "grant-box",
             paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
             boxes::NetworkMode::OwnIp,
             boxes::BoxPolicy::default(),
-        )
+        );
+        request.must_match_version = minimal_client::version_assertion();
+        request
     }
 
     // BEP-005: the member is a sign-in reference under the client's key,
