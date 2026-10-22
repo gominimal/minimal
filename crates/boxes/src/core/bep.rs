@@ -537,7 +537,18 @@ pub enum BepWarning {
         /// The GitHub grants, in name order.
         grants: Vec<String>,
     },
+    /// BEP-011: the box spec's environment sets a trust variable that the
+    /// box would get from its trust store, so the spec's value stays.
+    TrustEnvSetBySpec {
+        /// The variable the spec sets.
+        variable: String,
+    },
 }
+
+/// The trust variables a box with the proxy's root gets (BEP-011): the
+/// first two at the box's CA bundle, the last at the root alone.
+pub const TRUST_ENV_VARIABLES: [&str; 3] =
+    ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"];
 
 impl fmt::Display for BepWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -547,6 +558,11 @@ impl fmt::Display for BepWarning {
                 "steering is \"off\", so this box does not trust the proxy. \
                  The GitHub secret {} will not work in it.",
                 grants.join(", ")
+            ),
+            Self::TrustEnvSetBySpec { variable } => write!(
+                f,
+                "This box sets {variable} itself, so tools that read it will not \
+                 trust the proxy's certificate."
             ),
         }
     }
@@ -680,6 +696,32 @@ pub fn check_activation(
         inject_ca: spec.has_credentialed_upstream() && steering != Steering::Off,
         warnings,
     })
+}
+
+impl ActivationPlan {
+    /// Adds a warning for each trust variable (BEP-011) that the box spec's
+    /// environment sets, in [`TRUST_ENV_VARIABLES`] order, when the box gets
+    /// the proxy's root. The spec's value stays, so a tool that reads that
+    /// variable does not trust the proxy. `spec_env` is the names of the
+    /// variables the spec sets. A box without the root gets no warning.
+    pub fn warn_spec_trust_env<'a>(&mut self, spec_env: impl IntoIterator<Item = &'a str>) {
+        if !self.inject_ca {
+            return;
+        }
+        let set: std::collections::BTreeSet<&str> = spec_env.into_iter().collect();
+        for variable in TRUST_ENV_VARIABLES {
+            if set.contains(variable) {
+                tracing::debug!(
+                    rule = "BEP-011",
+                    variable,
+                    "box spec sets a trust variable, so its value stays"
+                );
+                self.warnings.push(BepWarning::TrustEnvSetBySpec {
+                    variable: variable.to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Refuses a box spec with a GitHub grant when no GitHub sign-in is held
@@ -1248,6 +1290,52 @@ mod tests {
         let plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
         assert!(plan.inject_ca);
         assert!(plan.warnings.is_empty());
+    }
+
+    /// BEP-011: a box spec that sets a trust variable keeps its value, and
+    /// the activation warns naming the variable. A box without the root
+    /// gets no warning.
+    #[test]
+    fn spec_trust_env_shadows_platform_with_warning() {
+        let secrets = grants(github_grant(None));
+        let egress = egress_with(GITHUB_HOSTS);
+        let bep = proxy_env();
+        let spec = ActivationSpec {
+            network: NetworkMode::OwnIp,
+            egress: Some(&egress),
+            bep: &bep,
+            secrets: &secrets,
+        };
+        let mut plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
+        assert!(plan.inject_ca);
+        plan.warn_spec_trust_env(["PATH", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"]);
+        assert_eq!(
+            plan.warnings,
+            vec![
+                BepWarning::TrustEnvSetBySpec {
+                    variable: "SSL_CERT_FILE".into()
+                },
+                BepWarning::TrustEnvSetBySpec {
+                    variable: "NODE_EXTRA_CA_CERTS".into()
+                },
+            ]
+        );
+        assert_eq!(
+            plan.warnings[0].to_string(),
+            "This box sets SSL_CERT_FILE itself, so tools that read it will not \
+             trust the proxy's certificate."
+        );
+
+        // Steering `off` injects no root, so the spec's value shadows nothing.
+        let bep = BepSettings {
+            steering: Some(Steering::Off),
+            ..BepSettings::default()
+        };
+        let spec = ActivationSpec { bep: &bep, ..spec };
+        let mut plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
+        let before = plan.warnings.clone();
+        plan.warn_spec_trust_env(["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]);
+        assert_eq!(plan.warnings, before);
     }
 
     /// BEP-010: `off` with `proxy_env = true` is refused with exit 3,
