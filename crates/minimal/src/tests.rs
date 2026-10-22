@@ -4009,6 +4009,27 @@ mod mint_tests {
         assert!(err.to_string().contains("Run `min auth login`"), "{err}");
         assert!(served.boxes.get(other).is_none());
 
+        // A box registration the proxy refuses leaves no client key
+        // registered.
+        let refused_key = ClientKey::generate().unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &refused_key,
+            &GrantBox {
+                box_id: other.into(),
+                egress: vec![".".into()],
+                ..grant_box(Stance::OwnIp)
+            },
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert!(served.boxes.get(other).is_none());
+        assert!(!served.clients.read().unwrap().contains(&refused_key.kid()));
+
         // Nothing answers on a socket no proxy serves.
         let gone = served.path.with_file_name("none.sock");
         let err = ControlClient::connect(&gone).err().unwrap();

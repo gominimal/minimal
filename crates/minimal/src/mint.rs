@@ -396,12 +396,14 @@ pub struct GrantBox {
 }
 
 /// Mints and seals a sign-in reference for each of `grant_box`'s grants
-/// under `key`, and registers the key and then the box with the proxy over
+/// under `key`, and registers the box and then the key with the proxy over
 /// `control` (BEP-005, BEP-063). `now` is the time of the mint, in seconds
 /// since the Unix epoch.
 ///
-/// The client's key is registered before any member is sealed, so no
-/// handle leaves this process under a key the proxy does not know. Nothing
+/// The client's key is registered last, after every other step succeeded,
+/// so a failed mint leaves no key the proxy trusts and no box uses. The
+/// sealed values leave this process only after this function returns, so
+/// no handle is delivered under a key the proxy does not know. Nothing
 /// here asks for a sign-in: the keychain gives the item's metadata only.
 ///
 /// # Errors
@@ -436,10 +438,6 @@ pub fn mint_and_register(
     // The Box Host is the sealing key's fingerprint, the name `bep serve`
     // opens values under.
     let node = sealing.kid();
-
-    // BEP-063: the key is registered before a handle signed under it is
-    // delivered.
-    control.register_client_key(key)?;
 
     let mut minted = Vec::with_capacity(grant_box.grants.len());
     for grant in &grant_box.grants {
@@ -487,5 +485,8 @@ pub fn mint_and_register(
     }
 
     control.register_box(&box_id, &grant_box.egress, grant_box.stance)?;
+    // BEP-063: the key is registered before a handle signed under it is
+    // delivered. It goes last, so no failed step leaves it registered.
+    control.register_client_key(key)?;
     Ok(minted)
 }
