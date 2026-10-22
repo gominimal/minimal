@@ -48,6 +48,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::boxes::{BoxRegistry, Boxes, Stance};
 use crate::handle::{ClientKeys, parse_authority};
 use crate::listener::bind_owner_only;
+use crate::redeem::Authority;
 
 /// The longest request line the control socket reads.
 pub const MAX_LINE_LEN: usize = 16 * 1024;
@@ -114,6 +115,20 @@ impl Reply {
     }
 }
 
+/// Parses one declared egress authority, `host` or `host:port`. The
+/// trailing dot of a fully qualified host comes off the host part, so
+/// `github.com.:8443` registers as `github.com:8443`. `None` when the text
+/// does not parse or the host is only dots.
+fn parse_egress(text: &str) -> Option<Authority<String>> {
+    let mut authority = parse_authority(text.trim())?;
+    let host = authority.host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    authority.host = host.to_owned();
+    Some(authority)
+}
+
 /// Does one request line against the client key `registry` and the box
 /// registry `boxes`.
 #[must_use]
@@ -153,7 +168,7 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> 
             }
             let Some(egress) = egress
                 .iter()
-                .map(|a| parse_authority(a.trim().trim_end_matches('.')))
+                .map(|a| parse_egress(a))
                 .collect::<Option<Vec<_>>>()
             else {
                 return Reply::refused("an egress authority is not `host` or `host:port`");
@@ -257,6 +272,21 @@ async fn write_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_host_loses_its_trailing_dot_before_the_port() {
+        let want = |host: &str, port| {
+            Some(Authority {
+                host: host.to_owned(),
+                port,
+            })
+        };
+        assert_eq!(parse_egress("github.com.:8443"), want("github.com", 8443));
+        assert_eq!(parse_egress(" GitHub.com. "), want("github.com", 443));
+        assert_eq!(parse_egress("github.com"), want("github.com", 443));
+        assert_eq!(parse_egress(".:443"), None);
+        assert_eq!(parse_egress("."), None);
+    }
 
     #[tokio::test]
     async fn control_socket_registers_a_client_key() {
