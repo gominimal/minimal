@@ -11501,6 +11501,9 @@ proof_published_proxy_routes_from_host() {
 # without both records it as NOT RUN.
 proof_bep_second_box_needs_no_sign_in() {
   echo "::group::GitHub grant boxes: the second box needs no sign-in"
+  # This proof reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  bep_control="$HOME/.minimal/bep/control.sock"
   if [ "$(uname -s)" != "Darwin" ]; then
     not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy runs on macOS only"
     echo "::endgroup::"
@@ -11512,8 +11515,8 @@ proof_bep_second_box_needs_no_sign_in() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -S "$HOME/.minimal/bep/control.sock" ]; then
-    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy is not running: no $HOME/.minimal/bep/control.sock"
+  if [ ! -S "$bep_control" ]; then
+    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy is not running: no $bep_control"
     echo "::endgroup::"
     return 0
   fi
