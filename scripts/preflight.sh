@@ -76,6 +76,20 @@ check_protoc() {
     else
         fail "protoc 3.15 or later (found $v)" "$fix"
     fi
+    # crates/remote-proto imports the well-known protos. On Debian they ship in
+    # libprotobuf-dev, a package that protobuf-compiler only recommends.
+    local tmp
+    tmp="$(mktemp -d)"
+    printf 'syntax = "proto3";\nimport "google/protobuf/empty.proto";\nimport "google/protobuf/timestamp.proto";\n' \
+        >"$tmp/preflight.proto"
+    local args=(--proto_path="$tmp")
+    if [ -n "${PROTOC_INCLUDE:-}" ]; then args+=(--proto_path="$PROTOC_INCLUDE"); fi
+    if protoc "${args[@]}" -o /dev/null "$tmp/preflight.proto" >/dev/null 2>&1; then
+        ok "protobuf well-known types"
+    else
+        fail "protobuf well-known types (google/protobuf/*.proto)" "$fix"
+    fi
+    rm -rf "$tmp"
 }
 
 check_cross() {
@@ -91,8 +105,10 @@ check_cross() {
     if [ "$os" = Linux ] && [ "$host_arch" = x86_64 ]; then
         return
     fi
-    local tc="$channel-x86_64-unknown-linux-gnu"
-    if have rustup && rustup toolchain list | grep -q "^$tc"; then
+    local tc="$channel-x86_64-unknown-linux-gnu" list=""
+    # Capture first: under pipefail, `grep -q` can SIGPIPE rustup into a false FAIL.
+    if have rustup; then list="$(rustup toolchain list 2>/dev/null || true)"; fi
+    if awk -v tc="$tc" 'index($0, tc) == 1 { found = 1 } END { exit !found }' <<<"$list"; then
         ok "x86_64 Linux toolchain for cross ($tc)"
     else
         fail "x86_64 Linux toolchain for cross ($tc)" \

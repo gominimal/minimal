@@ -91,6 +91,19 @@ stub protoc 'echo "libprotoc 3.12.4"'
 run all
 expect "protoc too old for proto3 optional" 1 "FAIL  protoc 3.15 or later (found 3.12.4)"
 
+setup Linux x86_64
+# shellcheck disable=SC2016 # $1 expands inside the stub, not here.
+stub protoc 'case "$1" in --version) echo "libprotoc 3.21.12" ;; *) exit 1 ;; esac'
+run all
+expect "Linux, no well-known protos" 1 \
+    "FAIL  protobuf well-known types (google/protobuf/*.proto)"$'\n'"        fix: sudo apt install protobuf-compiler libprotobuf-dev"
+
+# The toolchain name is a fixed-string prefix: the dots in the channel are not wildcards.
+setup Darwin arm64
+stub rustup "echo '${channel//./x}-x86_64-unknown-linux-gnu'"
+run cross
+expect "macOS, toolchain name matched literally" 1 "--force-non-host"
+
 setup Darwin arm64
 stub docker 'exit 1'
 run all
