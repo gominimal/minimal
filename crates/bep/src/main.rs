@@ -167,7 +167,20 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
     };
     // BEP-005: only a new root key starts a known validity. A new sealing or
     // signing key leaves the root's end as the previous identity gave it.
-    let root_made_at = (role == Role::Root).then(unix_now);
+    let root_made_at = if role == Role::Root {
+        match unix_now() {
+            Ok(now) => Some(now),
+            Err(err) => {
+                eprintln!("{err}");
+                eprintln!(
+                    "The published identity was not changed, so it still names the old {role} key. Correct the problem above, then run `bep` to publish the new key."
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let identity = Identity::after_replacement(store, role, &key, previous.as_ref())
         .with_root_validity(previous.as_ref(), root_made_at);
     match identity.publish(path) {
@@ -203,8 +216,10 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, Strin
     // validity starts now. A root key loaded from the store has an unknown
     // age, and its end rides the identity while the root key stays the same.
     let root_absent = matches!(store.find(Role::Root), Ok(None));
+    // The clock is read before `keys::load`, so a clock fault stops the
+    // start before it generates a root key with no known validity.
+    let root_made_at = if root_absent { Some(unix_now()?) } else { None };
     let loaded = keys::load(store, &published).map_err(|err| err.to_string())?;
-    let root_made_at = root_absent.then(unix_now);
     Identity::of(&loaded)
         .with_root_validity(previous.as_ref(), root_made_at)
         .publish(path)
@@ -213,11 +228,15 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, Strin
     Ok(loaded)
 }
 
-/// The time now, in seconds since the Unix epoch.
-fn unix_now() -> u64 {
+/// The time now, in seconds since the Unix epoch. A clock that reads
+/// before 1970 is an error, so the root's validity end never starts at 0.
+fn unix_now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
+        .map(|since| since.as_secs())
+        .map_err(|_| {
+            "This machine's clock reads a time before 1970, so the root key's validity cannot start. Set the system clock to the correct time.".to_owned()
+        })
 }
 
 /// The leaf issuer `bep serve` has today. The root and signing CA keys are
