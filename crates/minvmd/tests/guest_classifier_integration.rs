@@ -574,25 +574,15 @@ impl BoxSession {
                 egress,
                 ..Default::default()
             };
-            let req = CreateSessionRequest {
-                config: minimald_rpc::BoxConfig {
-                    name: Some(name.clone()),
-                    project_path: paths::HostAbsPath::try_new("/tmp")
-                        .map_err(|e| format!("project_path: {e}"))?,
-                    network,
-                    policy,
-                    // No registration happened on this path: the box attaches
-                    // as an unregistered one always has.
-                    task_addresses: Vec::new(),
-                    box_id: None,
-                    box_addresses: None,
-                    // The serde default; this session only runs execs, so it
-                    // declares no hooks either way.
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            };
+            // No registration happened on this path: the box attaches as an
+            // unregistered one always has. Hooks stay on, the serde default;
+            // this session only runs execs, so it declares no hooks either way.
+            let req = CreateSessionRequest::new(
+                name.clone(),
+                paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+                network,
+                policy,
+            );
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
             let mut rpc = channel.into_stream();
