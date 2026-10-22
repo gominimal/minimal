@@ -259,6 +259,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min` registers a GitHub grant box
+            // with the Box Egress Proxy over its control socket. The proxy is
+            // not the daemon, and the daemon's build is not in question here.
+            "cmd/boxes/create.rs::mint_grants = ungated",
             // Not a product path: the destroy-race test's own connection to
             // the harness daemon. The destroy it drives sends no gated RPC —
             // the race's loser just reports what the daemon said — so the
@@ -299,8 +303,14 @@ fn every_daemon_connection_is_classified() {
             // the selected daemon — but connections all the same, and the
             // paths they drive are the gated ones above, so the label records
             // what the tests assert rather than a decision they make.
+            // Not a product path, and not the daemon: the mint tests' own
+            // connections to a test Box Egress Proxy's control socket.
+            "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
         ]
     );
 }
