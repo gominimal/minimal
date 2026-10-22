@@ -5390,7 +5390,8 @@ fn gate_verdict(
     // port, and the node row's outside the exposures. The scoping holds only
     // while the baseline is announced: in force, the arm above returns first
     // and the baseline's registry and cache entries admit the alias at every
-    // port, a gap the in-force phase still has to close.
+    // port, a gap the in-force phase still has to close
+    // (gominimal/inbox#1147).
     let box_row = src != table.subnet().daemon_ip().octets();
     let transport_port = matches!(
         summary.protocol(),
