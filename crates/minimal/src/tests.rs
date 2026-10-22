@@ -298,6 +298,11 @@ fn every_daemon_connection_is_classified() {
             "dash/rpc.rs::connect_missing = gated",
             "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
+            // Not a daemon connection: a grant box's registration, dropped
+            // before the creation finished, forgets the box at the Box Egress
+            // Proxy over its control socket. The proxy is not the daemon, and
+            // the daemon's build is not in question here.
+            "mint.rs::drop = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
             // the selected daemon — but connections all the same, and the
@@ -311,6 +316,7 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
         ]
     );
