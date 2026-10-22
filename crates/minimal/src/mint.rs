@@ -397,10 +397,8 @@ pub fn sign_in_claims(
 pub struct Minted {
     /// The grant: the environment variable the value is for.
     pub grant: String,
-    /// The sealed value. Interim: nothing delivers it into the box until
-    /// BEP-007 places it in the grant's environment variable. The flip is
-    /// T42 (https://github.com/gominimal/minimal/issues/2488).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The sealed value. The create request carries it to the box, which
+    /// holds it in the grant's environment variable (BEP-007).
     pub sealed: Zeroizing<String>,
     /// The member's expiry, in seconds since the Unix epoch: the end of the
     /// root CA's validity.
