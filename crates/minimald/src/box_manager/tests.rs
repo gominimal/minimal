@@ -2031,3 +2031,83 @@ async fn sealed_deliveries_ride_the_record_to_the_host_params() {
             .is_none()
     );
 }
+
+/// BEP-011: the root certificate a create request carries rides the box's
+/// stored record, and a host launch takes it from there, so every launch,
+/// after a daemon restart included, adds it to the box's trust store. A box
+/// with no grant, or with steering `off`, gets none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_carries_the_root_certificate_to_the_launch() {
+    use boxes::core::bep::{BepSettings, Steering};
+    let (_state, _cache, mngr) = manager().await;
+    let pem = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n".to_string();
+    let grant_policy = |steering: Steering| boxes::BoxPolicy {
+        credentialed_upstream: Some(boxes::CredentialedUpstream {
+            bep: BepSettings {
+                steering: Some(steering),
+                ..BepSettings::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let created =
+        |name: &str, policy: boxes::BoxPolicy, root: Option<String>| minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            policy,
+            root_certificate: root,
+            ..sample_config()
+        };
+
+    let id = mngr
+        .create_session(
+            created("grant", grant_policy(Steering::ProxyEnv), Some(pem.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.root_certificate.as_deref(), Some(pem.as_str()));
+    assert_eq!(
+        crate::box_runtime::launch_root_certificate(&record).as_deref(),
+        Some(pem.as_str())
+    );
+    // The stored record reads back with it, as a restarted daemon reads it.
+    let wire = serde_json_lenient::to_string(&record).unwrap();
+    let reread: boxes::Record = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(reread.root_certificate, record.root_certificate);
+
+    // Steering `off` keeps the root out, whatever the record holds.
+    let id = mngr
+        .create_session(
+            created("off", grant_policy(Steering::Off), Some(pem.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
+
+    // A box with no grant carries no root and gets none.
+    let id = mngr
+        .create_session(created("no-grant", Default::default(), None), None)
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.root_certificate, None);
+    assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
+    let wire = serde_json_lenient::to_string(&record).unwrap();
+    assert!(!wire.contains("root_certificate"), "{wire}");
+}

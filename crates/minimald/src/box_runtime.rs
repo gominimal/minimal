@@ -327,6 +327,53 @@ pub(crate) fn place_sealed_deliveries(
     }
 }
 
+/// Where a box with the proxy's root (BEP-011) finds its CA bundle: the
+/// box's own copy of the system roots with the root appended. The bundle a
+/// package ships can be the package store's own file, so the launch writes
+/// a new file here and never writes into the one it replaces.
+pub(crate) const BOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// The hashed certificate directory the root is linked in under its
+/// subject hash (BEP-011), beside the system roots.
+pub(crate) const BOX_CA_DIR: &str = "/etc/ssl/certs";
+
+/// Where a box with the proxy's root (BEP-011) finds the root alone, for
+/// `NODE_EXTRA_CA_CERTS` and as the target of its hashed-directory link.
+pub(crate) const BOX_ROOT_CERTIFICATE: &str = "/etc/ssl/certs/minimal-box-egress-proxy-root.pem";
+
+/// The root certificate a host launch of the box adds to the box's trust
+/// store (BEP-011): the one its record holds, when the box declares a
+/// credentialed upstream and its steering is not `off`. `None` for every
+/// other box, so a box with no grant gets no root, whichever packages it
+/// shares with a box that has one.
+pub(crate) fn launch_root_certificate(record: &boxes::Record) -> Option<String> {
+    use boxes::core::bep::Steering;
+    let upstream = record.policy.credentialed_upstream.as_ref()?;
+    if upstream.bep.resolved_steering() == Steering::Off {
+        return None;
+    }
+    record.root_certificate.clone()
+}
+
+/// The trust variables a launch sets for a box whose trust store has the
+/// root (BEP-011): `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at the box's
+/// CA bundle, and `NODE_EXTRA_CA_CERTS` at the root. Empty when the root is
+/// not injected. The launch layers them below the composition, so a box
+/// spec that sets one of them keeps its own value.
+pub(crate) fn launch_trust_env(root_injected: bool) -> Vec<(String, String)> {
+    if !root_injected {
+        return Vec::new();
+    }
+    vec![
+        ("SSL_CERT_FILE".to_string(), BOX_CA_BUNDLE.to_string()),
+        ("REQUESTS_CA_BUNDLE".to_string(), BOX_CA_BUNDLE.to_string()),
+        (
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            BOX_ROOT_CERTIFICATE.to_string(),
+        ),
+    ]
+}
+
 /// The `NO_PROXY` entries every box whose environment points at the proxy
 /// carries (BEP-012), ahead of the box's own `[network.bep] no_proxy`
 /// entries: the local zone and loopback, so in-box and peer traffic never
@@ -1735,6 +1782,7 @@ mod proxy_env_tests {
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: BTreeMap::new(),
         }
     }

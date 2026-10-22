@@ -135,6 +135,10 @@ fn build_record(
         // BEP-007: the grants' sealed values ride the record, so every host
         // launch of the box, after a daemon restart included, places them.
         sealed_deliveries: config.sealed_deliveries,
+        // BEP-011: the proxy's root rides the record beside them, so every
+        // host launch of the box, after a daemon restart included, adds it
+        // to the box's own trust store.
+        root_certificate: config.root_certificate,
         attrs: config.attrs,
     };
     record

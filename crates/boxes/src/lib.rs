@@ -1287,6 +1287,13 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed_deliveries: Vec<SealedDelivery>,
 
+    /// The Box Egress Proxy's root certificate, PEM-encoded, as the
+    /// creating client handed it for a grant box (BEP-011). Every host
+    /// launch adds it to the box's own trust store. `None` for a box with
+    /// no grant and a record that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_certificate: Option<String>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
@@ -1515,6 +1522,7 @@ mod tests {
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: BTreeMap::new(),
         }
     }
