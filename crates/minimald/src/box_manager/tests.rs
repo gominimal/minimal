@@ -1570,4 +1570,32 @@ async fn sealed_deliveries_ride_the_record_to_the_host_params() {
         .unwrap()
         .expect("the created box has a record");
     assert!(crate::box_runtime::launch_deliveries(&record).is_empty());
+
+    // A grant whose name is not a variable name is refused, and no record
+    // is stored for it.
+    let err = mngr
+        .create_session(
+            minimald_rpc::BoxConfig {
+                name: Some("bad-grant".to_string()),
+                sealed_deliveries: vec![boxes::SealedDelivery {
+                    variable: "X=1; touch /tmp/owned #".to_string(),
+                    sealed: "v1.sealed-three".to_string(),
+                }],
+                ..sample_config()
+            },
+            None,
+        )
+        .await
+        .expect_err("a grant name that is not a variable name is refused");
+    assert!(
+        err.to_string()
+            .contains("not a valid environment variable name"),
+        "{err}"
+    );
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Name("bad-grant".to_string()))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

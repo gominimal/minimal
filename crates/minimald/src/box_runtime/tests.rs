@@ -7044,4 +7044,16 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
     let mut env = ConnectionEnv::new();
     place_sealed_deliveries(&mut env, boxes::SessionId::nil(), &[]);
     assert!(env.is_empty(), "{env:?}");
+
+    // A name that is not a variable name places nothing: it would be
+    // shell code in the file the box's shell sources.
+    place_sealed_deliveries(
+        &mut env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "X=1; touch /tmp/owned #".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert!(env.is_empty(), "{env:?}");
 }

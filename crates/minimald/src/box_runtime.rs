@@ -291,6 +291,17 @@ pub(crate) fn place_sealed_deliveries(
     deliveries: &[boxes::SealedDelivery],
 ) {
     for delivery in deliveries {
+        // The create refuses such a name. A record that holds one anyway
+        // places nothing, because the name is written unquoted into the
+        // file the box's shell sources.
+        if boxes::core::primitives::StrictVarName::try_new(delivery.variable.as_str()).is_err() {
+            tracing::warn!(
+                session_id = %session_id,
+                variable = ?delivery.variable,
+                "skipped a grant's sealed value: its name is not a variable name"
+            );
+            continue;
+        }
         env.insert(delivery.variable.clone(), delivery.sealed.clone());
         tracing::debug!(
             session_id = %session_id,
