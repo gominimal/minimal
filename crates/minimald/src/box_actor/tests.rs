@@ -3282,20 +3282,12 @@ async fn own_ip_default_deny_all() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some("own-ip-bare".to_string()),
-                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-                network: boxes::NetworkMode::OwnIp,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: None,
-        })
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "own-ip-bare",
+            paths::HostAbsPath::try_new("/uwu").unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        ))
         .await
         .unwrap();
     let logged = capture.contents();
@@ -3331,31 +3323,23 @@ async fn own_ip_default_deny_all() {
 /// An own-address session's config: a box that declares one published port —
 /// the ingress a publish is made of (NET-010) — under the session `name`.
 fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
-    minimald_rpc::CreateSessionRequest {
-        config: minimald_rpc::BoxConfig {
-            name: Some(name.to_string()),
-            project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-            network: boxes::NetworkMode::OwnIp,
-            policy: boxes::BoxPolicy {
-                egress: None,
-                ingress: Some(boxes::IngressPolicy {
-                    port_mappings: vec![boxes::PortMapping {
-                        external_port: 18080,
-                        internal_port: 80,
-                        proto: boxes::IpProto::Tcp,
-                    }],
-                    ..Default::default()
-                }),
-                credentialed_upstream: None,
-            },
-            task_addresses: Vec::new(),
-            box_id: None,
-            box_addresses: None,
-            hooks_enabled: true,
-            attrs: Default::default(),
+    minimald_rpc::CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new("/uwu").unwrap(),
+        boxes::NetworkMode::OwnIp,
+        boxes::BoxPolicy {
+            egress: None,
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: boxes::IpProto::Tcp,
+                }],
+                ..Default::default()
+            }),
+            credentialed_upstream: None,
         },
-        must_match_version: None,
-    }
+    )
 }
 
 /// The same request with the hand a real creator sends: the registration's
@@ -7837,20 +7821,12 @@ async fn create_logs_dynamic_ingress() {
         .await
         .unwrap();
     client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some("dyn-bare-logged".to_string()),
-                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-                network: boxes::NetworkMode::OwnIp,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: None,
-        })
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "dyn-bare-logged",
+            paths::HostAbsPath::try_new("/uwu").unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        ))
         .await
         .unwrap();
 
