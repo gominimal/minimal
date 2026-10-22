@@ -171,9 +171,12 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
         match unix_now() {
             Ok(now) => Some(now),
             Err(err) => {
+                // The store already holds the new root key. A later `bep`
+                // start publishes no validity end for a root it did not
+                // make, so only a new replacement gives the root its end.
                 eprintln!("{err}");
                 eprintln!(
-                    "The published identity was not changed, so it still names the old {role} key. Correct the problem above, then run `bep` to publish the new key."
+                    "The published identity was not changed, so it still names the old root key. Set the system clock, then run `bep --replace-key root` again."
                 );
                 return ExitCode::FAILURE;
             }
