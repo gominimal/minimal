@@ -204,7 +204,6 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -265,7 +264,6 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -416,7 +414,6 @@ impl FloodedAttach {
                 session_id: boxes::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
-                sealed_deliveries: Vec::new(),
                 #[cfg(target_os = "linux")]
                 name_marker: None,
             },
@@ -672,7 +669,6 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -736,7 +732,6 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -788,7 +783,6 @@ async fn a_kill_tells_the_binding_nothing() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -832,7 +826,6 @@ async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1308,7 +1301,6 @@ async fn get_attrs_tracks_title_and_io_times() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1387,7 +1379,6 @@ async fn kill_tears_down_host_and_reaps_process() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1494,7 +1485,6 @@ async fn exit_releases_the_network() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1551,7 +1541,6 @@ async fn detach_keystroke_holds_the_session_and_network() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1655,7 +1644,6 @@ async fn stale_binding_generation_input_is_discarded() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1790,7 +1778,6 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 session_id: boxes::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
-                sealed_deliveries: Vec::new(),
                 #[cfg(target_os = "linux")]
                 name_marker: None,
             },
@@ -6338,7 +6325,6 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
-            sealed_deliveries: Vec::new(),
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -6981,12 +6967,23 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
         ..test_paths()
     };
     // A value already in the variable is the one a delivery must replace.
-    let connection_env: ConnectionEnv = [
-        ("TERM".to_string(), "xterm-256color".to_string()),
-        ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
-    ]
-    .into_iter()
-    .collect();
+    // The launch places the deliveries before the host is built, the way
+    // `launch_host` does.
+    let mut attach_env = AttachEnv {
+        inherited: vec![],
+        connection: vec![
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
+        ],
+    };
+    let connection_env = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
     let (host, _handle) = Host::build(
         MockLauncher::default(),
         HostParams {
@@ -7002,10 +6999,6 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env,
-            sealed_deliveries: vec![boxes::SealedDelivery {
-                variable: "GH_TOKEN".to_string(),
-                sealed: SEALED.to_string(),
-            }],
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -7056,4 +7049,55 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
         }],
     );
     assert!(env.is_empty(), "{env:?}");
+}
+
+/// BEP-007: the `AttachEnv` a launch hands the launcher holds each grant's
+/// sealed value, so the shell's launch environment has it before its
+/// entrypoint runs. The connection layer sits above the composition, so the
+/// sealed value wins over a composition value in the same variable.
+#[test]
+fn sealed_value_reaches_the_shell_launch_environment() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    let mut attach_env = AttachEnv {
+        inherited: vec![("LANG".to_string(), "C.UTF-8".to_string())],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert_eq!(kept.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(attach_env.connection_env(), kept);
+    assert!(
+        attach_env
+            .connection
+            .contains(&("GH_TOKEN".to_string(), SEALED.to_string())),
+        "{:?}",
+        attach_env.connection
+    );
+    let env = layer_session_env(
+        session_baseline_env("box-1", None),
+        attach_env.inherited.clone(),
+        vec![("GH_TOKEN".to_string(), "from-the-composition".to_string())],
+        attach_env.connection.clone(),
+    );
+    assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+    assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+
+    // A box with no grant changes nothing in the launch environment.
+    let mut plain = AttachEnv {
+        inherited: vec![],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(&mut plain, boxes::SessionId::nil(), &[]);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        plain.connection,
+        vec![("TERM".to_string(), "xterm-256color".to_string())]
+    );
 }

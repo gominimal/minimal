@@ -260,10 +260,6 @@ pub(crate) struct HostParams {
     pub session_id: boxes::SessionId,
     pub composition: Option<Arc<boxes::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
-    /// The sealed value of each of the box's GitHub grants, from its record
-    /// (BEP-007). The build places each one in its grant's environment
-    /// variable; see [`place_sealed_deliveries`].
-    pub sealed_deliveries: Vec<boxes::SealedDelivery>,
     /// The session's hostname-registry marker (NET-128): the host marks the
     /// box's name running when it takes over and stopped when it exits, so a
     /// name the box shares with its node answers NODATA while a dead box's
@@ -275,9 +271,29 @@ pub(crate) struct HostParams {
 
 /// The sealed values a host launch of the box places in its environment
 /// (BEP-007): the ones its record holds, which the create copied from the
-/// request. [`HostParams::sealed_deliveries`] takes them.
+/// request. [`place_launch_deliveries`] places them.
 pub(crate) fn launch_deliveries(record: &boxes::Record) -> Vec<boxes::SealedDelivery> {
     record.sealed_deliveries.clone()
+}
+
+/// Places the grants' sealed values in a launch's connection layer
+/// (BEP-007), before the launcher builds the shell from `attach_env`, so the
+/// values exist before the shell's entrypoint runs. Returns the placed
+/// connection layer for the host to keep, layer onto what it runs in the box
+/// and republish for the shell to re-read. Logs once per variable, through
+/// [`place_sealed_deliveries`].
+pub(crate) fn place_launch_deliveries(
+    attach_env: &mut AttachEnv,
+    session_id: boxes::SessionId,
+    deliveries: &[boxes::SealedDelivery],
+) -> ConnectionEnv {
+    let mut connection_env = attach_env.connection_env();
+    place_sealed_deliveries(&mut connection_env, session_id, deliveries);
+    attach_env.connection = connection_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    connection_env
 }
 
 /// Places each grant's sealed value in the grant's environment variable
@@ -582,16 +598,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             holds_host_row,
             session_id,
             composition,
-            mut connection_env,
-            sealed_deliveries,
+            connection_env,
             #[cfg(target_os = "linux")]
             name_marker,
         } = params;
-        // BEP-007: the grants' sealed values join the layer this host puts
-        // over everything it runs in the box and publishes for the shell to
-        // re-read before every command, so the shell, its exec'd commands
-        // and its hooks all see them.
-        place_sealed_deliveries(&mut connection_env, session_id, &sealed_deliveries);
         // The change-detection baseline (`delta`) is armed once per session and
         // handed in, so a host rebuilt on reattach keeps the activation-time
         // reference point rather than re-snapshotting an already-modified
