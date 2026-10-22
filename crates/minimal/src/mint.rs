@@ -526,31 +526,34 @@ pub fn mint_and_register(
         // box the proxy stored. That connection can still carry the late
         // reply, so the forget goes over a new one.
         if !matches!(error, MintError::NotRunning { .. }) {
-            let forgot = ControlClient::connect_with_timeout(&control.path, FORGET_TIMEOUT)
-                .and_then(|mut fresh| fresh.forget_box(&box_id));
-            if let Err(forget) = forgot {
-                tracing::warn!(
-                    box_id = %box_id,
-                    error = %forget,
-                    "the proxy did not forget the box after its registration failed"
-                );
-            }
+            forget_on_a_new_connection(&control.path, &box_id, "its registration failed");
         }
         return Err(error);
     }
     // BEP-063: the key is registered before a handle signed under it is
     // delivered. It goes last, so no failed step leaves it registered.
+    // A failed key reply, a read timeout for one, can leave the late reply
+    // on this connection, so the forget goes over a new one here too.
     if let Err(error) = control.register_client_key(key) {
-        if let Err(forget) = control.forget_box(&box_id) {
-            tracing::warn!(
-                box_id = %box_id,
-                error = %forget,
-                "the proxy did not forget the box after its key was refused"
-            );
-        }
+        forget_on_a_new_connection(&control.path, &box_id, "its key was refused");
         return Err(error);
     }
     Ok(minted)
+}
+
+/// Tells the proxy at `path` to forget `box_id` over a new connection, so
+/// no late reply to an earlier request reads as the forget's answer. A
+/// forget that fails is logged with `after` as its cause.
+fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
+    let forgot = ControlClient::connect_with_timeout(path, FORGET_TIMEOUT)
+        .and_then(|mut fresh| fresh.forget_box(box_id));
+    if let Err(forget) = forgot {
+        tracing::warn!(
+            box_id = %box_id,
+            error = %forget,
+            "the proxy did not forget the box after {after}"
+        );
+    }
 }
 
 /// A box the proxy holds for a creation that has not finished. Dropped

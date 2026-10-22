@@ -4108,41 +4108,56 @@ mod mint_tests {
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
         std::thread::spawn(move || {
-            let clients = std::sync::RwLock::new(bep::handle::ClientKeys::new());
-            let Ok((stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut writer = stream;
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                let request: bep::control::Request = serde_json_lenient::from_str(&line).unwrap();
-                let op = match request {
-                    bep::control::Request::RegisterClientKey { .. } => "register_client_key",
-                    bep::control::Request::RegisterBox { .. } => "register_box",
-                    bep::control::Request::ForgetBox { .. } => "forget_box",
+            let clients = Arc::new(std::sync::RwLock::new(bep::handle::ClientKeys::new()));
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
                 };
-                served_ops.lock().unwrap().push(op.to_owned());
-                let reply = if op == "register_client_key" {
-                    bep::control::Reply {
-                        ok: false,
-                        kid: None,
-                        error: Some("the key is not a P-256 public key".into()),
+                served_ops.lock().unwrap().push("connect".to_owned());
+                // The proxy serves each connection on its own task.
+                let (clients, served_boxes, served_ops) = (
+                    Arc::clone(&clients),
+                    Arc::clone(&served_boxes),
+                    Arc::clone(&served_ops),
+                );
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        let request: bep::control::Request =
+                            serde_json_lenient::from_str(&line).unwrap();
+                        let op = match request {
+                            bep::control::Request::RegisterClientKey { .. } => {
+                                "register_client_key"
+                            }
+                            bep::control::Request::RegisterBox { .. } => "register_box",
+                            bep::control::Request::ForgetBox { .. } => "forget_box",
+                        };
+                        served_ops.lock().unwrap().push(op.to_owned());
+                        let reply = if op == "register_client_key" {
+                            bep::control::Reply {
+                                ok: false,
+                                kid: None,
+                                error: Some("the key is not a P-256 public key".into()),
+                            }
+                        } else {
+                            bep::control::handle_line(&line, &clients, &served_boxes)
+                        };
+                        let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                        answer.push('\n');
+                        writer.write_all(answer.as_bytes()).unwrap();
+                        line.clear();
                     }
-                } else {
-                    bep::control::handle_line(&line, &clients, &served_boxes)
-                };
-                let mut answer = serde_json_lenient::to_string(&reply).unwrap();
-                answer.push('\n');
-                writer.write_all(answer.as_bytes()).unwrap();
-                line.clear();
+                });
             }
         });
         (dir, path, boxes, ops)
     }
 
     // BEP-063: a client key the proxy refuses leaves no box registered
-    // either. The box is registered first and forgotten again.
+    // either. The box is registered first and forgotten again, over a new
+    // connection.
     #[test]
     fn a_refused_client_key_forgets_the_box_again() {
         let (_, identity) = proxy();
@@ -4161,7 +4176,13 @@ mod mint_tests {
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
         assert_eq!(
             *ops.lock().unwrap(),
-            ["register_box", "register_client_key", "forget_box"]
+            [
+                "connect",
+                "register_box",
+                "register_client_key",
+                "connect",
+                "forget_box"
+            ]
         );
         assert!(boxes.get(BOX_HEX).is_none());
     }
