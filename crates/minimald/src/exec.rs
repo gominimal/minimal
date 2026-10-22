@@ -1250,6 +1250,16 @@ where
         }
         None => bridge(channel_id, stream, r, w, e, client_lost).await,
     };
+    // A shutdown stops a command only by tearing down what runs it: a
+    // box exec is SIGKILLed with the container and the injection shim
+    // reports `128 + signo`, and a task exec is killed through its
+    // handle. A command that ends on its own during a shutdown — a
+    // graceful exit, a failure — was not stopped by it, so only a
+    // kill-shaped status (see `KILLED_STATUS_MIN`) gets the notice.
+    // Nothing the shutdown stops is silenced: every exec kind it stops
+    // reports a status of 128 or more. (The host-side git exec is
+    // signalled by nothing here — a signal-terminated `TokioProcess`
+    // maps to 1 — and it is the one kind the shutdown never stops.)
     let shutting_down = exit_status >= KILLED_STATUS_MIN && shutting_down();
     if let Some(notice) = exit_notice(shutting_down, exit_status, stopped.load(Ordering::SeqCst)) {
         let _ = e.write_all(notice).await;
