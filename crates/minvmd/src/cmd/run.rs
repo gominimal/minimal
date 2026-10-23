@@ -883,7 +883,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 &boxes,
                 wire,
                 bep_box_source(
-                    _bep_stub.is_some() || _bep_proxy.is_some(),
+                    // The stand-in binds before it returns, so it listens
+                    // for the boot's life. The proxy listens only once its
+                    // watcher sees its socket, and stops with its exit.
+                    if _bep_stub.is_some() {
+                        Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                            true,
+                        )))
+                    } else {
+                        _bep_proxy.as_ref().map(BepProxy::listening)
+                    },
                     boxes.table(),
                     proxy_attachments.clone(),
                 ),
@@ -1386,8 +1395,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 }
 
 /// The override for the `bep` binary the supervisor starts. Unset, the
-/// supervisor looks beside its own binary, where `just minvmd-build` and
-/// the installer put it.
+/// supervisor looks beside its own binary, where `just minvmd-build` puts
+/// it. The installer does not ship `bep` yet: `scripts/dist-build.sh` and
+/// the release workflow build only `minvmd`, so an installed `minvmd`
+/// finds no proxy and boots without a credentialed lane. That release gap
+/// is a residual of BEP-015.
 const BEP_BIN_ENV: &str = "MINVMD_BEP_BIN";
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
@@ -1417,6 +1429,10 @@ fn resolve_bep_binary() -> Option<std::path::PathBuf> {
 #[derive(Debug)]
 struct BepProxy {
     pid: u32,
+    /// Whether the proxy listens now: set by the watcher while the child
+    /// runs and its listener socket is the one this start made, cleared
+    /// when the child exits. The box source reads it at every poll.
+    listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     watcher: Option<std::thread::JoinHandle<()>>,
 }
@@ -1434,6 +1450,10 @@ impl BepProxy {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
 
+        // The socket a previous boot left at the path, if any. `bep`
+        // replaces a stale one, so only a socket that is not this one is
+        // the new proxy's.
+        let stale = socket_identity(listener);
         let out = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1466,15 +1486,22 @@ impl BepProxy {
         }
         let pid = child.id();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listening = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let watcher = {
-            let stop = std::sync::Arc::clone(&stop);
-            let log = log.to_path_buf();
+            let watch = BepWatch {
+                stop: std::sync::Arc::clone(&stop),
+                listening: std::sync::Arc::clone(&listening),
+                listener: listener.to_path_buf(),
+                stale,
+                log: log.to_path_buf(),
+            };
             std::thread::Builder::new()
                 .name("bep-watch".into())
-                .spawn(move || watch_bep(child, &stop, &log))?
+                .spawn(move || watch_bep(child, &watch))?
         };
         Ok(Self {
             pid,
+            listening,
             stop,
             watcher: Some(watcher),
         })
@@ -1483,6 +1510,37 @@ impl BepProxy {
     fn pid(&self) -> u32 {
         self.pid
     }
+
+    /// The flag the box source reads: whether the proxy listens now.
+    fn listening(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.listening)
+    }
+}
+
+/// The device, inode and change time of the socket at `path`, or `None`
+/// when no socket is there. `bep` removes a stale socket before it binds,
+/// so the inode alone can repeat. The change time tells the two apart.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    meta.file_type()
+        .is_socket()
+        .then(|| (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()))
+}
+
+/// What [`socket_identity`] returns.
+type SocketIdentity = (u64, u64, i64, i64);
+
+/// What the watcher thread holds beside the child.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+struct BepWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    listener: std::path::PathBuf,
+    /// The socket at `listener` before the start, which is not the proxy's.
+    stale: Option<SocketIdentity>,
+    log: std::path::PathBuf,
 }
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
@@ -1497,14 +1555,18 @@ impl Drop for BepProxy {
 
 /// The watcher's loop: wait for the proxy to exit, or for a stop.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn watch_bep(
-    mut child: std::process::Child,
-    stop: &std::sync::atomic::AtomicBool,
-    log: &std::path::Path,
-) {
+fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
+    use std::sync::atomic::Ordering;
     let pid = child.id();
+    let log = watch.log.as_path();
+    let stop = watch.stop.as_ref();
     loop {
-        match child.try_wait() {
+        let exited = child.try_wait();
+        if !matches!(exited, Ok(None)) {
+            // Not running, or not knowable: no share may bind to the path.
+            watch.listening.store(false, Ordering::SeqCst);
+        }
+        match exited {
             Ok(Some(status)) => {
                 tracing::warn!(
                     pid,
@@ -1514,13 +1576,23 @@ fn watch_bep(
                 );
                 return;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // `bep serve` binds its listener once its keys, audit log
+                // and root certificates are ready, so a new socket at the
+                // path is the proxy listening.
+                let bound = socket_identity(&watch.listener)
+                    .is_some_and(|identity| Some(identity) != watch.stale);
+                if bound != watch.listening.swap(bound, Ordering::SeqCst) {
+                    tracing::debug!(pid, listening = bound, "box egress proxy listener");
+                }
+            }
             Err(error) => {
                 tracing::warn!(pid, %error, "box egress proxy could not be waited on");
                 return;
             }
         }
-        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
+            watch.listening.store(false, Ordering::SeqCst);
             let _ = child.kill();
             let _ = child.wait();
             tracing::info!(pid, "box egress proxy stopped with the VM");
@@ -1568,37 +1640,72 @@ fn start_bep_proxy(
     }
 }
 
-/// The box source the peer's pool is partitioned by: the table's box rows
-/// with their attachments — [`crate::box_registry::RegisteredBoxes`] —
-/// when an acceptor was started at the wire's path, and
-/// [`switch::bep_host::NoBoxes`] — no row, no share, no socket — when none
-/// was.
+/// The box source the peer's pool is partitioned by:
+/// [`CredentialedBoxes`] when an acceptor was started at the wire's path,
+/// and [`switch::bep_host::NoBoxes`] — no row, no share, no socket — when
+/// none was.
 ///
 /// A socket in the pool is a lane onto the host for the box whose share
-/// holds it. The credentialed-only gate rule (NET-145, T45, #1665) is
-/// still ahead, so what stands at the end of that lane is the acceptor
-/// itself. A production boot that started `bep serve` registers rows: the
-/// proxy admits only a delivery with this boot's token, and redeems only
-/// for a box its control socket registered (BEP-015). A production boot
-/// with no proxy hands the peer an empty source and the pool binds nothing
-/// — a box's connection to the proxy's address meets the stack's own reset.
+/// holds it. The gate decides who may reach the proxy's address
+/// (NET-134, T45, #1885): `egress::proxy_lane_admits` refuses a frame to
+/// it from a row that declared no credentialed upstream. The shares follow
+/// the same declaration (§7.1), so a row with no lane holds no socket. A
+/// production boot that started `bep serve` registers rows, and the proxy
+/// admits only a delivery with this boot's token. A production boot with
+/// no proxy hands the peer an empty source and the pool binds nothing — a
+/// box's connection to the proxy's address meets the stack's own reset.
 /// The stand-in's boot (`MINVMD_BEP_STUB`, the e2e lane's flag and nothing
-/// else's) registers rows too. The caller passes whether an acceptor's
-/// handle exists — not whether a flag asked for one — so the pool can
-/// never be partitioned by a path nothing was started on.
+/// else's) registers rows too. The caller passes the acceptor's own
+/// `listening` flag — not whether a flag asked for one — so the pool is
+/// never partitioned by a path nothing listens on.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn bep_box_source(
-    acceptor_started: bool,
+    listening: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     table: crate::box_registry::BoxTable,
     attachments: crate::bep_attach::Attachments,
 ) -> std::sync::Arc<dyn switch::bep_host::BepBoxSource> {
-    if acceptor_started {
-        std::sync::Arc::new(crate::box_registry::RegisteredBoxes::new(
+    match listening {
+        Some(listening) => std::sync::Arc::new(CredentialedBoxes {
+            boxes: crate::box_registry::RegisteredBoxes::new(table.clone(), attachments),
             table,
-            attachments,
-        ))
-    } else {
-        std::sync::Arc::new(switch::bep_host::NoBoxes)
+            listening,
+        }),
+        None => std::sync::Arc::new(switch::bep_host::NoBoxes),
+    }
+}
+
+/// The registered box rows that declared a credentialed upstream, while
+/// the acceptor listens. The pool polls the addresses every stack turn, so
+/// a proxy that starts listening late grows the shares within a turn, and
+/// one that exits takes them away.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+struct CredentialedBoxes {
+    boxes: crate::box_registry::RegisteredBoxes,
+    table: crate::box_registry::BoxTable,
+    listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl switch::bep_host::BepBoxSource for CredentialedBoxes {
+    fn box_switch_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+        if !self.listening.load(std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let declared: std::collections::HashSet<std::net::Ipv4Addr> = self
+            .table
+            .rows()
+            .iter()
+            .filter(|row| row.declares_credentialed_upstream())
+            .map(|row| row.switch_addr())
+            .collect();
+        self.boxes
+            .box_switch_addresses()
+            .into_iter()
+            .filter(|addr| declared.contains(addr))
+            .collect()
+    }
+
+    fn box_id_for_source(&self, source: std::net::Ipv4Addr) -> Option<crate::bep_attach::BoxId> {
+        self.boxes.box_id_for_source(source)
     }
 }
 
@@ -3936,11 +4043,11 @@ mod tests {
     }
 
     /// NET-132/T69: a boot with no acceptor binds no pool socket. The
-    /// credentialed-only gate rule (T45, #1665) is still ahead, so the
     /// supervisor hands the peer an empty box source — rows registered or
     /// not, the node namespace's row included — and the pool a peer would
-    /// build holds nothing. A started acceptor (`bep serve`, or the
-    /// stand-in under its flag) is what registers rows.
+    /// build holds nothing. A listening acceptor (`bep serve`, or the
+    /// stand-in under its flag) is what registers rows, and only the rows
+    /// that declared a credentialed upstream (NET-134).
     #[tokio::test]
     async fn production_wiring_leaves_pool_len_zero_with_rows_registered() {
         let subnet = switch::SwitchSubnet::default();
@@ -3951,6 +4058,18 @@ mod tests {
         registry
             .register_client_box(crate::box_registry::ClientBoxSpec {
                 name: "box-a".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has a switch address to hand out");
+        // A box with no credentialed lane: the gate refuses its frames to
+        // the proxy's address, so it holds no share either.
+        registry
+            .register_client_box(crate::box_registry::ClientBoxSpec {
+                name: "box-b".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
@@ -3971,7 +4090,7 @@ mod tests {
         let mut lane = switch::bep_host::test_util::TestLane::new(
             subnet,
             wire.clone(),
-            super::bep_box_source(false, registry.table(), attachments.clone()),
+            super::bep_box_source(None, registry.table(), attachments.clone()),
         );
         for _ in 0..2 {
             lane.step().await;
@@ -3982,21 +4101,49 @@ mod tests {
             "a production boot binds no pool socket, rows registered or not"
         );
 
-        // The stand-in's wiring registers rows, and only the boxes': one
-        // client box, one share — the node namespace's row adds none.
-        let mut stub_lane = switch::bep_host::test_util::TestLane::new(
+        // An acceptor that is not listening yet binds nothing either.
+        let listening = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut acceptor_lane = switch::bep_host::test_util::TestLane::new(
             subnet,
             wire,
-            super::bep_box_source(true, registry.table(), attachments),
+            super::bep_box_source(
+                Some(std::sync::Arc::clone(&listening)),
+                registry.table(),
+                attachments,
+            ),
         );
         for _ in 0..2 {
-            stub_lane.step().await;
+            acceptor_lane.step().await;
         }
         assert_eq!(
-            stub_lane.pool_len(),
+            acceptor_lane.pool_len(),
+            0,
+            "no share binds to a path nothing listens on"
+        );
+
+        // Once it listens, the rows that declared a lane get shares: one
+        // declared box, one share. The undeclared box and the node
+        // namespace's row add none.
+        listening.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            acceptor_lane.step().await;
+        }
+        assert_eq!(
+            acceptor_lane.pool_len(),
             switch::bep_host::DEFAULT_PER_SOURCE_CAP,
-            "the stand-in's wiring registers the boxes' shares, and only \
-             the boxes'"
+            "a listening acceptor registers the declared boxes' shares, and \
+             only theirs"
+        );
+
+        // An acceptor that exits takes the shares with it.
+        listening.store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            acceptor_lane.step().await;
+        }
+        assert_eq!(
+            acceptor_lane.pool_len(),
+            0,
+            "the shares go when the acceptor stops listening"
         );
     }
 
@@ -4133,6 +4280,8 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let listener = dir.path().join("gvproxy-bep.sock");
+        // A socket a previous boot left behind is not the proxy listening.
+        let stale = std::os::unix::net::UnixListener::bind(&listener).expect("stale socket");
         let log = listener.with_file_name(super::BEP_LOG_FILE);
         let mut token = [0u8; switch::bep_host::TOKEN_LEN];
         for (i, byte) in token.iter_mut().enumerate() {
@@ -4169,8 +4318,34 @@ mod tests {
             "the proxy's output lands in the log beside its socket"
         );
 
+        // The watcher looks every interval. A stale socket never counts.
+        let listening = proxy.listening();
+        std::thread::sleep(super::BEP_WATCH_INTERVAL * 3);
+        assert!(
+            !listening.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale socket at the path is not the proxy listening"
+        );
+        // The proxy binds its own socket over the stale one, as `bep`
+        // does: bound at a staging path, then renamed onto the path.
+        let staging = dir.path().join("staging.sock");
+        let _bound = std::os::unix::net::UnixListener::bind(&staging).expect("bind");
+        std::fs::rename(&staging, &listener).unwrap();
+        drop(stale);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !listening.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher never saw the proxy's socket"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
         let pid = proxy.pid();
         drop(proxy);
+        assert!(
+            !listening.load(std::sync::atomic::Ordering::SeqCst),
+            "a stopped proxy is not listening"
+        );
         // The watcher reaped the child, so the pid names no process of ours.
         let alive = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
