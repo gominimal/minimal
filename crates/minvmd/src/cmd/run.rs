@@ -1464,14 +1464,16 @@ impl BepProxy {
             .append(true)
             .open(log)?;
         let err = out.try_clone()?;
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .arg("serve")
             .arg("--listener")
             .arg(listener)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()?;
+            .stderr(Stdio::from(err));
+        tie_to_parent(&mut command);
+        let mut child = command.spawn()?;
         let mut line = String::with_capacity(token.len() * 2 + 1);
         for byte in token {
             line.push_str(&format!("{byte:02x}"));
@@ -1522,6 +1524,39 @@ impl BepProxy {
     fn listening(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.listening)
     }
+}
+
+/// Ties the proxy's life to the supervisor's, so a supervisor that dies
+/// without unwinding (SIGKILL, a crash) does not leave `bep serve` running
+/// with this boot's token and holding its socket. Linux arms
+/// `PR_SET_PDEATHSIG(SIGTERM)` in the child. The signal follows the thread
+/// that forks, and the supervisor's boot thread lives as long as the VM.
+/// The child exits at once when the supervisor is already gone at the
+/// `prctl`. macOS has no parent-death signal: #2501
+/// (https://github.com/gominimal/minimal/issues/2501) owns that half.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn tie_to_parent(command: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: getpid() is called before the fork. In the child,
+        // prctl, getppid and _exit are async-signal-safe, and the closure
+        // allocates nothing.
+        let parent = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
 }
 
 /// The device, inode and change time of the socket at `path`, or `None`
@@ -4490,6 +4525,43 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "dropping the handle stops the proxy");
+    }
+
+    /// BEP-015: a supervisor that dies without unwinding leaves no
+    /// `bep serve` behind. The thread that starts the proxy exits here
+    /// while the handle lives on, as a SIGKILL'd supervisor would, and the
+    /// parent-death signal stops the child.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_is_started_with_the_per_boot_token_and_stops_when_its_parent_dies() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bep");
+        std::fs::write(&bin, "#!/bin/sh\nIFS= read -r token\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = dir.path().join("gvproxy-bep.sock");
+        let log = listener.with_file_name(super::BEP_LOG_FILE);
+        let token = [7u8; switch::bep_host::TOKEN_LEN];
+
+        let proxy = std::thread::spawn({
+            let (bin, listener, log) = (bin.clone(), listener.clone(), log.clone());
+            move || super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn")
+        })
+        .join()
+        .expect("the starting thread");
+        let pid = libc::pid_t::try_from(proxy.pid()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: kill with signal 0 only probes whether the pid exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the proxy outlived the thread that started it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(proxy);
     }
 
     /// A watcher thread that cannot start leaves no proxy running with the
