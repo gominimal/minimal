@@ -475,6 +475,17 @@ jobs:
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
+            - name: Fetch pinned gvproxy switch binary
+              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
+              # provides the guest's egress (NAT + DNS). Without it minvmd boots
+              # the VM switchless (gvproxy resolution is best-effort and never
+              # errors), so the guest overlay has no other end and every egress —
+              # including the in-guest `pkgs` clone during session mint — dies
+              # with "Could not resolve host". Fetched before the lifecycle step,
+              # which points MINVMD_GVPROXY_BIN here too: every gvproxy this job
+              # starts then runs from $RUNNER_TEMP, where the scoped reaps match
+              # it, and never from a gvproxy installed on the mini (#2456).
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Daemon lifecycle (run --detach → status → stop)
               # Exercises the supervised daemon path (detach, status polling,
               # documented stop semantics) that the integration harnesses and
@@ -488,15 +499,8 @@ jobs:
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
               run: ./scripts/minvmd-lifecycle.sh
-            - name: Fetch pinned gvproxy switch binary
-              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
-              # provides the guest's egress (NAT + DNS). Without it minvmd boots
-              # the VM switchless (gvproxy resolution is best-effort and never
-              # errors), so the guest overlay has no other end and every egress —
-              # including the in-guest `pkgs` clone during session mint — dies
-              # with "Could not resolve host".
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
               # The unified session e2e (scripts/session-e2e.sh — the SAME
               # proof every target lane runs), here against the VM-backed
