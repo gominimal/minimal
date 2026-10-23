@@ -535,6 +535,50 @@ impl BoxActor {
                 #[cfg(not(target_os = "linux"))]
                 let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = Vec::new();
 
+                // A declared TCP host port that another process already
+                // holds at this box's published address fails the finalize
+                // before the `Active` write (NET-121, design §7.1: the bind
+                // succeeds before the box is active, and a failed bind is an
+                // error). The probe needs the address the registration above
+                // publishes, so it runs here, and the client's activate
+                // cleanup withdraws the publish like any other failure after
+                // that point. On a native host the forwarder binds in the
+                // daemon's own network namespace, so the daemon probes. On a
+                // VM-backed host the forwarder binds on the host OS, so the
+                // probe finds nothing and the spawn's apply reports the port.
+                // Skipped when activate hooks run: their launch binds the
+                // forwards, and a taken port fails that apply with the same
+                // error.
+                #[cfg(target_os = "linux")]
+                if let (boxes::NetworkMode::OwnIp, Some(ingress), false) = (
+                    &record.network,
+                    record.policy.ingress.as_ref(),
+                    self.has_hooks_for(crate::hooks::HookEvent::Activate),
+                ) {
+                    let control = self.switch_control().await;
+                    let published = self
+                        .hostnames
+                        .read()
+                        .expect("hostname registry lock poisoned")
+                        .published_own_address(record.id);
+                    let yielded: Vec<u16> = shared_port_collisions.iter().map(|c| c.port).collect();
+                    if let Some(published) = published
+                        && let Some(&port) = crate::net::policy::host_ports_in_use(
+                            &control, published, ingress, &yielded,
+                        )
+                        .first()
+                    {
+                        tracing::warn!(
+                            port,
+                            session = %record.id,
+                            action = "host-port-in-use",
+                            "declared ingress port is already in use on the host; \
+                             finalize fails"
+                        );
+                        return Err(crate::net::policy::address_in_use_error(port));
+                    }
+                }
+
                 let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
                 if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
                     self.launch_host_for_hooks(LaunchPhase::Activating).await?;
