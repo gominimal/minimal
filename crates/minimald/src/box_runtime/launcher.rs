@@ -1254,12 +1254,10 @@ impl BoxLauncher for SandboxLauncher {
             .as_ref()
             .map(|c| c.orientation().loadouts_display.as_str())
             .filter(|d| !d.is_empty());
-        // BEP-011: the trust variables sit on the baseline layer, below the
-        // composition, so a box spec that sets one keeps its own value.
-        let mut baseline_env = session_baseline_env(&name, loadouts_display);
-        baseline_env.extend(super::launch_trust_env(root_certificate.is_some()));
+        // BEP-011: the env build adds the trust variables below these, once
+        // it knows whether the box's packages ship a CA bundle.
         let env_vars = layer_session_env(
-            baseline_env,
+            session_baseline_env(&name, loadouts_display),
             attach_env.inherited,
             composition_vars,
             attach_env.connection,
@@ -1316,7 +1314,7 @@ impl BoxLauncher for SandboxLauncher {
                 env_args = env_args.with_classifier_leaf(leaf);
             }
             // BEP-011: the build writes the root into the box's own bundle
-            // copy and hashed directory.
+            // copy and hashed directory, and sets the trust variables.
             if let Some(pem) = root_certificate {
                 env_args = env_args.with_root_certificate(pem);
             }

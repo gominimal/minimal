@@ -356,22 +356,38 @@ pub(crate) fn launch_root_certificate(record: &boxes::Record) -> Option<String> 
 }
 
 /// The trust variables a launch sets for a box whose trust store has the
-/// root (BEP-011): `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at the box's
-/// CA bundle, and `NODE_EXTRA_CA_CERTS` at the root. Empty when the root is
-/// not injected. The launch layers them below the composition, so a box
-/// spec that sets one of them keeps its own value.
-pub(crate) fn launch_trust_env(root_injected: bool) -> Vec<(String, String)> {
+/// root (BEP-011): `NODE_EXTRA_CA_CERTS` at the root, and, when the box has
+/// its own CA bundle, `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at it. A box
+/// whose packages ship no bundle gets no bundle, so those two stay unset and
+/// a tool that reads them keeps its own public roots. Empty when the root is
+/// not injected.
+pub(crate) fn launch_trust_env(root_injected: bool, bundle: bool) -> Vec<(String, String)> {
     if !root_injected {
         return Vec::new();
     }
-    vec![
-        ("SSL_CERT_FILE".to_string(), BOX_CA_BUNDLE.to_string()),
-        ("REQUESTS_CA_BUNDLE".to_string(), BOX_CA_BUNDLE.to_string()),
-        (
-            "NODE_EXTRA_CA_CERTS".to_string(),
-            BOX_ROOT_CERTIFICATE.to_string(),
-        ),
-    ]
+    let mut vars = Vec::new();
+    if bundle {
+        vars.push(("SSL_CERT_FILE".to_string(), BOX_CA_BUNDLE.to_string()));
+        vars.push(("REQUESTS_CA_BUNDLE".to_string(), BOX_CA_BUNDLE.to_string()));
+    }
+    vars.push((
+        "NODE_EXTRA_CA_CERTS".to_string(),
+        BOX_ROOT_CERTIFICATE.to_string(),
+    ));
+    vars
+}
+
+/// Adds the [`launch_trust_env`] variables to `vars`, the box's composed
+/// environment, below every variable it already holds: a box spec that
+/// sets one of them keeps its own value.
+pub(crate) fn layer_trust_env(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    root_injected: bool,
+    bundle: bool,
+) {
+    for (name, value) in launch_trust_env(root_injected, bundle) {
+        vars.entry(name).or_insert(value);
+    }
 }
 
 /// The `NO_PROXY` entries every box whose environment points at the proxy

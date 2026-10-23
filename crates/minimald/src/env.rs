@@ -565,6 +565,17 @@ impl Env {
             .map(|bsr| cache.read_dir(&graph.spec_hash(bsr)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| std::io::Error::other(format!("loading dependency: {e}")))?;
+        // BEP-011: the trust variables of a box with the proxy's root, below
+        // every variable the caller set, so a box spec keeps its own value.
+        // The bundle variables follow whether the packages ship a bundle,
+        // because the box's variables are fixed before its rootfs exists.
+        let ships_bundle = args.root_certificate.is_some()
+            && layers_ship_ca_bundle(rootfs_dirs.iter().map(|ce| ce.path()));
+        crate::box_runtime::layer_trust_env(
+            &mut pkg_env_vars,
+            args.root_certificate.is_some(),
+            ships_bundle,
+        );
 
         let config = Config::new(args.name.clone())
             .with_session_dirs(
@@ -623,13 +634,26 @@ impl Env {
         // keeps the packages' store unchanged.
         match &args.root_certificate {
             Some(pem) => {
-                let link = install_root_certificate(&sandbox.rootfs(), pem)?;
-                tracing::debug!(
-                    session_id = ?args.session_id,
-                    box_name = %args.name,
-                    link = %link,
-                    "injected the proxy's root certificate into the box's trust store"
-                );
+                let installed = install_root_certificate(&sandbox.rootfs(), pem)?;
+                if installed.bundle {
+                    tracing::debug!(
+                        session_id = ?args.session_id,
+                        box_name = %args.name,
+                        link = %installed.link,
+                        bundle_variables = ships_bundle,
+                        "injected the proxy's root certificate into the box's trust store"
+                    );
+                } else {
+                    tracing::debug!(
+                        session_id = ?args.session_id,
+                        box_name = %args.name,
+                        link = %installed.link,
+                        bundle_variables = ships_bundle,
+                        "injected the proxy's root certificate into the box's trust store; \
+                         the packages ship no CA bundle, so the box has no bundle and \
+                         only NODE_EXTRA_CA_CERTS names the root"
+                    );
+                }
             }
             None => tracing::debug!(
                 session_id = ?args.session_id,
@@ -879,7 +903,9 @@ fn install_attach_env_hooks(rootfs: &Path) -> std::io::Result<()> {
 ///
 /// - the root alone, at [`BOX_ROOT_CERTIFICATE`];
 /// - the box's own copy of the CA bundle at [`BOX_CA_BUNDLE`]: the bundle
-///   the packages ship, with the root appended;
+///   the packages ship, with the root appended. When the packages ship no
+///   bundle, no bundle is written: a bundle with the root alone would
+///   replace the public roots for a tool that reads it;
 /// - a link `<subject hash>.<n>` to the root in [`BOX_CA_DIR`], the name
 ///   OpenSSL looks a certificate up by in a hashed directory.
 ///
@@ -887,12 +913,13 @@ fn install_attach_env_hooks(rootfs: &Path) -> std::io::Result<()> {
 /// be the store's own. Each file is written as a new file in place of the
 /// one it replaces, and never through it, so no other box built from the
 /// same packages sees the root. A link in the rootfs resolves inside the
-/// rootfs, never on the daemon's side. Returns the link's name.
+/// rootfs, never on the daemon's side. Returns the link's name, and
+/// whether the box has a bundle.
 ///
 /// [`BOX_ROOT_CERTIFICATE`]: crate::box_runtime::BOX_ROOT_CERTIFICATE
 /// [`BOX_CA_BUNDLE`]: crate::box_runtime::BOX_CA_BUNDLE
 /// [`BOX_CA_DIR`]: crate::box_runtime::BOX_CA_DIR
-pub(crate) fn install_root_certificate(rootfs: &Path, pem: &str) -> std::io::Result<String> {
+pub(crate) fn install_root_certificate(rootfs: &Path, pem: &str) -> std::io::Result<RootInstall> {
     use crate::box_runtime::{BOX_CA_BUNDLE, BOX_CA_DIR, BOX_ROOT_CERTIFICATE};
     let unusable = || {
         std::io::Error::new(
@@ -917,15 +944,18 @@ pub(crate) fn install_root_certificate(rootfs: &Path, pem: &str) -> std::io::Res
     replace_file(&dir.join(&root_name), text.as_bytes())?;
 
     let bundle_name = file_name(BOX_CA_BUNDLE);
-    let mut bundle = match resolve_in_rootfs(rootfs, Path::new(BOX_CA_BUNDLE), false)? {
-        Some(path) if path.is_file() => std::fs::read(path)?,
-        _ => Vec::new(),
+    let bundle = match resolve_in_rootfs(rootfs, Path::new(BOX_CA_BUNDLE), false)? {
+        Some(path) if path.is_file() => {
+            let mut bundle = std::fs::read(path)?;
+            if !bundle.is_empty() && !bundle.ends_with(b"\n") {
+                bundle.push(b'\n');
+            }
+            bundle.extend_from_slice(text.as_bytes());
+            replace_file(&dir.join(&bundle_name), &bundle)?;
+            true
+        }
+        _ => false,
     };
-    if !bundle.is_empty() && !bundle.ends_with(b"\n") {
-        bundle.push(b'\n');
-    }
-    bundle.extend_from_slice(text.as_bytes());
-    replace_file(&dir.join(&bundle_name), &bundle)?;
 
     // A system root can hold the same subject hash: the first free suffix
     // is the root's, as `c_rehash` numbers a collision.
@@ -935,16 +965,42 @@ pub(crate) fn install_root_certificate(rootfs: &Path, pem: &str) -> std::io::Res
         match std::fs::symlink_metadata(&link) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 std::os::unix::fs::symlink(&root_name, &link)?;
-                return Ok(name);
+                return Ok(RootInstall { link: name, bundle });
             }
             Err(e) => return Err(e),
             Ok(_) if std::fs::read_link(&link).is_ok_and(|to| to == Path::new(&root_name)) => {
-                return Ok(name);
+                return Ok(RootInstall { link: name, bundle });
             }
             Ok(_) => {}
         }
     }
     unreachable!("a directory cannot hold a link for every suffix")
+}
+
+/// What [`install_root_certificate`] wrote into a box's trust store.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RootInstall {
+    /// The name of the root's link in the hashed directory.
+    pub(crate) link: String,
+    /// Whether the box has its own CA bundle with the root appended. False
+    /// when the packages ship no bundle, so the box has none.
+    pub(crate) bundle: bool,
+}
+
+/// Whether the packages in `layers`, the directories a box's rootfs is
+/// built from, ship a CA bundle at [`BOX_CA_BUNDLE`]. Read before the
+/// rootfs exists, because the box's variables are fixed when it is built.
+/// A link resolves inside the layer that holds it.
+///
+/// [`BOX_CA_BUNDLE`]: crate::box_runtime::BOX_CA_BUNDLE
+fn layers_ship_ca_bundle<'a>(layers: impl IntoIterator<Item = &'a Path>) -> bool {
+    let bundle = Path::new(crate::box_runtime::BOX_CA_BUNDLE);
+    layers.into_iter().any(|layer| {
+        resolve_in_rootfs(layer, bundle, false)
+            .ok()
+            .flatten()
+            .is_some_and(|path| path.is_file())
+    })
 }
 
 /// Writes `bytes` to `path` as a new file, after it removes what `path`
@@ -4788,9 +4844,16 @@ VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAdxfdz9bZjCvywfPZdGrNy
         std::fs::write(certs.join("other.pem"), "other").unwrap();
         std::os::unix::fs::symlink("other.pem", certs.join("75bae43c.0")).unwrap();
 
-        let link = install_root_certificate(rootfs.path(), ROOT_FIXTURE).unwrap();
+        let installed = install_root_certificate(rootfs.path(), ROOT_FIXTURE).unwrap();
 
-        assert_eq!(link, "75bae43c.1");
+        assert_eq!(
+            installed,
+            RootInstall {
+                link: "75bae43c.1".to_string(),
+                bundle: true
+            }
+        );
+        assert!(layers_ship_ca_bundle([store.path(), rootfs.path()]));
         assert_eq!(
             std::fs::read_to_string(&store_bundle).unwrap(),
             system_roots
@@ -4820,13 +4883,24 @@ VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAdxfdz9bZjCvywfPZdGrNy
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink("/etc/pki/tls", rootfs.path().join("etc/ssl")).unwrap();
 
-        let link = install_root_certificate(rootfs.path(), ROOT_FIXTURE).unwrap();
+        assert!(!layers_ship_ca_bundle([rootfs.path()]));
 
-        assert_eq!(link, "75bae43c.0");
+        let installed = install_root_certificate(rootfs.path(), ROOT_FIXTURE).unwrap();
+
         assert_eq!(
-            std::fs::read_to_string(real.join("ca-certificates.crt")).unwrap(),
-            ROOT_FIXTURE,
-            "with no system bundle the box's bundle holds the root alone"
+            installed,
+            RootInstall {
+                link: "75bae43c.0".to_string(),
+                bundle: false
+            }
+        );
+        assert!(
+            !real.join("ca-certificates.crt").exists(),
+            "with no system bundle the box gets no bundle"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join("minimal-box-egress-proxy-root.pem")).unwrap(),
+            ROOT_FIXTURE
         );
         assert!(real.join("75bae43c.0").is_symlink());
     }
