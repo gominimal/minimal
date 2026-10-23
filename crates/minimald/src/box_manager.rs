@@ -1789,7 +1789,7 @@ impl BoxManager {
                             if seed.is_some() && in_shutdown.is_cancelled() {
                                 return Err(BoxManagerError::new(
                                     std::io::ErrorKind::ConnectionRefused,
-                                    "in shutdown",
+                                    minimald_rpc::SHUTDOWN_REFUSAL,
                                 ));
                             }
                             let actor = match (claimed, seed) {
@@ -1804,7 +1804,7 @@ impl BoxManager {
                                         hnd.stop().await;
                                         return Err(BoxManagerError::new(
                                             std::io::ErrorKind::ConnectionRefused,
-                                            "in shutdown",
+                                            minimald_rpc::SHUTDOWN_REFUSAL,
                                         ));
                                     }
                                     Ok(hnd) => Some(hnd),

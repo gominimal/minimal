@@ -1,17 +1,56 @@
 use super::*;
 
+/// The host a box actor last published, read by its handle: a listing's
+/// attrs probe goes to the host through this slot rather than through the
+/// actor's mailbox, so an actor that is parked (a `ConfigureLoadout` inside
+/// its package-graph clone, an inline attach) costs the listing nothing, and
+/// a box with no host reads as `None` at once instead of after
+/// [`HOST_PROBE_TIMEOUT`]. The actor refreshes it after every message it
+/// handles ([`BoxActor::publish_host`]).
+pub(crate) type HostSlot = Arc<std::sync::Mutex<Option<AttrsProbe>>>;
+
+/// Empties a [`HostSlot`] when the actor that publishes it ends, however it
+/// ends: a teardown's `break` (which publishes nothing after it), or a panic
+/// unwinding the actor's task. A listing then reads no host for an actor
+/// that is gone, and the slot holds no sender that would keep the host's
+/// mailbox open.
+pub(super) struct ClearSlotOnExit(pub(super) HostSlot);
+
+impl Drop for ClearSlotOnExit {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// What the [`HostSlot`] hands out: a host's attrs, and nothing else. The
+/// slot is read by every holder of a [`BoxHandle`], so it carries no way to
+/// kill, attach to or rename the host: those stay with the actor, which
+/// serializes them and checks an attach before binding a channel.
+#[derive(Debug, Clone)]
+pub(crate) struct AttrsProbe(pub(super) crate::box_runtime::HostHandle);
+
+impl AttrsProbe {
+    async fn get_attrs(&self) -> Result<HostAttrs, ()> {
+        self.0.get_attrs().await
+    }
+}
+
 /// The handle to the session.
 #[derive(Debug, Clone)]
 pub struct BoxHandle(
     pub(super) crate::traced::Sender<BoxMessage>,
     pub(super) CancellationToken,
+    pub(super) HostSlot,
 );
 
 impl BoxHandle {
     /// Returns a non-owning handle to this session.
     #[must_use]
     pub fn downgrade(&self) -> WeakBoxHandle {
-        WeakBoxHandle(self.0.downgrade(), self.1.clone())
+        WeakBoxHandle(self.0.downgrade(), self.1.clone(), Arc::clone(&self.2))
     }
 
     /// Whether this session is being destroyed.
@@ -194,14 +233,47 @@ impl BoxHandle {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
     }
-    /// Returns the host attributes of the running session, if any. A dead
-    /// actor (self-terminated or mid-teardown) reads as `None` rather than a
-    /// panic — the manager polls this while actors come and go.
+    /// Returns the host attributes of the running session, if any: `None`
+    /// for a session without a host, a dead host, or a host that misses
+    /// [`HOST_PROBE_TIMEOUT`]. Read through the host slot, not the actor's
+    /// mailbox (see [`HostSlot`]): the manager polls this for every running
+    /// session on each listing, and an actor parked in a long message held
+    /// every `min ls` for the probe's full deadline (710d: 2 s per call
+    /// through a stalled clone, on every distro).
     pub async fn get_attrs(&self) -> Option<HostAttrs> {
-        let (send, recv) = oneshot::channel();
-        // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(BoxMessage::GetHostAttrs(send)).await;
-        recv.await.ok().flatten()
+        let host = self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        probe_host(host?.get_attrs()).await
+    }
+
+    /// Test-only: puts `host` in the slot a listing reads, as the actor does
+    /// after a message; the actor's next message overwrites it.
+    #[cfg(test)]
+    pub(crate) fn put_host_for_test(&self, host: crate::box_runtime::HostHandle) {
+        *self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AttrsProbe(host));
+    }
+
+    /// Test-only: parks the actor for `d`, the shape of a message that holds
+    /// its mailbox (a clone inside `ConfigureLoadout`, an inline attach).
+    /// Returns once the actor is inside the park, so every earlier message
+    /// and the slot publish after it are done.
+    #[cfg(test)]
+    pub(crate) async fn park_for(&self, d: std::time::Duration) {
+        let (entered, entered_recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a gone actor cannot be parked, and the recv below says so"
+        )]
+        let _ = self.0.send(BoxMessage::Park(d, entered)).await;
+        entered_recv
+            .await
+            .expect("the session actor should enter the park");
     }
 
     /// Returns the workspace's at-risk report (what a destroy would lose),
@@ -734,6 +806,7 @@ impl BoxHandle {
 pub struct WeakBoxHandle(
     pub(super) crate::traced::WeakSender<BoxMessage>,
     pub(super) CancellationToken,
+    pub(super) HostSlot,
 );
 
 impl WeakBoxHandle {
@@ -741,7 +814,11 @@ impl WeakBoxHandle {
     /// has already shut down (all strong senders dropped).
     #[must_use]
     pub fn upgrade(&self) -> Option<BoxHandle> {
-        Some(BoxHandle(self.0.upgrade()?, self.1.clone()))
+        Some(BoxHandle(
+            self.0.upgrade()?,
+            self.1.clone(),
+            Arc::clone(&self.2),
+        ))
     }
 
     /// A dangling handle whose actor is already gone (`upgrade` always yields
@@ -754,7 +831,7 @@ impl WeakBoxHandle {
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
-        Self(weak, CancellationToken::new())
+        Self(weak, CancellationToken::new(), HostSlot::default())
     }
 
     /// A handle to a stand-in "actor" that answers each expose request with
@@ -792,6 +869,6 @@ impl WeakBoxHandle {
                 }
             }
         });
-        Self(weak, CancellationToken::new())
+        Self(weak, CancellationToken::new(), HostSlot::default())
     }
 }

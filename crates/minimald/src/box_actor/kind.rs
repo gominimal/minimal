@@ -9,7 +9,6 @@ impl BoxMessage {
             Self::GetPaths { .. } => "GetPaths",
             Self::MakeContext { .. } => "MakeContext",
             Self::Attach { .. } => "Attach",
-            Self::GetHostAttrs { .. } => "GetHostAttrs",
             Self::EnsureHost { .. } => "EnsureHost",
             Self::GetWorkspaceDelta { .. } => "GetWorkspaceDelta",
             Self::GetHostScreen { .. } => "GetHostScreen",
@@ -41,6 +40,8 @@ impl BoxMessage {
             Self::SetWorkspaceUploadInFlight(..) => "SetWorkspaceUploadInFlight",
             #[cfg(test)]
             Self::PeekPendingAsks(_) => "PeekPendingAsks",
+            #[cfg(test)]
+            Self::Park(..) => "Park",
             #[cfg(test)]
             Self::PeekComposition { .. } => "PeekComposition",
             #[cfg(test)]

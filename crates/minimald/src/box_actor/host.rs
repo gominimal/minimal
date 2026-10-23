@@ -363,6 +363,10 @@ impl BoxActor {
             BoxInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             BoxInner::Draft { .. } => None,
         };
+        // The host is out of the actor's hands now: out of the slot too, so a
+        // handle that outlives a `Stop` reads no host rather than probing the
+        // one being stopped.
+        self.publish_host();
         if let Some((host, mut sops)) = inner {
             for s in sops.drain(..) {
                 s.shutdown().await;
@@ -758,6 +762,7 @@ impl BoxActor {
         // Minted for an exec: a command is about to run in this sandbox, so a
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
+        self.publish_host();
         Ok(host)
     }
 
@@ -836,6 +841,7 @@ impl BoxActor {
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
+        self.publish_host();
         outcome
     }
 
@@ -991,6 +997,7 @@ impl BoxActor {
         // attach may replace this shell rather than inherit its blank `TERM`.
         // See [`HostOrigin::Hooks`].
         self.host_origin = HostOrigin::Hooks;
+        self.publish_host();
         Ok(())
     }
 }
