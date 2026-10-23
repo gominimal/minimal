@@ -11750,6 +11750,198 @@ proof_bep_proxy_env_sets_node_use_env_proxy() {
   echo "::endgroup::"
 }
 
+# Trust-store proofs (BEP-011). A GitHub grant box gets the proxy's root in
+# its own CA bundle copy and in /etc/ssl/certs under its subject hash, and
+# the trust variables point at them. A box with no grant, from the same
+# packages, gets none of it. Both seeds add ca-certificates, so the grant
+# box's bundle holds the system roots beside the root.
+BEP_TRUST_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+BEP_TRUST_ROOT=/etc/ssl/certs/minimal-box-egress-proxy-root.pem
+
+# Records case $1 as NOT RUN and returns 1 when this target cannot start a
+# GitHub grant box: the same three gates as the sealed-value proof.
+bep_trust_grant_gate() {
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local tg_control="$HOME/.minimal/bep/control.sock" tg_status
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    return 1
+  fi
+  tg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$tg_status" != "Signed in to GitHub"* ]]; then
+    not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
+    return 1
+  fi
+  if [ ! -S "$tg_control" ]; then
+    not_run "$1" "the Box Egress Proxy is not running: no $tg_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
+    return 1
+  fi
+}
+
+# Removes the files bep_trust_box_files left for case $1.
+bep_trust_clean() {
+  local tc_ext
+  for tc_ext in env root bundle links err exec.err; do
+    rm -f "${WORK:?}/${1:?}.$tc_ext"
+  done
+}
+
+# Starts a box from a seed with ca-certificates, copies its trust store out
+# and destroys it. $1: the case name. $2: "grant" for a box with a GitHub
+# grant, "plain" for a box with none. Leaves $WORK/$1.env (the box's trust
+# variables), $WORK/$1.root and $WORK/$1.bundle (the files, empty when
+# absent) and $WORK/$1.links (each hashed-directory link and its target).
+bep_trust_box_files() {
+  local tb_case="$1" tb_kind="$2" tb_seed tb_out tb_sid tb_file
+  tb_seed="$(hook_mktemp /tmp/mnltrust.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["ca-certificates"]\n'
+    if [ "$tb_kind" = grant ]; then
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    fi
+  } > "$tb_seed/minimal.toml"
+  mkdir "$tb_seed/.git"
+  tb_out="$(cd "$tb_seed" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$tb_case" | tr '_' '-' | cut -c1-36)-$tb_kind" \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$tb_case.err")" || {
+    echo "::error::'min session activate' of the $tb_kind box for $tb_case failed"
+    echo "--- stdout ---"; printf '%s\n' "$tb_out"
+    echo "--- stderr ---"; cat "$WORK/$tb_case.err" 2>/dev/null || true
+    rm -rf "${tb_seed:?}"
+    fail
+  }
+  rm -rf "${tb_seed:?}"
+  tb_sid="$(printf '%s\n' "$tb_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$tb_sid" sh -c 'env' >"$WORK/$tb_case.env" 2>"$WORK/$tb_case.exec.err"; then
+    echo "::error::'min session exec' in the $tb_kind box for $tb_case failed"
+    cat "$WORK/$tb_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # The grant's sealed value is never kept: only the trust variables are.
+  grep -E '^(SSL_CERT_FILE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS)=' "$WORK/$tb_case.env" \
+    | tr -d '\r' >"$WORK/$tb_case.env.tmp" || true
+  mv "$WORK/$tb_case.env.tmp" "$WORK/$tb_case.env"
+  for tb_file in root:"$BEP_TRUST_ROOT" bundle:"$BEP_TRUST_BUNDLE"; do
+    mnl session exec "$tb_sid" sh -c "cat '${tb_file#*:}' 2>/dev/null || true" \
+      2>/dev/null | tr -d '\r' >"$WORK/$tb_case.${tb_file%%:*}" || true
+  done
+  # shellcheck disable=SC2016 # expanded inside the box
+  mnl session exec "$tb_sid" sh -c \
+    'for f in /etc/ssl/certs/*.[0-9]; do [ -L "$f" ] && printf "%s %s\n" "${f##*/}" "$(readlink "$f")"; done; true' \
+    2>/dev/null | tr -d '\r' >"$WORK/$tb_case.links" || true
+  mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+}
+
+# The number of certificates in the PEM file $1.
+bep_trust_cert_count() {
+  grep -c -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null || true
+}
+
+proof_bep_root_ca_present_in_box_trust_store() {
+  echo "::group::GitHub grant box: the proxy's root in both trust-store forms (BEP-011)"
+  bep_trust_grant_gate bep_root_ca_present_in_box_trust_store || { echo "::endgroup::"; return 0; }
+  local tp_case=bep_root_ca_present_in_box_trust_store tp_hash tp_size tp_count
+  bep_trust_box_files "$tp_case" grant
+  if [ "$(bep_trust_cert_count "$WORK/$tp_case.root")" != 1 ]; then
+    echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if ! openssl x509 -noout -subject -in "$WORK/$tp_case.root" | grep -q 'Minimal Box Egress Proxy Root CA'; then
+    echo "::error::the certificate at $BEP_TRUST_ROOT in the grant box is not the proxy's root"
+    fail
+  fi
+  # The bundle is the system roots with the root appended.
+  tp_size="$(wc -c <"$WORK/$tp_case.root" | tr -d ' ')"
+  if ! tail -c "$tp_size" "$WORK/$tp_case.bundle" | cmp -s - "$WORK/$tp_case.root"; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE does not end with the proxy's root"
+    fail
+  fi
+  tp_count="$(bep_trust_cert_count "$WORK/$tp_case.bundle")"
+  if [ "${tp_count:-0}" -lt 2 ]; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE holds ${tp_count:-0} certificates, so the system roots are not beside the root"
+    fail
+  fi
+  # The hashed directory links the root under its subject hash.
+  tp_hash="$(openssl x509 -noout -subject_hash -in "$WORK/$tp_case.root")"
+  if ! grep -Eq "^$tp_hash\.[0-9] ${BEP_TRUST_ROOT##*/}\$" "$WORK/$tp_case.links"; then
+    echo "::error::the grant box's /etc/ssl/certs has no link $tp_hash.N to ${BEP_TRUST_ROOT##*/}"
+    echo "--- links ---"; cat "$WORK/$tp_case.links"
+    fail
+  fi
+  bep_trust_clean "$tp_case"
+  echo "grant box: the root is at $BEP_TRUST_ROOT, at the end of $BEP_TRUST_BUNDLE beside $((tp_count - 1)) system roots, and linked as $tp_hash"
+  echo "::endgroup::"
+}
+
+proof_bep_root_ca_absent_from_box_without_credentialed_upstream() {
+  echo "::group::box with no grant: no proxy root in its trust store (BEP-011)"
+  local ta_case=bep_root_ca_absent_from_box_without_credentialed_upstream ta_grant=""
+  # With a grant box from the same packages first, the plain box proves that
+  # the grant box's root did not reach the shared packages.
+  if bep_trust_grant_gate "${ta_case}_beside_a_grant_box"; then
+    bep_trust_box_files "${ta_case}_grant" grant
+    if [ "$(bep_trust_cert_count "$WORK/${ta_case}_grant.root")" != 1 ]; then
+      echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+      fail
+    fi
+    ta_grant="$WORK/${ta_case}_grant.root"
+  fi
+  bep_trust_box_files "$ta_case" plain
+  if [ -s "$WORK/$ta_case.root" ]; then
+    echo "::error::the box with no grant has a file at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if grep -q " ${BEP_TRUST_ROOT##*/}\$" "$WORK/$ta_case.links"; then
+    echo "::error::the box with no grant links ${BEP_TRUST_ROOT##*/} in /etc/ssl/certs"
+    fail
+  fi
+  if [ -n "$ta_grant" ] && grep -qFf <(grep -v -- '-----' "$ta_grant") "$WORK/$ta_case.bundle"; then
+    echo "::error::the $BEP_TRUST_BUNDLE of the box with no grant holds the grant box's root"
+    fail
+  fi
+  if [ -s "$WORK/$ta_case.env" ]; then
+    echo "::error::the box with no grant has trust variables set:"
+    cat "$WORK/$ta_case.env"
+    fail
+  fi
+  bep_trust_clean "$ta_case"
+  bep_trust_clean "${ta_case}_grant"
+  if [ -n "$ta_grant" ]; then
+    echo "box with no grant: no proxy root in its trust store, beside a grant box from the same packages"
+  else
+    echo "box with no grant: no proxy root in its trust store"
+  fi
+  echo "::endgroup::"
+}
+
+proof_bep_trust_env_points_at_bundle_and_root() {
+  echo "::group::GitHub grant box: SSL_CERT_FILE, REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS (BEP-011)"
+  bep_trust_grant_gate bep_trust_env_points_at_bundle_and_root || { echo "::endgroup::"; return 0; }
+  local te_case=bep_trust_env_points_at_bundle_and_root te_var te_want te_got
+  bep_trust_box_files "$te_case" grant
+  for te_var in SSL_CERT_FILE:"$BEP_TRUST_BUNDLE" REQUESTS_CA_BUNDLE:"$BEP_TRUST_BUNDLE" \
+    NODE_EXTRA_CA_CERTS:"$BEP_TRUST_ROOT"; do
+    te_want="${te_var#*:}"
+    te_got="$(bep_env_value "$WORK/$te_case.env" "${te_var%%:*}")"
+    if [ "$te_got" != "$te_want" ]; then
+      echo "::error::the grant box's ${te_var%%:*} is '${te_got:-<unset>}', not $te_want"
+      fail
+    fi
+  done
+  if [ "$(bep_trust_cert_count "$WORK/$te_case.root")" != 1 ] || [ ! -s "$WORK/$te_case.bundle" ]; then
+    echo "::error::the files the grant box's trust variables name are not in the box"
+    fail
+  fi
+  bep_trust_clean "$te_case"
+  echo "grant box: SSL_CERT_FILE=REQUESTS_CA_BUNDLE=$BEP_TRUST_BUNDLE, NODE_EXTRA_CA_CERTS=$BEP_TRUST_ROOT"
+  echo "::endgroup::"
+}
+
 proof_github_only_allowlist() {
   echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
@@ -23021,6 +23213,9 @@ case "${1:-}" in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
+    proof_bep_root_ca_present_in_box_trust_store
+    proof_bep_root_ca_absent_from_box_without_credentialed_upstream
+    proof_bep_trust_env_points_at_bundle_and_root
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -23079,7 +23274,10 @@ case "${1:-}" in
     | bep_second_box_needs_no_sign_in \
     | bep_box_env_holds_sealed_value_only \
     | bep_proxy_env_and_no_proxy_are_set \
-    | bep_proxy_env_sets_node_use_env_proxy)
+    | bep_proxy_env_sets_node_use_env_proxy \
+    | bep_root_ca_present_in_box_trust_store \
+    | bep_root_ca_absent_from_box_without_credentialed_upstream \
+    | bep_trust_env_points_at_bundle_and_root)
     "proof_$1"
     ;;
   *)
@@ -23117,6 +23315,9 @@ case "${1:-}" in
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
+    echo "         bep_root_ca_present_in_box_trust_store"
+    echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
+    echo "         bep_trust_env_points_at_bundle_and_root"
     exit 2
     ;;
 esac
