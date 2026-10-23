@@ -84,5 +84,10 @@
    ]
   }
  ],
- "workspace_members": []
+ "workspace_members": [
+  "path+file:///x/crates/graph#graph@0.1.0",
+  "path+file:///x/crates/decode#decode@0.1.0",
+  "path+file:///x/crates/common#common@0.1.0",
+  "path+file:///x/crates/mip#mip@0.1.0"
+ ]
 }

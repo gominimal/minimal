@@ -295,8 +295,25 @@ EOF
     [ "$(echo "$out" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["exceptions"], s["unexcepted"])')" = "1 0" ] \
         && ok "it counts toward exceptions, not unexcepted" || bad "exception counts"
     echo "$out" | grep -q '"issue": "fixture#1"' && ok "the exception's issue is carried" || bad "issue not carried"
-    out="$(python3 "$layers" --rules "$tmp/exc-layers.toml" --metadata "$data/small-metadata.json" --json)" || true
+    status=0
+    out="$(python3 "$layers" --rules "$tmp/exc-layers.toml" --metadata "$data/small-metadata.json" --json)" || status=$?
     echo "$out" | grep -q '"common -> graph"' && ok "a stale exception is reported" || bad "stale exception not reported"
+    [ "$status" -eq 2 ] && ok "a stale exception exits 2" || bad "stale exception exit $status"
+}
+
+non_member_packages_are_not_crates() {   # full metadata through --metadata
+    # Without --no-deps, `packages` carries every dependency; only the
+    # workspace members are crates to place in a layer.
+    python3 - "$data/small-metadata.json" "$tmp/full-meta.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+m["packages"].append({"name": "serde", "id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0",
+                      "manifest_path": "/r/serde/Cargo.toml", "description": "serde", "dependencies": [], "targets": []})
+json.dump(m, open(sys.argv[2], "w"))
+PY
+    local status=0 out
+    out="$(python3 "$layers" --rules "$data/small-layers.toml" --metadata "$tmp/full-meta.json" --json)" || status=$?
+    [ "$status" -eq 0 ] && ok "a non-member package is not a crate to place" || bad "non-member exit $status: $out"
 }
 
 unassigned_crate_fails() {   # QM-008
@@ -594,6 +611,17 @@ mutants_scope_follows_mode() {   # QM-017
         && ok "the workspace sums the crates and records the in-diff scope" || bad "workspace mutants"
     [ "$(py "$snap" "s['gates']['floor:mutants.score_pct']['value']")" = "55.56" ] \
         && ok "the mutants.score_pct floor reads the workspace score" || bad "mutants floor"
+    # Every mutant unviable: nothing was tested, so the score is null, not 0 %.
+    python3 - "$data/outcomes.json" "$tmp/unviable-outcomes.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["outcomes"] = [o for o in d["outcomes"] if not isinstance(o["scenario"], dict) or o["summary"] == "Unviable"]
+json.dump(d, open(sys.argv[2], "w"))
+PY
+    run_collect "$tmp/mut-unviable" --mutants "$tmp/unviable-outcomes.json" --mutants-scope in-diff >/dev/null 2>&1 || true
+    [ "$(py "$tmp/mut-unviable/snapshot.json" "(s['workspace']['mutants']['tested'], s['workspace']['mutants']['score_pct'], s['gates']['floor:mutants.score_pct']['result'])")" = "(0, None, 'not_evaluated')" ] \
+        && ok "no tested mutant leaves the score null and the floor not evaluated" \
+        || bad "all-unviable mutants: $(py "$tmp/mut-unviable/snapshot.json" "(s['workspace']['mutants'], s['gates']['floor:mutants.score_pct'])")"
     run_collect "$tmp/mut-shard" --mutants "$data/outcomes.json" --mutants-scope shard --mutants-shard 2/7 >/dev/null 2>&1 || true
     [ "$(py "$tmp/mut-shard/snapshot.json" "(s['workspace']['mutants']['scope'], s['workspace']['mutants']['shard'])")" = "('shard', '2/7')" ] \
         && ok "a nightly run records its shard" || bad "shard not recorded"
@@ -647,6 +675,45 @@ untracked_file_is_listed() {   # QM-017 untracked clause
         && ok "with no run the block carries the list alone" || bad "list without a run"
     [ "$(py "$tmp/mut-untracked/snapshot.json" "s['gates']['floor:mutants.score_pct']['result']")" = "not_evaluated" ] \
         && ok "no score, so the floor is not evaluated" || bad "floor evaluated without a score"
+}
+
+truncated_junit_keeps_the_snapshot() {   # QM-001: a bad test report is not a lost snapshot
+    mutants_repo
+    local repo="$tmp/mut" fake="$tmp/junit-fakebin"
+    if ! ls "$(rustc --print target-libdir 2>/dev/null)"/libprofiler_builtins-*.rlib >/dev/null 2>&1; then
+        echo "skip - this toolchain has no profiler runtime, so run.sh skips coverage before the junit step"
+        return
+    fi
+    mkdir -p "$fake"
+    # cargo llvm-cov succeeds and leaves a junit cut off mid-element, as a
+    # killed nextest does.
+    cat > "$fake/cargo" <<EOF
+#!/bin/sh
+case "\$1 \$2" in
+    "metadata "*) cat "$data/small-metadata.json" ;;
+    "llvm-cov nextest")
+        while [ "\$#" -gt 0 ]; do [ "\$1" = "--output-path" ] && out="\$2"; shift; done
+        mkdir -p target/llvm-cov-target/nextest/coverage
+        printf '<testsuites tests="3" failures="0"><testsuite name="graph"' > target/llvm-cov-target/nextest/coverage/junit.xml
+        cp "$data/llvm-cov.json" "\$out" ;;
+    "llvm-cov report") : ;;
+    "llvm-cov show-env") : ;;
+    *" --version") echo "\$1 1.0.0" ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "$fake/cargo"
+    for stub in cargo-llvm-cov cargo-nextest; do
+        printf '#!/bin/sh\nexit 0\n' > "$fake/$stub"; chmod +x "$fake/$stub"
+    done
+    local status=0 snap="$repo/.scratch/junit/snapshot.json"
+    (cd "$repo" && PATH="$fake:$PATH" bash scripts/metrics/run.sh full --no-modules --no-clippy --no-mutants --no-hotspots \
+        --out "$repo/.scratch/junit" >/dev/null 2>"$tmp/junit.err") || status=$?
+    [ -f "$snap" ] && ok "a truncated junit still leaves a snapshot" \
+        || { bad "no snapshot with a truncated junit (exit $status): $(tail -n3 "$tmp/junit.err")"; return; }
+    [ "$(py "$snap" "(s['workspace']['coverage'] is not None, 'tests' in s['workspace']['coverage'])")" = "(True, False)" ] \
+        && ok "coverage is kept and the unreadable test counts are left out" \
+        || bad "coverage with a truncated junit: $(py "$snap" "s['workspace']['coverage']")"
 }
 
 crap_counts_over_threshold() {   # CRAP per crate against [crap] threshold
@@ -749,16 +816,20 @@ summary_is_appended_for_a_snapshot() {   # the nightly's glance: summary.md besi
     [ ! -f "$tmp/nosummary/summary.md" ] && ok "without --summary nothing is written" || bad "summary.md written without the flag"
 }
 
-clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors clippy.toml
+clippy_thresholds_agree() {   # thresholds.toml [clippy] mirrors every clippy.toml
+    # Clippy reads only the nearest clippy.toml above a crate's manifest, so a
+    # per-crate file must restate the thresholds or that crate falls back to
+    # clippy's defaults.
     python3 - "$root" <<'PY'
-import sys, tomllib
+import glob, sys, tomllib
 root = sys.argv[1]
 th = tomllib.load(open(f"{root}/metrics/thresholds.toml", "rb"))["clippy"]
-cl = tomllib.load(open(f"{root}/clippy.toml", "rb"))
-for k, v in th.items():
-    assert cl.get(k) == v, (k, cl.get(k), v)
+for path in [f"{root}/clippy.toml", *sorted(glob.glob(f"{root}/crates/*/clippy.toml"))]:
+    cl = tomllib.load(open(path, "rb"))
+    for k, v in th.items():
+        assert cl.get(k) == v, (path, k, cl.get(k), v)
 PY
-    [ $? -eq 0 ] && ok "clippy.toml and metrics/thresholds.toml agree on the complexity thresholds" || bad "complexity thresholds disagree"
+    [ $? -eq 0 ] && ok "every clippy.toml and metrics/thresholds.toml agree on the complexity thresholds" || bad "complexity thresholds disagree"
 }
 
 # ------------------------------------------------------- grading fixtures
@@ -1126,6 +1197,7 @@ all_cases=(
     report_is_byte_stable
     forbidden_edge_is_reported
     excepted_edge_is_counted_not_failed
+    non_member_packages_are_not_crates
     unassigned_crate_fails
     hotspots_rank_churn_times_findings
     hotspots_without_coverage
@@ -1135,6 +1207,7 @@ all_cases=(
     dashboard_renders_offline_with_tables
     mutants_scope_follows_mode
     untracked_file_is_listed
+    truncated_junit_keeps_the_snapshot
     crap_counts_over_threshold
     publish_targets_history_ref_only
     nightly_budget_is_declared

@@ -383,14 +383,18 @@ else
         > "$work/coverage.out" 2> "$work/coverage.err" || status=$?
     junit="$(find target/llvm-cov-target -path '*nextest/coverage/junit.xml' 2>/dev/null | head -n1 || true)"
     if [ -n "$junit" ]; then
-        python3 - "$junit" <<'PY' > "$work/coverage-tests.json" || true
+        # A truncated or malformed junit leaves the file empty; it is then not
+        # passed on, so collect.py still writes the snapshot (QM-001).
+        python3 - "$junit" <<'PY' > "$work/coverage-tests.json" 2> "$work/coverage-tests.err" || : > "$work/coverage-tests.json"
 import json, sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
 tests = int(root.get("tests") or 0); failures = int(root.get("failures") or 0); errors = int(root.get("errors") or 0)
 failed = sorted(f"{c.get('classname')}::{c.get('name')}" for c in root.iter("testcase") if c.find("failure") is not None or c.find("error") is not None)
 print(json.dumps({"tests": tests, "failures": failures + errors, "failed": failed}))
 PY
-        collect_args+=(--coverage-tests "$work/coverage-tests.json")
+        if [ -s "$work/coverage-tests.json" ]; then
+            collect_args+=(--coverage-tests "$work/coverage-tests.json")
+        fi
     fi
     if [ "$status" -eq 0 ]; then
         collect_args+=(--coverage "$work/llvm-cov.json")

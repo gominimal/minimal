@@ -533,7 +533,8 @@ def mutants_block(counts: Counter) -> dict:
         "missed": missed,
         "timeout": timeout,
         "unviable": counts["unviable"],
-        "score_pct": pct(caught, tested),
+        # No tested mutant (every one unviable) measures nothing: null, not 0 %.
+        "score_pct": pct(caught, tested) if tested else None,
     }
 
 

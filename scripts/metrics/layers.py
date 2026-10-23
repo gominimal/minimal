@@ -6,7 +6,8 @@ every normal dependency edge between workspace crates that the layer table
 forbids. An edge named by an `[[exception]]` is reported as excepted and
 counted toward the exceptions ratchet; one no exception names is unexcepted
 and fails the gate. A member in no layer, or in two, is unassigned and fails
-the gate too. Development and build dependencies are not edges.
+the gate too, as does a stale exception: one that names no forbidden edge.
+Development and build dependencies are not edges.
 
 Standalone: `python3 scripts/metrics/layers.py [--rules F] [--metadata F]
 [--json]`. `collect.py` imports `analyse` and reads the same dict. Exit 0
@@ -47,7 +48,10 @@ def load_metadata(path: Path | None) -> dict:
 
 def analyse(meta: dict, rules: dict) -> dict:
     """The layer findings for one workspace, as the snapshot's `layers` block."""
-    members = {p["name"]: p for p in meta["packages"]}
+    # `--no-deps` metadata lists only the workspace, but full metadata passed
+    # through `--metadata` lists every dependency too; scope to the members.
+    member_ids = set(meta["workspace_members"])
+    members = {p["name"]: p for p in meta["packages"] if p["id"] in member_ids}
     layer_of: dict[str, str] = {}
     doubly: set[str] = set()
     for layer, crates in rules["layers"].items():
@@ -134,7 +138,14 @@ def main(argv: list[str] | None = None) -> int:
 
     result = analyse(load_metadata(args.metadata), load_rules(args.rules))
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else render(result))
-    failing = result["unexcepted"] or result["unassigned"] or result["unknown"]
+    # A stale exception fails too: left in place, it would let a removed edge
+    # come back, or outlive a layer move, without a change to the table.
+    failing = (
+        result["unexcepted"]
+        or result["unassigned"]
+        or result["unknown"]
+        or result["stale_exceptions"]
+    )
     return GATE_EXIT if failing else 0
 
 
