@@ -358,6 +358,20 @@ pub async fn logs(
     tail_bytes: u64,
     absent: &mut Vec<LogPrefix>,
 ) -> Result<(), anyhow::Error> {
+    let audit_dir = bep::audit::default_dir();
+    logs_with_audit(w, paths, audit_dir.as_deref(), tail_bytes, absent).await
+}
+
+/// [`logs`], with the proxy's audit log read from `audit_dir` in place of
+/// the user's home. Tests pass a temp dir here so a real audit log on the
+/// host never enters their bundle.
+async fn logs_with_audit(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    audit_dir: Option<&Path>,
+    tail_bytes: u64,
+    absent: &mut Vec<LogPrefix>,
+) -> Result<(), anyhow::Error> {
     let log_dir = paths.state.join("logs");
     // Absence and inaccessibility are different facts: "no log directory"
     // may only be claimed on a real NotFound, never on EACCES or I/O errors.
@@ -420,7 +434,7 @@ pub async fn logs(
 
     // The proxy's audit log lives under the user's home, not the state dir:
     // `bep` writes it there wherever it runs from.
-    bep_audit(w, bep::audit::default_dir().as_deref(), tail_bytes).await;
+    bep_audit(w, audit_dir, tail_bytes).await;
 
     // The legend for everything above, plus the daemon logs that arrive
     // nested from the guest: two overlapping copies of the same output, each
@@ -1420,15 +1434,17 @@ mod tests {
         let out_dir = tempfile::TempDir::new().unwrap();
         let out = out_dir.path().join("diag.tar.zst");
         let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
-        logs(
+        // The audit dir is injected, so a real audit log on this host never
+        // enters the bundle.
+        logs_with_audit(
             &mut w,
             &paths(state.path()),
+            Some(&audit),
             diagnostics::LOG_TAIL_CAP,
             &mut Vec::new(),
         )
         .await
         .unwrap();
-        bep_audit(&mut w, Some(&audit), diagnostics::LOG_TAIL_CAP).await;
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
             .unwrap();
