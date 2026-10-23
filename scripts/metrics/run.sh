@@ -50,6 +50,9 @@
 #   2  snapshot written, verdict fail (in the grading modes: the report's)
 #   3  snapshot written, but a collector could not run (read it as incomplete)
 #   1  nothing written: a crash, or no python3
+# When both 2 and 3 apply, the grading modes exit 2 (the change failed on
+# what was measured) and the other modes exit 3 (the nightly publishes only
+# a complete snapshot, and keys that on 3).
 # None of the non-zero ones is ever read as clean.
 #
 # The grading modes end stdout with one line the review runtime records as
@@ -181,7 +184,8 @@ if [ "$grading" -eq 1 ]; then
         if [ "$no_rust_changes" -eq 1 ]; then
             want_clippy=0 want_coverage=0
         elif [ -s "$work/changed-crates.txt" ]; then
-            mapfile -t scope < "$work/changed-crates.txt"
+            # A read loop, not mapfile: macOS's stock bash is 3.2.
+            while IFS= read -r c; do [ -n "$c" ] && scope+=("$c"); done < "$work/changed-crates.txt"
         fi
     fi
 fi
@@ -239,9 +243,9 @@ all_crates="$(python3 -c 'import json,sys; print("\n".join(sorted(p["name"] for 
 # The scope the compiling collectors cover: the pinned crates, else every
 # member. collect.py nulls the compile-based blocks of crates outside it.
 if [ "${#scope[@]}" -gt 0 ]; then
-    printf '%s\n' "${scope[@]}" > "$work/scope.txt"
+    printf '%s\n' ${scope[@]+"${scope[@]}"} > "$work/scope.txt"
     cargo_scope=()
-    for c in "${scope[@]}"; do cargo_scope+=(-p "$c"); done
+    for c in ${scope[@]+"${scope[@]}"}; do cargo_scope+=(-p "$c"); done
     clippy_complete=()
 else
     printf '%s\n' "$all_crates" > "$work/scope.txt"
@@ -305,10 +309,10 @@ else
     done
     t0="$(now)"
     status=0
-    cargo clippy "${cargo_scope[@]}" --all-targets --locked --message-format=json -- "${lint_args[@]}" \
+    cargo clippy ${cargo_scope[@]+"${cargo_scope[@]}"} --all-targets --locked --message-format=json -- ${lint_args[@]+"${lint_args[@]}"} \
         > "$work/clippy.json" 2> "$work/clippy.err" || status=$?
     if [ "$status" -eq 0 ]; then
-        collect_args+=(--clippy "$work/clippy.json" "${clippy_complete[@]}")
+        collect_args+=(--clippy "$work/clippy.json" ${clippy_complete[@]+"${clippy_complete[@]}"})
     else
         fail_collector clippy "cargo clippy exited $status (see $work/clippy.err)"
     fi
@@ -327,7 +331,7 @@ run_crap() {
         skip crap "coverage wrote no lcov.info"
     else
         t0="$(now)"
-        cargo crap "${cargo_scope[@]}" --lcov "$lcov" --format json > "$out/raw/crap.json" 2> "$out/raw/crap.err" || status=$?
+        cargo crap ${cargo_scope[@]+"${cargo_scope[@]}"} --lcov "$lcov" --format json > "$out/raw/crap.json" 2> "$out/raw/crap.err" || status=$?
         if [ "$status" -eq 0 ] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$out/raw/crap.json" 2>/dev/null; then
             collect_args+=(--crap "$out/raw/crap.json")
         else
@@ -376,7 +380,7 @@ else
     # hard-coded target/debug path, a host-dependent probe) must not take
     # the coverage of everything that ran with it. The failures are counted
     # from nextest's junit and recorded in the snapshot instead.
-    cargo llvm-cov nextest "${cargo_scope[@]}" --locked --profile coverage --no-tests=fail \
+    cargo llvm-cov nextest ${cargo_scope[@]+"${cargo_scope[@]}"} --locked --profile coverage --no-tests=fail \
         --ignore-run-fail \
         --ignore-filename-regex '(^|/)(tests|benches|fuzz|examples)/|build\.rs$|/target/' \
         --json --summary-only --output-path "$work/llvm-cov.json" \
@@ -445,12 +449,12 @@ PY
             dot="$work/modules/$crate.$label.dot"
             err="$work/modules/$crate.$label.err"
             error=null
-            if ! cargo modules dependencies -p "$crate" "${sel[@]}" --all-features --cfg-test --no-externs \
+            if ! cargo modules dependencies -p "$crate" ${sel[@]+"${sel[@]}"} --all-features --cfg-test --no-externs \
                     --no-sysroot --no-fns --no-traits --no-types > "$dot" 2> "$err"; then
                 error="$(head -c 300 "$err" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
             fi
             orphans_file="$work/modules/$crate.$label.orphans"
-            cargo modules orphans -p "$crate" "${sel[@]}" --all-features --cfg-test --deny 2>&1 \
+            cargo modules orphans -p "$crate" ${sel[@]+"${sel[@]}"} --all-features --cfg-test --deny 2>&1 \
                 | grep -oE 'at crates/[^[:space:]]+' | sed 's/^at //' | sort -u > "$orphans_file" || true
             orphans_json="$(python3 -c 'import json,sys; print(json.dumps([l.strip() for l in open(sys.argv[1]) if l.strip()]))' "$orphans_file")"
             targets_json="$targets_json{\"target\": \"$label\", \"dot\": \"$dot\", \"orphans\": $orphans_json, \"error\": $error}, "
@@ -519,10 +523,16 @@ if [ "$want_mutants" -eq 0 ]; then
     skip mutants "$mode mode"
 elif [ "$(uname -s)" = "Darwin" ]; then
     skip mutants "darwin host: the baseline suite is green only on Linux"
-elif ! command -v cargo-mutants >/dev/null 2>&1; then
-    skip mutants "cargo-mutants not installed (scripts/metrics/install-tools.sh)"
-elif ! command -v cargo-nextest >/dev/null 2>&1; then
-    skip mutants "cargo-nextest not installed"
+elif ! command -v cargo-mutants >/dev/null 2>&1 || ! command -v cargo-nextest >/dev/null 2>&1; then
+    # In mutants mode the mutation run is all that was asked for, so a
+    # missing tool fails the run (exit 3) instead of passing it empty.
+    missing_tool="cargo-mutants"
+    command -v cargo-mutants >/dev/null 2>&1 && missing_tool="cargo-nextest"
+    if [ "$mode" = "mutants" ]; then
+        fail_collector mutants "$missing_tool not installed (scripts/metrics/install-tools.sh --only cargo-mutants --only cargo-nextest)"
+    else
+        skip mutants "$missing_tool not installed (scripts/metrics/install-tools.sh)"
+    fi
 else
     mutants_args=(--test-tool nextest --timeout-multiplier 1.5 --output "$out/mutants")
     scope_args=()
@@ -558,7 +568,9 @@ else
         # neither names a commit other than HEAD.
         ref=""
         if [ "$mutants_since" = "auto" ]; then
-            newest="$(find "$history_dir" -maxdepth 1 -name '*.json' 2>/dev/null | sort | tail -n1 || true)"
+            # Newest by date, then by commit time within a day (prune.py).
+            newest=""
+            [ -d "$history_dir" ] && newest="$(python3 "$here/prune.py" --newest "$history_dir" 2>/dev/null || true)"
             if [ -n "$newest" ]; then
                 sha7="$(basename "$newest" .json | sed 's/^[0-9-]*-//')"
                 git rev-parse --verify --quiet "$sha7^{commit}" >/dev/null 2>&1 && ref="$sha7"
@@ -596,7 +608,7 @@ else
         if command -v timeout >/dev/null 2>&1; then
             budget_cmd=(timeout --signal=INT --kill-after=60 "$mutants_budget")
         fi
-        "${budget_cmd[@]}" cargo mutants "${mutants_args[@]}" > "$work/mutants.log" 2> "$work/mutants.err" || status=$?
+        ${budget_cmd[@]+"${budget_cmd[@]}"} cargo mutants ${mutants_args[@]+"${mutants_args[@]}"} > "$work/mutants.log" 2> "$work/mutants.err" || status=$?
         outcomes="$out/mutants/mutants.out/outcomes.json"
         if [ "$status" -eq 124 ]; then
             echo "metrics: mutants stopped at the ${mutants_budget}s budget; partial result" >&2
@@ -616,7 +628,7 @@ ok = any(o.get("scenario") == "Baseline" and o.get("summary") == "Success" for o
 sys.exit(0 if ok else 1)
 PY
         then
-            collect_args+=(--mutants "$outcomes" "${scope_args[@]}")
+            collect_args+=(--mutants "$outcomes" ${scope_args[@]+"${scope_args[@]}"})
         else
             fail_collector mutants "cargo mutants exited $status (see $work/mutants.err)"
         fi
@@ -626,8 +638,8 @@ fi
 
 # ------------------------------------------------------------------ collect
 [ "$want_hotspots" -eq 1 ] || collect_args+=(--no-hotspots)
-for nm in "${not_measured[@]}"; do collect_args+=(--not-measured "$nm"); done
-for d in "${durations[@]}"; do collect_args+=(--duration "$d"); done
+for nm in ${not_measured[@]+"${not_measured[@]}"}; do collect_args+=(--not-measured "$nm"); done
+for d in ${durations[@]+"${durations[@]}"}; do collect_args+=(--duration "$d"); done
 run_mode="$mode"
 [ "$(uname -s)" = "Darwin" ] && [ "$mode" = "full" ] && run_mode="darwin"
 
@@ -638,10 +650,10 @@ status=0
 # nightly's glance at the run).
 summary_args=()
 [ "$grading" -eq 1 ] || summary_args=(--summary)
-python3 "$here/collect.py" --out "$out" --mode "$run_mode" --metadata "$work/metadata.json" "${summary_args[@]}" \
+python3 "$here/collect.py" --out "$out" --mode "$run_mode" --metadata "$work/metadata.json" ${summary_args[@]+"${summary_args[@]}"} \
     --tools "$work/tools.json" --toolchain "$work/toolchain.json" --started "$started" \
     --excluded "remote-proto=generated OUT_DIR code is invisible to source-level tools" \
-    "${collect_args[@]}" || status=$?
+    ${collect_args[@]+"${collect_args[@]}"} || status=$?
 # argparse also exits 2, so the file is the proof that collection happened.
 if [ ! -f "$out/snapshot.json" ] || { [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; }; then
     echo "metrics: collect.py failed (exit $status); no snapshot written" >&2
@@ -658,7 +670,7 @@ if [ "$grading" -eq 1 ]; then
     [ -n "$base_ref" ] && diff_args+=(--base-ref "$base_ref")
     status=0
     rm -f "$out/report.json"
-    python3 "$here/diff.py" "${diff_args[@]}" || status=$?
+    python3 "$here/diff.py" ${diff_args[@]+"${diff_args[@]}"} || status=$?
     if [ ! -f "$out/report.json" ] || { [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; }; then
         echo "metrics: diff.py failed (exit $status); no report written" >&2
         exit 1
@@ -668,10 +680,16 @@ if [ "$grading" -eq 1 ]; then
     digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$out/report.json")"
     [ "$failed" -eq 0 ] || echo "metrics: a collector could not run; the snapshot is incomplete" >&2
     echo "quality-gate: $verdict report=$out/report.json sha256=$digest"
+    # A failed gate outranks an incomplete snapshot: the change fails on what
+    # was measured, and what was not measured cannot pass it.
+    [ "$status" -eq 2 ] && exit 2
     [ "$failed" -eq 0 ] || exit 3
     exit "$status"
 fi
 
+# Here an incomplete snapshot outranks a failed verdict: the nightly reads
+# exit 3 as "do not publish", and a snapshot with a collector missing would
+# leave a hole in the history the ratchets grade against.
 if [ "$failed" -eq 1 ]; then
     echo "metrics: a collector could not run; the snapshot is incomplete" >&2
     exit 3

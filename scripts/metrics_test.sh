@@ -301,6 +301,31 @@ EOF
     [ "$status" -eq 2 ] && ok "a stale exception exits 2" || bad "stale exception exit $status"
 }
 
+edges_match_by_package_not_name() {   # a registry crate named like a member is not an edge
+    # common (leaf) -> graph is forbidden; each variant names `graph` as a
+    # dependency of common, and only the path dependency on the member is it.
+    local variant status out
+    for variant in registry outside member; do
+        python3 - "$data/small-metadata.json" "$tmp/edge-$variant.json" "$variant" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+dep = {"name": "graph", "kind": None,
+       "registry": {"source": "registry+https://github.com/rust-lang/crates.io-index"},
+       "outside": {"source": None, "path": "/elsewhere/graph"},
+       "member": {"source": None, "path": "/x/crates/graph"}}[sys.argv[3]]
+dep = {"name": "graph", "kind": None, **dep}
+next(p for p in m["packages"] if p["name"] == "common")["dependencies"].append(dep)
+json.dump(m, open(sys.argv[2], "w"))
+PY
+        status=0
+        out="$(python3 "$layers" --rules "$data/small-layers.toml" --metadata "$tmp/edge-$variant.json" --json)" || status=$?
+        case "$variant" in
+            member) [ "$status" -eq 2 ] && ok "a path dependency on the member is the forbidden edge" || bad "member edge exit $status" ;;
+            *) [ "$status" -eq 0 ] && ok "a same-named crate ($variant) is not an internal edge" || bad "$variant dep exit $status: $out" ;;
+        esac
+    done
+}
+
 non_member_packages_are_not_crates() {   # full metadata through --metadata
     # Without --no-deps, `packages` carries every dependency; only the
     # workspace members are crates to place in a layer.
@@ -471,6 +496,44 @@ PY
     [ ! -f "$hist/2026-06-20-fffffff.json" ] && [ -f "$hist/2026-06-05-1a2b3c4.json" ] && [ -f "$hist/notes.txt" ] \
         && ok "the later June snapshot goes; the earliest, the recent ones and a non-snapshot stay" || bad "prune removed the wrong files: $(ls "$hist")"
     grep -q '^remove 2026-06-20-fffffff.json$' "$tmp/prune.out" && ok "the removal is printed" || bad "prune output: $(cat "$tmp/prune.out")"
+}
+
+newest_snapshot_orders_a_day_by_commit() {   # the baseline and the mutants `auto` reference
+    # Two commits an hour apart whose sha7s sort the other way round, and a
+    # snapshot of each under the same date: a name sort picks the older one.
+    local repo="$tmp/newest" n=0 early late
+    rm -rf "$repo"; git -c init.templateDir= init -q -b main "$repo" 2>/dev/null
+    gc() { GIT_COMMITTER_DATE="$1" GIT_AUTHOR_DATE="$1" git -C "$repo" -c user.name=t -c user.email=t@x commit -q --allow-empty -m "$2"; }
+    gc 2026-10-01T01:00:00Z early; early="$(git -C "$repo" rev-parse --short=7 HEAD)"
+    while :; do
+        n=$((n + 1)); gc 2026-10-01T02:00:00Z "late $n"; late="$(git -C "$repo" rev-parse --short=7 HEAD)"
+        [[ "$late" < "$early" ]] && break
+        git -C "$repo" reset -q --hard HEAD~1
+    done
+    mkdir -p "$repo/hist"
+    echo '{}' > "$repo/hist/2026-10-01-$early.json"; echo '{}' > "$repo/hist/2026-10-01-$late.json"
+    echo '{}' > "$repo/hist/2026-09-30-fffffff.json"
+    [ "$(cd "$repo" && python3 "$prune" --newest hist)" = "2026-10-01-$late.json" ] \
+        && ok "prune.py --newest takes the later commit of the day, not the larger sha7" \
+        || bad "newest: $(cd "$repo" && python3 "$prune" --newest hist)"
+    # diff.py's baseline over a history ref holding both.
+    git -C "$repo" checkout -q --orphan metrics-data
+    git -C "$repo" rm -rqf --cached . 2>/dev/null || true
+    mkdir -p "$repo/history"; cp "$repo/hist/"*.json "$repo/history/"
+    git -C "$repo" add history; gc 2026-10-02T00:00:00Z data
+    git -C "$repo" checkout -q main
+    if python3 - "$here/metrics" "$repo" "2026-10-01-$late.json" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import diff
+_, name, note = diff.load_baseline(Path(sys.argv[2]), "metrics-data")
+assert name == sys.argv[3], (name, note)
+PY
+    then ok "diff.py grades against the later commit of the day"
+    else bad "diff.py baseline picked the older snapshot"
+    fi
+    unset -f gc
 }
 
 dashboard_renders_offline_with_tables() {   # QM-016
@@ -714,6 +777,42 @@ EOF
     [ "$(py "$snap" "(s['workspace']['coverage'] is not None, 'tests' in s['workspace']['coverage'])")" = "(True, False)" ] \
         && ok "coverage is kept and the unreadable test counts are left out" \
         || bad "coverage with a truncated junit: $(py "$snap" "s['workspace']['coverage']")"
+}
+
+missing_nextest_fails_mutants_mode() {   # the mutants task never passes empty
+    mutants_repo
+    local repo="$tmp/mut" fake="$tmp/nonextest-bin" clean_path status=0 snap="$tmp/mut/.scratch/nonextest/snapshot.json"
+    mkdir -p "$fake"; cp "$repo/fakebin/cargo" "$repo/fakebin/cargo-mutants" "$fake/"
+    # A PATH with every directory that holds cargo-nextest taken out.
+    clean_path="$(python3 -c 'import os; print(":".join(d for d in os.environ["PATH"].split(":") if not os.path.exists(os.path.join(d, "cargo-nextest"))))')"
+    (cd "$repo" && PATH="$fake:$clean_path" bash scripts/metrics/run.sh mutants main --out "$repo/.scratch/nonextest" >/dev/null 2>"$tmp/nonextest.err") || status=$?
+    [ "$status" -eq 3 ] && ok "mutants mode without cargo-nextest exits 3, not 0" || bad "mutants mode without nextest exit $status"
+    [ "$(py "$snap" "s['run']['not_measured'].get('mutants', '').startswith('cargo-nextest not installed')")" = "True" ] \
+        && ok "the snapshot names the missing tool" || bad "not_measured: $(py "$snap" "s['run']['not_measured']")"
+}
+
+failed_gate_outranks_incomplete_in_grading() {   # exit 2 wins over 3 in gate/diff
+    # A copy of the throwaway repo whose metadata carries a forbidden edge
+    # (common -> graph fails ceiling:layers.unexcepted) and whose tokei
+    # falls over (size FAILED, so the snapshot is incomplete).
+    mutants_repo
+    local repo="$tmp/mut-exit" fake="$tmp/exit-fakebin"
+    rm -rf "$repo"; cp -r "$tmp/mut" "$repo"; mkdir -p "$fake"
+    cp "$data/small-layers.toml" "$repo/metrics/layers.toml"
+    python3 - "$data/small-metadata.json" "$tmp/exit-meta.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+next(p for p in m["packages"] if p["name"] == "common")["dependencies"].append({"name": "graph", "kind": None})
+json.dump(m, open(sys.argv[2], "w"))
+PY
+    printf '#!/bin/sh\ncase "$1" in metadata) cat "%s" ;; *) exit 1 ;; esac\n' "$tmp/exit-meta.json" > "$fake/cargo"
+    printf '#!/bin/sh\n[ "$1" = "--version" ] && { echo "tokei 15.0.0"; exit 0; }\necho broken >&2; exit 1\n' > "$fake/tokei"
+    chmod +x "$fake/cargo" "$fake/tokei"
+    local status=0 out
+    out="$(cd "$repo" && PATH="$fake:$PATH" bash scripts/metrics/run.sh gate main --out "$repo/.scratch/exit" 2>"$tmp/exit.err")" || status=$?
+    grep -q 'size FAILED' "$tmp/exit.err" && ok "the fixture loses a collector" || { bad "tokei did not fail: $(tail -n3 "$tmp/exit.err")"; return; }
+    printf '%s\n' "$out" | tail -n1 | grep -q '^quality-gate: fail ' && ok "the fixture fails a gate" || { bad "verdict: $(printf '%s\n' "$out" | tail -n1)"; return; }
+    [ "$status" -eq 2 ] && ok "a failed gate exits 2 even when the snapshot is incomplete" || bad "exit $status with a failed gate and a lost collector"
 }
 
 crap_counts_over_threshold() {   # CRAP per crate against [crap] threshold
@@ -1198,16 +1297,20 @@ all_cases=(
     forbidden_edge_is_reported
     excepted_edge_is_counted_not_failed
     non_member_packages_are_not_crates
+    edges_match_by_package_not_name
     unassigned_crate_fails
     hotspots_rank_churn_times_findings
     hotspots_without_coverage
     module_cycles_from_dot
     darwin_scope_lists_uncovered_crates
     prune_keeps_daily_then_monthly
+    newest_snapshot_orders_a_day_by_commit
     dashboard_renders_offline_with_tables
     mutants_scope_follows_mode
     untracked_file_is_listed
     truncated_junit_keeps_the_snapshot
+    failed_gate_outranks_incomplete_in_grading
+    missing_nextest_fails_mutants_mode
     crap_counts_over_threshold
     publish_targets_history_ref_only
     nightly_budget_is_declared

@@ -8,7 +8,7 @@
 # `cargo install --locked` compiles each tool (minutes). Neither is required
 # for a tool already installed at the pinned version.
 #
-# Usage: scripts/metrics/install-tools.sh [--check] [--experimental]
+# Usage: scripts/metrics/install-tools.sh [--check] [--experimental] [--only TOOL]...
 #   --check         report what is missing or mispinned, install nothing;
 #                   exit 1 if any.
 #   --experimental  also install the experimental collectors (rustqual,
@@ -16,6 +16,8 @@
 #                   optional and they never count as missing: what they
 #                   measure is recorded, never gated (QM-005), so a host
 #                   without them still writes a complete snapshot.
+#   --only TOOL     consider only this tool (repeatable), so a task that needs
+#                   two tools installs those two at their pins and no others.
 #
 # Also needs the toolchain's `llvm-tools-preview` for coverage; rustup hosts
 # get it from `rustup component add`, others set LLVM_COV/LLVM_PROFDATA to a
@@ -39,13 +41,21 @@ experimental_pins=(
     "cargo-anatomy   cargo-anatomy   0.7.7   cargo anatomy -V"
 )
 
-check_only=0 experimental=0
-for arg in "$@"; do
-    case "$arg" in
-        --check) check_only=1 ;;
-        --experimental) experimental=1 ;;
-        *) echo "usage: $0 [--check] [--experimental]" >&2; exit 1 ;;
+check_only=0 experimental=0 only=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) check_only=1; shift ;;
+        --experimental) experimental=1; shift ;;
+        --only) [ "$#" -ge 2 ] || { echo "$0: --only takes a tool" >&2; exit 1; }; only+=("$2"); shift 2 ;;
+        *) echo "usage: $0 [--check] [--experimental] [--only TOOL]..." >&2; exit 1 ;;
     esac
+done
+for want_tool in ${only[@]+"${only[@]}"}; do   # bash 3.2 + set -u: an empty array is unset
+    known=0
+    for pin in "${pins[@]}" "${experimental_pins[@]}"; do
+        [ "${pin%% *}" = "$want_tool" ] && known=1
+    done
+    [ "$known" -eq 1 ] || { echo "$0: --only $want_tool: no pin for that tool" >&2; exit 1; }
 done
 
 # Installed version of a tool, or empty. Every tool prints its version
@@ -64,6 +74,9 @@ check_pin() {
     # shellcheck disable=SC2086 # the pin row is meant to split
     set -- $2
     tool="$1" crate="$2" want="$3"; shift 3
+    if [ "${#only[@]}" -gt 0 ] && [[ " ${only[*]} " != *" $tool "* ]]; then
+        return 0
+    fi
     have="$(installed_version "$tool" "$@")"
     if [ "$have" = "$want" ]; then
         echo "ok        $tool $want"

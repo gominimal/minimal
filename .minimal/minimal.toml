@@ -58,7 +58,9 @@ description = "cargo-mutants over this branch's changed lines (Linux; baseline s
 inherit_cwd = true
 bash = """
 set -e
-command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked --version 27.1.0
+# The two tools run.sh needs, at the pins install-tools.sh owns; without
+# either, run.sh fails the run rather than skipping it.
+scripts/metrics/install-tools.sh --only cargo-mutants --only cargo-nextest
 scripts/metrics/run.sh mutants ""
 """
 

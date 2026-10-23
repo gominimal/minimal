@@ -69,6 +69,19 @@ def analyse(meta: dict, rules: dict) -> dict:
         (e["from"], e["to"]): e for e in rules.get("exception", [])
     }
 
+    member_dirs = {
+        str(Path(p["manifest_path"]).parent): n for n, p in members.items() if "manifest_path" in p
+    }
+
+    def internal(dep: dict) -> bool:
+        """A path dependency on a workspace member, not a registry or git
+        crate that shares a member's name. Metadata without `source` or
+        `path` (older fixtures) falls back to the name."""
+        if dep["name"] not in members or dep.get("source") is not None:
+            return False
+        path = dep.get("path")
+        return path is None or member_dirs.get(path) == dep["name"]
+
     violations = []
     edges = 0
     for name in sorted(members):
@@ -76,7 +89,7 @@ def analyse(meta: dict, rules: dict) -> dict:
         if src_layer is None:
             continue
         for dep in members[name]["dependencies"]:
-            if dep.get("kind") is not None or dep["name"] not in members:
+            if dep.get("kind") is not None or not internal(dep):
                 continue
             edges += 1
             dst_layer = layer_of.get(dep["name"])

@@ -38,6 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import changed_lines  # noqa: E402
 import collect  # noqa: E402
+import prune  # noqa: E402
 
 GATE_EXIT = 2
 THRESHOLDS_PATH = "metrics/thresholds.toml"
@@ -90,7 +91,9 @@ def load_baseline(root: Path, history_ref: str) -> tuple[dict | None, str | None
     names = sorted(n for n in listing.splitlines() if n.endswith(".json"))
     if not names:
         return None, None, f"`{history_ref}:{HISTORY_DIR}/` holds no snapshot"
-    name = names[-1]
+    # Two snapshots of one day (a dispatch and the nightly) are ordered by
+    # their commits, not by the sha7 in the name.
+    name = prune.newest(names, lambda sha: prune.commit_time(sha, root))
     text = git(root, "show", f"{history_ref}:{HISTORY_DIR}/{name}")
     if text is None:
         return None, name, f"`{history_ref}:{HISTORY_DIR}/{name}` could not be read"
