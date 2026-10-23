@@ -535,11 +535,12 @@ impl Network for HostIpAddressNetwork {
             // through the daemon's own relay, which carries the node's DNS
             // layer ([`crate::net::switch::spawn_node_relay`]), so nothing
             // reaches upstream except through it. A deny-all box in a guest
-            // that decides per box resolves through the same address, the
-            // one carve-out the guest's table admits (the gateway on port 53
-            // over UDP and TCP, NET-079), and reaches none of what it
-            // resolves; in a guest that decides nothing it is refused before
-            // a plan is ever asked for.
+            // that decides per box resolves through the same address — the
+            // table steers the deny subtree's lookups onto the guest's own
+            // DNS listener at that address's port 53 (NET-079), which
+            // refuses every name outside the zone — and reaches none of
+            // what it resolves; in a guest that decides nothing it is
+            // refused before a plan is ever asked for.
             let ns = { self.switch.lock().await.subnet().dns_server() };
             Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![ns])))
         })
@@ -1241,20 +1242,21 @@ mod tests {
         );
 
         // The carve-out the table itself enforces for that resolver: the
-        // installer's rendered table retargets the deny subtree's DNS
+        // installer's rendered table steers the deny subtree's DNS
         // lookups — the one port a box cannot be refused on, or nothing it
         // asks ever resolves — onto the answerer's address and port, so the
         // one destination a deny-all box's connections are admitted to is
-        // the one its resolver really is. Read off the step's own
-        // `--print-ruleset` output, so what is pinned is what a host loads.
-        // 53 is DNS, spelled here because the constant that owns it
-        // (`dns_gate::DNS_PORT`) is private to its module.
+        // the one its resolver really is. The match carries no destination
+        // address (NET-079): a box asks the switch gateway like every other
+        // host-address box, and the steer is the carve-out. Read off the
+        // step's own `--print-ruleset` output, so what is pinned is what a
+        // host loads. 53 is DNS, spelled here because the constant that
+        // owns it (`dns_gate::DNS_PORT`) is private to its module.
         let ruleset = crate::net::classifier::rendered_ruleset();
         let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
         let dnat = format!(
             "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" \
-             ip daddr {} udp dport 53 dnat ip to {}:{}",
-            crate::net::classifier::ANSWERER_ADDRESS,
+             udp dport 53 dnat ip to {}:{}",
             crate::net::classifier::ANSWERER_ADDRESS,
             crate::net::answerer::ANSWERER_PORT,
         );
@@ -1289,19 +1291,23 @@ mod tests {
         );
     }
 
-    /// NET-079 on a VM host, with NET-003: a deny-all host-address box resolves
-    /// through the resolver Minimal owns for it, which on a VM-backed host is
-    /// the node's DNS layer at the switch gateway, the same one every other
-    /// host-address box there resolves through. In a guest that decides per
-    /// box, that resolver is the one carve-out the guest's own table admits:
-    /// the plan's nameserver is the address the deny chain admits on port 53,
-    /// over UDP and over TCP, so the carve-out the table enforces and the
-    /// resolver the plan names are one fact. A guest that decided nothing (a
-    /// boot whose check or load failed, a table gone behind its marker, a
-    /// probe that read no refusal) gives the plan the same resolver; such a
-    /// guest refuses the deny-all box at launch anyway. The decision is a
-    /// parameter the launch passes in, so no reading of another launch can
-    /// move the box's resolver, and a box that is not deny-all resolves
+    /// NET-079 on a VM host, with NET-003: a deny-all host-address box
+    /// resolves through the resolver Minimal owns for it, which on a
+    /// VM-backed host is the node's DNS layer at the switch gateway, the
+    /// same one every other host-address box there resolves through. In a
+    /// guest that decides per box, that address is the one the guest's
+    /// own table steers the deny subtree's lookups at: the dstnat rule
+    /// retargets its UDP-53 datagrams onto the guest's own DNS listener
+    /// (NET-079), which forwards the zone's A questions to the gateway
+    /// and refuses every name outside the zone, and the deny chain admits
+    /// the listener alone — the steer and the admission are one fact, so
+    /// the plan's nameserver and the table's carve-out cannot drift
+    /// apart. A guest that decided nothing (a boot whose check or load
+    /// failed, a table gone behind its marker, a probe that read no
+    /// refusal) gives the plan the same resolver; such a guest refuses
+    /// the deny-all box at launch anyway. The decision is a parameter
+    /// the launch passes in, so no reading of another launch can move
+    /// the box's resolver, and a box that is not deny-all resolves
     /// through the same layer.
     #[tokio::test]
     async fn guest_deny_all_box_resolves_through_answerer_once_decided() {
@@ -1338,24 +1344,42 @@ mod tests {
              node's DNS layer at the gateway"
         );
 
-        // And that resolver is the one carve-out the guest's table admits, on
-        // DNS's port over both transports a lookup travels.
+        // And that address is the one the guest's own table steers the deny
+        // subtree's lookups at: the dstnat rule retargets its UDP-53
+        // datagrams onto the guest's own DNS listener, and the deny chain
+        // admits the listener alone — the listener the box's lookups are
+        // steered onto, at the port the plan's nameserver answers at.
         let guest_ip = std::net::IpAddr::V4(subnet.daemon_ip());
         let ruleset = String::from_utf8(crate::net::classifier::guest_ruleset(guest_ip, guest_ip))
             .expect("the guest's render is text");
         let deny_out = crate::net::classifier::chain_rules(&ruleset, "deny_out");
+        let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
         let Resolver::Nameservers(nameservers) = decided.resolver() else {
             panic!("the plan names its nameservers: {:?}", decided.resolver());
         };
-        for nameserver in nameservers {
-            for transport in ["udp", "tcp"] {
-                let carve_out = format!("ip daddr {nameserver} {transport} dport 53 accept");
-                assert!(
-                    deny_out.contains(&carve_out.as_str()),
-                    "the guest's table admits the plan's nameserver {nameserver} on \
-                     {transport} 53: {deny_out:?}"
-                );
-            }
+        let listener_addr = crate::net::guest_dns::LISTENER_ADDRESS;
+        let listener_port = crate::net::guest_dns::LISTENER_PORT;
+        let steer = format!(
+            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" udp dport 53 dnat ip to \
+             {listener_addr}:{listener_port}"
+        );
+        assert_eq!(
+            dstnat,
+            [steer.as_str()],
+            "the guest's table steers the deny subtree's lookups onto the listener the \
+             plan's nameserver {nameservers:?} answers at: {dstnat:?}"
+        );
+        let listener = format!("ip daddr {listener_addr} udp dport {listener_port} accept");
+        assert!(
+            deny_out.contains(&listener.as_str()),
+            "the guest's table admits the listener the deny subtree's lookups are steered \
+             onto: {deny_out:?}"
+        );
+        for rule in deny_out.iter().filter(|rule| rule.ends_with("accept")) {
+            assert!(
+                rule.contains("ct direction reply") || rule == &listener,
+                "the listener and the reply direction are the whole carve-out: {deny_out:?}"
+            );
         }
 
         // Undecided, unread, and read again after a decided launch: the same

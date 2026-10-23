@@ -31,9 +31,12 @@
 # offer.
 #
 # Uninstall walks the local install record (no network) and removes each file
-# whose on-disk bytes still match what the installer recorded writing; it accepts
-# --force (remove modified files too), --purge (also delete the minimal data/
-# state/cache trees), and --dry-run.
+# whose on-disk bytes still match what the installer recorded writing. It
+# stops the running daemon first — asking on the terminal when that daemon
+# has active sessions, exactly as an upgrade does — and accepts --force
+# (remove modified files too), --force-stop (stop live sessions without
+# asking), --purge (also delete the minimal data/state/cache trees), and
+# --dry-run.
 #
 # After the files are placed, the installer wires up shell integration:
 # it generates per-shell init files that prepend the bin dir to PATH, installs
@@ -243,8 +246,9 @@ if [ "${1-}" = "--uninstall" ]; then
         case "$1" in
             --force)      uninstall_force=1 ;;
             --purge)      uninstall_purge=1 ;;
+            --force-stop) force_stop=1 ;;
             -n|--dry-run) dry_run=1 ;;
-            *)            die "unknown uninstall option '$1' (allowed: --force, --purge, --dry-run)" ;;
+            *)            die "unknown uninstall option '$1' (allowed: --force, --force-stop, --purge, --dry-run)" ;;
         esac
         shift
     done
@@ -622,6 +626,19 @@ do_uninstall() {
     say ""
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
 
+    # The walk below deletes `min` itself, so the daemon it runs must be
+    # stopped first, while the `min` that matches it is still on disk — a
+    # daemon left running through an uninstall+reinstall keeps serving the old
+    # build, and every daemon-backed command on the fresh install then hits a
+    # version skew. Same escalation as the upgrade swap: graceful stop, consent
+    # on the terminal if sessions are live, --force after. Uninstall and the
+    # upgrade share the once-guard, so a `min` removed here stays removed.
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would stop the running daemon (it is stopped on the real run)"
+    else
+        stop_running_daemon || die "aborted: the daemon is still running; nothing was removed"
+    fi
+
     # Before the walk (which deletes `min` and the shipped loader), offer to
     # tear down what was installed with root outside the record too.
     maybe_remove_finalize_install
@@ -806,6 +823,96 @@ do_uninstall() {
     return 0
 }
 
+# --- Daemon stop (shared by the upgrade swap and the uninstall walk) ---------
+
+# Swapping binaries under a running daemon wedges it: the daemon keeps
+# serving from the old image while the new `min` talks to it. Stop it first,
+# using the `min` ALREADY on disk — that one matches the daemon it started, and
+# it is about to be overwritten. Deliberately best-effort and silent: nothing
+# installed yet, no daemon running, or a `min` too old to have `stop` all mean
+# "nothing to stop", and none of them should fail an install whose binaries are
+# otherwise fine. `min stop` only connects (it never autospawns), so with no
+# daemon up this is a failed connect and nothing more.
+#
+# The graceful `min stop` goes first because it already refuses while sessions
+# are live, printing exactly this message — the one signal that an upgrade is
+# about to destroy someone's work, and worth a question. Matched literally
+# rather than on exit status: a bare non-zero also means no daemon, a failed
+# connect, or a transport drop on an otherwise successful stop, and none of
+# those may turn every upgrade into a prompt.
+#
+# Every `min` below reads from /dev/null: a child that ever read stdin would
+# eat the applicable-manifest rows still to be installed (the upgrade calls
+# this inside the component loop).
+sessions_live_msg='daemon has active sessions'
+
+# Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
+# `curl … | sh` stdin is the script pipe, so reading the answer from it would
+# consume the script; /dev/tty is the only sound source (overridable so the
+# test harness can drive both answers). No terminal to ask on — CI, a
+# non-interactive shell — means nobody can consent: say so and let the caller
+# abort, rather than hang or silently destroy work. Returns non-zero when the
+# upgrade must not proceed. The argument names the calling stop: `pre` (the
+# default) may tell the user to rerun with --force-stop, which works before
+# the swaps; `post` runs after them, where a rerun replaces nothing and could
+# never reach this stop, so it must not suggest one.
+confirm_force_stop() {
+    _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    say ""
+    say "warning: the running daemon has active sessions:"
+    "$bindir/min" ls >&2 </dev/null || true
+    say ""
+    if ! (exec <"$_tty") 2>/dev/null; then
+        if [ "${1:-pre}" = post ]; then
+            say "there is no terminal to confirm on."
+        else
+            say "there is no terminal to confirm on; rerun with --force-stop"
+            say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
+        fi
+        return 1
+    fi
+    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
+    _ans=
+    read -r _ans <"$_tty" || _ans=
+    case "$_ans" in
+        [Yy]*) return 0 ;;
+        *)     return 1 ;;
+    esac
+}
+
+# daemon_stop_consent records that this run may end live sessions: the user
+# passed --force-stop, or answered yes on the terminal. The post-swap stop
+# reads it, so it never forces a stop the user did not agree to. A yes covers
+# only the sessions the question listed, so their ids are kept in
+# pre_swap_sessions (`min ls --raw`, one per line). A listing that fails leaves
+# it empty, and then every session the post-swap stop finds counts as new.
+daemon_stop_tried=0
+daemon_stop_consent=0
+pre_swap_sessions=
+stop_running_daemon() {
+    [ "$daemon_stop_tried" -eq 0 ] || return 0
+    daemon_stop_tried=1
+    [ "$force_stop" -eq 0 ] || daemon_stop_consent=1
+    [ -x "$bindir/min" ] || return 0
+
+    if [ "$force_stop" -eq 0 ]; then
+        # Stopped gracefully (or there was nothing to stop): done, no --force.
+        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+            return 0
+        fi
+        case "$_stop_out" in
+            *"$sessions_live_msg"*)
+                pre_swap_sessions="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" \
+                    || pre_swap_sessions=
+                confirm_force_stop || return 1
+                daemon_stop_consent=1
+                ;;
+        esac
+        # Any other failure falls through to the force stop, silent as before.
+    fi
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+}
+
 # Dispatch uninstall before any target/manifest work. resolve_prefix and
 # the SHA/platform probes above are all it needs; it never resolves a target.
 if [ "$MODE" = uninstall ]; then
@@ -901,72 +1008,92 @@ records="$tmpdir/installed"
 : >"$records"
 installed=0 skipped=0
 
-# Swapping binaries under a running daemon wedges it: the daemon keeps
-# serving from the old image while the new `min` talks to it. Stop it first,
-# using the `min` ALREADY on disk — that one matches the daemon it started, and
-# it is about to be overwritten. Deliberately best-effort and silent: nothing
-# installed yet, no daemon running, or a `min` too old to have `stop` all mean
-# "nothing to stop", and none of them should fail an install whose binaries are
-# otherwise fine. `min stop` only connects (it never autospawns), so with no
-# daemon up this is a failed connect and nothing more.
+# The pre-swap stop used the OLD `min`, the one that matched the daemon. Two
+# ways leave a daemon of the old build running after the swap anyway:
 #
-# The graceful `min stop` goes first because it already refuses while sessions
-# are live, printing exactly this message — the one signal that an upgrade is
-# about to destroy someone's work, and worth a question. Matched literally
-# rather than on exit status: a bare non-zero also means no daemon, a failed
-# connect, or a transport drop on an otherwise successful stop, and none of
-# those may turn every upgrade into a prompt.
+# - An install can START with no `min` on disk (a fresh prefix over a leftover
+#   socket, or an uninstall whose walk kept a modified `min` that a later
+#   --force removed). Then nothing above stopped anything.
+# - An attached client autospawns a replacement daemon the moment the pre-swap
+#   stop ends, and that window spans every swap after the first. The daemon it
+#   spawns serves the old version from the binaries the run is replacing.
 #
-# Every `min` below reads from /dev/null: this runs inside the component loop,
-# whose stdin is the applicable-manifest file, and a child that ever read stdin
-# would eat the rows still to be installed.
-sessions_live_msg='daemon has active sessions'
-
-# Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
-# `curl … | sh` stdin is the script pipe, so reading the answer from it would
-# consume the script; /dev/tty is the only sound source (overridable so the
-# test harness can drive both answers). No terminal to ask on — CI, a
-# non-interactive shell — means nobody can consent: say so and let the caller
-# abort, rather than hang or silently destroy work. Returns non-zero when the
-# upgrade must not proceed.
-confirm_force_stop() {
-    _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
-    say ""
-    say "warning: the running daemon has active sessions:"
-    "$bindir/min" ls >&2 </dev/null || true
-    say ""
-    if ! (exec <"$_tty") 2>/dev/null; then
-        say "there is no terminal to confirm on; rerun with --force-stop"
-        say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
-        return 1
-    fi
-    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
-    _ans=
-    read -r _ans <"$_tty" || _ans=
-    case "$_ans" in
-        [Yy]*) return 0 ;;
-        *)     return 1 ;;
-    esac
-}
-
-daemon_stop_tried=0
-stop_running_daemon() {
-    [ "$daemon_stop_tried" -eq 0 ] || return 0
-    daemon_stop_tried=1
+# Either way every daemon-backed command on the new install then speaks to it
+# across a version skew. So once the swaps are done, probe with the NEW `min`
+# and stop only a daemon whose version differs from it. `min version` never
+# autospawns. It reports the client and, when a daemon answers, its version
+# too. Matching versions or no answer stop nothing and say nothing, so an
+# ordinary install, an up-to-date rerun, and a daemon respawned from the new
+# binaries are all left alone.
+#
+# A session can open in a respawned daemon while the run is still going (a
+# `min new`, an unattended job), and R5.5 never ends a session unasked. So the
+# stop is graceful unless this run already holds consent: --force-stop, or a
+# yes to the pre-swap question. The yes covers only the sessions that question
+# listed. So before it forces, the stop lists the daemon's live sessions, and
+# any session the yes did not see (or a listing that fails) makes the stop
+# graceful again. A graceful stop refused for live sessions asks
+# on the terminal, as the pre-swap stop does. Declined, or with no terminal to
+# ask on, it leaves the daemon running and says how to stop it: the swaps are
+# done, so the install itself still succeeds.
+stale_stop_tried=0
+stop_stale_daemon() {
+    [ "$stale_stop_tried" -eq 0 ] || return 0
+    stale_stop_tried=1
     [ -x "$bindir/min" ] || return 0
-
-    if [ "$force_stop" -eq 0 ]; then
-        # Stopped gracefully (or there was nothing to stop): done, no --force.
+    _vout="$("$bindir/min" version 2>&1 </dev/null)" || _vout=
+    _cv="$(printf '%s\n' "$_vout" | sed -n 's/^Client: minimal //p')"
+    _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
+    [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ] || return 0
+    say "stopping a daemon still running from build $_sv"
+    if [ "$force_stop" -eq 0 ] && { [ "$daemon_stop_consent" -eq 0 ] || ! sessions_seen_pre_swap; }; then
         if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*) confirm_force_stop || return 1 ;;
+            *"$sessions_live_msg"*)
+                if confirm_force_stop post; then
+                    force_stop_stale "$_sv"
+                    return 0
+                fi
+                say "the daemon has active sessions, so it is still running build $_sv."
+                say "run 'min stop' after those sessions end, or 'min stop --force' to end them now."
+                return 0
+                ;;
         esac
-        # Any other failure falls through to the force stop, silent as before.
+        # Any other failure falls through to the force stop, as the pre-swap
+        # stop does: no live sessions were reported, so none are at risk.
     fi
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+    force_stop_stale "$_sv"
 }
+
+# Succeeds when every live session the daemon lists now was in the list the
+# pre-swap yes covered. A failed listing proves nothing, so it fails too.
+sessions_seen_pre_swap() {
+    _now="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" || return 1
+    printf '%s\n' "$_now" | while read -r _id; do
+        [ -z "$_id" ] && continue
+        printf '%s\n' "$pre_swap_sessions" | grep -qxF -e "$_id" || exit 1
+    done
+}
+
+# The post-swap force stop. It follows a "stopping a daemon" line, so a failed
+# stop is reported rather than left looking like success: a daemon of the old
+# build may still be serving, and the user is told how to stop it.
+force_stop_stale() {
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null && return 0
+    say "the daemon on build $1 may still be running; run 'min stop --force'"
+}
+
+# Set once the pre-swap stop has run and the first executable is about to be
+# replaced. From then on a `die` (a failed download or checksum on a later
+# component) must still run the post-swap stop below: an attached client can
+# already have respawned the daemon from the half-replaced binaries. The EXIT
+# trap does that. From the trap, confirm_force_stop can ask its question after
+# the die message. That is acceptable: it only asks when a terminal is present,
+# and the question lists the sessions a yes would end.
+daemon_stop_ran=0
+trap 'if [ "$daemon_stop_ran" -eq 1 ]; then stop_stale_daemon; fi; rm -rf "$tmpdir"' EXIT
 
 # No field ever contains whitespace, so default IFS splitting is exact.
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
@@ -1084,6 +1211,7 @@ while read -r comp _ _ _ want kind dest src; do
                 rm -f "$tmp"
                 die "aborted: no executables were replaced, the daemon is still running"
             }
+            daemon_stop_ran=1
             ;;
     esac
 
@@ -1097,6 +1225,11 @@ while read -r comp _ _ _ want kind dest src; do
     # written by earlier installer versions.
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
+
+# The post-swap stop: stop_stale_daemon, defined above the loop.
+if [ "$installed" -gt 0 ]; then
+    stop_stale_daemon
+fi
 
 # --- Generated shell-init files and completions ----------------------------
 

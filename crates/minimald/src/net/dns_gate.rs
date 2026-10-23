@@ -413,7 +413,7 @@ fn normalized(name: &str) -> String {
 /// presentation form, so it forwards `x.MIN.INTERNAL` and the apex itself
 /// upstream; both are refused here. The case of the labels below the zone
 /// does not matter, and a label holding an escaped dot is one label.
-fn answered_on_the_switch(name: &Name) -> bool {
+pub(crate) fn answered_on_the_switch(name: &Name) -> bool {
     Name::from_ascii(super::dns::HOSTNAME_SUFFIX)
         .is_ok_and(|zone| zone.zone_of_case(name) && name.num_labels() > zone.num_labels())
 }

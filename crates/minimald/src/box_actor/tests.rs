@@ -15,7 +15,8 @@ const GIVE_UP: Duration = Duration::from_secs(600);
 
 /// A probe of a host that never answers has to end on its own deadline.
 ///
-/// The session actor forwards `GetHostAttrs`/`GetHostScreen` to a spawned
+/// The session actor forwards `GetHostScreen` (and, through the host slot,
+/// the listing's attrs probe takes the same bounded path) to a spawned
 /// task so the actor stays responsive, but nothing cancels that task:
 /// dropping the caller's receiver does not stop a spawned future. Left
 /// unbounded, every poll of a wedged host stranded one task forever — and
@@ -1866,7 +1867,7 @@ async fn missing_sidecar_falls_back_to_baseline() {
 /// session sitting idle with nobody attached must still be able to launch
 /// a host, and a second request must reuse it rather than starting a
 /// second shell in the same session.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -1891,7 +1892,8 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     assert!(host.is_alive());
     assert!(
         handle.get_attrs().await.is_some(),
-        "the session should now be holding the host it launched"
+        "the session should now be holding the host it launched: the slot is \
+         published before `ensure_host` replies, on a multi-thread runtime too"
     );
 
     let again = handle
@@ -2119,7 +2121,10 @@ async fn destroy_session(
 ) -> minimald_rpc::DestroySessionResponse {
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
-        .call::<DestroySession>(&DestroySessionRequest { id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
     {
         Errorable::Ok(resp) => resp,
@@ -3282,20 +3287,12 @@ async fn own_ip_default_deny_all() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some("own-ip-bare".to_string()),
-                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-                network: boxes::NetworkMode::OwnIp,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: None,
-        })
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "own-ip-bare",
+            paths::HostAbsPath::try_new("/uwu").unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        ))
         .await
         .unwrap();
     let logged = capture.contents();
@@ -3331,31 +3328,23 @@ async fn own_ip_default_deny_all() {
 /// An own-address session's config: a box that declares one published port —
 /// the ingress a publish is made of (NET-010) — under the session `name`.
 fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
-    minimald_rpc::CreateSessionRequest {
-        config: minimald_rpc::BoxConfig {
-            name: Some(name.to_string()),
-            project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-            network: boxes::NetworkMode::OwnIp,
-            policy: boxes::BoxPolicy {
-                egress: None,
-                ingress: Some(boxes::IngressPolicy {
-                    port_mappings: vec![boxes::PortMapping {
-                        external_port: 18080,
-                        internal_port: 80,
-                        proto: boxes::IpProto::Tcp,
-                    }],
-                    ..Default::default()
-                }),
-                credentialed_upstream: None,
-            },
-            task_addresses: Vec::new(),
-            box_id: None,
-            box_addresses: None,
-            hooks_enabled: true,
-            attrs: Default::default(),
+    minimald_rpc::CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new("/uwu").unwrap(),
+        boxes::NetworkMode::OwnIp,
+        boxes::BoxPolicy {
+            egress: None,
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: boxes::IpProto::Tcp,
+                }],
+                ..Default::default()
+            }),
+            credentialed_upstream: None,
         },
-        must_match_version: None,
-    }
+    )
 }
 
 /// The same request with the hand a real creator sends: the registration's
@@ -3854,7 +3843,10 @@ async fn destroyed_box_name_is_nxdomain() {
 
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
-        .call::<DestroySession>(&DestroySessionRequest { id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
     {
         Errorable::Ok(_) => {}
@@ -5105,6 +5097,68 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
         Some("restored-alpha".to_owned()),
         "the name still routes to its own session"
     );
+}
+
+/// A restarted daemon's resume launches the host of a restored own-address
+/// box — no RPC, no exec, no attach — so the box's declared ingress is
+/// bound and its name keeps answering without a client. A `HostNet` box
+/// gets no such launch: it owns no declared ingress and publishes no
+/// address, so its restored actor alone is the whole box, as before.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "restored-own-ip",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        handed,
+    )
+    .await;
+    create_configured_session(&mut client, "restored-hostnet", "/uwu").await;
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both active sessions are resumed"
+    );
+
+    let web = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the own-address box's session resolves");
+    for _ in 0..100 {
+        if web.get_attrs().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        web.get_attrs().await.is_some(),
+        "the resumed own-address box holds a host no client asked for"
+    );
+
+    let hostnet = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Name(
+            "restored-hostnet".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .expect("the host-network box's session resolves");
+    // Held for a settle rather than read once: a launch wrongly spawned
+    // for it would be in flight alongside the own-address box's.
+    for _ in 0..20 {
+        assert!(
+            hostnet.get_attrs().await.is_none(),
+            "a resumed host-network box launches no host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// One restored session whose actor cannot start costs only its own name:
@@ -7179,21 +7233,21 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
 
     // Present, name not yet registered (a first finalize): the hand.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         Some(hand)
     );
     // Absent: the hand is not vouched for, so the interim stands.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
         None
     );
     // Only an interim publish with a hand behind it moves.
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
         None
     );
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
         None
     );
 
@@ -7202,7 +7256,7 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
     reg.register_own_ip(me, "promo", BTreeSet::new());
     assert!(reg.name_held_by(me, "promo"));
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         Some(hand)
     );
 
@@ -7218,7 +7272,7 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
     reg.register_own_ip(other, "promo", BTreeSet::new());
     assert!(reg.name_held_by(other, "promo"));
     assert_eq!(
-        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        super::naming::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
         None
     );
 }
@@ -7775,20 +7829,12 @@ async fn create_logs_dynamic_ingress() {
         .await
         .unwrap();
     client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config: minimald_rpc::BoxConfig {
-                name: Some("dyn-bare-logged".to_string()),
-                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
-                network: boxes::NetworkMode::OwnIp,
-                policy: boxes::BoxPolicy::default(),
-                task_addresses: Vec::new(),
-                box_id: None,
-                box_addresses: None,
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            must_match_version: None,
-        })
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "dyn-bare-logged",
+            paths::HostAbsPath::try_new("/uwu").unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        ))
         .await
         .unwrap();
 

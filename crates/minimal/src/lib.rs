@@ -14,6 +14,7 @@ pub mod diag;
 pub mod dirs;
 pub mod git_remote;
 pub mod loadouts;
+pub(crate) mod mint;
 pub mod prompt;
 pub mod resolver;
 pub mod task;

@@ -86,6 +86,8 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Box subcommands: show what a box will get
+    Box(BoxArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
@@ -115,6 +117,8 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
+    /// Sign in to GitHub, and show the sign-in that boxes use
+    Auth(AuthArgs),
     /// Print that there is nothing to mint
     ///
     /// The HTTPS reverse proxy this verb once served is retired, so it
@@ -394,6 +398,59 @@ impl std::fmt::Display for OutputWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("failed to write the document to stdout")
     }
+}
+
+#[derive(Debug, Args)]
+pub struct BoxArgs {
+    #[command(subcommand)]
+    pub command: BoxCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BoxCommand {
+    /// Show how a project's box reaches GitHub through the local proxy:
+    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// the steering mode and the UDP 443 stance
+    Spec(BoxSpecArgs),
+    /// Show what the local proxy recorded for one box: each request it
+    /// admitted or refused, each secret minted for the box, and the box's
+    /// revocation. A removed box's records stay readable by its id
+    Audit(BoxAuditArgs),
+}
+
+// BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("box_or_parent").required(true).args(["target", "parent"])))]
+pub struct BoxAuditArgs {
+    /// The box: its id, or its name. A name reads the running box of that
+    /// name, else the newest box created under it. `self` is the box this
+    /// command runs in
+    pub target: Option<String>,
+    /// Show the records of every child box of this box (an id, a name or
+    /// `self`) together, each record naming its box
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Write each record as one JSON line, as the proxy wrote it
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxAuditOutputFormat>,
+    /// Show the records so far, then keep showing new records as the proxy
+    /// writes them, until interrupted
+    #[arg(long)]
+    pub follow: bool,
+}
+
+/// The rendering `min box audit` writes, beside the text default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxAuditOutputFormat {
+    /// One JSON object for each record
+    Jsonl,
+}
+
+#[derive(Debug, Args)]
+pub struct BoxSpecArgs {
+    /// The project directory whose minimal.toml declares the box
+    /// (default: --repo-dir, or the current directory)
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -992,7 +1049,7 @@ pub struct DestroyArgs {
     /// Destroy all sessions
     #[arg(long)]
     pub all: bool,
-    /// Skip the destroy confirmation
+    /// Skip the destroy confirmation, and treat a session that is already destroyed as success
     #[arg(long, short)]
     pub force: bool,
 }
@@ -1116,6 +1173,33 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Sign in to GitHub and keep the sign-in in the host keychain
+    ///
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
+    /// Show whether you are signed in to GitHub, and when the token expires
+    ///
+    /// Never prints the token.
+    Status,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Sign in with a code entered at github.com, not in this browser
+    #[arg(long)]
+    pub device: bool,
 }
 
 /// Arguments for `min login`.

@@ -108,7 +108,7 @@ jobs:
         # true` reclaims /opt/hostedtoolcache (~14 GB); the dtolnay step below
         # reinstalls the Rust toolchain we actually need. The Android SDK is
         # removed by the next step instead.
-        uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+        uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
         with:
           remove_android: false
           remove_dotnet: true
@@ -151,7 +151,7 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install cross + nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cross,nextest
 
@@ -238,7 +238,7 @@ jobs:
             || { echo "::error::built minvmd is not statically linked"; file testbed/minvmd; exit 1; }
 
       - name: Upload testbed
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: kvm-testbed
           path: testbed/
@@ -260,7 +260,7 @@ jobs:
           persist-credentials: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: nextest
 
@@ -280,7 +280,7 @@ jobs:
           ls -l /dev/kvm
 
       - name: Download testbed
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kvm-testbed
           path: ${{ runner.temp }}/testbed
@@ -401,7 +401,7 @@ jobs:
 
       - name: Upload guest boot console logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: minvmd-linux-boot-log-x86_64
           path: |

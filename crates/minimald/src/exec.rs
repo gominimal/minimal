@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use boxes::SessionId;
@@ -21,14 +23,17 @@ use russh::{
     Channel, ChannelId,
     server::{Msg, Session},
 };
+use std::collections::VecDeque;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
+
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 // Every task this module spawns carries the caller's span (TEL-022): the
@@ -58,7 +63,20 @@ use crate::{
 /// Setup errors and per-spawn errors both surface as `Err` items in the
 /// stream; the bridge handles them uniformly.
 pub trait Exec: Send + 'static {
+    /// What the bridge does with input arriving after the current command
+    /// closed its stdin: dropped for a single program, kept for the next in
+    /// a sequence (the default).
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Keep
+    }
+
     type Process: Process;
+
+    /// Whether a destroy of the box ends this exec's process. True for a
+    /// process inside the box, which the destroy's host teardown stops.
+    /// False for a process outside the box — on the daemon's host, or in a
+    /// task's own sandbox — which outlives it.
+    const ENDED_BY_BOX_DESTROY: bool = true;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>>;
 }
@@ -153,6 +171,11 @@ fn task_start_dir(
 
 impl Exec for TaskExec {
     type Process = TaskProcess;
+
+    // A task runs in a sandbox of its own, beside the box rather than in
+    // it: the destroy's host teardown (`BoxActor::stop_running`) does not
+    // stop it, so a task that ends during a destroy was not ended by it.
+    const ENDED_BY_BOX_DESTROY: bool = false;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
@@ -806,6 +829,17 @@ pub struct TokioExec {
 impl Exec for TokioExec {
     type Process = TokioProcess;
 
+    // The process runs on the daemon's host, not in the box, so the
+    // destroy's host teardown does not stop it.
+    const ENDED_BY_BOX_DESTROY: bool = false;
+
+    /// One program (`git receive-pack`, `git upload-pack`): input it leaves
+    /// unread after closing its stdin has no other reader, as for a
+    /// session exec.
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
+
     fn exec(self, _session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             let mut cmd = Command::new("/bin/sh");
@@ -899,6 +933,12 @@ const SESSION_SHELL: &str = "/usr/bin/bash";
 
 impl Exec for BoxExec {
     type Process = TokioProcess;
+
+    /// One program: input it leaves unread after closing its stdin has no
+    /// other reader.
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
@@ -1065,36 +1105,84 @@ impl<S: Exec> ExecTask<S> {
         // indefinitely (gominimal/inbox#813).
         // An in-memory pipe: unlike pipe(2) it cannot fail (no fds to run
         // out of), and dropping the pump's half still gives the bridge EOF.
-        let (stdin_tx, mut stdin_rx) = tokio::io::duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = watch::channel(false);
+        let held = HeldInput::new(HeldInputLimits::for_daemon());
+        let mut stdin_r = HeldInputReader(Arc::clone(&held));
+        let (end_tx, end_rx) = watch::channel(None);
+        let unread = self.exec.unread_stdin();
 
         let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
             rs.wait().await.map(|msg| (msg, rs))
         }));
-        let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
+        let pump = spawn(pump_channel_input(msgs, held, end_tx));
 
         let stream = self.exec.exec(self.session.clone());
         let mngr = self.serv.sessions_manager().await;
-        let exit_status = bridge_noting_shutdown(
+        let (exit_status, late_start) = bridge_noting_reason(
             self.channel_id,
             stream,
-            &mut stdin_rx,
+            &mut stdin_r,
             &mut w,
             &mut e,
-            client_lost_rx,
+            end_rx.clone(),
+            unread,
+            destroy_signal::<S>(|| self.session.destroy_signal()),
             || mngr.is_shutting_down(),
         )
         .await;
 
         pump.abort();
+        // Awaited to its end, so no push of the pump's is still in flight
+        // when the reader is dropped and the held input is cleared; an
+        // aborted task joins as cancelled, which is the expected outcome.
+        if let Err(err) = pump.await
+            && !err.is_cancelled()
+        {
+            tracing::warn!(error = %err, "exec: the input pump ended abnormally");
+        }
+        // The notice names the bound; a command that happened to finish on
+        // its own in the same instant still gets it, which is the rarer
+        // wrong of the two (the other being no notice for an ended exec).
+        let notice = match *end_rx.borrow() {
+            Some(ExecEnd::InputHeldOver(bound)) => Some(held_input_notice(bound)),
+            Some(ExecEnd::InputHeldUnstarted(bound)) => Some(unstarted_input_notice(bound)),
+            Some(ExecEnd::ClientLost) | None => None,
+        };
+        if let Some(notice) = notice
+            && e.write_all(notice.as_bytes()).await.is_err()
+        {
+            tracing::debug!("exec: the held-input notice was not written; the client is gone");
+        }
         let _ = w.flush().await;
         let _ = e.flush().await;
 
-        drop(stdin_rx);
+        drop(stdin_r);
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        // An exec that ended while its command was still starting has
+        // answered its client already; the command that start yields, if it
+        // ever does, is ended here rather than left running unbridged.
+        if let Some(mut late) = late_start {
+            reap_late_start(&mut late).await;
+        }
         exit_status
+    }
+}
+
+/// Ends the command a start already in flight yields, once it does: the exec
+/// it was for ended while it was starting ([`bridge_until_end`]). Takes one
+/// item only, the start that was pending, so no further command of a
+/// sequence is started. A start that never returns keeps this waiting, with
+/// the client already answered and its channel closed.
+async fn reap_late_start<S, P>(stream: &mut S)
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+{
+    if let Some(Ok(mut process)) = stream.next().await {
+        tracing::info!("exec: a command started after its exec had ended; ending it");
+        let _ = process.start_kill();
+        let _ = process.wait().await;
     }
 }
 
@@ -1102,65 +1190,665 @@ impl<S: Exec> ExecTask<S> {
 /// client is told why its command stopped rather than handed a bare 137.
 const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
 
-/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
-/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+/// The line an exec the session's destroy ended leaves on stderr, for the
+/// same reason: the client is told why its command stopped, not handed a
+/// bare 137 with nothing on the wire to explain it.
+const DESTROYED_NOTICE: &[u8] = b"the session was destroyed; the command was stopped\n";
+
+/// The destroy token the bridge watches for an exec of kind `S`.
 ///
-/// `shutting_down` is asked once the bridge returns. It reads the sessions
-/// manager's shutdown state, which is set before the manager stops any box,
-/// rather than the server's shutdown token, which is cancelled only after the
-/// manager is done and so after the command is already gone.
-async fn bridge_noting_shutdown<S, P, R, W, E>(
-    channel_id: impl Display + Clone,
+/// Only an exec whose process the destroy ends gets one
+/// ([`Exec::ENDED_BY_BOX_DESTROY`]). A process outside the box outlives the
+/// destroy, so the bridge does not stop it and does not name the destroy.
+fn destroy_signal<S: Exec>(token: impl FnOnce() -> CancellationToken) -> Option<CancellationToken> {
+    S::ENDED_BY_BOX_DESTROY.then(token)
+}
+
+/// The notice an exec leaves on stderr when it ends.
+///
+/// A daemon shutdown comes first. It names a command that ended with a
+/// kill-shaped status. The destroy notice names only a command that the
+/// bridge stopped because the destroy token fired.
+fn exit_notice(
+    shutting_down: bool,
+    exit_status: u32,
+    stopped_by_destroy: bool,
+) -> Option<&'static [u8]> {
+    if shutting_down && exit_status >= KILLED_STATUS_MIN {
+        Some(SHUTDOWN_NOTICE)
+    } else if stopped_by_destroy {
+        Some(DESTROYED_NOTICE)
+    } else {
+        None
+    }
+}
+
+/// The lowest exit status that is kill-shaped: `128 + signo` is how a
+/// signal-terminated command reports, in the shell convention.
+const KILLED_STATUS_MIN: u32 = 128;
+
+/// A [`Process`] that the bridge stops when the box's destroy starts.
+///
+/// `wait` races the inner process against the destroy token. When the
+/// token fires first, it calls `start_kill` and sets `stopped`. Then it
+/// waits for the inner process to end. A process that already ended wins
+/// the race, so a command that exits on its own never sets `stopped`.
+struct StoppedOnDestroy<P> {
+    inner: P,
+    /// `None` for a process the destroy does not stop: `wait` is then the
+    /// inner wait, and `stopped` is never set.
+    destroyed: Option<CancellationToken>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl<P: Process> Process for StoppedOnDestroy<P> {
+    type Stdin = P::Stdin;
+    type Stdout = P::Stdout;
+    type Stderr = P::Stderr;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        self.inner.take_stdio()
+    }
+
+    // Cancel-safe: the inner `wait` is, and `stopped` is set before the
+    // next await point.
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        if let Some(destroyed) = &self.destroyed
+            && !self.stopped.load(Ordering::SeqCst)
+        {
+            tokio::select! {
+                biased;
+                status = self.inner.wait() => return status,
+                () = destroyed.cancelled() => {
+                    self.stopped.store(true, Ordering::SeqCst);
+                    tracing::info!("exec: session destroy started; stopping the command");
+                    if let Err(err) = self.inner.start_kill() {
+                        tracing::warn!(error = %err, "exec: failed to stop the command for the destroy");
+                    }
+                }
+            }
+        }
+        self.inner.wait().await
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        self.inner.start_kill()
+    }
+}
+
+/// Runs [`bridge`] and writes the notice for why the command ended to `e`
+/// before it returns the exit status. The status always passes through.
+///
+/// `destroyed` is the box's destroy token, for an exec whose process the
+/// destroy ends. When it fires while a command runs, the bridge stops the
+/// command and notes the destroy. A command that exits on its own, with
+/// any status, gets no destroy notice.
+///
+/// `shutting_down` is asked once the bridge returns, and only for a
+/// kill-shaped status (128 or more, the shell convention for a signal).
+/// The sessions manager sets its shutdown state before it stops any box.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel's three halves, the three ways an exec ends, and the shutdown probe"
+)]
+async fn bridge_noting_reason<C, S, P, R, W, E, F>(
+    channel_id: C,
     stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
-    client_lost: watch::Receiver<bool>,
-    shutting_down: impl FnOnce() -> bool,
-) -> u32
+    client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
+    destroyed: Option<CancellationToken>,
+    shutting_down: F,
+) -> (
+    u32,
+    Option<impl Stream<Item = io::Result<StoppedOnDestroy<P>>> + Unpin + use<C, S, P, R, W, E, F>>,
+)
 where
+    C: Display + Clone,
+    F: FnOnce() -> bool,
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
-    if shutting_down() {
-        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    let stopped = Arc::new(AtomicBool::new(false));
+    // Every process is wrapped, with or without a token, so the stream the
+    // bridge hands back for a late start has one type either way.
+    let stream = {
+        let stopped = Arc::clone(&stopped);
+        stream.map(move |process| {
+            process.map(|inner| StoppedOnDestroy {
+                inner,
+                destroyed: destroyed.clone(),
+                stopped: Arc::clone(&stopped),
+            })
+        })
+    };
+    let (exit_status, late_start) =
+        bridge_until_end(channel_id, stream, r, w, e, client_lost, unread).await;
+    // A shutdown stops a command only by tearing down what runs it: a
+    // box exec is SIGKILLed with the container and the injection shim
+    // reports `128 + signo`, and a task exec is killed through its
+    // handle. A command that ends on its own during a shutdown — a
+    // graceful exit, a failure — was not stopped by it, so only a
+    // kill-shaped status (see `KILLED_STATUS_MIN`) gets the notice.
+    // Nothing the shutdown stops is silenced: every exec kind it stops
+    // reports a status of 128 or more. (The host-side git exec is
+    // signalled by nothing here — a signal-terminated `TokioProcess`
+    // maps to 1 — and it is the one kind the shutdown never stops.)
+    let shutting_down = exit_status >= KILLED_STATUS_MIN && shutting_down();
+    if let Some(notice) = exit_notice(shutting_down, exit_status, stopped.load(Ordering::SeqCst)) {
+        let _ = e.write_all(notice).await;
     }
-    exit_status
+    (exit_status, late_start)
 }
 
-/// Forwards the SSH channel's read half into the exec's stdin pipe and
-/// reports when the client is gone.
+/// How much of an exec's input the daemon holds for a command that is not
+/// reading it, before the exec is ended instead (gominimal/inbox#1089, the
+/// second half of #866; Eugeny/russh#730).
 ///
-/// `Data` is written to `stdin`. `Eof` closes `stdin` (the child sees
-/// EOF) but keeps watching the channel: `min task run` from a terminal
-/// half-closes stdin straight away, so a disconnect almost always
-/// arrives *after* EOF and must still be seen. `Close`, or the end of
-/// `msgs` (the channel's sender dropped with the connection), sets
-/// `client_lost` to `true` and returns.
-async fn pump_channel_input<M, W>(mut msgs: M, stdin: W, client_lost: watch::Sender<bool>)
-where
+/// russh grants the client's send window on receipt and gives the server
+/// no way to hold it back, so the client is never slowed down from here:
+/// what the command has not read is held in the daemon or the connection
+/// hangs. At this much the pump stops taking from the channel, which parks
+/// the connection for a bounded time: until the command starts (at most
+/// [`EXEC_INPUT_UNSTARTED`]), and then
+/// for at most [`EXEC_INPUT_STALL`] without it reading a byte, after which
+/// the exec ends with a notice on its stderr ([`held_input_notice`]), an
+/// active reject rather than a hang.
+const EXEC_INPUT_HELD_MAX: usize = 256 * 1024 * 1024;
+
+/// How long a running command may leave its held input at a bound without
+/// reading any of it before the exec ends. While the pump waits it takes
+/// nothing from the channel, so the connection is parked for at most this
+/// long per bound hit. A command that reads at least a byte within each
+/// such window releases it and is never ended; one that reads nothing for
+/// a whole window is. The window counts this exec's own reads only: another
+/// exec's release never restarts it. At the daemon bound an exec holding
+/// input of its own is the one ended; one that holds nothing waits for the
+/// others, up to [`EXEC_INPUT_STARVED`].
+const EXEC_INPUT_STALL: Duration = Duration::from_secs(10);
+
+/// How long an exec that holds no input of its own waits at the daemon bound
+/// for the execs that do. Each of those is ended within its own stall unless
+/// it reads, so the wait is normally short; but execs that each read a byte
+/// per window keep the budget full forever, and the waiting exec's channel —
+/// with the connection behind it — would be parked as long. Past this the
+/// waiting exec ends with the daemon-bound notice instead.
+const EXEC_INPUT_STARVED: Duration = Duration::from_secs(60);
+
+/// How long the pump waits at a bound for a command that has not started.
+/// A fast client puts the cap in flight before a cold box has spawned the
+/// command, and that wait normally ends with the start; this bounds it for
+/// a spawn that never returns. Past it the held input is released, the pump
+/// lets go of the channel (so the connection is no longer parked), and the
+/// exec is ended with [`ExecEnd::InputHeldUnstarted`] at once: the bridge
+/// races each start against the exec's end ([`bridge_until_end`]), and the
+/// command a late start yields is ended when it comes ([`reap_late_start`]).
+const EXEC_INPUT_UNSTARTED: Duration = Duration::from_secs(300);
+
+/// The most unread exec input this daemon holds across all its execs. The
+/// per-exec cap alone would let N stalled execs hold N times it in a guest
+/// with bounded memory; past this total the exec that would cross it ends,
+/// the same way, and the others are untouched.
+const EXEC_INPUT_HELD_DAEMON_MAX: usize = 512 * 1024 * 1024;
+
+/// Unread exec input held across this daemon's execs, in bytes.
+static EXEC_INPUT_HELD_DAEMON: AtomicUsize = AtomicUsize::new(0);
+
+/// Woken whenever any exec releases held input: a pump waiting at the
+/// daemon bound is waiting on other execs, so their releases must reach it.
+static EXEC_INPUT_PROGRESS: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Which bound an exec's held input crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldBound {
+    /// The exec's own cap ([`EXEC_INPUT_HELD_MAX`]).
+    Exec,
+    /// The daemon's total ([`EXEC_INPUT_HELD_DAEMON_MAX`]).
+    Daemon,
+}
+
+/// Why the bridge ends an exec before its command is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecEnd {
+    /// The SSH client is gone (channel close, or the sender dropped with
+    /// the connection).
+    ClientLost,
+    /// Input held for a command that was not reading it crossed a bound.
+    InputHeldOver(HeldBound),
+    /// Input reached a bound before the command started, and the command
+    /// had still not started when [`EXEC_INPUT_UNSTARTED`] ran out.
+    InputHeldUnstarted(HeldBound),
+}
+
+/// What the bridge does with input that arrives while the current command
+/// has closed its stdin: for a single program there is nobody else to read
+/// it, so it is read and dropped (it is not held against the command); for
+/// a sequence it is kept for the next command, and a command that closes
+/// its stdin and runs on while input keeps coming is bounded like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnreadStdin {
+    Discard,
+    Keep,
+}
+
+/// The bounds on input held for a command that is not reading it: one for
+/// the exec, one for the daemon as a whole (shared through `daemon_held`).
+#[derive(Clone, Copy)]
+struct HeldInputLimits {
+    per_exec: usize,
+    daemon: usize,
+    daemon_held: &'static AtomicUsize,
+    /// Woken on every release into `daemon_held`, by any exec.
+    daemon_progress: &'static tokio::sync::Notify,
+    /// The stall a running command is allowed at a bound.
+    stall: Duration,
+    /// The wait an exec holding nothing is allowed at the daemon bound.
+    starved: Duration,
+    /// The wait at a bound for a command that has not started.
+    unstarted: Duration,
+}
+
+impl HeldInputLimits {
+    fn for_daemon() -> Self {
+        Self {
+            per_exec: EXEC_INPUT_HELD_MAX,
+            daemon: EXEC_INPUT_HELD_DAEMON_MAX,
+            daemon_held: &EXEC_INPUT_HELD_DAEMON,
+            daemon_progress: &EXEC_INPUT_PROGRESS,
+            stall: EXEC_INPUT_STALL,
+            starved: EXEC_INPUT_STARVED,
+            unstarted: EXEC_INPUT_UNSTARTED,
+        }
+    }
+}
+
+/// The line an exec gets on its stderr when its command had not started by
+/// the end of the wait at a bound ([`ExecEnd::InputHeldUnstarted`]).
+fn unstarted_input_notice(bound: HeldBound) -> String {
+    let mib = |n: usize| n / (1024 * 1024);
+    let waited = EXEC_INPUT_UNSTARTED.as_secs();
+    match bound {
+        HeldBound::Exec => format!(
+            "minimald: this command had not started {waited} s after its input reached the {} MiB \
+             minimald holds for one exec, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_MAX)
+        ),
+        HeldBound::Daemon => format!(
+            "minimald: this command had not started {waited} s after unread exec input across \
+             this daemon's execs reached {} MiB, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_DAEMON_MAX)
+        ),
+    }
+}
+
+/// The line an exec whose held input crossed a bound gets on its stderr;
+/// the numbers are the caps themselves, so a retuned cap cannot leave the
+/// notice behind.
+fn held_input_notice(bound: HeldBound) -> String {
+    let mib = |n: usize| n / (1024 * 1024);
+    match bound {
+        HeldBound::Exec => format!(
+            "minimald: {} MiB of this command's input was still unread; minimald holds no more \
+             than that for one exec, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_MAX)
+        ),
+        HeldBound::Daemon => format!(
+            "minimald: unread exec input across this daemon's execs reached {} MiB and stayed \
+             there, so this exec could take no more of its input and was ended\n",
+            mib(EXEC_INPUT_HELD_DAEMON_MAX)
+        ),
+    }
+}
+
+/// Input taken off the SSH channel and not yet read by the command. The
+/// pump pushes as packets arrive; the bridge reads through
+/// [`HeldInputReader`]; every byte is charged to the exec's and the daemon's
+/// held counts from push to read (or to [`HeldInput::clear`]), so the counts
+/// are the memory this holds, in `Vec`s rather than russh's power-of-two
+/// locked buffers.
+struct HeldInput {
+    inner: std::sync::Mutex<HeldInner>,
+    waker: futures::task::AtomicWaker,
+    held: AtomicUsize,
+    limits: HeldInputLimits,
+    /// Set once nothing will read what arrives: pushes are dropped uncharged.
+    discarding: std::sync::atomic::AtomicBool,
+    /// Set once the command is running: a bound is then a stall, not a wait.
+    started: std::sync::atomic::AtomicBool,
+    /// Woken when bytes are released, the queue is cleared, or the command
+    /// starts: what a pump waiting at a bound needs to try again.
+    progress: tokio::sync::Notify,
+}
+
+struct HeldInner {
+    chunks: VecDeque<Vec<u8>>,
+    /// Bytes of the front chunk already read.
+    offset: usize,
+    /// No more pushes: the reader reports EOF once the chunks are read.
+    eof: bool,
+}
+
+impl HeldInput {
+    fn new(limits: HeldInputLimits) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(HeldInner {
+                chunks: VecDeque::new(),
+                offset: 0,
+                eof: false,
+            }),
+            waker: futures::task::AtomicWaker::new(),
+            held: AtomicUsize::new(0),
+            limits,
+            discarding: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicBool::new(false),
+            progress: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Charges and queues `data`, or refuses it (charging nothing) with the
+    /// bound it would cross. Once the rest is to be discarded it is dropped
+    /// here, uncharged.
+    fn push(&self, data: &[u8]) -> Result<(), HeldBound> {
+        let n = data.len();
+        if n == 0 || self.discarding.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let exec_total = self.held.fetch_add(n, Ordering::AcqRel) + n;
+        let daemon_total = self.limits.daemon_held.fetch_add(n, Ordering::AcqRel) + n;
+        let over = if exec_total > self.limits.per_exec {
+            Some(HeldBound::Exec)
+        } else if daemon_total > self.limits.daemon {
+            Some(HeldBound::Daemon)
+        } else {
+            None
+        };
+        if let Some(bound) = over {
+            self.release(n);
+            return Err(bound);
+        }
+        self.lock().chunks.push_back(data.to_vec());
+        self.waker.wake();
+        Ok(())
+    }
+
+    fn release(&self, n: usize) {
+        self.held.fetch_sub(n, Ordering::AcqRel);
+        self.limits.daemon_held.fetch_sub(n, Ordering::AcqRel);
+        self.progress.notify_waiters();
+        self.limits.daemon_progress.notify_waiters();
+    }
+
+    /// Bytes this exec holds unread.
+    fn held_bytes(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// The command is running: from here a bound is a stall, not a wait for
+    /// the start. The permit is stored, so a pump that reaches the bound
+    /// first is not missed.
+    fn command_started(&self) {
+        self.started.store(true, Ordering::Release);
+        self.progress.notify_one();
+    }
+
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// No more input will arrive; what is queued is still read, then EOF.
+    fn close(&self) {
+        self.lock().eof = true;
+        self.waker.wake();
+    }
+
+    /// Drops everything queued, releasing it from both counts at once, and
+    /// closes: the reader sees EOF.
+    fn clear(&self) {
+        // From here nothing is read: a push that races this (the pump is
+        // aborted, not awaited to its end) must not be charged either.
+        self.discarding.store(true, Ordering::Release);
+        let dropped = {
+            let mut g = self.lock();
+            let queued: usize = g.chunks.iter().map(Vec::len).sum();
+            let dropped = queued.saturating_sub(g.offset);
+            g.chunks.clear();
+            g.offset = 0;
+            g.eof = true;
+            dropped
+        };
+        self.release(dropped);
+        self.waker.wake();
+    }
+
+    /// Nothing will read what arrives from here on: what is queued is
+    /// dropped and released, later pushes are dropped uncharged, and the
+    /// reader sees EOF. A single program that closed its stdin is not held
+    /// to input it will never read, however fast the client sends it.
+    fn discard_rest(&self) {
+        self.discarding.store(true, Ordering::Release);
+        self.clear();
+    }
+
+    #[cfg(test)]
+    fn discarding(&self) -> bool {
+        self.discarding.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HeldInput {
+    /// Whatever this exec still counts leaves the daemon's total with it:
+    /// no path may leave the shared budget overstated.
+    fn drop(&mut self) {
+        let left = self.held.swap(0, Ordering::AcqRel);
+        if left > 0 {
+            self.limits.daemon_held.fetch_sub(left, Ordering::AcqRel);
+            self.limits.daemon_progress.notify_waiters();
+        }
+    }
+}
+
+/// Where the bridge reads a command's input from.
+trait ExecInput: AsyncRead + Unpin {
+    /// The command is running and can read from here on.
+    fn command_started(&mut self) {}
+    /// Nothing will read what arrives from here on; stop holding it.
+    fn discard_rest(&mut self) {}
+}
+
+impl ExecInput for HeldInputReader {
+    fn command_started(&mut self) {
+        self.0.command_started();
+    }
+    fn discard_rest(&mut self) {
+        self.0.discard_rest();
+    }
+}
+
+#[cfg(test)]
+impl ExecInput for tokio::io::DuplexStream {}
+
+/// The bridge's stdin: reads the held input in order, releasing each byte
+/// from the counts as it is read; EOF once the pump has closed the input
+/// (or cleared it) and the queue is empty. Dropping it clears what is left.
+struct HeldInputReader(Arc<HeldInput>);
+
+impl AsyncRead for HeldInputReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let held = &self.0;
+        let mut g = held.lock();
+        let offset = g.offset;
+        let taken = g.chunks.front().map(|front| {
+            let avail = front.get(offset..).unwrap_or_default();
+            let n = avail.len().min(buf.remaining());
+            buf.put_slice(avail.get(..n).unwrap_or_default());
+            (n, offset + n >= front.len())
+        });
+        let read = if let Some((n, done)) = taken {
+            if done {
+                g.chunks.pop_front();
+                g.offset = 0;
+            } else {
+                g.offset += n;
+            }
+            Some(n)
+        } else if g.eof {
+            Some(0)
+        } else {
+            // Registered under the lock, so a push that lands after the
+            // check cannot slip between it and the registration.
+            held.waker.register(cx.waker());
+            None
+        };
+        drop(g);
+        match read {
+            Some(n) => {
+                held.release(n);
+                std::task::Poll::Ready(Ok(()))
+            }
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for HeldInputReader {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Takes the SSH channel's read half off the channel as it arrives into
+/// `held` (the bridge reads it from there) and reports how the exec is to
+/// end, if the client goes or the held input crosses a bound.
+///
+/// The channel is read without ever waiting on the command. russh delivers
+/// each packet by awaiting a bounded per-channel queue, and a session loop
+/// parked on that queue delivers nothing to *any* channel, including this
+/// command's own output, whose draining is what lets the command read its
+/// stdin again (gominimal/inbox#1089, Eugeny/russh#730). So `Data` is
+/// queued, bounded per exec and for the daemon as a whole
+/// ([`HeldInputLimits`]): past either, the queue is cleared (its bytes
+/// released at once), the command sees EOF, and `end` carries the bound so
+/// the bridge ends the exec under that reason.
+///
+/// `Eof` closes the held input (the command sees EOF once it has read what
+/// is queued) but keeps watching the channel: `min task run` from a
+/// terminal half-closes stdin straight away, so a disconnect almost always
+/// arrives *after* EOF and must still be seen. `Close`, or the end of `msgs`
+/// (the channel's sender dropped with the connection), sends
+/// [`ExecEnd::ClientLost`] and returns.
+async fn pump_channel_input<M>(
+    mut msgs: M,
+    held: Arc<HeldInput>,
+    end: watch::Sender<Option<ExecEnd>>,
+) where
     M: Stream<Item = russh::ChannelMsg> + Unpin,
-    W: AsyncWrite + Unpin,
 {
-    let mut stdin = Some(stdin);
+    let mut open = true;
     loop {
         match msgs.next().await {
             Some(russh::ChannelMsg::Data { data }) => {
-                // A failed write means the pipe's read end is gone; drop
-                // the data but keep watching for a disconnect.
-                if let Some(w) = stdin.as_mut()
-                    && w.write_all(&data).await.is_err()
-                {
-                    stdin = None;
+                if !open {
+                    continue;
+                }
+                // At a bound the pump stops taking from the channel, which
+                // parks the connection behind russh's buffer, for a bounded
+                // time: until the command starts (a fast client puts the cap
+                // in flight before a command spawns), up to `unstarted`, and once it runs, for
+                // at most `stall` without this exec reading a byte, or, for
+                // an exec that holds nothing at the daemon bound, `starved`.
+                // The window restarts only on this exec's own reads; another
+                // exec's release wakes the pump to retry, at the daemon bound
+                // only, and leaves the window where it was.
+                let mut since = tokio::time::Instant::now();
+                let unstarted_from = since;
+                let mut starved_warned = false;
+                loop {
+                    let bound = match held.push(&data) {
+                        Ok(()) => break,
+                        Err(bound) => bound,
+                    };
+                    if !held.started() {
+                        tokio::select! {
+                            _ = held.progress.notified() => {}
+                            _ = held.limits.daemon_progress.notified() => {}
+                            () = tokio::time::sleep_until(unstarted_from + held.limits.unstarted) => {
+                                tracing::warn!(
+                                    ?bound,
+                                    waited_ms = u64::try_from(held.limits.unstarted.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "exec: the command had not started when the wait at an input bound ran out; ending the exec",
+                                );
+                                held.clear();
+                                end.send_replace(Some(ExecEnd::InputHeldUnstarted(bound)));
+                                return;
+                            }
+                        }
+                        since = tokio::time::Instant::now();
+                        continue;
+                    }
+                    let daemon_bound = matches!(bound, HeldBound::Daemon);
+                    // The daemon's budget is full of other execs' input and
+                    // this one holds nothing: it is not the one not reading,
+                    // and it waits for them, up to `starved`.
+                    let starved = daemon_bound && held.held_bytes() == 0;
+                    if starved && !starved_warned {
+                        starved_warned = true;
+                        tracing::warn!(
+                            daemon = held.limits.daemon,
+                            "exec: the daemon's input budget is held by other execs; this one waits for it",
+                        );
+                    }
+                    let allowed = if starved {
+                        held.limits.starved
+                    } else {
+                        held.limits.stall
+                    };
+                    tokio::select! {
+                        _ = held.progress.notified() => {
+                            since = tokio::time::Instant::now();
+                            continue;
+                        }
+                        _ = held.limits.daemon_progress.notified(), if daemon_bound => continue,
+                        () = tokio::time::sleep_until(since + allowed) => {}
+                    }
+                    tracing::warn!(
+                        ?bound,
+                        starved,
+                        per_exec = held.limits.per_exec,
+                        daemon = held.limits.daemon,
+                        waited_ms = u64::try_from(allowed.as_millis()).unwrap_or(u64::MAX),
+                        "exec: the command's input stayed at a bound for the whole window; ending the exec",
+                    );
+                    held.clear();
+                    end.send_replace(Some(ExecEnd::InputHeldOver(bound)));
+                    return;
                 }
             }
-            Some(russh::ChannelMsg::Eof) => stdin = None,
+            Some(russh::ChannelMsg::Eof) => {
+                open = false;
+                held.close();
+            }
             Some(russh::ChannelMsg::Close) | None => {
-                let _ = client_lost.send(true);
+                // Released at once, as the bound-over path does: nothing of
+                // a gone client's is held against the daemon's budget while
+                // its command is still being ended.
+                held.clear();
+                end.send_replace(Some(ExecEnd::ClientLost));
                 return;
             }
             Some(_) => {}
@@ -1189,25 +1877,86 @@ where
 ///
 /// Returns the SSH-encoded exit code of the last process run (or 0 if
 /// the stream was empty).
+#[cfg(test)]
 async fn bridge<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: ExecInput,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    bridge_until_end(channel_id, stream, r, w, e, client_lost, unread)
+        .await
+        .0
+}
+
+/// Resolves once the exec's end is set; never, if its sender is gone with
+/// none set. Reads with `borrow`, not `borrow_and_update`, so the end stays
+/// unseen for the `changed()` of [`bridge_one`] in the race where a command
+/// starts in the same instant.
+async fn until_ended(end: &mut watch::Receiver<Option<ExecEnd>>) {
+    loop {
+        if end.borrow().is_some() {
+            return;
+        }
+        if end.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// [`bridge`], and the stream back when the exec's end came while a command
+/// was still starting. The wait for each command's start is raced against
+/// the end ([`ExecEnd`]), so an exec whose client goes, or whose input's
+/// wait at a bound runs out ([`ExecEnd::InputHeldUnstarted`]), ends at once
+/// rather than once a spawn that may never return does. It reports exit 1,
+/// as a spawn that fails does. The start in flight lives in the stream, not
+/// in the abandoned `next()`, so the caller can finish it later and end
+/// what it yields ([`reap_late_start`]): dropping it instead could orphan a
+/// task's sandboxed child.
+async fn bridge_until_end<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     mut stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
-    mut client_lost: watch::Receiver<bool>,
-) -> u32
+    mut client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
+) -> (u32, Option<S>)
 where
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
     let mut stdin_open = true;
     let mut last_exit: u32 = 0;
     loop {
-        let process = match stream.next().await {
+        let next = tokio::select! {
+            // A command that starts in the same instant as the end is
+            // bridged, and `bridge_one` ends it at once.
+            biased;
+            next = stream.next() => next,
+            () = until_ended(&mut client_lost) => {
+                tracing::warn!(
+                    %channel_id,
+                    end = ?*client_lost.borrow(),
+                    "exec: ended while its command was starting; the start is ended when it returns",
+                );
+                return (1, Some(stream));
+            }
+        };
+        let process = match next {
             Some(Ok(p)) => p,
             None => break,
             Some(Err(err)) => {
@@ -1222,6 +1971,7 @@ where
                 break;
             }
         };
+        r.command_started();
         last_exit = bridge_one(
             channel_id.clone(),
             process,
@@ -1230,16 +1980,17 @@ where
             e,
             &mut stdin_open,
             &mut client_lost,
+            unread,
         )
         .await;
         // `changed()` fires once per transition, so a later step would
         // never see a disconnect an earlier step already consumed: a child
         // that exits 0 just as the client goes must still end the sequence.
-        if last_exit != 0 || *client_lost.borrow() {
+        if last_exit != 0 || client_lost.borrow().is_some() {
             break;
         }
     }
-    last_exit
+    (last_exit, None)
 }
 
 /// Drives one [`Process`] to completion: pumps `r → child stdin` and
@@ -1296,6 +2047,10 @@ where
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
 /// sees immediate EOF on its stdin without re-reading from `r`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel's three halves, the sequence's stdin state, and the two ways an exec ends"
+)]
 async fn bridge_one<P, R, W, E>(
     channel_id: impl Display,
     mut process: P,
@@ -1303,11 +2058,12 @@ async fn bridge_one<P, R, W, E>(
     w: &mut W,
     e: &mut E,
     stdin_open: &mut bool,
-    client_lost: &mut watch::Receiver<bool>,
+    client_lost: &mut watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
 ) -> u32
 where
     P: Process,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -1350,7 +2106,13 @@ where
             // most one chunk the child has not accepted is ever queued.
             // `select!` evaluates every gate before it builds any branch
             // future, so a gate may borrow what a future later holds.
-            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() && pending.is_none() => {
+            // With `UnreadStdin::Discard` the held input is told to drop
+            // the rest once the command's stdin is found closed (the write
+            // branch), and the read goes on only to see the EOF that gives:
+            // a single program has no other reader, and input it never
+            // reads must not be held against it.
+            read_res = r.read(&mut stdin_buf), if *stdin_open && pending.is_none()
+                && (child_stdin.is_some() || unread == UnreadStdin::Discard) => {
                 match read_res {
                     Ok(0) => {
                         *stdin_open = false;
@@ -1367,7 +2129,9 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        pending = Some((stdin_buf[..n].to_vec(), 0));
+                        if child_stdin.is_some() {
+                            pending = Some((stdin_buf.get(..n).unwrap_or_default().to_vec(), 0));
+                        }
                     }
                 }
             }
@@ -1390,6 +2154,9 @@ where
                         );
                         child_stdin = None;
                         pending = None;
+                        if unread == UnreadStdin::Discard {
+                            r.discard_rest();
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1398,6 +2165,9 @@ where
                         );
                         child_stdin = None;
                         pending = None;
+                        if unread == UnreadStdin::Discard {
+                            r.discard_rest();
+                        }
                     }
                     Ok(n) => {
                         let (data, offset) = pending.as_mut().expect("gated on a pending write");
@@ -1463,11 +2233,21 @@ where
             res = client_lost.changed(), if client_watch_open => {
                 if res.is_err() {
                     client_watch_open = false;
-                } else if *client_lost.borrow() {
-                    tracing::warn!(
-                        %channel_id,
-                        "exec: ssh client disconnected; killing child",
-                    );
+                } else if let Some(end) = *client_lost.borrow() {
+                    match end {
+                        ExecEnd::ClientLost => tracing::warn!(
+                            %channel_id,
+                            "exec: ssh client disconnected; killing child",
+                        ),
+                        ExecEnd::InputHeldOver(bound) => tracing::warn!(
+                            %channel_id, ?bound,
+                            "exec: the command's unread input crossed a bound; ending the exec",
+                        ),
+                        ExecEnd::InputHeldUnstarted(bound) => tracing::warn!(
+                            %channel_id, ?bound,
+                            "exec: the command started after its wait at an input bound ran out; ending the exec",
+                        ),
+                    }
                     ssh_write_failed = true;
                 }
             }
@@ -1537,7 +2317,7 @@ where
                 status = process.wait() => status,
                 // Reduced to a bool in the branch: the `watch::Ref` it
                 // yields is not `Send` and must not live across the wait.
-                lost = async { client_lost.wait_for(|lost| *lost).await.is_ok() } => {
+                lost = async { client_lost.wait_for(|end| end.is_some()).await.is_ok() } => {
                     if lost {
                         tracing::warn!(
                             %channel_id,
@@ -2503,6 +3283,19 @@ async fn handle_git_receive(
                 WORK_TREE=$(dirname "$GIT_DIR_ABS")
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
+                # The branch currently checked out in the worktree, and
+                # whether HEAD resolves to a commit (`born`). The first push
+                # into a fresh workspace has no commit on HEAD, so the first
+                # pushed branch that checks out cleanly populates the
+                # worktree and becomes HEAD. After that, a push to any branch
+                # other than the checked-out one must not move HEAD or touch
+                # the worktree. post-receive runs after the refs moved, so a
+                # first push that includes HEAD's own branch already reads as
+                # born, and that branch is the one checked out.
+                cur=$(g symbolic-ref -q HEAD)
+                born=
+                detached_moved=
+                g rev-parse -q --verify HEAD >/dev/null && born=yes
 
                 zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
@@ -2513,6 +3306,18 @@ async fn handle_git_receive(
                     [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
 
+                    # A push to a branch that is not the one checked out
+                    # leaves HEAD and the worktree alone: the ref itself has
+                    # already moved in receive-pack, so there is nothing more
+                    # to do. Only on the still-unborn first push does the
+                    # hook check out the first arriving branch.
+                    # A detached HEAD (`cur` empty) matches no branch, so
+                    # every push lands here; note it for the message below.
+                    if [ "$ref" != "$cur" ] && [ -n "$born" ]; then
+                        [ -z "$cur" ] && detached_moved=yes
+                        continue
+                    fi
+
                     if [ "$old" = "$zero" ]; then
                         # Previously-unborn branch: nothing tracked, so tracked
                         # dirtiness cannot exist — but uploaded/untracked files
@@ -2521,7 +3326,12 @@ async fn handle_git_receive(
                         # pushed tip and checks it out; WITHOUT -f, git refuses
                         # to overwrite untracked files (its stderr names them),
                         # and we surface the skip like the dirty case below.
-                        if ! g checkout -q -B "$branch" "$new"; then
+                        if g checkout -q -B "$branch" "$new"; then
+                            # HEAD is born now: later refs in this same push
+                            # are other branches and must not move it.
+                            cur=$ref
+                            born=yes
+                        else
                             echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
                         fi
                         continue
@@ -2536,7 +3346,13 @@ async fn handle_git_receive(
                         continue
                     fi
                     g checkout -qf "$branch"
-                done"#
+                done
+
+                # A detached HEAD stays detached, as with plain git; say so
+                # once, so the pusher knows the worktree did not change.
+                if [ -n "$detached_moved" ]; then
+                    echo "remote worktree HEAD is detached; moved refs without checking out (run git switch <branch> in the session)" >&2
+                fi"#
                     .as_bytes(),
             )
             .await
@@ -2712,6 +3528,7 @@ pub(crate) mod testing {
         exit: Mutex<Option<i32>>,
         notify: Notify,
         kill_requested: AtomicBool,
+        exit_on_kill: Mutex<Option<i32>>,
     }
 
     /// Test-side handle for driving and observing a [`MockProcess`].
@@ -2730,6 +3547,12 @@ pub(crate) mod testing {
             // which sidesteps the "set exit before bridge polls wait"
             // race that would otherwise leave the bridge hanging.
             self.inner.notify.notify_one();
+        }
+
+        /// Set the code the mock process reports once `start_kill` is
+        /// called. Without it a killed mock reports no numeric code.
+        pub async fn exit_on_kill(&self, code: i32) {
+            *self.inner.exit_on_kill.lock().await = Some(code);
         }
 
         /// Whether the bridge has called `start_kill` on the process.
@@ -2820,7 +3643,7 @@ pub(crate) mod testing {
                 // shell would report it as signal termination). Model
                 // that as `Ok(None)` so the bridge maps it to exit 1.
                 if self.ctrl.inner.kill_requested.load(Ordering::SeqCst) {
-                    return Ok(None);
+                    return Ok(*self.ctrl.inner.exit_on_kill.lock().await);
                 }
                 self.ctrl.inner.notify.notified().await;
             }
@@ -2839,2301 +3662,7 @@ pub(crate) mod testing {
     clippy::disallowed_methods,
     reason = "upstream's tests spawn plain tokio tasks; the traced-spawn rule is for request handling"
 )]
-mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
-
-    use super::testing::{MockEndpoints, build_mock, build_mock_seq};
-    use super::{bridge, bridge_noting_shutdown};
-
-    /// A never-firing client-loss signal for tests that exercise the
-    /// bridge without modelling a disconnect.
-    fn client_lost() -> tokio::sync::watch::Receiver<bool> {
-        tokio::sync::watch::channel(false).1
-    }
-
-    /// `start_kill` asks the shim to exit with SIGTERM, not SIGKILL: SIGTERM
-    /// is what runs the shim's handler, which kills the injected process's
-    /// whole group. A SIGKILL here would leave the grandchildren running.
-    #[tokio::test]
-    async fn start_kill_sends_sigterm() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        use super::{Process as _, TokioProcess};
-
-        let child = tokio::process::Command::new("sleep")
-            .arg("600")
-            .spawn()
-            .expect("spawning sleep");
-        let mut process = TokioProcess::shim(child);
-        process.start_kill().expect("signalling the child");
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
-            .await
-            .expect("the child exits on SIGTERM")
-            .expect("reaping the child");
-        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
-    }
-
-    /// Any child other than the shim (the git service path's `/bin/sh -c`)
-    /// has no group-kill handler, so `start_kill` SIGKILLs it at once.
-    #[tokio::test]
-    async fn start_kill_sigkills_a_plain_child() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        use super::{Process as _, TokioProcess};
-
-        let child = tokio::process::Command::new("sleep")
-            .arg("600")
-            .spawn()
-            .expect("spawning sleep");
-        let mut process = TokioProcess::new(child);
-        process.start_kill().expect("signalling the child");
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
-            .await
-            .expect("the child exits on SIGKILL")
-            .expect("reaping the child");
-        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
-    }
-
-    /// A child that ignores SIGTERM is not waited on forever: after the grace
-    /// period, `wait` escalates to SIGKILL.
-    #[tokio::test]
-    async fn wait_escalates_to_sigkill_when_sigterm_is_ignored() {
-        use super::{Process as _, TokioProcess};
-
-        // The ignored disposition survives the `exec`, so `sleep` itself
-        // ignores SIGTERM. The marker line says the trap is installed.
-        let child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; echo ready; exec sleep 600"])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawning sh");
-        let mut process = TokioProcess::shim(child);
-        let mut stdout = process.child.stdout.take().expect("piped stdout");
-        let mut ready = [0u8; 6];
-        stdout
-            .read_exact(&mut ready)
-            .await
-            .expect("reading the ready marker");
-
-        process.start_kill().expect("signalling the child");
-        let code = tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
-            .await
-            .expect("the escalation to SIGKILL ends the wait")
-            .expect("reaping the child");
-        assert_eq!(code, None, "a signalled child has no exit code");
-    }
-
-    /// `inherit_cwd` on the daemon side: a task that declares it starts at
-    /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
-    /// falls back to `/workbench` with a stderr notice when it is not. A task
-    /// without `inherit_cwd`, or a run from the root, keeps `/workbench`.
-    #[test]
-    fn task_start_dir_honours_inherit_cwd() {
-        use super::task_start_dir;
-
-        let tree = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tree.path().join("sub/inner")).unwrap();
-
-        assert_eq!(
-            task_start_dir(true, "sub/inner", tree.path()),
-            Ok(Some("/workbench/sub/inner".to_string()))
-        );
-        assert_eq!(task_start_dir(false, "sub/inner", tree.path()), Ok(None));
-        assert_eq!(task_start_dir(true, "", tree.path()), Ok(None));
-
-        let notice = task_start_dir(true, "sub/gone", tree.path()).unwrap_err();
-        assert!(notice.contains("sub/gone"), "{notice}");
-        assert!(notice.contains("/workbench"), "{notice}");
-        assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
-    }
-
-    /// A session record carrying `mode`, with everything else at its default.
-    #[cfg(target_os = "linux")]
-    fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
-        boxes::Record {
-            id: boxes::SessionId::nil(),
-            name: None,
-            username: None,
-            project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
-            network: mode,
-            policy: boxes::BoxPolicy::default(),
-            task_addresses: Vec::new(),
-            box_addresses: None,
-            status: boxes::BoxState::Active,
-            hooks_enabled: true,
-            // No launch ever minted these records, so none has recorded its
-            // outcome on one.
-            host_ip_enforcement: None,
-            box_id: None,
-            host_row_bound: false,
-            bound_ports: std::collections::BTreeSet::new(),
-            attrs: Default::default(),
-        }
-    }
-
-    /// NET-138: a task run of a registered box whose record names no box
-    /// id is refused before anything attaches — the host cannot be asked
-    /// for that box's row, and an address-only answer could be another
-    /// box's — while a box the host registered nothing for asks nothing.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
-        let switch = tokio::sync::Mutex::new(
-            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-                .with_transport(crate::net::SwitchTransport::HostShuttle {
-                    cid: crate::net::VSOCK_HOST_CID,
-                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                }),
-        );
-        let unregistered = record_with(boxes::NetworkMode::OwnIp);
-        super::ensure_task_rows_stand(&unregistered, &switch)
-            .await
-            .expect("a box with no host registration asks nothing");
-
-        let mut registered = record_with(boxes::NetworkMode::OwnIp);
-        registered.name = Some("web".to_string());
-        registered.box_addresses = Some(boxes::BoxAddresses {
-            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
-            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
-        });
-        registered.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
-        let refused = super::ensure_task_rows_stand(&registered, &switch)
-            .await
-            .expect_err("a registered box with no id is never answered as standing");
-        assert!(
-            refused.to_string().contains("could not confirm session"),
-            "{refused}"
-        );
-        // The bare command fails: a destroy needs a session or `--all`.
-        assert!(
-            refused
-                .to_string()
-                .contains("`min session destroy <session>`"),
-            "{refused}"
-        );
-    }
-
-    /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
-    /// is the case that matters, as it used to arrive as `HostNet`. The switch
-    /// is `HostShuttle`, so an own-IP plan is pure bookkeeping.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_task_takes_the_network_of_its_session() {
-        use std::sync::Arc;
-
-        let switch = Arc::new(tokio::sync::Mutex::new(
-            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-                .with_transport(crate::net::SwitchTransport::HostShuttle {
-                    cid: crate::net::VSOCK_HOST_CID,
-                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                }),
-        ));
-
-        let host = super::task_network(
-            &record_with(boxes::NetworkMode::HostNet),
-            &switch,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        );
-        assert!(!host.plan().await.unwrap().isolates_netns());
-
-        let no_net = super::task_network(
-            &record_with(boxes::NetworkMode::NoNet),
-            &switch,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        );
-        let plan = no_net.plan().await.unwrap();
-        assert!(plan.isolates_netns() && plan.tap().is_none());
-
-        let mut record = record_with(boxes::NetworkMode::OwnIp);
-        record.name = Some("web".to_string());
-        record.policy.ingress = Some(boxes::IngressPolicy::default());
-        // A VM host's switch draws nothing (NET-138): the task attaches at a
-        // task address its box's registration filed.
-        record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
-        let own_ip = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
-        let plan = own_ip.plan().await.unwrap();
-        assert!(
-            plan.isolates_netns(),
-            "an own-IP task gets its own namespace"
-        );
-        assert!(matches!(plan.resolver(), sandbox::Resolver::Nameservers(_)));
-        // Its own identity on the switch, and the session's *effective*
-        // egress (NET-074) — resolved under the phase this build ships, so
-        // the same rules the session's own gate enforces, whatever the
-        // rollout leaves in force — but none of its ingress, because the
-        // session's PTask is attached at the same time. The gate exists only
-        // where that egress has rules, so the answer follows the shipped
-        // phase rather than a literal a cutover would invalidate.
-        let gated = crate::box_actor::effective_egress_section(
-            &record.policy,
-            record.network,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        )
-        .is_some();
-        let described = format!("{own_ip:?}");
-        assert!(
-            described.contains("\"web-task\"")
-                && described.contains(&format!("has_policy: {gated}")),
-            "got {described}"
-        );
-        own_ip.abandon().await;
-
-        // No name: the session id, rather than an empty hostname.
-        let unnamed = super::task_network(
-            &record_with(boxes::NetworkMode::OwnIp),
-            &switch,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        );
-        assert!(format!("{unnamed:?}").contains(&boxes::SessionId::nil().to_string()));
-    }
-
-    /// A VM host's switch, which hands every address and draws none
-    /// (NET-138).
-    #[cfg(target_os = "linux")]
-    fn vm_host_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
-        std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-                .with_transport(crate::net::SwitchTransport::HostShuttle {
-                    cid: crate::net::VSOCK_HOST_CID,
-                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                }),
-        ))
-    }
-
-    /// NET-138 for a task run, whichever door started it — `min run` from
-    /// inside the box and a task run over exec both plan through
-    /// [`super::task_network`]: the task's sandbox attaches at a task
-    /// address its box's registration filed, the first one no run holds,
-    /// and never draws one of its own.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn in_box_run_task_draws_a_task_slot() {
-        let switch = vm_host_switch();
-        let mut record = record_with(boxes::NetworkMode::OwnIp);
-        record.task_addresses = vec![
-            std::net::Ipv4Addr::new(100, 64, 128, 2),
-            std::net::Ipv4Addr::new(100, 64, 128, 3),
-        ];
-        let first = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
-        first.plan().await.expect("a free task address");
-        let second = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
-        second.plan().await.expect("a second free task address");
-        let held: Vec<_> = switch
-            .lock()
-            .await
-            .leases()
-            .iter()
-            .map(|lease| lease.ip)
-            .collect();
-        assert_eq!(
-            held, record.task_addresses,
-            "each run holds one task address"
-        );
-
-        let third = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
-        let err = third.plan().await.expect_err("every task address is held");
-        assert!(
-            err.to_string()
-                .contains("2 task runs already in progress for this session"),
-            "{err}"
-        );
-        first.abandon().await;
-        third
-            .plan()
-            .await
-            .expect("the address the first run held is free again");
-    }
-
-    /// A VM session record from before task addresses were registered
-    /// carries none: its task run is refused, naming the remedy, rather
-    /// than drawn an address no host row is keyed by.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
-        let switch = vm_host_switch();
-        let record = record_with(boxes::NetworkMode::OwnIp);
-        let task = super::task_network(&record, &switch, boxes::EGRESS_DEFAULT_PHASE, false);
-        let err = task.plan().await.expect_err("nothing is drawn");
-        assert!(
-            err.to_string()
-                .contains("destroy the session and re-activate it"),
-            "{err}"
-        );
-        assert!(switch.lock().await.leases().is_empty());
-    }
-
-    /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
-    /// egress default its session does, and nothing else changes with it. A
-    /// gate is attached only where the effective egress has rules to enforce,
-    /// because a gate with no ingress declaration blocks a task's *inbound*
-    /// too. Under InForce, the shipped phase, a bare own-address task with no
-    /// opt-out carries the deny-all gate. The retired announced arm, pinned
-    /// here by name, attaches the same task ungated, as every task did before
-    /// the deny-all default.
-    ///
-    /// The phase decides only the *default* for a box that declared nothing.
-    /// A box that declared an `egress` section is enforced on its session's
-    /// own PTask in every phase, so a task in such a session carries that
-    /// declaration's gate under either phase — the same inbound posture the
-    /// in-force case below accepts: a task PTask holds no ingress of its own,
-    /// so its gate default-blocks unsolicited inbound.
-    ///
-    /// The phase is passed by name, not read from the shipped constant, so
-    /// both arms stay proven whichever one ships. `own_ip_default_deny_all`
-    /// proves what the deny-all section itself enforces.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_task_gate_follows_the_egress_default() {
-        use std::sync::Arc;
-
-        let switch = Arc::new(tokio::sync::Mutex::new(
-            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-                .with_transport(crate::net::SwitchTransport::HostShuttle {
-                    cid: crate::net::VSOCK_HOST_CID,
-                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                }),
-        ));
-        // A bare own-address box: no egress declaration, so its egress is
-        // whatever the default resolves for an absent one.
-        let record = record_with(boxes::NetworkMode::OwnIp);
-
-        // Announced, no opt-out: an absent section still allows all, so the
-        // task gets no gate at all — its inbound stays as open as it was
-        // before the default was announced.
-        assert_eq!(
-            crate::box_actor::effective_egress_section(
-                &record.policy,
-                record.network,
-                boxes::EgressDefaultPhase::Announced,
-                false,
-            ),
-            None,
-            "an announced default resolves an absent section to allow-all"
-        );
-        let announced = super::task_network(
-            &record,
-            &switch,
-            boxes::EgressDefaultPhase::Announced,
-            false,
-        );
-        assert!(
-            format!("{announced:?}").contains("has_policy: false"),
-            "an announced default gates nothing: {announced:?}"
-        );
-
-        // In force, no opt-out: the same absent section is the deny-all one,
-        // and the task carries the gate built from it.
-        assert_eq!(
-            crate::box_actor::effective_egress_section(
-                &record.policy,
-                record.network,
-                boxes::EgressDefaultPhase::InForce,
-                false,
-            ),
-            Some(boxes::EgressPolicy::deny_all()),
-            "the in-force default resolves an absent section to deny-all"
-        );
-        let in_force =
-            super::task_network(&record, &switch, boxes::EgressDefaultPhase::InForce, false);
-        assert!(
-            format!("{in_force:?}").contains("has_policy: true"),
-            "the in-force default gates a bare box's task: {in_force:?}"
-        );
-
-        // A box that *declared* an egress section is the other case where
-        // the task path attaches a gate, and the announcement does not defer
-        // it: the declaration is enforced on the session's own PTask in every
-        // phase, so a task in that session resolves the same section its
-        // session's gate did — the declaration, not the deny-all section and
-        // not nothing — under either phase. In force, the default also
-        // decides the destination list the declaration left absent
-        // (`allow_dns_hosts`): present and empty, granting nothing
-        // (NET-074); announced, the section is carried as declared.
-        let section = boxes::EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..boxes::EgressPolicy::default()
-        };
-        let mut declared_record = record_with(boxes::NetworkMode::OwnIp);
-        declared_record.policy.egress = Some(section.clone());
-        for (phase, expected) in [
-            (boxes::EgressDefaultPhase::Announced, section.clone()),
-            (
-                boxes::EgressDefaultPhase::InForce,
-                boxes::EgressPolicy {
-                    allow_dns_hosts: Some(Vec::new()),
-                    ..section.clone()
-                },
-            ),
-        ] {
-            assert_eq!(
-                crate::box_actor::effective_egress_section(
-                    &declared_record.policy,
-                    declared_record.network,
-                    phase,
-                    false,
-                ),
-                Some(expected),
-                "a declared egress section reaches the task's gate as the \
-                 default resolves it while the default is {phase:?}",
-            );
-        }
-        let declared = super::task_network(
-            &declared_record,
-            &switch,
-            boxes::EGRESS_DEFAULT_PHASE,
-            false,
-        );
-        assert!(
-            format!("{declared:?}").contains("has_policy: true"),
-            "a declared egress section gates the task under the shipped \
-             phase too: {declared:?}"
-        );
-    }
-
-    /// 017-005. An own-IP task whose attach is refused stops with the
-    /// provider's error: the process is killed and reaped, and the plan it was
-    /// built from was the provider's, never the host's.
-    #[tokio::test]
-    async fn a_refused_task_attach_stops_the_task() {
-        use std::sync::Arc;
-
-        #[derive(Debug)]
-        struct Refuses;
-        impl sandbox::Network for Refuses {
-            fn plan(&self) -> sandbox::PlanFuture<'_> {
-                Box::pin(std::future::ready(Ok(sandbox::NetPlan::isolated())))
-            }
-            fn attach(&self, _: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
-                Box::pin(std::future::ready(Err(sandbox::NetworkError::new(
-                    std::io::Error::other("switch refused the client"),
-                ))))
-            }
-        }
-
-        struct Child {
-            reaped: bool,
-        }
-        impl super::Reapable for Child {
-            fn kill_and_reap(&mut self) {
-                self.reaped = true;
-            }
-        }
-
-        let planned = sandbox::PlannedLaunch::begin(Arc::new(Refuses))
-            .await
-            .expect("planning succeeds; it is the attach that fails");
-        assert!(planned.plan().isolates_netns());
-
-        let mut child = Child { reaped: false };
-        let err = super::attach_or_reap(planned, sandbox::Spawned::new(1), &mut child)
-            .await
-            .err()
-            .expect("a refused attach must surface as an error");
-        assert!(child.reaped, "the task must not run on");
-        assert!(
-            err.to_string().contains("switch refused the client"),
-            "the provider's reason must reach the caller, got: {err}",
-        );
-    }
-
-    /// A guard whose teardown blocks until told to finish, then counts.
-    struct SlowGuard {
-        go: std::sync::Arc<tokio::sync::Notify>,
-        done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-    impl sandbox::NetGuard for SlowGuard {
-        fn teardown(
-            self: Box<Self>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-            Box::pin(async move {
-                self.go.notified().await;
-                self.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            })
-        }
-    }
-
-    /// 017-003 on the task path. `wait` is polled inside a `select!` and can
-    /// be dropped while the network is being released; the release must still
-    /// run, once, and the next `wait` must not return before it is done. A
-    /// process dropped before any `wait` completed releases the same way.
-    #[tokio::test]
-    async fn a_dropped_wait_still_releases_the_network_once() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let go = Arc::new(tokio::sync::Notify::new());
-        let done = Arc::new(AtomicUsize::new(0));
-        let guard = || {
-            Box::new(SlowGuard {
-                go: go.clone(),
-                done: done.clone(),
-            })
-        };
-
-        // The first `wait` is dropped mid-release, as `select!` does.
-        let mut net = super::NetRelease::new(guard());
-        let dropped = tokio::time::timeout(std::time::Duration::from_millis(20), net.release())
-            .await
-            .is_err();
-        assert!(dropped, "the release must still be in flight");
-        assert_eq!(done.load(Ordering::SeqCst), 0);
-
-        // The next `wait` waits for the same release, which then finishes;
-        // a later one has nothing left to do.
-        go.notify_one();
-        net.release().await;
-        net.release().await;
-        assert_eq!(done.load(Ordering::SeqCst), 1, "released exactly once");
-
-        // Dropped before any `wait`: `Drop` spawns the release; let it run.
-        drop(super::NetRelease::new(guard()));
-        go.notify_one();
-        tokio::task::yield_now().await;
-        assert_eq!(
-            done.load(Ordering::SeqCst),
-            2,
-            "a dropped process still releases"
-        );
-    }
-
-    /// Bytes flow client→child stdin and child stdout/stderr→client,
-    /// and the child's exit code propagates to the bridge's return.
-    #[tokio::test]
-    async fn bridge_round_trips_stdio_and_propagates_exit_code() {
-        let (
-            process,
-            MockEndpoints {
-                mut stdin_reader,
-                mut stdout_writer,
-                mut stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-
-        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
-        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
-        let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        client_stdin.write_all(b"hello\n").await.unwrap();
-        client_stdin.shutdown().await.unwrap();
-
-        let mut received_stdin = Vec::new();
-        stdin_reader.read_to_end(&mut received_stdin).await.unwrap();
-        assert_eq!(received_stdin, b"hello\n");
-
-        stdout_writer.write_all(b"out!").await.unwrap();
-        stderr_writer.write_all(b"err!").await.unwrap();
-        drop(stdout_writer);
-        drop(stderr_writer);
-
-        ctrl.signal_exit(42).await;
-
-        let exit = bridge_task.await.unwrap();
-        assert_eq!(exit, 42);
-
-        let mut out = Vec::new();
-        client_stdout.read_to_end(&mut out).await.unwrap();
-        assert_eq!(out, b"out!");
-
-        let mut err = Vec::new();
-        client_stderr.read_to_end(&mut err).await.unwrap();
-        assert_eq!(err, b"err!");
-
-        assert!(!ctrl.was_killed());
-    }
-
-    /// A child that stops reading stdin must not stop the bridge from
-    /// relaying the child's output to the client, nor from delivering the
-    /// queued stdin once the child reads again. The child's stdin pipe
-    /// holds 64 KiB; a 256 KiB write to it parks, and with the write
-    /// parked inside the loop's select the child's stdout would never be
-    /// polled and this test would time out.
-    #[tokio::test]
-    async fn bridge_relays_output_while_a_stdin_write_is_blocked() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                mut stdin_reader,
-                mut stdout_writer,
-                stderr_writer: _stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-
-        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
-        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        let bridge_task = tokio::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        // Far more than the child's stdin pipe holds; this writer blocks
-        // once both pipes are full, which is the point.
-        let feeder = tokio::spawn(async move {
-            let _ = client_stdin.write_all(&vec![b'x'; 256 * 1024]).await;
-        });
-
-        // Reads the child's output as the bridge relays it; the final
-        // read_exact would hang if any of the payload stalled behind the
-        // blocked stdin write.
-        let reader = tokio::spawn(async move {
-            let mut received = vec![0u8; 256 * 1024];
-            client_stdout.read_exact(&mut received).await.unwrap();
-            received
-        });
-
-        // With a stdin write parked behind a full pipe, output from the
-        // child must still reach the client.
-        let payload = vec![b'o'; 256 * 1024];
-        timeout(Duration::from_secs(10), stdout_writer.write_all(&payload))
-            .await
-            .expect("child output must keep flowing while a stdin write is blocked")
-            .unwrap();
-
-        let out = timeout(Duration::from_secs(10), reader)
-            .await
-            .expect("the client must receive child output while a stdin write is blocked")
-            .unwrap();
-        assert_eq!(out, payload);
-
-        // The queued stdin reaches the child as soon as it reads.
-        let mut received_stdin = vec![0u8; 256 * 1024];
-        timeout(
-            Duration::from_secs(10),
-            stdin_reader.read_exact(&mut received_stdin),
-        )
-        .await
-        .expect("queued stdin must reach the child once it reads")
-        .unwrap();
-        assert_eq!(received_stdin, vec![b'x'; 256 * 1024]);
-        feeder.await.unwrap();
-
-        // Both output pipes at EOF end the loop; the child then exits.
-        drop(stdout_writer);
-        ctrl.signal_exit(0).await;
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("the bridge must end once both output pipes close and the child exits")
-            .unwrap();
-        assert_eq!(exit, 0);
-        assert!(!ctrl.was_killed());
-    }
-
-    /// A real child that writes its output before it reads more input
-    /// (`cat`) gets several MB streamed through it in both directions at
-    /// once: every byte comes back in order, and the child sees EOF only
-    /// after the queued stdin has drained. With the stdin write parked
-    /// inside the loop's select, `cat` blocks on a full stdout pipe, stops
-    /// reading stdin, and the bridge never finishes.
-    #[tokio::test]
-    async fn bridge_streams_megabytes_through_cat() {
-        use std::process::Stdio;
-        use std::time::Duration;
-
-        use futures::stream;
-        use tokio::time::timeout;
-
-        use super::TokioProcess;
-
-        const LEN: usize = 4 * 1024 * 1024;
-
-        let child = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawning cat");
-        let processes = stream::iter(vec![Ok::<_, std::io::Error>(TokioProcess::new(child))]);
-
-        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
-        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        let bridge_task = tokio::spawn(async move {
-            bridge(
-                "test",
-                processes,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
-        let sent = payload.clone();
-        // Dropping the write half once the payload is in is the client's EOF.
-        let feeder = tokio::spawn(async move {
-            client_stdin.write_all(&sent).await.unwrap();
-        });
-        let reader = tokio::spawn(async move {
-            let mut received = Vec::with_capacity(LEN);
-            client_stdout.read_to_end(&mut received).await.unwrap();
-            received
-        });
-
-        let exit = timeout(Duration::from_secs(60), bridge_task)
-            .await
-            .expect("cat must finish while its stdin and stdout stream at once")
-            .unwrap();
-        assert_eq!(exit, 0);
-        feeder.await.unwrap();
-        let received = reader.await.unwrap();
-        assert_eq!(received.len(), LEN);
-        assert!(received == payload, "cat must echo the payload in order");
-    }
-
-    /// A child that exits with stdin still queued behind its full pipe
-    /// drops the queued bytes and still reports its own exit status.
-    ///
-    /// Every pipe end stays open until the bridge returns, so the only
-    /// way out of the loop is the `wait` branch with a chunk still
-    /// queued: closing the child's stdin first would instead end the
-    /// parked write with `BrokenPipe` and take the write-failure path.
-    #[tokio::test]
-    async fn bridge_reports_exit_when_child_exits_with_stdin_queued() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                // Not read until the bridge returns: the child's stdin
-                // pipe fills and a chunk queues behind it.
-                mut stdin_reader,
-                stdout_writer,
-                stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-
-        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        let feeder = tokio::spawn(async move {
-            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
-        });
-
-        let bridge_task = tokio::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        // Let the bridge fill the child's stdin pipe and queue a chunk.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!bridge_task.is_finished());
-
-        // The child is reaped while every pipe end is still open.
-        ctrl.signal_exit(3).await;
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("a child exiting with stdin queued must end the bridge")
-            .unwrap();
-        assert_eq!(exit, 3);
-        assert!(!ctrl.was_killed());
-
-        // The child's stdin holds exactly what fit in its pipe, then EOF:
-        // the queued chunk was dropped, not delivered late.
-        let mut delivered = Vec::new();
-        timeout(
-            Duration::from_secs(10),
-            stdin_reader.read_to_end(&mut delivered),
-        )
-        .await
-        .expect("the bridge must close the child's stdin on return")
-        .unwrap();
-        assert_eq!(delivered.len(), 64 * 1024);
-
-        drop(stdout_writer);
-        drop(stderr_writer);
-        feeder.abort();
-    }
-
-    /// An exec the daemon's shutdown ends tells the client why on stderr,
-    /// after whatever the command itself wrote there, and still reports the
-    /// command's own status. One that ends outside a shutdown gets no notice.
-    #[tokio::test]
-    async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
-        for shutting_down in [true, false] {
-            let (
-                process,
-                MockEndpoints {
-                    stdin_reader: _stdin_reader,
-                    stdout_writer,
-                    mut stderr_writer,
-                    ctrl,
-                },
-            ) = build_mock();
-
-            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-            drop(closed_stdin_w);
-            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
-            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
-
-            let bridge_task = crate::traced::spawn(async move {
-                let exit = bridge_noting_shutdown(
-                    "test",
-                    process,
-                    &mut bridge_stdin,
-                    &mut bridge_stdout,
-                    &mut bridge_stderr,
-                    client_lost(),
-                    || shutting_down,
-                )
-                .await;
-                (exit, bridge_stderr)
-            });
-
-            stderr_writer.write_all(b"err!").await.unwrap();
-            drop(stderr_writer);
-            drop(stdout_writer);
-            // What a box killed by the shutdown reports: 128 + SIGKILL.
-            ctrl.signal_exit(137).await;
-
-            let (exit, bridge_stderr) = bridge_task.await.unwrap();
-            assert_eq!(exit, 137, "the command's own status passes through");
-            drop(bridge_stderr);
-
-            let mut err = Vec::new();
-            client_stderr.read_to_end(&mut err).await.unwrap();
-            let expected: &[u8] = if shutting_down {
-                b"err!minimald is shutting down; the command was stopped\n"
-            } else {
-                b"err!"
-            };
-            assert_eq!(
-                err,
-                expected,
-                "shutting down: {shutting_down}; stderr was {:?}",
-                String::from_utf8_lossy(&err),
-            );
-        }
-    }
-
-    /// When the SSH-channel write side fails, the bridge must call
-    /// `start_kill` so the child unblocks and `wait` resolves —
-    /// otherwise the loop would hang waiting on the now-dead channel.
-    #[tokio::test]
-    async fn bridge_kills_child_when_ssh_write_fails() {
-        let (
-            process,
-            MockEndpoints {
-                stdin_reader: _stdin_reader,
-                mut stdout_writer,
-                stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-        // Model a process with nothing on stderr — bridge sees EOF on
-        // child_stderr immediately and never writes to bridge_stderr.
-        drop(stderr_writer);
-
-        // SSH-side stdout reader dropped, so every bridge write to
-        // bridge_stdout errors with BrokenPipe.
-        let (broken_reader, mut bridge_stdout) = duplex(64);
-        drop(broken_reader);
-
-        // bridge_stderr exists only because the signature requires it;
-        // the bridge will never touch it in this test.
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64);
-
-        // SSH stdin closed: bridge sees EOF immediately.
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        stdout_writer.write_all(b"output").await.unwrap();
-        drop(stdout_writer);
-
-        let exit = bridge_task.await.unwrap();
-        // A killed mock returns Ok(None) from wait, which the bridge
-        // maps to exit status 1.
-        assert_eq!(exit, 1);
-        assert!(ctrl.was_killed());
-    }
-
-    /// NET-015: a lost client on a non-PTY exec ends the command that exec
-    /// spawned — and only it. The lost client is the SSH write side failing
-    /// (the channel's peer is gone): the bridge kills the child it was
-    /// driving, reports the kill as exit 1, and stops the sequence without
-    /// ever pulling the next process, so nothing beyond the exec's own
-    /// command was touched. The box the exec ran against is the session
-    /// plane's concern (`box_actor::tests` proves it survives the same loss).
-    #[tokio::test]
-    async fn lost_exec_client_kills_only_its_own_process() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (iter, mut endpoints) = build_mock_seq(2);
-        let second = endpoints.pop().unwrap();
-        let MockEndpoints {
-            stdin_reader: _stdin_reader,
-            stdout_writer: mut first_stdout,
-            stderr_writer: first_stderr,
-            ctrl: first_ctrl,
-        } = endpoints.pop().unwrap();
-        // Nothing on stderr; its EOF is the ordinary case.
-        drop(first_stderr);
-
-        // The client hung up: writes to its stdout side fail at once.
-        let (lost_client, mut bridge_stdout) = duplex(64);
-        drop(lost_client);
-        // bridge_stderr exists only because the signature requires it; the
-        // bridge never touches it in this test.
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64);
-        // The client's stdin went with it: EOF.
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                iter,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        // The child prints; forwarding it to the dead channel is the write
-        // that models the lost client.
-        first_stdout.write_all(b"output").await.unwrap();
-        drop(first_stdout);
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("a lost client must end the exec promptly, not hang the bridge")
-            .unwrap();
-        // A killed mock waits back Ok(None), which the bridge maps to 1.
-        assert_eq!(exit, 1);
-        assert!(
-            first_ctrl.was_killed(),
-            "the exec's own command must be killed when its client is lost"
-        );
-        assert!(
-            !second.ctrl.was_killed(),
-            "nothing beyond the exec's own command was spawned, let alone killed"
-        );
-    }
-
-    /// gominimal/inbox#813: a lost client on the *read* side — the SSH
-    /// channel closes or its sender drops while the child is silent —
-    /// must still kill the child. `make_reader()` used to reduce the
-    /// read half to a bare `AsyncRead`, which only surfaces `Data` and
-    /// `Eof`; a lost client then looked like stdin EOF and a silent
-    /// child (sleep, quiet build) kept running indefinitely. The
-    /// client-loss watch signal must end the bridge and kill the child
-    /// even though the child never writes a byte.
-    #[tokio::test]
-    async fn bridge_kills_silent_child_when_client_disconnects() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                stdin_reader: _stdin_reader,
-                // Held, never written: a silent child keeps its stdio
-                // open. Dropping them would let output EOF end the loop
-                // before the client-loss branch wins the `select!`.
-                stdout_writer: _stdout_writer,
-                stderr_writer: _stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-        // A silent child: nothing on stdout or stderr, and it never
-        // exits on its own.
-
-        // SSH stdin closed: bridge sees EOF immediately.
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        // The client-loss signal fires: the SSH channel closed.
-        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost_rx,
-            )
-            .await
-        });
-
-        client_lost_tx.send(true).unwrap();
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("a lost client must kill a silent child promptly, not hang the bridge")
-            .unwrap();
-        // A killed mock waits back Ok(None), which the bridge maps to 1.
-        assert_eq!(exit, 1);
-        assert!(
-            ctrl.was_killed(),
-            "a silent child must be killed when its client disconnects"
-        );
-    }
-
-    /// gominimal/inbox#813: stdin EOF alone — the client closing its
-    /// input but keeping the channel open — must NOT kill a silent
-    /// child. EOF is a normal close, not a disconnect; the child keeps
-    /// running and the bridge returns the child's own exit code.
-    #[tokio::test]
-    async fn bridge_does_not_kill_silent_child_on_stdin_eof() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                stdin_reader: _stdin_reader,
-                stdout_writer,
-                stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-        // A silent child: nothing on stdout or stderr.
-        drop(stdout_writer);
-        drop(stderr_writer);
-
-        // SSH stdin closed: bridge sees EOF immediately.
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        // The client-loss signal never fires: the channel stays open.
-        let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost_rx,
-            )
-            .await
-        });
-
-        // The child exits cleanly on its own; the bridge must return its
-        // code without killing it.
-        ctrl.signal_exit(7).await;
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("stdin EOF alone must not hang the bridge")
-            .unwrap();
-        assert_eq!(exit, 7);
-        assert!(
-            !ctrl.was_killed(),
-            "stdin EOF is a normal close, not a disconnect; the child must not be killed"
-        );
-    }
-
-    /// A child that never reads stdin leaves the bridge parked writing
-    /// into a full stdin pipe. A disconnect arriving then must still
-    /// kill the child rather than wait on a write that never completes.
-    #[tokio::test]
-    async fn bridge_kills_child_blocked_on_stdin_when_client_disconnects() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                // Held but never read: the child's stdin pipe fills.
-                stdin_reader: _stdin_reader,
-                stdout_writer: _stdout_writer,
-                stderr_writer: _stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-
-        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
-
-        // Far more than the child's stdin pipe holds; this writer blocks
-        // once both pipes are full, which is the point.
-        let feeder = crate::traced::spawn(async move {
-            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
-        });
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost_rx,
-            )
-            .await
-        });
-
-        // Let the bridge fill the child's stdin pipe and park on it.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!bridge_task.is_finished());
-
-        client_lost_tx.send(true).unwrap();
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("a lost client must interrupt a blocked stdin write")
-            .unwrap();
-        assert_eq!(exit, 1);
-        assert!(ctrl.was_killed());
-        feeder.abort();
-    }
-
-    /// A child that closes stdout and stderr but keeps running ends the
-    /// I/O loop with the child still alive. A disconnect arriving while
-    /// the bridge waits on it must still kill the child; if it did not,
-    /// this test times out, since nothing else ever ends the child.
-    #[tokio::test]
-    async fn bridge_kills_child_with_closed_output_when_client_disconnects() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                stdin_reader: _stdin_reader,
-                stdout_writer,
-                stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-        // Output closed, but the child never exits on its own.
-        drop(stdout_writer);
-        drop(stderr_writer);
-
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost_rx,
-            )
-            .await
-        });
-
-        // Let the loop see both EOFs and park on the final wait.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!bridge_task.is_finished());
-
-        client_lost_tx.send(true).unwrap();
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("a lost client must kill a child whose output is already closed")
-            .unwrap();
-        assert_eq!(exit, 1);
-        assert!(ctrl.was_killed());
-    }
-
-    /// `min task run` from a terminal half-closes stdin before anything
-    /// else, so a disconnect arrives *after* EOF. The pump must close the
-    /// child's stdin on EOF yet keep watching, and still signal client
-    /// loss when the channel then closes.
-    #[tokio::test]
-    async fn pump_signals_client_loss_after_stdin_eof() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
-        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
-            rx.recv().await.map(|m| (m, rx))
-        }));
-        let (stdin_w, mut stdin_r) = duplex(64);
-        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
-        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
-
-        msg_tx
-            .send(russh::ChannelMsg::Data {
-                data: b"hi".as_slice().into(),
-            })
-            .unwrap();
-        msg_tx.send(russh::ChannelMsg::Eof).unwrap();
-
-        let mut got = Vec::new();
-        timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
-            .await
-            .expect("stdin EOF must close the child's stdin")
-            .unwrap();
-        assert_eq!(got, b"hi");
-        assert!(!*lost_rx.borrow(), "stdin EOF is not a disconnect");
-        assert!(!pump.is_finished(), "the pump must outlive stdin EOF");
-
-        msg_tx.send(russh::ChannelMsg::Close).unwrap();
-        timeout(Duration::from_secs(10), lost_rx.changed())
-            .await
-            .expect("a close after EOF must still signal client loss")
-            .unwrap();
-        assert!(*lost_rx.borrow());
-        pump.await.unwrap();
-    }
-
-    /// The channel's sender dropping (the connection died without a
-    /// `Close`) ends the message stream; that is a disconnect too.
-    #[tokio::test]
-    async fn pump_signals_client_loss_when_channel_sender_drops() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<russh::ChannelMsg>();
-        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
-            rx.recv().await.map(|m| (m, rx))
-        }));
-        let (stdin_w, _stdin_r) = duplex(64);
-        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
-        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
-
-        drop(msg_tx);
-        timeout(Duration::from_secs(10), lost_rx.changed())
-            .await
-            .expect("a dropped channel must signal client loss")
-            .unwrap();
-        assert!(*lost_rx.borrow());
-        pump.await.unwrap();
-    }
-
-    /// A grandchild that inherited the child's stdout keeps the pipe
-    /// open past the child's own exit — `sh -c 'sleep 20 & echo
-    /// STARTED'`. The bridge must return on the *child's* exit, relay
-    /// what the child wrote before exiting, and keep reading the orphan's
-    /// pipe rather than dropping it (gominimal/inbox#566).
-    ///
-    /// Every other test here drops the stdout writer *before* signalling
-    /// exit, which is why none of them caught this: holding it is the
-    /// whole point.
-    #[tokio::test]
-    async fn bridge_returns_on_child_exit_with_stdout_still_held_open() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (
-            process,
-            MockEndpoints {
-                stdin_reader: _stdin_reader,
-                mut stdout_writer,
-                stderr_writer,
-                ctrl,
-            },
-        ) = build_mock();
-        // Only stdout models the inherited fd; stderr EOFs as usual.
-        drop(stderr_writer);
-
-        // SSH stdin closed: bridge sees EOF immediately.
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (mut client_stdout, mut bridge_stdout) = duplex(1024 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                process,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        // What the child printed before exiting, then the exit — with
-        // the writer still held, standing in for the backgrounded
-        // grandchild's copy of the fd.
-        stdout_writer.write_all(b"STARTED\n").await.unwrap();
-        ctrl.signal_exit(0).await;
-
-        let exit = timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("bridge must return on child exit, not wait out the orphan")
-            .unwrap();
-        assert_eq!(exit, 0);
-        assert!(!ctrl.was_killed());
-
-        // The orphan lives on. Its next write must not hit a closed read
-        // end — that is EPIPE, and SIGPIPE kills a real process — and
-        // more than a pipeful must still move, proving something is
-        // actually draining rather than merely holding the fd.
-        let orphan_output = vec![b'x'; 256 * 1024];
-        timeout(
-            Duration::from_secs(10),
-            stdout_writer.write_all(&orphan_output),
-        )
-        .await
-        .expect("the daemon must keep draining the orphan's pipe, not stall on a full one")
-        .expect("dropping the read end would break the orphan's pipe (EPIPE/SIGPIPE)");
-
-        // Pre-exit output is still relayed in full; post-exit output is
-        // discarded, so the client sees exactly the former.
-        drop(stdout_writer);
-        let mut out = Vec::new();
-        client_stdout.read_to_end(&mut out).await.unwrap();
-        assert_eq!(out, b"STARTED\n");
-    }
-
-    /// A two-process sequence: the first child exits non-zero, so the
-    /// bridge must stop and report that code without ever pulling the
-    /// second process from the iter. If it tried to drive process 2,
-    /// `bridge_task.await` would hang (proc 2's ctrl is never signalled)
-    /// and the test would time out.
-    #[tokio::test]
-    async fn bridge_stops_sequence_on_first_non_zero_exit() {
-        let (iter, mut endpoints) = build_mock_seq(2);
-        let second = endpoints.pop().unwrap();
-        let MockEndpoints {
-            stdin_reader: _stdin_reader,
-            stdout_writer: mut first_stdout,
-            stderr_writer: mut first_stderr,
-            ctrl: first_ctrl,
-        } = endpoints.pop().unwrap();
-
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                iter,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        // Drive the first child to exit non-zero. Closing the writers
-        // gives the bridge EOF on both child stdout and stderr.
-        first_stdout.write_all(b"first").await.unwrap();
-        first_stderr.write_all(b"oops").await.unwrap();
-        drop(first_stdout);
-        drop(first_stderr);
-        first_ctrl.signal_exit(5).await;
-
-        let exit = bridge_task.await.unwrap();
-        assert_eq!(exit, 5);
-        // The second process was never spawned, so its kill flag should
-        // still be unset.
-        assert!(!second.ctrl.was_killed());
-    }
-
-    /// A disconnect consumed by the first step must still stop the
-    /// sequence when that child reports exit 0 (it exited just before
-    /// the kill landed, or ignores kill like `EchoProcess`). The watch
-    /// transition is already spent, so a second, silent child would
-    /// never see it: the bridge must not start it. If it did, this test
-    /// times out, since nothing ever ends the second child.
-    #[tokio::test]
-    async fn bridge_stops_sequence_on_client_loss_after_zero_exit() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let (iter, mut endpoints) = build_mock_seq(2);
-        // Silent and never exiting: stdio held open, ctrl never signalled.
-        let second = endpoints.pop().unwrap();
-        let MockEndpoints {
-            stdin_reader: _stdin_reader,
-            stdout_writer: first_stdout,
-            stderr_writer: first_stderr,
-            ctrl: first_ctrl,
-        } = endpoints.pop().unwrap();
-        drop(first_stdout);
-        drop(first_stderr);
-        first_ctrl.signal_exit(0).await;
-
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        // The client is gone and the transition is already observed, as
-        // the first step's `changed()` branch would have left it.
-        let (client_lost_tx, mut client_lost_rx) = tokio::sync::watch::channel(false);
-        client_lost_tx.send(true).unwrap();
-        client_lost_rx.borrow_and_update();
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                iter,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost_rx,
-            )
-            .await
-        });
-
-        timeout(Duration::from_secs(10), bridge_task)
-            .await
-            .expect("a lost client must end the sequence, not start the next child")
-            .unwrap();
-        assert!(
-            !second.ctrl.was_killed(),
-            "the second child must never be started"
-        );
-        drop(client_lost_tx);
-    }
-
-    /// A two-process sequence where both children exit cleanly: the
-    /// bridge runs them back-to-back, concatenates their stdout to the
-    /// SSH channel, and returns the second's exit code.
-    #[tokio::test]
-    async fn bridge_runs_sequence_to_completion_and_concatenates_stdout() {
-        let (iter, mut endpoints) = build_mock_seq(2);
-        let MockEndpoints {
-            stdin_reader: _r2,
-            stdout_writer: mut second_stdout,
-            stderr_writer: second_stderr,
-            ctrl: second_ctrl,
-        } = endpoints.pop().unwrap();
-        let MockEndpoints {
-            stdin_reader: _r1,
-            stdout_writer: mut first_stdout,
-            stderr_writer: first_stderr,
-            ctrl: first_ctrl,
-        } = endpoints.pop().unwrap();
-        drop(first_stderr);
-        drop(second_stderr);
-
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
-        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                iter,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        first_stdout.write_all(b"AAA").await.unwrap();
-        drop(first_stdout);
-        first_ctrl.signal_exit(0).await;
-
-        second_stdout.write_all(b"BBB").await.unwrap();
-        drop(second_stdout);
-        second_ctrl.signal_exit(0).await;
-
-        let exit = bridge_task.await.unwrap();
-        assert_eq!(exit, 0);
-
-        let mut out = Vec::new();
-        client_stdout.read_to_end(&mut out).await.unwrap();
-        assert_eq!(out, b"AAABBB");
-    }
-
-    /// An `EchoProcess` drives through the bridge as a zero-cost stand-in
-    /// for a spawned child: its text (plus a trailing newline, matching
-    /// `/bin/echo`) reaches the SSH stdout stream, stderr stays empty, and
-    /// it reports exit 0 — no sandbox involved.
-    #[tokio::test]
-    async fn echo_process_writes_text_and_exits_zero() {
-        use futures::stream::{self, StreamExt};
-
-        use super::{EchoProcess, TaskProcess};
-
-        let echo = TaskProcess::Echo(EchoProcess::new("MINIMALD_SESSION_OK"));
-        let mut echo_stream = stream::iter(vec![Ok(echo)]).boxed();
-
-        // SSH stdin closed: bridge sees EOF immediately.
-        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
-        drop(closed_stdin_w);
-        let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
-        let (mut client_stderr, mut bridge_stderr) = duplex(64 * 1024);
-
-        let bridge_task = crate::traced::spawn(async move {
-            bridge(
-                "test",
-                &mut echo_stream,
-                &mut bridge_stdin,
-                &mut bridge_stdout,
-                &mut bridge_stderr,
-                client_lost(),
-            )
-            .await
-        });
-
-        let exit = bridge_task.await.unwrap();
-        assert_eq!(exit, 0);
-
-        let mut out = Vec::new();
-        client_stdout.read_to_end(&mut out).await.unwrap();
-        assert_eq!(out, b"MINIMALD_SESSION_OK\n");
-
-        let mut err = Vec::new();
-        client_stderr.read_to_end(&mut err).await.unwrap();
-        assert!(err.is_empty(), "echo should produce no stderr: {err:?}");
-    }
-
-    mod end_to_end {
-        //! Tests that exercise the full ssh-exec stack against a real
-        //! `TestServer`: russh transport, `ConnectionHandler` dispatch,
-        //! and `handle_exec` request routing.
-        use boxes::SessionId;
-
-        use minimald_rpc::exec::ExecRequest;
-
-        use crate::MINIMAL_SESSION_ID_ENV;
-        use crate::test_harness::{
-            TestClient, TestServer, create_configured_session, create_session_req,
-        };
-
-        /// Creates a fresh session through the public CreateSession RPC
-        /// and returns its id, mirroring how a real client sets up state
-        /// before running commands against the session.
-        async fn fresh_session(client: &mut TestClient) -> SessionId {
-            create_configured_session(client, "exec-test", "/tmp").await
-        }
-
-        /// A path in the daemon's own filesystem that a command would create if
-        /// it ran there. Unique per call so parallel tests cannot collide.
-        fn daemon_marker(tag: &str) -> std::path::PathBuf {
-            std::env::temp_dir().join(format!(
-                "minimald-exec-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id(),
-            ))
-        }
-
-        /// An exec request the daemon does not service itself is handed to the
-        /// session's sandbox — and must never run on the daemon's own
-        /// filesystem.
-        ///
-        /// The marker file is what pins that: had the command run here, it
-        /// would exist. This harness launches a mock host with no sandbox to
-        /// join, so the command fails rather than running in-session; where it
-        /// was *sent* is the part that matters and the part that can be proved
-        /// without a real sandbox.
-        #[tokio::test]
-        async fn an_unrecognised_command_never_runs_on_the_daemon() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-            let marker = daemon_marker("arbitrary");
-            let _ = std::fs::remove_file(&marker);
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &format!("printf pwned > {}", marker.display()),
-                    &[],
-                )
-                .await
-                .expect("the request is serviced over the channel, not a channel failure");
-
-            assert!(
-                !marker.exists(),
-                "an exec request ran on the daemon's filesystem, creating {}",
-                marker.display(),
-            );
-            assert_ne!(
-                out.exit_status,
-                Some(0),
-                "the mock harness has no sandbox to run in, so this cannot succeed; stdout was {:?}",
-                String::from_utf8_lossy(&out.stdout),
-            );
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                !stderr.contains("unsupported command"),
-                "the command should be routed to the session, not refused, got {stderr:?}",
-            );
-        }
-
-        /// Brings a session to `Active` with a task-only `minimal.toml` in
-        /// its workspace: the create → populate → configure → finalize
-        /// sequence a task run's client drives, shared by every test here
-        /// that execs a task.
-        ///
-        /// The mfile holds only echo tasks — `tasks.echo_ok`, plus
-        /// `tasks.greet`, which declares one defaulted arg — whose entire
-        /// output lives in their declarations: no `[upstream]`, package
-        /// graph, or sandbox:
-        /// the echo short-circuit never builds a graph, so nothing here
-        /// reaches the (network-bound) package machinery. A task-only mfile
-        /// gates nothing, so the loadout composes in one shot, and this
-        /// composition has no patches, so `FinalizeSession` takes the
-        /// empty-composition shortcut past the marker check and promotes
-        /// the record to `Active` in one call.
-        async fn active_session_with_echo_task(
-            server: &TestServer,
-            client: &mut TestClient,
-            name: &str,
-        ) -> SessionId {
-            use minimald_rpc::{
-                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
-                FinalizeSessionRequest,
-            };
-
-            let session_id = client
-                .call::<CreateSession>(&create_session_req(name, "/tmp"))
-                .await
-                .unwrap()
-                .id;
-
-            // Drop a task-only `minimal.toml` into the session workspace,
-            // standing in for the e2e test's SFTP upload.
-            server
-                .seed_workspace_mfile(
-                    session_id,
-                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n\n\
-                     [tasks.greet]\n\
-                     args.name = { type = \"string\", default = \"world\" }\n\
-                     echo = \"hi %{name}\"\n",
-                )
-                .await;
-
-            crate::test_harness::unwrap_ready(
-                client
-                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
-                        session_id,
-                        contribution: Default::default(),
-                    })
-                    .await
-                    .unwrap(),
-            );
-
-            match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest {
-                    session_id,
-                    report_shared_port_collisions: false,
-                })
-                .await
-            {
-                minimald_rpc::Errorable::Ok(_) => {}
-                minimald_rpc::Errorable::Err { error } => {
-                    panic!("FinalizeSession failed: {error}");
-                }
-            }
-
-            session_id
-        }
-
-        /// End-to-end happy path for `min run <task>`: an `echo` task is
-        /// serviced straight from the workspace `minimal.toml` — no
-        /// package graph, upstream, or sandbox — and its text (plus a
-        /// trailing newline) round-trips over the channel with exit 0.
-        ///
-        /// Drives the client's real ordering — create, populate the
-        /// workspace, *then* configure the loadout against it — which is the
-        /// sequence `minvmd`'s libkrun e2e test runs over the bridge. Keeping
-        /// it in-process here means a break in that sequence (e.g. execing a
-        /// session whose loadout was never configured, which has no context
-        /// to resolve a task against) surfaces without needing a VM.
-        #[tokio::test]
-        async fn exec_runs_echo_task() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = active_session_with_echo_task(&server, &mut client, "exec-test").await;
-            let session_str = session_id.to_string();
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::TaskRun {
-                        task: "echo_ok".to_string(),
-                        owns_box: false,
-                        args: vec![],
-                        cwd: String::new(),
-                    }
-                    .encode(),
-                    &[],
-                )
-                .await
-                .expect("a task/run request should be accepted");
-
-            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
-            assert_eq!(out.exit_status, Some(0));
-            assert!(
-                out.stderr.is_empty(),
-                "echo task should produce no stderr: {:?}",
-                out.stderr,
-            );
-        }
-
-        /// A task run's args reach the task: the daemon parses the argv off
-        /// the wire against the task's declared `args`, so `%{name}` binds
-        /// to the default when none is given, to the value when one is, and
-        /// an undeclared flag fails the run rather than being dropped.
-        #[tokio::test]
-        async fn exec_binds_task_args_and_defaults() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = active_session_with_echo_task(&server, &mut client, "args-test").await;
-            let session_str = session_id.to_string();
-
-            let run = |args: Vec<String>| {
-                ExecRequest::TaskRun {
-                    task: "greet".to_string(),
-                    owns_box: false,
-                    args,
-                    cwd: String::new(),
-                }
-                .encode()
-            };
-
-            // No args: the declared default applies.
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &run(vec![]),
-                    &[],
-                )
-                .await
-                .expect("a task/run request should be accepted");
-            assert_eq!(out.stdout, b"hi world\n");
-            assert_eq!(out.exit_status, Some(0));
-
-            // An explicit value overrides the default.
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &run(vec!["--name".into(), "Alice".into()]),
-                    &[],
-                )
-                .await
-                .expect("a task/run request should be accepted");
-            assert_eq!(out.stdout, b"hi Alice\n");
-            assert_eq!(out.exit_status, Some(0));
-
-            // An undeclared flag fails the run instead of being ignored.
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &run(vec!["--nope".into(), "x".into()]),
-                    &[],
-                )
-                .await
-                .expect("a task/run request should be accepted");
-            assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
-            assert_ne!(out.exit_status, Some(0));
-        }
-
-        /// NET-131: a box created for a run ends when the run's command
-        /// exits, whether or not the client that started it is still here.
-        /// The request carries the owns-box flag; the daemon destroys the
-        /// session after the exit status is on the wire — the destroy the
-        /// client used to issue after a normal run, moved here so a client
-        /// killed mid-run strands nothing.
-        ///
-        /// The destroy runs after the channel closes, so this client's exec
-        /// can return before the box is gone: the end is polled for, not
-        /// raced on. The info line the run's end emits is asserted too — it
-        /// is what a diagnostic bundle's daemon-log tail reads the end of a
-        /// run box from.
-        #[tokio::test]
-        async fn run_box_ends_when_its_run_ends() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-
-            let capture = crate::test_harness::captured_log();
-
-            let session_id =
-                active_session_with_echo_task(&server, &mut client, "run-box-ends").await;
-            let session_str = session_id.to_string();
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::TaskRun {
-                        task: "echo_ok".to_string(),
-                        owns_box: true,
-                        args: vec![],
-                        cwd: String::new(),
-                    }
-                    .encode(),
-                    &[],
-                )
-                .await
-                .expect("a task/run request should be accepted");
-            assert_eq!(out.exit_status, Some(0));
-            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
-
-            // The box ends after the channel closes; poll until the listing
-            // is empty rather than racing the destroy.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
-                if listed.sessions.is_empty() {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the run's box must end once its task exits, but {} session(s) are still \
-                     listed: {:?}",
-                    listed.sessions.len(),
-                    listed.sessions,
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-
-            // The one info line the run's end emits, naming the session, the
-            // exec and the exit code.
-            let logged = capture.contents();
-            assert!(
-                logged.contains("run box ended"),
-                "expected the run-box-end info line, got: {logged}"
-            );
-            assert!(logged.contains(&session_str), "names the session: {logged}");
-            assert!(logged.contains("echo_ok"), "names the exec: {logged}");
-            assert!(logged.contains("exit=0"), "names the exit code: {logged}");
-        }
-
-        /// A task run that does not own its box leaves the session standing:
-        /// the daemon ends only what the run owns, and the unflagged
-        /// spelling — what `min session run` sends, and what every client
-        /// from before the flag sent — keeps the box for whoever holds it.
-        /// After the exec has returned, and the moment a stray destroy would
-        /// have needed, the session is still listed.
-        #[tokio::test]
-        async fn run_box_survives_when_run_keeps_it() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id =
-                active_session_with_echo_task(&server, &mut client, "run-box-kept").await;
-            let session_str = session_id.to_string();
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::TaskRun {
-                        task: "echo_ok".to_string(),
-                        owns_box: false,
-                        args: vec![],
-                        cwd: String::new(),
-                    }
-                    .encode(),
-                    &[],
-                )
-                .await
-                .expect("a task/run request should be accepted");
-            assert_eq!(out.exit_status, Some(0));
-            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
-
-            // The exec is over; the box is not. Give the moment a stray
-            // destroy would have needed before asserting.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
-            assert_eq!(
-                listed.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
-                vec![session_id],
-                "a run that keeps its box must not end it; got {:?}",
-                listed.sessions,
-            );
-        }
-
-        /// `min task run <task>` is the canonical spelling of the legacy
-        /// `min run <task>` and must be accepted by the exec channel; a
-        /// prefix-matched `min task runx` must still be refused. Acceptance
-        /// (vs `channel_failure`) is settled purely by argv parsing before any
-        /// process spawns, so an unpopulated task name is enough to exercise
-        /// the dispatch arm.
-        #[tokio::test]
-        async fn exec_accepts_task_run_canonical_form() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            let accepted = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::TaskRun {
-                        task: "some_task".to_string(),
-                        owns_box: false,
-                        args: vec![],
-                        cwd: String::new(),
-                    }
-                    .encode(),
-                    &[],
-                )
-                .await;
-            assert!(
-                accepted.is_ok(),
-                "a task/run request naming a task must be accepted, got {accepted:?}",
-            );
-
-            // A task/run naming no task is refused before anything spawns, and
-            // there is nothing useful to stream, so it is a channel failure.
-            let empty = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::TaskRun {
-                        task: String::new(),
-                        owns_box: false,
-                        args: vec![],
-                        cwd: String::new(),
-                    }
-                    .encode(),
-                    &[],
-                )
-                .await;
-            assert!(
-                empty.is_err(),
-                "a task/run naming no task must be refused, got {empty:?}",
-            );
-
-            // A near-miss tag is a form this daemon does not serve. It is not
-            // silently downgraded to a session shell command: the scheme was
-            // named, so the client asked for something specific.
-            let unknown = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    "min://task/runx some_task",
-                    &[],
-                )
-                .await
-                .expect("an unknown form is reported over the channel, not a channel failure");
-            assert_ne!(unknown.exit_status, Some(0));
-            assert!(
-                String::from_utf8_lossy(&unknown.stderr).contains("min://task/runx"),
-                "the refusal should name the form asked for, got {:?}",
-                String::from_utf8_lossy(&unknown.stderr),
-            );
-        }
-
-        /// End-to-end happy path for `min check`: the exec is accepted,
-        /// routed to a check side-op, and the run reports a terminal outcome
-        /// with an exit status. This workspace holds no `packages/`,
-        /// `profiles/`, or `stacks/` dirs, so there is nothing to lint and
-        /// the run completes clean — what's under test is the routing and the
-        /// exit-status contract a scripted `min check` depends on.
-        #[tokio::test]
-        async fn exec_runs_check_and_exits_zero_when_nothing_fails() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-            // `start_check` builds a fresh workspace-rooted context per call,
-            // so the workspace needs an mfile for it to resolve at all.
-            server.seed_workspace_mfile(session_id, "").await;
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::Check(String::new()).encode(),
-                    &[],
-                )
-                .await
-                .expect("a check request should be accepted");
-
-            assert_eq!(out.exit_status, Some(0));
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim(),
-                "check finished",
-            );
-            assert!(
-                out.stderr.is_empty(),
-                "a clean check should produce no stderr: {:?}",
-                out.stderr,
-            );
-        }
-
-        /// A mistyped flag must exit non-zero. Parsed as a name filter it
-        /// would match nothing, so the run would check zero objects and report
-        /// success — and the exit status is the whole contract for a scripted
-        /// `min check` over SSH.
-        #[tokio::test]
-        async fn exec_check_rejects_a_typod_flag_rather_than_passing() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-            server.seed_workspace_mfile(session_id, "").await;
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::Check("--packags".to_string()).encode(),
-                    &[],
-                )
-                .await
-                .expect("the exec itself is accepted; the flag fails the run");
-
-            assert_eq!(
-                out.exit_status,
-                Some(1),
-                "a typo'd flag must not exit 0; stdout was {:?}",
-                String::from_utf8_lossy(&out.stdout),
-            );
-            assert!(
-                String::from_utf8_lossy(&out.stderr).contains("unknown flag `--packags`"),
-                "the bad flag should be named on stderr, got {:?}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
-
-        /// A command that merely *looks* like one of the daemon's own belongs
-        /// to the session, and reaches it.
-        ///
-        /// This is the contract that replaced prefix-sniffing: the daemon used
-        /// to claim every command starting with `min ` and refuse the ones it
-        /// did not recognise, which made a session's own `min` binary
-        /// unreachable through exec (gominimal/inbox#558). Now only the
-        /// `min://` scheme addresses the daemon, so `min checkx` is just a
-        /// command — routed to the session, and never run on the daemon's own
-        /// filesystem.
-        ///
-        /// The marker file pins the second half: had it run here, it would
-        /// exist. This harness launches a mock host with no sandbox to join, so
-        /// the command fails rather than running in-session; where it was
-        /// *sent* is what matters and what can be proved without a real sandbox.
-        #[tokio::test]
-        async fn a_min_lookalike_goes_to_the_session_not_the_daemon() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-            let marker = daemon_marker("checkx");
-            let _ = std::fs::remove_file(&marker);
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &format!("min checkx > {}", marker.display()),
-                    &[],
-                )
-                .await
-                .expect("the request is serviced over the channel, not a channel failure");
-
-            assert!(
-                !marker.exists(),
-                "`min checkx` ran on the daemon's filesystem, creating {}",
-                marker.display(),
-            );
-            assert_ne!(
-                out.exit_status,
-                Some(0),
-                "the mock harness has no sandbox to run in, so this cannot succeed; stdout was {:?}",
-                String::from_utf8_lossy(&out.stdout),
-            );
-            // Routed, not refused: the old daemon answered this with an
-            // "unsupported command" refusal instead of handing it over.
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                !stderr.contains("unsupported"),
-                "a `min` lookalike must be routed to the session, not refused, got {stderr:?}",
-            );
-        }
-
-        /// An argv reaches the session as words, not as a line for some shell
-        /// to re-split — the fix for gominimal/inbox#558. The mock harness has
-        /// no sandbox, so what is provable here is that the form is accepted
-        /// and routed to the session rather than refused or run on the daemon.
-        #[tokio::test]
-        async fn an_argv_form_is_accepted_and_routed_to_the_session() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-            let marker = daemon_marker("argv");
-            let _ = std::fs::remove_file(&marker);
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::Argv(vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("printf pwned > {}", marker.display()),
-                    ])
-                    .encode(),
-                    &[],
-                )
-                .await
-                .expect("an argv request is serviced over the channel");
-
-            assert!(
-                !marker.exists(),
-                "an argv exec ran on the daemon's filesystem, creating {}",
-                marker.display(),
-            );
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                !stderr.contains("unsupported"),
-                "the argv form must be routed to the session, not refused, got {stderr:?}",
-            );
-        }
-
-        /// An argv naming no program is refused rather than guessed at.
-        #[tokio::test]
-        async fn an_empty_argv_is_refused() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    "min://argv []",
-                    &[],
-                )
-                .await
-                .expect("the refusal is reported over the channel");
-
-            assert_ne!(out.exit_status, Some(0));
-            assert!(
-                String::from_utf8_lossy(&out.stderr).contains("names no program"),
-                "got {:?}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
-
-        /// An argv exec carrying a credential-shaped token emits an `exec
-        /// request` line without the token and with the rest of the command
-        /// intact.
-        #[tokio::test]
-        async fn exec_request_scrubs_credentials_from_log() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            let capture = crate::test_harness::captured_log();
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    &ExecRequest::Argv(vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/".to_string(),
-                    ])
-                    .encode(),
-                    &[],
-                )
-                .await
-                .expect("an argv request is serviced over the channel");
-
-            // The exec itself may fail (no sandbox), but the log line must
-            // be scrubbed.
-            let logged = capture.contents();
-            assert!(
-                logged.contains("exec request"),
-                "expected an exec request line, got: {logged}"
-            );
-            assert!(
-                !logged.contains("ghp_FAKETOKEN"),
-                "token must be scrubbed from the exec request line, got: {logged}"
-            );
-            assert!(
-                logged.contains("<redacted:len=13>"),
-                "token must be replaced with placeholder, got: {logged}"
-            );
-            // The rest of the command is intact.
-            assert!(
-                logged.contains("curl -H 'Authorization: Bearer"),
-                "non-credential parts of the command must survive, got: {logged}"
-            );
-            assert!(
-                logged.contains("https://x/"),
-                "URL must survive, got: {logged}"
-            );
-
-            // The exec outcome is not the point of this test.
-            let _ = out;
-        }
-    }
-}
+mod tests;
 
 /// The exec channel's spans (OTel TEL-021, TEL-022, TEL-043): the client's
 /// `TRACEPARENT` reaches the `exec` and `git_*` spans, and the session
