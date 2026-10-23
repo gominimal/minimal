@@ -146,15 +146,22 @@ fn pid_gone(pid: nix::unistd::Pid) -> bool {
     false
 }
 
-/// Returns `true` if the owner's lock file cannot be opened for any reason
-/// or its exclusive `flock` can be acquired. Any lock-acquisition error
-/// returns `false`.
+/// Returns `true` if the owner's lock file is gone (the owner unlinked it on
+/// its way out) or its exclusive `flock` can be acquired. Any other error,
+/// opening the file (`EACCES`, `EMFILE`) or taking the lock, returns `false`:
+/// a watch that cannot tell keeps watching, rather than ending a live attach
+/// over a transient fault of its own.
 ///
 /// On acquiring the lock, attempts to unlink its file while still holding
 /// the lock, then releases it. An unlink failure does not change the result.
 fn owner_lock_is_free(path: &std::path::Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return true;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(err) => {
+            tracing::debug!(error = %err, path = %path.display(), "the proxy's owner lock could not be opened; still watching");
+            return false;
+        }
     };
     match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
         Ok(lock) => {
