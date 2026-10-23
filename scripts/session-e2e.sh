@@ -11809,6 +11809,7 @@ bep_trust_clean() {
 # absent) and $WORK/$1.links (each hashed-directory link and its target).
 bep_trust_box_files() {
   local tb_case="$1" tb_kind="$2" tb_seed tb_out tb_sid tb_file
+  local -a tb_egress
   tb_seed="$(hook_mktemp /tmp/mnltrust.XXXXXX)"
   {
     hook_seed_preamble
@@ -11818,10 +11819,17 @@ bep_trust_box_files() {
     fi
   } > "$tb_seed/minimal.toml"
   mkdir "$tb_seed/.git"
+  # Only the grant box declares the GitHub hosts its grant needs. A box with
+  # no grant declares no egress rules: a --network host_ip box on a VM host
+  # refuses hostname rules at the start, and that box needs none.
+  tb_egress=()
+  if [ "$tb_kind" = grant ]; then
+    tb_egress=(--allow-dns-hosts github.com --allow-dns-hosts api.github.com
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com)
+  fi
   tb_out="$(cd "$tb_seed" && mnl session activate . --no-prompt \
     --name "e2e-$(printf '%s' "$tb_case" | tr '_' '-' | cut -c1-36)-$tb_kind" \
-    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
-    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    ${tb_egress[@]+"${tb_egress[@]}"} \
     </dev/null 2>"$WORK/$tb_case.err")" || {
     echo "::error::'min session activate' of the $tb_kind box for $tb_case failed"
     echo "--- stdout ---"; printf '%s\n' "$tb_out"
