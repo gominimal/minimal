@@ -742,8 +742,18 @@ else
   # A dir counts only with BOTH halves of the pair: a shared target dir can
   # hold a 'min' from an earlier build and no daemon, and taking it skips the
   # build below and dies at the daemon gate.
+  # A pair whose halves report different versions is not one build: an
+  # earlier build of one half ran from a dirty tree, say. The CLI refuses
+  # such a daemon at the first activate, so rebuild the pair below instead.
+  min_skewed_pair=""
   for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
     if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
+      if [ "$("$d/min" --version 2>/dev/null | awk '{print $NF}')" \
+           != "$("$d/$min_daemon" --version 2>/dev/null | awk '{print $NF}')" ]; then
+        echo "the 'min' and '$min_daemon' under $d report different versions; rebuilding the pair"
+        min_skewed_pair=1
+        continue
+      fi
       min_cli_dir="$d"
       break
     fi
@@ -767,6 +777,11 @@ else
     # copies into place (beside min). It builds in its own invocation, as
     # `just zoned-build` does: beside `-p minvmd`, cargo would unify
     # minvmd's `libkrun` feature into the root-run program.
+    # The version build script reruns only on a git change, so a skewed pair
+    # keeps its skew through a rebuild unless the script is made to rerun.
+    if [ -n "$min_skewed_pair" ]; then
+      touch "$ROOT/crates/version/build.rs"
+    fi
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
         -p "$min_daemon" --bin "$min_daemon" \
         && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
