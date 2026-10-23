@@ -82,7 +82,7 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
 /// with the network mode (R2.1) — so an invalid session is never
 /// written to the store. The `id` field is left as `nil`; the store
-/// allocates the real id at `create` time.
+/// mints the record's box id at `create` time.
 ///
 /// The `CreateSession` handler always persists the record as
 /// `Pending`; the session actor's create flow promotes it to
@@ -208,6 +208,11 @@ enum ManagerMessage {
     /// start an actor?" is otherwise invisible from outside.
     #[cfg(test)]
     RunningCount(Responder<usize>),
+    /// The ids of the live session actors, in the order the `running`
+    /// map holds them. Test-only: it shows that the holder keeps its boxes
+    /// in box id order, which is their creation order.
+    #[cfg(test)]
+    RunningIds(Responder<Vec<SessionId>>),
     CreateSession(Box<CreateSessionMsg>),
     /// Destroy a session; with `true`, only if it has not finished
     /// activating (`None` when it was kept).
@@ -237,6 +242,8 @@ impl ManagerMessage {
             Self::GetComposition(..) => "GetComposition",
             #[cfg(test)]
             Self::RunningCount(..) => "RunningCount",
+            #[cfg(test)]
+            Self::RunningIds(..) => "RunningIds",
             Self::CreateSession(..) => "CreateSession",
             Self::DeleteSession(..) => "DeleteSession",
             Self::Shutdown(..) => "Shutdown",
@@ -262,6 +269,10 @@ pub struct BoxManager {
     /// can tell (see [`BoxManagerHandle::is_shutting_down`]).
     in_shutdown: CancellationToken,
     receiver: crate::traced::Receiver<ManagerMessage>,
+    /// The live session actors, keyed by box id. A box id is a `UUIDv7`
+    /// and orders by its bytes, so the map holds its boxes in the time
+    /// order their ids were minted: creation order. The shutdown stops
+    /// them in that order.
     running: BTreeMap<SessionId, BoxHandle>,
     /// Sessions whose teardown runs on a task of its own (`DeleteSession`):
     /// out of `running`, their record on disk until the task deletes it. The
@@ -1374,6 +1385,12 @@ impl BoxManager {
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
+        // On a VM guest the box id is the one the VM host handed in
+        // `config.box_id`, and the in-VM store still mints the record key
+        // (https://github.com/gominimal/minimal/issues/2397 files the
+        // record under the handed id). Elsewhere the
+        // record key is the box id.
+        let handed_box_id = config.box_id;
         let record = build_record(config, username, boxes::BoxState::Pending)?;
         let name = record.name.clone();
         let retry = record.clone();
@@ -1408,6 +1425,12 @@ impl BoxManager {
             Err(e) => return Err(e),
         };
         let session_id = *handle.id();
+        let box_id = handed_box_id.unwrap_or(session_id);
+        tracing::info!(
+            session_id = %session_id,
+            box_id = %box_id,
+            "filed the box record"
+        );
 
         let mut seed = self.session_config(handle.clone());
         seed.creator = creator;
@@ -1511,6 +1534,11 @@ impl BoxManager {
             ManagerMessage::RunningCount(r) => {
                 let n = self.running.len();
                 r.handle(async move { Ok::<_, BoxManagerError>(n) }).await;
+            }
+            #[cfg(test)]
+            ManagerMessage::RunningIds(r) => {
+                let ids: Vec<SessionId> = self.running.keys().copied().collect();
+                r.handle(async move { Ok::<_, BoxManagerError>(ids) }).await;
             }
             ManagerMessage::GetComposition(pred, r) => {
                 let tearing_down = self
