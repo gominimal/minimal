@@ -1569,9 +1569,12 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
 
     // A loadout whose file still declares the now-vestigial `name` field
     // makes `list_loadouts` emit a `tracing::warn!` during parsing.
+    // `--dir` names a minimal config dir; the loadout goes in its
+    // `loadouts/` subdirectory.
     let loadouts_dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(loadouts_dir.path().join("loadouts")).unwrap();
     std::fs::write(
-        loadouts_dir.path().join("dev.toml"),
+        loadouts_dir.path().join("loadouts/dev.toml"),
         "name = \"dev\"\ndescription = \"development\"\n",
     )
     .unwrap();

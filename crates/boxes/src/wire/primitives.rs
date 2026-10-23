@@ -5,6 +5,12 @@
 //! the wire schema can evolve independently of the TOML wire forms
 //! used at config load. Nothing here uses `#[serde(untagged)]`.
 
+/// The `kind` tag [`WireSource::UntrustedLoadout`] serializes under. A
+/// daemon that predates untrusted loadouts rejects a request carrying it
+/// with serde's ``unknown variant `untrusted_loadout` ``, and the client
+/// matches this tag to explain that refusal.
+pub const UNTRUSTED_LOADOUT_KIND: &str = "untrusted_loadout";
+
 /// Origin of a contributed item. Mirrors [`crate::core::source::Source`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -13,6 +19,14 @@ pub enum WireSource {
     UserLoadout {
         /// Loadout name.
         name: String,
+    },
+    /// Untrusted loadout, identified by name, with the loadout's own
+    /// directory on the client host.
+    UntrustedLoadout {
+        /// Loadout name.
+        name: String,
+        /// Host path to the loadout's own directory.
+        dir: paths::HostPath,
     },
     /// Project (`minimal.toml`) at the given host path.
     Project {
@@ -330,6 +344,9 @@ impl From<crate::core::source::Source> for WireSource {
     fn from(s: crate::core::source::Source) -> Self {
         match s {
             crate::core::source::Source::UserLoadout { name } => Self::UserLoadout { name },
+            crate::core::source::Source::UntrustedLoadout { name, dir } => {
+                Self::UntrustedLoadout { name, dir }
+            }
             crate::core::source::Source::Project { path } => Self::Project { path },
             crate::core::source::Source::Package { name } => Self::Package { name },
         }
@@ -445,9 +462,26 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_loadout_serializes_under_its_named_kind() {
+        let wire = WireSource::UntrustedLoadout {
+            name: "dev".into(),
+            dir: paths::HostPath::try_new("/cfg/loadouts-untrusted/dev").unwrap(),
+        };
+        let json = serde_json_lenient::to_string(&wire).unwrap();
+        assert!(
+            json.contains(&format!(r#""kind":"{UNTRUSTED_LOADOUT_KIND}""#)),
+            "expected `kind` tag `{UNTRUSTED_LOADOUT_KIND}`, got: {json}"
+        );
+    }
+
+    #[test]
     fn source_round_trips_all_variants() {
         let cases = [
             WireSource::UserLoadout { name: "dev".into() },
+            WireSource::UntrustedLoadout {
+                name: "dev".into(),
+                dir: paths::HostPath::try_new("/cfg/loadouts-untrusted/dev").unwrap(),
+            },
             WireSource::Project {
                 path: paths::HostPath::try_new("/repo").unwrap(),
             },

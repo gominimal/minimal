@@ -1,0 +1,4 @@
+description = "Untrusted: external hook whose script does not exist"
+
+[[lifecycle_hooks]]
+on_activate = { type = "external", value = "./does-not-exist.sh" }

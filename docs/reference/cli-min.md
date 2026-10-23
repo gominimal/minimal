@@ -104,7 +104,7 @@ the current directory).
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
 | `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them. `ask` asks the attached person about a `min net expose`. With nobody attached, `ask` refuses the request at once. `ask` never publishes a listen. `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. On a VM-backed host the create registers the stance and range with the VM host daemon. That daemon admits each publish the box requests against that grant. It admits an `ask` publish only on a yes the host records. Every macOS host is VM-backed |
 | `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
-| `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
+| `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`, or from the same paths under [`loadouts-untrusted/`](./loadouts.md#untrusted-loadouts), which the user policy gates. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
@@ -666,14 +666,23 @@ min loadout list [--dir <DIR>]
 ```
 
 Lists loadouts from the user's config directory, in both layouts —
-`<name>.toml` and `<name>/loadout.toml`. `--dir` overrides the
-loadouts directory (default: `<config>/minimal/loadouts`, e.g.
-`~/.config/minimal/loadouts` on Linux).
+`<name>.toml` and `<name>/loadout.toml` — and in both loadouts directories:
+`<config>/minimal/loadouts` and `<config>/minimal/loadouts-untrusted`, e.g.
+`~/.config/minimal/loadouts` on Linux. Rows from the
+[untrusted directory](./loadouts.md#untrusted-loadouts) are tagged
+`(untrusted)`.
+
+`--dir` names a minimal config directory to list in place of
+`<config>/minimal`. The command lists its `loadouts/` and
+`loadouts-untrusted/` subdirectories, which give each loadout its trust as they
+do at activation, and marks the defaults its `config.toml` names.
 
 A loadout that fails to load is reported on stderr and makes the command exit
 non-zero, leaving the table of valid loadouts intact. That covers a malformed
-file and a name defined in both layouts at once, which is
+file, a name defined in both layouts at once, and a name defined in both
+directories, each of which is
 [an error rather than a precedence rule](./loadouts.md#where-loadouts-live).
+A name with more than one of these faults has each of them reported.
 
 ### `dirs`
 

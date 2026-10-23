@@ -123,9 +123,28 @@ intentional and user-visible, and is documented for end users under
 pipeline** (described below). User-origin items auto-pass the
 `allow` step but still hit `deny` and `ignore`; vars whose value
 was a literal or fell back to a default (`carries_user_data ==
-false`) skip the policy check entirely — see the *carries_user_data*
-invariant below. Every outcome is decidable, so the gate completes
-without prompts. The output is a `WireContribution`, shipped to
+false`) skip the policy check entirely, unless an untrusted
+loadout set them — see the *carries_user_data* invariant below. Every outcome is decidable, so the gate completes
+without prompts.
+
+Loadouts read from `<config>/minimal/loadouts-untrusted/` are the
+exception. `Loadout::untrusted` tags their items
+`Source::UntrustedLoadout { name, dir }`, which gets no `allow`
+pass: the policy gates their vars and patches as it gates a project's,
+and `gate_hooks` gates their lifecycle hooks once per `dir`, as the
+handler gates a project's per root. Their items can therefore be
+undecided, so the client composes them via
+`UserComposer::compose_with_hooks`, with the same `PolicyHooks` that
+Phase 3 uses: the interactive prompt, or `NoPromptHook`, whose
+summary aborts the activation before `CreateSession`.
+
+The policy's own patterns (`~/`, `$NAME`) expand only against
+vars from trusted loadouts (`policy_expansion_vars`), here and on
+the daemon-response path alike. A project's, a package's, or an
+untrusted loadout's vars never take part, so no source the policy
+gates can rewrite the rules that gate it.
+
+Either way, the output is a `WireContribution`, shipped to
 the daemon inside `minimald_rpc::ConfigureLoadoutRequest {
 session_id, contribution }`. The out-of-band session fields
 (`name`, `project_path`, `network`, `policy`, `attrs`) ride
@@ -491,7 +510,9 @@ Below, in numbered prose:
    loadout authoring time — not the user's env — into the
    sandbox. The user policy exists to gate *user env* crossing
    into the sandbox; there's nothing to gate here. Auto-approve
-   without consulting `allow`/`deny`/`ignore`.
+   without consulting `allow`/`deny`/`ignore`. The exception is a
+   var from an untrusted loadout, which is gated by name whatever
+   its value's origin, with its value shown at the prompt.
 2. **Patch pre-walk.** For each `Patch`, expand `~` and `$VAR` in the
    source pattern (using the already-gated vars from earlier in the
    batch plus the composer's `HOME` env lookup as tilde fallback).
@@ -575,7 +596,11 @@ overload:
   user's environment cross into the sandbox, not to referee what
   packages hardcode. A package that ships `LD_PRELOAD = "/tmp/x"`
   as a literal is a package-declaration matter, not a policy
-  matter.
+  matter. An untrusted loadout's vars are the exception: `gate_vars`
+  gates them whatever the bit says, since their value is the risk,
+  and hands a literal or fallen-back value to the prompt
+  (`Unapproved::value`). The policy still matches the name only, so
+  a permanent `allow` trusts the name, not the value.
 - **Composers accumulate; compose decides.** Per phase, all
   contribution happens first; the gate pipeline runs over the
   accumulated `Contribution`. Phases 2 and 3 are linked by exactly

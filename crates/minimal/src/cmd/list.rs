@@ -300,9 +300,17 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let active =
         loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, global)?;
     // `true`: the dashboard has no `--no-hooks`, matching the `hooks_enabled`
-    // the TUI sends on `CreateSession`.
-    let (contribution, _user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
+    // the TUI sends on `CreateSession`. An untrusted default loadout's
+    // undecided items are refused rather than asked about: this one
+    // composition serves every session the dashboard creates.
+    let (contribution, _user_policy) = loadouts::compose_user_contribution_gated(
+        active,
+        user_policy,
+        compose_options,
+        true,
+        loadouts::PromptLane::Dashboard,
+        &config::user_policy_path(global),
+    )?;
     crate::dash::run(crate::dash::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
         config_dir: global.config_dir.clone(),

@@ -7,7 +7,7 @@ use anyhow::{Context as _, bail};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::{read_client_config, resolve_minimal_config_dir};
+use crate::config::resolve_minimal_config_dir;
 use crate::{GlobalArgs, LoadoutListArgs};
 
 /// The user's choice of which loadouts to apply for a session
@@ -38,6 +38,18 @@ impl LoadoutSelection {
         }
     }
 }
+
+/// The trusted loadouts directory's name under `<config>/minimal/`.
+/// Loadouts here are the user's own: their items auto-pass the user
+/// policy's `allow` step.
+pub(crate) const LOADOUTS_DIR_NAME: &str = "loadouts";
+
+/// The untrusted loadouts directory's name under `<config>/minimal/`,
+/// beside [`LOADOUTS_DIR_NAME`]. Loadouts here work the same way in
+/// every respect but one: the user policy gates them like a project, so
+/// their vars, patches, and lifecycle hooks must be allow-listed or
+/// approved at a prompt.
+pub(crate) const UNTRUSTED_LOADOUTS_DIR_NAME: &str = "loadouts-untrusted";
 
 /// Filename stem and `name` of the built-in `default` loadout.
 const BUILTIN_DEFAULT_NAME: &str = "default";
@@ -107,6 +119,12 @@ pub(crate) struct ActiveLoadouts {
     /// (`<dir>/<name>/`) — its external hook scripts, and
     /// `$LOADOUT_ROOT` in its patch sources — resolves against the
     /// directory the files actually came from.
+    ///
+    /// The trusted directory. An untrusted loadout carries its own
+    /// directory (see [`Loadout::untrusted`]), so this one anchors only
+    /// trusted loadouts.
+    ///
+    /// [`Loadout::untrusted`]: boxes::core::loadout::Loadout::untrusted
     pub(crate) loadouts_dir: paths::HostAbsPath,
     /// True when the zero-config fallback used the built-in `default`
     /// loadout (as opposed to user files, including a shadowing user
@@ -124,13 +142,20 @@ pub(crate) struct ActiveLoadouts {
 /// With no flags and an empty `default_loadouts`, falls back to the
 /// built-in [`builtin_default_loadout`] so a zero-config box is
 /// oriented rather than bare; a user `default` loadout on disk — in
-/// either layout — shadows the built-in.
+/// either layout, in either directory — shadows the built-in.
+///
+/// Every name is looked up in both the trusted and the untrusted
+/// loadouts directory (see [`load_named_loadout`]); one found in the
+/// untrusted directory comes back marked
+/// [untrusted](boxes::core::loadout::Loadout::untrusted).
 pub(crate) fn resolve_active_loadouts(
     selection: LoadoutSelection,
     cfg: &boxes::client::config::Config,
     global: &GlobalArgs,
 ) -> Result<ActiveLoadouts, anyhow::Error> {
-    let loadouts_dir = resolve_loadouts_dir_for_activation(global)?;
+    let loadouts_dir = resolve_loadouts_dir_for_activation(global, LOADOUTS_DIR_NAME)?;
+    let untrusted_loadouts_dir =
+        resolve_loadouts_dir_for_activation(global, UNTRUSTED_LOADOUTS_DIR_NAME)?;
     let (names, source): (Vec<String>, &str) = match selection {
         LoadoutSelection::None => {
             return Ok(ActiveLoadouts {
@@ -146,15 +171,16 @@ pub(crate) fn resolve_active_loadouts(
                 // Zero-config: no flags and no configured defaults.
                 // Fall back to the built-in `default` loadout unless
                 // the user shadows it with their own — in either
-                // layout, `default.toml` or `default/loadout.toml` —
-                // in which case that file is loaded instead.
+                // layout, `default.toml` or `default/loadout.toml`, and
+                // in either directory — in which case that file is
+                // loaded instead.
                 //
                 // Probed through the resolver rather than a bare
                 // `exists()` so both layouts are found by one rule,
                 // and so a `default` that exists but is broken
                 // (malformed TOML, both layouts at once) is reported
                 // as the error it is instead of being read as absence.
-                if !user_default_exists(&loadouts_dir)? {
+                if !user_default_exists(&loadouts_dir, &untrusted_loadouts_dir)? {
                     return Ok(ActiveLoadouts {
                         loadouts: vec![builtin_default_loadout()],
                         loadouts_dir,
@@ -189,12 +215,14 @@ pub(crate) fn resolve_active_loadouts(
                     )
                 })
                 .with_context(|| format!("{source} `{name}`"))?;
-            // `LoadError`'s Display already embeds its I/O source, so flatten
-            // it to a leaf before adding context; otherwise anyhow re-renders
-            // the underlying error a second time from the chain.
-            boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
-                .map(|(loadout, _layout)| loadout)
-                .map_err(|e| anyhow::anyhow!("{e}"))
+            load_named_loadout(&loadouts_dir, &untrusted_loadouts_dir, &name)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no loadout `{name}` in `{loadouts_dir}` or `{untrusted_loadouts_dir}` \
+                         (looked for `{name}.toml` and `{name}/{}` in each)",
+                        boxes::client::disk::LOADOUT_FILE_NAME,
+                    )
+                })
                 .with_context(|| format!("{source} `{name}`"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -205,28 +233,79 @@ pub(crate) fn resolve_active_loadouts(
     })
 }
 
-/// Whether the user has a `default` loadout of their own on disk, in
-/// either layout — the probe behind the zero-config fallback in
-/// [`resolve_active_loadouts`].
+/// Load loadout `name` from whichever of the trusted and untrusted
+/// loadouts directories defines it, marking it
+/// [untrusted](boxes::core::loadout::Loadout::untrusted) when it came
+/// from the untrusted one. `Ok(None)` when neither does.
 ///
-/// Absence is the normal answer here, so [`LoadError::NotFound`] maps
-/// to `Ok(false)`. Every other error means the file is *there* and
-/// unusable, which the user wants told rather than silently replaced
-/// by the built-in.
+/// A name defined in both is an error rather than resolved by
+/// precedence, for the reason a name defined in both layouts is (see
+/// [`boxes::client::disk`]): whichever copy lost would go on looking
+/// live while having no effect — and here, which copy wins also decides
+/// whether the user policy gates it.
 ///
-/// [`LoadError::NotFound`]: boxes::client::disk::LoadError::NotFound
-fn user_default_exists(loadouts_dir: &paths::HostAbsPath) -> Result<bool, anyhow::Error> {
-    let name = boxes::core::loadout::LoadoutName::try_new(BUILTIN_DEFAULT_NAME)
-        .expect("the built-in default's name is a valid loadout name");
-    match boxes::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name) {
-        Ok(_) => Ok(true),
-        Err(boxes::client::disk::LoadError::NotFound { .. }) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("{e}")).context("default_loadouts `default`"),
+/// # Errors
+///
+/// A loadout that exists but cannot load, or a name in both directories.
+fn load_named_loadout(
+    loadouts_dir: &paths::HostAbsPath,
+    untrusted_loadouts_dir: &paths::HostAbsPath,
+    name: &boxes::core::loadout::LoadoutName,
+) -> Result<Option<boxes::core::loadout::Loadout>, anyhow::Error> {
+    use boxes::client::disk::{LoadError, load_loadout};
+    // `LoadError`'s Display already embeds its I/O source, so flatten
+    // it to a leaf before the caller adds context; otherwise anyhow
+    // re-renders the underlying error a second time from the chain.
+    let probe =
+        |dir: &paths::HostAbsPath| match load_loadout(dir.as_utf8_path().as_std_path(), name) {
+            Ok((loadout, layout)) => Ok(Some((loadout, layout))),
+            Err(LoadError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        };
+    match (probe(loadouts_dir)?, probe(untrusted_loadouts_dir)?) {
+        (None, None) => Ok(None),
+        (Some((loadout, _)), None) => Ok(Some(loadout)),
+        (None, Some((loadout, _))) => {
+            // `name` is a single path component that stays put
+            // (`LoadoutName`), so the join stays under the directory.
+            let dir = untrusted_loadouts_dir.sub_path_unchecked(name.as_ref());
+            Ok(Some(loadout.untrusted(dir)))
+        }
+        (Some((_, trusted)), Some((_, untrusted))) => bail!(
+            "loadout `{name}` is defined in both loadouts directories:\n  {}\n  {}\n\
+             remove one.",
+            trusted
+                .path_for(loadouts_dir.as_utf8_path().as_std_path(), name)
+                .display(),
+            untrusted
+                .path_for(untrusted_loadouts_dir.as_utf8_path().as_std_path(), name)
+                .display(),
+        ),
     }
 }
 
-/// The loadouts directory an activation reads from:
-/// `<config>/minimal/loadouts`, under whatever
+/// Whether the user has a `default` loadout of their own on disk, in
+/// either layout and either directory — the probe behind the
+/// zero-config fallback in [`resolve_active_loadouts`].
+///
+/// Absence is the normal answer here, so not finding one maps to
+/// `Ok(false)`. Every error means the file is *there* and unusable (or
+/// there twice), which the user wants told rather than silently
+/// replaced by the built-in.
+fn user_default_exists(
+    loadouts_dir: &paths::HostAbsPath,
+    untrusted_loadouts_dir: &paths::HostAbsPath,
+) -> Result<bool, anyhow::Error> {
+    let name = boxes::core::loadout::LoadoutName::try_new(BUILTIN_DEFAULT_NAME)
+        .expect("the built-in default's name is a valid loadout name");
+    load_named_loadout(loadouts_dir, untrusted_loadouts_dir, &name)
+        .map(|found| found.is_some())
+        .context("default_loadouts `default`")
+}
+
+/// A loadouts directory an activation reads from:
+/// `<config>/minimal/<subdir>` — [`LOADOUTS_DIR_NAME`] or
+/// [`UNTRUSTED_LOADOUTS_DIR_NAME`] — under whatever
 /// [`resolve_minimal_config_dir`] resolved for this run.
 ///
 /// UTF-8 is required rather than best-effort: the directory is joined
@@ -247,8 +326,9 @@ fn user_default_exists(loadouts_dir: &paths::HostAbsPath) -> Result<bool, anyhow
 /// `..` in any pattern.
 fn resolve_loadouts_dir_for_activation(
     global: &GlobalArgs,
+    subdir: &str,
 ) -> Result<paths::HostAbsPath, anyhow::Error> {
-    let dir = resolve_minimal_config_dir(global).join("loadouts");
+    let dir = resolve_minimal_config_dir(global).join(subdir);
     let utf8 = camino::Utf8PathBuf::from_path_buf(dir)
         .map_err(|p| anyhow::anyhow!("loadouts directory is not valid UTF-8: {}", p.display()))?;
     match paths::HostAbsPath::try_new(utf8) {
@@ -293,8 +373,14 @@ pub(crate) fn compose_options_from_config(
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
-/// Resolve and validate every external hook script the active loadouts
-/// declare, ready to upload.
+/// Resolve and validate every external hook script in the composed
+/// loadout contribution, ready to upload.
+///
+/// Takes the *composed* hooks, not the active loadouts, so only hooks
+/// that survived composition are staged: one `--no-hooks` stripped, or
+/// one from an untrusted loadout the user policy ignored or the user
+/// refused at the prompt, is never read from disk or uploaded, and a
+/// missing script it names cannot fail the activation.
 ///
 /// Run before the daemon connection is opened so a mistyped script path
 /// fails on this machine, naming the file, instead of surfacing after a
@@ -305,35 +391,25 @@ pub(crate) fn compose_options_from_config(
 /// workspace upload, so it resolves those itself —
 /// [`check_project_hooks`] validates them without staging them.
 ///
-/// Returns an empty list when hooks are disabled — `--no-hooks` means
-/// nothing is staged, uploaded, or run.
+/// `loadouts_dir` is the trusted loadouts directory; an untrusted
+/// loadout's hooks carry their own directory in their source.
 pub(crate) fn stage_loadout_hook_scripts(
-    active: &ActiveLoadouts,
+    composed: &[boxes::wire::primitives::WireProvenancedHook],
+    loadouts_dir: &paths::HostAbsPath,
     project_root: &paths::HostAbsPath,
-    hooks_enabled: bool,
 ) -> Result<Vec<boxes::client::hookscripts::StagedScript>, anyhow::Error> {
     use boxes::client::hookscripts::{ScriptAnchors, stage_external_scripts};
-    use boxes::core::source::{ProvenancedHook, Source};
+    use boxes::core::source::ProvenancedHook;
 
-    if !hooks_enabled {
-        return Ok(Vec::new());
-    }
-
-    let hooks: Vec<ProvenancedHook> = active
-        .loadouts
+    let hooks: Vec<ProvenancedHook> = composed
         .iter()
-        .flat_map(|l| {
-            let source = Source::UserLoadout {
-                name: l.name().as_ref().to_owned(),
-            };
-            l.lifecycle_hooks()
-                .iter()
-                .map(move |h| ProvenancedHook::new(h.clone(), source.clone()))
-        })
-        .collect();
+        .cloned()
+        .map(ProvenancedHook::try_from)
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("staging loadout hook scripts: {e}"))?;
 
     let anchors = ScriptAnchors {
-        loadouts_dir: active.loadouts_dir.clone(),
+        loadouts_dir: loadouts_dir.clone(),
         project_root: project_root.clone(),
     };
     stage_external_scripts(&hooks, &anchors).map_err(|e| anyhow::anyhow!("{e}"))
@@ -417,30 +493,29 @@ pub(crate) fn check_project_hooks(project_root: &paths::HostAbsPath) -> Result<(
 
 /// The wall-clock the daemon may spend running `on_activate` hooks inside a
 /// single `FinalizeSession`: the summed declared timeouts of every
-/// activation hook the client can see — the active loadouts' plus the
-/// project's. Setup hooks run sequentially and without an aggregate budget
-/// on the daemon, so this sum bounds the round-trip, and it is known before
-/// the call — which is what lets the `FinalizeSession` deadline be sized to
-/// it so a hook declaring more than the base oneshot timeout can still
-/// finish.
+/// activation hook the client can see — the composed loadout hooks' plus
+/// the project's. Taken from the composition, so a loadout hook the user
+/// policy dropped adds nothing. Setup hooks run sequentially and without
+/// an aggregate budget on the daemon, so this sum bounds the round-trip,
+/// and it is known before the call — which is what lets the
+/// `FinalizeSession` deadline be sized to it so a hook declaring more than
+/// the base oneshot timeout can still finish.
 ///
 /// Zero when hooks are disabled or nothing declares an `on_activate`. The
 /// project's `minimal.toml` is read the same way [`check_project_hooks`]
 /// reads it; an unreadable or session-less file contributes nothing.
 pub(crate) fn activate_hook_budget(
-    active: &ActiveLoadouts,
+    composed: &[boxes::wire::primitives::WireProvenancedHook],
     project_root: &camino::Utf8Path,
     hooks_enabled: bool,
 ) -> Duration {
     if !hooks_enabled {
         return Duration::ZERO;
     }
-    let loadout: Duration = active
-        .loadouts
+    let loadout: Duration = composed
         .iter()
-        .flat_map(|l| l.lifecycle_hooks())
-        .filter_map(|h| h.on_activate())
-        .map(|s| s.timeout())
+        .filter_map(|h| h.hook.on_activate.clone())
+        .map(|s| boxes::core::lifecyclehook::HookScript::from(s).timeout())
         .sum();
     let project: Duration = mfile::File::from_dir(project_root.as_std_path())
         .ok()
@@ -456,12 +531,160 @@ pub(crate) fn activate_hook_budget(
     loadout + project
 }
 
+/// How [`compose_user_contribution_gated`] may ask the user about
+/// untrusted loadout items the policy can't decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptLane {
+    /// Prompt on the terminal; permanent choices are saved to
+    /// `user_policy.toml`.
+    Interactive,
+    /// Never prompt: any undecided item fails the composition with a
+    /// ready-to-paste `user_policy.toml` snippet.
+    NoPrompt,
+    /// `min dash`: refuse as [`Self::NoPrompt`] does, even on a terminal.
+    /// The dashboard composes its loadouts once, at startup, and reuses
+    /// the result for every session it creates, so an "allow once"
+    /// answered here would silently cover all of them.
+    Dashboard,
+}
+
+impl PromptLane {
+    /// The lane for a run, given whether it was told not to prompt
+    /// (`--no-prompt`, `--no-input`). A terminal that cannot be prompted
+    /// on takes the no-prompt lane too.
+    pub(crate) fn for_run(no_prompt: bool) -> Self {
+        if no_prompt || !crate::can_prompt_interactively() {
+            Self::NoPrompt
+        } else {
+            Self::Interactive
+        }
+    }
+}
+
+/// [`compose_user_contribution`], gating the items of any untrusted
+/// loadout against the user policy the way a project's items are gated:
+/// on the [`PromptLane::Interactive`] lane by prompting (and saving any
+/// permanent choice to `policy_path`, even when the activation then
+/// aborts), on the [`PromptLane::NoPrompt`] lane by failing with the
+/// `user_policy.toml` snippet that would let it through.
+///
+/// With no untrusted loadout active nothing can need approval, so this
+/// is exactly [`compose_user_contribution`].
+///
+/// Runs before the daemon is contacted, so a refusal here leaves nothing
+/// behind on it.
+///
+/// # Errors
+///
+/// Any composition failure, an abort at the prompt, or — on the
+/// no-prompt lane — any item that would have needed approval.
+pub(crate) fn compose_user_contribution_gated(
+    active: ActiveLoadouts,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
+    hooks_enabled: bool,
+    lane: PromptLane,
+    policy_path: &std::path::Path,
+) -> Result<
+    (
+        boxes::wire::request::WireContribution,
+        boxes::core::policy::UserPolicy,
+    ),
+    anyhow::Error,
+> {
+    if !active.loadouts.iter().any(|l| l.is_untrusted()) {
+        return compose_user_contribution(active, policy, options, hooks_enabled, None);
+    }
+    match lane {
+        PromptLane::NoPrompt | PromptLane::Dashboard => {
+            // `NoPromptHook` fake-approves so every gate runs and the
+            // snippet lists every edit at once. The contribution it
+            // produces is discarded unless nothing was recorded, so a
+            // fake approval never reaches the daemon.
+            let hooks = crate::prompt::NoPromptHook::new();
+            let composed =
+                compose_user_contribution(active, policy, options, hooks_enabled, Some(&hooks));
+            let summary = hooks.into_summary();
+            if summary.count() > 0 {
+                let count = summary.count();
+                let (s, need) = if count == 1 {
+                    ("", "needs")
+                } else {
+                    ("s", "need")
+                };
+                let why = match lane {
+                    PromptLane::Dashboard => {
+                        "min dash does not ask about them: it would apply one answer to every \
+                         session it creates"
+                    }
+                    _ => {
+                        "this run cannot ask (--no-prompt or --no-input was set, or \
+                         stdin/stderr is not a terminal)"
+                    }
+                };
+                let rerun = match lane {
+                    PromptLane::Dashboard => {
+                        "Then run `min dash` again, or run `min session activate` to be asked \
+                         about each item."
+                    }
+                    _ => "Then re-run this command.",
+                };
+                bail!(
+                    "{count} item{s} from untrusted loadouts {need} your approval, but {why}.\n\n\
+                     Add the following to {}:\n\n{}\n{rerun}",
+                    policy_path.display(),
+                    summary.as_toml_snippet(),
+                );
+            }
+            composed
+        }
+        PromptLane::Interactive => {
+            let hooks = crate::prompt::InteractivePrompt::new(policy_path, policy.clone());
+            compose_interactively(active, policy, options, hooks_enabled, hooks, policy_path)
+        }
+    }
+}
+
+/// The [`PromptLane::Interactive`] half of
+/// [`compose_user_contribution_gated`], taking the prompt ready-built so
+/// a test can script its answers. `hooks` must start from `policy`.
+fn compose_interactively(
+    active: ActiveLoadouts,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
+    hooks_enabled: bool,
+    hooks: crate::prompt::InteractivePrompt,
+    policy_path: &std::path::Path,
+) -> Result<
+    (
+        boxes::wire::request::WireContribution,
+        boxes::core::policy::UserPolicy,
+    ),
+    anyhow::Error,
+> {
+    let composed =
+        compose_user_contribution(active, policy.clone(), options, hooks_enabled, Some(&hooks));
+    // Saved before the result propagates: a `DenyPermanent` aborts the
+    // composition and still wants its rule kept, and a save failure must
+    // not mask the composition's own error.
+    let final_policy = hooks.into_final_policy();
+    if final_policy != policy {
+        match crate::prompt::save_user_policy(policy_path, &final_policy) {
+            Ok(()) => eprintln!("Updated {}", policy_path.display()),
+            Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+        }
+    }
+    composed
+}
+
 /// Compose the resolved [`ActiveLoadouts`] into a
 /// [`boxes::wire::request::WireContribution`] under the user's
-/// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
-/// auto-pass the allow step but the policy's `deny` / `ignore` rules
-/// still apply, so a loadout patch matching a deny rule fails the
-/// composition here rather than at the daemon.
+/// [`UserPolicy`] loaded from `user_policy.toml`. Items from trusted
+/// loadouts auto-pass the allow step but the policy's `deny` /
+/// `ignore` rules still apply, so a loadout patch matching a deny rule
+/// fails the composition here rather than at the daemon. Items from
+/// untrusted loadouts must also match `allow`, or be decided by
+/// `prompt` — without one, an undecided item fails the composition.
 ///
 /// The contribution also carries the first-prompt orientation as a
 /// first-class field (never a var): the loadout display list computed
@@ -478,6 +701,7 @@ pub(crate) fn compose_user_contribution(
     policy: boxes::core::policy::UserPolicy,
     options: boxes::core::compose::ComposeOptions,
     hooks_enabled: bool,
+    prompt: Option<&dyn boxes::core::hooks::PolicyHooks>,
 ) -> Result<
     (
         boxes::wire::request::WireContribution,
@@ -511,76 +735,121 @@ pub(crate) fn compose_user_contribution(
     composer
         .add_all(loadouts)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))?;
-    composer
-        .compose(policy, options)
-        .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))
+    match prompt {
+        Some(hooks) => composer.compose_with_hooks(policy, options, hooks),
+        None => composer.compose(policy, options),
+    }
+    .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))
 }
 
 // =========================================================================
 // `minimal loadout list` — enumerate discovered loadouts.
 // =========================================================================
 
-/// Resolve the loadouts directory. Order of precedence:
-/// `--dir` on the subcommand, then `--config-dir` via
-/// [`resolve_minimal_config_dir`], then the platform default.
-fn resolve_loadouts_dir(args: &LoadoutListArgs, global: &GlobalArgs) -> PathBuf {
-    if let Some(dir) = &args.dir {
-        return dir.clone();
-    }
-    resolve_minimal_config_dir(global).join("loadouts")
+/// Resolve the minimal config directory to list loadouts from: `--dir`
+/// on the subcommand, else [`resolve_minimal_config_dir`]
+/// (`--config-dir`, then the platform default). Its
+/// [`LOADOUTS_DIR_NAME`] and [`UNTRUSTED_LOADOUTS_DIR_NAME`]
+/// subdirectories give each loadout its trust, as they do at activation,
+/// and its `config.toml` names the defaults.
+fn resolve_list_config_dir(args: &LoadoutListArgs, global: &GlobalArgs) -> PathBuf {
+    args.dir
+        .clone()
+        .unwrap_or_else(|| resolve_minimal_config_dir(global))
 }
 
-/// List loadouts discovered in the loadouts directory, in both
-/// layouts (`<name>.toml` and `<name>/loadout.toml`). One row per
-/// parseable loadout; ones that fail to load — a parse error, or a
-/// name defined in both layouts at once — are reported on stderr and
-/// make the command exit non-zero, leaving the table of valid
-/// loadouts intact. Loadouts named in
-/// `[loadouts].default_loadouts` in the client config are marked
-/// with a leading `*`.
+/// List loadouts discovered in the minimal config directory's two
+/// loadouts directories — trusted and untrusted — in both layouts
+/// (`<name>.toml` and `<name>/loadout.toml`). One row per parseable loadout, with an
+/// untrusted one tagged `(untrusted)`; ones that fail to load — a parse
+/// error, a name defined in both layouts at once, or a name defined in
+/// both directories — are reported on stderr and make the command exit
+/// non-zero, leaving the table of valid loadouts intact. Loadouts named
+/// in `[loadouts].default_loadouts` in that directory's `config.toml`
+/// are marked with a leading `*`.
 pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    let dir = resolve_loadouts_dir(&args, global);
-    let entries = match boxes::client::disk::list_loadouts(&dir) {
-        Ok(entries) => entries,
-        // A missing directory is the fresh-install case: there are no
-        // user loadouts yet, but the built-in `default` row below still
-        // orients the user. Note where to add their own and continue.
-        Err(boxes::client::disk::ListError::NotFound { path }) => {
-            eprintln!(
-                "No loadouts directory at {} yet — add your own as `<name>.toml` \
-                 there, or as `<name>/loadout.toml` to keep one under version control.",
-                path.display()
-            );
-            Vec::new()
+    let config_dir = resolve_list_config_dir(&args, global);
+    let dirs = [
+        (config_dir.join(LOADOUTS_DIR_NAME), false),
+        (config_dir.join(UNTRUSTED_LOADOUTS_DIR_NAME), true),
+    ];
+    // Each entry paired with whether it came from the untrusted directory.
+    let mut entries: Vec<(boxes::client::disk::LoadoutEntry, bool)> = Vec::new();
+    for (dir, untrusted) in &dirs {
+        match boxes::client::disk::list_loadouts(dir) {
+            Ok(found) => entries.extend(found.into_iter().map(|e| (e, *untrusted))),
+            // The untrusted directory is opt-in: most users never create
+            // it, so its absence is not worth a line.
+            Err(boxes::client::disk::ListError::NotFound { .. }) if *untrusted => {}
+            // A missing trusted directory is the fresh-install case: there
+            // are no user loadouts yet, but the built-in `default` row
+            // below still orients the user. Note where to add their own
+            // and continue.
+            Err(boxes::client::disk::ListError::NotFound { path }) => {
+                eprintln!(
+                    "No loadouts directory at {} yet — add your own as `<name>.toml` \
+                     there, or as `<name>/loadout.toml` to keep one under version control.",
+                    path.display()
+                );
+            }
+            Err(e) => bail!("{e}"),
         }
-        Err(e) => bail!("{e}"),
-    };
+    }
+    // A name in both directories cannot be applied (activation refuses
+    // it), so neither copy gets a row: both are reported as one failure.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (entry, _) in &entries {
+        *seen.entry(entry.name.clone()).or_default() += 1;
+    }
+    let mut both: Vec<String> = seen
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name)
+        .collect();
+    both.sort();
+    for name in &both {
+        let paths: Vec<String> = entries
+            .iter()
+            .filter(|(e, _)| e.name == *name)
+            .map(|(e, _)| format!("  {}", e.path.display()))
+            .collect();
+        eprintln!(
+            "loadout `{name}` is defined in both loadouts directories:\n{}\nremove one.",
+            paths.join("\n")
+        );
+    }
+    let dir_list = dirs
+        .iter()
+        .map(|(d, _)| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" or ");
 
-    // Load `<config>/minimal/config.toml` to discover which
+    // Load the listed directory's `config.toml` to discover which
     // loadouts should be marked as defaults. Missing file → no
     // defaults; malformed file → error out so the user can see it.
-    // Routes through `read_client_config` so this and `cmd_activate`
-    // share one config-loading path.
-    let defaults: std::collections::HashSet<String> = read_client_config(global)?
-        .loadouts
-        .default_loadouts
-        .into_iter()
-        .collect();
+    // Read the way `read_client_config` reads it, but from `--dir`
+    // when given, so the defaults belong to the directory listed.
+    let defaults: std::collections::HashSet<String> =
+        boxes::client::config::read_config_or_default(&config_dir.join("config.toml"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .loadouts
+            .default_loadouts
+            .into_iter()
+            .collect();
 
     // Warn about defaults that don't have a matching file — a
     // silent typo in `default_loadouts` would otherwise be
     // invisible until the user wondered why their loadout wasn't
     // active.
     let present: std::collections::HashSet<&str> =
-        entries.iter().map(|e| e.name.as_str()).collect();
+        entries.iter().map(|(e, _)| e.name.as_str()).collect();
     defaults
         .iter()
         .filter(|missing| !present.contains(missing.as_str()))
         .for_each(|missing| {
             eprintln!(
                 "Warning: `{missing}` listed in default_loadouts but no `{missing}.toml` \
-                 or `{missing}/loadout.toml` in {}",
-                dir.display(),
+                 or `{missing}/loadout.toml` in {dir_list}",
             );
         });
 
@@ -594,10 +863,19 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
     // failures out of the table also preserves the layout their
     // multi-line parse errors would otherwise corrupt.
     let mut rows: Vec<LoadoutRow> = Vec::with_capacity(entries.len());
-    let mut failures = 0usize;
-    for entry in &entries {
+    let mut failures = both.len();
+    // Sorted by name across both directories, as each directory's own
+    // listing already is.
+    entries.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+    for (entry, untrusted) in &entries {
         match &entry.loadout {
-            Ok(loadout) => rows.push(LoadoutRow::from_entry(entry, loadout, &defaults)),
+            // A name in both directories gets no row (reported above), but
+            // a copy that also fails to load on its own is reported too,
+            // below, rather than hidden behind the directory clash.
+            Ok(_) if both.contains(&entry.name) => {}
+            Ok(loadout) => rows.push(LoadoutRow::from_entry(
+                entry, loadout, *untrusted, &defaults,
+            )),
             Err(e) => {
                 // `LoadError`'s Display already names the file, so the
                 // path is not repeated here.
@@ -663,9 +941,12 @@ impl LoadoutRow {
     /// Build a row from a successfully parsed loadout. Parse failures
     /// never reach here — the caller reports them on stderr and keeps
     /// them out of the table (see [`cmd_loadout_list`]).
+    /// An `untrusted` loadout's name column carries an `(untrusted)` tag,
+    /// as the built-in's carries `(built-in)`.
     fn from_entry(
         entry: &boxes::client::disk::LoadoutEntry,
         loadout: &boxes::core::loadout::Loadout,
+        untrusted: bool,
         defaults: &std::collections::HashSet<String>,
     ) -> Self {
         let marker = if defaults.contains(&entry.name) {
@@ -675,7 +956,11 @@ impl LoadoutRow {
         };
         Self {
             marker,
-            name: entry.name.clone(),
+            name: if untrusted {
+                format!("{} (untrusted)", entry.name)
+            } else {
+                entry.name.clone()
+            },
             desc: loadout.description().unwrap_or("").to_string(),
             counts: format!(
                 "{} pkg / {} var / {} patch",
@@ -899,6 +1184,7 @@ on_activate = { type = "inline", value = "echo activated" }
             boxes::core::policy::UserPolicy::empty(),
             boxes::core::compose::ComposeOptions::default(),
             true,
+            None,
         )
         .expect("composition succeeds with the declared hook");
 
@@ -935,19 +1221,76 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             loadouts_dir: stub_loadouts_dir(),
             builtin_default: false,
         };
+        let (contribution, _) = compose_user_contribution(
+            active,
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
+            true,
+            None,
+        )
+        .expect("composing a hook-only loadout");
         // A tempdir with no minimal.toml: the project side contributes
         // nothing, isolating the loadout hook's declared timeout.
         let tmp = tempfile::tempdir().unwrap();
         let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
 
         assert_eq!(
-            activate_hook_budget(&active, root, true),
+            activate_hook_budget(&contribution.lifecycle_hooks, root, true),
             Duration::from_secs(90),
         );
         assert_eq!(
-            activate_hook_budget(&active, root, false),
+            activate_hook_budget(&contribution.lifecycle_hooks, root, false),
             Duration::ZERO,
             "--no-hooks contributes no budget",
+        );
+    }
+
+    /// An untrusted loadout's hook that the user policy ignores is dropped
+    /// by the gate, so its script is never staged — a missing script
+    /// cannot fail the activation — and it adds nothing to the budget.
+    #[test]
+    fn a_hook_the_policy_drops_is_not_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = camino::Utf8Path::from_path(tmp.path())
+            .unwrap()
+            .join("loadouts-untrusted/ci");
+        let loadout: boxes::core::loadout::Loadout = toml::from_str(
+            r#"
+name = "ci"
+
+[[lifecycle_hooks]]
+on_activate = { type = "external", value = "./missing.sh", timeout = 90 }
+"#,
+        )
+        .expect("loadout parses");
+        let active = ActiveLoadouts {
+            loadouts: vec![loadout.untrusted(paths::HostAbsPath::try_new(dir.clone()).unwrap())],
+            loadouts_dir: stub_loadouts_dir(),
+            builtin_default: false,
+        };
+        let policy = boxes::core::policy::UserPolicy::empty()
+            .with_hooks(boxes::core::policy::HooksPolicy::empty().with_ignore([dir.as_str()]));
+        let (contribution, _) = compose_user_contribution(
+            active,
+            policy,
+            boxes::core::compose::ComposeOptions::default(),
+            true,
+            None,
+        )
+        .expect("an ignored hook composes without asking");
+        assert!(contribution.lifecycle_hooks.is_empty());
+
+        let root = paths::HostAbsPath::try_new(
+            camino::Utf8Path::from_path(tmp.path()).unwrap().to_owned(),
+        )
+        .unwrap();
+        let staged =
+            stage_loadout_hook_scripts(&contribution.lifecycle_hooks, &stub_loadouts_dir(), &root)
+                .expect("nothing to stage, so nothing to fail");
+        assert!(staged.is_empty());
+        assert_eq!(
+            activate_hook_budget(&contribution.lifecycle_hooks, root.as_utf8_path(), true),
+            Duration::ZERO,
         );
     }
 
@@ -1033,6 +1376,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             boxes::core::policy::UserPolicy::empty(),
             boxes::core::compose::ComposeOptions::default(),
             true,
+            None,
         )
         .expect("empty composition succeeds");
         assert_eq!(wire.orientation.loadouts_display, "default (built-in)");
@@ -1321,7 +1665,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         // Valid TOML, wrong schema: `packages` is a list → parse failure.
         std::fs::write(loadouts.join("broken.toml"), "packages = 1\n").unwrap();
         let args = LoadoutListArgs {
-            dir: Some(loadouts),
+            dir: Some(tmp.path().to_path_buf()),
         };
         let global = GlobalArgs {
             repo_dir: None,
@@ -1350,7 +1694,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         .unwrap();
         std::fs::write(loadouts.join("fine.toml"), "description = \"ok\"\n").unwrap();
         let args = LoadoutListArgs {
-            dir: Some(loadouts),
+            dir: Some(tmp.path().to_path_buf()),
         };
         let global = GlobalArgs {
             repo_dir: None,
@@ -1388,7 +1732,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         assert!(entries.iter().all(|e| e.loadout.is_ok()));
 
         let args = LoadoutListArgs {
-            dir: Some(loadouts),
+            dir: Some(tmp.path().to_path_buf()),
         };
         let global = GlobalArgs {
             repo_dir: None,
@@ -1430,6 +1774,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
                 boxes::core::policy::UserPolicy::empty(),
                 boxes::core::compose::ComposeOptions::default(),
                 hooks_enabled,
+                None,
             )
             .expect("composing a hook-only loadout");
             contribution.lifecycle_hooks.len()
@@ -1437,5 +1782,391 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
 
         assert_eq!(build(true), 1, "hooks on: the loadout's hook composes in");
         assert_eq!(build(false), 0, "--no-hooks: nothing reaches the wire");
+    }
+
+    /// A `GlobalArgs` reading its config from `dir`.
+    fn global_at(dir: &std::path::Path) -> GlobalArgs {
+        GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(dir.to_path_buf()),
+            provider: None,
+            no_input: false,
+            vm: None,
+        }
+    }
+
+    /// A loadout in `loadouts-untrusted/` resolves by name like any
+    /// other, in either layout, and comes back marked untrusted with its
+    /// own directory — the one the hooks policy matches it by.
+    #[test]
+    fn resolve_active_loadouts_reads_the_untrusted_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let untrusted = tmp.path().join("minimal/loadouts-untrusted");
+        std::fs::create_dir_all(untrusted.join("vc")).unwrap();
+        std::fs::write(untrusted.join("ci.toml"), "packages = [\"helix\"]\n").unwrap();
+        std::fs::write(untrusted.join("vc/loadout.toml"), "").unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        std::fs::write(loadouts.join("dev.toml"), "").unwrap();
+
+        let out = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["dev".into(), "ci".into(), "vc".into()]),
+            &boxes::client::config::Config::default(),
+            &global_at(tmp.path()),
+        )
+        .expect("loadouts in both directories resolve");
+        let trust: Vec<(&str, bool)> = out
+            .loadouts
+            .iter()
+            .map(|l| (l.name().as_ref(), l.is_untrusted()))
+            .collect();
+        assert_eq!(trust, vec![("dev", false), ("ci", true), ("vc", true)]);
+        assert_eq!(out.loadouts[1].packages(), &["helix"]);
+        match out.loadouts[1].source() {
+            boxes::core::source::Source::UntrustedLoadout { dir, .. } => {
+                assert_eq!(dir.as_str(), untrusted.join("ci").to_str().unwrap());
+            }
+            other => panic!("expected an untrusted source, got {other:?}"),
+        }
+    }
+
+    /// One name in both directories is refused, naming both files —
+    /// which copy won would also decide whether the policy gates it.
+    #[test]
+    fn resolve_active_loadouts_refuses_a_name_in_both_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["minimal/loadouts", "minimal/loadouts-untrusted"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("dev.toml"), "").unwrap();
+        }
+        let err = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["dev".into()]),
+            &boxes::client::config::Config::default(),
+            &global_at(tmp.path()),
+        )
+        .expect_err("an ambiguous loadout must error");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("loadouts/dev.toml"), "got: {rendered}");
+        assert!(
+            rendered.contains("loadouts-untrusted/dev.toml"),
+            "got: {rendered}"
+        );
+    }
+
+    /// A missing `--loadout` names both directories it looked in.
+    #[test]
+    fn resolve_active_loadouts_missing_names_both_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["missing".into()]),
+            &boxes::client::config::Config::default(),
+            &global_at(tmp.path()),
+        )
+        .expect_err("a missing --loadout must error");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("minimal/loadouts`"), "got: {rendered}");
+        assert!(
+            rendered.contains("minimal/loadouts-untrusted`"),
+            "got: {rendered}"
+        );
+    }
+
+    /// An untrusted `default` shadows the built-in, as a trusted one does.
+    #[test]
+    fn resolve_active_loadouts_untrusted_default_shadows_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let untrusted = tmp.path().join("minimal/loadouts-untrusted");
+        std::fs::create_dir_all(&untrusted).unwrap();
+        std::fs::write(untrusted.join("default.toml"), "").unwrap();
+        let out = resolve_active_loadouts(
+            LoadoutSelection::Defaults,
+            &boxes::client::config::Config::default(),
+            &global_at(tmp.path()),
+        )
+        .expect("an untrusted default resolves");
+        assert!(!out.builtin_default);
+        assert_eq!(out.loadouts.len(), 1);
+        assert!(out.loadouts[0].is_untrusted());
+    }
+
+    /// An untrusted loadout's hook, on the no-prompt lane, fails the
+    /// composition with the snippet that would allow it — keyed by the
+    /// loadout's own directory — before anything reaches the daemon.
+    #[test]
+    fn gated_compose_no_prompt_refuses_with_a_snippet() {
+        use boxes::core::lifecyclehook::{HookScript, LifecycleHook};
+        use boxes::core::loadout::{Loadout, LoadoutName};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = paths::HostAbsPath::try_new("/cfg/minimal/loadouts-untrusted/ci").unwrap();
+        let loadout = Loadout::new(LoadoutName::try_new("ci").unwrap())
+            .with_lifecycle_hook(
+                LifecycleHook::builder()
+                    .with_on_activate(HookScript::inline("echo hi"))
+                    .build()
+                    .unwrap(),
+            )
+            .untrusted(dir);
+        let active = ActiveLoadouts {
+            loadouts: vec![loadout],
+            loadouts_dir: stub_loadouts_dir(),
+            builtin_default: false,
+        };
+        let policy_path = tmp.path().join("user_policy.toml");
+        let err = compose_user_contribution_gated(
+            active,
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
+            true,
+            PromptLane::NoPrompt,
+            &policy_path,
+        )
+        .expect_err("an unapproved untrusted hook must refuse");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("[hooks]"), "got: {rendered}");
+        assert!(
+            rendered.contains("/cfg/minimal/loadouts-untrusted/ci"),
+            "got: {rendered}"
+        );
+        assert!(!policy_path.exists(), "the no-prompt lane writes nothing");
+    }
+
+    /// An untrusted loadout carrying one inline `on_activate` hook, read
+    /// from `/cfg/minimal/loadouts-untrusted/ci`.
+    fn untrusted_hook_loadouts() -> ActiveLoadouts {
+        use boxes::core::lifecyclehook::{HookScript, LifecycleHook};
+        use boxes::core::loadout::{Loadout, LoadoutName};
+        let loadout = Loadout::new(LoadoutName::try_new("ci").unwrap())
+            .with_lifecycle_hook(
+                LifecycleHook::builder()
+                    .with_on_activate(HookScript::inline("echo hi"))
+                    .build()
+                    .unwrap(),
+            )
+            .untrusted(paths::HostAbsPath::try_new("/cfg/minimal/loadouts-untrusted/ci").unwrap());
+        ActiveLoadouts {
+            loadouts: vec![loadout],
+            loadouts_dir: stub_loadouts_dir(),
+            builtin_default: false,
+        }
+    }
+
+    /// The interactive lane with `answers` scripted in.
+    fn compose_answering(
+        answers: Vec<crate::prompt::UserChoice>,
+        policy_path: &std::path::Path,
+    ) -> Result<
+        (
+            boxes::wire::request::WireContribution,
+            boxes::core::policy::UserPolicy,
+        ),
+        anyhow::Error,
+    > {
+        let hooks = crate::prompt::InteractivePrompt::with_prompter(
+            Box::new(crate::prompt::ScriptedPrompter::new(answers)),
+            true,
+        );
+        compose_interactively(
+            untrusted_hook_loadouts(),
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
+            true,
+            hooks,
+            policy_path,
+        )
+    }
+
+    /// `min dash` refuses an undecided untrusted item even where it could
+    /// prompt, naming itself rather than `--no-prompt`, and writes nothing.
+    #[test]
+    fn dashboard_lane_refuses_undecided_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy_path = tmp.path().join("user_policy.toml");
+        let err = compose_user_contribution_gated(
+            untrusted_hook_loadouts(),
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
+            true,
+            PromptLane::Dashboard,
+            &policy_path,
+        )
+        .expect_err("an undecided untrusted hook must refuse in the dashboard");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("min dash does not ask"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("[hooks]"), "got: {rendered}");
+        assert!(!rendered.contains("--no-prompt"), "got: {rendered}");
+        assert!(!policy_path.exists());
+    }
+
+    /// "Allow permanently" on an untrusted loadout's hook keeps the hook,
+    /// and records the loadout's own directory as a `[hooks]` allow rule —
+    /// in the returned policy and in `user_policy.toml`.
+    #[test]
+    fn interactive_allow_permanent_records_the_loadout_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy_path = tmp.path().join("user_policy.toml");
+        let (contribution, policy) = compose_answering(
+            vec![crate::prompt::UserChoice::AllowPermanent],
+            &policy_path,
+        )
+        .expect("an allowed hook composes");
+        assert_eq!(contribution.lifecycle_hooks.len(), 1);
+        assert_eq!(
+            policy.hooks().allow(),
+            ["/cfg/minimal/loadouts-untrusted/ci"]
+        );
+        let saved = std::fs::read_to_string(&policy_path).expect("the rule was saved");
+        assert!(
+            saved.contains("/cfg/minimal/loadouts-untrusted/ci"),
+            "got: {saved}"
+        );
+    }
+
+    /// "Deny permanently" aborts the composition, and its rule is still
+    /// saved: the user chose to record it whether or not this run fails.
+    #[test]
+    fn interactive_deny_permanent_aborts_and_still_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy_path = tmp.path().join("user_policy.toml");
+        compose_answering(vec![crate::prompt::UserChoice::DenyPermanent], &policy_path)
+            .expect_err("a denied hook aborts the activation");
+        let saved = std::fs::read_to_string(&policy_path).expect("the rule was saved");
+        assert!(saved.contains("deny"), "got: {saved}");
+        assert!(
+            saved.contains("/cfg/minimal/loadouts-untrusted/ci"),
+            "got: {saved}"
+        );
+    }
+
+    /// A once-only answer writes nothing: there is no rule to keep.
+    #[test]
+    fn interactive_allow_once_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy_path = tmp.path().join("user_policy.toml");
+        let (contribution, _) =
+            compose_answering(vec![crate::prompt::UserChoice::AllowOnce], &policy_path)
+                .expect("an allowed hook composes");
+        assert_eq!(contribution.lifecycle_hooks.len(), 1);
+        assert!(!policy_path.exists());
+    }
+
+    /// The same hook from a trusted loadout composes on the no-prompt
+    /// lane: nothing about it needs approval.
+    #[test]
+    fn gated_compose_no_prompt_passes_trusted_loadouts() {
+        use boxes::core::lifecyclehook::{HookScript, LifecycleHook};
+        use boxes::core::loadout::{Loadout, LoadoutName};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap()).with_lifecycle_hook(
+            LifecycleHook::builder()
+                .with_on_activate(HookScript::inline("echo hi"))
+                .build()
+                .unwrap(),
+        );
+        let active = ActiveLoadouts {
+            loadouts: vec![loadout],
+            loadouts_dir: stub_loadouts_dir(),
+            builtin_default: false,
+        };
+        let (contribution, _) = compose_user_contribution_gated(
+            active,
+            boxes::core::policy::UserPolicy::empty(),
+            boxes::core::compose::ComposeOptions::default(),
+            true,
+            PromptLane::NoPrompt,
+            &tmp.path().join("user_policy.toml"),
+        )
+        .expect("a trusted hook needs no approval");
+        assert_eq!(contribution.lifecycle_hooks.len(), 1);
+    }
+
+    /// Without `--dir`, the listing covers both directories; a name in
+    /// both is a failure, while the rest still list.
+    #[test]
+    fn cmd_loadout_list_covers_both_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        let untrusted = tmp.path().join("minimal/loadouts-untrusted");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        std::fs::create_dir_all(&untrusted).unwrap();
+        std::fs::write(loadouts.join("dev.toml"), "").unwrap();
+        std::fs::write(untrusted.join("ci.toml"), "").unwrap();
+        let global = global_at(tmp.path());
+
+        assert!(cmd_loadout_list(LoadoutListArgs { dir: None }, &global).is_ok());
+
+        std::fs::write(untrusted.join("dev.toml"), "").unwrap();
+        let err = cmd_loadout_list(LoadoutListArgs { dir: None }, &global)
+            .expect_err("a name in both directories fails the listing");
+        assert!(err.to_string().contains("1 loadout failed"), "got: {err}");
+    }
+
+    /// `--dir` names a minimal config directory, not a loadouts one: both
+    /// of its loadouts subdirectories are listed, whatever `--config-dir`
+    /// says, and a clash between them is caught there too.
+    #[test]
+    fn cmd_loadout_list_dir_names_the_minimal_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let minimal = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(minimal.join("loadouts")).unwrap();
+        std::fs::create_dir_all(minimal.join("loadouts-untrusted")).unwrap();
+        std::fs::write(minimal.join("loadouts/dev.toml"), "").unwrap();
+        std::fs::write(minimal.join("loadouts-untrusted/dev.toml"), "").unwrap();
+        // `--config-dir` points somewhere with nothing in it, so only
+        // `--dir` can have produced the clash.
+        let global = global_at(&tmp.path().join("unused"));
+
+        let err = cmd_loadout_list(LoadoutListArgs { dir: Some(minimal) }, &global)
+            .expect_err("the clash under --dir fails the listing");
+        assert!(err.to_string().contains("1 loadout failed"), "got: {err}");
+    }
+
+    /// A row from the untrusted directory is tagged `(untrusted)`; one
+    /// from the trusted directory is not.
+    #[test]
+    fn loadout_row_tags_untrusted_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ci.toml"), "").unwrap();
+        let entries = boxes::client::disk::list_loadouts(tmp.path()).unwrap();
+        let entry = &entries[0];
+        let loadout = entry.loadout.as_ref().unwrap();
+        let defaults = std::collections::HashSet::new();
+        assert_eq!(
+            LoadoutRow::from_entry(entry, loadout, true, &defaults).name,
+            "ci (untrusted)"
+        );
+        assert_eq!(
+            LoadoutRow::from_entry(entry, loadout, false, &defaults).name,
+            "ci"
+        );
+    }
+
+    /// A name in both directories whose trusted copy is itself broken
+    /// (both layouts at once) reports both faults: the directory clash
+    /// does not hide the layout clash.
+    #[test]
+    fn cmd_loadout_list_reports_a_broken_copy_of_a_name_in_both_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("loadouts");
+        std::fs::create_dir_all(loadouts.join("dev")).unwrap();
+        std::fs::write(loadouts.join("dev.toml"), "").unwrap();
+        std::fs::write(loadouts.join("dev/loadout.toml"), "").unwrap();
+        let untrusted = tmp.path().join("loadouts-untrusted");
+        std::fs::create_dir_all(&untrusted).unwrap();
+        std::fs::write(untrusted.join("dev.toml"), "").unwrap();
+
+        let err = cmd_loadout_list(
+            LoadoutListArgs {
+                dir: Some(tmp.path().to_path_buf()),
+            },
+            &global_at(&tmp.path().join("unused")),
+        )
+        .expect_err("both faults fail the listing");
+        assert!(err.to_string().contains("2 loadouts failed"), "got: {err}");
     }
 }

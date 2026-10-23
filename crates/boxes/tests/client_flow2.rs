@@ -713,12 +713,11 @@ fn hook_response(source: WireSource) -> ContributionResponse {
 /// A hook tagged as coming from a **package** is denied outright,
 /// without consulting the prompt (`PanicHooks` would fire if it were
 /// consulted). Packages have no legitimate way to declare a hook, so
-/// one appearing here is a bug or a bypass attempt and must not run.
+/// one appearing here is a bug or a bypass attempt; like any denial,
+/// it fails the whole response rather than being skipped.
 #[test]
 fn package_declared_hook_is_denied_without_prompting() {
-    use boxes::wire::policy::WireHookVerdict;
-
-    let (verdict, _) = handle_response(
+    let err = handle_response(
         hook_response(package_source("helix")),
         &[],
         UserPolicy::empty(),
@@ -726,16 +725,16 @@ fn package_declared_hook_is_denied_without_prompting() {
         ComposeOptions::default(),
         &pinned_env(&[]),
     )
-    .unwrap();
-    assert!(verdict.vars.is_empty());
-    assert!(verdict.patches.is_empty());
+    .unwrap_err();
     assert!(
         matches!(
-            verdict.lifecycle_hooks.as_slice(),
-            [WireHookVerdict::Denied { .. }]
+            err,
+            ComposeError::Denied {
+                from: boxes::core::source::Source::Package { .. },
+                ..
+            }
         ),
-        "got: {:?}",
-        verdict.lifecycle_hooks,
+        "got: {err:?}",
     );
 }
 
@@ -783,20 +782,19 @@ fn project_hook_allowed_by_policy_skips_the_prompt() {
     );
 }
 
-/// A `deny` rule refuses the project's hooks without prompting, and
-/// beats an overlapping `allow` — the same emergency-stop precedence
-/// the other two domains use.
+/// A `deny` rule beats a matching `allow`, and a denial fails the
+/// whole response: `ignore` is the "skip it but carry on" rule, `deny`
+/// the emergency stop.
 #[test]
 fn project_hook_denied_by_policy_beats_allow() {
     use boxes::core::policy::HooksPolicy;
-    use boxes::wire::policy::WireHookVerdict;
 
     let policy = UserPolicy::empty().with_hooks(
         HooksPolicy::empty()
             .with_allow(["/repo"])
             .with_deny(["/repo"]),
     );
-    let (verdict, _) = handle_response(
+    let err = handle_response(
         hook_response(project_source()),
         &[],
         policy,
@@ -804,14 +802,16 @@ fn project_hook_denied_by_policy_beats_allow() {
         ComposeOptions::default(),
         &pinned_env(&[]),
     )
-    .unwrap();
+    .unwrap_err();
     assert!(
         matches!(
-            verdict.lifecycle_hooks.as_slice(),
-            [WireHookVerdict::Denied { .. }]
+            err,
+            ComposeError::Denied {
+                from: boxes::core::source::Source::Project { .. },
+                ..
+            }
         ),
-        "got: {:?}",
-        verdict.lifecycle_hooks,
+        "got: {err:?}",
     );
 }
 
@@ -1257,4 +1257,125 @@ fn verdict_patch_id(v: &WirePatchVerdict) -> PendingId {
         | WirePatchVerdict::Denied { id, .. }
         | WirePatchVerdict::Ignored { id, .. } => *id,
     }
+}
+
+// =====================================================================
+// Policy expansion: only the user's own vars
+// =====================================================================
+
+/// A project's literal `HOME` does not move the policy's `~/`: the
+/// `deny` still expands against the real home and denies the project's
+/// patch of the real `~/.ssh`. Were the project's `HOME` honoured, the
+/// rule would expand under `/nonexistent`, miss, and the key would fall
+/// through to the prompt (`PanicHooks` panics if it does).
+#[test]
+fn project_home_cannot_defuse_a_tilde_deny() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = Utf8Path::from_path(tmp.path()).unwrap();
+    fixture_tree(home, [(".ssh/id_ed25519", "secret\n")]);
+
+    let response = ContributionResponse {
+        session_id: session_id(),
+        vars: vec![WirePendingVar {
+            id: PendingId::new(1),
+            name: "HOME".into(),
+            spec: WireVarSpec::Specified {
+                value: "/nonexistent".into(),
+            },
+            source: project_source(),
+            carries_user_data: false,
+        }],
+        patches: vec![WirePendingPatch {
+            id: PendingId::new(2),
+            source_pattern: home.join(".ssh/id_ed25519").to_string(),
+            destination: paths::SandboxRelPath::try_new(".ssh/id_ed25519").unwrap(),
+            description: None,
+            source: project_source(),
+        }],
+        lifecycle_hooks: vec![],
+    };
+    let policy = UserPolicy::empty().with_patches(PatchesPolicy::empty().with_deny(["~/.ssh/**"]));
+
+    let (verdict, _) = handle_response(
+        response,
+        &[],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[("HOME", home.as_str())]),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            verdict.patches.as_slice(),
+            [WirePatchVerdict::Denied { .. }]
+        ),
+        "got: {:?}",
+        verdict.patches,
+    );
+}
+
+/// A hooks-policy pattern naming a var only the project defines fails
+/// to expand rather than expanding to whatever the project chose, so a
+/// project cannot write its own `allow` rule.
+#[test]
+fn project_var_cannot_satisfy_a_hooks_policy_pattern() {
+    use boxes::core::policy::HooksPolicy;
+
+    let mut response = hook_response(project_source());
+    response.vars.push(WirePendingVar {
+        id: PendingId::new(1),
+        name: "PROJECT_DIR".into(),
+        spec: WireVarSpec::Specified {
+            value: "/repo".into(),
+        },
+        source: project_source(),
+        carries_user_data: false,
+    });
+    let policy = UserPolicy::empty().with_hooks(HooksPolicy::empty().with_allow(["$PROJECT_DIR"]));
+
+    let err = handle_response(
+        response,
+        &[],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[]),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ComposeError::Expansion(boxes::core::expansion::ExpandError::UndefinedVar { ref name })
+                if name == "PROJECT_DIR"
+        ),
+        "got: {err:?}",
+    );
+}
+
+/// The user's own loadout vars still expand the policy: the same rule,
+/// with `PROJECT_DIR` declared by a trusted loadout, allows the hook.
+#[test]
+fn trusted_loadout_var_still_expands_a_hooks_policy_pattern() {
+    use boxes::core::policy::HooksPolicy;
+    use boxes::wire::policy::WireHookVerdict;
+
+    let policy = UserPolicy::empty().with_hooks(HooksPolicy::empty().with_allow(["$PROJECT_DIR"]));
+    let (verdict, _) = handle_response(
+        hook_response(project_source()),
+        &[gated_var("PROJECT_DIR", "/repo", "dev")],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[]),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            verdict.lifecycle_hooks.as_slice(),
+            [WireHookVerdict::Approved { .. }]
+        ),
+        "got: {:?}",
+        verdict.lifecycle_hooks,
+    );
 }

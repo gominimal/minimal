@@ -4,10 +4,12 @@
 //! [`UserPolicy`] bundles the per-domain policies — [`VarsPolicy`] for
 //! environment variables and [`PatchesPolicy`] for file patches. Both
 //! gate every declaration regardless of origin; user-origin
-//! declarations from a [`Loadout`] don't need to be explicitly
+//! declarations from a trusted [`Loadout`] don't need to be explicitly
 //! `allow`-listed (they auto-pass that check), but `ignore` and
 //! `deny` apply to them just as they do to project- and
-//! package-origin items.
+//! package-origin items. A loadout from the untrusted loadouts
+//! directory gets no such pass: its declarations are gated exactly
+//! like a project's.
 //!
 //! Kept separate from [`Loadout`] on purpose: the user's policy is
 //! about what they let other sources contribute, not about what *they*
@@ -197,11 +199,12 @@ impl<'de> serde::Deserialize<'de> for VarNameGlobs {
 /// Overlapping deny+ignore rules resolve as denied so a would-be
 /// rejection isn't hidden behind an ignore glob.
 ///
-/// - **User-origin** (variables coming from a [`Loadout`]):
+/// - **User-origin** (variables coming from a trusted [`Loadout`]):
 ///   `deny` rejects, `ignore` drops, otherwise auto-allowed. The
 ///   user doesn't need to `allow`-list their own loadout items.
-/// - **Project- and Package-origin**: `deny` rejects, `ignore` drops,
-///   then `allow` must match or the item prompts.
+/// - **Untrusted-loadout-, Project- and Package-origin**: `deny`
+///   rejects, `ignore` drops, then `allow` must match or the item
+///   prompts.
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -316,8 +319,8 @@ impl VarsPolicy {
     /// resolve as denied. For user-origin items
     /// ([`Source::UserLoadout`]), the allow step auto-passes — the
     /// user doesn't need to allow-list their own loadout entries.
-    /// For every other source, `allow` must match or the item routes
-    /// to `NeedsApproval`.
+    /// For every other source, an untrusted loadout included, `allow`
+    /// must match or the item routes to `NeedsApproval`.
     ///
     /// `item` reports its provenance via [`Provenanced`]; the composer
     /// constructs `T` types that carry their own source, so the caller
@@ -529,8 +532,9 @@ impl PatchesPolicy {
 // HooksPolicy
 // =====================================================================
 
-/// The user's policy for which **projects** may run lifecycle hooks in
-/// their sessions, matched by project root path.
+/// The user's policy for which **projects** and **untrusted loadouts**
+/// may run lifecycle hooks in their sessions, matched by project root
+/// path or by the untrusted loadout's own directory.
 ///
 /// A lifecycle hook is arbitrary code a project asks to execute inside
 /// the session, so unlike vars and patches — where the risk is a
@@ -538,9 +542,12 @@ impl PatchesPolicy {
 /// itself. A project must therefore be allow-listed by path before any
 /// hook it declares will run.
 ///
-/// Only project-declared hooks are gated. A hook from a
-/// [`Loadout`](crate::core::loadout::Loadout) is the user's own file,
-/// already under their control, and passes without a rule. A hook
+/// Only project- and untrusted-loadout-declared hooks are gated. A hook
+/// from a trusted [`Loadout`](crate::core::loadout::Loadout) is the
+/// user's own file, already under their control, and passes without a
+/// rule. A hook from an untrusted loadout is matched by its directory
+/// (`<config>/minimal/loadouts-untrusted/<name>`), exactly as a
+/// project's is matched by its root. A hook
 /// tagged [`Source::Package`] is refused outright: packages have no
 /// legitimate way to contribute one, so its presence means either a bug
 /// or an attempt to smuggle execution past this gate.
@@ -690,6 +697,21 @@ pub struct ExpandedHooksPolicy {
     ignore: Vec<FileSet>,
 }
 
+/// The path the hooks policy matches a hook's source by: a project's
+/// root, or an untrusted loadout's own directory. `None` for a source
+/// the policy decides without a path (a trusted loadout, a package).
+///
+/// The one place a source's hook root is defined, so the policy's
+/// [`ExpandedHooksPolicy::check`] and the gates that group hooks by
+/// root for a single prompt cannot disagree about it.
+pub(crate) fn hook_policy_root(source: &Source) -> Option<camino::Utf8PathBuf> {
+    match source {
+        Source::Project { path } => Some(path.as_utf8_path().to_owned()),
+        Source::UntrustedLoadout { dir, .. } => Some(dir.as_utf8_path().to_owned()),
+        Source::UserLoadout { .. } | Source::Package { .. } => None,
+    }
+}
+
 impl ExpandedHooksPolicy {
     /// Categorize one hook against this policy, by the source that
     /// declared it.
@@ -700,16 +722,24 @@ impl ExpandedHooksPolicy {
     ///   and either way must not execute.
     /// - [`Source::Project`] → matched by project root: `deny`, then
     ///   `ignore`, then `allow`, else a prompt.
+    /// - [`Source::UntrustedLoadout`] → the same, matched by the
+    ///   loadout's own directory.
     ///
     /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
     /// [`Source::Package`]: crate::core::source::Source::Package
     /// [`Source::Project`]: crate::core::source::Source::Project
+    /// [`Source::UntrustedLoadout`]: crate::core::source::Source::UntrustedLoadout
     #[must_use]
     pub fn check<T: Provenanced>(&self, item: T) -> CheckOutcome<T> {
-        let path = match item.source() {
-            Source::UserLoadout { .. } => return CheckOutcome::Decided(Decision::Allowed(item)),
-            Source::Package { .. } => return CheckOutcome::Decided(Decision::Denied(item)),
-            Source::Project { path } => path.as_utf8_path().to_owned(),
+        let Some(path) = hook_policy_root(item.source()) else {
+            // No root to match: decided by the source alone. Only a
+            // trusted loadout passes; anything else without a root is
+            // a package, and is refused.
+            return if matches!(item.source(), Source::UserLoadout { .. }) {
+                CheckOutcome::Decided(Decision::Allowed(item))
+            } else {
+                CheckOutcome::Decided(Decision::Denied(item))
+            };
         };
         if filesets_match(&self.deny, &path) {
             return CheckOutcome::Decided(Decision::Denied(item));
@@ -728,8 +758,8 @@ impl ExpandedHooksPolicy {
 // UserPolicy
 // =====================================================================
 
-/// The user's policy for what projects and packages may contribute to a
-/// session.
+/// The user's policy for what projects, packages, and untrusted
+/// loadouts may contribute to a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UserPolicy {
     #[serde(default, skip_serializing_if = "vars_policy_is_default")]
@@ -883,8 +913,8 @@ impl ExpandedPatchesPolicy {
     /// (silent drop), then the origin-aware allow step. Overlapping
     /// deny+ignore rules resolve as denied. For user-origin items
     /// ([`Source::UserLoadout`]) the allow step auto-passes; for
-    /// every other source `allow` must match or the path routes to
-    /// `NeedsApproval`.
+    /// every other source, an untrusted loadout included, `allow`
+    /// must match or the path routes to `NeedsApproval`.
     ///
     /// **Combination precedence:** `Denied` > `Ignored` >
     /// `NeedsApproval` > `Allowed`. Any deny on either path wins

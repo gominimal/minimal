@@ -734,6 +734,15 @@ bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
 stress n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/stress-session-e2e.sh {{n}}
 
+# Suites under interactive-tests/ need a person at the terminal to answer
+# prompts, so no CI lane runs them. Each builds its own stack (SKIP_BUILD=1
+# reuses the last build) and boots its own daemon under a separate state dir.
+#
+# Run an interactive test suite, e.g. `just interactive-test untrusted-loadouts`.
+[macos]
+interactive-test suite:
+    ./interactive-tests/{{suite}}/run.sh
+
 # ── stack bring-up ───────────────────────────────────────────────────────────
 #
 # `just up` = this host's default run mode; `just down` stops it.

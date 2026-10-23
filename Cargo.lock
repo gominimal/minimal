@@ -8001,7 +8001,7 @@ checksum = "13439d04bb7987de5f937071c8131c995f3d18fcc0df6ce4ab33180a88fbc72c"
 [[package]]
 name = "topiary-tree-sitter-facade"
 version = "0.7.3"
-source = "git+https://github.com/tweag/topiary.git?rev=838c74ab4058f82bc3c6a12380f22c10f22ac814#838c74ab4058f82bc3c6a12380f22c10f22ac814"
+source = "git+https://github.com/topiary/topiary.git?rev=838c74ab4058f82bc3c6a12380f22c10f22ac814#838c74ab4058f82bc3c6a12380f22c10f22ac814"
 dependencies = [
  "js-sys",
  "streaming-iterator",
@@ -8015,7 +8015,7 @@ dependencies = [
 [[package]]
 name = "topiary-web-tree-sitter-sys"
 version = "0.7.3"
-source = "git+https://github.com/tweag/topiary.git?rev=838c74ab4058f82bc3c6a12380f22c10f22ac814#838c74ab4058f82bc3c6a12380f22c10f22ac814"
+source = "git+https://github.com/topiary/topiary.git?rev=838c74ab4058f82bc3c6a12380f22c10f22ac814#838c74ab4058f82bc3c6a12380f22c10f22ac814"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

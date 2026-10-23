@@ -54,11 +54,24 @@ fn find<'a>(files: &'a BTreeMap<String, Vec<u8>>, suffix: &str) -> Option<&'a Ve
 /// A config dir with loadouts holding a canary secret, to prove
 /// redaction. One of each layout — `dev.toml` and `vc/loadout.toml` —
 /// so a directory-layout loadout is proved to be collected *and*
-/// redacted, not quietly skipped.
+/// redacted, not quietly skipped; and the same pair again in
+/// `loadouts-untrusted/` (`ci.toml`, `team/loadout.toml`), which is
+/// collected by the same rules.
 fn fake_config_dir() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().join("minimal");
     std::fs::create_dir_all(root.join("loadouts/vc")).unwrap();
+    std::fs::create_dir_all(root.join("loadouts-untrusted/team")).unwrap();
+    std::fs::write(
+        root.join("loadouts-untrusted/ci.toml"),
+        "packages = [\"just\"]\n\n[vars]\nCI_TOKEN = \"canary-secret-value\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("loadouts-untrusted/team/loadout.toml"),
+        "packages = [\"jq\"]\n\n[vars]\nTEAM_TOKEN = \"canary-secret-value\"\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("config.toml"),
         "[loadouts]\ndefault_loadouts = [\"dev\"]\n",
@@ -375,6 +388,18 @@ async fn planted_secrets_never_reach_the_bundle() {
     .unwrap();
     std::os::unix::fs::symlink(&outside_dir, config.path().join("minimal/loadouts/evildir"))
         .unwrap();
+    // Both attacks again through the untrusted directory, which is
+    // collected by the same code and must refuse them the same way.
+    std::os::unix::fs::symlink(
+        &target,
+        config.path().join("minimal/loadouts-untrusted/evil.toml"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        &outside_dir,
+        config.path().join("minimal/loadouts-untrusted/evildir"),
+    )
+    .unwrap();
 
     let out_dir = tempfile::TempDir::new().unwrap();
     let out = out_dir.path().join("diag.tar.zst");
@@ -419,6 +444,24 @@ async fn planted_secrets_never_reach_the_bundle() {
         vc.contains("<redacted:len=19>"),
         "masked value records its length: {vc}"
     );
+
+    // The untrusted directory is collected beside the trusted one, in
+    // both layouts, under its own name and with the same masking.
+    for (suffix, key) in [
+        ("loadouts-untrusted/ci.toml.redacted", "CI_TOKEN"),
+        (
+            "loadouts-untrusted/team/loadout.toml.redacted",
+            "TEAM_TOKEN",
+        ),
+    ] {
+        let contents = find(&files, suffix).unwrap_or_else(|| panic!("missing {suffix}"));
+        let contents = String::from_utf8_lossy(contents);
+        assert!(contents.contains(key), "keys survive: {contents}");
+        assert!(
+            contents.contains("<redacted:len=19>"),
+            "masked value records its length: {contents}"
+        );
+    }
 
     // The canary value never appears anywhere in the archive.
     for (path, contents) in &files {

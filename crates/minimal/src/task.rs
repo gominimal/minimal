@@ -670,7 +670,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // loadout flags — the config's `default_loadouts` apply. Resolved before
     // the daemon connection so a broken loadout fails loudly client-side.
     let cfg = crate::config::read_client_config(global)?;
-    let initial_policy = user_policy.clone();
     let compose_options = crate::loadouts::compose_options_from_config(&cfg);
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
     let active = crate::loadouts::resolve_active_loadouts(selection, &cfg, global)?;
@@ -678,19 +677,34 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
-    // Same pre-daemon staging as an activate, so a broken hook script
-    // path fails here rather than after the ephemeral session exists.
-    let hook_scripts = crate::loadouts::stage_loadout_hook_scripts(&active, &abs_path, true)?;
-
     // Same first-class orientation field as an activate: a `--keep`
     // task session is attachable later, and its banner should orient
     // too.
+    let loadouts_dir = active.loadouts_dir.clone();
+    let (contribution, user_policy) = crate::loadouts::compose_user_contribution_gated(
+        active,
+        user_policy,
+        compose_options,
+        true,
+        crate::loadouts::PromptLane::for_run(global.no_input),
+        &policy_path,
+    )?;
+    // Same pre-daemon staging as an activate, so a broken hook script
+    // path fails here rather than after the ephemeral session exists.
+    // Staged after the gate, so a hook it dropped is neither read nor
+    // uploaded.
+    let hook_scripts = crate::loadouts::stage_loadout_hook_scripts(
+        &contribution.lifecycle_hooks,
+        &loadouts_dir,
+        &abs_path,
+    )?;
     // Size the later `FinalizeSession` deadline to the composition's
-    // `on_activate` hook timeouts, read while the loadouts are still in hand.
-    let finalize_hook_budget = crate::loadouts::activate_hook_budget(&active, &utf8_path, true);
-
-    let (contribution, user_policy) =
-        crate::loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
+    // `on_activate` hook timeouts.
+    let finalize_hook_budget =
+        crate::loadouts::activate_hook_budget(&contribution.lifecycle_hooks, &utf8_path, true);
+    // Taken after the loadout gate, which saves its own changes, so the
+    // daemon-response gate below saves only what it adds.
+    let initial_policy = user_policy.clone();
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
@@ -798,7 +812,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             contribution,
         })
         .await
-        .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
+        .map_err(|error| {
+            minimal_client::explain_configure_loadout_error(crate::session_rpc_failed(
+                crate::SessionRpc::ConfigureLoadout,
+                error,
+            ))
+        })?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
         // Same failure, same wording as an activate: the user knows the

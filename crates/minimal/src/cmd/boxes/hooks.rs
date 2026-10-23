@@ -5,6 +5,7 @@ pub(crate) fn render_hook_source(source: &boxes::wire::primitives::WireSource) -
     use boxes::wire::primitives::WireSource;
     match source {
         WireSource::UserLoadout { name } => format!("loadout {name}"),
+        WireSource::UntrustedLoadout { name, .. } => format!("untrusted loadout {name}"),
         WireSource::Project { path } => format!("project {path}"),
         WireSource::Package { name } => format!("package {name}"),
     }

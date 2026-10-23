@@ -1,0 +1,4 @@
+description = "Untrusted: literal var only; gated by name, prompt shows its value"
+
+[vars]
+UT_LITERAL = "hello-from-ut-literal"

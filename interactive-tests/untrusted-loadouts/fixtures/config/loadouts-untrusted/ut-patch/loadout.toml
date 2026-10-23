@@ -1,0 +1,4 @@
+description = "Untrusted: one patch from its own directory; gated by the patch prompt"
+patches = [
+  { dest = "ut-greeting.txt", source = "$LOADOUT_ROOT/files/greeting.txt" },
+]

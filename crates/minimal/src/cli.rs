@@ -468,8 +468,10 @@ pub enum LoadoutCommand {
 
 #[derive(Debug, Args)]
 pub struct LoadoutListArgs {
-    /// Override the loadouts directory (default:
-    /// `<config>/minimal/loadouts` per platform, e.g. `~/.config/minimal/loadouts` on Linux)
+    /// The minimal config directory to list from (default:
+    /// `<config>/minimal` per platform, e.g. `~/.config/minimal` on Linux).
+    /// Its `loadouts/` and `loadouts-untrusted/` subdirectories are listed,
+    /// and its `config.toml` names the defaults
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }
@@ -777,8 +779,9 @@ pub struct ActivateArgs {
     /// `--network own_ip`.
     #[arg(long)]
     pub credentialed_upstream: bool,
-    /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
-    /// Repeatable. If any `--loadout` is specified, defaults from
+    /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`
+    /// (or `loadouts-untrusted/`, gated by the user policy). Repeatable.
+    /// If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
     #[arg(long = "loadout", value_name = "NAME")]
     pub loadout: Vec<String>,

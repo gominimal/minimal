@@ -909,7 +909,6 @@ pub(crate) async fn activate_box(
             let cfg = config::read_client_config(global)?;
             let policy_path = config::user_policy_path(global);
             let user_policy = config::read_user_policy(global)?;
-            let initial_policy = user_policy.clone();
             let compose_options = loadouts::compose_options_from_config(&cfg);
             let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
             let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
@@ -939,34 +938,52 @@ pub(crate) async fn activate_box(
             // from it in the launcher baseline). The banner's other dynamic
             // clause — blueprint presence — is a session-filesystem fact,
             // tested by the templates in-shell when they print.
-            // Resolve the loadouts' external hook scripts before anything
-            // touches the daemon: a mistyped path, a symlinked script, or a
-            // missing loadout script directory should fail here, on this
-            // machine, rather than after a session exists on the daemon.
-            let hook_scripts =
-                loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
-
-            // Same idea for the *project's* hooks, which the daemon composes from
-            // the uploaded mfile and which therefore never pass through the
-            // staging above. Nothing here is uploaded — the project tree carries
-            // its own scripts — but the checks a staging pass would have made are
+            // The *project's* hooks are composed by the daemon from the
+            // uploaded mfile, so they never pass through the loadout staging
+            // below. Nothing here is uploaded — the project tree carries its
+            // own scripts — but the checks a staging pass would have made are
             // still worth making on this machine, before a session exists.
             if !args.no_hooks {
                 loadouts::check_project_hooks(&abs_path)?;
             }
 
-            // The daemon runs the composition's `on_activate` hooks inside
-            // `FinalizeSession`; size that call's deadline to their summed declared
-            // timeouts, computed here while the loadouts are still in hand.
-            let finalize_hook_budget =
-                loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
-
-            let (contribution, user_policy) = loadouts::compose_user_contribution(
+            // Untrusted loadouts are gated here, before the daemon is
+            // contacted: an item the policy can't decide prompts (or,
+            // headless, fails with the snippet), and any rule chosen at the
+            // prompt is saved now.
+            let loadouts_dir = active.loadouts_dir.clone();
+            let (contribution, user_policy) = loadouts::compose_user_contribution_gated(
                 active,
                 user_policy,
                 compose_options,
                 !args.no_hooks,
+                loadouts::PromptLane::for_run(args.no_prompt || global.no_input),
+                &policy_path,
             )?;
+
+            // Resolve the composed loadout hooks' external scripts before
+            // anything touches the daemon: a mistyped path, a symlinked
+            // script, or a missing loadout script directory should fail
+            // here, on this machine, rather than after a session exists on
+            // the daemon. Staged after the gate, so a hook it dropped is
+            // neither read nor uploaded.
+            let hook_scripts = loadouts::stage_loadout_hook_scripts(
+                &contribution.lifecycle_hooks,
+                &loadouts_dir,
+                &abs_path,
+            )?;
+
+            // The daemon runs the composition's `on_activate` hooks inside
+            // `FinalizeSession`; size that call's deadline to their summed
+            // declared timeouts.
+            let finalize_hook_budget = loadouts::activate_hook_budget(
+                &contribution.lifecycle_hooks,
+                &utf8_path,
+                !args.no_hooks,
+            );
+            // Taken after the loadout gate, which saves its own changes, so
+            // the daemon-response gate saves only what it adds.
+            let initial_policy = user_policy.clone();
             Ok::<_, anyhow::Error>((
                 policy_path,
                 initial_policy,
@@ -1752,9 +1769,8 @@ pub(crate) async fn activate_box(
                             .and_then(|registration| registration.box_id),
                     )
                     .await;
-                    return Err(session_rpc_failed(
-                        crate::SessionRpc::ConfigureLoadout,
-                        error,
+                    return Err(minimal_client::explain_configure_loadout_error(
+                        session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error),
                     ));
                 }
                 Ok(configured) => configured,
