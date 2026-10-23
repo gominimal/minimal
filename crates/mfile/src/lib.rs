@@ -1192,7 +1192,10 @@ impl File {
     /// fails the edit, so a stuck holder cannot block it forever. An edit
     /// made inside a session VM does not exclude one made on the host. The
     /// rename keeps the file's mode, but not its owner, ACLs or extended
-    /// attributes.
+    /// attributes: restoring the owner needs a `chown` the caller is usually
+    /// not privileged for, and ACLs and xattrs have no portable Rust API, so
+    /// the replacement is documented as dropping them rather than half-keeping
+    /// them per platform (review on PR #2302, lib.rs:1249).
     ///
     /// The `edit` closure receives the current content (`None` if the
     /// file does not exist yet) and returns `Ok(Some(new))` to write,
@@ -1308,6 +1311,14 @@ impl File {
                 {
                     return Err(Error::IO("setting permissions", path.to_path_buf(), e).into());
                 }
+                // Replacing by rename needs only write access to the parent
+                // directory, so a read-only minimal.toml no longer fails the
+                // edit the way std::fs::write did. A writability probe here
+                // could not restore the old error faithfully — it would also
+                // reject an edit a user runs through sudo, and the fix belongs
+                // with the atomic write as a whole — so it is deferred with
+                // the maintainer's sign-off on PR #2302 (lib.rs:1306), not
+                // patched in isolation.
                 match tmp.persist(path) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(Error::IO("replacing", path.to_path_buf(), e.error).into()),
