@@ -603,6 +603,10 @@ impl<B: FetchBackend> RemoteCache<B> {
                     // The same class of failure artifact downloads already
                     // survive: report it in terms of what was fetched, not
                     // the raw transport error.
+                    tracing::warn!(
+                        "fetching {} failed after {attempt} attempts: {e}",
+                        source.object()
+                    );
                     let status = match &e {
                         Error::Fetch { status } => Some(*status),
                         _ => None,
