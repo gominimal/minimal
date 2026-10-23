@@ -1407,6 +1407,29 @@ const BEP_BIN_ENV: &str = "MINVMD_BEP_BIN";
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_LOG_FILE: &str = "bep.log";
 
+/// The size past which a start moves the proxy's log aside, to
+/// [`BEP_LOG_FILE`] with `.old` added, before it opens a fresh one. The log
+/// is appended across boots, so without a cap a long-lived host fills its
+/// state dir. Each start keeps at most this much from earlier boots twice.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const BEP_LOG_CAP: u64 = 8 * 1024 * 1024;
+
+/// Moves `log` aside to `<log>.old` when it is larger than `cap`, replacing
+/// an older `.old`. A log at or under the cap, or no log, stays as it is.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn cap_bep_log(log: &std::path::Path, cap: u64) -> std::io::Result<()> {
+    match std::fs::metadata(log) {
+        Ok(meta) if meta.len() > cap => {
+            let mut old = log.as_os_str().to_owned();
+            old.push(".old");
+            std::fs::rename(log, old)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// How often the proxy's watcher looks for an exit or a stop.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1459,6 +1482,9 @@ impl BepProxy {
         // replaces a stale one, so only a socket that is not this one is
         // the new proxy's.
         let stale = socket_identity(listener);
+        if let Err(error) = cap_bep_log(log, BEP_LOG_CAP) {
+            tracing::warn!(log = %log.display(), %error, "could not move the full proxy log aside");
+        }
         let out = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -4562,6 +4588,37 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         drop(proxy);
+    }
+
+    /// The proxy's log, appended across boots, moves aside to `bep.log.old`
+    /// at a start once it passes its cap, so it cannot fill the state dir.
+    #[test]
+    fn proxy_is_started_with_the_per_boot_token_and_a_full_log_moves_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join(super::BEP_LOG_FILE);
+        let old = dir.path().join(format!("{}.old", super::BEP_LOG_FILE));
+
+        super::cap_bep_log(&log, 4).expect("no log is not an error");
+        assert!(!log.exists() && !old.exists());
+
+        std::fs::write(&log, b"1234").unwrap();
+        super::cap_bep_log(&log, 4).unwrap();
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            b"1234",
+            "a log at the cap stays"
+        );
+        assert!(!old.exists());
+
+        std::fs::write(&old, b"older").unwrap();
+        std::fs::write(&log, b"12345").unwrap();
+        super::cap_bep_log(&log, 4).unwrap();
+        assert!(!log.exists(), "a log past the cap moves aside");
+        assert_eq!(
+            std::fs::read(&old).unwrap(),
+            b"12345",
+            "and replaces the older copy"
+        );
     }
 
     /// A watcher thread that cannot start leaves no proxy running with the

@@ -853,7 +853,8 @@ providers/<name>/boot.log
 providers/<name>/bep.log
   source     the Box Egress Proxy's stdout and stderr, written by the VM host
              daemon that starts it beside gvproxy
-  retention  appended across boots
+  retention  appended across boots. A start moves a log past 8 MiB to
+             bep.log.old, and the bundle does not collect bep.log.old.
   format     human-readable tracing output
 
 bep/audit/audit-<n>.jsonl
