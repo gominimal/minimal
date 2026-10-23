@@ -1434,8 +1434,7 @@ mod tests {
 
         let files = unpack(&out, "r").await;
         assert_eq!(
-            files["providers/local-minvmd0/bep.log"],
-            b"bep serving\n",
+            files["providers/local-minvmd0/bep.log"], b"bep serving\n",
             "the proxy's log sits beside the VM host daemon's"
         );
         assert!(files.contains_key("providers/local-minvmd0/run.log"));
@@ -1473,10 +1472,8 @@ mod tests {
             serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         let skipped = manifest["skipped"].as_array().unwrap();
         assert!(
-            skipped
-                .iter()
-                .any(|s| s["what"] == "bep/audit/"
-                    && s["reason"].as_str().unwrap().starts_with("absent")),
+            skipped.iter().any(|s| s["what"] == "bep/audit/"
+                && s["reason"].as_str().unwrap().starts_with("absent")),
             "{skipped:?}"
         );
     }
