@@ -66,8 +66,11 @@ PY
 )" || exit $?
 [ -n "$date" ] || date="$(date -u +%Y-%m-%d)"
 # [[ =~ ]] anchors the whole string; grep -x would pass one good line of many.
-if ! [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-    echo "publish-snapshot: refusing date '$date'; want YYYY-MM-DD" >&2
+# The shape check comes first so only digits and dashes reach Python, which
+# then refuses a date that is not on the calendar (prune.py would skip it).
+if ! [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+    || ! python3 -c 'import datetime, sys; datetime.date.fromisoformat(sys.argv[1])' "$date" 2>/dev/null; then
+    echo "publish-snapshot: refusing date '$date'; want a real YYYY-MM-DD date" >&2
     exit 2
 fi
 name="$date-$sha7.json"

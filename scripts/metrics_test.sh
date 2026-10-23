@@ -897,7 +897,7 @@ PY
     [ "$status" -eq 2 ] && ok "a dirty flag that is not the boolean false is refused" || bad "string dirty exit $status"
     local bad_date
     for bad_date in '../2026-10-16' '2026-10-16/x' '2026-10-16
-x'; do
+x' '2026-02-30' '2026-13-01'; do
         status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-snap.json" --date "$bad_date" >/dev/null 2>&1) || status=$?
         [ "$status" -eq 2 ] && ok "a date of $(printf '%q' "$bad_date") is refused" || bad "date $(printf '%q' "$bad_date") exit $status"
     done
@@ -912,13 +912,13 @@ nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the s
     local budget
     budget="$(awk '/^  metrics:$/{p=1} p && /timeout-minutes:/{print $2; exit}' "$wf")"
     [ "$budget" = "120" ] && ok "the metrics job declares timeout-minutes 120" || bad "metrics job timeout: '$budget'"
-    awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'continue-on-error: true' && ok "the job is non-blocking" || bad "metrics job blocks"
-    awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'publish-snapshot.sh' && ok "the job publishes through the script" || bad "no publish step"
-    # The collector runs untrusted code, so the write token lives only in
-    # `publish`, which runs on main alone.
     local collector publisher
     collector="$(awk '/^  metrics:$/{p=1} /^  publish:$/{p=0} p' "$wf")"
     publisher="$(awk '/^  publish:$/{p=1} p' "$wf")"
+    printf '%s\n' "$collector" | grep -q 'continue-on-error: true' && ok "the job is non-blocking" || bad "metrics job blocks"
+    awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'publish-snapshot.sh' && ok "the job publishes through the script" || bad "no publish step"
+    # The collector runs untrusted code, so the write token lives only in
+    # `publish`, which runs on main alone.
     ! printf '%s\n' "$collector" | grep -q 'contents: write' && ! printf '%s\n' "$collector" | grep -q 'persist-credentials: true' \
         && ok "the collector job holds no write token and persists none" || bad "the collector job can write"
     printf '%s\n' "$publisher" | grep -q 'contents: write' && printf '%s\n' "$publisher" | grep -q "github.ref == 'refs/heads/main'" \
