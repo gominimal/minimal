@@ -5,7 +5,7 @@ owner: bryan-minimal
 epic: gominimal/inbox#721
 arch: https://github.com/gominimal/arch/blob/3dab1097cda11652ad24282969ed8dfe61d0d497/architecture.md
 arch_sha: "3dab1097cda11652ad24282969ed8dfe61d0d497"
-updated: 2026-10-19
+updated: 2026-10-23
 ---
 
 # PKV — Package verification — `min pkg verify`, fail-closed pulls, and a Sigstore bundle on every artifact
@@ -44,7 +44,7 @@ The epic's stretch story, timestamp and transparency layers over the KMS envelop
 
 ## Requirements
 
-Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure message is `<check>: <detail>`. A bundle's *signing time* is its RFC 3161 timestamp (Rekor v2 issues no signed entry timestamp, so a v2 bundle without one fails the `index` or `artifact bundle` check); an envelope's *build time* is the statement's `runDetails.metadata.finishedOn`, which the same key signs, so the KMS plane's window check is self-asserted until an external timestamp covers the envelope (gominimal/build-servers#95). The *verify error class* is the failure that `min pkg verify` reports with exit 6, carried unchanged into a run's output when the fetch path raises it.
+Checks are named `index`, `artifact`, `provenance`, `artifact bundle`, `sbom` and `build-log`; a failure message is `<check>: <detail>`. The *required checks* of a verification are `index`, `artifact` and `provenance`, plus `artifact bundle` where PKV-016's policy requires it, plus `sbom` or `build-log` for the payload command that prints that document (PKV-011); every other check is optional. A bundle's *signing time* is its RFC 3161 timestamp (Rekor v2 issues no signed entry timestamp, so a v2 bundle without one fails the `index` or `artifact bundle` check); an envelope's *build time* is the statement's `runDetails.metadata.finishedOn`, which the same key signs, so the KMS plane's window check is self-asserted until an external timestamp covers the envelope (gominimal/build-servers#95). The *verify error class* is the failure that `min pkg verify` reports with exit 6, carried unchanged into a run's output when the fetch path raises it.
 
 - **PKV-001** WHEN `min pkg verify <pkg>[@<ver>]` resolves a registry pin THE SYSTEM SHALL fetch that commit's Cache Index and its Sigstore bundle and verify the bundle's signature over the index hash, the certificate's SAN and OIDC issuer against a trust-root identity valid at the bundle's signing time, the Rekor inclusion proof against the Rekor log key, and the freshness of the Sigstore trust root those keys come from (PKV-021), before any index entry is read.
   tier:     T1
@@ -64,7 +64,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
     tier:   T1
     verify: cargo nextest run -p rcache verified_index_reads_closure_never_fallback
     property: verification_on ∧ read(index) ⇒ source(index) = closure(commit)
-  - WHEN the resolved index is a union of the upstream closure and sideload closures THE SYSTEM SHALL verify each link's bundle against that link's trust root (`--trusted-root` per source, the vendored root for the upstream) before its entries are read (on the pull path, the source's trust root is the one PKV-018 configures for it), and SHALL mark every entry from a link without a verified bundle `unverified`; `min pkg verify` reports an `unverified` entry as `index: source not verified` and PKV-018 refuses artifacts resolved from it.
+  - WHEN the resolved index is a union of the upstream closure and sideload closures THE SYSTEM SHALL verify each link's bundle against that link's trust root (`--trusted-root` per source, the vendored root for the upstream) before its entries are read (on the pull path, the source's trust root is the one PKV-018 configures for it), and SHALL mark every entry from a link without a verified bundle `source-unverified`, a state distinct from PKV-018's `unverified` (an entry from a source whose verification is off); `min pkg verify` reports a `source-unverified` entry as `index: source not verified`, and PKV-018 refuses artifacts resolved from it. An entry from a sideload link whose source has verification off is not `source-unverified`: that source's switch is off, so PKV-018's disabled-source rule applies to it (the hash check alone, the artifact marked `unverified`).
     tier:   T1
     verify: cargo nextest run -p rcache sideload_entries_verified_per_source_or_marked
     property: index_verified(pin(a)) ⇔ verified(bundle(source(entry(a))), root(source(entry(a))))
@@ -129,7 +129,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   tier:     T0
   verify:   cargo nextest run -p verify live_corpus_round_trip
 
-- **PKV-011** WHEN `--verify` is given to `min pkg provenance <pkg>` THE SYSTEM SHALL run every check PKV-012 requires, the artifact bundle under PKV-016's policy included, and print the decoded statement to stdout only after every required check passes; without `--verify` THE SYSTEM SHALL print the payload to stdout and one line to stderr stating it is unverified, so that stdout is the payload alone in both modes and with `-o json` the notice is not part of the document.
+- **PKV-011** WHEN `--verify` is given to `min pkg provenance <pkg>` THE SYSTEM SHALL run the required checks (the Requirements preamble: `index`, `artifact`, `provenance`, and `artifact bundle` under PKV-016's policy) and print the decoded statement to stdout only after every required check passes; without `--verify` THE SYSTEM SHALL print the payload to stdout and one line to stderr stating it is unverified, so that stdout is the payload alone in both modes and with `-o json` the notice is not part of the document.
   tier:     T0
   verify:   cargo nextest run -p minimal pkg_payload_commands_verify_before_print
   - IF a required check fails THEN THE SYSTEM SHALL print nothing of the payload and exit 6.
@@ -159,7 +159,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   tier:     T0
   verify:   cargo nextest run -p verify vendored_root_append_only_and_version_monotonic
 
-- **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root, verify its meta-key signature, refuse a root whose version is lower than the vendored one or than the highest version it has previously accepted (a persistent high-water mark, advanced only after a fetched root verified), refuse a root whose version equals an accepted version, the vendored one included, but whose bytes differ from the ones accepted at that version (one version is one content digest; the mark records the digest with the version, and starts at the vendored root's), and cache it; the vendored root SHALL remain the floor, so a replayed older root can neither reopen a closed signer nor undo a tightened plane. The production URL and the meta-key's custody wait on gominimal/arch#91 (Open questions); the behaviour is tested against a fixture URL and a test meta-key.
+- **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root in the Box Host daemon (the one process that fetches it and advances the mark below), verify its meta-key signature, refuse a root whose version is lower than the vendored one or than the highest version it has previously accepted (a persistent high-water mark, advanced only after a fetched root verified), refuse a root whose version equals an accepted version, the vendored one included, but whose bytes differ from the ones accepted at that version (one version is one content digest; the mark records the digest with the version, and starts at the vendored root's), and cache it; the vendored root SHALL remain the floor, so a replayed older root can neither reopen a closed signer nor undo a tightened plane. The production URL and the meta-key's custody wait on gominimal/arch#91 (Open questions); the behaviour is tested against a fixture URL and a test meta-key.
   tier:     T1
   verify:   cargo nextest run -p verify wellknown_root_fetch_verify_version_floor
   property: accept(root_fetched) ⇒ version(root_fetched) ≥ max(version(root_vendored), high_water) ∧ (version(root_fetched) = version(root_vendored) ⇒ digest(root_fetched) = digest(root_vendored)) ∧ (version(root_fetched) = high_water ⇒ digest(root_fetched) = high_water_digest) ∧ (high_water', high_water_digest') = (version(root_fetched), digest(root_fetched))
@@ -167,6 +167,9 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - THE SYSTEM SHALL keep the high-water mark in the Box Host's state directory (`<state>/trust-root/high-water.json`: version, digest, the time the root was accepted), written by the daemon alone with mode 0600 under the daemon's user, and no `min` caller or box can write it; a missing mark starts at the vendored root's version and digest, and a mark that does not parse or whose digest is not of the length the format gives is read as corrupt: THE SYSTEM SHALL exit 6 with `trust root: high-water mark unreadable` naming the file and the remediation (remove it to start again at the vendored root), never reset it on its own. A party that can write that directory holds the daemon's user, and with it the daemon's binary; the mark adds no trust beyond that user, and claims none.
     tier:   T0
     verify: cargo nextest run -p verify high_water_mark_missing_starts_at_vendored_corrupt_fails_closed
+  - WHEN `min pkg verify` runs with a Box Host daemon reachable THE SYSTEM SHALL take the trust root from the daemon (the root it last accepted under the mark, through an RPC that returns the root and its version), and SHALL neither fetch the published root nor read or write the mark itself; WHEN no daemon is reachable THE SYSTEM SHALL use the vendored root alone and report `trust root: vendored (no daemon)` as `detail` on the `index` check. A CLI run therefore never accepts a fetched root the mark has not seen, so a replayed older root cannot reopen a closed signer on that path either.
+    tier:   T0
+    verify: cargo nextest run -p minimal pkg_verify_takes_the_root_from_the_daemon_or_vendored
 - **PKV-016** WHEN the producer publishes a Sigstore bundle for the artifact's provenance statement THE SYSTEM SHALL verify it with the same four checks as the index bundle, bind its subject digest to the locally recomputed tarball hash, and report it as `artifact bundle`; WHILE the trust root marks that plane optional THE SYSTEM SHALL report an absent bundle as `absent`, and WHERE `--require-bundle` is given or the plane is marked required THE SYSTEM SHALL treat absence as `fail`.
   tier:     T1
   verify:   cargo nextest run -p verify artifact_bundle_verified_when_present_absent_policy
@@ -190,7 +193,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - THE SYSTEM SHALL cache the index-bundle result per registry pin only while the Sigstore trust-root metadata it was verified under is unexpired (PKV-021), re-running the index check at the next materialization after that, and SHALL not cache per-artifact results. The Box Host is long-lived, so a cache bounded by its lifetime would freeze a freshness verdict past the metadata's expiry.
     tier:   T0
     verify: cargo nextest run -p rcache materialize_caches_index_result_not_artifact_results
-  - IF verification is disabled for a source THEN THE SYSTEM SHALL check only the hash against the index for artifacts from that source, as today, and SHALL mark them `unverified`; verification of every other source is unchanged.
+  - IF verification is disabled for a source THEN THE SYSTEM SHALL check only the hash against the index for artifacts from that source, as today, and SHALL mark them `unverified` (accepted on the hash; distinct from `source-unverified`, which PKV-001 refuses); verification of every other source is unchanged.
     tier:   T0
     verify: cargo nextest run -p rcache materialize_disabled_source_checks_hash_only
   - THE SYSTEM SHALL read each source's switch and trust root from the Box Host's configuration, beside the source's location, so the switch's owner is whoever administers that Box Host; a `min` caller SHALL NOT turn verification off on a Box Host it does not administer, and `--trusted-root` on `min pkg verify` never changes the pull path.
