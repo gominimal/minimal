@@ -927,9 +927,12 @@ pub(crate) fn install_root_certificate(rootfs: &Path, pem: &str) -> std::io::Res
             "the Box Egress Proxy's root certificate is not a valid certificate",
         )
     };
-    let der = certificate_der(pem).ok_or_else(unusable)?;
+    // Only the one certificate block reaches the store: text around it,
+    // or a second block, would add trust the checks below never read.
+    let block = certificate_block(pem).ok_or_else(unusable)?;
+    let der = certificate_der(block).ok_or_else(unusable)?;
     let hash = trust_store::subject_hash(&der).ok_or_else(unusable)?;
-    let mut text = pem.trim().to_string();
+    let mut text = block.to_string();
     text.push('\n');
 
     let dir = resolve_in_rootfs(rootfs, Path::new(BOX_CA_DIR), true)?
@@ -1071,6 +1074,20 @@ fn resolve_in_rootfs(
         }
     }
     Ok(Some(current))
+}
+
+/// The text of the one certificate block in `pem`, from its `BEGIN` line
+/// through its `END` line, or `None` when `pem` holds no block or more
+/// than one.
+fn certificate_block(pem: &str) -> Option<&str> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if pem.matches(BEGIN).count() != 1 {
+        return None;
+    }
+    let start = pem.find(BEGIN)?;
+    let end = start + pem[start..].find(END)? + END.len();
+    Some(&pem[start..end])
 }
 
 /// The DER bytes of the first certificate in `pem`, or `None` when `pem`
@@ -4911,5 +4928,33 @@ VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAdxfdz9bZjCvywfPZdGrNy
         let error = install_root_certificate(rootfs.path(), "garbage").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!rootfs.path().join("etc/ssl/certs").exists());
+    }
+
+    /// BEP-011: a PEM with a second certificate block is refused, so no
+    /// trust anchor beyond the proxy's root reaches the box.
+    #[test]
+    fn root_certificate_with_two_blocks_is_refused() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let two = format!("{ROOT_FIXTURE}{ROOT_FIXTURE_MIXED}");
+        let error = install_root_certificate(rootfs.path(), &two).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!rootfs.path().join("etc/ssl/certs").exists());
+    }
+
+    /// BEP-011: text around the one block never reaches the store.
+    #[test]
+    fn root_certificate_text_outside_the_block_is_dropped() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let pem = format!("note before\n{ROOT_FIXTURE}trailing text\n");
+        install_root_certificate(rootfs.path(), &pem).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                rootfs
+                    .path()
+                    .join("etc/ssl/certs/minimal-box-egress-proxy-root.pem")
+            )
+            .unwrap(),
+            ROOT_FIXTURE
+        );
     }
 }
