@@ -853,11 +853,13 @@ publish_targets_history_ref_only() {   # QM-014: the publish script pushes to th
     git -C "$repo" add -A && git -C "$repo" commit -q -m "main" && git -C "$repo" branch -M main
     git -C "$repo" remote add origin "$remote" && git -C "$repo" push -q origin main
     local main_before; main_before="$(git -C "$remote" rev-parse main)"
-    # A full, clean snapshot out of the fixture set, sha7 and date fixed.
-    python3 - "$data/history" "$tmp/pub-snap.json" <<'PY'
+    # A full, clean snapshot out of the fixture set, of the checkout's own
+    # commit, date fixed.
+    local head7; head7="$(git -C "$repo" rev-parse HEAD | cut -c1-7)"
+    python3 - "$data/history" "$tmp/pub-snap.json" "$head7" <<'PY'
 import json, sys, glob
 s = json.load(open(sorted(glob.glob(sys.argv[1] + "/*.json"))[-1]))
-s["run"]["mode"] = "full"; s["git"]["dirty"] = False; s["git"]["sha7"] = "abc1234"
+s["run"]["mode"] = "full"; s["git"]["dirty"] = False; s["git"]["sha7"] = sys.argv[3]
 json.dump(s, open(sys.argv[2], "w"))
 PY
     local status=0
@@ -866,7 +868,7 @@ PY
     git -C "$remote" rev-parse --verify -q refs/heads/metrics-data >/dev/null && ok "metrics-data exists on the remote" || bad "no metrics-data on the remote"
     [ "$(git -C "$remote" rev-parse main)" = "$main_before" ] && ok "main on the remote is untouched" || bad "main moved"
     [ "$(git -C "$remote" rev-list --count metrics-data)" = "1" ] && ok "the data branch is an orphan with one commit" || bad "data branch history: $(git -C "$remote" rev-list --count metrics-data)"
-    git -C "$remote" ls-tree --name-only -r metrics-data | grep -q '^history/2026-10-14-abc1234.json$' && ok "the snapshot is named by date and sha7 under history/" || bad "tree: $(git -C "$remote" ls-tree --name-only -r metrics-data)"
+    git -C "$remote" ls-tree --name-only -r metrics-data | grep -qx "history/2026-10-14-$head7.json" && ok "the snapshot is named by date and sha7 under history/" || bad "tree: $(git -C "$remote" ls-tree --name-only -r metrics-data)"
     [ "$(git -C "$repo" rev-parse --abbrev-ref HEAD)" = "main" ] && [ -z "$(git -C "$repo" status --porcelain)" ] && ok "the working checkout is left on its branch, clean" || bad "working checkout disturbed"
     # Second publish appends; same snapshot twice is a no-op.
     status=0
@@ -892,6 +894,13 @@ PY
         [ "$status" -eq 2 ] && grep -q 'refusing git.sha7' "$tmp/pub-badsha.out" \
             && ok "a sha7 of $(printf '%q' "$bad_sha") is refused" || bad "sha7 $(printf '%q' "$bad_sha") exit $status: $(cat "$tmp/pub-badsha.out")"
     done
+    # A well-formed sha7 of a commit this checkout is not on was not made by
+    # this run's collector.
+    local other7; other7="$([ "${head7:0:1}" = 0 ] && echo 1 || echo 0)${head7:1}"
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["sha7"]=sys.argv[3]; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-othersha.json" "$other7"
+    status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-othersha.json" --date 2026-10-16 >"$tmp/pub-othersha.out" 2>&1) || status=$?
+    [ "$status" -eq 2 ] && grep -q 'this checkout is at' "$tmp/pub-othersha.out" \
+        && ok "a snapshot of another commit is refused" || bad "other-commit sha7 exit $status: $(cat "$tmp/pub-othersha.out")"
     python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["dirty"]="false"; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-strdirty.json"
     status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-strdirty.json" --date 2026-10-16 >/dev/null 2>&1) || status=$?
     [ "$status" -eq 2 ] && ok "a dirty flag that is not the boolean false is refused" || bad "string dirty exit $status"

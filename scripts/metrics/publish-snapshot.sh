@@ -64,6 +64,14 @@ if not isinstance(sha7, str) or not re.fullmatch(r"[0-9a-f]{7}", sha7):
 print(sha7)
 PY
 )" || exit $?
+# The snapshot must measure the commit this checkout is on: in CI the publish
+# job checks out the run's own commit, so an artifact naming another commit
+# was not made by this run's collector and is not published.
+case "$(git -C "$root" rev-parse HEAD)" in
+    "$sha7"*) ;;
+    *) echo "publish-snapshot: refusing git.sha7 '$sha7'; this checkout is at $(git -C "$root" rev-parse --short=7 HEAD)" >&2
+       exit 2 ;;
+esac
 [ -n "$date" ] || date="$(date -u +%Y-%m-%d)"
 # [[ =~ ]] anchors the whole string; grep -x would pass one good line of many.
 # The shape check comes first so only digits and dashes reach Python, which
