@@ -324,9 +324,12 @@ history for the harness lives under `scripts/metrics/testdata/history/`.
 
 The `metrics` job in `.github/workflows/metrics.yml` runs every night,
 called by `nightly-tests.yml`, and on demand by dispatching `metrics.yml`
-alone. It runs `just metrics`, renders the dashboard from the fetched history plus the new
-snapshot, uploads both as the `metrics` artifact, and on main hands the
-snapshot to `scripts/metrics/publish-snapshot.sh`. That script fetches the
+alone. It runs `just metrics` and renders the dashboard from the fetched
+history plus the new snapshot. The `metrics` artifact carries both. The job
+builds the tree and runs tools from crates.io, so it runs with a read-only
+token that the checkout does not persist. On main, a separate `publish` job holds
+the write token. It downloads that artifact and passes the snapshot to
+`scripts/metrics/publish-snapshot.sh`. That script fetches the
 `metrics-data` branch (creating it as an orphan the first time), adds
 `history/<date>-<sha7>.json`, prunes, commits and pushes to that branch
 alone: its refspec names the branch on both sides, so it cannot reach main.

@@ -453,11 +453,12 @@ jobs:
 
   metrics:
     # Architectural-health snapshot, defined in metrics.yml so it can also be
-    # dispatched alone. Non-blocking: its job is continue-on-error inside the
-    # called workflow, and `notify` does not need it.
+    # dispatched alone. Non-blocking: its jobs are continue-on-error inside
+    # the called workflow, and `notify` does not need it.
     permissions:
-      # Pushing to metrics-data; a called workflow cannot hold a permission
-      # its caller withheld.
+      # For metrics.yml's `publish` job alone, which pushes to metrics-data;
+      # a called workflow cannot hold a permission its caller withheld. The
+      # collector job there narrows itself to `contents: read`.
       contents: write
     uses: ./.github/workflows/metrics.yml
 

@@ -364,8 +364,9 @@ Nightly failures should notify (issue-on-failure or Slack), not just rot in the 
   allowlist in `.github/actionlint.yaml`.
 - **Quality metrics** — the `metrics` job (`continue-on-error`), defined in `metrics.yml`
   so it can also be dispatched alone, runs `just metrics`, renders
-  the dashboard, uploads both as the `metrics` artifact, and pushes the snapshot to the
-  orphan `metrics-data` branch with `scripts/metrics/publish-snapshot.sh`; it never writes
+  the dashboard, and uploads both as the `metrics` artifact with a read-only token. On
+  main, a separate `publish` job pushes the snapshot from that artifact to the
+  orphan `metrics-data` branch with `scripts/metrics/publish-snapshot.sh`. Neither job writes
   to main. `metrics/README.md` describes the snapshot and the gates.
 - **Cache priming** — `session-e2e-soak` and the `msrv`/`miri` jobs restore+save their own
   cache classes (`save-if` main-only) so a scheduled main run keeps them warm.

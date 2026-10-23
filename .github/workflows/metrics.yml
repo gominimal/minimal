@@ -25,13 +25,15 @@ env:
 jobs:
   metrics:
     # `just metrics` runs every collector, the dashboard renders from the
-    # history, both ship as the `metrics` artifact, the snapshot's summary.md
-    # lands on the run's summary page, and the snapshot is pushed to the
-    # orphan `metrics-data` branch, never to main (AGENTS.md: nothing commits
-    # to main outside a reviewed PR; the gate reads its baseline from that
-    # ref). Non-blocking while it beds in: read it in the run, promote into
+    # history, both ship as the `metrics` artifact, and the snapshot's
+    # summary.md lands on the run's summary page. This job builds and tests
+    # the checked-out tree and runs tools from crates.io, so it holds a
+    # read-only token and keeps none in .git/config; `publish` below pushes.
+    # Non-blocking while it beds in: read it in the run, promote into
     # nightly-tests' `notify` once a week of snapshots says it is quiet.
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.snapshot.outputs.status }}
     # Coverage is a cold instrumented workspace build plus the suite; the
     # module graphs load every crate through rust-analyzer; mutants test one
     # shard. The spec's bound (QM-N02) is this value.
@@ -40,9 +42,8 @@ jobs:
     # cannot set continue-on-error, so this keeps nightly-tests green.
     continue-on-error: true
     permissions:
-      # Pushing to metrics-data. The publish script's refspec names that
-      # branch on both sides, so this cannot reach main.
-      contents: write
+      # Read only: the checkout and the history checkout.
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # The mutation run's share of the job: coverage is a cold instrumented
@@ -52,9 +53,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The publish step pushes with the job token; hotspots walk the
-          # history, so no shallow clone.
-          persist-credentials: true
+          # Hotspots walk the history and the mutants reference orders
+          # snapshots by commit time, so no shallow clone.
+          persist-credentials: false
           fetch-depth: 0
       - name: Setup Rust (protoc + cache)
         uses: ./.github/actions/setup-rust
@@ -66,7 +67,7 @@ jobs:
       - name: Install just and cargo-binstall
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
-          tool: just,cargo-binstall
+          tool: just@1.58.0,cargo-binstall@1.24.0
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
       - name: Install the pinned metrics tools
@@ -76,15 +77,24 @@ jobs:
         # binaries); a failed install leaves their blocks not measured, which
         # the snapshot says, rather than failing the run.
         run: scripts/metrics/install-tools.sh --experimental || echo "experimental tools not installed; recorded as not measured"
-      - name: Fetch the snapshot history
-        # Missing on the first run; the dashboard then renders this run alone.
+      - name: Check out the snapshot history
+        # The checkout fetches with the token but keeps none; the branch is
+        # missing on the first run, and the dashboard then renders this run
+        # alone.
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: metrics-data
+          path: .scratch/metrics-data
+          persist-credentials: false
+      - name: Stage the snapshot history
         run: |
           set -euo pipefail
           mkdir -p .scratch/metrics/history
-          if git fetch --quiet origin metrics-data; then
-            git --work-tree=.scratch/metrics checkout FETCH_HEAD -- history
-            git reset --quiet -- history
+          if [ -d .scratch/metrics-data/history ]; then
+            cp .scratch/metrics-data/history/*.json .scratch/metrics/history/ 2>/dev/null || true
           fi
+          rm -rf .scratch/metrics-data
       - name: Snapshot
         # Exit 2 is a failed gate and 3 an incomplete snapshot; both still
         # write the file, and both are worth the artifact. Anything else is
@@ -111,10 +121,37 @@ jobs:
             .scratch/metrics/dashboard/
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    # Pushes the snapshot to the orphan `metrics-data` branch, never to main
+    # (AGENTS.md: nothing commits to main outside a reviewed PR; the gate
+    # reads its baseline from that ref). The only job with a write token: it
+    # builds nothing and installs nothing, and runs main's own
+    # publish-snapshot.sh over the artifact the collector uploaded.
+    # Scheduled and manual runs on main only (called from nightly-tests,
+    # github.ref is the caller's), and a complete snapshot only: exit 3 says
+    # a collector did not run, and a history with holes in it ratchets
+    # against nothing. `metrics` is continue-on-error, so its result reads
+    # success whatever happened; its snapshot status is the real test.
+    needs: metrics
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (needs.metrics.outputs.status == '0' || needs.metrics.outputs.status == '2')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      # The publish script's refspec names metrics-data on both sides, so
+      # this cannot reach main.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The push below uses the job token from .git/config.
+          persist-credentials: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: metrics
+          path: .scratch/metrics
       - name: Publish the snapshot to metrics-data
-        # Scheduled and manual runs on main only; a complete snapshot only
-        # (exit 3 says a collector did not run, and a history with holes in it
-        # ratchets against nothing). Called from nightly-tests, github.ref is
-        # the caller's.
-        if: github.ref == 'refs/heads/main' && steps.snapshot.outputs.status != '3'
         run: scripts/metrics/publish-snapshot.sh .scratch/metrics/full/snapshot.json
