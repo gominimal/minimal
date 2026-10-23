@@ -1500,9 +1500,11 @@ impl BepProxy {
                 stale,
                 log: log.to_path_buf(),
             };
-            std::thread::Builder::new()
-                .name("bep-watch".into())
-                .spawn(move || watch_bep(child, &watch))?
+            hand_to_watcher(child, watch, |body| {
+                std::thread::Builder::new()
+                    .name("bep-watch".into())
+                    .spawn(body)
+            })?
         };
         Ok(Self {
             pid,
@@ -1558,6 +1560,49 @@ impl Drop for BepProxy {
     }
 }
 
+/// The body a watcher thread runs.
+type WatchBody = Box<dyn FnOnce() + Send + 'static>;
+
+/// Starts the watcher through `spawn` and hands it `child`. The child
+/// stays here until the thread runs, so when the thread cannot start the
+/// proxy is killed and reaped, and never runs on with the token unowned.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn hand_to_watcher<S>(
+    child: std::process::Child,
+    watch: BepWatch,
+    spawn: S,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    S: FnOnce(WatchBody) -> std::io::Result<std::thread::JoinHandle<()>>,
+{
+    let (send, receive) = std::sync::mpsc::channel::<std::process::Child>();
+    let body: WatchBody = Box::new(move || {
+        if let Ok(child) = receive.recv() {
+            watch_bep(child, &watch);
+        }
+    });
+    match spawn(body) {
+        Ok(handle) => match send.send(child) {
+            Ok(()) => Ok(handle),
+            // The thread ended before it took the child.
+            Err(std::sync::mpsc::SendError(mut child)) => {
+                let _ = handle.join();
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(std::io::Error::other(
+                    "the proxy's watcher ended before it took the proxy",
+                ))
+            }
+        },
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
 /// The watcher's loop: wait for the proxy to exit, or for a stop.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
@@ -1592,7 +1637,11 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
                 }
             }
             Err(error) => {
-                tracing::warn!(pid, %error, "box egress proxy could not be waited on");
+                // Not knowable is not stopped: stop it here, because the
+                // handle's drop can reach the child only through this loop.
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(pid, %error, "box egress proxy could not be waited on; stopped it");
                 return;
             }
         }
@@ -4441,5 +4490,35 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "dropping the handle stops the proxy");
+    }
+
+    /// A watcher thread that cannot start leaves no proxy running with the
+    /// token: the child is killed and reaped before the error returns.
+    #[test]
+    fn proxy_is_started_with_the_per_boot_token_and_stopped_when_no_watcher_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let watch = super::BepWatch {
+            stop: std::sync::Arc::default(),
+            listening: std::sync::Arc::default(),
+            listener: dir.path().join("gvproxy-bep.sock"),
+            stale: None,
+            log: dir.path().join(super::BEP_LOG_FILE),
+        };
+        let error = super::hand_to_watcher(child, watch, |_body| {
+            Err(std::io::Error::other("no thread for the watcher"))
+        })
+        .expect_err("a watcher that cannot start fails the start");
+        assert_eq!(error.to_string(), "no thread for the watcher");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the proxy does not outlive a failed watcher start");
     }
 }
