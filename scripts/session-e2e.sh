@@ -11700,11 +11700,15 @@ proof_bep_box_env_holds_sealed_value_only() {
 # the signed-in account can push to. The push makes a throwaway branch from
 # the cloned HEAD and the case deletes it again with a second push. A lane
 # without the proxy, or without a repository named, records NOT RUN.
+# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS
+# lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
+# T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
 #
 # Known gap: git sends an Authorization header only when a credential helper
 # gives it one, and no box ships a git credential helper yet. Gatehouse
-# requires the shipped git-credential-helper, but the BEP spec has no
-# requirement for it and no issue tracks it. Until both exist, the clone
+# requires the shipped git-credential-helper. #2499
+# (https://github.com/gominimal/minimal/issues/2499) tracks the helper and
+# the spec requirement for it. Until #2499 lands, the clone
 # step fails against a private repository on a lane that runs this case.
 # The case does not configure a helper of its own: that hides the gap.
 proof_bep_git_and_gh_against_private_repo() {

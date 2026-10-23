@@ -77,7 +77,7 @@
 //! bind a socket on the peer** — it carries the per-source caps and the
 //! pre-screen that holds a share before the stack assigns a listener —
 //! and not even T69 binds on a production boot yet. The credentialed-
-//! only gate rule (NET-145, T45, #1665) is still ahead, so the
+//! only gate is `egress::proxy_lane_admits` (T45, #1885), and the
 //! supervisor wires [`NoBoxes`] there: no row, no share, no socket, and
 //! a box's connection to the proxy's address is answered the way a
 //! stack with no listener answers it. Only the stand-in's own boot
@@ -331,7 +331,7 @@ pub trait BepBoxSource: Send + Sync {
 
 /// A box source with no rows: the wiring that binds nothing. A socket in
 /// the pool is a lane onto the host for the box whose share holds it, so
-/// until the credentialed-only gate rule (NET-145, T45, #1665) decides who
+/// where the gate `egress::proxy_lane_admits` (T45, #1885) decides who
 /// may reach one, a production boot hands the peer this source — no row,
 /// no share, no socket — and a box's connection to the proxy's address
 /// meets the stack's own reset, the answer an acceptor that is down is
