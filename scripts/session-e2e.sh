@@ -11122,6 +11122,7 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
     minvmd stop >/dev/null 2>&1 || true
   fi
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
 
   BEP_SEED_DIR="$(hook_mktemp /tmp/mnlbep.XXXXXX)"
   hook_seed_preamble > "$BEP_SEED_DIR/minimal.toml"
@@ -11503,6 +11504,67 @@ proof_published_proxy_routes_from_host() {
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# The live Box Egress Proxy gate (BEP-015, #2275). The VM host daemon starts
+# `bep serve` beside gvproxy on a production boot, and the proxy opens its
+# control socket under the real home. Records case $1 as NOT RUN and returns
+# 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
+# Keychain), without gvproxy (the daemon starts the proxy beside it) or
+# without a GitHub sign-in a person made with `min auth login`. Everywhere
+# else the proxy must come up, so a proxy that does not is a failure, never
+# NOT RUN.
+#
+# A daemon an earlier case started under MINVMD_BEP_STUB runs the stand-in
+# in place of the proxy, so the first live case restarts the daemon pair
+# without the flag; BEP_LIVE_DAEMON records that the running pair has the
+# proxy, and every case that exports MINVMD_BEP_STUB clears it.
+BEP_LIVE_DAEMON=""
+bep_control_live() {
+  python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+s.connect(sys.argv[1])' "$1" 2>/dev/null
+}
+bep_live_gate() {
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
+  local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    return 1
+  fi
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$1" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
+    return 1
+  fi
+  lg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$lg_status" != "Signed in to GitHub"* ]]; then
+    not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
+    return 1
+  fi
+  if [ "$BEP_LIVE_DAEMON" != 1 ]; then
+    unset MINVMD_BEP_STUB
+    mnl stop --force >/dev/null 2>&1 || true
+    minvmd stop >/dev/null 2>&1 || true
+    if ! mnl ls >/dev/null 2>"$WORK/bep-live-up.err"; then
+      echo "::error::the daemon did not start for $1"
+      cat "$WORK/bep-live-up.err" 2>/dev/null || true
+      fail
+    fi
+  fi
+  for lg_try in $(seq 1 60); do
+    [ "$lg_try" -gt 1 ] && sleep 1
+    bep_control_live "$lg_control" && break
+  done
+  if ! bep_control_live "$lg_control"; then
+    echo "::error::the Box Egress Proxy is not serving: nothing answers on $lg_control 60 s after the VM host daemon started (it starts 'bep serve' beside gvproxy)"
+    echo "--- $lg_log (tail) ---"; tail -40 "$lg_log" 2>/dev/null || echo "(absent)"
+    fail
+  fi
+  BEP_LIVE_DAEMON=1
+}
+
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The proxy_sees_each_vm_box_by_its_switch_address case, which the dispatch
@@ -11518,28 +11580,7 @@ proof_published_proxy_routes_from_host() {
 # without both records it as NOT RUN.
 proof_bep_second_box_needs_no_sign_in() {
   echo "::group::GitHub grant boxes: the second box needs no sign-in"
-  # This proof reads the real home, which no earlier subshell export changes.
-  # shellcheck disable=SC2031
-  bep_control="$HOME/.minimal/bep/control.sock"
-  if [ "$(uname -s)" != "Darwin" ]; then
-    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy runs on macOS only"
-    echo "::endgroup::"
-    return 0
-  fi
-  bep_status="$(mnl auth status </dev/null 2>/dev/null || true)"
-  if [[ "$bep_status" != "Signed in to GitHub"* ]]; then
-    not_run bep_second_box_needs_no_sign_in "no GitHub sign-in on this machine: run 'min auth login' first"
-    echo "::endgroup::"
-    return 0
-  fi
-  if [ ! -S "$bep_control" ]; then
-    # Nothing starts 'bep serve' on any lane until T18
-    # (https://github.com/gominimal/minimal/issues/2275) runs the proxy beside
-    # gvproxy.
-    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy is not running: no $bep_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
-    echo "::endgroup::"
-    return 0
-  fi
+  bep_live_gate bep_second_box_needs_no_sign_in || { echo "::endgroup::"; return 0; }
 
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
   {
@@ -11584,25 +11625,7 @@ proof_bep_second_box_needs_no_sign_in() {
 # as the second-box proof above record a lane without the proxy as NOT RUN.
 proof_bep_box_env_holds_sealed_value_only() {
   echo "::group::GitHub grant boxes: the grant's variable holds a sealed value only"
-  # This proof reads the real home, which no earlier subshell export changes.
-  # shellcheck disable=SC2031
-  bep_control="$HOME/.minimal/bep/control.sock"
-  if [ "$(uname -s)" != "Darwin" ]; then
-    not_run bep_box_env_holds_sealed_value_only "the Box Egress Proxy runs on macOS only"
-    echo "::endgroup::"
-    return 0
-  fi
-  bep_status="$(mnl auth status </dev/null 2>/dev/null || true)"
-  if [[ "$bep_status" != "Signed in to GitHub"* ]]; then
-    not_run bep_box_env_holds_sealed_value_only "no GitHub sign-in on this machine: run 'min auth login' first"
-    echo "::endgroup::"
-    return 0
-  fi
-  if [ ! -S "$bep_control" ]; then
-    not_run bep_box_env_holds_sealed_value_only "the Box Egress Proxy is not running: no $bep_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
-    echo "::endgroup::"
-    return 0
-  fi
+  bep_live_gate bep_box_env_holds_sealed_value_only || { echo "::endgroup::"; return 0; }
 
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
   {
@@ -11666,6 +11689,98 @@ proof_bep_box_env_holds_sealed_value_only() {
   done
   rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
   echo "Sealed-value placement proof OK (two grant boxes started headless, each GH_TOKEN a sealed value of its own)"
+  echo "::endgroup::"
+}
+
+# git and gh through the live proxy (BEP-015): a proxy_env box that holds a
+# sealed GitHub member clones a private repository of the signed-in account,
+# pushes to it and reads it with `gh api`, with no tool configured in the box
+# beyond what it carries at creation. E2E_BEP_PRIVATE_REPO names the
+# repository as <owner>/<name>: private, with at least one commit, and one
+# the signed-in account can push to. The push makes a throwaway branch from
+# the cloned HEAD and the case deletes it again with a second push. A lane
+# without the proxy, or without a repository named, records NOT RUN.
+# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS
+# lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
+# T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
+#
+# Known gap: git sends an Authorization header only when a credential helper
+# gives it one, and no box ships a git credential helper yet. Gatehouse
+# requires the shipped git-credential-helper. #2499
+# (https://github.com/gominimal/minimal/issues/2499) tracks the helper and
+# the spec requirement for it. Until #2499 lands, the clone
+# step fails against a private repository on a lane that runs this case.
+# The case does not configure a helper of its own: that hides the gap.
+proof_bep_git_and_gh_against_private_repo() {
+  echo "::group::GitHub grant box: git clone, git push and gh api against a private repository (BEP-015)"
+  local gg_case=bep_git_and_gh_against_private_repo gg_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gg_out gg_sid gg_branch gg_step gg_private
+  if [ -z "$gg_repo" ]; then
+    not_run "$gg_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gg_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gg_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gg_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gg_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-and-gh \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gg_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gg_out"
+    echo "--- stderr ---"; cat "$WORK/$gg_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gg_sid="$(printf '%s\n' "$gg_out" | tail -n1 | tr -d '\r')"
+  gg_branch="e2e-bep-$(date +%s)-$$"
+
+  # Each step runs on its own, so a failure names the tool that failed. The
+  # prompt switch only keeps a refused git from waiting on a terminal: it
+  # gives git no credential.
+  for gg_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gg_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gg_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gg_branch"; do
+    if ! mnl session exec "$gg_sid" sh -c "${gg_step#*:}" \
+      >"$WORK/$gg_case.${gg_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gg_step%%:*}' against the private repository $gg_repo failed in the proxy_env box"
+      cat "$WORK/$gg_case.${gg_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gg_step%%:*}: OK"
+  done
+  if ! gg_private="$(mnl session exec "$gg_sid" sh -c \
+    "timeout 60 gh api repos/$gg_repo --jq .private" 2>"$WORK/$gg_case.gh.err")"; then
+    echo "::error::'gh api repos/$gg_repo' failed in the proxy_env box"
+    cat "$WORK/$gg_case.gh.err" 2>/dev/null || true
+    mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  gg_private="$(printf '%s' "$gg_private" | tr -d '\r' | tail -n1)"
+  mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+  if [ "$gg_private" != true ]; then
+    echo "::error::'gh api repos/$gg_repo' answered private='$gg_private': the case needs a private repository"
+    fail
+  fi
+  rm -f "$WORK/$gg_case".*
+  echo "proxy_env grant box: git clone, git push and gh api against the private repository $gg_repo"
   echo "::endgroup::"
 }
 
@@ -11774,24 +11889,9 @@ BEP_TRUST_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 BEP_TRUST_ROOT=/etc/ssl/certs/minimal-box-egress-proxy-root.pem
 
 # Records case $1 as NOT RUN and returns 1 when this target cannot start a
-# GitHub grant box: the same three gates as the sealed-value proof.
+# GitHub grant box: the same gates as the sealed-value proof.
 bep_trust_grant_gate() {
-  # This reads the real home, which no earlier subshell export changes.
-  # shellcheck disable=SC2031
-  local tg_control="$HOME/.minimal/bep/control.sock" tg_status
-  if [ "$(uname -s)" != "Darwin" ]; then
-    not_run "$1" "the Box Egress Proxy runs on macOS only"
-    return 1
-  fi
-  tg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
-  if [[ "$tg_status" != "Signed in to GitHub"* ]]; then
-    not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
-    return 1
-  fi
-  if [ ! -S "$tg_control" ]; then
-    not_run "$1" "the Box Egress Proxy is not running: no $tg_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
-    return 1
-  fi
+  bep_live_gate "$1"
 }
 
 # Removes the files bep_trust_box_files left for case $1.
@@ -13521,6 +13621,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     minvmd stop >/dev/null 2>&1 || true
   fi
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
 
   # The filter the daemon this case autospawns will read its log at. The
   # lane runs the whole script under `warn,minimald::exec=info`, and the
@@ -14035,6 +14136,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
   CRED_STUB=1
 
   local proxy_ip proxy_port host_alias lane_sid lane_ip sock sock_wait
@@ -14410,6 +14512,7 @@ proof_proxy_sees_boxes_by_address() {
   local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
   CRED_STUB=1
   # One directive wider than cred_begin's: the pool's per-delivery record is
   # a DEBUG one, and the delivery assertions below read it, so widen the
@@ -23234,6 +23337,7 @@ case "${1:-}" in
     proof_github_only_allowlist
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
+    proof_bep_git_and_gh_against_private_repo
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
     proof_bep_root_ca_present_in_box_trust_store
@@ -23296,6 +23400,7 @@ case "${1:-}" in
     | daemon_fetch_under_deny_all_host_address_box \
     | bep_second_box_needs_no_sign_in \
     | bep_box_env_holds_sealed_value_only \
+    | bep_git_and_gh_against_private_repo \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
     | bep_root_ca_present_in_box_trust_store \
@@ -23337,6 +23442,7 @@ case "${1:-}" in
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
+    echo "         bep_git_and_gh_against_private_repo"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
