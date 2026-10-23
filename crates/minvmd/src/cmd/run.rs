@@ -1398,8 +1398,8 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 /// supervisor looks beside its own binary, where `just minvmd-build` puts
 /// it. The installer does not ship `bep` yet: `scripts/dist-build.sh` and
 /// the release workflow build only `minvmd`, so an installed `minvmd`
-/// finds no proxy and boots without a credentialed lane. That release gap
-/// is a residual of BEP-015.
+/// finds no proxy and boots without a credentialed lane. #2498
+/// (https://github.com/gominimal/minimal/issues/2498) owns that release gap.
 const BEP_BIN_ENV: &str = "MINVMD_BEP_BIN";
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
@@ -1425,6 +1425,11 @@ fn resolve_bep_binary() -> Option<std::path::PathBuf> {
 /// The running `bep serve` of this boot. A watcher thread owns the child:
 /// it logs one warn line when the proxy exits on its own, and it stops the
 /// proxy when this handle drops with the supervisor.
+///
+/// Interim: `bep` starts as minvmd's own user, which is also the user of
+/// gvproxy and the VM. Gatehouse §6.10 requires distinct OS users for them
+/// (BEP-047). T38, #2285 (https://github.com/gominimal/minimal/issues/2285),
+/// owns that split.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
 struct BepProxy {
@@ -4144,6 +4149,89 @@ mod tests {
             acceptor_lane.pool_len(),
             0,
             "the shares go when the acceptor stops listening"
+        );
+    }
+
+    /// A registry with one box that declares a credentialed upstream and
+    /// one that does not, and the [`super::CredentialedBoxes`] source over it.
+    fn credentialed_boxes_with_two_rows(
+        listening: bool,
+    ) -> (
+        super::CredentialedBoxes,
+        std::net::Ipv4Addr,
+        std::net::Ipv4Addr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let attachments = crate::bep_attach::Attachments::new();
+        let registry = crate::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+            .feeding_proxy_attachments(attachments.clone());
+        let spec = |name: &str, credentialed: bool| crate::box_registry::ClientBoxSpec {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: credentialed.then(boxes::CredentialedUpstream::default),
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let declared = registry
+            .register_client_box(spec("box-lane", true))
+            .expect("the plan has a switch address to hand out")
+            .switch_addr();
+        let undeclared = registry
+            .register_client_box(spec("box-no-lane", false))
+            .expect("the plan has a switch address to hand out")
+            .switch_addr();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(listening));
+        let table = registry.table();
+        let source = super::CredentialedBoxes {
+            boxes: crate::box_registry::RegisteredBoxes::new(table.clone(), attachments),
+            table,
+            listening: std::sync::Arc::clone(&flag),
+        };
+        (source, declared, undeclared, flag)
+    }
+
+    /// NET-134: while the proxy listens, a registered row that declared no
+    /// credentialed upstream gets no share.
+    #[test]
+    fn credentialed_boxes_skip_a_row_without_a_credentialed_upstream() {
+        use switch::bep_host::BepBoxSource as _;
+        let (source, _declared, undeclared, _flag) = credentialed_boxes_with_two_rows(true);
+        assert!(
+            !source.box_switch_addresses().contains(&undeclared),
+            "a row with no credentialed upstream holds no share"
+        );
+    }
+
+    /// NET-134: while the proxy listens, a registered row that declared a
+    /// credentialed upstream gets its share, and it is the only one.
+    #[test]
+    fn credentialed_boxes_share_a_row_with_a_credentialed_upstream() {
+        use switch::bep_host::BepBoxSource as _;
+        let (source, declared, _undeclared, _flag) = credentialed_boxes_with_two_rows(true);
+        assert_eq!(
+            source.box_switch_addresses(),
+            vec![declared],
+            "the declared row gets its share, and only it"
+        );
+    }
+
+    /// No row gets a share while the proxy does not listen, and the shares
+    /// follow the flag when it changes.
+    #[test]
+    fn credentialed_boxes_share_nothing_while_not_listening() {
+        use switch::bep_host::BepBoxSource as _;
+        let (source, declared, _undeclared, flag) = credentialed_boxes_with_two_rows(false);
+        assert!(
+            source.box_switch_addresses().is_empty(),
+            "no row holds a share while nothing listens"
+        );
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(source.box_switch_addresses(), vec![declared]);
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            source.box_switch_addresses().is_empty(),
+            "the shares go when the proxy stops listening"
         );
     }
 
