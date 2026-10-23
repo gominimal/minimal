@@ -1687,11 +1687,11 @@ impl BoxManager {
                         let span = tracing::Span::current();
                         self.teardowns.spawn(tracing::Instrument::instrument(
                             async move {
-                                let _release = TearingDown {
+                                let release = TearingDown {
                                     set: tearing_down,
                                     id,
                                 };
-                                r.handle(async {
+                                let answer: Result<Option<Vec<String>>, BoxManagerError> = async {
                                     let answer = hnd.destroy_if_unfinalized().await?;
                                     // Belt-and-braces, as on the unconditional
                                     // path: a dead actor (self-terminated, not
@@ -1708,8 +1708,14 @@ impl BoxManager {
                                         return Err(e);
                                     }
                                     Ok(answer)
-                                })
+                                }
                                 .await;
+                                // Out of the set before the answer goes out: a
+                                // caller that reads the record or the listing on
+                                // the reply must not find a kept session still
+                                // hidden behind the set.
+                                drop(release);
+                                r.handle(async { answer }).await;
                             },
                             span,
                         ));
