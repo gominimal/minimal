@@ -158,6 +158,7 @@ fn project_bep_and_grants(
     (
         boxes::core::bep::BepSettings,
         boxes::core::bep::SecretGrants,
+        Vec<String>,
     ),
     ProjectFileInvalid,
 > {
@@ -175,9 +176,23 @@ fn project_bep_and_grants(
         }
     };
     Ok(session.map_or_else(Default::default, |session| {
+        // BEP-011: the names of the variables the box spec's own
+        // environment sets, so the activation can warn for a trust variable.
+        let spec_env = session
+            .vars
+            .keys()
+            .map(|name| name.as_ref().to_string())
+            .chain(
+                session
+                    .vars_lenient
+                    .iter()
+                    .map(|entry| entry.name().as_ref().to_string()),
+            )
+            .collect();
         (
             session.network.and_then(|n| n.bep).unwrap_or_default(),
             session.secrets,
+            spec_env,
         )
     }))
 }
@@ -203,7 +218,8 @@ fn credentialed_upstream_for(
 }
 
 /// Refuses a box spec whose grants the box or this host cannot honour, and
-/// prints the warnings of one it accepts. It checks the project's settings
+/// prints and returns the warnings of one it accepts. `spec_env` is the names
+/// of the variables the box spec's own environment sets. It checks the project's settings
 /// whether or not they declare a credentialed upstream, so a contradiction
 /// in `[session.network.bep]` alone is still refused. The refusal ends the
 /// run with exit 3 (`main.rs`). Every host today is un-enrolled and has no
@@ -214,7 +230,8 @@ fn refuse_unhonourable_grants(
     settings: &boxes::core::bep::BepSettings,
     secrets: &boxes::core::bep::SecretGrants,
     full_breadth_acknowledged: bool,
-) -> Result<(), anyhow::Error> {
+    spec_env: &[String],
+) -> Result<Vec<boxes::core::bep::BepWarning>, anyhow::Error> {
     use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
     let hosts: Vec<&str> = bep::module::GITHUB
         .hosts
@@ -233,11 +250,13 @@ fn refuse_unhonourable_grants(
         full_breadth_acknowledged,
         ..HostFacts::LOCAL
     };
-    let plan = check_activation(&spec, host, &hosts)?;
+    let mut plan = check_activation(&spec, host, &hosts)?;
+    // BEP-011: a spec that sets a trust variable keeps its value, and says so.
+    plan.warn_spec_trust_env(spec_env.iter().map(String::as_str));
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
     }
-    Ok(())
+    Ok(plan.warnings)
 }
 
 /// The names of the project's GitHub grants, in name order.
@@ -795,7 +814,7 @@ pub(crate) async fn activate_box(
             let has_ingress = !port_mappings.is_empty()
                 || args.dynamic_ingress.is_some()
                 || args.dynamic_range.is_some();
-            let (project_bep, project_secrets) = project_bep_and_grants(&utf8_path)?;
+            let (project_bep, project_secrets, project_env) = project_bep_and_grants(&utf8_path)?;
             let policy = boxes::BoxPolicy {
                 egress,
                 ingress: has_ingress.then_some(boxes::IngressPolicy {
@@ -828,6 +847,7 @@ pub(crate) async fn activate_box(
                 &project_bep,
                 &project_secrets,
                 full_breadth_acknowledged,
+                &project_env,
             )?;
             // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
             // proxy, and then a held sign-in. Only the item's metadata is
@@ -2334,7 +2354,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
         // The egress here is unset, so both runs refuse for that too. Only
         // the narrow-scope refusal depends on the acknowledgement.
         let narrow = |acknowledged: bool| {
@@ -2344,6 +2364,7 @@ mod tests {
                 &bep,
                 &secrets,
                 acknowledged,
+                &spec_env,
             )
             .expect_err("refused for the egress");
             let refused = err
@@ -2360,6 +2381,59 @@ mod tests {
         assert!(!narrow(true), "accepted with the acknowledgement");
     }
 
+    /// BEP-011: a box spec with a GitHub grant that sets `SSL_CERT_FILE` in
+    /// its own environment gets the warning on stderr. The same spec
+    /// without the variable gets none.
+    #[test]
+    fn spec_trust_env_warns_at_activation() {
+        let warnings = |vars: &str| {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!(
+                    "[session]\n{vars}\
+                     [session.network.bep]\nsteering = \"proxy_env\"\n\
+                     [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                     scopes = [\"github:user-token\"]\n"
+                ),
+            )
+            .expect("write minimal.toml");
+            let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
+            let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+            let egress = boxes::EgressPolicy {
+                allow_dns_hosts: Some(
+                    bep::module::GITHUB
+                        .hosts
+                        .iter()
+                        .map(|authority| authority.host.to_string())
+                        .collect(),
+                ),
+                ..boxes::EgressPolicy::default()
+            };
+            refuse_unhonourable_grants(
+                boxes::NetworkMode::OwnIp,
+                Some(&egress),
+                &bep,
+                &secrets,
+                false,
+                &spec_env,
+            )
+            .expect("accepted")
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            warnings("vars = { SSL_CERT_FILE = \"/etc/my-ca.pem\" }\n"),
+            vec![
+                "This box sets SSL_CERT_FILE itself, so tools that read it will not \
+                 trust the proxy's certificate."
+                    .to_string()
+            ]
+        );
+        assert!(warnings("").is_empty(), "no trust variable, no warning");
+    }
+
     /// BEP-016: a `[session.network.bep]` setting alone declares no
     /// credentialed upstream. The set is derived from broker grants.
     #[test]
@@ -2371,11 +2445,18 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
-        refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false)
-            .expect("accepted");
+        refuse_unhonourable_grants(
+            boxes::NetworkMode::OwnIp,
+            None,
+            &bep,
+            &secrets,
+            false,
+            &spec_env,
+        )
+        .expect("accepted");
     }
 
     /// A `client_env` grant alone declares no credentialed upstream. A
@@ -2408,7 +2489,7 @@ mod tests {
         let secrets = boxes::core::bep::SecretGrants::new();
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         let err =
-            refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false)
+            refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false, &[])
                 .expect_err("refused");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
