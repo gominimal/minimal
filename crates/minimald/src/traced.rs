@@ -240,6 +240,13 @@ impl<T> Sender<T> {
     pub(crate) fn downgrade(&self) -> WeakSender<T> {
         WeakSender(self.0.downgrade())
     }
+
+    /// Test-only: messages sent and not yet received, so a test can wait
+    /// for a message another task sends to be queued.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.0.max_capacity() - self.0.capacity()
+    }
 }
 
 pub(crate) struct WeakSender<T>(mpsc::WeakSender<(T, Caller)>);
@@ -641,7 +648,13 @@ mod tests {
         let mut files = Vec::new();
         walk(&src, &mut files);
         let mut bad = Vec::new();
-        for f in files.iter().filter(|f| !f.ends_with("traced.rs")) {
+        // A module's own `tests.rs` file is test-only, like an inline
+        // `#[cfg(test)] mod tests` block that `outside_test_modules` skips.
+        // `Path::ends_with` matches whole components, so only that file name.
+        for f in files
+            .iter()
+            .filter(|f| !f.ends_with("traced.rs") && !f.ends_with("tests.rs"))
+        {
             let text = std::fs::read_to_string(f).unwrap();
             for (i, line) in outside_test_modules(&text) {
                 // An imported bare `spawn` (`use tokio::task::spawn;`, or

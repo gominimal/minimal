@@ -33,11 +33,11 @@ native-dir   := scratch / "native-state"
 # The workspace doesn't compile natively on macOS (minimald/lcache/mctx are
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
-scope      := if os() == "macos" { "-p minvmd -p boxes" } else { "--workspace" }
-# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+scope      := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "--workspace" }
+# The strict gate's scope on macOS: the same crates `clippy` and `test` already
 # use, because the Linux-only crates do not build there. The script reports any
 # changed crate this leaves out, so the scope is never silently narrower.
-strict-scope := if os() == "macos" { "-p minvmd -p boxes" } else { "" }
+strict-scope := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }

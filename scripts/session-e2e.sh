@@ -418,6 +418,8 @@ RECOVER_HOLDER_PID="" # the port holder the recovery proof starts; killed
 RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
+GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardown
@@ -737,8 +739,21 @@ elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1 \
   :
 else
   min_cli_dir=""
+  # A dir counts only with BOTH halves of the pair: a shared target dir can
+  # hold a 'min' from an earlier build and no daemon, and taking it skips the
+  # build below and dies at the daemon gate.
+  # A pair whose halves report different versions is not one build: an
+  # earlier build of one half ran from a dirty tree, say. The CLI refuses
+  # such a daemon at the first activate, so rebuild the pair below instead.
+  min_skewed_pair=""
   for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-    if [ -x "$d/min" ]; then
+    if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
+      if [ "$("$d/min" --version 2>/dev/null | awk '{print $NF}')" \
+           != "$("$d/$min_daemon" --version 2>/dev/null | awk '{print $NF}')" ]; then
+        echo "the 'min' and '$min_daemon' under $d report different versions; rebuilding the pair"
+        min_skewed_pair=1
+        continue
+      fi
       min_cli_dir="$d"
       break
     fi
@@ -757,17 +772,22 @@ else
   # instead of the run dying at the CLI gate with a build instruction the
   # caller cannot read mid-verify.
   if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
-    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    echo "no usable 'min' and '$min_daemon' pair on PATH or under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
     # copies into place (beside min). It builds in its own invocation, as
     # `just zoned-build` does: beside `-p minvmd`, cargo would unify
     # minvmd's `libkrun` feature into the root-run program.
+    # The version build script reruns only on a git change, so a skewed pair
+    # keeps its skew through a rebuild unless the script is made to rerun.
+    if [ -n "$min_skewed_pair" ]; then
+      touch "$ROOT/crates/version/build.rs"
+    fi
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
         -p "$min_daemon" --bin "$min_daemon" \
         && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
         >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-        if [ -x "$d/min" ]; then
+        if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
           min_cli_dir="$d"
           break
         fi
@@ -989,6 +1009,8 @@ teardown() {
   [ -n "$RECOVER_SEED_DIR" ] && rm -rf "$RECOVER_SEED_DIR"
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
+  [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
+  [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
   [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
@@ -11486,6 +11508,463 @@ proof_published_proxy_routes_from_host() {
 # The proxy_sees_each_vm_box_by_its_switch_address case, which the dispatch
 # runs after this one, stops and respawns both daemons for its own filter
 # and stand-in.
+# ---------------------------------------------------------------------------
+# GitHub grant proof (BEP-003, BEP-005): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and neither asks for a sign-in. Each creation mints a
+# sealed sign-in reference and registers the box with the proxy, so the second
+# box reuses the sign-in the first one found. `bep serve` runs on macOS only,
+# and the case needs a sign-in a person made with `min auth login`, so a lane
+# without both records it as NOT RUN.
+proof_bep_second_box_needs_no_sign_in() {
+  echo "::group::GitHub grant boxes: the second box needs no sign-in"
+  # This proof reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  bep_control="$HOME/.minimal/bep/control.sock"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy runs on macOS only"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$bep_status" != "Signed in to GitHub"* ]]; then
+    not_run bep_second_box_needs_no_sign_in "no GitHub sign-in on this machine: run 'min auth login' first"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ ! -S "$bep_control" ]; then
+    # Nothing starts 'bep serve' on any lane until T18
+    # (https://github.com/gominimal/minimal/issues/2275) runs the proxy beside
+    # gvproxy.
+    not_run bep_second_box_needs_no_sign_in "the Box Egress Proxy is not running: no $bep_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  for bep_name in e2e-bep-first e2e-bep-second; do
+    # Headless: stdin from /dev/null and --no-prompt. A sign-in prompt has
+    # no terminal to ask on, so a box that needed one fails here.
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-$bep_name.err"
+      fail
+    fi
+    bep_sids="$bep_sids $(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "GitHub grant proof OK (two grant boxes started headless, with no sign-in prompt)"
+  echo "::endgroup::"
+}
+
+# Sealed-value placement proof (BEP-007): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and each box's GH_TOKEN holds a sealed value and no
+# plaintext token. Each box's value names its own box, so the two differ.
+# The case looks for a plaintext token by its GitHub shape (ghp_, gho_, ghu_,
+# ghs_, ghr_ or github_pat_) in the box's whole environment. The same gates
+# as the second-box proof above record a lane without the proxy as NOT RUN.
+proof_bep_box_env_holds_sealed_value_only() {
+  echo "::group::GitHub grant boxes: the grant's variable holds a sealed value only"
+  # This proof reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  bep_control="$HOME/.minimal/bep/control.sock"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run bep_box_env_holds_sealed_value_only "the Box Egress Proxy runs on macOS only"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$bep_status" != "Signed in to GitHub"* ]]; then
+    not_run bep_box_env_holds_sealed_value_only "no GitHub sign-in on this machine: run 'min auth login' first"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ ! -S "$bep_control" ]; then
+    not_run bep_box_env_holds_sealed_value_only "the Box Egress Proxy is not running: no $bep_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  bep_values=""
+  for bep_name in e2e-bep-env-first e2e-bep-env-second; do
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-env-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-env-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-env-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-env-$bep_name.err"
+      fail
+    fi
+    bep_sid="$(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+    bep_sids="$bep_sids $bep_sid"
+    if ! mnl session exec "$bep_sid" sh -c 'env' \
+      >"$WORK/bep-env-$bep_name.env" 2>"$WORK/bep-env-$bep_name.exec.err"; then
+      echo "::error::'min session exec' in the GitHub grant box $bep_name failed"
+      cat "$WORK/bep-env-$bep_name.exec.err" 2>/dev/null || true
+      fail
+    fi
+    # The value itself is never printed: the transcript names only its length.
+    bep_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/bep-env-$bep_name.env" | tr -d '\r' | head -n1)"
+    if [ -z "$bep_value" ]; then
+      echo "::error::the GitHub grant box $bep_name has no value in GH_TOKEN"
+      fail
+    fi
+    # A sealed value is a compact JWE, header..iv.ciphertext.tag, the form
+    # bep::seal returns.
+    if ! [[ "$bep_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+      echo "::error::the GH_TOKEN value of the GitHub grant box $bep_name is not a sealed value: it is not in the compact JWE form header..iv.ciphertext.tag"
+      fail
+    fi
+    if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/bep-env-$bep_name.env"; then
+      echo "::error::the environment of the GitHub grant box $bep_name holds a plaintext GitHub token"
+      fail
+    fi
+    case " $bep_values " in
+      *" $bep_value "*)
+        echo "::error::the GitHub grant box $bep_name holds the same GH_TOKEN value as an earlier box, so the value does not name its box"
+        fail
+        ;;
+    esac
+    bep_values="$bep_values $bep_value"
+    rm -f "$WORK/bep-env-$bep_name.env"
+    echo "$bep_name: GH_TOKEN holds a sealed value (${#bep_value} characters), and no plaintext token"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "Sealed-value placement proof OK (two grant boxes started headless, each GH_TOKEN a sealed value of its own)"
+  echo "::endgroup::"
+}
+
+# Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
+# is proxy_env starts on an own-address credentialed lane, and its
+# environment points at the Box Egress Proxy. The two cases share one box
+# start. The lane needs a switch, so a target without one records the case
+# as NOT RUN. The box declares no grant, so the case needs no sign-in and no
+# running proxy: it reads the variables, never a connection through them.
+# $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
+bep_proxy_env_box_env() {
+  local pe_case="$1" pe_sid pe_out
+  PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlpenv.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\nno_proxy = ["e2e-direct.example", "10.0.0.0/8"]\n'
+  } > "$PROXY_ENV_SEED_DIR/minimal.toml"
+  mkdir "$PROXY_ENV_SEED_DIR/.git"
+  pe_out="$(cd "$PROXY_ENV_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$pe_case" | tr '_' '-' | cut -c1-40)" \
+    --network own_ip --credentialed-upstream \
+    </dev/null 2>"$WORK/$pe_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    echo "--- stdout ---"; printf '%s\n' "$pe_out"
+    echo "--- stderr ---"; cat "$WORK/$pe_case.err" 2>/dev/null || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  }
+  pe_sid="$(printf '%s\n' "$pe_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$pe_sid" sh -c 'env' \
+    >"$WORK/$pe_case.env" 2>"$WORK/$pe_case.exec.err"; then
+    echo "::error::'min session exec' in the proxy_env box failed"
+    cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  fi
+  tr -d '\r' <"$WORK/$pe_case.env" >"$WORK/$pe_case.env.tmp" && mv "$WORK/$pe_case.env.tmp" "$WORK/$pe_case.env"
+  mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+  rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+}
+
+# The value of variable $2 in the env dump $1, or nothing.
+bep_env_value() {
+  sed -n "s/^$2=//p" "$1" | head -n1
+}
+
+proof_bep_proxy_env_and_no_proxy_are_set() {
+  echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_https pe_http pe_no
+  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set
+  pe_env="$WORK/bep_proxy_env_and_no_proxy_are_set.env"
+  pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
+  pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
+  pe_no="$(bep_env_value "$pe_env" NO_PROXY)"
+  # The proxy's address is the switch subnet's broadcast - 3, and its
+  # listener port is 8118 (boxes::core::egress::PROXY_LISTENER_PORT).
+  if ! [[ "$pe_https" =~ ^http://100\.64\.[0-9]+\.[0-9]+:8118$ ]]; then
+    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the proxy's address on the switch at port 8118"
+    fail
+  fi
+  if [ "$pe_http" != "$pe_https" ]; then
+    echo "::error::the proxy_env box's HTTP_PROXY is '${pe_http:-<unset>}', not its HTTPS_PROXY '$pe_https'"
+    fail
+  fi
+  if [ "$pe_no" != ".min.internal,host.min.internal,localhost,127.0.0.1,e2e-direct.example,10.0.0.0/8" ]; then
+    echo "::error::the proxy_env box's NO_PROXY is '${pe_no:-<unset>}', not the local zone, loopback and the seed's no_proxy entries"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: HTTPS_PROXY=HTTP_PROXY=$pe_https, NO_PROXY=$pe_no"
+  echo "::endgroup::"
+}
+
+proof_bep_proxy_env_sets_node_use_env_proxy() {
+  echo "::group::proxy_env box: NODE_USE_ENV_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_node
+  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy
+  pe_env="$WORK/bep_proxy_env_sets_node_use_env_proxy.env"
+  pe_node="$(bep_env_value "$pe_env" NODE_USE_ENV_PROXY)"
+  if [ "$pe_node" != "1" ]; then
+    echo "::error::the proxy_env box's NODE_USE_ENV_PROXY is '${pe_node:-<unset>}', not 1"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: NODE_USE_ENV_PROXY=1"
+  echo "::endgroup::"
+}
+
+# Trust-store proofs (BEP-011). A GitHub grant box gets the proxy's root in
+# its own CA bundle copy and in /etc/ssl/certs under its subject hash, and
+# the trust variables point at them. A box with no grant, from the same
+# packages, gets none of it. Both seeds add ca-certificates, so the grant
+# box's bundle holds the system roots beside the root.
+BEP_TRUST_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+BEP_TRUST_ROOT=/etc/ssl/certs/minimal-box-egress-proxy-root.pem
+
+# Records case $1 as NOT RUN and returns 1 when this target cannot start a
+# GitHub grant box: the same three gates as the sealed-value proof.
+bep_trust_grant_gate() {
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local tg_control="$HOME/.minimal/bep/control.sock" tg_status
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    return 1
+  fi
+  tg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$tg_status" != "Signed in to GitHub"* ]]; then
+    not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
+    return 1
+  fi
+  if [ ! -S "$tg_control" ]; then
+    not_run "$1" "the Box Egress Proxy is not running: no $tg_control. Nothing starts it on this lane until https://github.com/gominimal/minimal/issues/2275 lands"
+    return 1
+  fi
+}
+
+# Removes the files bep_trust_box_files left for case $1.
+bep_trust_clean() {
+  local tc_ext
+  for tc_ext in env root bundle links err exec.err; do
+    rm -f "${WORK:?}/${1:?}.$tc_ext"
+  done
+}
+
+# Starts a box from a seed with ca-certificates, copies its trust store out
+# and destroys it. $1: the case name. $2: "grant" for a box with a GitHub
+# grant, "plain" for a box with none. Leaves $WORK/$1.env (the box's trust
+# variables), $WORK/$1.root and $WORK/$1.bundle (the files, empty when
+# absent) and $WORK/$1.links (each hashed-directory link and its target).
+bep_trust_box_files() {
+  local tb_case="$1" tb_kind="$2" tb_seed tb_out tb_sid tb_file
+  local -a tb_egress
+  tb_seed="$(hook_mktemp /tmp/mnltrust.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["ca-certificates"]\n'
+    if [ "$tb_kind" = grant ]; then
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    fi
+  } > "$tb_seed/minimal.toml"
+  mkdir "$tb_seed/.git"
+  # Only the grant box declares the GitHub hosts its grant needs. A box with
+  # no grant declares no egress rules: a --network host_ip box on a VM host
+  # refuses hostname rules at the start, and that box needs none.
+  tb_egress=()
+  if [ "$tb_kind" = grant ]; then
+    tb_egress=(--allow-dns-hosts github.com --allow-dns-hosts api.github.com
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com)
+  fi
+  tb_out="$(cd "$tb_seed" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$tb_case" | tr '_' '-' | cut -c1-36)-$tb_kind" \
+    ${tb_egress[@]+"${tb_egress[@]}"} \
+    </dev/null 2>"$WORK/$tb_case.err")" || {
+    echo "::error::'min session activate' of the $tb_kind box for $tb_case failed"
+    echo "--- stdout ---"; printf '%s\n' "$tb_out"
+    echo "--- stderr ---"; cat "$WORK/$tb_case.err" 2>/dev/null || true
+    rm -rf "${tb_seed:?}"
+    fail
+  }
+  rm -rf "${tb_seed:?}"
+  tb_sid="$(printf '%s\n' "$tb_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$tb_sid" sh -c 'env' >"$WORK/$tb_case.env" 2>"$WORK/$tb_case.exec.err"; then
+    echo "::error::'min session exec' in the $tb_kind box for $tb_case failed"
+    cat "$WORK/$tb_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # The grant's sealed value is never kept: only the trust variables are.
+  grep -E '^(SSL_CERT_FILE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS)=' "$WORK/$tb_case.env" \
+    | tr -d '\r' >"$WORK/$tb_case.env.tmp" || true
+  mv "$WORK/$tb_case.env.tmp" "$WORK/$tb_case.env"
+  for tb_file in root:"$BEP_TRUST_ROOT" bundle:"$BEP_TRUST_BUNDLE"; do
+    mnl session exec "$tb_sid" sh -c "cat '${tb_file#*:}' 2>/dev/null || true" \
+      2>/dev/null | tr -d '\r' >"$WORK/$tb_case.${tb_file%%:*}" || true
+  done
+  # shellcheck disable=SC2016 # expanded inside the box
+  mnl session exec "$tb_sid" sh -c \
+    'for f in /etc/ssl/certs/*.[0-9]; do [ -L "$f" ] && printf "%s %s\n" "${f##*/}" "$(readlink "$f")"; done; true' \
+    2>/dev/null | tr -d '\r' >"$WORK/$tb_case.links" || true
+  mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+}
+
+# The number of certificates in the PEM file $1.
+bep_trust_cert_count() {
+  grep -c -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null || true
+}
+
+proof_bep_root_ca_present_in_box_trust_store() {
+  echo "::group::GitHub grant box: the proxy's root in both trust-store forms (BEP-011)"
+  bep_trust_grant_gate bep_root_ca_present_in_box_trust_store || { echo "::endgroup::"; return 0; }
+  local tp_case=bep_root_ca_present_in_box_trust_store tp_hash tp_size tp_count
+  bep_trust_box_files "$tp_case" grant
+  if [ "$(bep_trust_cert_count "$WORK/$tp_case.root")" != 1 ]; then
+    echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if ! openssl x509 -noout -subject -in "$WORK/$tp_case.root" | grep -q 'Minimal Box Egress Proxy Root CA'; then
+    echo "::error::the certificate at $BEP_TRUST_ROOT in the grant box is not the proxy's root"
+    fail
+  fi
+  # The bundle is the system roots with the root appended.
+  tp_size="$(wc -c <"$WORK/$tp_case.root" | tr -d ' ')"
+  if ! tail -c "$tp_size" "$WORK/$tp_case.bundle" | cmp -s - "$WORK/$tp_case.root"; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE does not end with the proxy's root"
+    fail
+  fi
+  tp_count="$(bep_trust_cert_count "$WORK/$tp_case.bundle")"
+  if [ "${tp_count:-0}" -lt 2 ]; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE holds ${tp_count:-0} certificates, so the system roots are not beside the root"
+    fail
+  fi
+  # The hashed directory links the root under its subject hash.
+  tp_hash="$(openssl x509 -noout -subject_hash -in "$WORK/$tp_case.root")"
+  if ! grep -Eq "^$tp_hash\.[0-9] ${BEP_TRUST_ROOT##*/}\$" "$WORK/$tp_case.links"; then
+    echo "::error::the grant box's /etc/ssl/certs has no link $tp_hash.N to ${BEP_TRUST_ROOT##*/}"
+    echo "--- links ---"; cat "$WORK/$tp_case.links"
+    fail
+  fi
+  bep_trust_clean "$tp_case"
+  echo "grant box: the root is at $BEP_TRUST_ROOT, at the end of $BEP_TRUST_BUNDLE beside $((tp_count - 1)) system roots, and linked as $tp_hash"
+  echo "::endgroup::"
+}
+
+proof_bep_root_ca_absent_from_box_without_credentialed_upstream() {
+  echo "::group::box with no grant: no proxy root in its trust store (BEP-011)"
+  local ta_case=bep_root_ca_absent_from_box_without_credentialed_upstream ta_grant=""
+  # With a grant box from the same packages first, the plain box proves that
+  # the grant box's root did not reach the shared packages.
+  if bep_trust_grant_gate "${ta_case}_beside_a_grant_box"; then
+    bep_trust_box_files "${ta_case}_grant" grant
+    if [ "$(bep_trust_cert_count "$WORK/${ta_case}_grant.root")" != 1 ]; then
+      echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+      fail
+    fi
+    ta_grant="$WORK/${ta_case}_grant.root"
+  fi
+  bep_trust_box_files "$ta_case" plain
+  if [ -s "$WORK/$ta_case.root" ]; then
+    echo "::error::the box with no grant has a file at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if grep -q " ${BEP_TRUST_ROOT##*/}\$" "$WORK/$ta_case.links"; then
+    echo "::error::the box with no grant links ${BEP_TRUST_ROOT##*/} in /etc/ssl/certs"
+    fail
+  fi
+  if [ -n "$ta_grant" ] && grep -qFf <(grep -v -- '-----' "$ta_grant") "$WORK/$ta_case.bundle"; then
+    echo "::error::the $BEP_TRUST_BUNDLE of the box with no grant holds the grant box's root"
+    fail
+  fi
+  if [ -s "$WORK/$ta_case.env" ]; then
+    echo "::error::the box with no grant has trust variables set:"
+    cat "$WORK/$ta_case.env"
+    fail
+  fi
+  bep_trust_clean "$ta_case"
+  bep_trust_clean "${ta_case}_grant"
+  if [ -n "$ta_grant" ]; then
+    echo "box with no grant: no proxy root in its trust store, beside a grant box from the same packages"
+  else
+    echo "box with no grant: no proxy root in its trust store"
+  fi
+  echo "::endgroup::"
+}
+
+proof_bep_trust_env_points_at_bundle_and_root() {
+  echo "::group::GitHub grant box: SSL_CERT_FILE, REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS (BEP-011)"
+  bep_trust_grant_gate bep_trust_env_points_at_bundle_and_root || { echo "::endgroup::"; return 0; }
+  local te_case=bep_trust_env_points_at_bundle_and_root te_var te_want te_got
+  bep_trust_box_files "$te_case" grant
+  for te_var in SSL_CERT_FILE:"$BEP_TRUST_BUNDLE" REQUESTS_CA_BUNDLE:"$BEP_TRUST_BUNDLE" \
+    NODE_EXTRA_CA_CERTS:"$BEP_TRUST_ROOT"; do
+    te_want="${te_var#*:}"
+    te_got="$(bep_env_value "$WORK/$te_case.env" "${te_var%%:*}")"
+    if [ "$te_got" != "$te_want" ]; then
+      echo "::error::the grant box's ${te_var%%:*} is '${te_got:-<unset>}', not $te_want"
+      fail
+    fi
+  done
+  if [ "$(bep_trust_cert_count "$WORK/$te_case.root")" != 1 ] || [ ! -s "$WORK/$te_case.bundle" ]; then
+    echo "::error::the files the grant box's trust variables name are not in the box"
+    fail
+  fi
+  bep_trust_clean "$te_case"
+  echo "grant box: SSL_CERT_FILE=REQUESTS_CA_BUNDLE=$BEP_TRUST_BUNDLE, NODE_EXTRA_CA_CERTS=$BEP_TRUST_ROOT"
+  echo "::endgroup::"
+}
+
 proof_github_only_allowlist() {
   echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
@@ -14439,11 +14918,14 @@ PY
 # own drops rather than by the boxes' declared union.
 #
 # Two resident boxes with disjoint declared egress bound the union: box A
-# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the runner's
-# address as a /32 (the destination their own probes reach) and the fabric
-# (100.64.0.0/16), which carries the host alias, the node-plane baseline
-# set's one category-pair (NET-130: the alias is the registry and the cache,
-# shown beside the rules by `min session policy`). The arms:
+# declares 198.18.0.0/16 and box B 198.19.0.0/16 — the two halves of
+# 198.18.0.0/15, RFC 2544 benchmark space, spelled outside RFC 1918 so no
+# infrastructure rule can take a cross-box destination before the row's
+# own rules do — and both declare the runner's address as a /32 (the
+# destination their own probes reach) and the fabric (100.64.0.0/16),
+# which carries the host alias, the node-plane baseline set's one
+# category-pair (NET-130: the alias is the registry and the cache, shown
+# beside the rules by `min session policy`). The arms:
 #
 #   * each box's own probe to the runner's address arrives — the whole chain
 #     working, and the union's declared half live for a box's own address;
@@ -14452,12 +14934,13 @@ PY
 #     rows declare: it is dropped before any frame leaves the VM, under the
 #     gate's own unregistered rule, and the drop line names the source —
 #     the receipt for the frames the spoofer spoke;
-#   * box A's address toward 192.168.77.7, declared only by box B — the
-#     union's other half — is refused: the row that holds the source address
-#     decides, and box A's row does not cover it (the RFC 1918 the
-#     infrastructure set takes where the row's own allow-list does not);
-#   * box B's address toward 10.0.0.7, box A's private half, refused the
-#     same way from the other side;
+#   * box A's address toward 198.19.0.7, declared only by box B — the
+#     union's other half — is refused under egress-undeclared-subnet: the
+#     row that holds the source address decides, and box A's row does not
+#     cover it — the verdict the union bound rides on, which the public
+#     range cannot let the private-space rule answer for;
+#   * box B's address toward 198.18.0.7, box A's half, refused the same way
+#     from the other side;
 #   * box A's address toward 198.51.100.7 — beyond the whole union — is
 #     refused by box A's own rules (egress-undeclared-subnet);
 #   * a made-up in-plan lease toward that same 198.51.100.7 is dropped the
@@ -14800,11 +15283,11 @@ ESU_LISTENER_EOF
 
   esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-a --network own_ip \
-    --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.18.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-a.err")" || {
-    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box A's activate (--network own_ip, 198.18.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-a.err" 2>/dev/null || true
     esu_fail
   }
@@ -14817,11 +15300,11 @@ ESU_LISTENER_EOF
   fi
   esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-b --network own_ip \
-    --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.19.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-b.err")" || {
-    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box B's activate (--network own_ip, 198.19.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-b.err" 2>/dev/null || true
     esu_fail
   }
@@ -14865,8 +15348,8 @@ ESU_LISTENER_EOF
     echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
     esu_fail
   fi
-  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric + $esu_host/32)"
-  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric + $esu_host/32)"
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 198.18.0.0/16 + the fabric + $esu_host/32)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 198.19.0.0/16 + the fabric + $esu_host/32)"
 
   # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
   # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
@@ -14966,9 +15449,9 @@ ESU_LISTENER_EOF
     echo "box $esu_box's effective policy (the baseline set beside the rules):"
     printf '%s\n' "$esu_policy" | sed 's/^/  /'
     if [ "$esu_box" = a ]; then
-      esu_line="subnets  10.0.0.0/8, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.18.0.0/16, 100.64.0.0/16, $esu_host/32"
     else
-      esu_line="subnets  192.168.0.0/16, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.19.0.0/16, 100.64.0.0/16, $esu_host/32"
     fi
     if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
@@ -15341,19 +15824,20 @@ source=$esu_ip_b (box B's own probe) destination=$esu_host:$ESU_LISTEN_PORT verd
   esu_rows="$esu_rows
 source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward a destination both rows declare)"
 
-  # Box A's address toward box B's private half — inside the union, outside
-  # the row that holds the worn address: the gate's infrastructure rule
-  # refuses it, and its line names both the source and the destination, so
-  # both are pinned inside the wait: a line box A's own traffic wrote under
-  # the same rule names a different destination and cannot pass for this
-  # arm's, and a line that predates the arm cannot either (the window
-  # discipline below).
-  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-infrastructure-destination 192.168.77.7 | wc -l)"
-  esu_run_spoofer cross-a "$esu_ip_a" 192.168.77.7 esu-spoof-cross-a 3 no
+  # Box A's address toward box B's half — inside the union, outside the row
+  # that holds the worn address: box A's own rules refuse it, under
+  # egress-undeclared-subnet — the public half no infrastructure rule
+  # takes, so the refusal is the row's own and the union bound it proves.
+  # The line names both the source and the destination, so both are pinned
+  # inside the wait: a line box A's own traffic wrote under the same rule
+  # names a different destination and cannot pass for this arm's, and a
+  # line that predates the arm cannot either (the window discipline below).
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet 198.19.0.7 | wc -l)"
+  esu_run_spoofer cross-a "$esu_ip_a" 198.19.0.7 esu-spoof-cross-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box A's address completed a flow to 192.168.77.7 — box B's declared half must be refused for a source box A's row holds"
+      echo "::error::the spoofer wearing box A's address completed a flow to 198.19.0.7 — box B's declared half must be refused for a source box A's row holds"
       esu_fail
       ;;
   esac
@@ -15361,13 +15845,25 @@ source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-infrastructure-destination \
-    192.168.77.7 "$esu_prior")" || {
-    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet \
+    198.19.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box A's address toward 198.19.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
+source=$esu_ip_a destination=198.19.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box B's declared half, which box A's row does not cover)"
+
+  # The window pace: box A wears two undeclared-subnet arms — this one and
+  # the far-side one below — and the gate's limiter writes one line per
+  # source per rule per DROP_WARN_MIN_INTERVAL (60s), keyed by source and
+  # rule only, never the destination (DropLimiter::decide in
+  # crates/minvmd/src/net/egress_gate.rs). The far-side arm's line would be
+  # Silent inside this arm's window and never land, failing its wait. The
+  # made-up arms dodge the same limiter by wearing a fresh made-up address
+  # no row holds; these two arms cannot — the address each wears is box
+  # A's own, and that is the bound they prove — so the window is waited
+  # out instead.
+  sleep 60
 
   # Box A's address toward a destination no resident box declared — beyond
   # the whole union: the row's own rules refuse it, and the undeclared-subnet
@@ -15431,15 +15927,15 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
   esu_rows="$esu_rows
 source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source names the source, no marker — an in-plan lease no row holds never reaches past the union)"
 
-  # Box B's address toward box A's private half: the same refusal, worn from
-  # the other side — whichever box's address the spoofer wears, its own row is
+  # Box B's address toward box A's half: the same refusal, worn from the
+  # other side — whichever box's address the spoofer wears, its own row is
   # the one that decides, and the destination stays pinned inside the wait.
-  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-infrastructure-destination 10.0.0.7 | wc -l)"
-  esu_run_spoofer cross-b "$esu_ip_b" 10.0.0.7 esu-spoof-cross-b 3 no
+  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-undeclared-subnet 198.18.0.7 | wc -l)"
+  esu_run_spoofer cross-b "$esu_ip_b" 198.18.0.7 esu-spoof-cross-b 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box B's address completed a flow to 10.0.0.7 — box A's declared half must be refused for a source box B's row holds"
+      echo "::error::the spoofer wearing box B's address completed a flow to 198.18.0.7 — box A's declared half must be refused for a source box B's row holds"
       esu_fail
       ;;
   esac
@@ -15447,13 +15943,13 @@ source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at 
     echo "::error::a refused spoof from box B's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-infrastructure-destination \
-    10.0.0.7 "$esu_prior")" || {
-    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-undeclared-subnet \
+    198.18.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box B's address toward 198.18.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box A's declared half, which box B's row does not cover)"
+source=$esu_ip_b destination=198.18.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box A's declared half, which box B's row does not cover)"
 
   # An address outside the plan's lease block: refused outright, under either
   # posture — outside the plan there is no lease to spoof. The source is
@@ -22736,6 +23232,13 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
     proof_github_only_allowlist
+    proof_bep_second_box_needs_no_sign_in
+    proof_bep_box_env_holds_sealed_value_only
+    proof_bep_proxy_env_and_no_proxy_are_set
+    proof_bep_proxy_env_sets_node_use_env_proxy
+    proof_bep_root_ca_present_in_box_trust_store
+    proof_bep_root_ca_absent_from_box_without_credentialed_upstream
+    proof_bep_trust_env_points_at_bundle_and_root
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -22790,7 +23293,14 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | host_ip_deny_all \
-    | daemon_fetch_under_deny_all_host_address_box)
+    | daemon_fetch_under_deny_all_host_address_box \
+    | bep_second_box_needs_no_sign_in \
+    | bep_box_env_holds_sealed_value_only \
+    | bep_proxy_env_and_no_proxy_are_set \
+    | bep_proxy_env_sets_node_use_env_proxy \
+    | bep_root_ca_present_in_box_trust_store \
+    | bep_root_ca_absent_from_box_without_credentialed_upstream \
+    | bep_trust_env_points_at_bundle_and_root)
     "proof_$1"
     ;;
   *)
@@ -22825,6 +23335,12 @@ case "${1:-}" in
     echo "         escape_reaches_only_declared_union"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
+    echo "         bep_second_box_needs_no_sign_in"
+    echo "         bep_box_env_holds_sealed_value_only"
+    echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
+    echo "         bep_root_ca_present_in_box_trust_store"
+    echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
+    echo "         bep_trust_env_points_at_bundle_and_root"
     exit 2
     ;;
 esac

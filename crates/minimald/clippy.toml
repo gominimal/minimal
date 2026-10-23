@@ -18,4 +18,8 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "use crate::traced::spawn (or spawn_detached for a task that outlives its request)" },
     { path = "tokio::task::spawn", reason = "use crate::traced::spawn (or spawn_detached for a task that outlives its request)" },
     { path = "tokio::task::spawn_blocking", reason = "use crate::traced::spawn_blocking" },
+    # Restated from /clippy.toml: `Entry::unpack` resolves a hardlink's link
+    # name against the process CWD, not the destination root.
+    { path = "tar::Entry::unpack", reason = "resolves hardlink targets against the process CWD, escaping the destination root; use `Archive::unpack` or intercept hardlinks (see `common::archive::extract_tar_impl`)" },
+    { path = "async_tar::Entry::unpack", reason = "resolves hardlink targets against the process CWD, escaping the destination root; use `Archive::unpack` or intercept hardlinks (see `common::archive::extract_tar_impl`)" },
 ]

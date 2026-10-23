@@ -2707,6 +2707,7 @@ fn launcher_with(
         publications: Default::default(),
         // The test's own state directory, the one its context builds under.
         state_dir: state_path.to_path_buf(),
+        root_certificate: None,
     }
 }
 
@@ -6947,4 +6948,207 @@ async fn shell_exit_keep_item_names_the_restored_registration_for_a_registered_b
         registered.contains(delete) && unregistered.contains(delete),
         "both prompts keep the Delete item"
     );
+}
+
+/// BEP-007: a grant's sealed value is placed in the grant's environment
+/// variable, over any value the session's environment held there, and is
+/// the only value the variable holds: in the published per-attach files the
+/// shell re-reads before every command, and in what the host runs in the
+/// box. A box with no grant gets no such variable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_value_is_placed_in_its_grant_variable_only() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    const PLAINTEXT: &str = "ghp_plaintexttoken";
+    let tmp = tempfile::tempdir().unwrap();
+    let home =
+        DaemonAbsPath::try_new(camino::Utf8PathBuf::try_from(tmp.path().to_path_buf()).unwrap())
+            .unwrap();
+    let paths = BoxPaths {
+        home: home.clone(),
+        ..test_paths()
+    };
+    // A value already in the variable is the one a delivery must replace.
+    // The launch places the deliveries before the host is built, the way
+    // `launch_host` does.
+    let mut attach_env = AttachEnv {
+        inherited: vec![],
+        connection: vec![
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
+        ],
+    };
+    let connection_env = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    let (host, _handle) = Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths,
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env,
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+
+    // The shell's half: the files it re-reads before every command.
+    let json = std::fs::read_to_string(home.sub_path_unchecked(ATTACH_ENV_JSON_REL).as_str())
+        .expect("the build publishes the per-attach environment");
+    let published: ConnectionEnv = serde_json_lenient::from_str(&json).expect("{json}");
+    assert_eq!(published.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(
+        published.get("TERM").map(String::as_str),
+        Some("xterm-256color")
+    );
+    assert_eq!(published.len(), 2, "nothing else is placed: {published:?}");
+    for rel in [ATTACH_ENV_SH_REL, ATTACH_ENV_FISH_REL, ATTACH_ENV_JSON_REL] {
+        let body = std::fs::read_to_string(home.sub_path_unchecked(rel).as_str()).unwrap();
+        assert!(body.contains(SEALED), "{rel}: {body}");
+        assert!(
+            !body.contains(PLAINTEXT),
+            "{rel} holds the plaintext: {body}"
+        );
+    }
+
+    // The host's half: what it runs in the box sees the sealed value.
+    let output = host
+        .command_in_session("sh", ["-c", "printenv GH_TOKEN"], Default::default())
+        .expect("a host-side command under test")
+        .output()
+        .expect("printenv runs");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), SEALED);
+
+    // A box with no grant places nothing.
+    let mut env = ConnectionEnv::new();
+    place_sealed_deliveries(&mut env, boxes::SessionId::nil(), &[]);
+    assert!(env.is_empty(), "{env:?}");
+
+    // A name that is not a variable name places nothing: it would be
+    // shell code in the file the box's shell sources.
+    place_sealed_deliveries(
+        &mut env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "X=1; touch /tmp/owned #".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert!(env.is_empty(), "{env:?}");
+}
+
+/// BEP-007: the `AttachEnv` a launch hands the launcher holds each grant's
+/// sealed value, so the shell's launch environment has it before its
+/// entrypoint runs. The connection layer sits above the composition, so the
+/// sealed value wins over a composition value in the same variable.
+#[test]
+fn sealed_value_reaches_the_shell_launch_environment() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    let mut attach_env = AttachEnv {
+        inherited: vec![("LANG".to_string(), "C.UTF-8".to_string())],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert_eq!(kept.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(attach_env.connection_env(), kept);
+    assert!(
+        attach_env
+            .connection
+            .contains(&("GH_TOKEN".to_string(), SEALED.to_string())),
+        "{:?}",
+        attach_env.connection
+    );
+    let env = layer_session_env(
+        session_baseline_env("box-1", None),
+        attach_env.inherited.clone(),
+        vec![("GH_TOKEN".to_string(), "from-the-composition".to_string())],
+        attach_env.connection.clone(),
+    );
+    assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+    assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+
+    // A box with no grant changes nothing in the launch environment.
+    let mut plain = AttachEnv {
+        inherited: vec![],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(&mut plain, boxes::SessionId::nil(), &[]);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        plain.connection,
+        vec![("TERM".to_string(), "xterm-256color".to_string())]
+    );
+}
+
+// BEP-011: a box with the proxy's root and its own bundle gets the three
+// trust variables, at its own bundle and root. A box whose packages ship no
+// bundle gets NODE_EXTRA_CA_CERTS alone, so a tool that reads the bundle
+// variables keeps its public roots. A box without the root gets none.
+#[test]
+fn trust_env_points_at_bundle_and_root() {
+    let vars = launch_trust_env(true, true);
+    let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, boxes::core::bep::TRUST_ENV_VARIABLES);
+    let get = |name: &str| {
+        vars.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(get("SSL_CERT_FILE"), Some(BOX_CA_BUNDLE));
+    assert_eq!(get("REQUESTS_CA_BUNDLE"), Some(BOX_CA_BUNDLE));
+    assert_eq!(get("NODE_EXTRA_CA_CERTS"), Some(BOX_ROOT_CERTIFICATE));
+    assert!(BOX_CA_BUNDLE.starts_with(BOX_CA_DIR));
+    assert!(BOX_ROOT_CERTIFICATE.starts_with(BOX_CA_DIR));
+
+    assert_eq!(
+        launch_trust_env(true, false),
+        vec![(
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            BOX_ROOT_CERTIFICATE.to_string()
+        )],
+        "with no bundle only the root is named"
+    );
+    assert!(launch_trust_env(false, true).is_empty());
+    assert!(launch_trust_env(false, false).is_empty());
+}
+
+// BEP-011: the trust variables sit below the composed environment, so a box
+// spec that sets one keeps its own value, and the others still reach the box.
+#[test]
+fn trust_env_keeps_a_spec_value() {
+    let mut env = layer_session_env(
+        session_baseline_env("box", None),
+        Vec::new(),
+        vec![("SSL_CERT_FILE".to_string(), "/spec/roots.pem".to_string())],
+        Vec::new(),
+    )
+    .into_iter()
+    .collect::<std::collections::BTreeMap<_, _>>();
+    layer_trust_env(&mut env, true, true);
+    assert_eq!(env["SSL_CERT_FILE"], "/spec/roots.pem");
+    assert_eq!(env["REQUESTS_CA_BUNDLE"], BOX_CA_BUNDLE);
+    assert_eq!(env["NODE_EXTRA_CA_CERTS"], BOX_ROOT_CERTIFICATE);
 }

@@ -58,7 +58,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+        uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
         with:
           remove_android: true
           remove_dotnet: true
@@ -80,7 +80,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -205,7 +205,7 @@ jobs:
         # dir alongside the per-iteration boot logs, so a red nightly ships the
         # daemon's own logs/state/config — not just scraped console tails.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: soak-boot-logs
           path: ${{ runner.temp }}/soak-logs
@@ -291,7 +291,7 @@ jobs:
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below. zizmor is version-pinned so new audits
         # arrive through a deliberate bump, not an overnight hygiene failure.
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-machete,zizmor@1.30.1
       - name: actionlint (workflow lint)
@@ -339,7 +339,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Install cargo-hack
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-hack
       - name: cargo hack check --rust-version

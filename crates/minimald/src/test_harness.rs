@@ -733,22 +733,14 @@ impl russh::client::Handler for TestClientHandler {
 /// Build a `CreateSessionRequest` with sensible defaults for tests
 /// that only care about `name` and `project_path`.
 pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSessionRequest {
-    minimald_rpc::CreateSessionRequest {
-        config: minimald_rpc::BoxConfig {
-            name: Some(name.to_string()),
-            project_path: paths::HostAbsPath::try_new(project).unwrap(),
-            network: boxes::NetworkMode::default(),
-            policy: Default::default(),
-            task_addresses: Vec::new(),
-            box_id: None,
-            box_addresses: None,
-            hooks_enabled: true,
-            attrs: Default::default(),
-        },
-        // No assertion: the harness's client *is* this daemon's build, and
-        // the version gate has its own tests.
-        must_match_version: None,
-    }
+    // No version assertion: the harness's client *is* this daemon's build,
+    // and the version gate has its own tests.
+    minimald_rpc::CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new(project).unwrap(),
+        boxes::NetworkMode::default(),
+        Default::default(),
+    )
 }
 
 /// Unwrap the `Ready` arm of a [`minimald_rpc::ConfigureLoadoutResponse`],
@@ -812,4 +804,23 @@ pub async fn create_configured_session(
         }
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    /// The harness's create request is the shared constructor's, with the
+    /// default network and policy: a field the constructor gains reaches
+    /// every harness-driven create without an edit here.
+    #[test]
+    fn harness_create_request_uses_the_constructor() {
+        assert_eq!(
+            super::create_session_req("harness-box", "/uwu"),
+            minimald_rpc::CreateSessionRequest::new(
+                "harness-box",
+                paths::HostAbsPath::try_new("/uwu").unwrap(),
+                boxes::NetworkMode::default(),
+                Default::default(),
+            )
+        );
+    }
 }
