@@ -262,7 +262,10 @@ developer running agent boxes, build-infra operator, and auditor.
     credentials v in credentials(c) ∪ planted(d) ∪ planted_in_paths(c), where
     every v is at least 16 characters drawn so that no v is a substring of
     any declared input, package name or version of c, and planted_in_paths(c)
-    plants one v as a path segment of each location kind: v not in ir(c),
+    plants one v in each part the sub-bullets drop (a location's userinfo,
+    path, query and fragment, a `purl`'s qualifiers and subpath) and none in
+    a part they keep (a GitHub import's `owner/repo`, a file entry's relative
+    `path`, which are identity and the user's own naming): v not in ir(c),
     and no string anywhere in parse_s(emit_s(c)) equals or contains v
   - THE SYSTEM SHALL record an environment-variable asset (`[env_vars]`,
     `[loadouts.vars]`) by its name and its provenance only, never its value.
