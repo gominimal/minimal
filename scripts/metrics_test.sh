@@ -881,6 +881,28 @@ PY
     python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["dirty"]=True; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-dirty.json"
     status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-dirty.json" >/dev/null 2>&1) || status=$?
     [ "$status" -eq 2 ] && ok "a dirty-tree snapshot is refused" || bad "dirty snapshot exit $status"
+    # The artifact is untrusted: a field that would leave history/ is refused
+    # before anything is written, and so is a dirty flag that is not a boolean.
+    local bad_sha before_tree
+    before_tree="$(git -C "$remote" rev-parse metrics-data)"
+    for bad_sha in '../../x' 'ABC1234' 'abc123' 'abc1234/../../x' 'abc1234
+'; do
+        python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["sha7"]=sys.argv[3]; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-badsha.json" "$bad_sha"
+        status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-badsha.json" --date 2026-10-16 >"$tmp/pub-badsha.out" 2>&1) || status=$?
+        [ "$status" -eq 2 ] && grep -q 'refusing git.sha7' "$tmp/pub-badsha.out" \
+            && ok "a sha7 of $(printf '%q' "$bad_sha") is refused" || bad "sha7 $(printf '%q' "$bad_sha") exit $status: $(cat "$tmp/pub-badsha.out")"
+    done
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["git"]["dirty"]="false"; json.dump(s,open(sys.argv[2],"w"))' "$tmp/pub-snap.json" "$tmp/pub-strdirty.json"
+    status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-strdirty.json" --date 2026-10-16 >/dev/null 2>&1) || status=$?
+    [ "$status" -eq 2 ] && ok "a dirty flag that is not the boolean false is refused" || bad "string dirty exit $status"
+    local bad_date
+    for bad_date in '../2026-10-16' '2026-10-16/x' '2026-10-16
+x'; do
+        status=0; (cd "$repo" && bash scripts/metrics/publish-snapshot.sh "$tmp/pub-snap.json" --date "$bad_date" >/dev/null 2>&1) || status=$?
+        [ "$status" -eq 2 ] && ok "a date of $(printf '%q' "$bad_date") is refused" || bad "date $(printf '%q' "$bad_date") exit $status"
+    done
+    [ "$(git -C "$remote" rev-parse metrics-data)" = "$before_tree" ] && ok "no refused snapshot reached metrics-data" || bad "a refused snapshot was pushed"
+    [ ! -e "$tmp/x" ] && [ ! -e "$repo/x" ] && ok "nothing was written outside history/" || bad "a file escaped history/"
     [ "$(git -C "$remote" rev-parse main)" = "$main_before" ] && ok "main is still untouched after every publish" || bad "main moved later"
 }
 
@@ -892,6 +914,16 @@ nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the s
     [ "$budget" = "120" ] && ok "the metrics job declares timeout-minutes 120" || bad "metrics job timeout: '$budget'"
     awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'continue-on-error: true' && ok "the job is non-blocking" || bad "metrics job blocks"
     awk '/^  metrics:$/{p=1} p' "$wf" | grep -q 'publish-snapshot.sh' && ok "the job publishes through the script" || bad "no publish step"
+    # The collector runs untrusted code, so the write token lives only in
+    # `publish`, which runs on main alone.
+    local collector publisher
+    collector="$(awk '/^  metrics:$/{p=1} /^  publish:$/{p=0} p' "$wf")"
+    publisher="$(awk '/^  publish:$/{p=1} p' "$wf")"
+    ! printf '%s\n' "$collector" | grep -q 'contents: write' && ! printf '%s\n' "$collector" | grep -q 'persist-credentials: true' \
+        && ok "the collector job holds no write token and persists none" || bad "the collector job can write"
+    printf '%s\n' "$publisher" | grep -q 'contents: write' && printf '%s\n' "$publisher" | grep -q "github.ref == 'refs/heads/main'" \
+        && printf '%s\n' "$publisher" | grep -q 'publish-snapshot.sh' \
+        && ok "publish alone holds the write token, on main only" || bad "publish job shape"
     grep -q '^  workflow_dispatch:' "$wf" && grep -q '^  workflow_call:' "$wf" && ok "the workflow runs alone and when called" || bad "metrics.yml lacks workflow_dispatch or workflow_call"
     [ -f "$nightly" ] || { echo "skip - no nightly workflow in this tree"; return; }
     awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$nightly" | grep -q 'uses: ./.github/workflows/metrics.yml' && ok "the nightly calls metrics.yml" || bad "nightly-tests does not call metrics.yml"

@@ -42,18 +42,34 @@ snapshot="$(cd "$(dirname "$snapshot")" && pwd)/$(basename "$snapshot")"
 
 # Refuse what is not history. The checks are the snapshot's own fields, so a
 # caller cannot publish a darwin run by naming the file differently.
-read -r mode dirty sha7 <<EOF
-$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(s["run"]["mode"], str(s["git"]["dirty"]).lower(), s["git"]["sha7"])' "$snapshot")
-EOF
-if [ "$mode" != "full" ]; then
-    echo "publish-snapshot: refusing a '$mode' snapshot; only a full run is history" >&2
-    exit 2
-fi
-if [ "$dirty" = "true" ]; then
-    echo "publish-snapshot: refusing a snapshot of a dirty tree" >&2
-    exit 2
-fi
+#
+# The snapshot is untrusted input: in CI it is an artifact of the collector
+# job, which ran the tree's build scripts and tools from crates.io, and this
+# script runs with a write token. So every field that reaches a path or a git
+# command is checked against its exact shape here, in one place, before use:
+# a `sha7` of `../x` would otherwise put the file outside history/.
+sha7="$(python3 - "$snapshot" <<'PY'
+import json, re, sys
+try:
+    s = json.load(open(sys.argv[1]))
+    mode, dirty, sha7 = s["run"]["mode"], s["git"]["dirty"], s["git"]["sha7"]
+except (OSError, ValueError, KeyError, TypeError) as e:
+    print(f"publish-snapshot: not a snapshot: {e}", file=sys.stderr); sys.exit(1)
+if mode != "full":
+    print(f"publish-snapshot: refusing a {mode!r} snapshot; only a full run is history", file=sys.stderr); sys.exit(2)
+if dirty is not False:
+    print("publish-snapshot: refusing a snapshot of a dirty tree", file=sys.stderr); sys.exit(2)
+if not isinstance(sha7, str) or not re.fullmatch(r"[0-9a-f]{7}", sha7):
+    print(f"publish-snapshot: refusing git.sha7 {sha7!r}; want seven lowercase hex digits", file=sys.stderr); sys.exit(2)
+print(sha7)
+PY
+)" || exit $?
 [ -n "$date" ] || date="$(date -u +%Y-%m-%d)"
+# [[ =~ ]] anchors the whole string; grep -x would pass one good line of many.
+if ! [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "publish-snapshot: refusing date '$date'; want YYYY-MM-DD" >&2
+    exit 2
+fi
 name="$date-$sha7.json"
 
 work="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-publish)"
