@@ -36,6 +36,126 @@
    "dependencies": [
     {
      "kind": null,
+     "name": "aes-gcm"
+    },
+    {
+     "kind": null,
+     "name": "base64"
+    },
+    {
+     "kind": null,
+     "name": "clap"
+    },
+    {
+     "kind": null,
+     "name": "getrandom"
+    },
+    {
+     "kind": null,
+     "name": "p256"
+    },
+    {
+     "kind": null,
+     "name": "rcgen"
+    },
+    {
+     "kind": null,
+     "name": "rustls"
+    },
+    {
+     "kind": null,
+     "name": "rustls-native-certs"
+    },
+    {
+     "kind": null,
+     "name": "rustls-pki-types"
+    },
+    {
+     "kind": null,
+     "name": "serde"
+    },
+    {
+     "kind": null,
+     "name": "serde_json"
+    },
+    {
+     "kind": null,
+     "name": "sha2"
+    },
+    {
+     "kind": null,
+     "name": "thiserror"
+    },
+    {
+     "kind": null,
+     "name": "time"
+    },
+    {
+     "kind": null,
+     "name": "tokio"
+    },
+    {
+     "kind": null,
+     "name": "tokio-rustls"
+    },
+    {
+     "kind": null,
+     "name": "tokio-util"
+    },
+    {
+     "kind": null,
+     "name": "tracing"
+    },
+    {
+     "kind": null,
+     "name": "tracing-subscriber"
+    },
+    {
+     "kind": null,
+     "name": "zeroize"
+    },
+    {
+     "kind": "dev",
+     "name": "proptest"
+    },
+    {
+     "kind": "dev",
+     "name": "reqwest"
+    },
+    {
+     "kind": "dev",
+     "name": "rustls-webpki"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
+    },
+    {
+     "kind": null,
+     "name": "core-foundation"
+    },
+    {
+     "kind": null,
+     "name": "security-framework"
+    },
+    {
+     "kind": null,
+     "name": "security-framework-sys"
+    },
+    {
+     "kind": null,
+     "name": "libc"
+    }
+   ],
+   "description": "Box Egress Proxy: credential modules and the sealed envelope a box carries in place of a credential.",
+   "id": "path+file:///workbench/minimal/crates/bep#0.0.1",
+   "manifest_path": "<root>/crates/bep/Cargo.toml",
+   "name": "bep"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
      "name": "thiserror"
     },
     {
@@ -480,6 +600,10 @@
     },
     {
      "kind": "dev",
+     "name": "proptest"
+    },
+    {
+     "kind": "dev",
      "name": "tempfile"
     }
    ],
@@ -624,6 +748,10 @@
     },
     {
      "kind": null,
+     "name": "crc32c"
+    },
+    {
+     "kind": null,
      "name": "google-cloud-storage"
     },
     {
@@ -720,6 +848,10 @@
     },
     {
      "kind": null,
+     "name": "nix"
+    },
+    {
+     "kind": null,
      "name": "object"
     },
     {
@@ -753,6 +885,10 @@
     {
      "kind": null,
      "name": "url"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile"
     }
    ],
    "description": "mip check linting of minimal.toml, packages, profiles, and stacks.",
@@ -1579,6 +1715,14 @@
     },
     {
      "kind": null,
+     "name": "base64"
+    },
+    {
+     "kind": null,
+     "name": "bep"
+    },
+    {
+     "kind": null,
      "name": "boxes"
     },
     {
@@ -1616,6 +1760,10 @@
     {
      "kind": null,
      "name": "futures"
+    },
+    {
+     "kind": null,
+     "name": "getrandom"
     },
     {
      "kind": null,
@@ -1664,6 +1812,10 @@
     {
      "kind": null,
      "name": "ot"
+    },
+    {
+     "kind": null,
+     "name": "p256"
     },
     {
      "kind": null,
@@ -1736,6 +1888,10 @@
     {
      "kind": null,
      "name": "version"
+    },
+    {
+     "kind": null,
+     "name": "zeroize"
     },
     {
      "kind": "dev",
@@ -2382,6 +2538,7 @@
  ],
  "workspace_members": [
   "path+file:///workbench/minimal/crates/args#0.0.1",
+  "path+file:///workbench/minimal/crates/bep#0.0.1",
   "path+file:///workbench/minimal/crates/async-dialog#0.0.1",
   "path+file:///workbench/minimal/crates/lcache#0.0.1",
   "path+file:///workbench/minimal/crates/common#0.0.1",

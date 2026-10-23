@@ -46,7 +46,7 @@ build = [
     "sandbox",
 ]
 # The session plane's library crates.
-session = ["boxes", "minimal-client", "minimald-rpc"]
+session = ["bep", "boxes", "minimal-client", "minimald-rpc"]
 # The build-plane facade the product crates embed.
 facade = ["mctx"]
 # The product surface: the binaries users run.
