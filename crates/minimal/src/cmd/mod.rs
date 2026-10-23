@@ -19,6 +19,7 @@ use crate::*;
 
 mod admin;
 mod auth;
+mod box_audit;
 mod box_spec;
 // `boxes.rs` is mounted under another name: see its module docs.
 #[path = "boxes.rs"]
@@ -36,6 +37,7 @@ pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_status};
+pub use box_audit::AuditSelfUnsupportedUnenrolled;
 pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
@@ -89,7 +91,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
 /// Neither returns, so neither can run inside the span: the span would never
 /// end, and every span under it (the client's and the daemon's) would parent
 /// to one the collector never sees. A command returns this as its error
-/// ([`session_via_ssh`]); [`run`] takes it back out once the span has ended
+/// ([`box_via_ssh`]); [`run`] takes it back out once the span has ended
 /// and finishes it there. It is the [`crate::task::TaskExit`] pattern: a
 /// status carried on the error path, never printed.
 #[derive(Debug)]
@@ -225,9 +227,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
-        Some(Command::Box(BoxArgs {
-            command: BoxCommand::Spec(args),
-        })) => box_spec::cmd_box_spec(&cli.global_args, args),
+        Some(Command::Box(BoxArgs { command })) => match command {
+            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
+            BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
+        },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
@@ -772,16 +775,31 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::S
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
 /// back to `cmd_activate`.
-pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id: boxes::SessionId) {
+///
+/// With `only_if_unfinalized` (the cleanup after an activation the client
+/// gave up on) the daemon keeps a session that finished after all
+/// (inbox#690), and the answer says which it did: see
+/// [`cleanup_after_failed_finalize`], which waits for that answer.
+pub(crate) async fn best_effort_destroy(
+    client: &mut client::Client,
+    session_id: boxes::SessionId,
+    only_if_unfinalized: bool,
+) -> minimal_client::box_registration::CleanupOutcome {
+    use minimal_client::box_registration::CleanupOutcome;
+    if only_if_unfinalized {
+        return cleanup_after_failed_finalize(client, session_id).await;
+    }
     /// Ceiling on how long we let a cleanup RPC run. Chosen well
     /// above a healthy `DestroySession` (single-digit milliseconds
     /// on a UDS) so the timeout only fires against pathologies.
     const DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     use minimald_rpc::DestroySession;
-    let call = client
-        .oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest { id: session_id });
+    let call = client.oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest {
+        id: session_id,
+        only_if_unfinalized: false,
+    });
     match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
-        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
+        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => return CleanupOutcome::Destroyed,
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
             eprintln!(
                 "warning: could not remove the unfinished session {session_id}: {error}; \
@@ -800,6 +818,116 @@ pub(crate) async fn best_effort_destroy(client: &mut client::Client, session_id:
                  daemon did not answer within {DESTROY_TIMEOUT:?}; the session may \
                  still exist; run `min session destroy {session_id}` to remove it",
             );
+        }
+    }
+    CleanupOutcome::Unknown
+}
+
+/// The cleanup after an activation the client gave up on (inbox#690): a
+/// conditional destroy, waited for until the daemon answers. It waits in the
+/// session's mailbox behind any finalize still running, which a stalled
+/// fetch can hold for minutes, and only its answer says whether a box is
+/// live behind the registration's row. A timer would have to guess, and a
+/// wrong guess either withdraws a live box's row or leaves a removed
+/// session's row published with nothing able to withdraw it (the session is
+/// gone, so `min session destroy` no longer finds it). So past
+/// `NOTE_AFTER` the client says what it is waiting for, and waits on.
+///
+/// A Ctrl-C stops the wait, not the destroy: the daemon has it in hand and
+/// finishes it, keeping the session if its activation completed and removing
+/// it otherwise. Nothing the client can read then says which, since a
+/// session a destroy is in flight for is hidden from reads, so the outcome
+/// is [`Unknown`](CleanupOutcome::Unknown): the row stays, for a box that
+/// may be live, and the user is told how to see what became of it.
+async fn cleanup_after_failed_finalize(
+    client: &mut client::Client,
+    session_id: boxes::SessionId,
+) -> minimal_client::box_registration::CleanupOutcome {
+    use minimal_client::box_registration::CleanupOutcome;
+    use minimald_rpc::DestroySession;
+    const NOTE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The call's own deadline. The daemon bounds neither the finalize this
+    /// destroy waits behind nor the destroy, and a client RPC's usual 60 s
+    /// would turn a finalize still running into "unknown" and keep a row
+    /// the daemon may then orphan. The user's Ctrl-C is the bound; this only
+    /// keeps the timer finite.
+    const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    /// With no terminal on stdin (CI, a script) nobody presses Ctrl-C, so
+    /// the wait is bounded here instead and ends unknown: the row stays, the
+    /// daemon still settles the session, and the warning says how to see
+    /// what became of it.
+    const UNATTENDED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let deadline = if std::io::stdin().is_terminal() {
+        CLEANUP_DEADLINE
+    } else {
+        UNATTENDED_DEADLINE
+    };
+    let answer = {
+        let call = client.oneshot_rpc_with_deadline::<DestroySession>(
+            minimald_rpc::DestroySessionRequest {
+                id: session_id,
+                only_if_unfinalized: true,
+            },
+            deadline,
+        );
+        tokio::pin!(call);
+        let note = tokio::time::sleep(NOTE_AFTER);
+        tokio::pin!(note);
+        let mut noted = false;
+        loop {
+            tokio::select! {
+                answer = &mut call => break Some(answer),
+                () = &mut note, if !noted => {
+                    noted = true;
+                    eprintln!(
+                        "note: waiting for the daemon to finish or remove session {session_id}: \
+                         its activation is still running. Press Ctrl-C to stop waiting; the \
+                         daemon still finishes or removes the session on its own"
+                    );
+                }
+                _ = tokio::signal::ctrl_c() => break None,
+            }
+        }
+    };
+    match answer {
+        Some(Ok(minimald_rpc::Errorable::Ok(resp))) if resp.kept => {
+            eprintln!(
+                "note: the session {session_id} finished activating after this client gave \
+                 up on it, so it was kept: it is live (`min ls`)"
+            );
+            CleanupOutcome::Kept
+        }
+        Some(Ok(minimald_rpc::Errorable::Ok(_))) => CleanupOutcome::Destroyed,
+        // Already gone: a concurrent `min session destroy` removed it first,
+        // and nothing runs behind the row, so the row goes as for a destroy
+        // this client made. Kept, it could never be removed: the session the
+        // destroy command would look for no longer exists.
+        Some(Ok(minimald_rpc::Errorable::Err { error }))
+            if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) =>
+        {
+            CleanupOutcome::Destroyed
+        }
+        Some(Ok(minimald_rpc::Errorable::Err { error })) => {
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {error}; \
+                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+            );
+            CleanupOutcome::Unknown
+        }
+        Some(Err(e)) => {
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {e}; \
+                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+            );
+            CleanupOutcome::Unknown
+        }
+        None => {
+            eprintln!(
+                "warning: stopped waiting for session {session_id}; the daemon is still \
+                 finishing or removing it. `min ls` shows which once it is done, and `min \
+                 session destroy {session_id}` removes it if it is still there"
+            );
+            CleanupOutcome::Unknown
         }
     }
 }

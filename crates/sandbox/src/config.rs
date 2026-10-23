@@ -934,6 +934,10 @@ impl Config {
             }
         };
 
+        // Until the `Sandbox` exists (its `Drop` removes the directory from
+        // then on), a failure below would leave the directory behind.
+        let cleanup = RemoveUnlessKept((!self.keep_dirs).then(|| build_base_dir.clone()));
+
         // Validate FS mappings, creating any non-existent files as we go.
         for m in self.wd.fs_mappings() {
             match fs::metadata(&m.host_path) {
@@ -991,7 +995,32 @@ impl Config {
         }
         .map_err(|e| Error::IO("synthesizing user/group configuration", sd, e))?;
 
-        Sandbox::new(build_base_dir, self, channel)
+        let sandbox = Sandbox::new(build_base_dir, self, channel)?;
+        cleanup.keep();
+        Ok(sandbox)
+    }
+}
+
+/// Removes a sandbox directory on drop unless [`Self::keep`] is called: the
+/// cleanup for a directory that never became a [`Sandbox`].
+struct RemoveUnlessKept(Option<PathBuf>);
+
+impl RemoveUnlessKept {
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RemoveUnlessKept {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take()
+            && let Err(e) = common::remove_dir_all(&dir)
+        {
+            tracing::warn!(
+                "failed to remove sandbox directory {} after a failed build: {e}",
+                dir.display()
+            );
+        }
     }
 }
 

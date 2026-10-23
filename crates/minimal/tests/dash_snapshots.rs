@@ -84,6 +84,8 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
         attrs: Default::default(),
     }
 }

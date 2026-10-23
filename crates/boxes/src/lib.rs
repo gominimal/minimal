@@ -1124,6 +1124,27 @@ impl HostIpEnforcement {
     }
 }
 
+/// One grant's sealed value, delivered into the box (BEP-007): the box's
+/// environment holds `sealed` in the variable `variable`. The value is
+/// sealed to this host's Box Egress Proxy key, so it is not a credential
+/// anywhere else. `Debug` prints the variable and never the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedDelivery {
+    /// The grant: the environment variable the value lands in.
+    pub variable: String,
+    /// The sealed value.
+    pub sealed: String,
+}
+
+impl fmt::Debug for SealedDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedDelivery")
+            .field("variable", &self.variable)
+            .field("sealed", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -1258,6 +1279,20 @@ pub struct Record {
     /// the field.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bound_ports: BTreeSet<SocketAddrV4>,
+
+    /// The sealed value of each of the box's GitHub grants, as the
+    /// creating client minted them (BEP-007). Every host launch places
+    /// each one in its grant's environment variable. Empty for a box with
+    /// no grant and a record that predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed_deliveries: Vec<SealedDelivery>,
+
+    /// The Box Egress Proxy's root certificate, PEM-encoded, as the
+    /// creating client handed it for a grant box (BEP-011). Every host
+    /// launch adds it to the box's own trust store. `None` for a box with
+    /// no grant and a record that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_certificate: Option<String>,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -1486,6 +1521,8 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: BTreeMap::new(),
         }
     }

@@ -97,7 +97,7 @@ fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Pat
 /// reduced to the session-name alphabet by the same sanitizer the activate
 /// autogen path uses, and the caller supplies the hex so a collision retry
 /// can re-mint with fresh entropy.
-fn task_session_name(task: &str, hex: &str) -> String {
+fn task_box_name(task: &str, hex: &str) -> String {
     format!("task-{}-{hex}", crate::sanitize_name_component(task))
 }
 
@@ -408,8 +408,8 @@ impl Drop for TaskRunInterrupt {
 
 fn arm_task_run_interrupt(
     global: &GlobalArgs,
-    session_id: boxes::SessionId,
-    session_name: String,
+    box_id: boxes::SessionId,
+    box_name: String,
     keep: bool,
 ) -> TaskRunInterrupt {
     let sock =
@@ -424,12 +424,12 @@ fn arm_task_run_interrupt(
         }
         if keep {
             eprintln!(
-                "\nInterrupted; session {session_name} kept — attach with: \
-                 min session attach {session_name}"
+                "\nInterrupted; session {box_name} kept — attach with: \
+                 min session attach {box_name}"
             );
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted; destroying session {session_name}…");
+        eprintln!("\nInterrupted; destroying session {box_name}…");
         // The whole connect-and-destroy is bounded by the same 10-second
         // cleanup ceiling as `best_effort_destroy` — the interrupt may well
         // mean the daemon is already wedged — and raced against a second
@@ -446,19 +446,22 @@ fn arm_task_run_interrupt(
             {
                 use minimald_rpc::{DestroySession, DestroySessionRequest};
                 let _ = client
-                    .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
+                    .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+                        id: box_id,
+                        only_if_unfinalized: false,
+                    })
                     .await;
             }
             // The run's own return never comes on this path, so the release
             // it owes is made here, inside the same bound.
-            release_task_name_hold(control_sock, session_id, &session_name, false).await;
+            release_task_name_hold(control_sock, box_id, &box_name, false).await;
         };
         tokio::select! {
             res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
                 if res.is_err() {
                     eprintln!(
                         "DestroySession timed out after {CLEANUP_TIMEOUT:?}; the session may \
-                         still be present (run `min session destroy {session_name}` to clean \
+                         still be present (run `min session destroy {box_name}` to clean \
                          up manually)"
                     );
                 }
@@ -649,21 +652,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     crate::ensure_daemon(global)?;
 
-    let config = minimald_rpc::BoxConfig {
-        name: Some(task_session_name(&args.task, &crate::random_hex4())),
-        project_path: abs_path.clone(),
-        network: boxes::NetworkMode::HostNet,
-        policy: boxes::BoxPolicy::default(),
-        task_addresses: Vec::new(),
-        box_id: None,
-        box_addresses: None,
-        // Same default as an activate with no flags, matching the
-        // loadout handling below. `min task run` has no `--no-hooks` of
-        // its own; a `--keep` session is attachable later, so its hooks
-        // should behave like any other session's.
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
+    // Same default as an activate with no flags, matching the loadout
+    // handling below: `min task run` has no `--no-hooks` of its own, and a
+    // `--keep` session is attachable later, so its hooks behave like any
+    // other session's. The constructor turns them on.
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        task_box_name(&args.task, &crate::random_hex4()),
+        abs_path.clone(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    // Refused by a daemon of another build before it allocates anything;
+    // `None` under the skew override.
+    request.must_match_version = minimal_client::version_assertion();
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
@@ -711,21 +712,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // `GetVersion` ahead of it.
     let mut client = crate::connect_daemon_unchecked(global).await?;
 
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-    };
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
     // The minted name can (rarely) collide; retry with fresh entropy on the
     // daemon's already-exists rejection, within the activate autogen budget.
-    let mut config = config;
     let mut attempts = 0u32;
     let created = loop {
         let resp = client
-            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                config: config.clone(),
-                // Refused by a daemon of another build before it allocates
-                // anything; `None` under the skew override.
-                must_match_version: minimal_client::version_assertion(),
-            })
+            .oneshot_rpc::<CreateSession>(request.clone())
             .await
             .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
         match resp {
@@ -733,7 +726,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             minimald_rpc::Errorable::Err { error } => {
                 if crate::should_retry_autogen(true, attempts, &error) {
                     attempts += 1;
-                    config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
+                    request.config.name = Some(task_box_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
                 bail!("{error}");
@@ -745,7 +738,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
-    let session_name = config
+    let session_name = request
+        .config
         .name
         .clone()
         .expect("the task session is always named");
@@ -886,7 +880,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     )
     .await
     {
-        crate::best_effort_destroy(&mut client, id).await;
+        // Unconditional: a task box is its run's own, and one whose finalize
+        // completed after the client gave up has no exec whose end would
+        // destroy it, so a kept box would be stranded. Only an activation's
+        // cleanup keeps a finished session (inbox#690).
+        crate::best_effort_destroy(&mut client, id, false).await;
         return Err(e);
     }
 
@@ -912,7 +910,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // always did. A run that bridged leaves its box to the daemon.
         Err(e) => {
             if !args.keep {
-                crate::best_effort_destroy(&mut client, id).await;
+                // Finished (the exec never started): unconditional.
+                crate::best_effort_destroy(&mut client, id, false).await;
             }
             Err(e)
         }
@@ -971,9 +970,9 @@ mod tests {
     /// pushed through the same sanitizer as the activate autogen so it
     /// always clears `validate_session_name`.
     #[test]
-    fn task_session_name_sanitizes_the_task_stem() {
-        assert_eq!(task_session_name("build", "9c1e"), "task-build-9c1e");
-        assert_eq!(task_session_name("My Task!", "4f2a"), "task-mytask-4f2a");
+    fn task_box_name_sanitizes_the_task_stem() {
+        assert_eq!(task_box_name("build", "9c1e"), "task-build-9c1e");
+        assert_eq!(task_box_name("My Task!", "4f2a"), "task-mytask-4f2a");
     }
 
     /// The hidden `min run` redirect names both canonical forms — the host

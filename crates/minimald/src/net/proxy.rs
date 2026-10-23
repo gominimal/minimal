@@ -4134,18 +4134,20 @@ mod tests {
         // The documented default each VM binds in its own guest: a free
         // port with a free rung above it — the walk's next proposal — probed
         // the way every other borrowed port in this suite is.
-        let guest_port = loop {
+        // Both host-side numbers stay bound on the host loopback from here
+        // until the forwards take them over: a number probed free and bound
+        // later is a race against every sibling test's own port pick. Each
+        // VM's proxy binds its own guest loopback, never this address.
+        let (guest_port, host_a_listener, host_b_listener) = loop {
             let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
-            drop(probe);
             let Some(rung) = crate::server::next_host_publish_port(port) else {
                 continue;
             };
             match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, rung)) {
-                Ok(rung_probe) => drop(rung_probe),
+                Ok(rung_probe) => break (port, probe, rung_probe),
                 Err(_) => continue,
             }
-            break port;
         };
         let rung = guest_port + u16::try_from(HOST_PUBLISH_PORT_STRIDE).unwrap();
 
@@ -4208,15 +4210,15 @@ mod tests {
             "the second VM's publication must take a host port of its own"
         );
 
-        // Each VM's own box, on its own lease, at the one external port both
-        // registries publish — the two leases the attach path would report.
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let box_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Each VM's own box, on its own lease, at a port of its own — the
+        // two leases the attach path would report. The backend binds its
+        // port itself: a number probed free on one address and bound later
+        // on another is a race against every other test's port pick, and
+        // lost it (`AddrInUse` on the second backend, CI and the lab gate).
         let lease_a = Ipv4Addr::new(127, 0, 0, 4);
         let lease_b = Ipv4Addr::new(127, 0, 0, 5);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        let box_port_a = spawn_backend_on(lease_a, "vm-a-web").await;
+        let box_port_b = spawn_backend_on(lease_b, "vm-b-api").await;
         a.sessions_manager()
             .await
             .hostnames()
@@ -4226,7 +4228,7 @@ mod tests {
                 SessionId::nil(),
                 "web",
                 lease_a,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_a)]),
             );
         b.sessions_manager()
             .await
@@ -4237,16 +4239,17 @@ mod tests {
                 SessionId::nil(),
                 "api",
                 lease_b,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_b)]),
             );
 
         // The forwards the publications describe, played by hand: each VM's
         // published host port relays to that VM's proxy — the half of the
-        // publication that lives on the host.
+        // publication that lives on the host — on the sockets held since the
+        // numbers were chosen.
         let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
         let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-        spawn_forward(host_a, guest_a).await;
-        spawn_forward(host_b, guest_b).await;
+        spawn_forward(host_a_listener, guest_a);
+        spawn_forward(host_b_listener, guest_b);
 
         // Both VMs' box names route through the host at the same time: each
         // published port reaches its own VM's box and refuses the other
@@ -4291,10 +4294,11 @@ mod tests {
         // the answerer's documented default on their own guest loopbacks —
         // so the host ports their *publications* contend for are the ones
         // that must differ, exactly as the proxies' did.
-        let zone_port = loop {
+        // Held on the host loopback until the UDP forwards take them, as the
+        // proxies' numbers are above.
+        let (zone_port, zone_a_socket, zone_b_socket) = loop {
             let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
-            drop(probe);
             let Some(zone_rung) = crate::server::next_host_publish_port(port) else {
                 continue;
             };
@@ -4302,10 +4306,9 @@ mod tests {
                 continue;
             }
             match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, zone_rung)) {
-                Ok(rung_probe) => drop(rung_probe),
+                Ok(rung_probe) => break (port, probe, rung_probe),
                 Err(_) => continue,
             }
-            break port;
         };
         let zone_rung = zone_port + u16::try_from(HOST_PUBLISH_PORT_STRIDE).unwrap();
 
@@ -4356,8 +4359,8 @@ mod tests {
         let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
         let zone_guest_a = SocketAddr::new(guest_a.ip(), zone_port);
         let zone_guest_b = SocketAddr::new(guest_b.ip(), zone_port);
-        spawn_udp_forward(zone_host_a, zone_guest_a).await;
-        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+        spawn_udp_forward(zone_a_socket, zone_guest_a);
+        spawn_udp_forward(zone_b_socket, zone_guest_b);
 
         // Both VMs' box names answer through the host at the same time, each
         // through the answerer port its VM published: its own box is held in
@@ -4452,31 +4455,33 @@ mod tests {
         // host — the property two pinned publications rely on. Probed free
         // on the loopback, TCP for the proxies and UDP for the answerers,
         // the way every other borrowed port in this suite is.
-        let free_tcp = |taken: &mut HashSet<u16>| -> u16 {
+        // Each pick keeps its socket bound on the host loopback until the
+        // forward takes it over (a number probed free and bound later is a
+        // race against every sibling's pick); the VMs bind their own guest
+        // loopbacks, never this address.
+        let free_tcp = |taken: &mut HashSet<u16>| -> (u16, std::net::TcpListener) {
             loop {
                 let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
                 let port = probe.local_addr().unwrap().port();
-                drop(probe);
                 if taken.insert(port) {
-                    break port;
+                    break (port, probe);
                 }
             }
         };
-        let free_udp = |taken: &mut HashSet<u16>| -> u16 {
+        let free_udp = |taken: &mut HashSet<u16>| -> (u16, std::net::UdpSocket) {
             loop {
                 let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
                 let port = probe.local_addr().unwrap().port();
-                drop(probe);
                 if taken.insert(port) {
-                    break port;
+                    break (port, probe);
                 }
             }
         };
         let mut handed = HashSet::new();
-        let proxy_a_port = free_tcp(&mut handed);
-        let answerer_a_port = free_udp(&mut handed);
-        let proxy_b_port = free_tcp(&mut handed);
-        let answerer_b_port = free_udp(&mut handed);
+        let (proxy_a_port, host_a_listener) = free_tcp(&mut handed);
+        let (answerer_a_port, zone_a_socket) = free_udp(&mut handed);
+        let (proxy_b_port, host_b_listener) = free_tcp(&mut handed);
+        let (answerer_b_port, zone_b_socket) = free_udp(&mut handed);
 
         // Two VM-shaped daemons: `in_microvm` is what routes an own-address
         // box to its lease, and each binds the pair its VM was handed on its
@@ -4537,15 +4542,15 @@ mod tests {
             "VM B's proxy must publish at exactly the number it was handed"
         );
 
-        // Each VM's own box, on its own lease, at the one external port both
-        // registries publish — the two leases the attach path would report.
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let box_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Each VM's own box, on its own lease, at a port of its own — the
+        // two leases the attach path would report. The backend binds its
+        // port itself: a number probed free on one address and bound later
+        // on another is a race against every other test's port pick, and
+        // lost it (`AddrInUse` on the second backend, CI and the lab gate).
         let lease_a = Ipv4Addr::new(127, 0, 0, 4);
         let lease_b = Ipv4Addr::new(127, 0, 0, 5);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        let box_port_a = spawn_backend_on(lease_a, "vm-a-web").await;
+        let box_port_b = spawn_backend_on(lease_b, "vm-b-api").await;
         a.sessions_manager()
             .await
             .hostnames()
@@ -4555,7 +4560,7 @@ mod tests {
                 SessionId::nil(),
                 "web",
                 lease_a,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_a)]),
             );
         b.sessions_manager()
             .await
@@ -4566,16 +4571,17 @@ mod tests {
                 SessionId::nil(),
                 "api",
                 lease_b,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_b)]),
             );
 
         // The forwards those publications describe, played by hand: each
         // VM's handed host port relays to that VM's proxy — the half of the
-        // publication that lives on the host.
+        // publication that lives on the host — on the sockets held since the
+        // numbers were handed.
         let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
         let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-        spawn_forward(host_a, guest_a).await;
-        spawn_forward(host_b, guest_b).await;
+        spawn_forward(host_a_listener, guest_a);
+        spawn_forward(host_b_listener, guest_b);
 
         // Both VMs' box names route through the host at the same time: each
         // handed port reaches its own VM's box and refuses the other VM's
@@ -4647,8 +4653,8 @@ mod tests {
         let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
         let zone_guest_a = SocketAddr::new(guest_a.ip(), answerer_a_port);
         let zone_guest_b = SocketAddr::new(guest_b.ip(), answerer_b_port);
-        spawn_udp_forward(zone_host_a, zone_guest_a).await;
-        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+        spawn_udp_forward(zone_a_socket, zone_guest_a);
+        spawn_udp_forward(zone_b_socket, zone_guest_b);
 
         // Both VMs' box names answer through the host at the same time, each
         // through the port its VM was handed: its own box is held in its
@@ -4755,12 +4761,14 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    /// Spawns a one-shot backend on `addr` that answers every connection
-    /// with a `200 OK` carrying `body`, closing when it has — the box each
-    /// VM's name routes to, distinguishable by what it says.
+    /// Spawns a one-shot backend on `lease`, at a port the kernel hands it,
+    /// that answers every connection with a `200 OK` carrying `body`,
+    /// closing when it has — the box each VM's name routes to,
+    /// distinguishable by what it says. Returns the port it listens on.
     #[cfg(target_os = "linux")]
-    async fn spawn_backend_on(addr: SocketAddr, body: &'static str) {
-        let backend = TcpListener::bind(addr).await.unwrap();
+    async fn spawn_backend_on(lease: Ipv4Addr, body: &'static str) -> u16 {
+        let backend = TcpListener::bind((lease, 0)).await.unwrap();
+        let port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 crate::traced::spawn(async move {
@@ -4786,17 +4794,20 @@ mod tests {
                 });
             }
         });
+        port
     }
 
-    /// Binds `local` on the host loopback and relays every connection to
+    /// Takes over `held` (a socket bound on the host loopback when its
+    /// number was chosen) and relays every connection to
     /// `remote`: the forward a published port stands for, played by hand —
     /// the real gvproxy forwarder binds the host port and bridges it to the
     /// guest listener over the switch, and this is the same wiring with the
     /// switch replaced by a loopback dial, so a test's dials go through the
     /// host port the way a host client's do.
     #[cfg(target_os = "linux")]
-    async fn spawn_forward(local: SocketAddr, remote: SocketAddr) {
-        let listener = TcpListener::bind(local).await.unwrap();
+    fn spawn_forward(held: std::net::TcpListener, remote: SocketAddr) {
+        held.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(held).unwrap();
         crate::traced::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
                 crate::traced::spawn(async move {
@@ -4880,8 +4891,9 @@ mod tests {
     /// loopback dial, so a test's resolver dials go through the host port the
     /// way a host resolver's datagrams do.
     #[cfg(target_os = "linux")]
-    async fn spawn_udp_forward(local: SocketAddr, remote: SocketAddr) {
-        let listener = tokio::net::UdpSocket::bind(local).await.unwrap();
+    fn spawn_udp_forward(held: std::net::UdpSocket, remote: SocketAddr) {
+        held.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UdpSocket::from_std(held).unwrap();
         crate::traced::spawn(async move {
             let mut buf = [0u8; 512];
             loop {

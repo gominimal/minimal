@@ -72,6 +72,11 @@ sha2.workspace = true
 # the GitHub module's host set, which activation checks a grant box's egress
 # against.
 bep = { path = "../bep" }
+# A GitHub grant's sign-in reference (`mint.rs`): the client's handle-signing
+# key, the handle id, and the key's encoding on the proxy's control socket.
+base64.workspace = true
+getrandom.workspace = true
+p256.workspace = true
 boxes.workspace = true
 # The reserved local range the resolver advisory's bind probe reads. Owned by
 # the zero-dependency `switch` crate — the same constant the daemon's DNS zone

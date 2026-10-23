@@ -157,7 +157,7 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
 /// callers publish it on different streams: `min init` puts the line on
 /// stdout — it is that command's whole scriptable result — while
 /// `min activate`'s scaffold offer keeps it on stderr, where stdout carries
-/// only the session id (see [`activate_session`]).
+/// only the session id (see [`activate_box`]).
 pub(crate) enum InitOutcome {
     /// The operator declined the confirmation; nothing was written.
     Declined,

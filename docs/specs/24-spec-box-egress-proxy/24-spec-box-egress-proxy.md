@@ -225,10 +225,11 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p boxes spec_trust_env_shadows_platform_with_warning
 
-- **BEP-012** WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
+- **BEP-012** WHERE a box declares a credentialed upstream that is in effect for its network mode, and its steering is `proxy_env` or `both` or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_proxy_env_and_no_proxy_are_set
-  - WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
+  <!-- the lane gate: a box with no credentialed upstream in effect cannot reach the proxy's address (networking §7.1), so a proxy variable there points at nothing -->
+  - WHERE a box declares a credentialed upstream that is in effect for its network mode, and its steering is `proxy_env` or `both` or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_proxy_env_sets_node_use_env_proxy
     <!-- Node's built-in `fetch` ignores `HTTPS_PROXY` unless this variable is set, so a Node client that uses it connects directly and its handle reaches the upstream unsubstituted; measured in docs/spikes/2026-10-20-sealed-handle-bearer-clients.md; Node reads the variable from v22.21.0 on the 22.x line and from v24.0.0, and an older Node ignores it: under `dns` or `both` steering the box resolver still sends its credentialed names to the proxy, and under `proxy_env` alone it connects directly and the upstream refuses the unsubstituted handle, so a box that runs an older Node client uses `both` -->
@@ -461,7 +462,7 @@ Store references
   tier:     T0
   verify:   cargo nextest run -p bep store_value_read_per_request_never_written
 
-- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle signed under the client's local key carrying the store, the identifier, the registered upstream authorities, the injection form and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
+- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle of JWS `typ` `gatehouse-store-handle+jws`, signed under the client's local key, carrying the box id (`sub`), the host (`node_id`), the store, the identifier, the registered upstream authorities, the injection form, the issue time (`iat`), a unique handle id (`jti`) and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
   <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request and item deletion revokes it at once, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
@@ -478,10 +479,10 @@ Store references
     verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
     <!-- ubiquitous; the operator's own processes are the trust boundary un-enrolled (Gatehouse §6.2), and the redemption listener stays closed to them (BEP-026) -->
 
-- **BEP-064** IF a store handle's signature does not verify under a registered client key, its expiry has passed, its `upstream` is not a subset of the current rule for its store and identifier, or its `inject` differs from that rule's THEN THE SYSTEM SHALL refuse the request and record an audit event marked `store_handle_invalid`.
+- **BEP-064** IF a store handle's signature does not verify under a registered client key, its `sub` or `node_id` differs from the sealed value's box or host, its expiry has passed, its `upstream` is not a subset of the current rule for its store and identifier, or its `inject` differs from that rule's THEN THE SYSTEM SHALL refuse the request and record an audit event marked `store_handle_invalid`.
   tier:     T2
   verify:   cargo nextest run -p bep prop_store_handle_verified_against_current_rule
-  property: for every handle, every registered key set, every clock reading and every current rule, redemption admits only when the signature verifies, the clock is before `exp`, `upstream` is a subset of the rule's authorities and `inject` equals the rule's form
+  property: for every handle, every registered key set, every clock reading and every current rule, redemption admits only when the signature verifies, `sub` and `node_id` equal the sealed value's box and host, the clock is before `exp`, `upstream` is a subset of the rule's authorities and `inject` equals the rule's form
   harness:  kani_redeem_refuses_invalid_store_handle, same bound and purity constraint as BEP-019
   <!-- a rule that has since narrowed, or changed its injection form, refuses: editing a rule bites a running box -->
   - WHEN the operator's `[secret-store-rules]` change THE SYSTEM SHALL judge the next request against the changed rules, with no restart of the proxy or the box.
@@ -575,6 +576,7 @@ Review, audit and revocation
   tier:     T0
   verify:   cargo nextest run -p minimal box_audit_filters_to_one_box
   <!-- the ruled grammar: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`; the log is the proxy's, not part of the box record, so `rm` and `prune` never touch it; retention is BEP-068's -->
+  <!-- the design reads over the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137); v1 reads the operator-owned log files under file mode in its place until gominimal/minimal#2463 serves the read; the interim is gominimal/minimal#2459 -->
   - WHEN `min box audit <name>` is run with a friendly name THE SYSTEM SHALL read the live box of that name, else the most recent creation under it, and name the id it read.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_name_reads_live_else_latest_creation
