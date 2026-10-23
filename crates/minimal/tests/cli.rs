@@ -3073,24 +3073,41 @@ fn policy_shows_baseline_set() {
 
     // The rows are the enumeration the helper carries, one per category —
     // the set the host-side gate decides the daemon's own frames by once the
-    // baseline is in force.
-    let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
-    let rendered_baseline = baseline
-        .entries()
-        .iter()
-        .map(|entry| {
-            format!(
-                "  {}  {}",
-                entry.category().as_str(),
-                entry.endpoints().join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // baseline is in force — each alias endpoint with the in-force arm's
+    // protocol and port bound beside it (NET-061).
+    let alias = fabric.host_alias();
+    let rendered_baseline =
+        format!("  registry  {alias}/32 tcp/443\n  cache  {alias}/32 tcp/443\n");
     assert!(
         text.contains(&rendered_baseline),
-        "the baseline rows are the enumeration's entries, one per category:\n{text}"
+        "the baseline rows are the enumeration's entries, one per category, \
+         with the alias bound:\n{text}"
     );
+
+    // The JSON view carries the same bounded endpoints.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &deny_all,
+        boxes::NetworkMode::OwnIp,
+        Some(fabric),
+        Ok(Vec::new()),
+        &[],
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let bounded = Value::String(format!("{alias}/32 tcp/443"));
+    let entries = document["node_plane_baseline"]["entries"]
+        .as_array()
+        .expect("the JSON view carries the baseline entries");
+    assert_eq!(entries.len(), 2, "registry and cache:\n{document}");
+    for entry in entries {
+        assert_eq!(
+            entry["endpoints"],
+            Value::Array(vec![bounded.clone()]),
+            "the JSON view spells the alias bound:\n{document}"
+        );
+    }
     // Beside, not instead: the egress block comes first, the baseline set
     // after it, the ingress block last.
     let egress_at = text.find("egress").expect("the egress block renders");
