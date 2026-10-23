@@ -26,6 +26,10 @@ Follow these steps in order. The examples use version `X.Y.Z` and commit
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
   a PR and cut the next version.
+- A release runs on a branch that outlives one build. Fixes land on
+  `release/X.Y.Z` while `main` keeps moving, and each release candidate burns
+  its own version number, because a staged number is permanent. 0.7.0 went
+  out as `0.7.0-rc1`, then `0.7.0-rc2`, then `0.7.0`.
 
 ### 1. Choose the commit and check the version
 
@@ -58,6 +62,10 @@ git push origin <commit>:refs/heads/release/X.Y.Z
 
 Nothing in the pipeline reads the branch name. The draft release and the tag
 point at the commit.
+
+Keep the branch. It carries the fixes that go into the release while `main`
+moves on, and a hotfix cuts the next version from it. Step 8 says what to do
+with it after the release.
 
 ### 3. Rehearse the release run
 
@@ -136,37 +144,55 @@ on it. Then the workflow does these things, in this order:
 If the release publish job fails, fix the cause and use **Re-run failed jobs**
 on the same run.
 
-### 7. Clean up
+### 7. Update minimal-skills
 
-If the release commit is not on `main`, merge the tag back into `main`
-before you delete the branch. This happens when the branch took commits of
-its own, such as release candidate bumps or cherry-picked fixes. The version
-of every `main` build comes from `git describe`, which finds only tags that
-the commit descends from. The release notes and `just check-version` find the
-previous release the same way. Without the merge, they all keep counting from
-the previous release.
+[`gominimal/minimal-skills`](https://github.com/gominimal/minimal-skills)
+describes the behaviour of the released build, so it follows the release.
+Check its claims against the version you just released, run its evals, and
+file each place where the published docs and the running build disagree in
+[`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
+its own `release/vX.Y.Z` branch. The 0.7.0 pass ran on 2026-10-14 against
+`0.7.0-rc2`.
 
-The promotion created the tag on GitHub, so fetch it first. `--force`
-replaces a stale local tag of the same name:
+### 8. Forward port the release branch
+
+Bring the fixes that landed on `release/X.Y.Z` back to `main`. `main` moves
+while a release is out, so a port that waits costs more than one that does
+not.
+
+In this step, `release/X.Y.Z` is the branch from step 2. A hotfix keeps
+the branch of the release that it fixes: 0.7.1 went out from
+`release/0.7.0`, so its port reads `release/0.7.0`. Compare the branch, not
+the tag. A fix can land on the branch after the tag, and the tag does not
+contain it.
+
+The promotion created the tag on GitHub, so fetch it with the branch.
+`--force` replaces a stale local tag of the same name. If the branch is
+already on `main`, there is nothing to port:
 
 ```sh
-git fetch --force origin main tag vX.Y.Z
-git merge-base --is-ancestor vX.Y.Z origin/main && echo "already on main"
+git fetch --force origin main release/X.Y.Z tag vX.Y.Z
+git merge-base --is-ancestor origin/release/X.Y.Z origin/main && echo "already on main"
 ```
 
-The merge uses the `ours` strategy, which keeps the tree of `main` and
-records only the history. It drops any change on the branch that `main`
-lacks, so first make sure that `main` has every fix on the branch. List the
-branch commits that have no identical patch on `main`:
+List the branch commits that have no identical patch on `main`:
 
 ```sh
-git cherry -v origin/main vX.Y.Z | grep '^+'
+git cherry -v origin/main origin/release/X.Y.Z | grep '^+'
 ```
 
 The list holds the version bumps, and also each cherry-pick whose conflicts
 someone resolved by hand. Find the `main` PR for each fix in the list. If a
-fix has no PR on `main`, land it on `main` before you merge the tag. Then
-merge:
+fix has no PR on `main`, open a PR that brings it to `main` and land it.
+
+Then merge the tag back into `main`. The version of every `main` build comes
+from `git describe`, which finds only tags that the commit descends from. The
+release notes and `just check-version` find the previous release the same
+way. Without the merge, they all keep counting from the previous release.
+
+The merge uses the `ours` strategy, which keeps the tree of `main` and
+records only the history. It drops any change on the branch that `main`
+lacks, so merge only after `main` has every fix in the list:
 
 ```sh
 git switch -c chore/merge-back-X.Y.Z origin/main
@@ -176,13 +202,8 @@ git merge -s ours vX.Y.Z -m "Merge tag 'vX.Y.Z' into main"
 Push the branch, open a PR, and merge it with **Create a merge commit**. The
 other merge buttons drop the link to the tag.
 
-Then delete the branch from step 2:
-
-```sh
-git push origin --delete release/X.Y.Z
-```
-
-Also delete any private pointer that you wrote in step 5.
+Keep the branch from step 2. A hotfix lands on it, bumps `package.version`,
+and goes out through steps 3 to 8 as the next version.
 
 ### Roll back
 
