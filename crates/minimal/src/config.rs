@@ -25,7 +25,7 @@ pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
 /// disk twice.
 ///
 /// It also reads `[secret-store-rules]` and prints each refused rule on
-/// stderr, as [`read_client_config_and_store_rules`] does.
+/// stderr, as [`read_client_config_and_store_rules`] does, once per process.
 pub fn read_client_config(
     global: &GlobalArgs,
 ) -> Result<boxes::client::config::Config, anyhow::Error> {
@@ -34,7 +34,8 @@ pub fn read_client_config(
 
 /// Read the client config and its `[secret-store-rules]` once. Each rule the
 /// deny set refuses (BEP-034) is printed on stderr and left out of the
-/// returned rules. Call it once per command, so each refusal prints once.
+/// returned rules. The refusals print on the first read in a process only,
+/// so a command that reads the config more than once prints each one once.
 ///
 /// # Errors
 ///
@@ -44,7 +45,12 @@ pub fn read_client_config_and_store_rules(
 ) -> Result<(boxes::client::config::Config, StoreRules), anyhow::Error> {
     let cfg_path = resolve_minimal_config_dir(global).join("config.toml");
     let (config, rules) = read_config_parts(&cfg_path)?;
-    let rules = refuse_store_rules(rules, &cfg_path, &mut std::io::stderr());
+    static PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let rules = if PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        refuse_store_rules(rules, &cfg_path, &mut std::io::sink())
+    } else {
+        refuse_store_rules(rules, &cfg_path, &mut std::io::stderr())
+    };
     Ok((config, rules))
 }
 
@@ -92,6 +98,7 @@ pub fn refuse_store_rules(rules: StoreRules, path: &Path, out: &mut impl Write) 
         .collect();
     let deny = StoreDenySet {
         module_hosts: &module_hosts,
+        infrastructure: bep::ca::DENY_SET,
         sign_in_items: &[bep::signin::SERVICE, bep::signin::META_SERVICE],
     };
     let file = path.display().to_string();
@@ -202,7 +209,8 @@ mod tests {
              [secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\n\
              header = \"Authorization\"\nprefix = \"Bearer \"\n\n\
              [secret-store-rules.gh]\nupstream = [\"api.github.com\"]\nheader = \"Authorization\"\n\n\
-             [secret-store-rules.host]\nupstream = [\"example.com\"]\nheader = \"Host\"\n",
+             [secret-store-rules.host]\nupstream = [\"example.com\"]\nheader = \"Host\"\n\n\
+             [secret-store-rules.internal]\nupstream = [\"host.min.internal\"]\nheader = \"X-Key\"\n",
         )
         .expect("write config.toml");
         let (config, rules) = read_config_parts(&path).expect("config.toml parses");
@@ -219,7 +227,9 @@ mod tests {
                 "The secret-store rule gh in {file} names api.github.com, which a secret can \
                  never be sent to. Remove or change the rule.\n\
                  The secret-store rule host in {file} names the header Host, which a secret can \
-                 never be sent to. Remove or change the rule.\n"
+                 never be sent to. Remove or change the rule.\n\
+                 The secret-store rule internal in {file} names host.min.internal, which a \
+                 secret can never be sent to. Remove or change the rule.\n"
             )
         );
     }

@@ -857,10 +857,6 @@ pub const DENIED_HEADERS: [&str; 6] = [
     "upgrade",
 ];
 
-/// The domains of Minimal's own infrastructure (BEP-034). A rule's upstream
-/// can name neither a domain here nor a name under it.
-pub const MINIMAL_INFRASTRUCTURE: [&str; 1] = ["minimal.dev"];
-
 /// The consent a store rule asks for before a reference is redeemed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -917,6 +913,11 @@ pub type StoreRules = BTreeMap<String, StoreRuleConfig>;
 pub struct StoreDenySet<'a> {
     /// The hosts of every configured deep module, such as the GitHub set.
     pub module_hosts: &'a [&'a str],
+    /// The domains of Minimal's own infrastructure, such as the box-internal
+    /// names and `minimal.dev`. A rule's upstream can name neither a domain
+    /// here nor a name under it. The caller passes the root's deny set, so
+    /// one list feeds the root's name constraints and this check.
+    pub infrastructure: &'a [&'a str],
     /// The identifiers of the GitHub sign-in item, which only the GitHub
     /// module can use.
     pub sign_in_items: &'a [&'a str],
@@ -1051,10 +1052,10 @@ fn store_rule_refusal(
                 host: written.clone(),
             });
         }
-        if MINIMAL_INFRASTRUCTURE
-            .iter()
-            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-        {
+        if deny.infrastructure.iter().any(|domain| {
+            let domain = normalize_host(domain);
+            host == domain || host.ends_with(&format!(".{domain}"))
+        }) {
             return Some(StoreRuleRefusal::MinimalInfrastructure {
                 host: written.clone(),
             });
@@ -1291,22 +1292,36 @@ fn authority_host(authority: &str) -> String {
     normalize_host(host)
 }
 
-/// Whether `authority` is a plain `host` or `host:port`: a host of letters,
-/// digits, dots and hyphens, and a port of one to five digits. Anything else
-/// (userinfo, a path, brackets, a wildcard, whitespace) can name a host the
-/// deny set does not see, so the rule is refused.
+/// Whether `authority` is a plain `host` or `host:port`: a DNS name of
+/// non-empty labels of letters, digits and hyphens, and a port from 1 to
+/// 65535. Anything else (userinfo, a path, brackets, a wildcard, whitespace,
+/// an IP address) can name a host the deny set does not see, so the rule is
+/// refused. The deny set compares names, so an IP address is refused too.
 fn is_plain_authority(authority: &str) -> bool {
     let (host, port) = match authority.split_once(':') {
         Some((host, port)) => (host, Some(port)),
         None => (authority, None),
     };
-    let host_ok = !host.trim_end_matches('.').is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    let port_ok =
-        port.is_none_or(|p| (1..=5).contains(&p.len()) && p.chars().all(|c| c.is_ascii_digit()));
+    let labels: Vec<&str> = host.strip_suffix('.').unwrap_or(host).split('.').collect();
+    let host_ok = labels.iter().all(|label| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    }) && !labels.last().is_some_and(|last| is_numeric_label(last));
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len())
+            && p.chars().all(|c| c.is_ascii_digit())
+            && p.parse::<u16>().is_ok_and(|n| n != 0)
+    });
     host_ok && port_ok
+}
+
+/// Whether `label`, the last label of a host, makes the host an IPv4
+/// address as a URL parser reads it: decimal digits, or `0x` and hex digits.
+fn is_numeric_label(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    match lower.strip_prefix("0x") {
+        Some(hex) => hex.chars().all(|c| c.is_ascii_hexdigit()),
+        None => lower.chars().all(|c| c.is_ascii_digit()),
+    }
 }
 
 /// Whether `name` is an HTTP header name: one or more `tchar` (RFC 9110).
@@ -1948,6 +1963,8 @@ mod tests {
     fn deny() -> StoreDenySet<'static> {
         StoreDenySet {
             module_hosts: GITHUB_HOSTS,
+            // The names of `bep::ca::DENY_SET`, which the client passes.
+            infrastructure: &["min.internal", "minimal.dev"],
             sign_in_items: SIGN_IN_ITEMS,
         }
     }
@@ -2048,6 +2065,18 @@ mod tests {
             );
         }
         assert_eq!(reasons["both"], &StoreRuleRefusal::Incomplete);
+        // The box-internal names are infrastructure too.
+        let (_, internal) = check_store_rules(
+            StoreRules::from([("internal".into(), rule(&["host.min.internal"]))]),
+            "c",
+            deny(),
+        );
+        assert_eq!(
+            internal.first().map(|r| &r.reason),
+            Some(&StoreRuleRefusal::MinimalInfrastructure {
+                host: "host.min.internal".into()
+            })
+        );
         let gh = refused.iter().find(|r| r.rule == "gh").expect("gh refused");
         assert_eq!(
             gh.to_string(),
@@ -2091,6 +2120,14 @@ mod tests {
             "api.github.com :443",
             "api.github.com:",
             "",
+            // An IP address escapes a deny set of names.
+            "140.82.112.5",
+            "140.82.112.5:443",
+            "2354212869",
+            "0x8c527005",
+            "a..github.com",
+            "example.com:0",
+            "example.com:65536",
         ] {
             let (_, refused) = check_store_rules(
                 StoreRules::from([("x".into(), rule(&[upstream]))]),
