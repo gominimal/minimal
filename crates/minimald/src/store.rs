@@ -131,8 +131,8 @@ impl Store {
                 "refused a create: the minted box id is already held by a retained record"
             );
             return Err(std::io::Error::other(format!(
-                "the new session's id {id} is already in use by another session, \
-                 so no session was created; run the command again"
+                "the new session's id {id} is already in use by another session. \
+                 No session was created. Run the command again."
             )));
         }
         record.id = id;
