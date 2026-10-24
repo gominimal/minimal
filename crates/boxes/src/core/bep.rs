@@ -953,9 +953,10 @@ pub enum StoreRuleRefusal {
     SignInItem,
     /// BEP-034: a field is not in the shape the deny set can judge: an
     /// upstream that is not a plain `host` or `host:port`, a header that is
-    /// not an HTTP token, or a prefix with a control character.
+    /// not an HTTP token, a prefix with a control character, or a
+    /// `basic_auth` other than `user` or `password`.
     Malformed {
-        /// The field: `upstream`, `header` or `prefix`.
+        /// The field: `upstream`, `header`, `prefix` or `basic_auth`.
         field: &'static str,
         /// The value, as the rule writes it.
         value: String,
@@ -1006,6 +1007,7 @@ impl fmt::Display for StoreRuleRefused {
                 let shape = match *field {
                     "upstream" => "a host name or host:port",
                     "header" => "an HTTP header name",
+                    "basic_auth" => "user or password",
                     _ => "text without control characters",
                 };
                 return write!(
@@ -1085,6 +1087,14 @@ fn store_rule_refusal(
             return Some(StoreRuleRefusal::Malformed {
                 field: "prefix",
                 value: prefix.clone(),
+            });
+        }
+    }
+    if let Some(field) = &rule.basic_auth {
+        if !matches!(field.as_str(), "user" | "password") {
+            return Some(StoreRuleRefusal::Malformed {
+                field: "basic_auth",
+                value: field.clone(),
             });
         }
     }
@@ -2187,6 +2197,39 @@ mod tests {
             "The secret-store rule crlf in c has the prefix \"Bearer \\r\\nHost: evil \", which is \
              not text without control characters. Change the rule."
         );
+        // A basic_auth field other than user or password fills nothing
+        // (review finding on store_rule_refusal).
+        for field in ["anything", "User", ""] {
+            let mut r = rule(&["example.com"]);
+            r.header = None;
+            r.basic_auth = Some(field.into());
+            let (_, refused) = check_store_rules(StoreRules::from([("ba".into(), r)]), "c", deny());
+            assert_eq!(
+                refused.first().map(|r| &r.reason),
+                Some(&StoreRuleRefusal::Malformed {
+                    field: "basic_auth",
+                    value: field.into()
+                }),
+                "{field:?} must be refused"
+            );
+        }
+        let mut r = rule(&["example.com"]);
+        r.header = None;
+        r.basic_auth = Some("anything".into());
+        let (_, refused) = check_store_rules(StoreRules::from([("ba".into(), r)]), "c", deny());
+        assert_eq!(
+            refused[0].to_string(),
+            "The secret-store rule ba in c has the basic_auth \"anything\", which is not user \
+             or password. Change the rule."
+        );
+        for field in ["user", "password"] {
+            let mut r = rule(&["example.com"]);
+            r.header = None;
+            r.prefix = None;
+            r.basic_auth = Some(field.into());
+            let (_, refused) = check_store_rules(StoreRules::from([("ba".into(), r)]), "c", deny());
+            assert!(refused.is_empty(), "{field} must pass");
+        }
     }
 
     /// BEP-034: a rule or a store reference that names the GitHub sign-in
