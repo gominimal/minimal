@@ -570,7 +570,6 @@ impl Flow {
                         marker: admitted,
                         cohort_attributed,
                     } => {
-                        span.record("cohort_attributed", cohort_attributed);
                         if let Err(marker) = substitute(request, &at, &credential, self.validated) {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
@@ -579,6 +578,9 @@ impl Flow {
                             return Err(marker);
                         }
                         span.record("substitution", "substituted");
+                        // Recorded only once the admit stands, so a refused
+                        // substitution never shows the cohort flag.
+                        span.record("cohort_attributed", cohort_attributed);
                         // BEP-028: a cohort admission keeps its marker.
                         self.record(Outcome::Admit, admitted, Some(identifier), mapping);
                         Ok(())
