@@ -12006,6 +12006,142 @@ proof_bep_first_slice_end_to_end() {
   echo "::endgroup::"
 }
 
+# Logout proof (BEP-044): `min auth logout` deletes the sign-in item, and
+# every running box's next GitHub request is refused, while the boxes keep
+# running. Two boxes that declare a GitHub grant each answer `gh api user`
+# through the proxy. Then `min auth logout` runs, `min auth status` reports
+# no sign-in, and `gh api user` fails in both boxes. `min box audit` shows a
+# refusal marked `github_sign_in_required` for each box. The case signs this
+# machine out of GitHub, so it runs only with E2E_BEP_LOGOUT=1, and the
+# whole-lane run orders it after every other live proxy case. Sign in again
+# with `min auth login` after it. That a later sign-in revives none of the
+# refused references is proven by the unit test
+# sign_in_after_logout_revives_no_earlier_reference: a sign-in needs a
+# person at the device flow, and this script has none.
+proof_bep_logout_refuses_every_reference_at_next_request() {
+  echo "::group::min auth logout: every box's next GitHub request is refused"
+  local lo_case=bep_logout_refuses_every_reference_at_next_request
+  local lo_out lo_name lo_sid lo_sids="" lo_status
+  if [ "${E2E_BEP_LOGOUT:-}" != 1 ]; then
+    not_run "$lo_case" "the case signs this machine out of GitHub: set E2E_BEP_LOGOUT=1 to run it, then run 'min auth login' again"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_live_gate "$lo_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: lo_cleanup reads them.
+  LO_SIDS=""
+  lo_cleanup() {
+    local c_sid
+    for c_sid in $LO_SIDS; do
+      mnl session destroy --force "$c_sid" >/dev/null 2>&1
+    done
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  lo_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    lo_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnllogout.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  # Two grant boxes, headless. Each answers `gh api user` before the logout,
+  # so a refusal after it is the logout's.
+  for lo_name in e2e-bep-logout-first e2e-bep-logout-second; do
+    lo_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$lo_name" \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/$lo_case.$lo_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $lo_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$lo_out"
+      echo "--- stderr ---"; cat "$WORK/$lo_case.$lo_name.err" 2>/dev/null || true
+      lo_fail
+    }
+    lo_sid="$(printf '%s\n' "$lo_out" | tail -n1 | tr -d '\r')"
+    LO_SIDS="$LO_SIDS $lo_sid"
+    lo_sids="$lo_sids $lo_name:$lo_sid"
+    if ! mnl session exec "$lo_sid" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$lo_case.$lo_name.before" 2>&1; then
+      echo "::error::'gh api user' failed in the box $lo_name before the logout, so the case proves nothing"
+      cat "$WORK/$lo_case.$lo_name.before" 2>/dev/null || true
+      lo_fail
+    fi
+    echo "$lo_name before the logout: 'gh api user' answered"
+  done
+
+  # The logout. It succeeds whether or not GitHub confirms the revocation.
+  if ! lo_out="$(mnl auth logout </dev/null 2>"$WORK/$lo_case.logout.err")"; then
+    echo "::error::'min auth logout' failed"
+    echo "--- stdout ---"; printf '%s\n' "$lo_out"
+    echo "--- stderr ---"; cat "$WORK/$lo_case.logout.err" 2>/dev/null || true
+    lo_fail
+  fi
+  lo_out="$(printf '%s\n' "$lo_out" | tr -d '\r')"
+  if [ "$lo_out" != "Signed out of GitHub. Boxes created before now lose GitHub access at their next request." ]; then
+    echo "::error::'min auth logout' printed an unexpected line on stdout"
+    printf '%s\n' "$lo_out"
+    lo_fail
+  fi
+  if grep -qF "GitHub did not confirm the sign-out" "$WORK/$lo_case.logout.err"; then
+    echo "min auth logout: the sign-in is deleted, and GitHub did not confirm the revocation"
+  else
+    echo "min auth logout: the sign-in is deleted, and GitHub confirmed the revocation"
+  fi
+  lo_status="$(mnl auth status </dev/null 2>&1 | tr -d '\r')"
+  if [[ "$lo_status" != "Not signed in to GitHub."* ]]; then
+    echo "::error::'min auth status' after the logout does not report that no sign-in is held"
+    printf '%s\n' "$lo_status"
+    lo_fail
+  fi
+
+  # The next request of each box is refused, and each box keeps running.
+  for lo_sid in $lo_sids; do
+    lo_name="${lo_sid%%:*}"
+    lo_sid="${lo_sid#*:}"
+    if mnl session exec "$lo_sid" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$lo_case.$lo_name.after" 2>&1; then
+      echo "::error::'gh api user' in the box $lo_name succeeded after 'min auth logout'"
+      cat "$WORK/$lo_case.$lo_name.after" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! mnl session exec "$lo_sid" true >/dev/null 2>"$WORK/$lo_case.$lo_name.alive"; then
+      echo "::error::the box $lo_name does not run a command after the logout: the logout must keep the box's processes running"
+      cat "$WORK/$lo_case.$lo_name.alive" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! mnl box audit "$lo_name" -o jsonl </dev/null \
+      >"$WORK/$lo_case.audit" 2>"$WORK/$lo_case.audit.err"; then
+      echo "::error::'min box audit $lo_name' failed"
+      cat "$WORK/$lo_case.audit.err" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! lo_out="$(bep_slice_jsonl_check "$WORK/$lo_case.audit" github_sign_in_required)"; then
+      echo "::error::'min box audit $lo_name': $lo_out"
+      echo "--- min box audit $lo_name -o jsonl ---"; cat "$WORK/$lo_case.audit"
+      lo_fail
+    fi
+    echo "$lo_name after the logout: 'gh api user' failed, the box still runs, and min box audit shows $lo_out"
+  done
+
+  lo_cleanup
+  rm -f "${WORK:?}/${lo_case:?}".*
+  echo "Logout proof OK (both boxes refused at their next request after 'min auth logout'). Run 'min auth login' to sign this machine in again."
+  echo "::endgroup::"
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -23566,6 +23702,7 @@ case "${1:-}" in
     proof_bep_root_ca_present_in_box_trust_store
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
+    proof_bep_logout_refuses_every_reference_at_next_request
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -23629,7 +23766,8 @@ case "${1:-}" in
     | bep_proxy_env_sets_node_use_env_proxy \
     | bep_root_ca_present_in_box_trust_store \
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
-    | bep_trust_env_points_at_bundle_and_root)
+    | bep_trust_env_points_at_bundle_and_root \
+    | bep_logout_refuses_every_reference_at_next_request)
     "proof_$1"
     ;;
   *)
@@ -23671,7 +23809,7 @@ case "${1:-}" in
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
-    echo "         bep_trust_env_points_at_bundle_and_root"
+    echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
     exit 2
     ;;
 esac
