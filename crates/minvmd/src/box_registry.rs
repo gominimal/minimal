@@ -2842,6 +2842,10 @@ pub struct BoxRegistry {
     /// `None` for a registry that feeds no proxy — a table-less registry
     /// still publishes rows, it just gives no attachments.
     attachments: Option<crate::bep_attach::Attachments>,
+    /// The Box Egress Proxy's control socket, which a live box's destroy
+    /// tells to revoke and forget the box (BEP-043, BEP-067). `None` sends
+    /// nothing: a registry under test, or a host with no home directory.
+    proxy_control: Option<std::path::PathBuf>,
     /// The record of pending asks (NET-045): the unresolved asks by their
     /// host-minted ids, each row's queue of them, and the attached host
     /// clients by the box id each subscribed to — shared by every clone,
@@ -2897,6 +2901,63 @@ pub struct BoxRegistry {
 /// the one [`Self::spawn_withdrawal_drainer`] (or a test) drains — holds the
 /// receiving end, so a clone can register, allocate, and file reports like
 /// the original but has nothing to take.
+/// How long a destroy waits for the Box Egress Proxy, for each read and
+/// write. It is short, so a stuck proxy does not hold up the destroy.
+pub const PROXY_REVOKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `~/.minimal/bep/control.sock`, the Box Egress Proxy's control socket.
+/// `None` when the home directory is not known.
+#[must_use]
+pub fn proxy_control_path() -> Option<std::path::PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock"))
+}
+
+/// The box id as the proxy names a box: 32 lowercase hex digits.
+fn proxy_box_id(box_id: &BoxId) -> String {
+    crate::bep_attach::BoxIdText(box_id).to_string()
+}
+
+/// Sends `record_revocation` and then `forget_box` for `box_id` to the
+/// proxy's control socket at `control`, and waits at most
+/// [`PROXY_REVOKE_TIMEOUT`] for each read and write (BEP-043, BEP-067).
+/// The revocation goes first, so no request from the box finds it
+/// forgotten and not yet revoked.
+///
+/// # Errors
+///
+/// The connection's I/O error, or an `InvalidData` error when the proxy
+/// refuses a request or its reply is not a reply.
+pub fn revoke_at_proxy(control: &std::path::Path, box_id: &BoxId) -> std::io::Result<()> {
+    use std::io::{BufRead as _, Write as _};
+    let stream = std::os::unix::net::UnixStream::connect(control)?;
+    stream.set_read_timeout(Some(PROXY_REVOKE_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROXY_REVOKE_TIMEOUT))?;
+    let mut stream = std::io::BufReader::new(stream);
+    let id = proxy_box_id(box_id);
+    for op in ["record_revocation", "forget_box"] {
+        let mut line = serde_json::json!({ "op": op, "box_id": id }).to_string();
+        line.push('\n');
+        stream.get_mut().write_all(line.as_bytes())?;
+        let mut answer = String::new();
+        if stream.read_line(&mut answer)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let reply: serde_json::Value = serde_json::from_str(&answer)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            let why = reply
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason given");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the proxy refused {op}: {why}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Clone for BoxRegistry {
     fn clone(&self) -> Self {
         BoxRegistry {
@@ -2917,6 +2978,7 @@ impl Clone for BoxRegistry {
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
             attachments: self.attachments.clone(),
+            proxy_control: self.proxy_control.clone(),
             asks: Arc::clone(&self.asks),
             ask_gauges: Arc::clone(&self.ask_gauges),
             withdrawal_generations: Arc::clone(&self.withdrawal_generations),
@@ -2959,6 +3021,11 @@ impl BoxRegistry {
             )),
             loopback_slice,
             attachments: None,
+            // A unit test never reaches the operator's own proxy.
+            #[cfg(not(test))]
+            proxy_control: proxy_control_path(),
+            #[cfg(test)]
+            proxy_control: None,
             asks: Arc::new(Mutex::new(AskBook::default())),
             ask_gauges: Arc::new(AskGauges::default()),
             withdrawal_generations: Arc::new(Mutex::new(HashMap::new())),
@@ -3107,6 +3174,42 @@ impl BoxRegistry {
     ) -> Self {
         self.attachments = Some(attachments);
         self
+    }
+
+    /// Sets the Box Egress Proxy control socket that a live box's destroy
+    /// sends its revocation to, or `None` to send nothing. The default is
+    /// [`proxy_control_path`]. Returns `self`, for the call chain.
+    #[must_use]
+    pub fn revoking_at_proxy(mut self, control: Option<std::path::PathBuf>) -> Self {
+        self.proxy_control = control;
+        self
+    }
+
+    /// Tells the proxy that the live box `box_id` was destroyed: its
+    /// revocation, then its forget (BEP-043). A proxy that does not answer
+    /// does not stop the destroy. The box's attachment is already retired
+    /// (NET-133), so the proxy attributes the box's values to no live box
+    /// whether or not it records the revocation.
+    fn revoke_destroyed_box(&self, name: &str, box_id: &BoxId) {
+        let Some(control) = &self.proxy_control else {
+            return;
+        };
+        let id = crate::bep_attach::BoxIdText(box_id);
+        match revoke_at_proxy(control, box_id) {
+            Ok(()) => tracing::debug!(
+                box_id = %id,
+                box = name,
+                "the proxy revoked and forgot the destroyed box"
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %id,
+                box = name,
+                control = %control.display(),
+                %error,
+                "the box was destroyed, but the proxy did not record its revocation. \
+                 Its values are refused because no live box holds its address"
+            ),
+        }
     }
 
     /// Persists this registry's client-box creations at `path` — the
@@ -4392,6 +4495,12 @@ impl BoxRegistry {
         }
         if ended {
             self.persist();
+        }
+        // A standing row is a live box, so its destroy is a revocation
+        // (BEP-043). A dormant creation ended above is a stopped box, and
+        // its values are already refused by attribution.
+        if let Some(record) = &removed {
+            self.revoke_destroyed_box(record.name(), &record.box_id);
         }
         Ok(removed)
     }
@@ -9524,6 +9633,73 @@ mod tests {
             logged.contains("asked=web") && logged.contains("held=Web"),
             "the warn line names the asking and the held spelling, got: {logged}"
         );
+    }
+
+    // BEP-043, BEP-067: a live box's destroy sends its revocation and then
+    // its forget to the proxy. A box with no live row sends nothing.
+    #[test]
+    fn destroying_a_live_box_revokes_and_forgets_it_at_the_proxy() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let control = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&control).expect("binds");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let served = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
+                let mut writer = stream;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    served
+                        .lock()
+                        .expect("unpoisoned")
+                        .push(line.trim().to_owned());
+                    writer.write_all(b"{\"ok\":true}\n").expect("writes");
+                    line.clear();
+                }
+            }
+        });
+        let registry = BoxRegistry::new(SUBNET).revoking_at_proxy(Some(control));
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let id = proxy_box_id(&web.box_id());
+        registry
+            .withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None)
+            .expect("the creator withdraws its box");
+        assert_eq!(
+            *seen.lock().expect("unpoisoned"),
+            [
+                format!(r#"{{"box_id":"{id}","op":"record_revocation"}}"#),
+                format!(r#"{{"box_id":"{id}","op":"forget_box"}}"#),
+            ]
+        );
+
+        // A second withdrawal finds no row: no live box, so no revocation.
+        registry
+            .withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None)
+            .expect("nothing to withdraw is the goal state");
+        assert_eq!(seen.lock().expect("unpoisoned").len(), 2);
+    }
+
+    // BEP-043: a destroy completes when the proxy is down.
+    #[test]
+    fn a_destroy_completes_with_the_proxy_down() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry =
+            BoxRegistry::new(SUBNET).revoking_at_proxy(Some(dir.path().join("control.sock")));
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(
+            registry
+                .withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None)
+                .expect("the destroy completes")
+                .is_some()
+        );
+        assert!(registry.row_by_name("web").is_none());
     }
 
     /// A withdrawal presents the same name-folding proof the registration
