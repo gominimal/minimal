@@ -810,7 +810,13 @@ impl BoxActor {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
                 let (toml_path, content) = self.default_mfile_plan(wsp)?;
-                std::fs::write(&toml_path, &content).map_err(|e| e.to_string())
+                // Under the lock `min init`/`add`/`update` take, and only if
+                // the file is still missing there, so a concurrent writer's
+                // file is never clobbered by the default.
+                mfile::File::edit_exclusively::<mfile::Error>(&toml_path, |existing| {
+                    Ok(existing.is_none().then_some(content))
+                })
+                .map_err(|e| e.to_string())
             }
             Err(e) => Err(e.to_string()),
         }

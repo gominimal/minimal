@@ -820,3 +820,40 @@ async fn bug_no_guest_makes_no_daemon_contact() {
     // Host-side per-provider collection still ran.
     assert!(find(&files, "local-minimald0/status.json").is_some());
 }
+
+/// An invalid link table is reported as such, without the table header the
+/// parser quotes, the same reduction a malformed config gets.
+#[tokio::test]
+async fn an_invalid_link_table_is_reported_without_quoting_it() {
+    let project = tempfile::TempDir::new().unwrap();
+    let config = project.path().join(".minimal");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("minimal.toml"),
+        "[upstream]\nrepo = \"https://example.invalid/up.git\"\n\n\
+         [[upstream.sideload]]\nbranch = \"canary-secret-value\"\n",
+    )
+    .unwrap();
+
+    let files = bundle_for_project(Some(project.path())).await;
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let scope = &manifest["project"];
+
+    assert_eq!(scope["state"], "unknown", "unparseable is not identified");
+    let reason = scope["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("invalid [upstream] or sideload table"),
+        "an invalid link must be reported as such: {reason}"
+    );
+    assert!(
+        !reason.contains("[[upstream.sideload]]") && !reason.contains(" at line "),
+        "the reason must not quote the table or its line: {reason}"
+    );
+    for (path, contents) in &files {
+        assert!(
+            !String::from_utf8_lossy(contents).contains("canary-secret-value"),
+            "a rejected config line leaked into {path}"
+        );
+    }
+}
