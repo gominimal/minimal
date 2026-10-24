@@ -40,8 +40,9 @@ pub fn read_client_config(
 /// (BEP-034) is printed on stderr, naming its file, and left out of the
 /// returned rules. A user rule replaces the fields of an organization rule
 /// for the same item, but keeps the stricter of the two actions, as
-/// [`merge_store_rules`] says. An organization rule that the deny set
-/// refuses still sets that floor. The refusals of a file print on its first
+/// [`merge_store_rules`] says. A rule that the deny set refuses still sets
+/// that floor. An item that has only refused rules gets a `deny` rule with
+/// no upstream, so a store reference to it is denied. The refusals of a file print on its first
 /// read in a process only, so a command that reads the config more than
 /// once prints each one once.
 ///
@@ -76,10 +77,13 @@ fn read_client_and_org_config(
         Err(e) => return Err(e),
     };
     let org_read = org_rules.clone();
+    let user_read = user_rules.clone();
     let org_rules = refuse_store_rules_once(org_rules, org_path);
     let user_rules = refuse_store_rules_once(user_rules, &user);
     let merged = merge_store_rules(org_rules, user_rules);
-    Ok((config, keep_org_actions(&org_read, merged)))
+    let merged = keep_read_actions(&org_read, merged);
+    let merged = keep_read_actions(&user_read, merged);
+    Ok((config, deny_refused_items(&[&org_read, &user_read], merged)))
 }
 
 /// Print, on its first call in this process, that the organization file
@@ -123,17 +127,39 @@ pub fn merge_store_rules(org: StoreRules, user: StoreRules) -> StoreRules {
     rules
 }
 
-/// Raise the action of each rule in `merged` to the action of the
-/// organization rule for the same item in `org_read`, when that action is
-/// stricter. `org_read` holds the organization rules as read, before the
-/// deny set refuses any of them. So an organization rule that is refused
-/// still keeps a user rule for its item from loosening its `deny` or `ask`.
-fn keep_org_actions(org_read: &StoreRules, mut merged: StoreRules) -> StoreRules {
+/// Raise the action of each rule in `merged` to the action of the rule for
+/// the same item in `read`, when that action is stricter. `read` holds the
+/// rules of one file as read, before the deny set refuses any of them. So a
+/// rule that is refused still keeps the rule that applies to its item from
+/// loosening its `deny` or `ask`.
+fn keep_read_actions(read: &StoreRules, mut merged: StoreRules) -> StoreRules {
     for (item, rule) in &mut merged {
-        if let Some(org_rule) = org_read.get(item)
-            && action_rank(org_rule.action) > action_rank(rule.action)
+        if let Some(read_rule) = read.get(item)
+            && action_rank(read_rule.action) > action_rank(rule.action)
         {
-            rule.action = org_rule.action;
+            rule.action = read_rule.action;
+        }
+    }
+    merged
+}
+
+/// Add a `deny` rule to `merged` for each item that a file in `reads` has a
+/// rule for and `merged` has none. Such an item has only refused rules. Its
+/// `deny` rule registers no upstream and no header, so a store reference to
+/// the item is denied, and is never redeemed with no rule to check.
+fn deny_refused_items(reads: &[&StoreRules], mut merged: StoreRules) -> StoreRules {
+    for read in reads {
+        for (item, rule) in *read {
+            merged
+                .entry(item.clone())
+                .or_insert_with(|| boxes::core::bep::StoreRuleConfig {
+                    store: rule.store.clone(),
+                    upstream: Vec::new(),
+                    header: None,
+                    prefix: None,
+                    basic_auth: None,
+                    action: Some(StoreAction::Deny),
+                });
         }
     }
     merged
@@ -400,8 +426,48 @@ mod tests {
         let org = refuse_store_rules(org_read.clone(), &org_path, &mut std::io::sink());
         assert!(org.is_empty());
         let user: StoreRules = [("item".to_owned(), rule(Some(StoreAction::Allow)))].into();
-        let merged = keep_org_actions(&org_read, merge_store_rules(org, user));
+        let merged = keep_read_actions(&org_read, merge_store_rules(org, user));
         assert_eq!(merged["item"].action, Some(StoreAction::Deny));
         assert_eq!(merged["item"].upstream, ["api.example.com"]);
+    }
+
+    /// An item whose only rules the deny set refuses gets a `deny` rule with
+    /// no upstream, so a store reference to it is denied. A refused user
+    /// `deny` rule also keeps its action over an organization rule.
+    #[test]
+    fn refused_only_item_is_denied() {
+        let path = std::path::Path::new("config.toml");
+        let mut refused = rule(None);
+        refused.upstream = vec!["api.github.com".to_owned()];
+        let mut refused_deny = refused.clone();
+        refused_deny.action = Some(StoreAction::Deny);
+        let org_read: StoreRules = [
+            ("org-refused".to_owned(), refused.clone()),
+            ("shared".to_owned(), rule(Some(StoreAction::Allow))),
+        ]
+        .into();
+        let user_read: StoreRules = [
+            ("user-refused".to_owned(), refused_deny.clone()),
+            ("shared".to_owned(), refused_deny),
+        ]
+        .into();
+        let org = refuse_store_rules(org_read.clone(), path, &mut std::io::sink());
+        let user = refuse_store_rules(user_read.clone(), path, &mut std::io::sink());
+        let merged = merge_store_rules(org, user);
+        let merged = keep_read_actions(&org_read, merged);
+        let merged = keep_read_actions(&user_read, merged);
+        let merged = deny_refused_items(&[&org_read, &user_read], merged);
+        for item in ["org-refused", "user-refused"] {
+            assert_eq!(merged[item].action, Some(StoreAction::Deny), "{item}");
+            assert!(merged[item].upstream.is_empty(), "{item}");
+            assert_eq!(merged[item].header, None, "{item}");
+        }
+        assert_eq!(merged["shared"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["shared"].upstream, ["api.example.com"]);
+        let rule = &merged["org-refused"];
+        assert_eq!(
+            boxes::core::bep::store_consent(rule, true),
+            boxes::core::bep::StoreConsent::Deny
+        );
     }
 }
