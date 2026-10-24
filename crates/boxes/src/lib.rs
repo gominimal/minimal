@@ -895,37 +895,10 @@ pub fn normalized_cidr(s: &str) -> Option<String> {
     Some(format!("{normalized}/{prefix}"))
 }
 
-/// A session ID, a newtype over a UUID.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SessionId(Uuid);
-
-impl SessionId {
-    #[must_use]
-    pub fn nil() -> Self {
-        Self(Uuid::nil())
-    }
-
-    /// Parses the given UUID as a session ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the given string is not a UUID.
-    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
-        Uuid::parse_str(s).map(Self)
-    }
-}
-
-impl AsRef<Uuid> for SessionId {
-    fn as_ref(&self) -> &Uuid {
-        &self.0
-    }
-}
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+/// The name the session-plane code spelled a record's key by before the
+/// box id became the one key. It is the same type as [`BoxId`], kept so
+/// the code that still says session compiles unchanged.
+pub type SessionId = BoxId;
 
 /// Lifecycle status of a [`Record`].
 ///
@@ -997,62 +970,122 @@ where
     Ok(name.filter(|name| !name.is_empty()))
 }
 
-/// A box's identity on its host: 16 bytes — one `UUIDv7`, 32 lowercase hex
-/// digits on the wire — minted once per box by the host-side creator
-/// outside the VM, with its random fields from the host's OS CSPRNG
-/// (BEP-070): never a counter, never a digest of the box's facts, never
-/// anything a process inside the VM could predict or arrange. The
-/// registration that publishes the box's row mints it — a client never
-/// presents one — the row and the proxy's attachment hold it, and the
-/// reply hands it back so the client records the id its box was created
-/// as.
+/// A box's identity: one `UUIDv7`, the one id type every record, event and
+/// reply names a box by, with its random fields from the OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts. The
+/// daemon's store mints a record's id ([`Record::id`]) at creation. On a
+/// VM host the host-side registration mints the box's id outside the VM,
+/// where no process inside the VM can predict or arrange it, and its row
+/// holds that id. On a VM guest the in-VM store still mints
+/// [`Record::id`] inside the VM, so there the box's id is
+/// [`Record::box_id`] until
+/// <https://github.com/gominimal/minimal/issues/2397> files the record
+/// under it. That interim ends when `DiskLoader::create` keys a record by
+/// a handed `config.box_id` instead of minting one. Both are this type. A
+/// client never presents one of its own.
 ///
 /// Unique per creation by construction: a box recreated with the same
 /// name and the same addresses is a new box, and its id says so. Ids are
-/// never reused — no registration can present one, and the host refuses a
-/// mint that collides with a record it holds — so a revocation scoped to
-/// an id stays scoped forever. The all-zero id is not
-/// a mint's output and never names a box: the delivery header carried it
-/// for "no box named" before ids were the box's own, and the acceptor
-/// that reads a delivered header refuses it like any other id the
-/// source's attachment does not hold.
+/// never reused, so a revocation scoped to an id stays scoped forever.
+/// The all-zero id is not a mint's output and never names a live box: a
+/// record read without an id carries it until it is migrated, and the
+/// acceptor that reads a delivered header refuses it like any other id
+/// the source's attachment does not hold.
 ///
-/// On the wire it is one hex string, the same 32 lowercase digits a
-/// diagnostic names a box id by — so a log line, a transcript and a
-/// socket capture all read the same spelling.
+/// One id has one printed spelling for each surface. The hyphenated UUID
+/// form ([`Display`] and the default serde form) is what a record on disk,
+/// a reply, a log line and `min ls` all show. An audit record spells the
+/// same 16 bytes as 32 lowercase hex digits (`Uuid::simple`): the BEP
+/// audit `subject`, the ask audit record's `box_id` and every
+/// `box-admissions.log` line. The VM host's box control wire uses the same
+/// 32-hex spelling, and its fields keep it through [`box_id_hex`]. A
+/// reader accepts either spelling, so a record or a reply written before
+/// the two id types merged reads back as the same id.
+///
+/// Ordered by its bytes, which for a `UUIDv7` is the order of its mint
+/// time: a map keyed by box id holds its boxes in creation order.
+///
+/// [`Display`]: std::fmt::Display
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BoxId([u8; 16]);
+pub struct BoxId(Uuid);
 
 impl BoxId {
     /// Wraps `bytes` as a box id — the shape a registration's reply
     /// carries and a delivery header fills from the box's attachment.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
+        Self(Uuid::from_bytes(bytes))
     }
 
     /// The id's own 16 bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; 16] {
-        self.0
+        self.0.into_bytes()
+    }
+
+    /// Mints a fresh box id: one `UUIDv7`, its timestamp from the clock
+    /// and its random fields from the OS CSPRNG. Ids minted in one process
+    /// sort in mint order.
+    #[must_use]
+    pub fn mint() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// The all-zero id: what a record read without an id carries until it
+    /// is migrated. It never names a live box.
+    #[must_use]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Whether this is the all-zero id.
+    #[must_use]
+    pub fn is_nil(&self) -> bool {
+        self.0.is_nil()
+    }
+
+    /// Parses a box id from either spelling it is written in: the
+    /// hyphenated UUID form or 32 hex digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the given string is not a UUID.
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(Self)
+    }
+
+    /// The id as 32 lowercase hex digits: the spelling the VM host's box
+    /// control wire carries.
+    #[must_use]
+    pub fn simple(&self) -> String {
+        self.0.simple().to_string()
     }
 }
 
-impl std::fmt::Display for BoxId {
-    /// 32 lowercase hex digits — the one fixed form every diagnostic that
-    /// names a box id uses, so a tail can compare two lines for the same
+impl From<Uuid> for BoxId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl AsRef<Uuid> for BoxId {
+    fn as_ref(&self) -> &Uuid {
+        &self.0
+    }
+}
+
+impl fmt::Display for BoxId {
+    /// The hyphenated UUID form — the one spelling every surface that
+    /// prints a box id uses, so a tail can compare two lines for the same
     /// box.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
 impl Serialize for BoxId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(self.0))
+        self.0.serialize(serializer)
     }
 }
 
@@ -1061,17 +1094,75 @@ impl<'de> Deserialize<'de> for BoxId {
         // Owned, not borrowed: a record read from a file or a request read
         // off a socket is deserialized from a reader, which lends no `&str`.
         let text = String::deserialize(deserializer)?;
-        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
-        let bytes: [u8; 16] = match bytes.try_into() {
-            Ok(bytes) => bytes,
-            Err(bytes) => {
-                return Err(serde::de::Error::custom(format!(
-                    "a box id is 32 hex digits (16 bytes); got {} bytes",
-                    bytes.len()
-                )));
+        box_id_from_text(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Reads a box id from either spelling. The error names both spellings,
+/// so a reader of a log line sees what a box id looks like.
+fn box_id_from_text(text: &str) -> Result<BoxId, String> {
+    BoxId::parse_str(text)
+        .map_err(|_| format!("a box id is a UUID or 32 hex digits (16 bytes); got `{text}`"))
+}
+
+/// The serde adapter for a field whose wire spells a [`BoxId`] as 32
+/// lowercase hex digits: the VM host's box control wire, and the record's
+/// [`Record::box_id`] field that copies it. It writes the same bytes those
+/// fields carried before the two id types merged, and reads either
+/// spelling.
+pub mod box_id_hex {
+    use super::BoxId;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes `id` as 32 lowercase hex digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error.
+    pub fn serialize<S: Serializer>(id: &BoxId, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&id.simple())
+    }
+
+    /// Reads a box id in either spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text is not a box id.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BoxId, D::Error> {
+        BoxId::deserialize(deserializer)
+    }
+
+    /// The same adapter for an optional field.
+    pub mod option {
+        use super::BoxId;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        /// Writes `Some(id)` as 32 lowercase hex digits and `None` as null.
+        ///
+        /// # Errors
+        ///
+        /// Returns the serializer's error.
+        #[allow(clippy::ref_option)] // serde's `with` hands the field by reference
+        pub fn serialize<S: Serializer>(
+            id: &Option<BoxId>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match id {
+                Some(id) => serializer.serialize_some(&id.simple()),
+                None => serializer.serialize_none(),
             }
-        };
-        Ok(Self(bytes))
+        }
+
+        /// Reads an optional box id in either spelling.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the text is not a box id.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<BoxId>, D::Error> {
+            Option::<BoxId>::deserialize(deserializer)
+        }
     }
 }
 
@@ -1158,9 +1249,15 @@ impl fmt::Debug for SealedDelivery {
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// Unique ID describing this session.
-    #[serde(default = "SessionId::nil")]
-    pub id: SessionId,
+    /// The record's key: the id the store files this record under, and
+    /// the id every event and reply names the box by. On a VM guest it is
+    /// the in-VM store's key, not the id the VM host minted: that one is
+    /// [`Self::box_id`] until
+    /// <https://github.com/gominimal/minimal/issues/2397> files the record
+    /// under the handed id. Written in the hyphenated form, and read in
+    /// either spelling.
+    #[serde(default = "BoxId::nil")]
+    pub id: BoxId,
     /// The name a user assigned to this session, if
     /// one was specifically assigned.
     ///
@@ -1240,7 +1337,11 @@ pub struct Record {
     /// that handed no box addresses, and for one that predates the field:
     /// a registered box with no id is never answered as standing, so it
     /// must be re-activated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 
     /// The per-box egress enforcement this session's own launch placed its

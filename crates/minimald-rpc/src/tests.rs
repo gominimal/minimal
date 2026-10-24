@@ -1799,3 +1799,84 @@ fn box_control_answerer_status_reply_round_trip() {
         "an unknown cause drops the sibling, never the answerer's state"
     );
 }
+
+/// Every reply that names a box carries the one box id type, and each
+/// keeps the bytes it carried before the session id and the box id merged:
+/// a session reply spells the id in the hyphenated form, and the VM host's
+/// box control replies spell it as 32 hex digits. Each pre-merge document
+/// reads as the same id and writes back byte for byte, so a client and a
+/// daemon on either side of the merge read each other's replies.
+#[test]
+fn every_reply_id_round_trips_byte_for_byte() {
+    const HYPHENATED: &str = "0190b3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b";
+    const HEX: &str = "0190b3c45d6e7f809a1b2c3d4e5f6a7b";
+    let expected = BoxId::parse_str(HYPHENATED).expect("a UUID");
+    assert_eq!(BoxId::parse_str(HEX).expect("32 hex digits"), expected);
+
+    /// Reads `wire` as `T`, checks the id it names, and writes it back.
+    fn round_trip<T>(wire: &str, id_of: impl Fn(&T) -> BoxId, expected: BoxId)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let read: T = serde_json_lenient::from_str(wire)
+            .unwrap_or_else(|e| panic!("a pre-merge reply decodes: {e}: {wire}"));
+        assert_eq!(id_of(&read), expected, "the reply names the one id: {wire}");
+        let written = serde_json_lenient::to_string(&read).expect("serialize");
+        assert_eq!(written, wire, "the reply writes back byte for byte");
+    }
+
+    // Session-plane replies: the id in the hyphenated form.
+    round_trip::<CreateSessionResponse>(
+        &format!(r#"{{"id":"{HYPHENATED}","interim_loopback":false,"answerer_bound":false}}"#),
+        |r| r.id,
+        expected,
+    );
+    round_trip::<ListSessionsEntry>(
+        &format!(
+            r#"{{"id":"{HYPHENATED}","name":"web","project_path":null,"status":"active","git":null,"attrs":null}}"#
+        ),
+        |r| r.id,
+        expected,
+    );
+    round_trip::<BoxRuntimeFacts>(
+        &format!(r#"{{"id":"{HYPHENATED}","host_ip_enforcement":null}}"#),
+        |r| r.id,
+        expected,
+    );
+
+    // The VM host's box control replies: the id as 32 hex digits.
+    round_trip::<RegisteredBox>(
+        &format!(
+            r#"{{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0","box_id":"{HEX}"}}"#
+        ),
+        |r| r.box_id,
+        expected,
+    );
+    round_trip::<BoxControlReply>(
+        &format!(r#"{{"subscribed":true,"box_id":"{HEX}"}}"#),
+        |r| match r {
+            BoxControlReply::AsksSubscribed { box_id, .. } => *box_id,
+            other => panic!("decoded as another reply: {other:?}"),
+        },
+        expected,
+    );
+    round_trip::<PendingAskOffer>(
+        &format!(
+            r#"{{"ask_id":"07070707070707070707070707070707","box_id":"{HEX}","name":"web","port":8080,"proto":"tcp"}}"#
+        ),
+        |r| r.box_id,
+        expected,
+    );
+
+    // A create request carries the id the registration handed back in
+    // its own hex spelling, and the record the daemon files keys on it.
+    let config: BoxConfig =
+        serde_json_lenient::from_str(&format!(r#"{{"project_path":"/p","box_id":"{HEX}"}}"#))
+            .expect("a create config with a handed id decodes");
+    assert_eq!(config.box_id, Some(expected));
+    let wire = serde_json_lenient::to_string(&config).expect("serialize");
+    assert!(
+        wire.contains(&format!(r#""box_id":"{HEX}""#)),
+        "the handed id crosses as its hex spelling: {wire}"
+    );
+}
