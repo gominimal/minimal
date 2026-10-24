@@ -21,7 +21,10 @@
 //!
 //! The same control socket then registers the box with its declared egress
 //! and its address stance, so the proxy admits the box's requests to those
-//! authorities.
+//! authorities. Last, it submits one `mint` record for each member, which
+//! the proxy appends to its audit log (BEP-067). The proxy is the log's
+//! only writer, so `min box audit <box>` reads the mints in the same chain
+//! as the proxy's decisions and the box's revocation at its destroy.
 
 use std::fmt;
 use std::io::{self, BufRead as _, BufReader, Write as _};
@@ -32,7 +35,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bep::boxes::Stance;
-use bep::control::{Reply, Request};
+use bep::control::{Reply, Request, Submission};
 use bep::handle::{self, Claims};
 use bep::module::{GITHUB, Module};
 use bep::publish::{Identity, PublishError};
@@ -236,7 +239,11 @@ impl ControlClient {
         })
     }
 
-    fn ask(&mut self, request: &Request, what: &'static str) -> Result<Reply, MintError> {
+    fn ask(
+        &mut self,
+        request: &impl serde::Serialize,
+        what: &'static str,
+    ) -> Result<Reply, MintError> {
         let mut line = serde_json_lenient::to_string(request).map_err(|error| {
             MintError::Control(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
@@ -295,6 +302,25 @@ impl ControlClient {
             "the box's removal",
         )?;
         tracing::debug!(box_id, "withdrew the box's declared egress from the proxy");
+        Ok(())
+    }
+
+    /// Submits the `mint` record of one member minted for `box_id`, with
+    /// `identifier` as its audit identifier, `<store>:<id>` (BEP-067).
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy does not write the record.
+    pub fn record_mint(&mut self, box_id: &str, identifier: &str) -> Result<(), MintError> {
+        self.ask(
+            &Submission::RecordMint {
+                box_id: box_id.to_owned(),
+                identifier: identifier.to_owned(),
+            },
+            "the mint record",
+        )?;
+        tracing::debug!(box_id, identifier, "submitted a mint record to the proxy");
         Ok(())
     }
 
@@ -436,7 +462,9 @@ pub struct GrantBox {
 /// The client's key is registered last, after every other step succeeded,
 /// so a failed mint leaves no key the proxy trusts and no box uses. When
 /// the key's registration fails, the box is forgotten again, so a failed
-/// mint leaves neither a key nor a box behind. The
+/// mint leaves neither a key nor a box behind. After the key, the proxy
+/// appends one `mint` record for each member (BEP-067). A refused record
+/// forgets the box too, and the key stays registered. The
 /// sealed values leave this process only after this function returns, so
 /// no handle is delivered under a key the proxy does not know. Nothing
 /// here asks for a sign-in: the keychain gives the item's metadata only.
@@ -536,6 +564,16 @@ pub fn mint_and_register(
         forget_on_a_new_connection(&control.path, &box_id, "its key was refused");
         return Err(error);
     }
+    // BEP-067: the proxy writes each mint's record, so the box's trail is
+    // one chain. The records go after the key, so a proxy that refuses the
+    // key sees no record for a box that never ran.
+    let identifier = format!("{}:{}", GITHUB.id, held.instance);
+    for _ in &minted {
+        if let Err(error) = control.record_mint(&box_id, &identifier) {
+            forget_on_a_new_connection(&control.path, &box_id, "its mint record failed");
+            return Err(error);
+        }
+    }
     Ok(minted)
 }
 
@@ -621,6 +659,144 @@ impl Drop for ProxyRegistration {
             // that box at its destroy.
             Ok(runtime) => drop(runtime.spawn_blocking(forget)),
             Err(_) => forget(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bep::audit::{AuditLog, Kind, LogReader, Outcome, segment_name};
+    use bep::boxes::BoxRegistry;
+    use bep::control::{Control, Registry};
+    use bep::publish::PublishedKey;
+    use bep::revoke::{Revocations, Revoker};
+    use bep::seal::{ProxyKey, ProxyPublicKey};
+    use bep::signin::{Completed, Flow, Material, MemoryKeychain, store_sign_in};
+
+    use super::*;
+
+    const BOX_ID: &str = "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f5";
+    const BOX_HEX: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+    const NOW: u64 = 1_800_000_000;
+    const ROOT_END: u64 = 2_000_000_000;
+
+    fn published(key: &ProxyPublicKey) -> PublishedKey {
+        PublishedKey {
+            public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
+            kid: key.kid(),
+        }
+    }
+
+    // BEP-067, BEP-043: the client's mint of each member and the box's
+    // revocation at its destroy reach the proxy's one audit log over the
+    // control socket, as `min box audit <box>` reads it. A second
+    // revocation of the box writes no second record.
+    #[test]
+    fn mint_and_destroy_append_audit_records() {
+        let identity = Identity {
+            sealing: Some(published(&ProxyKey::generate().unwrap().public())),
+            root: Some(published(&ProxyKey::generate().unwrap().public())),
+            signing: Some(published(&ProxyKey::generate().unwrap().public())),
+            root_not_after: Some(ROOT_END),
+            root_certificate: None,
+        };
+        let keychain = MemoryKeychain::default();
+        store_sign_in(
+            &keychain,
+            &Completed {
+                account: "octocat".into(),
+                flow: Flow::Device,
+                material: Material {
+                    instance: String::new(),
+                    access_token: "ghu_secret_token_value".into(),
+                    refresh_token: "ghr_secret_refresh_value".into(),
+                },
+                token_expires_at: NOW + 3_600,
+                refresh_expires_at: NOW + 86_400,
+            },
+        )
+        .unwrap();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        let log = AuditLog::open(audit_dir.join(segment_name(0))).unwrap();
+        let revoker = Revoker::new(Revocations::default()).with_log(Arc::new(Mutex::new(log)));
+        let path = dir.path().join("bep/control.sock");
+        let boxes = BoxRegistry::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async { Control::bind(&path, Registry::default(), Arc::clone(&boxes)) })
+            .unwrap()
+            .with_revoker(revoker.clone());
+        runtime.spawn(control.run());
+
+        let mut client = ControlClient::connect(&path).unwrap();
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            Path::new("identity.json"),
+            &mut client,
+            &ClientKey::generate().unwrap(),
+            &GrantBox {
+                box_id: BOX_ID.into(),
+                grants: vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
+                egress: vec!["github.com".into(), "api.github.com".into()],
+                stance: Stance::OwnIp,
+            },
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 2);
+        assert!(!revoker.covers(BOX_HEX));
+
+        // The destroy: the lines the VM host daemon sends.
+        for _ in 0..2 {
+            client
+                .ask(
+                    &Submission::RevokeBox {
+                        box_id: BOX_ID.into(),
+                    },
+                    "the box's revocation",
+                )
+                .unwrap();
+        }
+        client
+            .ask(
+                &Request::ForgetBox {
+                    box_id: BOX_ID.into(),
+                },
+                "the box's removal",
+            )
+            .unwrap();
+        assert!(revoker.covers(BOX_HEX));
+        assert!(boxes.get(BOX_HEX).is_none());
+
+        let batch = LogReader::new(&audit_dir).read_new().unwrap();
+        let records: Vec<_> = batch.entries.iter().map(|e| e.record.clone()).collect();
+        let kinds: Vec<Kind> = records.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![Kind::Mint, Kind::Mint, Kind::Revocation]);
+        let identifier = format!("github:{instance}");
+        for record in &records {
+            assert_eq!(record.subject, BOX_HEX);
+            assert!(!batch.entries.iter().any(|e| e.line.contains("ghu_")));
+        }
+        assert_eq!(records[0].identifier, identifier);
+        assert_eq!(records[0].decision, Outcome::Admit);
+        assert_eq!(records[2].identifier, bep::audit::NONE);
+        assert_eq!(records[2].decision, Outcome::Refuse);
+        // One chain: each record names the hash of the line before it.
+        for pair in batch.entries.windows(2) {
+            assert_eq!(
+                pair[1].record.previous_hash,
+                bep::audit::line_hash(&pair[0].line)
+            );
         }
     }
 }

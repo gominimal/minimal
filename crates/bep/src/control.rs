@@ -105,6 +105,14 @@ pub enum Request {
         /// The box id.
         box_id: String,
     },
+}
+
+/// One request line that adds a record to a box's trail. It is a type of
+/// its own beside [`Request`], so a reader of [`Request`] lines keeps its
+/// set of cases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Submission {
     /// Append the `mint` record of one member the client minted.
     RecordMint {
         /// The box id the member is sealed for.
@@ -198,6 +206,9 @@ pub fn handle_with(
     boxes: &Boxes,
     revoker: &Revoker,
 ) -> Reply {
+    if let Ok(submission) = serde_json::from_str::<Submission>(line) {
+        return submit(submission, revoker);
+    }
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(err) => return Reply::refused(format!("the request is not valid: {err}")),
@@ -248,7 +259,13 @@ pub fn handle_with(
             boxes.forget(&box_id);
             Reply::done()
         }
-        Request::RecordMint { box_id, identifier } => {
+    }
+}
+
+/// Does one submission against the revocations and log of `revoker`.
+fn submit(submission: Submission, revoker: &Revoker) -> Reply {
+    match submission {
+        Submission::RecordMint { box_id, identifier } => {
             let Some(box_id) = normalise_box_id(&box_id) else {
                 return Reply::refused("the box id is not 32 hex digits");
             };
@@ -259,7 +276,7 @@ pub fn handle_with(
                 }
             }
         }
-        Request::RevokeBox { box_id } => {
+        Submission::RevokeBox { box_id } => {
             let Some(box_id) = normalise_box_id(&box_id) else {
                 return Reply::refused("the box id is not 32 hex digits");
             };
