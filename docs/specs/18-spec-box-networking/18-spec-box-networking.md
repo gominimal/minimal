@@ -419,7 +419,7 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-056** THE SYSTEM SHALL scope process reaping to the checkout's own VMs.
   tier:     T0
-  verify:   cargo nextest run -p minvmd reap_scoped_per_checkout
+  verify:   just test-shell
   <!-- S7a/AC4; prose 36; ubiquitous -->
 
 - **NET-057** WHILE two VMs run THE SYSTEM SHALL show the VM per box in `min ls`.
