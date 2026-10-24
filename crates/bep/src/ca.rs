@@ -559,7 +559,9 @@ impl<'k, K: CaKey> Ca<'k, K> {
     }
 
     /// Issues the signing CA again under the same key, from `now`, issued by
-    /// the current root. A long-running caller runs it before
+    /// the current root. The root certificate does not change, and the new
+    /// signing CA names the root by the same key identifier, so a box that
+    /// trusts the root trusts the leaves of either signing CA. A long-running caller runs it before
     /// [`Ca::signing_expiry`]. Leaves that the earlier signing CA issued stay
     /// valid until their own expiry, because the key and subject are the same.
     /// The new signing CA never outlives the current root.
@@ -582,7 +584,14 @@ impl<'k, K: CaKey> Ca<'k, K> {
             now,
             self.root_expiry,
         )?;
-        tracing::info!(expiry = %params.not_after, "renewed the signing CA under the same key");
+        // BEP-061: one line per rotation, naming the certificate it replaced
+        // and the one now in use.
+        tracing::info!(
+            old_fingerprint = %crate::publish::certificate_fingerprint(&self.signing),
+            new_fingerprint = %crate::publish::certificate_fingerprint(&signing),
+            expiry = %params.not_after,
+            "rotated the signing CA under the unchanged root and key identifier"
+        );
         self.signing_params = params;
         self.signing = signing;
         Ok(())
@@ -1296,6 +1305,50 @@ mod tests {
             seq = next;
         }
         tags
+    }
+
+    /// The authority key identifier extension value of `cert`.
+    fn akid(cert: &[u8]) -> Vec<u8> {
+        const OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1d, 0x23];
+        let at = cert
+            .windows(OID.len())
+            .position(|w| w == OID)
+            .expect("an authority key identifier extension");
+        let mut rest = &cert[at + OID.len()..];
+        if rest[0] == 0x01 {
+            rest = tlv(rest).2;
+        }
+        tlv(rest).1.to_vec()
+    }
+
+    // BEP-061: a box holds the root alone. The rotation leaves the root as
+    // it was, so leaves from the old and the new signing CA both validate
+    // against the trust store the box got at creation.
+    #[test]
+    fn signing_ca_rotation_invisible_to_boxes() {
+        let (root_key, signing_key) = keys();
+        let mut ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        let host = GITHUB.hosts[0].host;
+        let box_trust = ca.root().clone();
+        let before = ca.signing().clone();
+        let old_leaf = ca.issue_leaf(host, now()).unwrap();
+
+        ca.renew_signing(now()).unwrap();
+
+        assert_eq!(*ca.root(), box_trust, "the root changed");
+        assert_ne!(*ca.signing(), before, "no new signing CA was issued");
+        assert_eq!(akid(ca.signing()), akid(&before));
+        assert_eq!(subject_and_key(ca.signing()), subject_and_key(&before));
+        let new_leaf = ca.issue_leaf(host, now()).unwrap();
+        assert_eq!(new_leaf.chain[1], *ca.signing());
+        assert!(validates(&box_trust, &new_leaf, host));
+        assert!(validates(&box_trust, &old_leaf, host));
     }
 
     #[test]
