@@ -862,6 +862,11 @@ impl DiskLoader {
     /// Returns `InvalidInput` for the nil id or an invalid name,
     /// `AlreadyExists` when another session holds the name, and an I/O
     /// error if the session directory, record, or index cannot be written.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the directory key is always five hex digits, a
+    /// valid relative path.
     pub fn create_with_id(&mut self, record: Record) -> Result<DiskBoxKey, std::io::Error> {
         if record.id.is_nil() {
             return Err(std::io::Error::new(
