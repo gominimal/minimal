@@ -513,6 +513,9 @@ fn reap_scoped_per_checkout() {
     };
     let recorded = || std::fs::read_to_string(&log).unwrap_or_default();
     let root = checkout.display().to_string();
+    // The root as the script quotes it for the patterns that pin it as an
+    // ERE literal: a temp dir's path carries `.`.
+    let root_re = ere_quote(&root);
 
     // Bare invocation: every VM this checkout spawned is in reach — the
     // default VM's and any named VM's, whose cmdlines carry only an appended
@@ -527,24 +530,77 @@ fn reap_scoped_per_checkout() {
     let lines = recorded();
     assert_eq!(
         lines.lines().count(),
-        4,
-        "two patterns, each user-side and once via sudo: {lines}"
+        6,
+        "three patterns, each user-side and once via sudo: {lines}"
     );
     for line in lines.lines() {
         assert!(
-            line.contains(&root),
+            line.contains(&root) || line.contains(&root_re),
             "every pattern must be pinned to this checkout's path, never a bare name: {line}"
         );
     }
     for expected in [
         format!("pkill -f {root}/.*minvmd"),
         format!("pkill -f {root}/.*gvproxy"),
+        format!(
+            "pkill -9 -f {root_re}/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock"
+        ),
         format!("sudo -n pkill -f {root}/.*minvmd"),
         format!("sudo -n pkill -f {root}/.*gvproxy"),
+        format!(
+            "sudo -n pkill -9 -f {root_re}/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock"
+        ),
     ] {
         assert!(
             lines.lines().any(|l| l == expected),
             "missing pattern {expected:?} in:\n{lines}"
+        );
+    }
+    // #2501: the proxy pattern reaps this checkout's `bep serve` of every
+    // VM, and nothing else: not another checkout's, not a look-alike path
+    // where the root's `.` would match any character, and not one listening
+    // outside a VM's `local-minvmd<N>/` directory.
+    let bep_bare =
+        format!("{root_re}/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock");
+    let provider = "/home/u/.minimal/providers/local-minvmd0";
+    for (cmdline, want, why) in [
+        (
+            format!(
+                "{root}/target/debug/bep serve --listener {provider}/gvproxy-bep.sock --exit-on-stdin-close"
+            ),
+            true,
+            "the default VM's proxy",
+        ),
+        (
+            format!(
+                "{root}/target/debug/bep serve --listener {provider}/alpha/gvproxy-bep.sock --exit-on-stdin-close"
+            ),
+            true,
+            "a named VM's proxy",
+        ),
+        (
+            format!("/elsewhere/target/debug/bep serve --listener {provider}/gvproxy-bep.sock"),
+            false,
+            "another checkout's proxy",
+        ),
+        (
+            format!(
+                "{}/target/debug/bep serve --listener {provider}/gvproxy-bep.sock",
+                root.replace('.', "X")
+            ),
+            false,
+            "a look-alike checkout's proxy",
+        ),
+        (
+            format!("{root}/target/debug/bep serve --listener /tmp/gvproxy-bep.sock"),
+            false,
+            "this checkout's proxy on a listener outside every VM's directory",
+        ),
+    ] {
+        assert_eq!(
+            ere_matches(&bep_bare, &cmdline),
+            want,
+            "the bare proxy pattern and {why}: {cmdline}"
         );
     }
     let bare_patterns = lines;
@@ -585,10 +641,26 @@ fn reap_scoped_per_checkout() {
         format!("sudo -n pkill -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
         format!("pkill -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
         format!("sudo -n pkill -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
+        format!("pkill -9 -f {root_re}/.*/bep serve .*local-minvmd[0-9]+/alpha/gvproxy-bep\\.sock"),
+        format!(
+            "sudo -n pkill -9 -f {root_re}/.*/bep serve .*local-minvmd[0-9]+/alpha/gvproxy-bep\\.sock"
+        ),
     ] {
         assert!(
             lines.lines().any(|l| l == expected),
             "missing pattern {expected:?} in:\n{lines}"
+        );
+    }
+    // #2501: alpha's proxy, and not the default VM's or another VM's.
+    let bep_alpha = format!("{root_re}/.*/bep serve .*local-minvmd[0-9]+/alpha/gvproxy-bep\\.sock");
+    for (vm_dir, want) in [("alpha/", true), ("", false), ("beta/", false)] {
+        let cmdline = format!(
+            "{root}/target/debug/bep serve --listener {provider}/{vm_dir}gvproxy-bep.sock --exit-on-stdin-close"
+        );
+        assert_eq!(
+            ere_matches(&bep_alpha, &cmdline),
+            want,
+            "--vm alpha's proxy pattern against {cmdline}"
         );
     }
 
@@ -614,6 +686,40 @@ fn reap_scoped_per_checkout() {
         "the usage error must say how to call the script: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `s` as an ERE literal, escaped as `scripts/reap-vms.sh`'s `ere_quote`
+/// escapes it.
+fn ere_quote(s: &str) -> String {
+    let mut quoted = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "[]\\.*^+|(){}?$".contains(c) {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted
+}
+
+/// Whether the ERE `pattern` matches `line`, as `pkill -f` would match a
+/// cmdline: asked of `grep -E`, the same POSIX ERE engine family.
+fn ere_matches(pattern: &str, line: &str) -> bool {
+    use std::io::Write as _;
+    let mut grep = Command::new("grep")
+        .args(["-Eq", "--", pattern])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning grep");
+    grep.stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(format!("{line}\n").as_bytes())
+        .expect("writing to grep");
+    match grep.wait().expect("waiting on grep").code() {
+        Some(0) => true,
+        Some(1) => false,
+        other => panic!("grep -E failed on {pattern:?}: {other:?}"),
+    }
 }
 
 /// Mark `path` executable (0700): the stub commands and the copied script must
