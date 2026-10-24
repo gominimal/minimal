@@ -44,6 +44,10 @@ pub fn read_client_config(
 /// read in a process only, so a command that reads the config more than
 /// once prints each one once.
 ///
+/// Use this reader, and not [`read_client_config`], on a path that
+/// enforces store consent or store references. It fails closed on an
+/// organization file that is not read or does not parse.
+///
 /// # Errors
 ///
 /// A file that exists but is not read or does not parse, naming its path.
@@ -82,8 +86,9 @@ fn report_org_read_error_once(error: &anyhow::Error) {
     tracing::debug!(file = ORGANIZATION_CONFIG_PATH, %error, "organization config not read");
     PRINTED.call_once(|| {
         eprintln!(
-            "Minimal did not use {ORGANIZATION_CONFIG_PATH}. {error}. \
-             The secret-store rules in that file do not apply to this command."
+            "Minimal did not use {ORGANIZATION_CONFIG_PATH}: {error}\n\
+             The secret-store rules in that file do not apply to this command.\n\
+             Correct or remove {ORGANIZATION_CONFIG_PATH}, and then run the command again."
         );
     });
 }
