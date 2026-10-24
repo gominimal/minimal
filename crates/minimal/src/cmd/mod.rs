@@ -36,7 +36,7 @@ mod session;
 pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
-pub use auth::{cmd_auth_login, cmd_auth_status};
+pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 pub use box_audit::AuditSelfUnsupportedUnenrolled;
 pub use box_verbs::*;
 pub use finalize_install::*;
@@ -252,6 +252,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Auth(AuthArgs { command })) => match command {
             AuthCommand::Login(args) => cmd_auth_login(&cli.global_args, args).await,
             AuthCommand::Status => cmd_auth_status(&cli.global_args),
+            AuthCommand::Logout => cmd_auth_logout(&cli.global_args).await,
         },
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await

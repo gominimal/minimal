@@ -207,6 +207,12 @@ pub enum Verdict {
         /// True when this request renewed the sign-in that gave the
         /// credential. The forwarder audits the renewal as its own record.
         renewed: bool,
+        /// The admission's audit marker: `cohort_attributed` for a cohort
+        /// admission, `None` for an admission from the named box itself.
+        marker: Option<&'static str>,
+        /// Whether the admission is cohort-attributed, for the
+        /// `box_connection` span (BEP-028).
+        cohort_attributed: bool,
     },
     /// The decision refused the request. The text is the audit marker.
     Refuse(&'static str),
@@ -684,6 +690,8 @@ impl Flow {
                         identifier,
                         mapping,
                         renewed,
+                        marker: admitted,
+                        cohort_attributed,
                     } => {
                         if renewed {
                             // BEP-069: the renewal is its own audit record,
@@ -703,7 +711,11 @@ impl Flow {
                             return Err(marker);
                         }
                         span.record("substitution", "substituted");
-                        self.record(Outcome::Admit, None, Some(identifier), mapping);
+                        // Recorded only once the admit stands, so a refused
+                        // substitution never shows the cohort flag.
+                        span.record("cohort_attributed", cohort_attributed);
+                        // BEP-028: a cohort admission keeps its marker.
+                        self.record(Outcome::Admit, admitted, Some(identifier), mapping);
                         Ok(())
                     }
                     Verdict::Refuse(marker) => {
@@ -1117,6 +1129,8 @@ mod tests {
                 identifier: "github:member".to_owned(),
                 mapping: Mapping::ModuleUnmapped,
                 renewed: false,
+                marker: None,
+                cohort_attributed: false,
             }
         }
     }
@@ -1556,6 +1570,8 @@ mod tests {
                 identifier: "github:member".to_owned(),
                 mapping: Mapping::ModuleUnmapped,
                 renewed: false,
+                marker: None,
+                cohort_attributed: false,
             }
         }
     }
@@ -1694,6 +1710,8 @@ mod tests {
                     permission: "read".to_owned(),
                 },
                 renewed: false,
+                marker: None,
+                cohort_attributed: false,
             }
         }
     }
