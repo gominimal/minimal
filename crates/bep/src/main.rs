@@ -59,6 +59,12 @@ struct Args {
     #[arg(long, conflicts_with = "replace_key")]
     rotate_signing: bool,
 
+    /// The control socket of the `bep serve` to rotate. Give the same path
+    /// as `bep serve --control`.
+    /// [default: ~/.minimal/bep/control.sock]
+    #[arg(long, value_name = "PATH", requires = "rotate_signing")]
+    control: Option<PathBuf>,
+
     /// Where to write the proxy's public keys and fingerprints.
     /// [default: ~/.minimal/bep/identity.json]
     #[arg(long, value_name = "PATH")]
@@ -142,12 +148,15 @@ where
         }
         // The signing CA lives in the serving proxy alone, so the rotation
         // happens there (BEP-061).
-        let rotated = bep_dir()
+        let rotated = args
+            .control
+            .clone()
+            .or_else(default_control)
             .ok_or_else(|| {
-                "bep did not find your home directory, which holds the state of `bep serve`."
+                "bep did not find your home directory. Give the socket with `bep --rotate-signing --control <PATH>`."
                     .to_string()
             })
-            .and_then(|dir| request_rotation(&dir, signal_rotation, ROTATE_TIMEOUT));
+            .and_then(|control| request_rotation(&control, signal_rotation, ROTATE_TIMEOUT));
         return match rotated {
             Ok(report) => {
                 println!("{report}");
@@ -340,20 +349,31 @@ fn log_root(root: &RootCertificate) {
 const ROTATED_SIGNING: &str =
     "Signing certificate rotated. Running boxes keep working; nothing inside them changes.";
 
-/// The file a serving proxy holds locked for its life. It names the
-/// process, so `bep --rotate-signing` can reach it.
-const SERVE_LOCK: &str = "serve.lock";
+/// The suffix of the file a serving proxy holds locked for its life. It
+/// names the process, so `bep --rotate-signing` can reach it.
+const SERVE_LOCK: &str = "lock";
 
-/// The fingerprint of the signing CA that a serving proxy signs leaves with.
-const SIGNING_FINGERPRINT: &str = "signing.fingerprint";
+/// The suffix of the file that holds the fingerprint of the signing CA that
+/// a serving proxy signs leaves with.
+const SIGNING_FINGERPRINT: &str = "signing";
 
 /// How long `bep --rotate-signing` waits for the serving proxy to report
 /// its new signing CA.
 const ROTATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The directory that holds the state of a serving proxy by default.
-fn bep_dir() -> Option<PathBuf> {
-    std::env::home_dir().map(|home| home.join(".minimal/bep"))
+/// The control socket of `bep serve` when `--control` names none.
+fn default_control() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock"))
+}
+
+/// A state file of the proxy whose control socket is `control`: the socket
+/// path with `.suffix` added. Each control socket has its own state, so two
+/// proxies in one directory do not share a lock.
+fn state_file(control: &Path, suffix: &str) -> PathBuf {
+    let mut name = control.as_os_str().to_owned();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// What a serving proxy keeps on disk so that `bep --rotate-signing` can
@@ -361,21 +381,23 @@ fn bep_dir() -> Option<PathBuf> {
 /// the fingerprint of the signing CA in use.
 #[derive(Debug)]
 struct ServeState {
-    dir: PathBuf,
+    control: PathBuf,
     _lock: std::fs::File,
 }
 
 impl ServeState {
-    /// Takes the lock in `dir` for the process `pid`. Gives `None` when
-    /// another serving proxy holds it.
-    fn claim(dir: &Path, pid: u32) -> io::Result<Option<Self>> {
-        std::fs::create_dir_all(dir)?;
+    /// Takes the lock beside the control socket `control` for the process
+    /// `pid`. Gives `None` when another serving proxy holds it.
+    fn claim(control: &Path, pid: u32) -> io::Result<Option<Self>> {
+        if let Some(dir) = control.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let mut lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(dir.join(SERVE_LOCK))?;
+            .open(state_file(control, SERVE_LOCK))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
@@ -384,7 +406,7 @@ impl ServeState {
         lock.set_len(0)?;
         writeln!(lock, "{pid}")?;
         Ok(Some(Self {
-            dir: dir.to_path_buf(),
+            control: control.to_path_buf(),
             _lock: lock,
         }))
     }
@@ -392,9 +414,10 @@ impl ServeState {
     /// Records `signing` as the signing CA in use. The write replaces the
     /// file whole, so a reader never sees half of it.
     fn record(&self, signing: &[u8]) -> io::Result<()> {
-        let staged = self.dir.join(format!("{SIGNING_FINGERPRINT}.new"));
+        let path = state_file(&self.control, SIGNING_FINGERPRINT);
+        let staged = state_file(&path, "new");
         std::fs::write(&staged, certificate_fingerprint(signing))?;
-        std::fs::rename(staged, self.dir.join(SIGNING_FINGERPRINT))
+        std::fs::rename(staged, path)
     }
 }
 
@@ -411,25 +434,28 @@ fn rotate<K: CaKey>(
     if let Some(state) = state
         && let Err(error) = state.record(ca.signing())
     {
-        tracing::warn!(dir = %state.dir.display(), %error, "did not record the new signing CA fingerprint");
+        tracing::warn!(control = %state.control.display(), %error, "did not record the new signing CA fingerprint");
     }
     Ok(())
 }
 
-/// `bep --rotate-signing`: asks the `bep serve` whose state is in `dir` to
+/// `bep --rotate-signing`: asks the `bep serve` on the control socket
+/// `control` to
 /// rotate its signing CA, through `notify`, and waits until it records a
 /// new one. Gives the line to print.
 fn request_rotation(
-    dir: &Path,
+    control: &Path,
     notify: impl FnOnce(u32) -> io::Result<()>,
     timeout: Duration,
 ) -> Result<&'static str, String> {
     let not_running = || {
-        "The signing certificate was not rotated, because no `bep serve` is running. \
-         `bep serve` issues a new signing certificate each time it starts."
-            .to_string()
+        format!(
+            "The signing certificate was not rotated, because no `bep serve` is running with the control socket {}. \
+             `bep serve` issues a new signing certificate each time it starts.",
+            control.display()
+        )
     };
-    let lock_path = dir.join(SERVE_LOCK);
+    let lock_path = state_file(control, SERVE_LOCK);
     let lock = match std::fs::File::open(&lock_path) {
         Ok(lock) => lock,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(not_running()),
@@ -452,7 +478,7 @@ fn request_rotation(
                 lock_path.display()
             )
         })?;
-    let fingerprint_path = dir.join(SIGNING_FINGERPRINT);
+    let fingerprint_path = state_file(control, SIGNING_FINGERPRINT);
     let read_fingerprint = || std::fs::read_to_string(&fingerprint_path).ok();
     let before = read_fingerprint();
     notify(pid).map_err(|err| {
@@ -560,15 +586,14 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
 /// serves and renews its signing CA.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn claim_state(control: &Path) -> Option<Arc<ServeState>> {
-    let dir = control.parent()?;
-    match ServeState::claim(dir, std::process::id()) {
+    match ServeState::claim(control, std::process::id()) {
         Ok(Some(state)) => Some(Arc::new(state)),
         Ok(None) => {
-            tracing::warn!(dir = %dir.display(), "another `bep serve` holds the state; `bep --rotate-signing` reaches that one");
+            tracing::warn!(control = %control.display(), "another `bep serve` holds the state; `bep --rotate-signing` reaches that one");
             None
         }
         Err(error) => {
-            tracing::warn!(dir = %dir.display(), %error, "did not write the state that `bep --rotate-signing` reads");
+            tracing::warn!(control = %control.display(), %error, "did not write the state that `bep --rotate-signing` reads");
             None
         }
     }
@@ -685,11 +710,9 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     root: RootCertificate,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
-    let control = args
-        .control
-        .clone()
-        .or_else(|| std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock")))
-        .ok_or("bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.")?;
+    let control = args.control.clone().or_else(default_control).ok_or(
+        "bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.",
+    )?;
     let dir = audit::default_dir()
         .ok_or("bep did not find your home directory, which holds the audit log.")?;
     let segment = audit::segments(&dir)
@@ -742,7 +765,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         if let Some(state) = &state {
             let signing = ca.lock().unwrap_or_else(PoisonError::into_inner).signing().clone();
             if let Err(error) = state.record(&signing) {
-                tracing::warn!(dir = %state.dir.display(), %error, "did not record the signing CA fingerprint");
+                tracing::warn!(control = %state.control.display(), %error, "did not record the signing CA fingerprint");
             }
         }
         keep_signing_renewed(Arc::clone(&ca), state.clone());
@@ -945,22 +968,32 @@ mod tests {
         let ca = Mutex::new(Ca::with_root(&root_key, &signing_key, root, at).unwrap());
         let box_trust = ca.lock().unwrap().root().clone();
         let dir = tempfile::tempdir().unwrap();
+        // A custom `--control` path: the state follows the socket.
+        let control = dir.path().join("custom/one.sock");
+        let other = dir.path().join("custom/two.sock");
 
         // No proxy ran here, so there is nothing to rotate.
-        let refused = request_rotation(dir.path(), |_| unreachable!(), ROTATE_TIMEOUT);
+        let refused = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
         assert!(refused.unwrap_err().contains("no `bep serve` is running"));
 
-        let state = ServeState::claim(dir.path(), 4242).unwrap().unwrap();
+        let state = ServeState::claim(&control, 4242).unwrap().unwrap();
         let in_use = ca.lock().unwrap().signing().clone();
         state.record(&in_use).unwrap();
         assert!(
-            ServeState::claim(dir.path(), 4343).unwrap().is_none(),
+            ServeState::claim(&control, 4343).unwrap().is_none(),
             "a second proxy took the state of a running one"
+        );
+        // A proxy on another socket in the same directory has its own state.
+        let refused = request_rotation(&other, |_| unreachable!(), ROTATE_TIMEOUT);
+        assert!(refused.unwrap_err().contains("no `bep serve` is running"));
+        assert!(
+            ServeState::claim(&other, 4444).unwrap().is_some(),
+            "two control sockets share one lock"
         );
 
         let mut asked = None;
         let printed = request_rotation(
-            dir.path(),
+            &control,
             |pid| {
                 asked = Some(pid);
                 rotate(&ca, Some(&state), SystemTime::now()).map_err(io::Error::other)
@@ -980,13 +1013,13 @@ mod tests {
             "the serving proxy kept its signing CA"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join(SIGNING_FINGERPRINT)).unwrap(),
+            std::fs::read_to_string(state_file(&control, SIGNING_FINGERPRINT)).unwrap(),
             certificate_fingerprint(ca_now.signing())
         );
         drop(ca_now);
 
         // A proxy that answers nothing gets a refusal, not a claim.
-        let silent = request_rotation(dir.path(), |_| Ok(()), Duration::ZERO);
+        let silent = request_rotation(&control, |_| Ok(()), Duration::ZERO);
         assert!(
             silent
                 .unwrap_err()
@@ -995,7 +1028,7 @@ mod tests {
 
         // A proxy that stopped leaves its file unlocked.
         drop(state);
-        let stale = request_rotation(dir.path(), |_| unreachable!(), ROTATE_TIMEOUT);
+        let stale = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
         assert!(stale.unwrap_err().contains("no `bep serve` is running"));
 
         let expiry = ca.lock().unwrap().signing_expiry();
