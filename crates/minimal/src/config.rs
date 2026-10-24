@@ -40,7 +40,8 @@ pub fn read_client_config(
 /// (BEP-034) is printed on stderr, naming its file, and left out of the
 /// returned rules. A user rule replaces the fields of an organization rule
 /// for the same item, but keeps the stricter of the two actions, as
-/// [`merge_store_rules`] says. The refusals of a file print on its first
+/// [`merge_store_rules`] says. An organization rule that the deny set
+/// refuses still sets that floor. The refusals of a file print on its first
 /// read in a process only, so a command that reads the config more than
 /// once prints each one once.
 ///
@@ -74,9 +75,11 @@ fn read_client_and_org_config(
         }
         Err(e) => return Err(e),
     };
+    let org_read = org_rules.clone();
     let org_rules = refuse_store_rules_once(org_rules, org_path);
     let user_rules = refuse_store_rules_once(user_rules, &user);
-    Ok((config, merge_store_rules(org_rules, user_rules)))
+    let merged = merge_store_rules(org_rules, user_rules);
+    Ok((config, keep_org_actions(&org_read, merged)))
 }
 
 /// Print, on its first call in this process, that the organization file
@@ -118,6 +121,22 @@ pub fn merge_store_rules(org: StoreRules, user: StoreRules) -> StoreRules {
         rules.insert(item, rule);
     }
     rules
+}
+
+/// Raise the action of each rule in `merged` to the action of the
+/// organization rule for the same item in `org_read`, when that action is
+/// stricter. `org_read` holds the organization rules as read, before the
+/// deny set refuses any of them. So an organization rule that is refused
+/// still keeps a user rule for its item from loosening its `deny` or `ask`.
+fn keep_org_actions(org_read: &StoreRules, mut merged: StoreRules) -> StoreRules {
+    for (item, rule) in &mut merged {
+        if let Some(org_rule) = org_read.get(item)
+            && action_rank(org_rule.action) > action_rank(rule.action)
+        {
+            rule.action = org_rule.action;
+        }
+    }
+    merged
 }
 
 /// [`refuse_store_rules`] to stderr on the first read of `path` in this
@@ -367,5 +386,22 @@ mod tests {
         assert_eq!(merged["loose"].action, Some(StoreAction::Deny));
         assert_eq!(merged["org-only"].action, Some(StoreAction::Ask));
         assert_eq!(merged["user-only"].action, None);
+    }
+
+    /// An organization `deny` rule that the deny set refuses still keeps a
+    /// user rule for the same item from loosening it.
+    #[test]
+    fn refused_org_rule_keeps_its_action_over_user_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let org_path = dir.path().join("org.toml");
+        let mut refused = rule(Some(StoreAction::Deny));
+        refused.upstream = vec!["api.github.com".to_owned()];
+        let org_read: StoreRules = [("item".to_owned(), refused)].into();
+        let org = refuse_store_rules(org_read.clone(), &org_path, &mut std::io::sink());
+        assert!(org.is_empty());
+        let user: StoreRules = [("item".to_owned(), rule(Some(StoreAction::Allow)))].into();
+        let merged = keep_org_actions(&org_read, merge_store_rules(org, user));
+        assert_eq!(merged["item"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["item"].upstream, ["api.example.com"]);
     }
 }
