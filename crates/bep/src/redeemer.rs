@@ -20,7 +20,8 @@
 //! (BEP-071). The redeemer never logs or returns the credential except in
 //! [`Verdict::Admit`], which the forwarder substitutes and zeroes.
 
-use std::sync::{Arc, PoisonError, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
@@ -72,7 +73,15 @@ pub struct BoxRedeemer<K, C> {
     clock: Clock,
     endpoint: Arc<dyn TokenEndpoint>,
     renewals: SingleFlight<Result<Resolved, RenewError>>,
+    /// When the last renewal of each item failed, by instance. Within
+    /// [`RENEW_RETRY_AFTER_SECS`] of it, no request calls GitHub again.
+    failed_renewals: Mutex<HashMap<String, u64>>,
 }
+
+/// How long the proxy waits after a failed renewal of an item before it asks
+/// GitHub again. A refused refresh token stays refused, and each attempt
+/// can take up to 30 seconds, so a request in this window does not retry.
+pub const RENEW_RETRY_AFTER_SECS: u64 = 60;
 
 impl<K, C> std::fmt::Debug for BoxRedeemer<K, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -122,6 +131,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             clock: system_clock(),
             endpoint: Arc::new(NoTokenEndpoint),
             renewals: SingleFlight::default(),
+            failed_renewals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -332,9 +342,11 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         if metadata.instance != instance {
             return None;
         }
-        if metadata.needs_renewal(now) {
+        if metadata.needs_renewal(now) && !self.renewal_backed_off(instance, now) {
             let ran = self.renewals.run(instance, || {
-                signin::renew(&self.keychain, self.endpoint.as_ref(), instance, now)
+                let outcome = signin::renew(&self.keychain, self.endpoint.as_ref(), instance, now);
+                self.record_renewal(instance, &outcome, now);
+                outcome
             });
             return match ran {
                 Ran::Led(Ok(resolved)) => Some((resolved.token, resolved.renewed)),
@@ -344,7 +356,18 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                     None
                 }
                 Ran::Abandoned => None,
+                Ran::TimedOut => {
+                    tracing::warn!(
+                        "the sign-in renewal in flight did not end in time; the request is refused"
+                    );
+                    None
+                }
             };
+        }
+        if now >= metadata.token_expires_at {
+            // A renewal failed within the back-off, and the token expired.
+            tracing::debug!("the sign-in reference resolved to an expired token");
+            return None;
         }
         match self.keychain.material() {
             Ok(Some(material)) if material.instance == instance => {
@@ -354,6 +377,37 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             Err(error) => {
                 tracing::warn!(%error, "the sign-in item was not read");
                 None
+            }
+        }
+    }
+}
+
+impl<K, C> BoxRedeemer<K, C> {
+    /// True when the last renewal of `instance` failed less than
+    /// [`RENEW_RETRY_AFTER_SECS`] before `now`.
+    fn renewal_backed_off(&self, instance: &str, now: u64) -> bool {
+        self.failed_renewals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(instance)
+            .is_some_and(|&failed| now < failed.saturating_add(RENEW_RETRY_AFTER_SECS))
+    }
+
+    /// Record the outcome of a renewal of `instance`. A renewal that gave no
+    /// new token starts the back-off. A renewed token ends it.
+    fn record_renewal(&self, instance: &str, outcome: &Result<Resolved, RenewError>, now: u64) {
+        let mut failed = self
+            .failed_renewals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match outcome {
+            // A renewed token, or a token that another renewal already wrote
+            // with time to live. Nothing failed.
+            Ok(resolved) if !resolved.failed => {
+                failed.remove(instance);
+            }
+            _ => {
+                failed.insert(instance.to_owned(), now);
             }
         }
     }
@@ -1331,5 +1385,54 @@ mod tests {
         assert_eq!(endpoint.calls(), 1);
         assert_eq!(refused(&end), None, "{end:?}");
         assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+    }
+
+    // BEP-069: a failed renewal is not retried on every request. Within the
+    // back-off the held token is used while it lives, and GitHub is not
+    // asked again. After the back-off, the next request asks once more.
+    #[test]
+    fn a_failed_renewal_is_not_retried_within_the_back_off() {
+        let endpoint = Arc::new(FakeEndpoint {
+            refuse: true,
+            ..FakeEndpoint::default()
+        });
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(NOW));
+        let now = Arc::clone(&clock);
+        let keychain = MemoryKeychain::default();
+        seed(&keychain, NOW + 100, NOW + 86_400);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer
+                .with_token_endpoint(Arc::clone(&endpoint) as Arc<dyn TokenEndpoint>)
+                .with_clock(Arc::new(move || {
+                    now.load(std::sync::atomic::Ordering::SeqCst)
+                }))
+        });
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        for _ in 0..3 {
+            let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{end:?}");
+            assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        }
+        assert_eq!(endpoint.calls(), 1, "one call to GitHub in the back-off");
+
+        clock.store(
+            NOW + RENEW_RETRY_AFTER_SECS,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(endpoint.calls(), 2, "the back-off ended");
+
+        // The token expires inside the next back-off: the request is refused
+        // `github_sign_in_required`, and GitHub is not asked.
+        clock.store(NOW + 101, std::sync::atomic::Ordering::SeqCst);
+        let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        assert_eq!(endpoint.calls(), 2);
     }
 }

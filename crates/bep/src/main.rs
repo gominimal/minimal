@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
@@ -959,7 +959,8 @@ const GITHUB_APP_CLIENT_ID: &str = "Iv23liv6KetAFJp4Eb5K";
 /// the host passes to the proxy. A browser-flow sign-in renews under it.
 const CLIENT_SECRET_ENV: &str = "MINIMAL_GITHUB_APP_CLIENT_SECRET";
 
-/// How long one renewal has to connect, send and read GitHub's answer.
+/// How long one renewal has, in all, to look up GitHub, connect, send and
+/// read the answer.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest answer the token endpoint reads.
@@ -1009,15 +1010,36 @@ impl GitHubTokenEndpoint {
     /// POST `body` to the token endpoint, and give the answer's status code
     /// and body.
     fn post(&self, body: &str) -> Result<(u16, Zeroizing<Vec<u8>>), String> {
-        let addr = (self.host, 443)
-            .to_socket_addrs()
+        // One deadline for the whole exchange: the lookup, the connect, the
+        // send and every read share TOKEN_TIMEOUT.
+        let deadline = Instant::now() + TOKEN_TIMEOUT;
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| format!("GitHub did not answer within {}s", TOKEN_TIMEOUT.as_secs()))
+        };
+        // The system lookup has no timeout of its own, so it runs on a thread
+        // that the exchange stops waiting for at the deadline.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let host = self.host;
+        std::thread::Builder::new()
+            .name("bep-token-dns".into())
+            .spawn(move || {
+                let _ = tx.send((host, 443).to_socket_addrs().map(|mut a| a.next()));
+            })
+            .map_err(|e| format!("{} was not looked up: {e}", self.host))?;
+        let addr = rx
+            .recv_timeout(remaining()?)
+            .map_err(|_| format!("{} did not resolve in time", self.host))?
             .map_err(|e| format!("{} did not resolve: {e}", self.host))?
-            .next()
             .ok_or_else(|| format!("{} did not resolve", self.host))?;
-        let tcp = TcpStream::connect_timeout(&addr, TOKEN_TIMEOUT)
+        let tcp = TcpStream::connect_timeout(&addr, remaining()?)
             .map_err(|e| format!("{} was not reached: {e}", self.host))?;
-        tcp.set_read_timeout(Some(TOKEN_TIMEOUT))
-            .and_then(|()| tcp.set_write_timeout(Some(TOKEN_TIMEOUT)))
+        // The TLS handshake reads during the send, so both timeouts are set.
+        let left = remaining()?;
+        tcp.set_read_timeout(Some(left))
+            .and_then(|()| tcp.set_write_timeout(Some(left)))
             .map_err(|e| e.to_string())?;
         let name = rustls::pki_types::ServerName::try_from(self.host)
             .map_err(|e| e.to_string())?
@@ -1037,6 +1059,9 @@ impl GitHubTokenEndpoint {
         let mut reply = Zeroizing::new(Vec::new());
         let mut chunk = Zeroizing::new([0u8; 4096]);
         loop {
+            tls.sock
+                .set_read_timeout(Some(remaining()?))
+                .map_err(|e| e.to_string())?;
             match tls.read(&mut chunk[..]) {
                 Ok(0) => break,
                 Ok(n) => {

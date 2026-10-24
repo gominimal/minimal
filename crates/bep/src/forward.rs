@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -265,7 +266,15 @@ pub enum Ran<T> {
     Waited(T),
     /// The run this caller waited for ended with no outcome: it panicked.
     Abandoned,
+    /// The run this caller waited for did not end within the wait limit.
+    /// The caller stopped waiting, and the run goes on.
+    TimedOut,
 }
+
+/// How long a caller waits for a run in flight before it stops waiting. A
+/// renewal's exchange with GitHub has 30 seconds. The rest of the limit
+/// covers the keychain reads and the write.
+pub const FLIGHT_WAIT_LIMIT: Duration = Duration::from_secs(45);
 
 /// One run in flight per key, the other callers waiting for its outcome.
 ///
@@ -275,13 +284,12 @@ pub enum Ran<T> {
 /// flight waits for that renewal's outcome and does not renew again.
 pub struct SingleFlight<T> {
     flights: Mutex<HashMap<String, Arc<InFlight<T>>>>,
+    wait_limit: Duration,
 }
 
 impl<T> Default for SingleFlight<T> {
     fn default() -> Self {
-        Self {
-            flights: Mutex::new(HashMap::new()),
-        }
+        Self::with_wait_limit(FLIGHT_WAIT_LIMIT)
     }
 }
 
@@ -320,9 +328,21 @@ impl<T> Drop for Finish<'_, T> {
     }
 }
 
+impl<T> SingleFlight<T> {
+    /// No run in flight, each waiter waiting at most `wait_limit`.
+    #[must_use]
+    pub fn with_wait_limit(wait_limit: Duration) -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            wait_limit,
+        }
+    }
+}
+
 impl<T: Clone> SingleFlight<T> {
     /// Run `work` for `key`, unless a run for `key` is in flight. Then wait
-    /// for that run's outcome in place of running `work`.
+    /// for that run's outcome in place of running `work`, for at most the
+    /// wait limit.
     pub fn run(&self, key: &str, work: impl FnOnce() -> T) -> Ran<T> {
         let (flight, leader) = {
             let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
@@ -353,12 +373,13 @@ impl<T: Clone> SingleFlight<T> {
             drop(finish);
             return Ran::Led(outcome);
         }
-        let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while !state.0 {
-            state = flight
-                .done
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+        let state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (state, waited) = flight
+            .done
+            .wait_timeout_while(state, self.wait_limit, |state| !state.0)
+            .unwrap_or_else(PoisonError::into_inner);
+        if waited.timed_out() && !state.0 {
+            return Ran::TimedOut;
         }
         state.1.clone().map_or(Ran::Abandoned, Ran::Waited)
     }
@@ -1876,5 +1897,28 @@ mod tests {
         }
         assert_eq!(carried(&request("token ghp_x".into())), Carried::Foreign);
         assert!(!is_sealed("a.b.c"));
+    }
+
+    // BEP-069: a caller that waits for a run in flight stops waiting at the
+    // wait limit, so a stalled renewal does not hold every request.
+    #[test]
+    fn a_waiter_stops_waiting_at_the_wait_limit() {
+        let flights: SingleFlight<u8> = SingleFlight::with_wait_limit(Duration::from_millis(50));
+        let started = std::sync::Barrier::new(2);
+        let release = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(|| {
+                flights.run("item", || {
+                    started.wait();
+                    release.wait();
+                    7
+                })
+            });
+            started.wait();
+            assert_eq!(flights.run("item", || 9), Ran::TimedOut);
+            release.wait();
+            assert_eq!(leader.join().unwrap(), Ran::Led(7));
+        });
+        assert_eq!(flights.run("item", || 9), Ran::Led(9));
     }
 }

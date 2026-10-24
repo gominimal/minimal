@@ -334,10 +334,11 @@ pub trait Keychain {
     /// sign-in that replaced it with a new instance, gives
     /// [`Updated::Gone`].
     ///
-    /// The default checks the held metadata, then writes. A host keychain
-    /// tool has no update-only write, so a logout between the check and the
-    /// write can still lose that race. [`MemoryKeychain`] checks and writes
-    /// under one lock.
+    /// The default checks the held metadata, then writes, with nothing
+    /// between them. [`MemoryKeychain`] checks and writes under one lock.
+    /// [`HostKeychain`] checks and writes under the item lock
+    /// ([`lock_item`]), which `min auth logout` holds for its delete. The
+    /// host keychain tools have no update-only write of their own.
     ///
     /// # Errors
     ///
@@ -455,6 +456,9 @@ pub struct Resolved {
     /// True when this renewal got the token from GitHub and wrote it to the
     /// item. False when the held token was still good to use.
     pub renewed: bool,
+    /// True when this renewal asked GitHub, or meant to, and got no new
+    /// token, and the held token is given until it expires.
+    pub failed: bool,
 }
 
 /// Why a renewal gave no token. Each one refuses the request.
@@ -508,13 +512,14 @@ pub fn renew(
             return Err(RenewError::SignInRequired);
         }
     };
-    let held = |renewed| Resolved {
+    let held = |failed| Resolved {
         token: Zeroizing::new(material.access_token.clone()),
-        renewed,
+        renewed: false,
+        failed,
     };
     let keep = || {
         if now < metadata.token_expires_at {
-            Ok(held(false))
+            Ok(held(true))
         } else {
             Err(RenewError::SignInRequired)
         }
@@ -561,6 +566,7 @@ pub fn renew(
             Ok(Resolved {
                 token: Zeroizing::new(renewed_material.access_token.clone()),
                 renewed: true,
+                failed: false,
             })
         }
         Ok(Updated::Gone) => {
@@ -808,6 +814,75 @@ impl Keychain for HostKeychain {
         }
         Ok(())
     }
+
+    fn update(&self, metadata: &Metadata, material: &Material) -> Result<Updated, SignInError> {
+        // BEP-069: the check and the write happen under the item lock, so a
+        // logout that holds it for its delete cannot fall between them.
+        let _lock = lock_item()?;
+        match self.metadata()? {
+            Some(held) if held.instance == metadata.instance => {
+                self.write(metadata, material)?;
+                Ok(Updated::Written)
+            }
+            _ => Ok(Updated::Gone),
+        }
+    }
+}
+
+/// The file the item lock is held on: `~/.minimal/bep/sign-in.lock`. `None`
+/// when no home directory is known.
+#[must_use]
+pub fn item_lock_path() -> Option<std::path::PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep/sign-in.lock"))
+}
+
+/// The item lock, held until drop. It is an exclusive lock on a file, so it
+/// holds across processes: the proxy's renewal and `min auth logout`.
+#[derive(Debug)]
+pub struct ItemLock {
+    _file: std::fs::File,
+}
+
+/// Take the item lock at [`item_lock_path`], and wait while another process
+/// holds it. The renewal holds it from its check to its write, and a logout
+/// holds it for its delete, so a renewal never writes an item back after a
+/// logout deleted it.
+///
+/// # Errors
+///
+/// When no home directory is known, or the lock file is not opened or not
+/// locked.
+pub fn lock_item() -> Result<ItemLock, SignInError> {
+    let path = item_lock_path().ok_or_else(|| SignInError::Keychain {
+        action: "lock the sign-in",
+        detail: "no home directory is known".into(),
+    })?;
+    lock_item_at(&path)
+}
+
+/// Take the item lock on the file at `path`, created when missing.
+///
+/// # Errors
+///
+/// When the lock file is not opened or not locked.
+pub fn lock_item_at(path: &std::path::Path) -> Result<ItemLock, SignInError> {
+    let refused = |e: std::io::Error| SignInError::Keychain {
+        action: "lock the sign-in",
+        detail: format!("{}: {e}", path.display()),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(refused)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(refused)?;
+    file.lock().map_err(refused)?;
+    Ok(ItemLock { _file: file })
 }
 
 fn run(
@@ -1003,5 +1078,26 @@ mod host {
             action,
             detail: String::from_utf8_lossy(stderr).trim().to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BEP-069: the item lock excludes a second holder until the first drops
+    // it, so a renewal's check and write never straddle a logout's delete.
+    #[test]
+    fn the_item_lock_excludes_a_second_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/sign-in.lock");
+        let held = lock_item_at(&path).unwrap();
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a second holder takes the lock while the first holds it"
+        );
+        drop(held);
+        other.try_lock().expect("the lock is free once dropped");
     }
 }
