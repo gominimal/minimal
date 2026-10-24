@@ -237,9 +237,11 @@ jobs:
     # The main ruleset requires `license/cla`, but the CLA assistant reports
     # only on PR head commits, never on the merge queue's
     # gh-readonly-queue/* commits, so every group waited out the queue's
-    # check timeout and was dropped. This job copies the assistant's verdict
-    # from the queued PR's head commit onto the group commit, and fails
-    # without posting when the PR's head has no passing `license/cla`.
+    # check timeout and was dropped. This job checks every PR the group
+    # commit carries (the queue squashes each one into a commit whose
+    # subject ends in `(#N)`) and posts `license/cla` on the group commit
+    # only when each PR's head has a passing one; otherwise it fails and
+    # posts nothing.
     cla-merge-group:
         if: github.event_name == 'merge_group'
         permissions:
@@ -248,30 +250,39 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 5
         steps:
-            - name: Mirror the PR's license/cla onto the merge-group commit
+            - name: Mirror the group's license/cla onto the merge-group commit
               env:
                   GH_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
+                  BASE: ${{ github.event.merge_group.base_sha }}
                   SHA: ${{ github.event.merge_group.head_sha }}
-                  HEAD_REF: ${{ github.event.merge_group.head_ref }}
               run: |
-                  # refs/heads/gh-readonly-queue/<base>/pr-<number>-<base sha>
-                  pr=$(sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p' <<<"$HEAD_REF")
-                  if [ -z "$pr" ]; then
-                      echo "cannot read a PR number from $HEAD_REF" >&2
-                      exit 1
-                  fi
-                  head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
-                  state=$(gh api "repos/$REPO/commits/$head/status" \
-                      --jq '[.statuses[] | select(.context == "license/cla") | .state] | first // "missing"')
-                  if [ "$state" != success ]; then
-                      echo "license/cla is '$state' on #$pr's head $head" >&2
-                      exit 1
-                  fi
+                  set -euo pipefail
+                  subjects=$(gh api "repos/$REPO/compare/$BASE...$SHA" \
+                      --jq '.commits[].commit.message | split("\n")[0]')
+                  prs=()
+                  while IFS= read -r subject; do
+                      pr=$(sed -nE 's/.*\(#([0-9]+)\)$/\1/p' <<<"$subject")
+                      if [ -z "$pr" ]; then
+                          echo "no (#N) on queue commit subject: $subject" >&2
+                          exit 1
+                      fi
+                      prs+=("$pr")
+                  done <<<"$subjects"
+                  for pr in "${prs[@]}"; do
+                      head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
+                      state=$(gh api "repos/$REPO/commits/$head/status" \
+                          --jq '[.statuses[] | select(.context == "license/cla") | .state] | first // "missing"')
+                      if [ "$state" != success ]; then
+                          echo "license/cla is '$state' on #$pr's head $head" >&2
+                          exit 1
+                      fi
+                      echo "#$pr: license/cla success on $head"
+                  done
                   gh api --method POST "repos/$REPO/statuses/$SHA" \
                       -f state=success \
                       -f context=license/cla \
-                      -f description="Mirrored from #$pr's head ${head:0:7}."
+                      -f description="Mirrored from the group's PRs: ${prs[*]/#/#}."
 
     # Single required status check for branch protection. Green when every
     # gating job succeeded OR was path-skipped (docs-only changes); red only
