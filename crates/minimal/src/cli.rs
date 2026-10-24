@@ -1173,6 +1173,16 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+    /// The `min` process this proxy serves (ssh's parent): the proxy exits,
+    /// closing the daemon connection, once that process is gone.
+    #[arg(long, hide = true)]
+    pub owner: Option<u32>,
+    /// A file the owner holds an exclusive `flock` on for its lifetime: the
+    /// proxy exits the moment it can take that lock, which the kernel
+    /// releases on any end of the owner, a SIGKILL included. The pid above
+    /// is the fallback where no lock was handed.
+    #[arg(long, hide = true)]
+    pub owner_lock: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

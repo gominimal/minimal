@@ -503,6 +503,23 @@ impl Client {
             .await
     }
 
+    /// Issue a oneshot RPC with a deadline the caller names, for a call
+    /// that waits on work the daemon does not bound: the cleanup destroy
+    /// after a failed finalize waits in the session's mailbox behind that
+    /// finalize, which a stalled fetch can hold for longer than any fixed
+    /// deadline. The caller still names one, so the timer is finite; it is
+    /// the caller's job to make the user's interrupt the real bound.
+    pub async fn oneshot_rpc_with_deadline<R: OneshotSshRpc>(
+        &mut self,
+        request: R::Request<'_>,
+        deadline: Duration,
+    ) -> Result<R::Response, anyhow::Error>
+    where
+        <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
+    {
+        self.oneshot_rpc_within::<R>(request, deadline).await
+    }
+
     #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs()))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,

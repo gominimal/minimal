@@ -358,6 +358,20 @@ pub async fn logs(
     tail_bytes: u64,
     absent: &mut Vec<LogPrefix>,
 ) -> Result<(), anyhow::Error> {
+    let audit_dir = bep::audit::default_dir();
+    logs_with_audit(w, paths, audit_dir.as_deref(), tail_bytes, absent).await
+}
+
+/// [`logs`], with the proxy's audit log read from `audit_dir` in place of
+/// the user's home. Tests pass a temp dir here so a real audit log on the
+/// host never enters their bundle.
+async fn logs_with_audit(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    audit_dir: Option<&Path>,
+    tail_bytes: u64,
+    absent: &mut Vec<LogPrefix>,
+) -> Result<(), anyhow::Error> {
     let log_dir = paths.state.join("logs");
     // Absence and inaccessibility are different facts: "no log directory"
     // may only be claimed on a real NotFound, never on EACCES or I/O errors.
@@ -394,11 +408,18 @@ pub async fn logs(
     // host daemon's zone-table dump (NET-138) — the table its answerer
     // answered from, written at start and on every change — so a bundle
     // holds the table the answers were given by, not only its name in the
-    // dir listing. Absent the same way a log that never appeared is: a
-    // provider dir with no daemon (or a daemon predating the dump) records
-    // absence, not an error.
+    // dir listing. bep.log: the Box Egress Proxy's stdout and stderr, which
+    // the VM host daemon starts beside gvproxy and writes here (BEP-015).
+    // Absent the same way a log that never appeared is: a provider dir with
+    // no daemon (or a daemon predating the dump, or a host the proxy does
+    // not run on) records absence, not an error.
     for (name, dir) in provider_dirs(&paths.state).await? {
-        for file_name in ["run.log", "boot.log", minvmd::diag::ZONE_TABLE_FILE] {
+        for file_name in [
+            "run.log",
+            "boot.log",
+            BEP_LOG_FILE,
+            minvmd::diag::ZONE_TABLE_FILE,
+        ] {
             let dest = format!("providers/{name}/{file_name}");
             match w
                 .add_file_tail(&dest, &dir.join(file_name), tail_bytes)
@@ -411,6 +432,10 @@ pub async fn logs(
         }
     }
 
+    // The proxy's audit log lives under the user's home, not the state dir:
+    // `bep` writes it there wherever it runs from.
+    bep_audit(w, audit_dir, tail_bytes).await;
+
     // The legend for everything above, plus the daemon logs that arrive
     // nested from the guest: two overlapping copies of the same output, each
     // systematically missing what the other has.
@@ -420,6 +445,42 @@ pub async fn logs(
         Redaction::None,
     )
     .await
+}
+
+/// The file in a provider dir that holds the Box Egress Proxy's output. The
+/// VM host daemon names the same file beside the proxy's socket.
+const BEP_LOG_FILE: &str = "bep.log";
+
+/// Collects the newest segments of the Box Egress Proxy's audit log from
+/// `dir` into `bep/audit/`, tail-capped and line-scrubbed like a log.
+/// `None` is a host with no home directory.
+async fn bep_audit(w: &mut BundleWriter, dir: Option<&Path>, tail_bytes: u64) {
+    let Some(dir) = dir else {
+        w.skip("bep/audit/", "no home directory, so no audit log location");
+        return;
+    };
+    let segments = match bep::audit::segments(dir) {
+        Ok(segments) => segments,
+        Err(e) => {
+            w.skip("bep/audit/", format!("unreadable: {e}"));
+            return;
+        }
+    };
+    if segments.is_empty() {
+        w.skip(
+            "bep/audit/",
+            format!("absent: no audit segments in {}", dir.display()),
+        );
+        return;
+    }
+    let newest = segments.len().saturating_sub(LOG_FILES_PER_PREFIX);
+    for path in &segments[newest..] {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let dest = format!("bep/audit/{name}");
+        if let Err(e) = w.add_file_tail(&dest, path, tail_bytes).await {
+            w.skip(&dest, format!("unreadable: {e}"));
+        }
+    }
 }
 
 /// The host-side telemetry spool: the CLI's and minvmd's records (spec 25
@@ -802,6 +863,18 @@ providers/<name>/boot.log
              (state volume quiesced, connections drained, the final close)
   lacks      nothing observed; a measured incident window showed no console
              record absent under saturation
+
+providers/<name>/bep.log
+  source     the Box Egress Proxy's stdout and stderr, written by the VM host
+             daemon that starts it beside gvproxy
+  retention  appended across boots. A start moves a log past 8 MiB to
+             bep.log.old, and the bundle does not collect bep.log.old.
+  format     human-readable tracing output
+
+bep/audit/audit-<n>.jsonl
+  source     the Box Egress Proxy's audit log, ~/.minimal/bep/audit
+  retention  the newest segments only
+  format     JSON lines, one decision per line
 
 providers/<name>/guest/daemon-diag.tar.zst -> logs/minimald.log.<date>
   source     the on-volume file appender inside the guest, attached once the
@@ -1333,6 +1406,92 @@ mod tests {
             reason("logs/minimald.log*")
                 .contains("providers/local-minvmd0/guest/daemon-diag.tar.zst"),
             "the skip must name where the logs actually are"
+        );
+    }
+
+    /// BEP-015's diagnostics: a bundle carries the proxy's log beside the VM
+    /// host daemon's, and the newest audit segments, oldest dropped first.
+    #[tokio::test]
+    async fn bundle_collects_the_proxy_log_and_audit_segments() {
+        let state = tempfile::TempDir::new().unwrap();
+        let provider = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::write(provider.join("run.log"), b"minvmd run\n").unwrap();
+        std::fs::write(provider.join(BEP_LOG_FILE), b"bep serving\n").unwrap();
+
+        let home = tempfile::TempDir::new().unwrap();
+        let audit = home.path().join("audit");
+        std::fs::create_dir_all(&audit).unwrap();
+        let count = LOG_FILES_PER_PREFIX as u64 + 2;
+        for n in 0..count {
+            std::fs::write(
+                audit.join(bep::audit::segment_name(n)),
+                format!("{{\"segment\":{n}}}\n"),
+            )
+            .unwrap();
+        }
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        // The audit dir is injected, so a real audit log on this host never
+        // enters the bundle.
+        logs_with_audit(
+            &mut w,
+            &paths(state.path()),
+            Some(&audit),
+            diagnostics::LOG_TAIL_CAP,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert_eq!(
+            files["providers/local-minvmd0/bep.log"], b"bep serving\n",
+            "the proxy's log sits beside the VM host daemon's"
+        );
+        assert!(files.contains_key("providers/local-minvmd0/run.log"));
+        for n in 0..count {
+            let dest = format!("bep/audit/{}", bep::audit::segment_name(n));
+            let kept = n >= count - LOG_FILES_PER_PREFIX as u64;
+            assert_eq!(
+                files.contains_key(&dest),
+                kept,
+                "{dest} kept={kept}: {:?}",
+                files.keys().collect::<Vec<_>>()
+            );
+            if kept {
+                assert_eq!(files[&dest], format!("{{\"segment\":{n}}}\n").as_bytes());
+            }
+        }
+        let note = String::from_utf8(files["logs/PROVENANCE.txt"].clone()).unwrap();
+        assert!(note.contains("providers/<name>/bep.log"));
+        assert!(note.contains("bep/audit/"));
+    }
+
+    /// An empty audit directory is recorded as absent, not as an error.
+    #[tokio::test]
+    async fn an_empty_audit_dir_is_recorded_as_absent() {
+        let home = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        bep_audit(&mut w, Some(&home.path().join("audit")), 1024).await;
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        assert!(
+            skipped.iter().any(|s| s["what"] == "bep/audit/"
+                && s["reason"].as_str().unwrap().starts_with("absent")),
+            "{skipped:?}"
         );
     }
 

@@ -2707,6 +2707,7 @@ fn launcher_with(
         publications: Default::default(),
         // The test's own state directory, the one its context builds under.
         state_dir: state_path.to_path_buf(),
+        root_certificate: None,
     }
 }
 
@@ -7100,4 +7101,54 @@ fn sealed_value_reaches_the_shell_launch_environment() {
         plain.connection,
         vec![("TERM".to_string(), "xterm-256color".to_string())]
     );
+}
+
+// BEP-011: a box with the proxy's root and its own bundle gets the three
+// trust variables, at its own bundle and root. A box whose packages ship no
+// bundle gets NODE_EXTRA_CA_CERTS alone, so a tool that reads the bundle
+// variables keeps its public roots. A box without the root gets none.
+#[test]
+fn trust_env_points_at_bundle_and_root() {
+    let vars = launch_trust_env(true, true);
+    let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, boxes::core::bep::TRUST_ENV_VARIABLES);
+    let get = |name: &str| {
+        vars.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(get("SSL_CERT_FILE"), Some(BOX_CA_BUNDLE));
+    assert_eq!(get("REQUESTS_CA_BUNDLE"), Some(BOX_CA_BUNDLE));
+    assert_eq!(get("NODE_EXTRA_CA_CERTS"), Some(BOX_ROOT_CERTIFICATE));
+    assert!(BOX_CA_BUNDLE.starts_with(BOX_CA_DIR));
+    assert!(BOX_ROOT_CERTIFICATE.starts_with(BOX_CA_DIR));
+
+    assert_eq!(
+        launch_trust_env(true, false),
+        vec![(
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            BOX_ROOT_CERTIFICATE.to_string()
+        )],
+        "with no bundle only the root is named"
+    );
+    assert!(launch_trust_env(false, true).is_empty());
+    assert!(launch_trust_env(false, false).is_empty());
+}
+
+// BEP-011: the trust variables sit below the composed environment, so a box
+// spec that sets one keeps its own value, and the others still reach the box.
+#[test]
+fn trust_env_keeps_a_spec_value() {
+    let mut env = layer_session_env(
+        session_baseline_env("box", None),
+        Vec::new(),
+        vec![("SSL_CERT_FILE".to_string(), "/spec/roots.pem".to_string())],
+        Vec::new(),
+    )
+    .into_iter()
+    .collect::<std::collections::BTreeMap<_, _>>();
+    layer_trust_env(&mut env, true, true);
+    assert_eq!(env["SSL_CERT_FILE"], "/spec/roots.pem");
+    assert_eq!(env["REQUESTS_CA_BUNDLE"], BOX_CA_BUNDLE);
+    assert_eq!(env["NODE_EXTRA_CA_CERTS"], BOX_ROOT_CERTIFICATE);
 }

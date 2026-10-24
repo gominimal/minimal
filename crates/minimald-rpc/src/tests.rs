@@ -315,8 +315,31 @@ fn destroy_session_response_decodes_the_old_shape() {
 
     let failed = DestroySessionResponse {
         hook_failures: vec!["user loadout `dev`: exited with status 3".to_string()],
+        kept: false,
     };
     assert_eq!(round_trip(&failed), failed);
+
+    // A kept session (an `only_if_unfinalized` destroy the session
+    // outlived, inbox#690) round-trips, and is never the old `null`.
+    let kept = DestroySessionResponse {
+        hook_failures: Vec::new(),
+        kept: true,
+    };
+    assert_eq!(round_trip(&kept), kept);
+    assert_ne!(
+        serde_json_lenient::to_string(&Errorable::Ok(kept)).unwrap(),
+        "null"
+    );
+    // A request that predates the flag decodes as unconditional, and an
+    // unconditional one encodes exactly as it always did.
+    let old: DestroySessionRequest =
+        serde_json_lenient::from_str(&format!(r#"{{"id":"{}"}}"#, SessionId::nil())).unwrap();
+    assert!(!old.only_if_unfinalized);
+    assert!(
+        !serde_json_lenient::to_string(&old)
+            .unwrap()
+            .contains("only_if_unfinalized")
+    );
 
     let err: Errorable<DestroySessionResponse> =
         serde_json_lenient::from_str(r#"{"error":"no such session"}"#)

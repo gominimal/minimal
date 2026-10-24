@@ -1,10 +1,8 @@
 //! The proxy's published identity (BEP-072).
 //!
-//! BEP-072 also asks for the root certificate. This file publishes the root
-//! CA's public key and fingerprint only. The proxy issues no certificate
-//! yet. The self-signed, name-constrained root certificate is deferred to
-//! <https://github.com/gominimal/minimal/issues/2437>, which adds it to this
-//! file.
+//! The file also carries the root certificate, PEM, that the proxy issued
+//! from its root CA key at its start or at a root key replacement. A box
+//! with a GitHub grant gets that certificate at its creation.
 //!
 //! At each start the proxy writes the public half and the fingerprint of
 //! each of its keys to a file the operator's processes read. A mint seals
@@ -13,7 +11,8 @@
 //! binds.
 //!
 //! The file is JSON, one object per role:
-//! `{"sealing": {"public": ..., "kid": ...}, "root": {...}, "signing": {...}}`.
+//! `{"sealing": {"public": ..., "kid": ...}, "root": {...}, "signing": {...}}`,
+//! beside `root_not_after` and `root_certificate`.
 //! `public` is the uncompressed SEC1 point in unpadded base64url. A role is
 //! read only when it is used, and [`Identity::key`] refuses a role whose
 //! entry is missing, does not parse as a P-256 key, or carries a `kid` that is
@@ -23,9 +22,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
+use crate::ca::{self, CaError, CaKey, RootCertificate, Union};
 use crate::keys::{HeldKey, KeyStore, ProxyKeys, Role};
 use crate::seal::{self, Context, MemberList, ProxyPublicKey, SealError};
 
@@ -63,10 +64,8 @@ pub struct Identity {
     /// The sealing key, which a mint seals to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealing: Option<PublishedKey>,
-    /// The root CA's public key. It is not the root certificate, which
-    /// BEP-072 asks for. The issuance of that certificate is deferred to
-    /// <https://github.com/gominimal/minimal/issues/2437>, which publishes
-    /// it here.
+    /// The root CA's public key. The root certificate is
+    /// [`Self::root_certificate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<PublishedKey>,
     /// The signing CA key.
@@ -77,6 +76,42 @@ pub struct Identity {
     /// reads it as the expiry of each member (BEP-005).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_not_after: Option<u64>,
+    /// The current root certificate, PEM: self-signed under the root key,
+    /// with the registered names as its constraints (BEP-013, BEP-072).
+    /// `None` in a file that an older `bep` published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_certificate: Option<String>,
+}
+
+const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const PEM_END: &str = "-----END CERTIFICATE-----";
+
+/// The certificate `der` in PEM, with 64 characters to a line.
+#[must_use]
+pub fn certificate_pem(der: &[u8]) -> String {
+    let body = STANDARD.encode(der);
+    let mut pem = String::with_capacity(body.len() + body.len() / 64 + 64);
+    pem.push_str(PEM_BEGIN);
+    pem.push('\n');
+    for line in body.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).unwrap_or_default());
+        pem.push('\n');
+    }
+    pem.push_str(PEM_END);
+    pem.push('\n');
+    pem
+}
+
+/// The SHA-256 fingerprint of the certificate `der`, as uppercase hex
+/// pairs joined by colons, the form `openssl x509 -fingerprint -sha256`
+/// prints.
+#[must_use]
+pub fn certificate_fingerprint(der: &[u8]) -> String {
+    Sha256::digest(der)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Why a published identity was not used.
@@ -119,6 +154,12 @@ pub enum PublishError {
         "The proxy's published identity does not say when its root certificate expires. Run `bep --replace-key root` to make a new root key with a known expiry, then start `bep serve` again."
     )]
     NoRootValidity,
+    /// The identity carries no root certificate, or one that is not PEM.
+    /// An identity that an older `bep` published has none.
+    #[error(
+        "The proxy's published identity carries no usable root certificate. Start `bep` to publish it again."
+    )]
+    NoRootCertificate,
     /// The value was not sealed.
     #[error("The value was not sealed: {0}")]
     Seal(#[from] SealError),
@@ -132,7 +173,76 @@ impl Identity {
             root: Some(PublishedKey::of(&keys.root.public())),
             signing: Some(PublishedKey::of(&keys.signing.public())),
             root_not_after: None,
+            root_certificate: None,
         }
+    }
+
+    /// This identity with `der` as its root certificate. The caller issued
+    /// it under the root key this identity names.
+    #[must_use]
+    pub fn with_root_certificate(mut self, der: &[u8]) -> Self {
+        self.root_certificate = Some(certificate_pem(der));
+        self
+    }
+
+    /// Issues the root certificate under `root_key`, constrained to
+    /// `union`, and gives this identity with it beside the certificate. The
+    /// certificate ends no later than [`Self::root_not_after`], so call
+    /// [`Self::with_root_validity`] first. A
+    /// start and a root key replacement publish the identity it gives.
+    ///
+    /// # Errors
+    ///
+    /// The CA's refusal, as [`ca::issue_root`] gives it.
+    pub fn issuing_root<K: CaKey>(
+        self,
+        root_key: &K,
+        union: Union,
+        now: std::time::SystemTime,
+    ) -> Result<(Self, RootCertificate), CaError> {
+        // BEP-005: the certificate ends no later than the root key's
+        // validity, which counts from the key's creation, not from now.
+        let ends = self
+            .root_not_after
+            .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        let root = ca::issue_root_until(root_key, union, now, ends)?;
+        Ok((self.with_root_certificate(root.der()), root))
+    }
+
+    /// The published root certificate, DER.
+    ///
+    /// # Errors
+    ///
+    /// [`PublishError::NoRootCertificate`] when the identity carries no
+    /// root certificate, or one that is not a PEM certificate.
+    pub fn root_certificate_der(&self) -> Result<Vec<u8>, PublishError> {
+        let pem = self
+            .root_certificate
+            .as_deref()
+            .ok_or(PublishError::NoRootCertificate)?;
+        let body = pem
+            .trim()
+            .strip_prefix(PEM_BEGIN)
+            .and_then(|rest| rest.strip_suffix(PEM_END))
+            .ok_or(PublishError::NoRootCertificate)?;
+        let body: String = body.split_whitespace().collect();
+        STANDARD
+            .decode(body)
+            .ok()
+            .filter(|der| !der.is_empty())
+            .ok_or(PublishError::NoRootCertificate)
+    }
+
+    /// The SHA-256 fingerprint of the published root certificate, as
+    /// [`certificate_fingerprint`] gives it.
+    ///
+    /// # Errors
+    ///
+    /// [`PublishError::NoRootCertificate`] as [`Self::root_certificate_der`]
+    /// gives it.
+    pub fn root_certificate_fingerprint(&self) -> Result<String, PublishError> {
+        self.root_certificate_der()
+            .map(|der| certificate_fingerprint(&der))
     }
 
     /// This identity with the end of the root CA's validity.
@@ -209,13 +319,23 @@ impl Identity {
             }
             entry
         };
+        let root = entry(Role::Root);
+        // A root certificate stays valid while its root key stays. A new
+        // root key needs a new certificate, which the caller adds with
+        // `with_root_certificate`.
+        let root_certificate = previous
+            .filter(|previous| {
+                role != Role::Root && previous.root.is_some() && previous.root == root
+            })
+            .and_then(|previous| previous.root_certificate.clone());
         Self {
             sealing: entry(Role::Sealing),
-            root: entry(Role::Root),
+            root,
             signing: entry(Role::Signing),
             // The caller adds the end with `with_root_validity`, from the
             // root key's creation time when it is known.
             root_not_after: None,
+            root_certificate,
         }
     }
 
@@ -475,6 +595,105 @@ mod tests {
             assert!(!second.get(role).exportable());
             assert_in_no_file(dir.path(), &store.secret_bytes(role));
         }
+    }
+
+    fn github_union() -> Union {
+        Union::new(&[crate::module::GITHUB], [""; 0])
+    }
+
+    /// The SubjectPublicKeyInfo's last 65 bytes are the uncompressed point.
+    fn certificate_carries_key(der: &[u8], key: &ProxyPublicKey) -> bool {
+        let point = key.to_sec1_bytes();
+        der.windows(point.len()).any(|w| w == &point[..])
+    }
+
+    // BEP-072, BEP-013: the published identity carries the root certificate
+    // that the start issued from the held root key, beside that key.
+    #[test]
+    fn published_identity_carries_the_root_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let store = MemoryStore::default();
+        let keys = load(&store, &[]).unwrap();
+        let (identity, root) = Identity::of(&keys)
+            .issuing_root(&keys.root, github_union(), std::time::SystemTime::now())
+            .unwrap();
+        identity.publish(&path).unwrap();
+
+        let published = Identity::read(&path).unwrap();
+        let pem = published.root_certificate.as_deref().unwrap();
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"), "{pem}");
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"), "{pem}");
+        assert!(pem.lines().all(|line| line.len() <= 64), "{pem}");
+        let der = published.root_certificate_der().unwrap();
+        assert_eq!(der, root.der().to_vec());
+        assert!(certificate_carries_key(&der, &keys.root.public()));
+        assert_eq!(published.key(Role::Root).unwrap(), keys.root.public());
+        let fingerprint = published.root_certificate_fingerprint().unwrap();
+        assert_eq!(fingerprint, certificate_fingerprint(root.der()));
+        assert_eq!(fingerprint.len(), 32 * 3 - 1);
+        // The certificate is public material: no key's private half is in
+        // the file.
+        for role in Role::ALL {
+            assert_in_no_file(dir.path(), &store.secret_bytes(role));
+        }
+
+        // An identity that an older `bep` published has no certificate.
+        let older = Identity::of(&keys);
+        assert!(matches!(
+            older.root_certificate_der(),
+            Err(PublishError::NoRootCertificate)
+        ));
+        let broken = Identity {
+            root_certificate: Some("not a certificate".into()),
+            ..older
+        };
+        assert!(matches!(
+            broken.root_certificate_fingerprint(),
+            Err(PublishError::NoRootCertificate)
+        ));
+    }
+
+    // BEP-072, BEP-060: a root key replacement publishes a certificate under
+    // the new key. A replacement of another key keeps the certificate.
+    #[test]
+    fn root_replacement_publishes_a_new_root_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let store = MemoryStore::default();
+        let now = std::time::SystemTime::now();
+        let keys = load(&store, &[]).unwrap();
+        let (first, _) = Identity::of(&keys)
+            .issuing_root(&keys.root, github_union(), now)
+            .unwrap();
+        first.publish(&path).unwrap();
+        let old_root = keys.root.public();
+        drop(keys);
+
+        // A sealing key replacement keeps the root key, so it keeps the
+        // published certificate.
+        let sealing = replace(&store, Role::Sealing).unwrap();
+        let previous = Identity::read(&path).unwrap();
+        let kept = Identity::after_replacement(&store, Role::Sealing, &sealing, Some(&previous));
+        assert_eq!(kept.root_certificate, first.root_certificate);
+        kept.publish(&path).unwrap();
+
+        // A root key replacement drops the old certificate and publishes one
+        // under the new key.
+        let root = replace(&store, Role::Root).unwrap();
+        let previous = Identity::read(&path).unwrap();
+        let replaced = Identity::after_replacement(&store, Role::Root, &root, Some(&previous));
+        assert_eq!(replaced.root_certificate, None);
+        let (replaced, issued) = replaced.issuing_root(&root, github_union(), now).unwrap();
+        replaced.publish(&path).unwrap();
+
+        let published = Identity::read(&path).unwrap();
+        let der = published.root_certificate_der().unwrap();
+        assert_eq!(der, issued.der().to_vec());
+        assert_ne!(published.root_certificate, first.root_certificate);
+        assert!(certificate_carries_key(&der, &root.public()));
+        assert!(!certificate_carries_key(&der, &old_root));
+        assert_eq!(published.key(Role::Root).unwrap(), root.public());
     }
 
     // BEP-072

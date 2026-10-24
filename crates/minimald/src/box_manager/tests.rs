@@ -738,6 +738,227 @@ async fn until_claimed(mngr: &BoxManagerHandle, id: SessionId) {
     .expect("the destroy never claimed the session");
 }
 
+/// A cleanup destroy (`only_if_unfinalized`) keeps a session that
+/// finished activating and destroys one that did not (inbox#690).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleanup_destroy_keeps_a_finished_session() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let kept = mngr.delete_session_if_unfinalized(id).await.unwrap();
+    assert!(kept.is_none(), "an Active session should be kept");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "a kept session keeps its record"
+    );
+    assert_eq!(mngr.list().await.unwrap().len(), 1, "and is listed");
+
+    let (_state, _cache, pending_mngr, pending, _response) = create_pending_session().await;
+    let destroyed = pending_mngr
+        .delete_session_if_unfinalized(pending)
+        .await
+        .unwrap();
+    assert!(
+        destroyed.is_some(),
+        "an unfinished session should be destroyed"
+    );
+    assert!(
+        pending_mngr
+            .get_record(BoxKeyPredicate::Id(pending))
+            .await
+            .unwrap()
+            .is_none(),
+        "the destroyed session's record should be gone"
+    );
+}
+
+/// The race inbox#690 is about, pinned: a cleanup destroy queued in the
+/// session's mailbox behind a finalize that is still running waits for
+/// it, and keeps the session it finished. While the cleanup is in
+/// flight the session is in the tearing-down set: a second destroy is
+/// refused, and a listing skips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleanup_destroy_queued_behind_a_running_finalize_keeps_the_session() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let handle = session(&mngr, id).await;
+    assert!(
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("an empty loadout configures")
+            .is_none(),
+        "an empty loadout needs no verdict"
+    );
+
+    // The actor is held, so the finalize and then the cleanup queue in
+    // its mailbox in that order: the finalize is the one "still running".
+    let release = handle.hold_for_test().await;
+    let finalize = crate::traced::spawn({
+        let handle = handle.clone();
+        async move { handle.finalize().await }
+    });
+    handle.until_queued(1).await;
+    let cleanup = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.delete_session_if_unfinalized(id).await }
+    });
+    handle.until_queued(2).await;
+
+    let second = mngr
+        .delete_session(id)
+        .await
+        .expect_err("a second destroy while the cleanup is in flight is refused");
+    assert_eq!(second.kind(), ErrorKind::ResourceBusy);
+    assert!(
+        mngr.list().await.unwrap().is_empty(),
+        "a session a cleanup is in flight for is not listed"
+    );
+
+    release.send(()).expect("the actor is held");
+    finalize
+        .await
+        .unwrap()
+        .expect("the finalize ahead of the cleanup succeeds");
+    let kept = cleanup.await.unwrap().unwrap();
+    assert!(
+        kept.is_none(),
+        "the cleanup keeps the session the finalize finished"
+    );
+    let listed = mngr.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "the kept session is listed again");
+    assert_eq!(listed[0].status, boxes::BoxState::Active);
+}
+
+/// A cleanup destroy that does destroy — the session never finished —
+/// leaves a listing whole: the session is skipped while its actor
+/// deletes the record, and gone after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_survives_a_cleanup_destroy_of_an_unfinished_session() {
+    let (_state, _cache, mngr, id, _response) = create_pending_session().await;
+    let handle = session(&mngr, id).await;
+    let release = handle.hold_for_test().await;
+    let cleanup = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.delete_session_if_unfinalized(id).await }
+    });
+    handle.until_queued(1).await;
+    assert!(mngr.list().await.unwrap().is_empty());
+    release.send(()).expect("the actor is held");
+    let destroyed = cleanup.await.unwrap().unwrap();
+    assert!(destroyed.is_some(), "an unfinished session is destroyed");
+    assert!(mngr.list().await.unwrap().is_empty());
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A listing must not wait on a box actor: its attrs come from the host the
+/// actor last published, not from the actor's mailbox. With an actor parked
+/// (a clone inside `ConfigureLoadout`, an inline attach), `list` answered
+/// only after `HOST_PROBE_TIMEOUT` for that box: 2 s per `min ls` through
+/// the whole of a stalled activation (710d).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_does_not_wait_on_a_parked_actor() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let handle = mngr
+        .get_session(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    // Returns once the actor is inside the park: every earlier message, and
+    // its post-message publish, is done.
+    handle.park_for(std::time::Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+        .await
+        .expect("`list` waited on the parked actor")
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].attrs.is_none(), "no host, so no attrs");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the listing took {:?}",
+        started.elapsed()
+    );
+    drop(handle);
+}
+
+/// The slot path with a live host, the 710d case itself: an actor parked in
+/// a long message still has its host's attrs listed, at once, read through
+/// the slot and not the actor's mailbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_actors_live_host_is_still_listed() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let handle = mngr
+        .get_session(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    handle.park_for(std::time::Duration::from_secs(3)).await;
+    // Published while the actor is parked (park_for returns once it is), as
+    // a host it had before would be: nothing overwrites it until the park ends.
+    handle.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+    let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+        .await
+        .expect("`list` waited on the parked actor")
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(
+        listed[0].attrs.is_some(),
+        "the live host's attrs come through the slot while the actor is parked"
+    );
+    drop(handle);
+}
+
+/// The slot is emptied when the actor ends, so a handle that outlives it
+/// reads no host, and holds no sender to one. The destroy's message ends the
+/// actor with a `break`, after which nothing is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_actors_slot_is_emptied() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let handle = mngr
+        .get_session(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    // The actor rewrites the slot after every message it handles, and it
+    // replies to a message before that rewrite, so a host put right after a
+    // reply can still be overwritten by the publish that follows it. Put
+    // until the put survives: once the mailbox is empty nothing rewrites
+    // the slot, and the host stays.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            handle.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if handle.get_attrs().await.is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no put of a host survived the actor's publishes");
+    mngr.delete_session(id).await.unwrap();
+    // The destroy replies just before the actor's loop ends.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while handle.get_attrs().await.is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the ended actor's slot still served a host");
+}
+
 /// Destroying an unknown ID is a `NotFound` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroy_unknown_id_errors() {
@@ -1953,4 +2174,84 @@ async fn sealed_deliveries_ride_the_record_to_the_host_params() {
             .unwrap()
             .is_none()
     );
+}
+
+/// BEP-011: the root certificate a create request carries rides the box's
+/// stored record, and a host launch takes it from there, so every launch,
+/// after a daemon restart included, adds it to the box's trust store. A box
+/// with no grant, or with steering `off`, gets none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_carries_the_root_certificate_to_the_launch() {
+    use boxes::core::bep::{BepSettings, Steering};
+    let (_state, _cache, mngr) = manager().await;
+    let pem = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n".to_string();
+    let grant_policy = |steering: Steering| boxes::BoxPolicy {
+        credentialed_upstream: Some(boxes::CredentialedUpstream {
+            bep: BepSettings {
+                steering: Some(steering),
+                ..BepSettings::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let created =
+        |name: &str, policy: boxes::BoxPolicy, root: Option<String>| minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            policy,
+            root_certificate: root,
+            ..sample_config()
+        };
+
+    let id = mngr
+        .create_session(
+            created("grant", grant_policy(Steering::ProxyEnv), Some(pem.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.root_certificate.as_deref(), Some(pem.as_str()));
+    assert_eq!(
+        crate::box_runtime::launch_root_certificate(&record).as_deref(),
+        Some(pem.as_str())
+    );
+    // The stored record reads back with it, as a restarted daemon reads it.
+    let wire = serde_json_lenient::to_string(&record).unwrap();
+    let reread: boxes::Record = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(reread.root_certificate, record.root_certificate);
+
+    // Steering `off` keeps the root out, whatever the record holds.
+    let id = mngr
+        .create_session(
+            created("off", grant_policy(Steering::Off), Some(pem.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
+
+    // A box with no grant carries no root and gets none.
+    let id = mngr
+        .create_session(created("no-grant", Default::default(), None), None)
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.root_certificate, None);
+    assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
+    let wire = serde_json_lenient::to_string(&record).unwrap();
+    assert!(!wire.contains("root_certificate"), "{wire}");
 }

@@ -88,6 +88,119 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
     }
 }
 
+/// The exclusive lock this process holds for the proxies it drives, taken
+/// once and kept for the process's life; see [`hold_owner_lock`].
+static OWNER_LOCK: std::sync::OnceLock<(std::path::PathBuf, nix::fcntl::Flock<std::fs::File>)> =
+    std::sync::OnceLock::new();
+
+/// Takes (once per process) the exclusive `flock` the proxy's owner watch
+/// reads, on a file beside the daemon socket named for this pid, and
+/// returns its path. Held in [`OWNER_LOCK`] until the process ends: that
+/// end — a SIGKILL as much as an exit — is what releases it, and what the
+/// proxy is waiting for. Best-effort: where the file cannot be made or
+/// locked (a socket path with no directory yet, a read-only state dir)
+/// the proxy keeps the pid watch alone, and the attach goes on.
+fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
+    if let Some((path, _)) = OWNER_LOCK.get() {
+        return Some(path.clone());
+    }
+    // One coordination lock per directory, held across the sweep of stale
+    // owner files and this one's create-and-lock, so a sweep never removes
+    // a file between its creation and its owner's lock. Not taken, the
+    // proxy keeps the pid watch alone.
+    let coord_path = sock.with_file_name(OWNER_COORD_FILE);
+    let coord = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&coord_path)
+        .ok()
+        .and_then(|f| nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive).ok());
+    if coord.is_none() {
+        tracing::debug!(
+            path = %coord_path.display(),
+            "no proxy owner coordination lock; the proxy watches the pid alone"
+        );
+        return None;
+    }
+    if let Some(dir) = sock.parent() {
+        sweep_stale_owner_locks(dir);
+    }
+    // Unique to this process, not just its pid: a recycled pid must not
+    // find (or be found by) a proxy still watching the old owner's path.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = sock.with_file_name(format!("proxy-owner-{}-{started}.lock", std::process::id()));
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "no proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_, errno)) => {
+            tracing::debug!(
+                path = %path.display(),
+                %errno,
+                "could not lock the proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    // A second caller racing this one holds the same lock: either value is
+    // the process's, and the loser's lock drops, released, with its file
+    // still ours through the winner.
+    let (path, _) = OWNER_LOCK.get_or_init(|| (path, lock));
+    drop(coord);
+    Some(path.clone())
+}
+
+/// The coordination lock beside the daemon socket; see [`hold_owner_lock`].
+const OWNER_COORD_FILE: &str = "proxy-owners.lock";
+
+/// Removes the `proxy-owner-*.lock` files in `dir` that no live process
+/// holds: an owner that ended (an attach or exec that completed, or one
+/// killed) leaves its file behind, and the proxy unlinks it only when it
+/// was still watching at that moment. A file is removed while this process
+/// holds its lock, then released. Called under the coordination lock, so a
+/// new file is never caught between its creation and its owner's lock.
+fn sweep_stale_owner_locks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("proxy-owner-") && name.ends_with(".lock")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if let Ok(lock) = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        {
+            let removed = std::fs::remove_file(&path);
+            drop(lock);
+            tracing::debug!(?removed, path = %path.display(), "swept a stale proxy owner lock");
+        }
+    }
+}
+
 /// Build the `ssh` command that attaches to session `id` via the daemon
 /// socket at `sock`.
 ///
@@ -106,6 +219,16 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// matching `SendEnv` option) the daemon reads back alongside
 /// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
 /// for non-interactive exec channels, which have no detach.
+///
+/// Returns the command without spawning ssh. Configures the proxy to close
+/// when this process exits, using a process-lifetime owner lock when available
+/// and a PID watch otherwise. Preparing the lock may create files beside
+/// `sock` and remove stale owner lock files; lock failures use the PID fallback.
+///
+/// # Errors
+///
+/// Returns an error if the current executable cannot be located or `sock`
+/// has no parent from which an SSH host alias can be derived.
 pub fn attach_command(
     sock: &Path,
     id: boxes::SessionId,
@@ -113,13 +236,27 @@ pub fn attach_command(
     session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
-    // depend on socat or nc being installed.
+    // depend on socat or nc being installed. `--owner-lock` is a file this
+    // process holds an exclusive `flock` on for its lifetime, and `--owner`
+    // its pid: a `min` that dies without taking ssh down (SIGKILL, an OOM
+    // kill) leaves ssh and the proxy holding the daemon's socket open, and
+    // the daemon learns of a lost client only from that socket closing — so
+    // the proxy watches its owner and exits when it is gone. The lock is
+    // the watch that cannot be fooled: the kernel releases it on any end of
+    // this process, where a pid can be recycled or linger as a zombie.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
-    let proxy_cmd = format!(
-        "{} proxy --socket {}",
+    let mut proxy_cmd = format!(
+        "{} proxy --socket {} --owner {}",
         shell_quote(&exe.display().to_string()),
         shell_quote(&sock.display().to_string()),
+        std::process::id(),
     );
+    if let Some(owner_lock) = hold_owner_lock(sock) {
+        proxy_cmd.push_str(&format!(
+            " --owner-lock {}",
+            shell_quote(&owner_lock.display().to_string())
+        ));
+    }
 
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
@@ -912,6 +1049,30 @@ pub(crate) fn trace_env() -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale owner file (its owner gone, its lock free) is swept; one a
+    /// live process holds stays, as does anything that is not an owner file.
+    #[test]
+    fn stale_owner_locks_are_swept_and_held_ones_kept() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let stale = dir.path().join("proxy-owner-1-1.lock");
+        std::fs::File::create(&stale).expect("the stale file");
+        let held_path = dir.path().join("proxy-owner-2-2.lock");
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::create(&held_path).expect("the held file"),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let other = dir.path().join(OWNER_COORD_FILE);
+        std::fs::File::create(&other).expect("the coordination file");
+
+        sweep_stale_owner_locks(dir.path());
+
+        assert!(!stale.exists(), "a free owner file is swept");
+        assert!(held_path.exists(), "a held owner file is kept");
+        assert!(other.exists(), "the coordination file is not an owner file");
+        drop(held);
+    }
     use std::path::PathBuf;
 
     /// The dashboard's hold verbs: a release is one release line naming the
@@ -1001,6 +1162,14 @@ mod tests {
         assert!(
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
+        );
+        // The proxy is told who it serves (lab scenario 732): without the
+        // flag a SIGKILLed `min` leaves the daemon socket open again.
+        let owner = format!("--owner {}", std::process::id());
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("ProxyCommand=") && a.contains(&owner)),
+            "the ProxyCommand should name this process as the proxy's owner: {args:?}"
         );
     }
 

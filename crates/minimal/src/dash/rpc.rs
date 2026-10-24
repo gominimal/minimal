@@ -388,9 +388,15 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
 /// destroy` does.
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
     let record = record_of(provider, id).await;
-    match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
-        .await
-        .context("DestroySession RPC failed")?
+    match timed::<DestroySession>(
+        &mut provider.client,
+        DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        },
+    )
+    .await
+    .context("DestroySession RPC failed")?
     {
         Errorable::Ok(_) => {
             if let Some(record) = record {
@@ -1283,6 +1289,7 @@ mod tests {
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: Default::default(),
         }
     }
@@ -1338,6 +1345,7 @@ mod tests {
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: Default::default(),
         };
         settle_destroyed_box(&ssh_sock, record.id, &record).await;

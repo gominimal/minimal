@@ -73,13 +73,9 @@ const ROOT_VALIDITY: Duration = Duration::from_secs(crate::publish::ROOT_VALIDIT
 const SIGNING_VALIDITY: Duration = Duration::from_secs(365 * DAY);
 const LEAF_VALIDITY: Duration = Duration::from_secs(7 * DAY);
 
-/// A held key that can sign a certificate.
-///
-/// No production key implements this trait yet. The CA key is in the host
-/// keychain (BEP-014), but nothing can sign with it, so the signing CA is
-/// not keychain-held until the `Keychain` and `MemoryKey` keys of `keys.rs`
-/// implement `CaKey`. That work is outside this module. It is tracked in
-/// <https://github.com/gominimal/minimal/issues/2440>.
+/// A held key that can sign a certificate. The keychain key and the
+/// in-memory test key of [`crate::keys`] implement it, so the root and
+/// signing CA keys sign in the store that holds them.
 pub trait CaKey: HeldKey {
     /// An ECDSA P-256 SHA-256 signature over `msg`, DER-encoded as X9.62
     /// specifies. The private half stays in the store.
@@ -314,6 +310,83 @@ impl<K: CaKey> SigningKey for Signer<'_, K> {
     }
 }
 
+/// A root certificate that [`issue_root`] issued, with the union it
+/// permits. [`Ca::with_root`] keeps it as the CA's anchor.
+#[derive(Debug, Clone)]
+pub struct RootCertificate {
+    der: CertificateDer<'static>,
+    not_after: OffsetDateTime,
+    union: Union,
+}
+
+impl RootCertificate {
+    /// The certificate, DER.
+    #[must_use]
+    pub fn der(&self) -> &CertificateDer<'static> {
+        &self.der
+    }
+
+    /// The union the certificate permits.
+    #[must_use]
+    pub fn union(&self) -> &Union {
+        &self.union
+    }
+}
+
+/// Issues the self-signed root certificate under the held `root_key`,
+/// constrained to `union` (BEP-013). The proxy issues it at each start, so
+/// a changed union gets a root under the same key and subject.
+///
+/// # Errors
+///
+/// [`CaError::WrongRole`] when `root_key` is not the root key,
+/// [`CaError::Exportable`] when it is exportable, [`CaError::EmptyUnion`]
+/// when the union holds no name, and [`CaError::Key`] when the store refuses
+/// the key or cannot sign with it.
+pub fn issue_root<K: CaKey>(
+    root_key: &K,
+    union: Union,
+    now: SystemTime,
+) -> Result<RootCertificate, CaError> {
+    issue_root_until(root_key, union, now, None)
+}
+
+/// Issues the root certificate as [`issue_root`] does, and ends it no later
+/// than `ends` when that is known. A start passes the root key's published
+/// validity end, so each issue under one root key keeps the end counted
+/// from the key's creation (BEP-005).
+///
+/// # Errors
+///
+/// As [`issue_root`], and [`CaError::RootExpired`] when `now` is at or past
+/// `ends`.
+pub fn issue_root_until<K: CaKey>(
+    root_key: &K,
+    union: Union,
+    now: SystemTime,
+    ends: Option<SystemTime>,
+) -> Result<RootCertificate, CaError> {
+    check_key(root_key, Role::Root)?;
+    let signer = Signer::new(root_key);
+    let mut params = root_params(&union, now)?;
+    if let Some(ends) = ends.map(OffsetDateTime::from) {
+        if OffsetDateTime::from(now) >= ends {
+            return Err(CaError::RootExpired(ends));
+        }
+        params.not_after = params.not_after.min(ends);
+    }
+    let der = params
+        .self_signed(&signer)
+        .map_err(|err| signer.error(err))?
+        .der()
+        .clone();
+    Ok(RootCertificate {
+        der,
+        not_after: params.not_after,
+        union,
+    })
+}
+
 /// The host's interception CA: the root, the signing CA, and the leaves.
 pub struct Ca<'k, K> {
     root_key: Signer<'k, K>,
@@ -349,31 +422,48 @@ impl<'k, K: CaKey> Ca<'k, K> {
         union: Union,
         now: SystemTime,
     ) -> Result<Self, CaError> {
+        let root = issue_root(root_key, union, now)?;
+        Self::with_root(root_key, signing_key, root, now)
+    }
+
+    /// The CA anchored on `root`, which [`issue_root`] issued under
+    /// `root_key`, with a signing CA under `signing_key` issued by it.
+    ///
+    /// # Errors
+    ///
+    /// [`CaError::WrongRole`] when `root_key` is not the root key or
+    /// `signing_key` is not the signing key, [`CaError::Exportable`] when a
+    /// key is exportable, [`CaError::RootExpired`] when `root` expired, and
+    /// [`CaError::Key`] when the store refuses a key.
+    pub fn with_root(
+        root_key: &'k K,
+        signing_key: &'k K,
+        root: RootCertificate,
+        now: SystemTime,
+    ) -> Result<Self, CaError> {
         // A key that is not the role's own, or that can leave the store,
         // lets the signing CA key sign a root that the constraints do not
         // bind.
         check_key(root_key, Role::Root)?;
         check_key(signing_key, Role::Signing)?;
+        if OffsetDateTime::from(now) >= root.not_after {
+            return Err(CaError::RootExpired(root.not_after));
+        }
         let root_key = Signer::new(root_key);
         let signing_key = Signer::new(signing_key);
-        let root_params = root_params(&union, now)?;
-        let root = root_params
-            .self_signed(&root_key)
-            .map_err(|err| root_key.error(err))?
-            .der()
-            .clone();
-
-        let root_expiry = root_params.not_after;
+        // The issuer is named by subject and key identifier, which are the
+        // same in each issue of the root under the same key.
+        let root_params = root_params(&root.union, now)?;
         let (signing_params, signing) =
-            issue_signing(&root_params, &root_key, &signing_key, now, root_expiry)?;
+            issue_signing(&root_params, &root_key, &signing_key, now, root.not_after)?;
 
         Ok(Self {
             root_key,
             signing_key,
             signing_params,
-            root_expiry,
-            union,
-            root,
+            root_expiry: root.not_after,
+            union: root.union,
+            root: root.der,
             signing,
         })
     }
@@ -512,7 +602,9 @@ impl<'k, K: CaKey> Ca<'k, K> {
         if union == self.union {
             return Ok(false);
         }
-        let params = root_params(&union, now)?;
+        let mut params = root_params(&union, now)?;
+        // The same root key keeps the same validity end.
+        params.not_after = params.not_after.min(self.root_expiry);
         let root = params
             .self_signed(&self.root_key)
             .map_err(|err| self.root_key.error(err))?
@@ -928,6 +1020,62 @@ mod tests {
         assert!(!validates(ca.root(), &forged, "example.com"));
     }
 
+    // BEP-013, BEP-072: the root comes from the held root key, carries the
+    // union as its constraints, and anchors the CA that `bep serve` runs.
+    #[test]
+    fn root_certificate_is_issued_from_the_held_root_key() {
+        let (root_key, signing_key) = keys();
+        let union = Union::new(&[GITHUB], [""; 0]);
+        let root = issue_root(&root_key, union.clone(), now()).unwrap();
+
+        // Self-signed under the root key, with the root's subject.
+        let (_, spki) = subject_and_key(root.der());
+        assert!(spki.ends_with(&root_key.public().to_sec1_bytes()));
+        let (permitted, excluded) = name_constraints(root.der());
+        assert_eq!(permitted, union.names().map(str::to_owned).collect());
+        assert_eq!(
+            excluded,
+            DENY_SET.iter().map(|name| (*name).to_owned()).collect()
+        );
+
+        // The CA keeps that root as its anchor, and its leaves validate
+        // against it alone.
+        let ca = Ca::with_root(&root_key, &signing_key, root.clone(), now()).unwrap();
+        assert_eq!(ca.root(), root.der());
+        assert_eq!(ca.union(), &union);
+        let leaf = ca.issue_leaf("api.github.com", now()).unwrap();
+        assert!(validates(root.der(), &leaf, "api.github.com"));
+
+        // A changed union gets a root under the same key and subject.
+        let changed = Union::new(&[GITHUB], ["api.anthropic.com:443"]);
+        let again = issue_root(&root_key, changed.clone(), now()).unwrap();
+        assert_eq!(subject_and_key(again.der()), subject_and_key(root.der()));
+        assert_eq!(
+            name_constraints(again.der()).0,
+            changed.names().map(str::to_owned).collect()
+        );
+        assert!(validates(again.der(), &leaf, "api.github.com"));
+
+        // Only the root key issues the root.
+        assert!(matches!(
+            issue_root(&signing_key, union.clone(), now()),
+            Err(CaError::WrongRole {
+                expected: Role::Root,
+                got: Role::Signing
+            })
+        ));
+        assert!(matches!(
+            issue_root(&root_key, Union::default(), now()),
+            Err(CaError::EmptyUnion)
+        ));
+        // A root past its expiry anchors no CA.
+        let late = now() + ROOT_VALIDITY + Duration::from_secs(1);
+        assert!(matches!(
+            Ca::with_root(&root_key, &signing_key, root, late),
+            Err(CaError::RootExpired(_))
+        ));
+    }
+
     #[test]
     fn ca_refuses_a_wrong_role_or_exportable_key() {
         let union = || Union::new(&[GITHUB], [""; 0]);
@@ -978,6 +1126,34 @@ mod tests {
         let (_, validity, _) = tlv(rest);
         let (_, _, after) = tlv(validity);
         tlv(after).1.to_vec()
+    }
+
+    // BEP-005: a start issues the root under the key's validity end, which
+    // counts from the key's creation. A later start keeps the same end.
+    #[test]
+    fn root_certificate_ends_at_the_root_key_validity_end() {
+        let (root_key, signing_key) = keys();
+        let union = Union::new(&[GITHUB], [""; 0]);
+        let ends = now() + Duration::from_secs(86_400);
+        let first = issue_root_until(&root_key, union.clone(), now(), Some(ends)).unwrap();
+        let later = now() + Duration::from_secs(3_600);
+        let again = issue_root_until(&root_key, union.clone(), later, Some(ends)).unwrap();
+        assert_eq!(not_after(first.der()), not_after(again.der()));
+        let rolling = issue_root(&root_key, union.clone(), later).unwrap();
+        assert_ne!(not_after(first.der()), not_after(rolling.der()));
+
+        // The signing CA and a re-issued root keep the end.
+        let mut ca = Ca::with_root(&root_key, &signing_key, first.clone(), now()).unwrap();
+        assert_eq!(not_after(ca.signing()), not_after(first.der()));
+        let changed = Union::new(&[GITHUB], ["api.anthropic.com:443"]);
+        assert!(ca.reissue_root(changed, later).unwrap());
+        assert_eq!(not_after(ca.root()), not_after(first.der()));
+
+        // A root key past its end issues no certificate.
+        assert!(matches!(
+            issue_root_until(&root_key, union, ends, Some(ends)),
+            Err(CaError::RootExpired(_))
+        ));
     }
 
     #[test]

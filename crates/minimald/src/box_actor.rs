@@ -189,7 +189,6 @@ enum BoxMessage {
         /// The attaching connection's liveness, see [`BoxActor::creator`].
         Option<std::sync::Weak<()>>,
     ),
-    GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     /// Hand back this session's host, minting one — with no channel bound to
     /// it — if the session has none running. Used by the exec path, which runs
     /// a command inside the session's sandbox and so needs the sandbox up, but
@@ -246,12 +245,22 @@ enum BoxMessage {
     /// would strand it) or an `Active` with a minted host. A `Draft` that
     /// was merely created isn't busy — nothing is in flight to strand.
     IsBusy(oneshot::Sender<bool>),
+    /// Test-only: park the actor for the duration, holding its mailbox the
+    /// way a long inline message does. The sender is answered as the park
+    /// begins, so a test knows every earlier message, and the publish that
+    /// follows it, is done.
+    #[cfg(test)]
+    Park(std::time::Duration, oneshot::Sender<()>),
     /// Shutdown-stop: kill the host (if any), withdraw the hostname, and stop
     /// the actor — the on-disk record is kept.
     Stop(oneshot::Sender<()>),
     /// Full teardown: like [`Stop`](Self::Stop), but also deletes the on-disk
     /// record.
     Destroy(oneshot::Sender<Result<Vec<String>, std::io::Error>>),
+    /// [`Self::Destroy`] for a session that has not finished activating:
+    /// `Ok(None)` and nothing done when the record is `Active`. Decided here,
+    /// in mailbox order, so a finalize ahead of it ends first (inbox#690).
+    DestroyIfUnfinalized(oneshot::Sender<Result<Option<Vec<String>>, std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
@@ -379,6 +388,11 @@ enum BoxMessage {
     /// evaluates the graph itself. Acknowledged once dropped.
     #[cfg(test)]
     ForgetComposedGraphNames(oneshot::Sender<()>),
+    /// Test-only: acknowledge on the first sender, then hold the actor in
+    /// this message until the receiver fires or its sender drops, so a test
+    /// can queue messages behind it in a known order.
+    #[cfg(test)]
+    HoldUntil(oneshot::Sender<()>, oneshot::Receiver<()>),
 }
 
 /// Manages one session, from the moment its record is allocated: the create
@@ -390,6 +404,8 @@ enum BoxMessage {
 #[derive(Debug)]
 pub struct BoxActor {
     receiver: crate::traced::Receiver<BoxMessage>,
+    /// The slot this actor's handle reads its host from; see [`HostSlot`].
+    host_slot: HostSlot,
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
     daemon_ctx: Arc<mctx::DaemonContext>,
@@ -624,6 +640,7 @@ impl BoxActor {
             workspace_uploads_in_flight: 0,
             creator,
             manager,
+            host_slot: Arc::clone(&weak_self.2),
             weak_self,
             destroying,
             // No host yet; the first launch sets this. `Interactive` is the
@@ -772,7 +789,12 @@ impl BoxActor {
         }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
-        let weak_self = WeakBoxHandle(sender.downgrade(), destroying.clone());
+        let host_slot = HostSlot::default();
+        let weak_self = WeakBoxHandle(
+            sender.downgrade(),
+            destroying.clone(),
+            Arc::clone(&host_slot),
+        );
         let actor = Self::assemble(conf, receiver, inner, weak_self, destroying.clone());
 
         // Register the PTask hostname before the actor goes live, so the
@@ -799,7 +821,79 @@ impl BoxActor {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(BoxHandle(sender, destroying))
+        Ok(BoxHandle(sender, destroying, host_slot))
+    }
+
+    /// Publishes the host this actor holds to the slot its handle reads
+    /// ([`HostSlot`]). Called after every message, so between messages, and
+    /// for as long as one parks the actor, the slot holds the host the actor
+    /// last had, and a listing's probe never waits on this mailbox. Also
+    /// called where a host is installed ([`Self::ensure_host`],
+    /// [`Self::mint_session_host`], [`Self::launch_host_for_hooks`]), which
+    /// is before the message that launched it replies: a caller that awaits
+    /// an attach or `ensure_host` and then reads attrs sees the new host.
+    pub(super) fn publish_host(&self) {
+        let host = match &self.inner {
+            BoxInner::Active {
+                host: Some((h, _)), ..
+            } => Some(AttrsProbe(h.clone())),
+            _ => None,
+        };
+        *self
+            .host_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = host;
+    }
+
+    /// Tears the session down for good: its `on_destroy` hooks (failures
+    /// reported, never obeyed), its host, its hostname, its record. Returns
+    /// one line per hook that failed.
+    async fn destroy_now(&mut self) -> Result<Vec<String>, std::io::Error> {
+        // Before `stop_running`: a destroy hook runs *inside* the
+        // session, so the sandbox it joins has to still exist — or
+        // be minted, which is what this does when the session's
+        // shell has already gone. Failures are reported back to the
+        // destroying client, never obeyed: a session must stay
+        // destroyable whatever its hooks do.
+        //
+        // A slot of [`DESTROY_HOOK_RUNS`] is held across the hook run
+        // only, and only when there are hooks to run.
+        let hook_slot = if self.has_hooks_for(crate::hooks::HookEvent::Destroy) {
+            DESTROY_HOOK_RUNS.acquire().await.ok()
+        } else {
+            None
+        };
+        let hook_failures: Vec<String> = self
+            .run_hooks_headless(crate::hooks::HookEvent::Destroy)
+            .await
+            .iter()
+            .filter(|o| o.failed())
+            .map(|o| {
+                let mut line = format!("{}: {}", o.declared_by, o.status);
+                if !o.output.is_empty() {
+                    line.push('\n');
+                    line.push_str(&o.output);
+                }
+                line
+            })
+            .collect();
+        // Cancelled immediately before `stop_running`, which is what
+        // ends the session's commands, so a command that ends there
+        // can see why. Not before the hooks: they can take seconds,
+        // and a command that finishes on its own meanwhile was not
+        // stopped by the destroy.
+        self.destroying.cancel();
+        drop(hook_slot);
+        self.stop_running(false).await;
+        // Withdraw the hostname before the fallible record delete, so
+        // a delete failure leaves a stale on-disk record (repairable
+        // on restart) but never a stale routing entry pointing at a
+        // destroyed session (R3.5). The session is ending for good, so
+        // its lease fact goes with it.
+        #[cfg(target_os = "linux")]
+        self.deregister_hostname(true).await;
+        let deleted = self.record.clone().delete().await;
+        deleted.map(|()| hook_failures)
     }
 
     /// The async task which handles interactions with the session.
@@ -810,6 +904,8 @@ impl BoxActor {
     /// instead of deadlocking against a full manager mailbox.
     async fn mainloop(mut self) {
         let mut teardown = Teardown::ManagerInitiated;
+        let _clear_slot = ClearSlotOnExit(Arc::clone(&self.host_slot));
+        self.publish_host();
         while let Some((msg, caller)) = self.receiver.recv().await {
             // Opened now, a child of the sender's ids (see
             // `traced::Receiver::recv`), so compose, graph resolution and
@@ -829,6 +925,7 @@ impl BoxActor {
                 teardown = t;
                 break;
             }
+            self.publish_host();
         }
         if matches!(teardown, Teardown::SelfInitiated) {
             let session_id = *self.record.id();
@@ -862,29 +959,6 @@ impl BoxActor {
             BoxMessage::EnsureHost(r, session_hnd, conn_username) => {
                 let _ = r.send(self.ensure_host(session_hnd, conn_username).await);
             }
-            BoxMessage::GetHostAttrs(r) => match &self.inner {
-                BoxInner::Active {
-                    host: Some((h, _)), ..
-                } => {
-                    // Forwarded off-actor for the same reason as
-                    // `GetWorkspaceDelta`: the host loop can be mid-attach or
-                    // mid-teardown, and awaiting it from here parks this
-                    // actor — which the manager awaits in turn, from its own
-                    // mainloop, where a park costs every session RPC.
-                    //
-                    // Bounded *inside* the task: dropping the caller's
-                    // receiver does not cancel a spawned future, so an
-                    // unbounded probe would strand one task per poll against
-                    // a host that never answers.
-                    let h = h.clone();
-                    crate::traced::spawn(async move {
-                        let _ = r.send(probe_host(h.get_attrs()).await);
-                    });
-                }
-                _ => {
-                    let _ = r.send(None);
-                }
-            },
             BoxMessage::GetWorkspaceDelta(r) => match &self.inner {
                 BoxInner::Active {
                     host: Some((h, _)), ..
@@ -906,7 +980,7 @@ impl BoxActor {
                     host: Some((h, _)), ..
                 } => {
                     // Off-actor and bounded for the same reasons as
-                    // `GetHostAttrs`.
+                    // `GetWorkspaceDelta`.
                     let h = h.clone();
                     crate::traced::spawn(async move {
                         let _ = r.send(probe_host(h.get_screen()).await);
@@ -966,6 +1040,15 @@ impl BoxActor {
             },
             BoxMessage::Rename(new_name, r) => {
                 let _ = r.send(self.rename(new_name).await);
+            }
+            #[cfg(test)]
+            BoxMessage::Park(d, entered) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the parker may already be gone; the park still runs"
+                )]
+                let _ = entered.send(());
+                tokio::time::sleep(d).await;
             }
             BoxMessage::IsBusy(r) => {
                 let _ = r.send(match &self.inner {
@@ -1028,52 +1111,29 @@ impl BoxActor {
                 let _ = r.send(());
             }
             BoxMessage::Destroy(r) => {
-                // Before `stop_running`: a destroy hook runs *inside* the
-                // session, so the sandbox it joins has to still exist — or
-                // be minted, which is what this does when the session's
-                // shell has already gone. Failures are reported back to the
-                // destroying client, never obeyed: a session must stay
-                // destroyable whatever its hooks do.
-                //
-                // A slot of [`DESTROY_HOOK_RUNS`] is held across the hook run
-                // only, and only when there are hooks to run.
-                let hook_slot = if self.has_hooks_for(crate::hooks::HookEvent::Destroy) {
-                    DESTROY_HOOK_RUNS.acquire().await.ok()
-                } else {
-                    None
-                };
-                let hook_failures: Vec<String> = self
-                    .run_hooks_headless(crate::hooks::HookEvent::Destroy)
-                    .await
-                    .iter()
-                    .filter(|o| o.failed())
-                    .map(|o| {
-                        let mut line = format!("{}: {}", o.declared_by, o.status);
-                        if !o.output.is_empty() {
-                            line.push('\n');
-                            line.push_str(&o.output);
-                        }
-                        line
-                    })
-                    .collect();
-                // Cancelled immediately before `stop_running`, which is what
-                // ends the session's commands, so a command that ends there
-                // can see why. Not before the hooks: they can take seconds,
-                // and a command that finishes on its own meanwhile was not
-                // stopped by the destroy.
-                self.destroying.cancel();
-                drop(hook_slot);
-                self.stop_running(false).await;
-                // Withdraw the hostname before the fallible record delete, so
-                // a delete failure leaves a stale on-disk record (repairable
-                // on restart) but never a stale routing entry pointing at a
-                // destroyed session (R3.5). The session is ending for good, so
-                // its lease fact goes with it.
-                #[cfg(target_os = "linux")]
-                self.deregister_hostname(true).await;
-                let deleted = self.record.clone().delete().await;
-                let _ = r.send(deleted.map(|()| hook_failures));
+                let _ = r.send(self.destroy_now().await);
                 return ControlFlow::Break(Teardown::ManagerInitiated);
+            }
+            BoxMessage::DestroyIfUnfinalized(r) => {
+                // A record that cannot be read is destroyed, as an
+                // unconditional destroy would: keeping is the exception.
+                let finished = matches!(
+                    self.record.record().await,
+                    Ok(record) if record.status == BoxState::Active
+                );
+                if finished {
+                    tracing::info!(
+                        session_id = %self.record.id(),
+                        "kept a session a cleanup destroy was sent for: it finished activating first"
+                    );
+                    let _ = r.send(Ok(None));
+                } else {
+                    let _ = r.send(self.destroy_now().await.map(Some));
+                    // The manager did not claim this actor (its entry stays
+                    // in `running` for a conditional destroy), so it evicts
+                    // itself.
+                    return ControlFlow::Break(Teardown::SelfInitiated);
+                }
             }
             BoxMessage::GetPatchesUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.patches_upload_lock));
@@ -1186,6 +1246,19 @@ impl BoxActor {
                     reason = "the asker may already be gone; there is nothing to answer then"
                 )]
                 let _ = r.send(());
+            }
+            #[cfg(test)]
+            BoxMessage::HoldUntil(entered, release) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the holder may already be gone; the hold still ends on its release"
+                )]
+                let _ = entered.send(());
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "a dropped release ends the hold as a sent one does"
+                )]
+                let _ = release.await;
             }
             #[cfg(test)]
             BoxMessage::ForgetComposedGraphNames(r) => {

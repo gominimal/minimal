@@ -853,6 +853,7 @@ mod tests {
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: Default::default(),
         };
         let ssh_sock = dir.path().join("ssh.sock");
@@ -1644,7 +1645,10 @@ mod tests {
 
         // The Delete choice destroyed it daemon-side: the name is released.
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -1729,7 +1733,10 @@ mod tests {
         // the hold is made for a session that is gone, and released again
         // by its id once the second lookup finds no session.
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -1775,7 +1782,10 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id: gone })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id: gone,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -1855,7 +1865,10 @@ mod tests {
             .expect("the lookup does not fail")
             .expect("the session's record is read");
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}
@@ -1909,7 +1922,10 @@ mod tests {
         );
 
         match daemon
-            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest {
+                id,
+                only_if_unfinalized: false,
+            })
             .await
         {
             minimald_rpc::Errorable::Ok(_) => {}

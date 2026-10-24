@@ -543,6 +543,11 @@ pub(crate) struct SandboxLauncher {
     /// its watcher appends each listen it publishes to the audit log under
     /// it, the one the session's runtime expose path audits in (NET-046).
     pub(crate) state_dir: std::path::PathBuf,
+    /// The proxy's root certificate, PEM-encoded, that this launch adds to
+    /// the box's own trust store (BEP-011), as
+    /// [`super::launch_root_certificate`] reads it from the box's record.
+    /// `None` for a box that gets no root.
+    pub(crate) root_certificate: Option<String>,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -903,6 +908,9 @@ impl BoxLauncher for SandboxLauncher {
         // The mount table the launch's classifier facts answer over, moved
         // out with it (see the field's doc).
         let classifier_mountinfo = self.classifier_mountinfo;
+        // BEP-011: the root this launch adds to the box's trust store, moved
+        // out with them for the env build below.
+        let root_certificate = self.root_certificate;
         let net_switch = self.net_switch;
         let own_address = self.own_address;
         let box_addresses = self.box_addresses;
@@ -1246,6 +1254,8 @@ impl BoxLauncher for SandboxLauncher {
             .as_ref()
             .map(|c| c.orientation().loadouts_display.as_str())
             .filter(|d| !d.is_empty());
+        // BEP-011: the env build adds the trust variables below these, once
+        // it knows whether the box's packages ship a CA bundle.
         let env_vars = layer_session_env(
             session_baseline_env(&name, loadouts_display),
             attach_env.inherited,
@@ -1302,6 +1312,11 @@ impl BoxLauncher for SandboxLauncher {
             // launch's duration; this copy travels into the config.
             if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get).cloned() {
                 env_args = env_args.with_classifier_leaf(leaf);
+            }
+            // BEP-011: the build writes the root into the box's own bundle
+            // copy and hashed directory, and sets the trust variables.
+            if let Some(pem) = root_certificate {
+                env_args = env_args.with_root_certificate(pem);
             }
             let mut env = Box::pin(crate::env::Env::build(ctx, graph, env_args)).await?;
 

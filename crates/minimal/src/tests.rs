@@ -341,6 +341,8 @@ fn every_create_session_asserts_the_daemon_build() {
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
             "tests.rs::create_box_on = asserts",
+            // Not a client path: the mint unit tests' create-request fixture.
+            "tests.rs::create_request = asserts",
         ]
     );
 }
@@ -3763,6 +3765,7 @@ mod mint_tests {
     use bep::publish::{Identity, PublishedKey};
     use bep::seal::{Binding, Breadth, MemberKind, Mode, ProxyKey, ProxyPublicKey};
     use bep::signin::{Completed, Flow, Keychain as _, Material, MemoryKeychain, store_sign_in};
+    use minimald_rpc::CreateSessionRequest;
 
     use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
 
@@ -3787,6 +3790,7 @@ mod mint_tests {
             root: Some(published(&root.public())),
             signing: Some(published(&ProxyKey::generate().unwrap().public())),
             root_not_after: Some(ROOT_END),
+            root_certificate: None,
         };
         (sealing, identity)
     }
@@ -3855,6 +3859,124 @@ mod mint_tests {
             boxes,
             _runtime: runtime,
         }
+    }
+
+    // BEP-072, BEP-011: a grant box's create request carries the root
+    // certificate the proxy published, beside each grant's sealed value. A
+    // grant box whose proxy publishes none is refused with a message that
+    // names `bep`, and a box with no grant carries no root.
+    #[test]
+    fn grant_box_create_request_carries_the_published_root_certificate() {
+        use crate::cmd::{grant_root_certificate, hand_grants};
+
+        let (_, identity) = proxy();
+        let root_key = identity.key(bep::keys::Role::Root).unwrap();
+        let pem = bep::publish::certificate_pem(&certificate_der(&root_key.to_sec1_bytes()));
+        let identity = Identity {
+            root_certificate: Some(pem.clone()),
+            ..identity
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        identity.publish(&path).unwrap();
+        let published = Identity::read(&path).unwrap();
+
+        let root = grant_root_certificate(&published).unwrap();
+        assert_eq!(root, pem);
+        let grants = vec!["GH_TOKEN".to_string()];
+        let minted = vec![crate::mint::Minted {
+            grant: "GH_TOKEN".into(),
+            sealed: zeroize::Zeroizing::new("sealed-value".into()),
+            expiry: ROOT_END,
+        }];
+        let mut request = create_request();
+        hand_grants(&mut request, &grants, &minted, Some(root)).unwrap();
+        assert_eq!(
+            request.config.root_certificate.as_deref(),
+            Some(pem.as_str())
+        );
+        assert_eq!(request.config.sealed_deliveries.len(), 1);
+        assert_eq!(request.config.sealed_deliveries[0].variable, "GH_TOKEN");
+
+        // An identity that an older `bep` published has no certificate, one
+        // with a broken certificate has none that the box can trust, and a
+        // certificate under another key is not the published root's.
+        let foreign = ProxyKey::generate().unwrap().public().to_sec1_bytes();
+        let foreign = bep::publish::certificate_pem(&certificate_der(&foreign));
+        for root_certificate in [None, Some("not a certificate".to_string()), Some(foreign)] {
+            let identity = Identity {
+                root_certificate,
+                ..published.clone()
+            };
+            let error = grant_root_certificate(&identity).unwrap_err().to_string();
+            assert!(error.contains("no root certificate"), "{error}");
+            assert!(error.contains("Run `bep`"), "{error}");
+        }
+        let mut refused = create_request();
+        let error = hand_grants(&mut refused, &grants, &minted, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Run `bep`"), "{error}");
+        assert_eq!(refused.config.root_certificate, None);
+        assert!(refused.config.sealed_deliveries.is_empty());
+
+        // A box with no GitHub grant carries no root.
+        let mut plain = create_request();
+        hand_grants(&mut plain, &[], &[], None).unwrap();
+        assert_eq!(plain.config.root_certificate, None);
+    }
+
+    /// A certificate's DER, in the shape of the one `bep` issues, whose
+    /// subject public key is `point`, an uncompressed P-256 point. Only the
+    /// structure up to the subject key is real.
+    fn certificate_der(point: &[u8]) -> Vec<u8> {
+        fn element(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+            let content = parts.concat();
+            let mut out = vec![tag];
+            match u16::try_from(content.len()).unwrap() {
+                len @ 0..0x80 => out.push(u8::try_from(len).unwrap()),
+                len @ 0x80..0x100 => out.extend([0x81, u8::try_from(len).unwrap()]),
+                len => {
+                    out.push(0x82);
+                    out.extend(len.to_be_bytes());
+                }
+            }
+            out.extend(content);
+            out
+        }
+        const P256: &[u8] = &[
+            0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+            0xce, 0x3d, 0x03, 0x01, 0x07,
+        ];
+        let algorithm = element(0x30, &[P256]);
+        let key = element(0x03, &[&[0], point]);
+        let spki = element(0x30, &[&algorithm, &key]);
+        let name = element(0x30, &[&element(0x31, &[])]);
+        let tbs = element(
+            0x30,
+            &[
+                &element(0xa0, &[&element(0x02, &[&[2]])]),
+                &element(0x02, &[&[1]]),
+                &element(0x30, &[]),
+                &name,
+                &element(0x30, &[]),
+                &name,
+                &spki,
+                &element(0xa3, &[&[0; 200]]),
+            ],
+        );
+        element(0x30, &[&tbs, &element(0x30, &[]), &element(0x03, &[&[0]])])
+    }
+
+    fn create_request() -> CreateSessionRequest {
+        let mut request = CreateSessionRequest::new(
+            "grant-box",
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        );
+        request.must_match_version = minimal_client::version_assertion();
+        request
     }
 
     // BEP-005: the member is a sign-in reference under the client's key,

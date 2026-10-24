@@ -1,18 +1,21 @@
 //! `bep`: the Box Egress Proxy on this host.
 //!
-//! At start it loads the proxy's keys from the host keychain and publishes
-//! their public halves (BEP-059, BEP-072). `bep --replace-key <role>` is the
-//! operator's command that replaces a key (BEP-060). It needs no file and no
-//! other key, so it works when the proxy itself does not start. After the
-//! replacement it publishes the new public key, so a mint stops sealing to
-//! the old one.
+//! At start it loads the proxy's keys from the host keychain, issues the
+//! root certificate under the root key, and publishes the certificate with
+//! the keys' public halves (BEP-013, BEP-059, BEP-072).
+//! `bep --replace-key <role>` is the operator's command that replaces a key
+//! (BEP-060). It needs no file and no other key, so it works when the proxy
+//! itself does not start. After the replacement it publishes the new public
+//! key, so a mint stops sealing to the old one. A new root key also gets a
+//! new root certificate.
 //!
 //! `bep serve` starts the proxy the same way, then serves box connections on
 //! the listener socket ([`bep::listener`]), and client key and box
 //! registrations on the control socket ([`bep::control`]). It reads the
 //! per-boot token from standard input. Each request inside a box connection
 //! goes to the redemption decision ([`bep::redeemer`]), which reads the
-//! boxes the control socket registers.
+//! boxes the control socket registers. The root certificate the start
+//! issued is the anchor of the CA that signs each leaf.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,14 +26,14 @@ use std::time::SystemTime;
 
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
-use bep::ca::{CaError, Leaf};
+use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
 use bep::control::{Control, Registry};
 use bep::forward::Redeemer;
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, LeafIssuer, Proxy, SystemResolver};
-use bep::publish::{Identity, PublishError};
+use bep::proxy::{self, Admission, Proxy, SystemResolver};
+use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::BoxRedeemer;
 use bep::signin::{HostKeychain, Keychain};
 use clap::{Parser, Subcommand};
@@ -100,7 +103,7 @@ fn main() -> ExitCode {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn run<S: KeyStore>(store: &S, args: &Args) -> ExitCode
 where
-    S::Key: Send + Sync + 'static,
+    S::Key: CaKey + Send + Sync + 'static,
 {
     let path = match identity_path(args) {
         Ok(path) => path,
@@ -118,8 +121,8 @@ where
         }
         return replace_key(store, role, &path);
     }
-    let started = start(store, &path).and_then(|keys| match &args.command {
-        Some(Command::Serve(serve_args)) => serve(serve_args, keys.sealing),
+    let started = start(store, &path).and_then(|(keys, root)| match &args.command {
+        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root),
         None => Ok(()),
     });
     match started {
@@ -133,7 +136,10 @@ where
 
 /// `bep --replace-key <role>`. It needs no other key and no file, so it
 /// works when the proxy does not start.
-fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
+fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode
+where
+    S::Key: CaKey,
+{
     let key = match keys::replace(store, role) {
         Ok(key) => key,
         Err(ReplaceError::Remove(err)) => {
@@ -186,7 +192,38 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
     };
     let identity = Identity::after_replacement(store, role, &key, previous.as_ref())
         .with_root_validity(previous.as_ref(), root_made_at);
+    // BEP-072: a new root key gets a new root certificate. Another role
+    // keeps the certificate the identity already carries.
+    let mut issued = true;
+    let identity = if role == Role::Root {
+        match identity
+            .clone()
+            .issuing_root(&key, registered_union(), SystemTime::now())
+        {
+            Ok((identity, root)) => {
+                log_root(&root);
+                identity
+            }
+            Err(err) => {
+                // The public key is still published, so a mint never seals
+                // to the deleted key. A later start issues the certificate.
+                eprintln!("The new root key did not issue a root certificate: {err}.");
+                issued = false;
+                identity
+            }
+        }
+    } else {
+        identity
+    };
     match identity.publish(path) {
+        Ok(()) if !issued => {
+            tracing::info!(path = %path.display(), "published the proxy identity with no root certificate");
+            println!("Published the new public key to {}.", path.display());
+            eprintln!(
+                "The published identity has no root certificate, so boxes with a GitHub grant cannot be created. Correct the problem above, then run `bep` to issue the certificate."
+            );
+            ExitCode::FAILURE
+        }
         Ok(()) => {
             tracing::info!(path = %path.display(), "published the proxy identity");
             println!("Published the new public key to {}.", path.display());
@@ -202,9 +239,16 @@ fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode {
     }
 }
 
-/// A proxy start: reads the published identity, loads the keys and
-/// publishes their public halves again. Gives the loaded keys.
-fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, String> {
+/// A proxy start: reads the published identity, loads the keys, issues the
+/// root certificate, and publishes the certificate and the keys' public
+/// halves again. Gives the loaded keys and the root certificate.
+fn start<S: KeyStore>(
+    store: &S,
+    path: &Path,
+) -> Result<(ProxyKeys<S::Key>, RootCertificate), String>
+where
+    S::Key: CaKey,
+{
     // BEP-060: a role the identity names had a key before, so the start
     // refuses when the store lost it. With no file, `keys::load` still
     // refuses a lost key when the store holds a key for another role.
@@ -223,12 +267,57 @@ fn start<S: KeyStore>(store: &S, path: &Path) -> Result<ProxyKeys<S::Key>, Strin
     // start before it generates a root key with no known validity.
     let root_made_at = if root_absent { Some(unix_now()?) } else { None };
     let loaded = keys::load(store, &published).map_err(|err| err.to_string())?;
-    Identity::of(&loaded)
+    // BEP-013, BEP-072: each start issues the root from the held root key,
+    // so a changed set of registered names reaches the next box created.
+    let (identity, root) = Identity::of(&loaded)
         .with_root_validity(previous.as_ref(), root_made_at)
-        .publish(path)
-        .map_err(|err| err.to_string())?;
+        .issuing_root(&loaded.root, registered_union(), SystemTime::now())
+        .map_err(root_refusal)?;
+    log_root(&root);
+    identity.publish(path).map_err(|err| err.to_string())?;
     tracing::info!(path = %path.display(), "published the proxy identity");
-    Ok(loaded)
+    Ok((loaded, root))
+}
+
+/// The names the root permits: the configured modules' hosts, less the
+/// deny set. The store rules' authorities join them when
+/// `[secret-store-rules]` is read at start, which is T25
+/// (<https://github.com/gominimal/minimal/issues/2280>).
+fn registered_union() -> Union {
+    Union::new(&[GITHUB], [""; 0])
+}
+
+/// The one start line for the root certificate. It names the certificate's
+/// fingerprint and the count of its permitted names, never a key.
+fn log_root(root: &RootCertificate) {
+    tracing::info!(
+        fingerprint = %certificate_fingerprint(root.der()),
+        permitted_names = root.union().names().count(),
+        "issued the root CA certificate"
+    );
+}
+
+/// What a start says when the root key did not issue the root certificate.
+fn root_refusal(err: CaError) -> String {
+    match err {
+        // BEP-060: a refused key gets the replacement command, in the same
+        // words as a key refused at load.
+        CaError::Key(KeyError::Refused { role, .. }) => keys::StartError::Unusable {
+            refused: vec![role],
+            missing: Vec::new(),
+        }
+        .to_string(),
+        CaError::Key(err @ KeyError::Store { .. }) => format!(
+            "The proxy did not start: the keychain did not sign the root certificate with the root key: {err}. \
+             If the keychain is locked, unlock it and run `bep` again. \
+             If it stays refused, run `bep --replace-key root` to make a new root key. Boxes created before then must be re-created."
+        ),
+        CaError::RootExpired(at) => format!(
+            "The proxy did not start: the root CA expired at {at}. \
+             Run `bep --replace-key root` to make a new root key. Boxes created before then must be re-created."
+        ),
+        other => format!("The proxy did not start: {other}."),
+    }
 }
 
 /// The time now, in seconds since the Unix epoch. A clock that reads
@@ -240,25 +329,6 @@ fn unix_now() -> Result<u64, String> {
         .map_err(|_| {
             "This machine's clock reads a time before 1970, so the root key's validity cannot start. Set the system clock to the correct time.".to_owned()
         })
-}
-
-/// The leaf issuer `bep serve` has today. The root and signing CA keys are
-/// in the Keychain, but no Keychain key can sign a certificate yet
-/// (<https://github.com/gominimal/minimal/issues/2440>). Until one can,
-/// every leaf is refused, and the proxy answers an admitted CONNECT with
-/// `502`.
-///
-/// This issuer signs no leaf, so no tunnel opens and no request inside one
-/// reaches the redeemer that [`wire`] installs.
-struct NoSigningKey;
-
-impl LeafIssuer for NoSigningKey {
-    fn issue(&self, _hostname: &str, _now: SystemTime) -> Result<Leaf, CaError> {
-        Err(CaError::Key(KeyError::Store {
-            role: Role::Signing,
-            detail: "the Keychain key cannot sign certificates in this version of bep".into(),
-        }))
-    }
 }
 
 /// What `bep serve` shares between the control socket and the proxy: the
@@ -332,7 +402,11 @@ impl Wiring {
 
 /// `bep serve`: the listener and the control socket, until one fails.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Result<(), String> {
+fn serve<K: CaKey + Send + Sync + 'static>(
+    args: &ServeArgs,
+    keys: ProxyKeys<K>,
+    root: RootCertificate,
+) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
     let control = args
         .control
@@ -358,9 +432,20 @@ fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Re
     // (https://github.com/gominimal/minimal/issues/2280). Until it lands the
     // GitHub module's host set is the set, so a CONNECT to a registered store
     // authority is refused and audited `off_module`.
+    let ProxyKeys {
+        sealing,
+        root: root_key,
+        signing,
+    } = keys;
+    // The CA lives as long as the process, and it borrows its keys.
+    let root_key: &'static K = Box::leak(Box::new(root_key));
+    let signing: &'static K = Box::leak(Box::new(signing));
+    // The published root is the anchor. The signing CA is issued under it.
+    let ca = Ca::with_root(root_key, signing, root, SystemTime::now())
+        .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let proxy = Proxy::new(
         Admission::new(&[GITHUB], [("", 0); 0]),
-        Arc::new(NoSigningKey),
+        Arc::new(Mutex::new(ca)),
         roots,
         Arc::new(SystemResolver),
         Arc::new(Mutex::new(log)),
@@ -378,8 +463,7 @@ fn serve<K: HeldKey + Send + Sync + 'static>(args: &ServeArgs, sealing: K) -> Re
             .control(&control)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
-            "no CA key can sign a leaf certificate yet (#2440), so every admitted CONNECT is answered 502. \
-             A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
+            "A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
              A store-handle member is not admitted until #2280 lands. \
              No revocation is in force until #2277 and #2290 land. \
              Nothing forgets a destroyed box's declared egress until #2277 lands."
@@ -450,6 +534,20 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+    use bep::ca::Leaf;
+    use bep::proxy::LeafIssuer;
+
+    /// A leaf issuer that signs no leaf, so the test opens no tunnel.
+    struct NoSigningKey;
+
+    impl LeafIssuer for NoSigningKey {
+        fn issue(&self, _hostname: &str, _now: SystemTime) -> Result<Leaf, CaError> {
+            Err(CaError::Key(KeyError::Store {
+                role: Role::Signing,
+                detail: "the test signs no leaf".into(),
+            }))
+        }
+    }
 
     const INSTANCE: &str = "0123456789abcdef0123456789abcdef";
     const TOKEN: &str = "ghu_serve_token";
