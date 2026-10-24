@@ -506,14 +506,10 @@ fn request_rotation(
     notify: impl FnOnce(u32) -> io::Result<()>,
     timeout: Duration,
 ) -> Result<&'static str, String> {
-    let not_running = || {
-        format!(
-            "The signing certificate was not rotated, because no `bep serve` is running with the control socket {}. \
-             `bep serve` issues a new signing certificate each time it starts.",
-            control.display()
-        )
-    };
     let lock_path = state_file(control, SERVE_LOCK);
+    // A `bep serve` that did not claim its state still serves, so this
+    // names the missing state and not a missing proxy.
+    let not_running = || no_serve_state(control, &lock_path);
     let lock = match std::fs::File::open(&lock_path) {
         Ok(lock) => lock,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(not_running()),
@@ -574,6 +570,21 @@ fn request_rotation(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// What `bep --rotate-signing` says when no `bep serve` holds the state at
+/// `lock_path`. Either no proxy uses `control`, or the proxy did not claim
+/// its state and logged why. A restart rotates in both cases.
+fn no_serve_state(control: &Path, lock_path: &Path) -> String {
+    format!(
+        "The signing certificate was not rotated, because no `bep serve` holds its state at {lock}. \
+         Either no `bep serve` uses the control socket {control}, or a `bep serve` did not claim that state. \
+         The log of a running `bep serve` says why it did not claim it. \
+         To rotate, stop `bep serve` and start it again. \
+         Each `bep serve` issues a new signing certificate when it starts.",
+        lock = lock_path.display(),
+        control = control.display(),
+    )
 }
 
 /// The first of `lock_path` and its directory that another user owns or can
@@ -1069,7 +1080,18 @@ mod tests {
 
         // No proxy ran here, so there is nothing to rotate.
         let refused = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert!(refused.unwrap_err().contains("no `bep serve` is running"));
+        assert_eq!(
+            refused.unwrap_err(),
+            format!(
+                "The signing certificate was not rotated, because no `bep serve` holds its state at {}. \
+                 Either no `bep serve` uses the control socket {}, or a `bep serve` did not claim that state. \
+                 The log of a running `bep serve` says why it did not claim it. \
+                 To rotate, stop `bep serve` and start it again. \
+                 Each `bep serve` issues a new signing certificate when it starts.",
+                state_file(&control, SERVE_LOCK).display(),
+                control.display(),
+            )
+        );
 
         // A fingerprint left by an earlier run is replaced before the lock
         // names the new process.
@@ -1122,7 +1144,11 @@ mod tests {
         );
         // A proxy on another socket in the same directory has its own state.
         let refused = request_rotation(&other, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert!(refused.unwrap_err().contains("no `bep serve` is running"));
+        assert!(
+            refused
+                .unwrap_err()
+                .contains("no `bep serve` holds its state")
+        );
         assert!(
             ServeState::claim(&other, 4444, &in_use, Duration::ZERO)
                 .unwrap()
@@ -1192,7 +1218,11 @@ mod tests {
         // A proxy that stopped leaves its file unlocked.
         drop(state);
         let stale = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert!(stale.unwrap_err().contains("no `bep serve` is running"));
+        assert!(
+            stale
+                .unwrap_err()
+                .contains("no `bep serve` holds its state")
+        );
 
         let expiry = ca.lock().unwrap().signing_expiry();
         let at = SystemTime::now();
