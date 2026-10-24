@@ -497,6 +497,29 @@ fn rotate<K: CaKey>(
     Ok(())
 }
 
+/// Answers one rotation request from `bep --rotate-signing`. The rotation
+/// signs through the keychain, which can block or wait for a prompt, so it
+/// runs on a blocking thread and never stalls a runtime thread.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+async fn rotate_on_request<K: CaKey + Send + Sync + 'static>(
+    ca: &Arc<Mutex<Ca<'static, K>>>,
+    state: &Option<Arc<ServeState>>,
+) {
+    let ca = Arc::clone(ca);
+    let state = state.clone();
+    let rotated =
+        tokio::task::spawn_blocking(move || rotate(&ca, state.as_deref(), SystemTime::now())).await;
+    match rotated {
+        Ok(Ok(())) => {}
+        Ok(Err(CaError::RootExpired(at))) => tracing::error!(
+            %at,
+            "the signing CA did not rotate: the root CA expired; run `bep --replace-key root`"
+        ),
+        Ok(Err(error)) => tracing::warn!(%error, "the signing CA did not rotate on request"),
+        Err(error) => tracing::warn!(%error, "the signing CA did not rotate on request"),
+    }
+}
+
 /// `bep --rotate-signing`: asks the `bep serve` on the control socket
 /// `control` to
 /// rotate its signing CA, through `notify`, and waits until it records a
@@ -873,18 +896,19 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         let mut rotation = tokio::signal::unix::signal(SignalKind::user_defined1())
             .map_err(|err| format!("bep did not take rotation requests: {err}"))?;
         let signing = ca.lock().unwrap_or_else(PoisonError::into_inner).signing().clone();
-        let state = claim_state(&control, &signing);
+        // `claim_state` can sleep for `CLAIM_RETRY`, so it runs off the
+        // runtime threads.
+        let claim_control = control.clone();
+        let state = tokio::task::spawn_blocking(move || claim_state(&claim_control, &signing))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "did not write the state that `bep --rotate-signing` reads");
+                None
+            });
         keep_signing_renewed(Arc::clone(&ca), state.clone());
         tokio::spawn(async move {
             while rotation.recv().await.is_some() {
-                match rotate(&ca, state.as_deref(), SystemTime::now()) {
-                    Ok(()) => {}
-                    Err(CaError::RootExpired(at)) => tracing::error!(
-                        %at,
-                        "the signing CA did not rotate: the root CA expired; run `bep --replace-key root`"
-                    ),
-                    Err(error) => tracing::warn!(%error, "the signing CA did not rotate on request"),
-                }
+                rotate_on_request(&ca, &state).await;
             }
         });
         let listener = Listener::bind(&args.listener, token, Arc::new(PeerAttested))
@@ -1241,6 +1265,120 @@ mod tests {
             "renewal is due before the signing CA expires"
         );
         assert_eq!(renewal_wait(expiry, expiry), Duration::ZERO);
+    }
+
+    /// A CA key that notes the thread of each signature.
+    struct ThreadNotingKey {
+        inner: CaTestKey,
+        signed_on: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl HeldKey for ThreadNotingKey {
+        fn role(&self) -> Role {
+            self.inner.role()
+        }
+
+        fn public(&self) -> ProxyPublicKey {
+            self.inner.public()
+        }
+
+        fn exportable(&self) -> bool {
+            self.inner.exportable()
+        }
+
+        fn agree(&self, peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            self.inner.agree(peer)
+        }
+
+        fn probe(&self) -> Result<(), KeyError> {
+            self.inner.probe()
+        }
+    }
+
+    impl CaKey for ThreadNotingKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            self.signed_on
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            self.inner.sign(msg)
+        }
+    }
+
+    // BEP-061: a rotation request reaches `bep serve` through the same
+    // handler as SIGUSR1. The keychain signature runs on a blocking thread,
+    // never on a runtime thread, and the rotation still completes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signing_ca_rotation_invisible_to_boxes_off_the_runtime() {
+        let runtime_thread = std::thread::current().id();
+        let root_key: &'static ThreadNotingKey = Box::leak(Box::new(ThreadNotingKey {
+            inner: CaTestKey::new(Role::Root),
+            signed_on: Mutex::new(Vec::new()),
+        }));
+        let signing_key: &'static ThreadNotingKey = Box::leak(Box::new(ThreadNotingKey {
+            inner: CaTestKey::new(Role::Signing),
+            signed_on: Mutex::new(Vec::new()),
+        }));
+        let at = SystemTime::now();
+        let root = bep::ca::issue_root(root_key, registered_union(), at).unwrap();
+        let ca = Arc::new(Mutex::new(
+            Ca::with_root(root_key, signing_key, root, at).unwrap(),
+        ));
+        let (box_trust, in_use) = {
+            let ca = ca.lock().unwrap();
+            (ca.root().clone(), ca.signing().clone())
+        };
+        root_key.signed_on.lock().unwrap().clear();
+
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("private/control.sock");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(control.parent().unwrap())
+            .unwrap();
+        let state = ServeState::claim(&control, std::process::id(), &in_use, Duration::ZERO)
+            .unwrap()
+            .map(Arc::new);
+        assert!(state.is_some(), "the test proxy did not claim its state");
+
+        // The loop `bep serve` runs for SIGUSR1, fed from a channel.
+        let (request, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let serving = Arc::clone(&ca);
+        tokio::spawn(async move {
+            while requests.recv().await.is_some() {
+                rotate_on_request(&serving, &state).await;
+            }
+        });
+
+        let asking = control.clone();
+        let printed = tokio::task::spawn_blocking(move || {
+            request_rotation(
+                &asking,
+                |_| request.send(()).map_err(io::Error::other),
+                ROTATE_TIMEOUT,
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            printed.unwrap(),
+            "Signing certificate rotated. Running boxes keep working; nothing inside them changes."
+        );
+
+        let ca_now = ca.lock().unwrap();
+        assert_eq!(*ca_now.root(), box_trust, "the root changed");
+        assert_ne!(*ca_now.signing(), in_use, "the signing CA did not rotate");
+        assert_eq!(
+            std::fs::read_to_string(state_file(&control, SIGNING_FINGERPRINT)).unwrap(),
+            certificate_fingerprint(ca_now.signing())
+        );
+        let signed_on = root_key.signed_on.lock().unwrap();
+        assert!(!signed_on.is_empty(), "the rotation signed nothing");
+        assert!(
+            signed_on.iter().all(|thread| *thread != runtime_thread),
+            "the rotation signed on the runtime thread"
+        );
     }
 
     fn now() -> u64 {
