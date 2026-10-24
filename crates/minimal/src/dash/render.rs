@@ -1096,6 +1096,7 @@ mod tests {
                     }),
                     ingress: None,
                     credentialed_upstream: None,
+                    quic443: None,
                 },
             )
         };
@@ -1122,6 +1123,7 @@ mod tests {
             egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            quic443: None,
         };
         let unlaned = boxes::BoxPolicy {
             credentialed_upstream: None,

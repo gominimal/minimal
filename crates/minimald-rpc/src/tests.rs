@@ -288,6 +288,7 @@ fn policy_types_are_present_and_serializable() {
         egress: None,
         ingress: Some(IngressPolicy::default()),
         credentialed_upstream: None,
+        quic443: None,
     };
     let json = serde_json_lenient::to_string(&policy).unwrap();
     assert!(json.contains("\"egress\":null"), "got: {json}");
@@ -383,7 +384,8 @@ fn errorable_session_policy_decodes_daemon_error_as_err() {
         Errorable::Ok(BoxPolicy {
             egress: None,
             ingress: None,
-            credentialed_upstream: None
+            credentialed_upstream: None,
+            quic443: None,
         })
     );
 }

@@ -955,6 +955,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -981,6 +982,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -999,6 +1001,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -1016,6 +1019,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -1152,6 +1156,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let gate = gate_for(&two_names);
         let now = Instant::now();
@@ -2653,6 +2658,7 @@ pub(crate) mod tests {
             egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -3001,6 +3007,7 @@ pub(crate) mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         for policy in [github_only_egress(), allow_all] {
             let gate = gate_for(&policy);
@@ -3120,6 +3127,7 @@ pub(crate) mod tests {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
+                quic443: None,
             }),
         ]
     }
@@ -3317,6 +3325,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
