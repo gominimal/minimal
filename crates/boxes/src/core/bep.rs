@@ -1090,13 +1090,13 @@ fn store_rule_refusal(
             });
         }
     }
-    if let Some(field) = &rule.basic_auth {
-        if !matches!(field.as_str(), "user" | "password") {
-            return Some(StoreRuleRefusal::Malformed {
-                field: "basic_auth",
-                value: field.clone(),
-            });
-        }
+    if let Some(field) = &rule.basic_auth
+        && !matches!(field.as_str(), "user" | "password")
+    {
+        return Some(StoreRuleRefusal::Malformed {
+            field: "basic_auth",
+            value: field.clone(),
+        });
     }
     let forms = usize::from(rule.header.is_some()) + usize::from(rule.basic_auth.is_some());
     if rule.upstream.is_empty() || forms != 1 || (rule.prefix.is_some() && rule.header.is_none()) {
