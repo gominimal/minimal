@@ -329,7 +329,8 @@ impl Proxy {
 
     /// Serves one admitted box connection. The span carries the box id, the
     /// authority the box asked for, the upstream's validation outcome, the
-    /// last substitution decision, and the outcome. It never carries a
+    /// last substitution decision, whether an admission was
+    /// cohort-attributed, and the outcome. It never carries a
     /// credential.
     pub async fn serve<S>(&self, delivery: Delivery, stream: S)
     where
@@ -343,6 +344,7 @@ impl Proxy {
             authority = tracing::field::Empty,
             upstream_tls = tracing::field::Empty,
             substitution = tracing::field::Empty,
+            cohort_attributed = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
         async {

@@ -352,13 +352,18 @@ where
         let facts = self.facts(box_id, authority, request, sealed, now);
         let verdict = match redeem::decide(&facts.redemption) {
             Decision::Refuse(check) => Verdict::Refuse(check.marker()),
-            Decision::Admit { .. } => {
+            decision @ Decision::Admit { .. } => {
                 let identifier = facts.identifier.unwrap_or_default();
                 match self.credential(&identifier, now) {
+                    // The admission's marker reaches the audit record, so a
+                    // cohort admission is recorded `cohort_attributed`
+                    // (BEP-028).
                     Some(credential) => Verdict::Admit {
                         credential,
                         identifier,
                         mapping: Mapping::ModuleUnmapped,
+                        marker: decision.marker(),
+                        cohort_attributed: decision.cohort_attributed(),
                     },
                     None => Verdict::Refuse(SIGN_IN_REQUIRED),
                 }
@@ -710,6 +715,31 @@ mod tests {
         let verdict = world.redeemer.redeem("c0", &api(), &request, &sealed);
         assert!(matches!(verdict, Verdict::Refuse(m) if m == Check::CrossBox.marker()));
         assert_eq!(count(), 1);
+    }
+
+    // BEP-028: a `host_ip` sender that presents a value naming another live
+    // `host_ip` box is admitted, and its audit record is marked
+    // `cohort_attributed`. An admission from the named box itself carries
+    // no marker.
+    #[test]
+    fn host_ip_redemption_is_cohort_attributed_in_the_audit_record() {
+        let world = new_world();
+        world.boxes.register("c1", github(), Stance::HostIp);
+        world.boxes.register("c2", github(), Stance::HostIp);
+        let sealed = sealed_for(&world, "c2", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, "c1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
+
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (_, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].marker, None);
     }
 
     /// One scenario for the property test.
