@@ -9,9 +9,10 @@
 //! key, so a mint stops sealing to the old one. A new root key also gets a
 //! new root certificate.
 //!
-//! `bep --rotate-signing` starts the same way, then issues a new signing
-//! certificate under the unchanged root (BEP-061). A box trusts the root
-//! alone, so nothing inside a running box changes.
+//! `bep --rotate-signing` asks the running `bep serve` for a new signing
+//! certificate under the unchanged root (BEP-061), and waits until it reports
+//! one. The signing certificate lives in the serving proxy alone. A box
+//! trusts the root alone, so nothing inside a running box changes.
 //!
 //! `bep serve` starts the proxy the same way, then serves box connections on
 //! the listener socket ([`bep::listener`]), and client key and box
@@ -21,7 +22,7 @@
 //! boxes the control socket registers. The root certificate the start
 //! issued is the anchor of the CA that signs each leaf.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -41,6 +42,7 @@ use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::BoxRedeemer;
 use bep::signin::{HostKeychain, Keychain};
 use clap::{Parser, Subcommand};
+use tokio::signal::unix::SignalKind;
 
 /// Runs the box egress proxy on this host.
 #[derive(Debug, Parser)]
@@ -51,8 +53,9 @@ struct Args {
     #[arg(long, value_name = "ROLE")]
     replace_key: Option<Role>,
 
-    /// Issue a new signing certificate under the same root certificate.
-    /// Running boxes keep working, because they trust only the root.
+    /// Make the running `bep serve` issue a new signing certificate under
+    /// the same root certificate. Running boxes keep working, because they
+    /// trust only the root.
     #[arg(long, conflicts_with = "replace_key")]
     rotate_signing: bool,
 
@@ -137,9 +140,14 @@ where
             );
             return ExitCode::FAILURE;
         }
-        let rotated = start(store, &path).and_then(|(keys, root)| {
-            rotate_signing(&keys.root, &keys.signing, root, SystemTime::now())
-        });
+        // The signing CA lives in the serving proxy alone, so the rotation
+        // happens there (BEP-061).
+        let rotated = bep_dir()
+            .ok_or_else(|| {
+                "bep did not find your home directory, which holds the state of `bep serve`."
+                    .to_string()
+            })
+            .and_then(|dir| request_rotation(&dir, signal_rotation, ROTATE_TIMEOUT));
         return match rotated {
             Ok(report) => {
                 println!("{report}");
@@ -332,25 +340,159 @@ fn log_root(root: &RootCertificate) {
 const ROTATED_SIGNING: &str =
     "Signing certificate rotated. Running boxes keep working; nothing inside them changes.";
 
-/// `bep --rotate-signing`: issues the signing CA under `root`, then rotates
-/// it. The root does not change, so a box's trust store needs no change
-/// (BEP-061). Gives the line to print.
-fn rotate_signing<K: CaKey>(
-    root_key: &K,
-    signing_key: &K,
-    root: RootCertificate,
+/// The file a serving proxy holds locked for its life. It names the
+/// process, so `bep --rotate-signing` can reach it.
+const SERVE_LOCK: &str = "serve.lock";
+
+/// The fingerprint of the signing CA that a serving proxy signs leaves with.
+const SIGNING_FINGERPRINT: &str = "signing.fingerprint";
+
+/// How long `bep --rotate-signing` waits for the serving proxy to report
+/// its new signing CA.
+const ROTATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The directory that holds the state of a serving proxy by default.
+fn bep_dir() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep"))
+}
+
+/// What a serving proxy keeps on disk so that `bep --rotate-signing` can
+/// reach it: its process id, in a file it holds locked while it runs, and
+/// the fingerprint of the signing CA in use.
+#[derive(Debug)]
+struct ServeState {
+    dir: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl ServeState {
+    /// Takes the lock in `dir` for the process `pid`. Gives `None` when
+    /// another serving proxy holds it.
+    fn claim(dir: &Path, pid: u32) -> io::Result<Option<Self>> {
+        std::fs::create_dir_all(dir)?;
+        let mut lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(SERVE_LOCK))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+        lock.set_len(0)?;
+        writeln!(lock, "{pid}")?;
+        Ok(Some(Self {
+            dir: dir.to_path_buf(),
+            _lock: lock,
+        }))
+    }
+
+    /// Records `signing` as the signing CA in use. The write replaces the
+    /// file whole, so a reader never sees half of it.
+    fn record(&self, signing: &[u8]) -> io::Result<()> {
+        let staged = self.dir.join(format!("{SIGNING_FINGERPRINT}.new"));
+        std::fs::write(&staged, certificate_fingerprint(signing))?;
+        std::fs::rename(staged, self.dir.join(SIGNING_FINGERPRINT))
+    }
+}
+
+/// Issues a new signing CA under the unchanged root and records it. The
+/// root does not change, so a box's trust store needs no change (BEP-061).
+/// `Ca::renew_signing` logs the old and the new fingerprint.
+fn rotate<K: CaKey>(
+    ca: &Mutex<Ca<'_, K>>,
+    state: Option<&ServeState>,
     now: SystemTime,
+) -> Result<(), CaError> {
+    let mut ca = ca.lock().unwrap_or_else(PoisonError::into_inner);
+    ca.renew_signing(now)?;
+    if let Some(state) = state
+        && let Err(error) = state.record(ca.signing())
+    {
+        tracing::warn!(dir = %state.dir.display(), %error, "did not record the new signing CA fingerprint");
+    }
+    Ok(())
+}
+
+/// `bep --rotate-signing`: asks the `bep serve` whose state is in `dir` to
+/// rotate its signing CA, through `notify`, and waits until it records a
+/// new one. Gives the line to print.
+fn request_rotation(
+    dir: &Path,
+    notify: impl FnOnce(u32) -> io::Result<()>,
+    timeout: Duration,
 ) -> Result<&'static str, String> {
-    let refused = |err: CaError| match err {
-        CaError::RootExpired(at) => format!(
-            "The signing certificate was not rotated: the root CA expired at {at}. \
-             Run `bep --replace-key root` to make a new root key. Boxes created before then must be re-created."
-        ),
-        other => format!("The signing certificate was not rotated: {other}."),
+    let not_running = || {
+        "The signing certificate was not rotated, because no `bep serve` is running. \
+         `bep serve` issues a new signing certificate each time it starts."
+            .to_string()
     };
-    let mut ca = Ca::with_root(root_key, signing_key, root, now).map_err(refused)?;
-    ca.renew_signing(now).map_err(refused)?;
-    Ok(ROTATED_SIGNING)
+    let lock_path = dir.join(SERVE_LOCK);
+    let lock = match std::fs::File::open(&lock_path) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(not_running()),
+        Err(err) => return Err(format!("bep did not read {}: {err}", lock_path.display())),
+    };
+    match lock.try_lock_shared() {
+        // Nothing holds the lock, so the file is from a proxy that stopped.
+        Ok(()) => return Err(not_running()),
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(format!("bep did not read {}: {err}", lock_path.display()));
+        }
+    }
+    let pid = std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .ok_or_else(|| {
+            format!(
+                "The signing certificate was not rotated: {} names no process. Run `bep --rotate-signing` again.",
+                lock_path.display()
+            )
+        })?;
+    let fingerprint_path = dir.join(SIGNING_FINGERPRINT);
+    let read_fingerprint = || std::fs::read_to_string(&fingerprint_path).ok();
+    let before = read_fingerprint();
+    notify(pid).map_err(|err| {
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            not_running()
+        } else {
+            format!("The signing certificate was not rotated: bep did not reach `bep serve` (process {pid}): {err}.")
+        }
+    })?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let now = read_fingerprint();
+        if now.is_some() && now != before {
+            return Ok(ROTATED_SIGNING);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "`bep serve` (process {pid}) did not report a new signing certificate within {} seconds. \
+                 Its log says why.",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Asks the process `pid` to rotate its signing CA, with SIGUSR1.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn signal_rotation(pid: u32) -> io::Result<()> {
+    // A pid of 0 or less signals a whole process group.
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    // SAFETY: `kill` takes no pointer. It sends one signal to one process.
+    if unsafe { libc::kill(pid, libc::SIGUSR1) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// How long before the signing CA expires `bep serve` renews it.
@@ -372,7 +514,10 @@ fn renewal_wait(expiry: SystemTime, now: SystemTime) -> Duration {
 /// proxy keeps signing leaves past one signing CA validity. The root does
 /// not change, so running boxes see no change (BEP-061).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(ca: Arc<Mutex<Ca<'static, K>>>) {
+fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
+    ca: Arc<Mutex<Ca<'static, K>>>,
+    state: Option<Arc<ServeState>>,
+) {
     let expiry_of = |ca: &Mutex<Ca<'static, K>>| {
         ca.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -382,11 +527,11 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(ca: Arc<Mutex<Ca<'stat
         loop {
             let expiry = expiry_of(&ca);
             std::thread::sleep(renewal_wait(expiry, SystemTime::now()));
-            let renewed = ca
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .renew_signing(SystemTime::now());
-            match renewed {
+            // A rotation on request moves the expiry. Wait for the new one.
+            if expiry_of(&ca) != expiry {
+                continue;
+            }
+            match rotate(&ca, state.as_deref(), SystemTime::now()) {
                 Ok(()) if expiry_of(&ca) > expiry => {}
                 Ok(()) => {
                     // The signing CA never outlives the root, so a renewal
@@ -408,6 +553,25 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(ca: Arc<Mutex<Ca<'stat
             }
         }
     });
+}
+
+/// Takes the state of this serving proxy beside its control socket. With
+/// no state, `bep --rotate-signing` cannot reach it, and the proxy still
+/// serves and renews its signing CA.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn claim_state(control: &Path) -> Option<Arc<ServeState>> {
+    let dir = control.parent()?;
+    match ServeState::claim(dir, std::process::id()) {
+        Ok(Some(state)) => Some(Arc::new(state)),
+        Ok(None) => {
+            tracing::warn!(dir = %dir.display(), "another `bep serve` holds the state; `bep --rotate-signing` reaches that one");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "did not write the state that `bep --rotate-signing` reads");
+            None
+        }
+    }
 }
 
 /// What a start says when the root key did not issue the root certificate.
@@ -557,10 +721,9 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let ca = Ca::with_root(root_key, signing, root, SystemTime::now())
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let ca = Arc::new(Mutex::new(ca));
-    keep_signing_renewed(Arc::clone(&ca));
     let proxy = Proxy::new(
         Admission::new(&[GITHUB], [("", 0); 0]),
-        ca,
+        ca.clone(),
         roots,
         Arc::new(SystemResolver),
         Arc::new(Mutex::new(log)),
@@ -570,6 +733,31 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
+        // The handler is in place before the state names this process, so
+        // a SIGUSR1 from `bep --rotate-signing` never meets the default
+        // action, which ends the process.
+        let mut rotation = tokio::signal::unix::signal(SignalKind::user_defined1())
+            .map_err(|err| format!("bep did not take rotation requests: {err}"))?;
+        let state = claim_state(&control);
+        if let Some(state) = &state {
+            let signing = ca.lock().unwrap_or_else(PoisonError::into_inner).signing().clone();
+            if let Err(error) = state.record(&signing) {
+                tracing::warn!(dir = %state.dir.display(), %error, "did not record the signing CA fingerprint");
+            }
+        }
+        keep_signing_renewed(Arc::clone(&ca), state.clone());
+        tokio::spawn(async move {
+            while rotation.recv().await.is_some() {
+                match rotate(&ca, state.as_deref(), SystemTime::now()) {
+                    Ok(()) => {}
+                    Err(CaError::RootExpired(at)) => tracing::error!(
+                        %at,
+                        "the signing CA did not rotate: the root CA expired; run `bep --replace-key root`"
+                    ),
+                    Err(error) => tracing::warn!(%error, "the signing CA did not rotate on request"),
+                }
+            }
+        });
         let listener = Listener::bind(&args.listener, token, Arc::new(PeerAttested))
             .map_err(|err| format!("bep did not listen on {}: {err}", args.listener.display()))?;
         // The redeemer reads the client keys and the boxes this socket
@@ -744,27 +932,74 @@ mod tests {
         }
     }
 
-    // BEP-061: `bep --rotate-signing` prints that running boxes need no
-    // change, and `bep serve` renews its signing CA before it expires.
+    // BEP-061: `bep --rotate-signing` reaches the serving proxy, which
+    // issues a new signing CA under the root it already had. The command
+    // prints that running boxes need no change, and it refuses when no
+    // proxy runs. `bep serve` also renews its signing CA before it expires.
     #[test]
     fn signing_ca_rotation_invisible_to_boxes() {
         let root_key = CaTestKey::new(Role::Root);
         let signing_key = CaTestKey::new(Role::Signing);
         let at = SystemTime::now();
         let root = bep::ca::issue_root(&root_key, registered_union(), at).unwrap();
-        assert_eq!(
-            rotate_signing(&root_key, &signing_key, root, at).unwrap(),
-            "Signing certificate rotated. Running boxes keep working; nothing inside them changes."
+        let ca = Mutex::new(Ca::with_root(&root_key, &signing_key, root, at).unwrap());
+        let box_trust = ca.lock().unwrap().root().clone();
+        let dir = tempfile::tempdir().unwrap();
+
+        // No proxy ran here, so there is nothing to rotate.
+        let refused = request_rotation(dir.path(), |_| unreachable!(), ROTATE_TIMEOUT);
+        assert!(refused.unwrap_err().contains("no `bep serve` is running"));
+
+        let state = ServeState::claim(dir.path(), 4242).unwrap().unwrap();
+        let in_use = ca.lock().unwrap().signing().clone();
+        state.record(&in_use).unwrap();
+        assert!(
+            ServeState::claim(dir.path(), 4343).unwrap().is_none(),
+            "a second proxy took the state of a running one"
         );
 
-        let ca = Ca::with_root(
-            &root_key,
-            &signing_key,
-            bep::ca::issue_root(&root_key, registered_union(), at).unwrap(),
-            at,
-        )
-        .unwrap();
-        let expiry = ca.signing_expiry();
+        let mut asked = None;
+        let printed = request_rotation(
+            dir.path(),
+            |pid| {
+                asked = Some(pid);
+                rotate(&ca, Some(&state), SystemTime::now()).map_err(io::Error::other)
+            },
+            ROTATE_TIMEOUT,
+        );
+        assert_eq!(
+            printed.unwrap(),
+            "Signing certificate rotated. Running boxes keep working; nothing inside them changes."
+        );
+        assert_eq!(asked, Some(4242), "the request went to another process");
+        let ca_now = ca.lock().unwrap();
+        assert_eq!(*ca_now.root(), box_trust, "the root changed");
+        assert_ne!(
+            *ca_now.signing(),
+            in_use,
+            "the serving proxy kept its signing CA"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SIGNING_FINGERPRINT)).unwrap(),
+            certificate_fingerprint(ca_now.signing())
+        );
+        drop(ca_now);
+
+        // A proxy that answers nothing gets a refusal, not a claim.
+        let silent = request_rotation(dir.path(), |_| Ok(()), Duration::ZERO);
+        assert!(
+            silent
+                .unwrap_err()
+                .contains("did not report a new signing certificate")
+        );
+
+        // A proxy that stopped leaves its file unlocked.
+        drop(state);
+        let stale = request_rotation(dir.path(), |_| unreachable!(), ROTATE_TIMEOUT);
+        assert!(stale.unwrap_err().contains("no `bep serve` is running"));
+
+        let expiry = ca.lock().unwrap().signing_expiry();
+        let at = SystemTime::now();
         assert!(expiry > at + RENEW_BEFORE_EXPIRY);
         let wait = renewal_wait(expiry, at);
         assert!(wait > Duration::ZERO);
