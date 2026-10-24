@@ -388,20 +388,33 @@ struct ServeState {
 
 impl ServeState {
     /// Takes the lock beside the control socket `control` for the process
-    /// `pid`. Gives `None` when another serving proxy holds it.
-    fn claim(control: &Path, pid: u32) -> io::Result<Option<Self>> {
-        if let Some(dir) = control.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
+    /// `pid`, whose signing CA is `signing`. Gives `None` when another
+    /// serving proxy holds it. Refuses a directory that another user owns
+    /// or can write, and a symlink at the lock path.
+    fn claim(control: &Path, pid: u32, signing: &[u8]) -> io::Result<Option<Self>> {
+        let dir = control
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        // Another user who can write the directory can plant a symlink at
+        // a state file, and bep would write the file it names.
+        if !is_private(dir) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("another user owns or can write {}", dir.display()),
+            ));
         }
-        let mut lock = std::fs::OpenOptions::new()
+        let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(state_file(control, SERVE_LOCK))?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -409,19 +422,37 @@ impl ServeState {
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
         lock.set_len(0)?;
-        writeln!(lock, "{pid}")?;
-        Ok(Some(Self {
+        let state = Self {
             control: control.to_path_buf(),
             _lock: lock,
-        }))
+        };
+        // The fingerprint is current before the pid names this process, so
+        // `bep --rotate-signing` never reads one from an earlier run as the
+        // signing CA in use.
+        state.record(signing)?;
+        writeln!(&state._lock, "{pid}")?;
+        Ok(Some(state))
     }
 
     /// Records `signing` as the signing CA in use. The write replaces the
-    /// file whole, so a reader never sees half of it.
+    /// file whole, so a reader never sees half of it. The staged file is
+    /// created fresh, so a symlink planted there is never followed.
     fn record(&self, signing: &[u8]) -> io::Result<()> {
         let path = state_file(&self.control, SIGNING_FINGERPRINT);
         let staged = state_file(&path, "new");
-        std::fs::write(&staged, certificate_fingerprint(signing))?;
+        match std::fs::remove_file(&staged) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&staged)?;
+        file.write_all(certificate_fingerprint(signing).as_bytes())?;
+        drop(file);
         std::fs::rename(staged, path)
     }
 }
@@ -523,18 +554,22 @@ fn request_rotation(
 /// write, or that bep cannot inspect. `None` when both are private to the
 /// caller.
 fn not_private(lock_path: &Path) -> Option<PathBuf> {
-    // SAFETY: `geteuid` takes no argument and cannot fail.
-    let me = unsafe { libc::geteuid() };
     let dir = lock_path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     [lock_path, dir]
         .into_iter()
-        .find_map(|path| match std::fs::metadata(path) {
-            Ok(meta) if meta.uid() == me && meta.mode() & 0o022 == 0 => None,
-            _ => Some(path.to_path_buf()),
-        })
+        .find(|path| !is_private(path))
+        .map(Path::to_path_buf)
+}
+
+/// Whether the caller owns `path` and no other user can write it. `false`
+/// when bep cannot inspect it.
+fn is_private(path: &Path) -> bool {
+    // SAFETY: `geteuid` takes no argument and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    matches!(std::fs::metadata(path), Ok(meta) if meta.uid() == me && meta.mode() & 0o022 == 0)
 }
 
 /// Asks the process `pid` to rotate its signing CA, with SIGUSR1.
@@ -624,8 +659,8 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
 /// no state, `bep --rotate-signing` cannot reach it, and the proxy still
 /// serves and renews its signing CA.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn claim_state(control: &Path) -> Option<Arc<ServeState>> {
-    match ServeState::claim(control, std::process::id()) {
+fn claim_state(control: &Path, signing: &[u8]) -> Option<Arc<ServeState>> {
+    match ServeState::claim(control, std::process::id(), signing) {
         Ok(Some(state)) => Some(Arc::new(state)),
         Ok(None) => {
             tracing::warn!(control = %control.display(), "another `bep serve` holds the state; `bep --rotate-signing` reaches that one");
@@ -800,13 +835,8 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         // action, which ends the process.
         let mut rotation = tokio::signal::unix::signal(SignalKind::user_defined1())
             .map_err(|err| format!("bep did not take rotation requests: {err}"))?;
-        let state = claim_state(&control);
-        if let Some(state) = &state {
-            let signing = ca.lock().unwrap_or_else(PoisonError::into_inner).signing().clone();
-            if let Err(error) = state.record(&signing) {
-                tracing::warn!(control = %state.control.display(), %error, "did not record the signing CA fingerprint");
-            }
-        }
+        let signing = ca.lock().unwrap_or_else(PoisonError::into_inner).signing().clone();
+        let state = claim_state(&control, &signing);
         keep_signing_renewed(Arc::clone(&ca), state.clone());
         tokio::spawn(async move {
             while rotation.recv().await.is_some() {
@@ -1015,19 +1045,53 @@ mod tests {
         let refused = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
         assert!(refused.unwrap_err().contains("no `bep serve` is running"));
 
-        let state = ServeState::claim(&control, 4242).unwrap().unwrap();
+        // A fingerprint left by an earlier run is replaced before the lock
+        // names the new process.
         let in_use = ca.lock().unwrap().signing().clone();
-        state.record(&in_use).unwrap();
+        std::fs::create_dir_all(control.parent().unwrap()).unwrap();
+        let fingerprint_path = state_file(&control, SIGNING_FINGERPRINT);
+        std::fs::write(&fingerprint_path, "from an earlier run").unwrap();
+
+        // A symlink planted at a state file is never written through.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let lock_path = state_file(&control, SERVE_LOCK);
+        std::os::unix::fs::symlink(&victim, &lock_path).unwrap();
         assert!(
-            ServeState::claim(&control, 4343).unwrap().is_none(),
+            ServeState::claim(&control, 4242, &in_use).is_err(),
+            "claim followed a symlink at the lock"
+        );
+        std::fs::remove_file(&lock_path).unwrap();
+        std::os::unix::fs::symlink(&victim, state_file(&fingerprint_path, "new")).unwrap();
+
+        let state = ServeState::claim(&control, 4242, &in_use).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(&fingerprint_path).unwrap(),
+            certificate_fingerprint(&in_use)
+        );
+        assert!(
+            ServeState::claim(&control, 4343, &in_use)
+                .unwrap()
+                .is_none(),
             "a second proxy took the state of a running one"
         );
         // A proxy on another socket in the same directory has its own state.
         let refused = request_rotation(&other, |_| unreachable!(), ROTATE_TIMEOUT);
         assert!(refused.unwrap_err().contains("no `bep serve` is running"));
         assert!(
-            ServeState::claim(&other, 4444).unwrap().is_some(),
+            ServeState::claim(&other, 4444, &in_use).unwrap().is_some(),
             "two control sockets share one lock"
+        );
+        // A directory that another user can write is refused.
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        let mut mode = std::fs::metadata(&loose).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o777);
+        std::fs::set_permissions(&loose, mode).unwrap();
+        assert!(
+            ServeState::claim(&loose.join("control.sock"), 4545, &in_use).is_err(),
+            "claim wrote state in a directory another user can write"
         );
 
         let mut asked = None;
@@ -1059,7 +1123,6 @@ mod tests {
 
         // A lock file that another user can write names no process to
         // trust.
-        let lock_path = state_file(&control, SERVE_LOCK);
         let private = std::fs::metadata(&lock_path).unwrap().permissions();
         let mut shared = private.clone();
         std::os::unix::fs::PermissionsExt::set_mode(&mut shared, 0o666);
