@@ -11784,6 +11784,228 @@ proof_bep_git_and_gh_against_private_repo() {
   echo "::endgroup::"
 }
 
+# The first slice end to end (BEP, T19): one case that walks the slice the
+# way a person does. It needs the sign-in a person made with `min auth
+# login` (the live gate below records NOT RUN without one), then:
+#   1. `min box spec` on the demo project shows the root CA fingerprint, the
+#      grant `github:user-token` marked `full` with the four GitHub hosts,
+#      and the steering `proxy_env`.
+#   2. The demo box starts headless on a credentialed lane, and its GH_TOKEN
+#      holds a sealed value.
+#   3. In that box, `gh api user` answers, and git clones the private
+#      repository E2E_BEP_PRIVATE_REPO and pushes a throwaway branch, which
+#      a second push deletes again.
+#   4. The value copied to the host shell is refused: GitHub answers 401 to
+#      it. The host has no way to reach the proxy itself (BEP-026).
+#   5. The value copied into a second box is refused by the proxy, because
+#      the value names the first box (BEP-020).
+#   6. `min box audit` shows the first box's admits for github.com and
+#      api.github.com, and the second box's refusal marked `cross_box`.
+# The value is never printed: the transcript names only its length.
+# The clone meets the same known gap as the private-repository case above:
+# no box ships a git credential helper until #2499 lands, so the clone fails
+# on a lane that runs this case, and the case does not hide it.
+bep_slice_jsonl_check() { # $1 = the jsonl file, $2 = admit or cross_box
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+path, want = sys.argv[1], sys.argv[2]
+records = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+decisions = [r for r in records if r.get("kind") == "decision"]
+if want == "admit":
+    admits = [r for r in decisions if r.get("decision") == "admit"]
+    seen = {r.get("upstream") for r in admits}
+    missing = [a for a in ("github.com:443", "api.github.com:443") if a not in seen]
+    if missing:
+        print("no admit record for: " + ", ".join(missing))
+        sys.exit(1)
+    if not any(r.get("upstream") == "api.github.com:443"
+               and r.get("identifier") not in (None, "none") for r in admits):
+        print("no admit record for api.github.com:443 names a member: the sealed value was not redeemed")
+        sys.exit(1)
+    print("%d admit record(s), for %s" % (len(admits), ", ".join(sorted(seen))))
+else:
+    hits = [r for r in decisions if r.get("decision") == "refuse" and r.get("marker") == want]
+    if not hits:
+        print("no refuse record marked %s" % want)
+        sys.exit(1)
+    print("%d refuse record(s) marked %s, for %s" % (
+        len(hits), want, ", ".join(sorted({r.get("upstream") for r in hits}))))
+PY
+}
+
+proof_bep_first_slice_end_to_end() {
+  echo "::group::Box Egress Proxy first slice: spec, gh, clone, push, a copied value refused, audit"
+  local fs_case=bep_first_slice_end_to_end fs_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local fs_out fs_value fs_branch fs_step fs_spec fs_code fs_check
+  local fs_name=e2e-bep-slice-demo fs_name2=e2e-bep-slice-second
+  if [ -z "$fs_repo" ]; then
+    not_run "$fs_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$fs_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$fs_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$fs_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: fs_cleanup and fs_fail read them.
+  FS_SID="" FS_SID2=""
+  fs_cleanup() {
+    [ -n "$FS_SID" ] && mnl session destroy --force "$FS_SID" >/dev/null 2>&1
+    [ -n "$FS_SID2" ] && mnl session destroy --force "$FS_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  fs_fail() {
+    # The proxy's connection spans, which name the box id, the authority and
+    # the outcome of each request (no credential).
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    fs_cleanup
+    fail
+  }
+
+  # The demo project: the GitHub grant spelt `github:user-token`, proxy_env
+  # steering, and the tools the steps below run.
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlslice.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  # 1. `min box spec` (BEP-038).
+  if ! fs_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
+    echo "::error::'min box spec' of the demo project failed"
+    cat "$WORK/$fs_case.spec.err" 2>/dev/null || true
+    fs_fail
+  fi
+  fs_spec="$(printf '%s\n' "$fs_spec" | tr -d '\r')"
+  for fs_check in \
+    '^root CA  certificate SHA256:[0-9A-Fa-f:]+$' \
+    '^grant  github:user-token  full  GH_TOKEN  hosts github\.com, api\.github\.com, uploads\.github\.com, codeload\.github\.com$' \
+    '^steering  proxy_env$'; do
+    if ! printf '%s\n' "$fs_spec" | grep -Eq -- "$fs_check"; then
+      echo "::error::'min box spec' of the demo project has no line matching: $fs_check"
+      echo "--- min box spec ---"; printf '%s\n' "$fs_spec"
+      fs_fail
+    fi
+  done
+  echo "min box spec: root CA fingerprint, grant github:user-token marked full with the four GitHub hosts, steering proxy_env"
+
+  # 2. The demo box and the second box, headless: a sign-in prompt has no
+  # terminal to ask on. Both stay up until step 6, so the second box's
+  # refusal is cross_box and not revoked.
+  for fs_step in "$fs_name" "$fs_name2"; do
+    fs_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$fs_step" \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/$fs_case.$fs_step.err")" || {
+      echo "::error::'min session activate' of the box $fs_step failed"
+      echo "--- stdout ---"; printf '%s\n' "$fs_out"
+      echo "--- stderr ---"; cat "$WORK/$fs_case.$fs_step.err" 2>/dev/null || true
+      fs_fail
+    }
+    if [ "$fs_step" = "$fs_name" ]; then
+      FS_SID="$(printf '%s\n' "$fs_out" | tail -n1 | tr -d '\r')"
+    else
+      FS_SID2="$(printf '%s\n' "$fs_out" | tail -n1 | tr -d '\r')"
+    fi
+  done
+
+  if ! mnl session exec "$FS_SID" sh -c 'env' \
+    >"$WORK/$fs_case.env" 2>"$WORK/$fs_case.env.err"; then
+    echo "::error::'min session exec' in the demo box failed"
+    cat "$WORK/$fs_case.env.err" 2>/dev/null || true
+    fs_fail
+  fi
+  fs_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/$fs_case.env" | tr -d '\r' | head -n1)"
+  if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/$fs_case.env"; then
+    rm -f "${WORK:?}/${fs_case:?}.env"
+    echo "::error::the environment of the demo box holds a plaintext GitHub token"
+    fs_fail
+  fi
+  rm -f "${WORK:?}/${fs_case:?}.env"
+  if ! [[ "$fs_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the GH_TOKEN value of the demo box is not a sealed value (${#fs_value} characters): it is not in the compact JWE form header..iv.ciphertext.tag"
+    fs_fail
+  fi
+  echo "demo box: GH_TOKEN holds a sealed value (${#fs_value} characters), and no plaintext token"
+
+  # 3. gh, clone and push from the demo box. Each step runs on its own, so a
+  # failure names the tool that failed. The prompt switch only keeps a
+  # refused git from waiting on a terminal: it gives git no credential.
+  fs_branch="e2e-bep-slice-$(date +%s)-$$"
+  for fs_step in \
+    "gh:timeout 60 gh api user --jq .login" \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$fs_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$fs_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $fs_branch"; do
+    if ! mnl session exec "$FS_SID" sh -c "${fs_step#*:}" \
+      >"$WORK/$fs_case.${fs_step%%:*}.out" 2>&1; then
+      echo "::error::'${fs_step%%:*}' against $fs_repo failed in the demo box"
+      cat "$WORK/$fs_case.${fs_step%%:*}.out" 2>/dev/null || true
+      fs_fail
+    fi
+    echo "${fs_step%%:*} in the demo box: OK"
+  done
+
+  # 4. The copied value on the host shell. GitHub sees the sealed value
+  # itself, never a token, and answers 401.
+  fs_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+    -H "Authorization: token $fs_value" https://api.github.com/user 2>"$WORK/$fs_case.host.err")" || {
+    echo "::error::the host request to api.github.com with the copied value did not complete"
+    cat "$WORK/$fs_case.host.err" 2>/dev/null || true
+    fs_fail
+  }
+  if [ "$fs_code" != 401 ]; then
+    echo "::error::GitHub answered $fs_code, not 401, to the value copied out of the demo box onto the host"
+    fs_fail
+  fi
+  echo "copied value on the host: GitHub answered 401"
+
+  # 5. The copied value in the second box. The proxy refuses it, because the
+  # value names the demo box and the request comes from another box.
+  if mnl session exec "$FS_SID2" sh -c "GH_TOKEN='$fs_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$fs_case.cross.out" 2>&1; then
+    echo "::error::'gh api user' in the second box succeeded with the value copied out of the demo box"
+    fs_fail
+  fi
+  echo "copied value in the second box: 'gh api user' failed"
+
+  # 6. `min box audit` for each box, by name (BEP-042, BEP-039).
+  for fs_step in "$fs_name:admit" "$fs_name2:cross_box"; do
+    if ! mnl box audit "${fs_step%%:*}" -o jsonl </dev/null \
+      >"$WORK/$fs_case.audit" 2>"$WORK/$fs_case.audit.err"; then
+      echo "::error::'min box audit ${fs_step%%:*}' failed"
+      cat "$WORK/$fs_case.audit.err" 2>/dev/null || true
+      fs_fail
+    fi
+    if ! fs_out="$(bep_slice_jsonl_check "$WORK/$fs_case.audit" "${fs_step#*:}")"; then
+      echo "::error::'min box audit ${fs_step%%:*}': $fs_out"
+      echo "--- min box audit ${fs_step%%:*} -o jsonl ---"; cat "$WORK/$fs_case.audit"
+      fs_fail
+    fi
+    echo "min box audit ${fs_step%%:*}: $fs_out"
+  done
+
+  fs_cleanup
+  rm -f "${WORK:?}/${fs_case:?}".*
+  echo "Box Egress Proxy first slice OK (spec, gh, clone and push of $fs_repo, a copied value refused on the host and in a second box, both boxes audited)"
+  echo "::endgroup::"
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -23338,6 +23560,7 @@ case "${1:-}" in
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_git_and_gh_against_private_repo
+    proof_bep_first_slice_end_to_end
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
     proof_bep_root_ca_present_in_box_trust_store
@@ -23401,6 +23624,7 @@ case "${1:-}" in
     | bep_second_box_needs_no_sign_in \
     | bep_box_env_holds_sealed_value_only \
     | bep_git_and_gh_against_private_repo \
+    | bep_first_slice_end_to_end \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
     | bep_root_ca_present_in_box_trust_store \
@@ -23443,6 +23667,7 @@ case "${1:-}" in
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
     echo "         bep_git_and_gh_against_private_repo"
+    echo "         bep_first_slice_end_to_end"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
