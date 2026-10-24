@@ -12006,6 +12006,350 @@ proof_bep_first_slice_end_to_end() {
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# Revocation at destroy (BEP-043, BEP-067, BEP-071, T20). The two cases below
+# share the helpers here. Each one starts a grant box named web and a second
+# grant box, copies web's GH_TOKEN value, and destroys web with
+# `min session destroy`. The value is never printed: the transcript names
+# only its length. The same gates as the other live proxy cases record a lane
+# without the proxy as NOT RUN.
+#
+# A copied value from a second box meets the cross-box refusal before the
+# revocation check (crates/bep/src/redeem.rs), so the second box's refusal
+# is marked cross_box. A refusal record names the box the request came from,
+# so it shows under `min box audit` of the second box. The revocation record
+# names the destroyed box, and shows under `min box audit <box-id>` of web.
+
+# Starts the grant box $2 for case $1 from $GRANT_SEED_DIR, and prints its id.
+bep_revoke_box_start() {
+  local rv_out
+  rv_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$2" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$1.$2.err")" || {
+    echo "::error::'min session activate' of the box $2 failed" >&2
+    { echo "--- stdout ---"; printf '%s\n' "$rv_out"
+      echo "--- stderr ---"; cat "$WORK/$1.$2.err" 2>/dev/null || true; } >&2
+    return 1
+  }
+  printf '%s\n' "$rv_out" | tail -n1 | tr -d '\r'
+}
+
+# Seeds $GRANT_SEED_DIR with a GitHub grant project, proxy_env steering, and
+# the tools the cases run.
+bep_revoke_seed() {
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlrevoke.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+}
+
+# The sealed GH_TOKEN value of box $2, for case $1. Prints nothing and
+# returns 1 when the value is not a sealed value.
+bep_revoke_value() {
+  local rv_value
+  if ! mnl session exec "$2" sh -c 'env' \
+    >"$WORK/$1.env" 2>"$WORK/$1.env.err"; then
+    echo "::error::'min session exec' in the box $2 failed" >&2
+    cat "$WORK/$1.env.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  rv_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/$1.env" | tr -d '\r' | head -n1)"
+  rm -f "${WORK:?}/${1:?}.env"
+  if ! [[ "$rv_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the GH_TOKEN value of the box $2 is not a sealed value (${#rv_value} characters)" >&2
+    return 1
+  fi
+  printf '%s' "$rv_value"
+}
+
+# Checks the `min box audit -o jsonl` file $1 for $2:
+#   revocation  exactly one revocation record, for box id $3, with no member
+#   refusal     at least one refusal record of a request to api.github.com
+#   none        no revocation record
+bep_revoke_jsonl_check() {
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+path, want, box = sys.argv[1], sys.argv[2], sys.argv[3]
+records = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+revocations = [r for r in records if r.get("kind") == "revocation"]
+if want == "revocation":
+    if len(revocations) != 1:
+        print("%d revocation record(s), not 1" % len(revocations))
+        sys.exit(1)
+    r = revocations[0]
+    if str(r.get("subject", "")).replace("-", "").lower() != box:
+        print("the revocation record does not name the box id " + box)
+        sys.exit(1)
+    if r.get("identifier") not in (None, "none") or r.get("decision") != "refuse":
+        print("the revocation record names a member, or its decision is not refuse")
+        sys.exit(1)
+    print("one revocation record, for " + box)
+elif want == "refusal":
+    refusals = [r for r in records if r.get("kind") == "decision"
+                and r.get("decision") == "refuse"
+                and r.get("upstream") == "api.github.com:443"]
+    if not refusals:
+        print("no refusal record for api.github.com:443")
+        sys.exit(1)
+    print("%d refusal record(s), marked %s" % (
+        len(refusals), ", ".join(sorted({str(r.get("marker")) for r in refusals}))))
+elif want == "none":
+    if revocations:
+        print("%d revocation record(s), with the proxy down at the destroy" % len(revocations))
+        sys.exit(1)
+    print("no revocation record")
+PY
+}
+
+# Polls `min box audit $2 -o jsonl` for case $1 until bep_revoke_jsonl_check
+# with $3 and $4 passes, for at most $5 seconds. Prints the check's last line.
+bep_revoke_audit_until() {
+  local rv_try rv_out=""
+  for rv_try in $(seq 1 "$5"); do
+    [ "$rv_try" -gt 1 ] && sleep 1
+    mnl box audit "$2" -o jsonl </dev/null >"$WORK/$1.audit" 2>"$WORK/$1.audit.err" || continue
+    rv_out="$(bep_revoke_jsonl_check "$WORK/$1.audit" "$3" "$4")" && { printf '%s\n' "$rv_out"; return 0; }
+  done
+  [ -n "$rv_out" ] || rv_out="the command failed: $(head -n1 "$WORK/$1.audit.err" 2>/dev/null)"
+  printf '%s\n' "$rv_out"
+  return 1
+}
+
+# Presents the value $3 from box $2 for case $1: `gh api user` in the box with
+# GH_TOKEN set to it. Returns 0 when the request was refused.
+bep_revoke_refused_from() {
+  ! mnl session exec "$2" sh -c "GH_TOKEN='$3' timeout 60 gh api user --jq .login" \
+    >"$WORK/$1.present.out" 2>&1
+}
+
+# The box id $1 as the proxy and its logs name it: 32 lowercase hex digits.
+bep_revoke_hex() {
+  printf '%s' "$1" | tr -d '-' | tr 'A-F' 'a-f'
+}
+
+# The destroyed box's values refused within a minute (BEP-043, BEP-067):
+#   1. web and a second box start, and web's GH_TOKEN value is copied.
+#   2. `min session destroy` of web completes.
+#   3. Within 60 s, `min box audit <web's box id>` shows one revocation
+#      record, and the copied value is refused in the second box.
+#   4. `min box audit` of the second box shows the refusal.
+#   5. A box created after the destroy under the name web redeems its own
+#      value: the revocation covers web's box id only (BEP-071).
+proof_bep_destroyed_box_values_refused_within_60s() {
+  echo "::group::Box Egress Proxy: a destroyed box's values are refused within 60 s"
+  local rv_case=bep_destroyed_box_values_refused_within_60s
+  local rv_value rv_web rv_other rv_new rv_out rv_start rv_try rv_refused=""
+  bep_live_gate "$rv_case" || { echo "::endgroup::"; return 0; }
+
+  RV_SIDS=""
+  rv_fail() {
+    local rv_sid
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection\|revocation' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    for rv_sid in $RV_SIDS; do mnl session destroy --force "$rv_sid" >/dev/null 2>&1; done
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    fail
+  }
+  bep_revoke_seed
+  rv_web="$(bep_revoke_box_start "$rv_case" e2e-bep-revoke-web)" || rv_fail
+  RV_SIDS="$rv_web"
+  rv_other="$(bep_revoke_box_start "$rv_case" e2e-bep-revoke-other)" || rv_fail
+  RV_SIDS="$RV_SIDS $rv_other"
+  rv_value="$(bep_revoke_value "$rv_case" "$rv_web")" || rv_fail
+  echo "web: GH_TOKEN holds a sealed value (${#rv_value} characters)"
+
+  # 2. The destroy, the way a person types it.
+  if ! mnl session destroy --force "$rv_web" </dev/null >"$WORK/$rv_case.destroy.out" 2>&1; then
+    echo "::error::'min session destroy' of web failed"
+    cat "$WORK/$rv_case.destroy.out"
+    rv_fail
+  fi
+  rv_start="$(date +%s)"
+  RV_SIDS="$rv_other"
+  echo "min session destroy web: OK"
+
+  # 3. The revocation record, and the copied value refused, inside 60 s.
+  if ! rv_out="$(bep_revoke_audit_until "$rv_case" "$rv_web" revocation "$(bep_revoke_hex "$rv_web")" 60)"; then
+    echo "::error::'min box audit $rv_web' 60 s after the destroy: $rv_out"
+    echo "--- min box audit $rv_web -o jsonl ---"; cat "$WORK/$rv_case.audit" 2>/dev/null || true
+    rv_fail
+  fi
+  echo "min box audit <web's box id>: $rv_out ($(( $(date +%s) - rv_start )) s after the destroy)"
+  for rv_try in $(seq 1 6); do
+    if bep_revoke_refused_from "$rv_case" "$rv_other" "$rv_value"; then
+      rv_refused=1
+      break
+    fi
+    [ $(( $(date +%s) - rv_start )) -ge 60 ] && break
+    sleep 5
+  done
+  if [ -z "$rv_refused" ]; then
+    echo "::error::'gh api user' in the second box succeeded with web's value after web's destroy"
+    rv_fail
+  fi
+  if [ $(( $(date +%s) - rv_start )) -gt 60 ]; then
+    echo "::error::web's copied value was refused $(( $(date +%s) - rv_start )) s after the destroy, more than 60 s"
+    rv_fail
+  fi
+  echo "web's copied value in the second box: refused, $(( $(date +%s) - rv_start )) s after the destroy"
+
+  # 4. The second box's refusal in its trail.
+  if ! rv_out="$(bep_revoke_audit_until "$rv_case" "$rv_other" refusal "" 10)"; then
+    echo "::error::'min box audit $rv_other': $rv_out"
+    echo "--- min box audit $rv_other -o jsonl ---"; cat "$WORK/$rv_case.audit" 2>/dev/null || true
+    rv_fail
+  fi
+  echo "min box audit <second box>: $rv_out"
+
+  # 5. A new box under the name web: a new box id, which no revocation names.
+  rv_new="$(bep_revoke_box_start "$rv_case" e2e-bep-revoke-web)" || rv_fail
+  RV_SIDS="$RV_SIDS $rv_new"
+  if [ "$rv_new" = "$rv_web" ]; then
+    echo "::error::the box created under the name web has the destroyed box's id"
+    rv_fail
+  fi
+  if ! mnl session exec "$rv_new" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$rv_case.new.out" 2>&1; then
+    echo "::error::'gh api user' failed in the box created under the name web after the destroy"
+    cat "$WORK/$rv_case.new.out" 2>/dev/null || true
+    rv_fail
+  fi
+  echo "new box under the name web: 'gh api user' answered"
+
+  for rv_sid in $RV_SIDS; do mnl session destroy --force "$rv_sid" >/dev/null 2>&1 || true; done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  rm -f "${WORK:?}/${rv_case:?}".*
+  echo "Revocation at destroy OK (one revocation record for web's box id, web's value refused within 60 s, a new box under the name redeems)"
+  echo "::endgroup::"
+}
+
+# A destroy with the proxy down (BEP-043, its unwanted case):
+#   1. web starts, and its GH_TOKEN value is copied.
+#   2. `bep serve` stops. The VM host daemon starts it again only at its
+#      next boot.
+#   3. `min session destroy` of web completes, and the VM host daemon's log
+#      has one warn line for web's box id: the proxy was unreachable.
+#   4. The daemon pair restarts, so the proxy is back, and a second box
+#      starts. The copied value is refused there: web's attachment is
+#      withdrawn, so the value comes from no live box of its own.
+#   5. `min box audit <web's box id>` shows no revocation record.
+proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
+  echo "::group::Box Egress Proxy: a destroy with the proxy down refuses the box's values by its withdrawn attachment"
+  local rv_case=bep_destroy_with_proxy_down_refuses_by_attachment
+  local rv_value rv_web rv_other rv_out rv_pids rv_pid rv_hex rv_try rv_warned
+  local rv_warn='the destroy completed with the Box Egress Proxy unreachable'
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local rv_control="$HOME/.minimal/bep/control.sock"
+  bep_live_gate "$rv_case" || { echo "::endgroup::"; return 0; }
+
+  RV_SIDS=""
+  rv_fail() {
+    local rv_sid
+    for rv_sid in $RV_SIDS; do mnl session destroy --force "$rv_sid" >/dev/null 2>&1; done
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # The proxy can be down here. The next live case restarts the pair.
+    BEP_LIVE_DAEMON=""
+    fail
+  }
+  bep_revoke_seed
+  rv_web="$(bep_revoke_box_start "$rv_case" e2e-bep-down-web)" || rv_fail
+  RV_SIDS="$rv_web"
+  rv_hex="$(bep_revoke_hex "$rv_web")"
+  rv_value="$(bep_revoke_value "$rv_case" "$rv_web")" || rv_fail
+  echo "web: GH_TOKEN holds a sealed value (${#rv_value} characters)"
+
+  # 2. Stop the proxy. SIGKILL leaves its control socket file behind, so the
+  # destroy's connection is refused, not missing.
+  rv_pids="$(pgrep -u "$(id -u)" -f '(^|/)bep serve' 2>/dev/null || true)"
+  if [ -z "$rv_pids" ]; then
+    echo "::error::no 'bep serve' process of this user to stop"
+    rv_fail
+  fi
+  for rv_pid in $rv_pids; do kill -KILL "$rv_pid" 2>/dev/null || true; done
+  BEP_LIVE_DAEMON=""
+  for rv_try in $(seq 1 10); do
+    bep_control_live "$rv_control" || break
+    sleep 1
+  done
+  if bep_control_live "$rv_control"; then
+    echo "::error::the Box Egress Proxy control socket still answers after 'bep serve' stopped"
+    rv_fail
+  fi
+  echo "bep serve: stopped"
+
+  # 3. The destroy completes all the same.
+  rv_warned="$(minvmd_log_lines "$rv_warn" | grep -c -- "$rv_hex" || true)"
+  if ! mnl session destroy --force "$rv_web" </dev/null >"$WORK/$rv_case.destroy.out" 2>&1; then
+    echo "::error::'min session destroy' of web failed with the proxy down"
+    cat "$WORK/$rv_case.destroy.out"
+    rv_fail
+  fi
+  RV_SIDS=""
+  if mnl ls </dev/null 2>/dev/null | grep -q -- 'e2e-bep-down-web'; then
+    echo "::error::'min ls' still lists web after its destroy with the proxy down"
+    rv_fail
+  fi
+  echo "min session destroy web: OK, with the proxy down"
+  for rv_try in $(seq 1 10); do
+    [ "$(minvmd_log_lines "$rv_warn" | grep -c -- "$rv_hex" || true)" -gt "$rv_warned" ] && break
+    sleep 1
+  done
+  if [ "$(minvmd_log_lines "$rv_warn" | grep -c -- "$rv_hex" || true)" -le "$rv_warned" ]; then
+    echo "::error::the VM host daemon's log has no warn line for web's destroy with the proxy unreachable"
+    minvmd_log_lines 'Box Egress Proxy' | tail -10
+    rv_fail
+  fi
+  echo "VM host daemon log: one warn line, the destroy completed with the proxy unreachable"
+
+  # 4. The proxy back, a second box, and the copied value refused there.
+  bep_live_gate "$rv_case" || rv_fail
+  rv_other="$(bep_revoke_box_start "$rv_case" e2e-bep-down-other)" || rv_fail
+  RV_SIDS="$rv_other"
+  if ! bep_revoke_refused_from "$rv_case" "$rv_other" "$rv_value"; then
+    echo "::error::'gh api user' in the second box succeeded with web's value after web's destroy with the proxy down"
+    rv_fail
+  fi
+  if ! rv_out="$(bep_revoke_audit_until "$rv_case" "$rv_other" refusal "" 10)"; then
+    echo "::error::'min box audit $rv_other': $rv_out"
+    echo "--- min box audit $rv_other -o jsonl ---"; cat "$WORK/$rv_case.audit" 2>/dev/null || true
+    rv_fail
+  fi
+  echo "web's copied value in the second box: refused ($rv_out)"
+
+  # 5. No revocation record for web: the proxy was down at the destroy.
+  if ! mnl box audit "$rv_web" -o jsonl </dev/null >"$WORK/$rv_case.audit" 2>"$WORK/$rv_case.audit.err"; then
+    echo "::error::'min box audit $rv_web' failed"
+    cat "$WORK/$rv_case.audit.err" 2>/dev/null || true
+    rv_fail
+  fi
+  if ! rv_out="$(bep_revoke_jsonl_check "$WORK/$rv_case.audit" none)"; then
+    echo "::error::'min box audit $rv_web': $rv_out"
+    rv_fail
+  fi
+  echo "min box audit <web's box id>: $rv_out"
+
+  mnl session destroy --force "$rv_other" >/dev/null 2>&1 || true
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  rm -f "${WORK:?}/${rv_case:?}".*
+  echo "Destroy with the proxy down OK (the destroy completed, one warn line, web's value refused by its withdrawn attachment)"
+  echo "::endgroup::"
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -23561,6 +23905,8 @@ case "${1:-}" in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_git_and_gh_against_private_repo
     proof_bep_first_slice_end_to_end
+    proof_bep_destroyed_box_values_refused_within_60s
+    proof_bep_destroy_with_proxy_down_refuses_by_attachment
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
     proof_bep_root_ca_present_in_box_trust_store
@@ -23625,6 +23971,8 @@ case "${1:-}" in
     | bep_box_env_holds_sealed_value_only \
     | bep_git_and_gh_against_private_repo \
     | bep_first_slice_end_to_end \
+    | bep_destroyed_box_values_refused_within_60s \
+    | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
     | bep_root_ca_present_in_box_trust_store \
@@ -23668,6 +24016,8 @@ case "${1:-}" in
     echo "         bep_box_env_holds_sealed_value_only"
     echo "         bep_git_and_gh_against_private_repo"
     echo "         bep_first_slice_end_to_end"
+    echo "         bep_destroyed_box_values_refused_within_60s"
+    echo "         bep_destroy_with_proxy_down_refuses_by_attachment"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
