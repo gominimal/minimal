@@ -12,7 +12,9 @@
 //!    keys ([`handle::read_opened`]),
 //! 4. gives the facts and the revocations it holds to [`redeem::decide`],
 //! 5. and on an admit only, resolves the sign-in reference to the member's
-//!    credential from the sign-in item in the host keychain.
+//!    credential from the sign-in item in the host keychain. A token that
+//!    has expired, or expires within 5 minutes, is renewed first, one
+//!    renewal in flight per item (BEP-069).
 //!
 //! A revoked value is refused at step 4, so no reference is resolved for it
 //! (BEP-071). The redeemer never logs or returns the credential except in
@@ -26,7 +28,7 @@ use zeroize::Zeroizing;
 use crate::audit::Mapping;
 use crate::boxes::BoxRegistry;
 use crate::control::Registry;
-use crate::forward::{Redeemer, Verdict};
+use crate::forward::{Ran, Redeemer, SingleFlight, Verdict};
 use crate::handle::{self, Handle, StoreRule};
 use crate::keys::HeldKey;
 use crate::module::Module;
@@ -34,11 +36,11 @@ use crate::redeem::{
     self, Attribution, Authority, Decision, Redemption, RequestAuthority, Unsealed,
 };
 use crate::seal::{self, Binding, OpenError, Opened};
-use crate::signin::{Keychain, Standing};
+use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, TokenEndpoint};
 
 /// The audit marker of an admitted redemption whose sign-in reference
 /// resolves to no live sign-in: the item is gone, names another sign-in, or
-/// its token expired.
+/// its token expired and was not renewed.
 pub const SIGN_IN_REQUIRED: &str = "github_sign_in_required";
 
 /// The box ids that the revocations in force name.
@@ -68,6 +70,8 @@ pub struct BoxRedeemer<K, C> {
     keychain: C,
     revocations: Revocations,
     clock: Clock,
+    endpoint: Arc<dyn TokenEndpoint>,
+    renewals: SingleFlight<Result<Resolved, RenewError>>,
 }
 
 impl<K, C> std::fmt::Debug for BoxRedeemer<K, C> {
@@ -116,7 +120,18 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             keychain,
             revocations: Revocations::default(),
             clock: system_clock(),
+            endpoint: Arc::new(NoTokenEndpoint),
+            renewals: SingleFlight::default(),
         }
+    }
+
+    /// This redeemer, with `endpoint` as GitHub's token endpoint, which
+    /// renews an expiring sign-in (BEP-069). With none, an expired token is
+    /// refused.
+    #[must_use]
+    pub fn with_token_endpoint(mut self, endpoint: Arc<dyn TokenEndpoint>) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// This redeemer, with `revocations` as the revocations in force.
@@ -297,8 +312,12 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     }
 
     /// The credential the sign-in reference `identifier` names, when the
-    /// held sign-in is that one and its token is live.
-    fn credential(&self, identifier: &str, now: u64) -> Option<Zeroizing<String>> {
+    /// held sign-in is that one, and whether this request renewed it.
+    ///
+    /// A token that has expired or expires within 5 minutes goes to the
+    /// renewal, one in flight per item (BEP-069). A request that finds a
+    /// renewal in flight waits for its outcome and does not renew again.
+    fn credential(&self, identifier: &str, now: u64) -> Option<(Zeroizing<String>, bool)> {
         let instance = identifier
             .strip_prefix(self.module.id)
             .and_then(|rest| rest.strip_prefix(':'))?;
@@ -310,18 +329,26 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 return None;
             }
         };
-        // Interim: a token that is `Standing::RenewsAtProxy` is refused here,
-        // and the request is refused `github_sign_in_required`. BEP-069
-        // renews the token at the proxy before it is substituted. T24
-        // (https://github.com/gominimal/minimal/issues/2279) wires that
-        // renewal, and is the flip. Until then the refusal stands, while
-        // `min auth status` tells the user that the token renews at the proxy.
-        if metadata.instance != instance || metadata.standing(now) != Standing::Live {
+        if metadata.instance != instance {
             return None;
+        }
+        if metadata.needs_renewal(now) {
+            let ran = self.renewals.run(instance, || {
+                signin::renew(&self.keychain, self.endpoint.as_ref(), instance, now)
+            });
+            return match ran {
+                Ran::Led(Ok(resolved)) => Some((resolved.token, resolved.renewed)),
+                Ran::Waited(Ok(resolved)) => Some((resolved.token, false)),
+                Ran::Led(Err(error)) | Ran::Waited(Err(error)) => {
+                    tracing::debug!(%error, "the sign-in reference resolved to no token");
+                    None
+                }
+                Ran::Abandoned => None,
+            };
         }
         match self.keychain.material() {
             Ok(Some(material)) if material.instance == instance => {
-                Some(Zeroizing::new(material.access_token.clone()))
+                Some((Zeroizing::new(material.access_token.clone()), false))
             }
             Ok(_) => None,
             Err(error) => {
@@ -355,10 +382,11 @@ where
             Decision::Admit { .. } => {
                 let identifier = facts.identifier.unwrap_or_default();
                 match self.credential(&identifier, now) {
-                    Some(credential) => Verdict::Admit {
+                    Some((credential, renewed)) => Verdict::Admit {
                         credential,
                         identifier,
                         mapping: Mapping::ModuleUnmapped,
+                        renewed,
                     },
                     None => Verdict::Refuse(SIGN_IN_REQUIRED),
                 }
@@ -402,9 +430,10 @@ mod tests {
     const NODE: &str = "node-1";
     const INSTANCE: &str = "0123456789abcdef0123456789abcdef";
     const TOKEN: &str = "ghu_the_real_token";
+    const REFRESH: &str = "ghr_refresh";
 
-    struct World<K = MemoryKey> {
-        redeemer: Arc<BoxRedeemer<K, MemoryKeychain>>,
+    struct World<K = MemoryKey, C = MemoryKeychain> {
+        redeemer: Arc<BoxRedeemer<K, C>>,
         boxes: BoxRegistry,
         revocations: Revocations,
         sealing: seal::ProxyPublicKey,
@@ -437,27 +466,42 @@ mod tests {
     fn new_world_with<K: HeldKey>(wrap: impl FnOnce(MemoryKey) -> K) -> World<K> {
         let store = MemoryStore::default();
         let key = wrap(store.generate(Role::Sealing).unwrap());
-        let sealing = key.public();
-        let client = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
-        let mut keys = ClientKeys::new();
-        keys.register(&client.verifying_key().to_sec1_bytes())
-            .unwrap();
         let keychain = MemoryKeychain::default();
+        seed(&keychain, NOW + 3600, NOW + 7200);
+        world_over(key, keychain, |redeemer| redeemer)
+    }
+
+    /// Hold the sign-in `INSTANCE` in `keychain`, with token `TOKEN`.
+    fn seed(keychain: &dyn Keychain, token_expires_at: u64, refresh_expires_at: u64) {
         keychain
             .write(
                 &Metadata {
                     account: "octocat".into(),
                     instance: INSTANCE.into(),
                     flow: SignInFlow::Device,
-                    token_expires_at: NOW + 3600,
-                    refresh_expires_at: NOW + 7200,
+                    token_expires_at,
+                    refresh_expires_at,
                 },
                 &Material {
                     instance: INSTANCE.into(),
                     access_token: TOKEN.into(),
-                    refresh_token: "ghr_refresh".into(),
+                    refresh_token: REFRESH.into(),
                 },
             )
+            .unwrap();
+    }
+
+    /// A world over sealing key `key` and `keychain`, with the redeemer
+    /// that `configure` gives.
+    fn world_over<K: HeldKey, C: Keychain>(
+        key: K,
+        keychain: C,
+        configure: impl FnOnce(BoxRedeemer<K, C>) -> BoxRedeemer<K, C>,
+    ) -> World<K, C> {
+        let sealing = key.public();
+        let client = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let mut keys = ClientKeys::new();
+        keys.register(&client.verifying_key().to_sec1_bytes())
             .unwrap();
         let boxes: BoxRegistry = Arc::new(Boxes::new());
         let revocations = Revocations::default();
@@ -472,7 +516,7 @@ mod tests {
         .with_revocations(Arc::clone(&revocations))
         .with_clock(Arc::new(|| NOW));
         World {
-            redeemer: Arc::new(redeemer),
+            redeemer: Arc::new(configure(redeemer)),
             boxes,
             revocations,
             sealing,
@@ -481,7 +525,7 @@ mod tests {
     }
 
     /// A value sealed for `box_id` on this node, with a sign-in member.
-    fn sealed_for<K>(world: &World<K>, box_id: &str, expiry: u64, version: u32) -> String {
+    fn sealed_for<K, C>(world: &World<K, C>, box_id: &str, expiry: u64, version: u32) -> String {
         let jws = handle::sign(
             &world.client,
             &Claims {
@@ -524,8 +568,8 @@ mod tests {
     /// Sends one request from `box_id` to `authority`, with `host` as its
     /// `Host` header and `sealed` as its bearer token. Gives what reached the
     /// upstream, how the half ended, and the audit records.
-    fn send(
-        world: &World,
+    fn send<C: Keychain + Send + Sync + 'static>(
+        world: &World<MemoryKey, C>,
         box_id: &str,
         authority: &Authority<String>,
         host: &str,
@@ -925,5 +969,337 @@ mod tests {
             sealing: world.sealing,
             client: world.client.clone(),
         }
+    }
+
+    const RENEWED: &str = "ghu_the_renewed_token";
+    const RENEWED_REFRESH: &str = "ghr_renewed";
+
+    /// A stand-in for GitHub's token endpoint. It counts the refreshes,
+    /// records the refresh tokens it got, and runs `during` before it
+    /// answers.
+    #[derive(Default)]
+    struct FakeEndpoint {
+        calls: std::sync::atomic::AtomicUsize,
+        got: std::sync::Mutex<Vec<String>>,
+        refuse: bool,
+        during: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl FakeEndpoint {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TokenEndpoint for FakeEndpoint {
+        fn refresh(
+            &self,
+            flow: SignInFlow,
+            refresh_token: &str,
+        ) -> Result<signin::Refreshed, signin::RefreshError> {
+            assert_eq!(flow, SignInFlow::Device);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.got.lock().unwrap().push(refresh_token.to_owned());
+            if let Some(during) = &self.during {
+                during();
+            }
+            if self.refuse {
+                return Err(signin::RefreshError::Refused("bad_refresh_token".into()));
+            }
+            Ok(signin::Refreshed {
+                access_token: RENEWED.into(),
+                refresh_token: RENEWED_REFRESH.into(),
+                expires_in: 28_800,
+                refresh_token_expires_in: 15_897_600,
+            })
+        }
+    }
+
+    /// A world whose held token expires at `token_expires_at`, renewed
+    /// through `endpoint`.
+    fn renewal_world<C: Keychain>(
+        keychain: C,
+        token_expires_at: u64,
+        refresh_expires_at: u64,
+        endpoint: Arc<FakeEndpoint>,
+    ) -> World<MemoryKey, C> {
+        seed(&keychain, token_expires_at, refresh_expires_at);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_token_endpoint(endpoint)
+        });
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world
+    }
+
+    fn renewal_records(records: &[Record]) -> usize {
+        records
+            .iter()
+            .filter(|r| r.marker.as_deref() == Some(crate::forward::SIGN_IN_RENEWED))
+            .count()
+    }
+
+    // BEP-069: an expired token, and one that expires within 5 minutes, is
+    // renewed from the refresh material, written to the same item, and the
+    // renewed token is substituted. The renewal is its own audit record.
+    #[test]
+    fn an_expiring_sign_in_is_renewed_at_the_proxy() {
+        for token_expires_at in [NOW - 1, NOW + signin::RENEW_WITHIN_SECS] {
+            let endpoint = Arc::new(FakeEndpoint::default());
+            let world = renewal_world(
+                MemoryKeychain::default(),
+                token_expires_at,
+                NOW + 86_400,
+                Arc::clone(&endpoint),
+            );
+            let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+            let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{end:?}");
+            assert!(
+                upstream.contains(&format!("Bearer {RENEWED}")),
+                "{upstream}"
+            );
+            assert!(!upstream.contains(TOKEN));
+            assert_eq!(endpoint.calls(), 1);
+            assert_eq!(*endpoint.got.lock().unwrap(), vec![REFRESH.to_owned()]);
+
+            // The same item holds the renewed material, under the same
+            // instance.
+            let keychain = &world.redeemer.keychain;
+            let metadata = keychain.metadata().unwrap().unwrap();
+            assert_eq!(metadata.instance, INSTANCE);
+            assert_eq!(metadata.token_expires_at, NOW + 28_800);
+            assert_eq!(metadata.refresh_expires_at, NOW + 15_897_600);
+            let material = keychain.material().unwrap().unwrap();
+            assert_eq!(material.access_token, RENEWED);
+            assert_eq!(material.refresh_token, RENEWED_REFRESH);
+
+            // One renewal record, then the decision.
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert_eq!(
+                records[0].marker.as_deref(),
+                Some(crate::forward::SIGN_IN_RENEWED)
+            );
+            assert_eq!(
+                records[0].identifier.as_deref(),
+                Some(format!("github:{INSTANCE}").as_str())
+            );
+            assert_eq!(records[1].outcome, Outcome::Admit);
+            assert_eq!(records[1].marker, None);
+            assert!(!format!("{records:?}").contains(RENEWED));
+
+            // The next request uses the renewed token and renews nothing.
+            let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{end:?}");
+            assert!(upstream.contains(&format!("Bearer {RENEWED}")));
+            assert_eq!(endpoint.calls(), 1);
+            assert_eq!(renewal_records(&records), 0);
+        }
+    }
+
+    // BEP-069: while one renewal is in flight, the other requests for the
+    // item wait for its outcome and do not renew again.
+    #[test]
+    fn concurrent_redemptions_share_one_renewal() {
+        let endpoint = Arc::new(FakeEndpoint {
+            during: Some(Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })),
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let requests = 8;
+        let barrier = std::sync::Barrier::new(requests);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..requests)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        send(&world, "b1", &api(), "api.github.com", &sealed)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(endpoint.calls(), 1, "one renewal for every request");
+        let mut renewals = 0;
+        for (upstream, end, records) in &results {
+            assert_eq!(refused(end), None, "{end:?}");
+            assert!(
+                upstream.contains(&format!("Bearer {RENEWED}")),
+                "{upstream}"
+            );
+            renewals += renewal_records(records);
+        }
+        assert_eq!(renewals, 1, "the one renewal is audited once");
+    }
+
+    /// A keychain that reads from a memory keychain and refuses every write.
+    struct RefusingWrites(MemoryKeychain);
+
+    impl Keychain for RefusingWrites {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.0.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.0.material()
+        }
+        fn write(
+            &self,
+            metadata: &Metadata,
+            material: &Material,
+        ) -> Result<(), signin::SignInError> {
+            // The seed goes in. Every later write is refused.
+            if self.0.metadata()?.is_none() {
+                return self.0.write(metadata, material);
+            }
+            Err(signin::SignInError::Keychain {
+                action: "write the sign-in",
+                detail: "locked".into(),
+            })
+        }
+    }
+
+    // BEP-069: a renewal that is not written to the item refuses the
+    // request and substitutes nothing.
+    #[test]
+    fn renewal_not_persisted_is_refused() {
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let world = renewal_world(
+            RefusingWrites(MemoryKeychain::default()),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        let material = world.redeemer.keychain.material().unwrap().unwrap();
+        assert_eq!(material.access_token, TOKEN, "the item is unchanged");
+    }
+
+    // BEP-069: an item deleted while its renewal runs stays deleted. The
+    // renewed material is discarded and the request is refused.
+    #[test]
+    fn renewal_finding_item_deleted_refuses_and_creates_nothing() {
+        let keychain = Arc::new(MemoryKeychain::default());
+        let logout = Arc::clone(&keychain);
+        let endpoint = Arc::new(FakeEndpoint {
+            during: Some(Box::new(move || logout.clear())),
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            Arc::clone(&keychain),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(keychain.item(signin::SERVICE), None, "no item is created");
+        assert_eq!(
+            keychain.item(signin::META_SERVICE),
+            None,
+            "no item is created"
+        );
+    }
+
+    // BEP-069: a token that expires more than 5 minutes after the request is
+    // substituted without a renewal.
+    #[test]
+    fn a_sign_in_with_time_to_live_is_not_renewed() {
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW + signin::RENEW_WITHIN_SECS + 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")), "{upstream}");
+        assert_eq!(endpoint.calls(), 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(renewal_records(&records), 0);
+    }
+
+    // BEP-069: an expired token that GitHub refuses to renew, or whose
+    // refresh material expired too, is refused `github_sign_in_required`.
+    #[test]
+    fn unrenewable_sign_in_refuses_with_sign_in_required() {
+        // GitHub refuses the renewal of an expired token.
+        let endpoint = Arc::new(FakeEndpoint {
+            refuse: true,
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some(SIGN_IN_REQUIRED));
+        let material = world.redeemer.keychain.material().unwrap().unwrap();
+        assert_eq!(material.access_token, TOKEN, "the item is unchanged");
+
+        // The refresh material expired too: GitHub is not asked.
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW - 7200,
+            NOW - 1,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 0);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        assert_eq!(records[0].marker.as_deref(), Some(SIGN_IN_REQUIRED));
+
+        // A token that has not expired yet is still substituted when GitHub
+        // refuses its early renewal.
+        let endpoint = Arc::new(FakeEndpoint {
+            refuse: true,
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW + 60,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
     }
 }
