@@ -397,7 +397,31 @@ pub(crate) struct DnsGate {
     /// alone, this gate's refusals by rule and name
     /// ([`PolicyWarnLimiter::warn_dns_refusal`]).
     limiter: Arc<PolicyWarnLimiter>,
+    /// The names this box's queries are steered to the Box Egress Proxy for
+    /// (BEP-062, BEP-078), or `None` when the box's steering is not `dns`
+    /// or `both`. Set by [`Self::with_steering`].
+    steering: Option<Steered>,
 }
+
+/// One box's DNS steering: the credentialed names, the proxy's address on
+/// the box's switch, and the proxy's listener state.
+struct Steered {
+    /// The credentialed names, normalized as [`normalized`] writes them.
+    names: HashSet<String>,
+    /// The proxy's address, the one A answer a steered name gets.
+    proxy: Ipv4Addr,
+    /// Whether the proxy's listener is live: a steered A lookup while it is
+    /// down is answered SERVFAIL, never forwarded (BEP-062).
+    listener: super::dns::ProxyListenerState,
+}
+
+/// The TTL of the A answer a steered name gets. Short, so a box's resolver
+/// stack asks again soon and a listener that went down fails closed at the
+/// next lookup.
+const STEERED_TTL: u32 = 30;
+
+/// The rate-limit key prefix of the SERVFAIL warning for a steered name.
+const STEERED_SERVFAIL_RULE: &str = "bep-steered-servfail";
 
 /// A DNS wire name in the form the allowlist matches: ASCII-lowercased,
 /// with the root dot stripped — `github.com` for `GitHub.com.`.
@@ -459,7 +483,51 @@ impl DnsGate {
             flow_idle_cap: FLOW_IDLE_CAP,
             label: label.to_string(),
             limiter,
+            steering: None,
         }
+    }
+
+    /// Steers this box's lookups of the credentialed names to the Box Egress
+    /// Proxy (BEP-062, BEP-078), when `policy` declares a credentialed
+    /// upstream and its steering resolves to `dns` or `both`. Any other box
+    /// is returned unchanged.
+    ///
+    /// `module_hosts` is the credential module's host set, `proxy` the
+    /// proxy's address on the box's switch, and `listener` the proxy's
+    /// listener state the switch shares. A steered name is answered here and
+    /// never forwarded: an A lookup gets `proxy` while the listener is live
+    /// and SERVFAIL while it is down, and every other record type gets
+    /// NODATA.
+    // The relay's gate construction (`BoxGate::for_session`) does not call
+    // this yet, so outside the tests it has no caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn with_steering(
+        mut self,
+        policy: &boxes::BoxPolicy,
+        module_hosts: &[&str],
+        proxy: Ipv4Addr,
+        listener: super::dns::ProxyListenerState,
+    ) -> Self {
+        let steered = policy
+            .credentialed_upstream
+            .as_ref()
+            .is_some_and(|upstream| upstream.bep.resolved_steering().needs_resolver());
+        self.steering = steered.then(|| Steered {
+            names: module_hosts.iter().map(|host| normalized(host)).collect(),
+            proxy,
+            listener,
+        });
+        self
+    }
+
+    /// Whether `question` asks for a name this box's lookups are steered for.
+    fn steers(&self, question: &Query) -> bool {
+        self.steering.as_ref().is_some_and(|steering| {
+            steering
+                .names
+                .contains(&normalized(&question.name().to_lowercase().to_string()))
+        })
     }
 
     /// Shrinks the admission window. A test hook for the one proof that
@@ -541,10 +609,65 @@ impl DnsGate {
         if query.metadata.message_type != MessageType::Query {
             return None;
         }
-        let (question, rcode) = self.decide(&query)?;
+        if let Some((question, rcode)) = self.decide(&query) {
+            let name = normalized(&question.name().to_lowercase().to_string());
+            let rtype = question.query_type();
+            return self.answer(query, rcode, &name, rtype);
+        }
+        self.answer_steered(query)
+    }
+
+    /// The reply for a query that asks for a steered name (BEP-062), or
+    /// `None` when no question in it does. Read after [`Self::decide`], so
+    /// its REFUSED, NXDOMAIN and NODATA rules come first: an AAAA, HTTPS or
+    /// SVCB question of a steered name is answered NODATA there (BEP-078).
+    ///
+    /// A steered query is never forwarded. While the proxy's listener is
+    /// down it is answered SERVFAIL, and a rate-limited warning names the
+    /// name and the box. While the listener is live, each steered A question
+    /// is answered with the proxy's address, and every other question gets
+    /// no answer.
+    fn answer_steered(&self, query: Message) -> Option<Vec<u8>> {
+        let steering = self.steering.as_ref()?;
+        let question = query.queries.iter().find(|q| self.steers(q))?.clone();
         let name = normalized(&question.name().to_lowercase().to_string());
-        let rtype = question.query_type();
-        self.answer(query, rcode, &name, rtype)
+        if !steering.listener.is_live() {
+            let key = format!("{STEERED_SERVFAIL_RULE}:{name}");
+            if self
+                .limiter
+                .should_warn_at(&self.label, &key, Instant::now())
+            {
+                tracing::warn!(
+                    component = COMPONENT,
+                    session_id = %self.label,
+                    name = %name,
+                    "answered SERVFAIL for a steered name: the Box Egress Proxy is not listening"
+                );
+            }
+            return self.answer(query, ResponseCode::ServFail, &name, question.query_type());
+        }
+        let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
+        reply.metadata = Metadata::response_from_request(&query.metadata);
+        reply.metadata.response_code = ResponseCode::NoError;
+        for q in query.queries.iter().filter(|q| self.steers(q)) {
+            if q.query_type() == RecordType::A {
+                reply.add_answer(hickory_proto::rr::Record::from_rdata(
+                    q.name().clone(),
+                    STEERED_TTL,
+                    RData::A(hickory_proto::rr::rdata::A(steering.proxy)),
+                ));
+            }
+        }
+        reply.add_queries(query.queries);
+        tracing::debug!(
+            component = COMPONENT,
+            switch_addr = %self.label,
+            name,
+            query_type = ?question.query_type(),
+            proxy = %steering.proxy,
+            "answered a steered lookup with the Box Egress Proxy's address"
+        );
+        reply.to_vec().ok()
     }
 
     /// The answer the relay writes itself for `query`, with the question
@@ -3404,5 +3527,180 @@ pub(crate) mod tests {
             !gate.admits_destination([198, 51, 100, 9], now),
             "a reply with no question to match pins nothing"
         );
+    }
+
+    /// The GitHub module's host set, as the caller hands it to
+    /// [`DnsGate::with_steering`].
+    const STEERED_HOSTS: &[&str] = &[
+        "github.com",
+        "api.github.com",
+        "uploads.github.com",
+        "codeload.github.com",
+    ];
+
+    /// The Box Egress Proxy's address on the default switch.
+    fn proxy_address() -> Ipv4Addr {
+        ::switch::SwitchSubnet::default().box_egress_proxy_address()
+    }
+
+    /// A box that allows the GitHub hosts and declares a credentialed
+    /// upstream with `steering`, or with no steering (which resolves to
+    /// `dns`) when it is `None`.
+    fn steered_policy(steering: Option<boxes::core::bep::Steering>) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(STEERED_HOSTS.iter().map(|h| (*h).to_string()).collect()),
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: Some(boxes::CredentialedUpstream {
+                bep: boxes::core::bep::BepSettings {
+                    steering,
+                    ..Default::default()
+                },
+                secrets: Default::default(),
+            }),
+        }
+    }
+
+    /// A gate over `policy`, steered with `listener`.
+    fn steered_gate(
+        policy: &boxes::BoxPolicy,
+        listener: &crate::net::dns::ProxyListenerState,
+    ) -> DnsGate {
+        gate_for(policy).with_steering(policy, STEERED_HOSTS, proxy_address(), listener.clone())
+    }
+
+    /// The gate's reply to a `name` query of `rtype`, parsed, or `None` when
+    /// the gate forwards it.
+    fn steered_reply(gate: &DnsGate, name: &str, rtype: RecordType) -> Option<Message> {
+        let query = dns_query(name, rtype);
+        let id = Message::from_vec(&query).unwrap().metadata.id;
+        let reply = gate.intercept_query(&SocketAddrV4::new(RESOLVER, 53), &query)?;
+        let reply = Message::from_vec(&reply).expect("the gate's reply parses");
+        assert_eq!(reply.metadata.id, id, "the reply echoes the query's id");
+        assert_eq!(reply.metadata.message_type, MessageType::Response);
+        assert_eq!(reply.queries.first().unwrap().query_type(), rtype);
+        Some(reply)
+    }
+
+    /// BEP-062: while the proxy's listener is down, a `dns` or `both` box's
+    /// A lookup of a credentialed name is answered SERVFAIL by the relay and
+    /// never forwarded to real DNS. The warning names the name and the box,
+    /// once per name per minute. Once the listener is live, the same lookup
+    /// gets the proxy's address. A `proxy_env` or `off` box is not steered.
+    #[test]
+    fn steered_name_servfail_while_proxy_down() {
+        let capture = captured_log();
+        let listener = crate::net::dns::ProxyListenerState::down();
+        for steering in [
+            None,
+            Some(boxes::core::bep::Steering::Dns),
+            Some(boxes::core::bep::Steering::Both),
+        ] {
+            let gate = steered_gate(&steered_policy(steering), &listener);
+            for name in ["github.com.", "API.GitHub.com.", "codeload.github.com"] {
+                let reply = steered_reply(&gate, name, RecordType::A)
+                    .unwrap_or_else(|| panic!("{steering:?}: {name} is answered, not forwarded"));
+                assert_eq!(
+                    reply.metadata.response_code,
+                    ResponseCode::ServFail,
+                    "{steering:?}: {name} fails closed while the proxy is down"
+                );
+                assert!(reply.answers.is_empty(), "SERVFAIL carries no address");
+            }
+            // A name outside the credentialed set still forwards.
+            assert!(steered_reply(&gate, "example.com.", RecordType::A).is_none());
+        }
+        let logged = capture.contents();
+        for expected in [
+            "answered SERVFAIL for a steered name",
+            "name=github.com",
+            "name=api.github.com",
+            &format!("session_id={LEASE}"),
+        ] {
+            assert!(
+                logged.contains(expected),
+                "the warning carries {expected:?}: {logged}"
+            );
+        }
+        // The warning is rate-limited per name: one more lookup adds no line.
+        let before = logged
+            .matches("answered SERVFAIL for a steered name")
+            .count();
+        let gate = steered_gate(&steered_policy(None), &listener);
+        steered_reply(&gate, "github.com.", RecordType::A);
+        steered_reply(&gate, "github.com.", RecordType::A);
+        let after = capture
+            .contents()
+            .matches("answered SERVFAIL for a steered name")
+            .count();
+        assert_eq!(after, before + 1, "one warning per name per minute per box");
+
+        // Live: the steered A lookup answers the proxy's address.
+        assert!(listener.set_live(true), "down to live is a change");
+        assert!(
+            capture
+                .contents()
+                .contains("the Box Egress Proxy's listener is live"),
+            "the listener's return writes one info line"
+        );
+        let reply = steered_reply(&gate, "github.com.", RecordType::A).expect("answered here");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        let addresses: Vec<_> = reply
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(address) => Some(address.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addresses, vec![proxy_address()]);
+
+        // Down again: SERVFAIL again, never the real address.
+        assert!(listener.set_live(false));
+        let reply = steered_reply(&gate, "github.com.", RecordType::A).expect("answered here");
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+
+        // A box whose steering does not use DNS is not steered here.
+        for steering in [
+            boxes::core::bep::Steering::ProxyEnv,
+            boxes::core::bep::Steering::Off,
+        ] {
+            let gate = steered_gate(&steered_policy(Some(steering)), &listener);
+            assert!(
+                steered_reply(&gate, "github.com.", RecordType::A).is_none(),
+                "{steering:?}: the lookup is forwarded"
+            );
+        }
+    }
+
+    /// BEP-078: a `dns` or `both` box's AAAA, HTTPS and SVCB lookups of a
+    /// steered name are answered NODATA, whether the proxy's listener is
+    /// live or down, and never forwarded.
+    #[test]
+    fn steered_name_aaaa_https_svcb_are_nodata() {
+        let listener = crate::net::dns::ProxyListenerState::down();
+        for live in [false, true] {
+            listener.set_live(live);
+            for steering in [None, Some(boxes::core::bep::Steering::Both)] {
+                let gate = steered_gate(&steered_policy(steering), &listener);
+                for name in STEERED_HOSTS {
+                    for rtype in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+                        let reply = steered_reply(&gate, name, rtype).unwrap_or_else(|| {
+                            panic!("live={live} {steering:?}: {rtype:?} {name} is answered here")
+                        });
+                        assert_eq!(
+                            reply.metadata.response_code,
+                            ResponseCode::NoError,
+                            "NODATA is NOERROR"
+                        );
+                        assert!(reply.answers.is_empty(), "NODATA answers nothing");
+                    }
+                }
+            }
+        }
     }
 }
