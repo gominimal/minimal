@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use boxes::core::bep::{StoreDenySet, StoreRules, check_store_rules};
+use boxes::core::bep::{StoreAction, StoreDenySet, StoreRules, check_store_rules};
 
 use crate::GlobalArgs;
 
@@ -26,19 +26,23 @@ pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
 ///
 /// It also reads `[secret-store-rules]` and prints each refused rule on
 /// stderr, as [`read_client_config_and_store_rules`] does, once per file
-/// in a process.
+/// in a process. These callers use no store rules, so an organization
+/// file that is not read or does not parse does not fail them: its error
+/// prints once on stderr and its rules are left out.
 pub fn read_client_config(
     global: &GlobalArgs,
 ) -> Result<boxes::client::config::Config, anyhow::Error> {
-    Ok(read_client_config_and_store_rules(global)?.0)
+    Ok(read_client_and_org_config(global, false)?.0)
 }
 
 /// Read the client config and the `[secret-store-rules]` of the user and
 /// the organization client configuration. Each rule the deny set refuses
 /// (BEP-034) is printed on stderr, naming its file, and left out of the
-/// returned rules. A user rule replaces an organization rule for the same
-/// item. The refusals of a file print on its first read in a process only,
-/// so a command that reads the config more than once prints each one once.
+/// returned rules. A user rule replaces the fields of an organization rule
+/// for the same item, but keeps the stricter of the two actions, as
+/// [`merge_store_rules`] says. The refusals of a file print on its first
+/// read in a process only, so a command that reads the config more than
+/// once prints each one once.
 ///
 /// # Errors
 ///
@@ -46,12 +50,69 @@ pub fn read_client_config(
 pub fn read_client_config_and_store_rules(
     global: &GlobalArgs,
 ) -> Result<(boxes::client::config::Config, StoreRules), anyhow::Error> {
+    read_client_and_org_config(global, true)
+}
+
+/// [`read_client_config_and_store_rules`], with an organization file that
+/// is not read or does not parse fatal only when `org_required` is set.
+fn read_client_and_org_config(
+    global: &GlobalArgs,
+    org_required: bool,
+) -> Result<(boxes::client::config::Config, StoreRules), anyhow::Error> {
     let user = resolve_minimal_config_dir(global).join("config.toml");
     let (config, user_rules) = read_config_parts(&user)?;
-    let (_, org_rules) = read_config_parts(Path::new(ORGANIZATION_CONFIG_PATH))?;
-    let mut rules = refuse_store_rules_once(org_rules, Path::new(ORGANIZATION_CONFIG_PATH));
-    rules.extend(refuse_store_rules_once(user_rules, &user));
-    Ok((config, rules))
+    let org_path = Path::new(ORGANIZATION_CONFIG_PATH);
+    let org_rules = match read_config_parts(org_path) {
+        Ok((_, rules)) => rules,
+        Err(e) if !org_required => {
+            report_org_read_error_once(&e);
+            StoreRules::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let org_rules = refuse_store_rules_once(org_rules, org_path);
+    let user_rules = refuse_store_rules_once(user_rules, &user);
+    Ok((config, merge_store_rules(org_rules, user_rules)))
+}
+
+/// Print, on its first call in this process, that the organization file
+/// was not read and that its secret-store rules do not apply.
+fn report_org_read_error_once(error: &anyhow::Error) {
+    static PRINTED: std::sync::Once = std::sync::Once::new();
+    tracing::debug!(file = ORGANIZATION_CONFIG_PATH, %error, "organization config not read");
+    PRINTED.call_once(|| {
+        eprintln!(
+            "Minimal did not use {ORGANIZATION_CONFIG_PATH}. {error}. \
+             The secret-store rules in that file do not apply to this command."
+        );
+    });
+}
+
+/// How strict a rule's consent is: no action and `allow` ask for nothing,
+/// `ask` asks the person, and `deny` never redeems.
+fn action_rank(action: Option<StoreAction>) -> u8 {
+    match action {
+        None | Some(StoreAction::Allow) => 0,
+        Some(StoreAction::Ask) => 1,
+        Some(StoreAction::Deny) => 2,
+    }
+}
+
+/// Merge the user's rules over the organization's. A user rule replaces
+/// the fields of an organization rule for the same item. It keeps the
+/// organization rule's action when that action is stricter, so a user
+/// file can never loosen an organization `deny` or `ask`.
+pub fn merge_store_rules(org: StoreRules, user: StoreRules) -> StoreRules {
+    let mut rules = org;
+    for (item, mut rule) in user {
+        if let Some(org_rule) = rules.get(&item)
+            && action_rank(org_rule.action) > action_rank(rule.action)
+        {
+            rule.action = org_rule.action;
+        }
+        rules.insert(item, rule);
+    }
+    rules
 }
 
 /// [`refuse_store_rules`] to stderr on the first read of `path` in this
@@ -261,5 +322,45 @@ mod tests {
         let (config, rules) = read_config_parts(&path).expect("parses");
         assert!(config.secret_store_rules.is_empty());
         assert_eq!(rules.keys().collect::<Vec<_>>(), ["claude"]);
+    }
+
+    fn rule(action: Option<StoreAction>) -> boxes::core::bep::StoreRuleConfig {
+        boxes::core::bep::StoreRuleConfig {
+            store: None,
+            upstream: vec!["api.example.com".to_owned()],
+            header: Some("Authorization".to_owned()),
+            prefix: None,
+            basic_auth: None,
+            action,
+        }
+    }
+
+    /// A user rule replaces an organization rule's fields, but never
+    /// loosens the organization's `deny` or `ask`.
+    #[test]
+    fn user_store_rule_keeps_stricter_org_action() {
+        let org: StoreRules = [
+            ("denied".to_owned(), rule(Some(StoreAction::Deny))),
+            ("asked".to_owned(), rule(Some(StoreAction::Ask))),
+            ("loose".to_owned(), rule(None)),
+            ("org-only".to_owned(), rule(Some(StoreAction::Ask))),
+        ]
+        .into();
+        let mut user_denied = rule(None);
+        user_denied.upstream = vec!["other.example.com".to_owned()];
+        let user: StoreRules = [
+            ("denied".to_owned(), user_denied),
+            ("asked".to_owned(), rule(Some(StoreAction::Allow))),
+            ("loose".to_owned(), rule(Some(StoreAction::Deny))),
+            ("user-only".to_owned(), rule(None)),
+        ]
+        .into();
+        let merged = merge_store_rules(org, user);
+        assert_eq!(merged["denied"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["denied"].upstream, ["other.example.com"]);
+        assert_eq!(merged["asked"].action, Some(StoreAction::Ask));
+        assert_eq!(merged["loose"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["org-only"].action, Some(StoreAction::Ask));
+        assert_eq!(merged["user-only"].action, None);
     }
 }
