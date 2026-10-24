@@ -1096,7 +1096,13 @@ mod tests {
         // A fingerprint left by an earlier run is replaced before the lock
         // names the new process.
         let in_use = ca.lock().unwrap().signing().clone();
-        std::fs::create_dir_all(control.parent().unwrap()).unwrap();
+        // The directory is private whatever the umask, as `bep serve`
+        // makes it, so `claim` does not refuse it on a host with umask 002.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(control.parent().unwrap())
+            .unwrap();
         let fingerprint_path = state_file(&control, SIGNING_FINGERPRINT);
         std::fs::write(&fingerprint_path, "from an earlier run").unwrap();
 
