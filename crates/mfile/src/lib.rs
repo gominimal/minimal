@@ -1147,8 +1147,15 @@ impl File {
             // A key that is valid at another nesting level is not really
             // unknown; point at the correct path instead of the generic
             // upgrade hint, which cannot fix it.
+            // BEP-037: a project cannot set secret-store rules. The table is
+            // ignored with its own warning, not the generic unknown-field one.
+            boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
             let mut unknown = Vec::new();
-            for key in self.extra.keys() {
+            for key in self
+                .extra
+                .keys()
+                .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+            {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
                         "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
@@ -1192,12 +1199,21 @@ impl File {
         if let Some(session) = &self.session
             && !session.extra.is_empty()
         {
-            tracing::warn!(
-                "unknown fields in [session] section of {}: {}",
-                MFILE_NAME,
-                session.extra.keys().cloned().collect::<Vec<_>>().join(",")
-            );
-            was_unknown_fields = true;
+            boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
+            let unknown: Vec<&str> = session
+                .extra
+                .keys()
+                .map(String::as_str)
+                .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+                .collect();
+            if !unknown.is_empty() {
+                tracing::warn!(
+                    "unknown fields in [session] section of {}: {}",
+                    MFILE_NAME,
+                    unknown.join(",")
+                );
+                was_unknown_fields = true;
+            }
         }
 
         for (task_name, task) in &self.tasks {
@@ -2735,6 +2751,34 @@ mod tests {
             let file: File = toml::from_str(&format!("[tasks.one]\n{action}\n")).unwrap();
             file.validate().unwrap_or_else(|e| panic!("{action}: {e}"));
             assert!(file.tasks["one"].extra.is_empty(), "{action}");
+        }
+    }
+
+    /// BEP-037: a project's `[secret-store-rules]` table, at the top level
+    /// or under `[session]`, is ignored with its own warning, not the
+    /// generic unknown-field one.
+    #[test]
+    fn project_store_rules_are_ignored_with_warning() {
+        for body in [
+            "[secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\nheader = \"x-api-key\"\n",
+            "[session.secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\n",
+        ] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
+            let capture = CaptureWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            File::from_dir(dir.path()).expect("the file still reads");
+            drop(guard);
+            let out = capture.contents();
+            assert!(
+                out.contains(boxes::core::bep::PROJECT_STORE_RULES_IGNORED),
+                "{body}: {out}"
+            );
+            assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
         }
     }
 
