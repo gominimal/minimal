@@ -1,5 +1,5 @@
-//! `min auth`: sign in to GitHub under the Minimal-published GitHub App, and
-//! report the held sign-in.
+//! `min auth`: sign in to GitHub under the Minimal-published GitHub App,
+//! report the held sign-in, and sign out.
 //!
 //! The sign-in lives in one host keychain item (`bep::signin`), never in a
 //! file. `min auth status` reads the item's metadata and never the token.
@@ -98,6 +98,198 @@ pub async fn cmd_auth_login(_global: &GlobalArgs, args: AuthLoginArgs) -> anyhow
 /// `min auth status`.
 pub fn cmd_auth_status(_global: &GlobalArgs) -> anyhow::Result<()> {
     write_status(&HostKeychain, now(), &mut std::io::stdout())
+}
+
+/// `min auth logout`.
+pub async fn cmd_auth_logout(_global: &GlobalArgs) -> anyhow::Result<()> {
+    let logout = Logout {
+        keychain: &HostKeychain,
+        endpoints: &Endpoints::github(),
+        client_secret: BUILT_IN_SECRET,
+    };
+    run_logout(&logout, &mut std::io::stdout(), &mut std::io::stderr()).await?;
+    Ok(())
+}
+
+/// What `min auth logout` prints on stdout once the item is deleted.
+pub(crate) const SIGNED_OUT: &str =
+    "Signed out of GitHub. Boxes created before now lose GitHub access at their next request.";
+
+/// What `min auth logout` prints on stderr when GitHub did not confirm the
+/// revocation. The local deletion is the enforcement (BEP-044).
+pub(crate) const NOT_CONFIRMED: &str =
+    "GitHub did not confirm the sign-out; the sign-in is removed from this machine.";
+
+/// The sign-in item, as `min auth logout` deletes it.
+pub(crate) trait SignInItem: Keychain + Sync {
+    /// Delete both parts of the item. Deleting an item that is not held is
+    /// not an error.
+    fn delete(&self) -> anyhow::Result<()>;
+}
+
+impl SignInItem for signin::MemoryKeychain {
+    fn delete(&self) -> anyhow::Result<()> {
+        self.clear();
+        Ok(())
+    }
+}
+
+impl SignInItem for HostKeychain {
+    fn delete(&self) -> anyhow::Result<()> {
+        host_delete()?;
+        // Read the item back: a keychain command can exit 0 and delete
+        // nothing.
+        let meta = self.metadata().ok().flatten();
+        let material = self.material().ok().flatten();
+        if meta.is_some() || material.is_some() {
+            bail!("the host keychain still holds the GitHub sign-in after the delete");
+        }
+        Ok(())
+    }
+}
+
+/// Delete the item under [`signin::SERVICE`], which holds the token, then
+/// the metadata. The token goes first: the proxy resolves a reference from
+/// it, so its deletion is what refuses every reference.
+#[cfg(target_os = "macos")]
+fn host_delete() -> anyhow::Result<()> {
+    // `security` exits 44 when no item matches.
+    const NOT_FOUND: i32 = 44;
+    let out = keychain_tool(
+        "/usr/bin/security",
+        &[
+            "delete-generic-password",
+            "-s",
+            signin::SERVICE,
+            "-a",
+            signin::ITEM_ACCOUNT,
+        ],
+    )?;
+    if !out.status.success() && out.status.code() != Some(NOT_FOUND) {
+        bail!(
+            "the host keychain refused to delete the GitHub sign-in: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_delete() -> anyhow::Result<()> {
+    for service in [signin::SERVICE, signin::META_SERVICE] {
+        let out = keychain_tool("secret-tool", &["clear", "service", service])?;
+        // `secret-tool` fails with no message when nothing matches.
+        if !out.status.success() && !out.stderr.is_empty() {
+            bail!(
+                "the host keychain refused to delete the GitHub sign-in: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn keychain_tool(tool: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    std::process::Command::new(tool)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("could not run the host keychain tool `{tool}`"))
+}
+
+/// One `min auth logout`, with everything that reaches outside the process
+/// passed in.
+pub(crate) struct Logout<'a> {
+    pub keychain: &'a dyn SignInItem,
+    pub endpoints: &'a Endpoints,
+    /// The App's client secret. GitHub revokes a sign-in only under it.
+    pub client_secret: Option<&'a str>,
+}
+
+/// What a logout did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoggedOut {
+    /// No sign-in was held, and nothing changed.
+    NotSignedIn,
+    /// The item is deleted. `confirmed` is whether GitHub confirmed the
+    /// revocation.
+    Deleted { confirmed: bool },
+}
+
+/// Delete the sign-in item, then ask GitHub to revoke the sign-in, best
+/// effort (BEP-044). A refused or unreachable revocation is reported, and
+/// the logout still succeeds. Deleting the item refuses every reference to
+/// it at its next request: the proxy reads the item for each request, and a
+/// later sign-in is a new instance that no earlier reference names.
+pub(crate) async fn run_logout(
+    logout: &Logout<'_>,
+    out: &mut (dyn Write + Send),
+    err: &mut (dyn Write + Send),
+) -> anyhow::Result<LoggedOut> {
+    // A read that fails does not stop the delete: the delete is the
+    // enforcement, and a damaged item is deleted like any other.
+    let meta = logout.keychain.metadata();
+    let material = logout.keychain.material();
+    if matches!(meta, Ok(None)) && matches!(material, Ok(None)) {
+        writeln!(out, "Not signed in to GitHub.")?;
+        return Ok(LoggedOut::NotSignedIn);
+    }
+    let account = meta
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown".to_owned(), |m| m.account);
+    let token = material
+        .ok()
+        .flatten()
+        .map(|m| zeroize::Zeroizing::new(m.access_token.clone()));
+    logout
+        .keychain
+        .delete()
+        .context("The GitHub sign-in was not removed, so you are still signed in")?;
+    let revoked = match (token, logout.client_secret.filter(|s| !s.is_empty())) {
+        (Some(token), Some(secret)) => revoke(logout.endpoints, secret, &token).await,
+        (None, _) => Err("no token was read from the sign-in".to_owned()),
+        (_, None) => Err("this build carries no client secret to revoke under".to_owned()),
+    };
+    let confirmed = revoked.is_ok();
+    tracing::info!(
+        account = %account,
+        github_confirmed = confirmed,
+        detail = revoked.err().as_deref().unwrap_or(""),
+        "GitHub sign-in deleted from the host keychain"
+    );
+    writeln!(out, "{SIGNED_OUT}")?;
+    if !confirmed {
+        writeln!(err, "{NOT_CONFIRMED}")?;
+    }
+    Ok(LoggedOut::Deleted { confirmed })
+}
+
+/// Ask GitHub to delete the App's grant for the signed-in user, which
+/// revokes the token and its refresh token. `Err` says why GitHub did not
+/// confirm, for the log. It never holds the token.
+async fn revoke(endpoints: &Endpoints, secret: &str, token: &str) -> Result<(), String> {
+    let url = format!("{}/applications/{CLIENT_ID}/grant", endpoints.api);
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("min/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("building the HTTP client: {e}"))?;
+    let mut body = serde_json_lenient::json!({ "access_token": token }).to_string();
+    let sent = http
+        .delete(&url)
+        .basic_auth(CLIENT_ID, Some(secret))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await;
+    body.zeroize();
+    match sent {
+        Ok(reply) if reply.status() == reqwest::StatusCode::NO_CONTENT => Ok(()),
+        Ok(reply) => Err(format!("GitHub answered {url} with {}", reply.status())),
+        Err(e) => Err(format!("could not reach {url}: {e}")),
+    }
 }
 
 /// Sign in, store the sign-in in the keychain item, and print the account.
@@ -604,6 +796,7 @@ fn base64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use bep::signin::{META_SERVICE, MemoryKeychain, Metadata, SERVICE, valid_account};
     use std::sync::{Arc, Mutex};
 
@@ -629,6 +822,8 @@ mod tests {
         Flaky,
         /// `authorization_pending` once, then a token in an unexpected form.
         OddToken,
+        /// As `Pending`, but the revocation of a grant is refused.
+        RevokeRefused,
     }
 
     /// A local stand-in for github.com and api.github.com. The device flow
@@ -693,7 +888,7 @@ mod tests {
                                 status = "502 Bad Gateway";
                                 "<html>bad gateway</html>".to_owned()
                             }
-                            (Script::Pending | Script::OddToken, 1) => {
+                            (Script::Pending | Script::OddToken | Script::RevokeRefused, 1) => {
                                 r#"{"error":"authorization_pending"}"#.to_owned()
                             }
                             _ => token,
@@ -713,6 +908,20 @@ mod tests {
                     "/user" => {
                         assert!(headers.contains(&format!("bearer {}", access.to_lowercase())));
                         format!(r#"{{"login":"{account}","id":1}}"#)
+                    }
+                    p if p == format!("/applications/{CLIENT_ID}/grant") => {
+                        assert_eq!(method, "DELETE");
+                        // Basic auth: the client id and the test secret.
+                        let basic = base64::engine::general_purpose::STANDARD
+                            .encode(format!("{CLIENT_ID}:test-secret"));
+                        assert!(headers.contains(&format!("basic {}", basic.to_lowercase())));
+                        if script == Script::RevokeRefused {
+                            status = "422 Unprocessable Entity";
+                            r#"{"message":"Validation Failed"}"#.to_owned()
+                        } else {
+                            status = "204 No Content";
+                            String::new()
+                        }
                     }
                     other => panic!("unexpected request to {other}"),
                 };
@@ -1138,5 +1347,324 @@ mod tests {
             base64url(&Sha256::digest(verifier.as_bytes())),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    /// A keychain the test and a proxy's redeemer share.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<MemoryKeychain>);
+
+    impl Keychain for Shared {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.0.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.0.material()
+        }
+        fn write(&self, meta: &Metadata, material: &Material) -> Result<(), signin::SignInError> {
+            self.0.write(meta, material)
+        }
+    }
+
+    impl SignInItem for Shared {
+        fn delete(&self) -> anyhow::Result<()> {
+            self.0.delete()
+        }
+    }
+
+    /// A keychain that refuses to delete the item.
+    #[derive(Default)]
+    struct Undeletable(MemoryKeychain);
+
+    impl Keychain for Undeletable {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.0.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.0.material()
+        }
+        fn write(&self, meta: &Metadata, material: &Material) -> Result<(), signin::SignInError> {
+            self.0.write(meta, material)
+        }
+    }
+
+    impl SignInItem for Undeletable {
+        fn delete(&self) -> anyhow::Result<()> {
+            bail!("the host keychain refused to delete the GitHub sign-in: locked")
+        }
+    }
+
+    async fn logout_with(
+        keychain: &dyn SignInItem,
+        endpoints: &Endpoints,
+        secret: Option<&str>,
+    ) -> (anyhow::Result<LoggedOut>, String, String) {
+        let logout = Logout {
+            keychain,
+            endpoints,
+            client_secret: secret,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let done = run_logout(&logout, &mut out, &mut err).await;
+        (
+            done,
+            String::from_utf8(out).expect("utf8"),
+            String::from_utf8(err).expect("utf8"),
+        )
+    }
+
+    fn revocations(gh: &FakeGitHub) -> Vec<String> {
+        gh.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with(&format!("DELETE /applications/{CLIENT_ID}/grant")))
+            .cloned()
+            .collect()
+    }
+
+    // BEP-044: logout deletes the item, asks GitHub to revoke the sign-in,
+    // and reports a refused or unreachable revocation without failing.
+    #[tokio::test]
+    async fn logout_revokes_at_github_best_effort() {
+        let deleted =
+            |k: &MemoryKeychain| k.item(SERVICE).is_none() && k.item(META_SERVICE).is_none();
+
+        // GitHub confirms the revocation.
+        let gh = fake_github("octocat").await;
+        let keychain = MemoryKeychain::default();
+        login_with(&keychain, &gh, None, true, &no_browser).await;
+        let (done, out, err) = logout_with(&keychain, &gh.endpoints, Some("test-secret")).await;
+        assert_eq!(
+            done.expect("logout"),
+            LoggedOut::Deleted { confirmed: true }
+        );
+        assert_eq!(out, format!("{SIGNED_OUT}\n"));
+        assert_eq!(err, "");
+        assert!(deleted(&keychain));
+        let asked = revocations(&gh);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains(ACCESS), "the revocation names the token");
+
+        // GitHub refuses the revocation: the logout still succeeds.
+        let refusing = fake_github_scripted("octocat", Script::RevokeRefused).await;
+        login_with(&keychain, &refusing, None, true, &no_browser).await;
+        let (done, out, err) =
+            logout_with(&keychain, &refusing.endpoints, Some("test-secret")).await;
+        assert_eq!(
+            done.expect("logout"),
+            LoggedOut::Deleted { confirmed: false }
+        );
+        assert_eq!(out, format!("{SIGNED_OUT}\n"));
+        assert_eq!(err, format!("{NOT_CONFIRMED}\n"));
+        assert!(deleted(&keychain));
+        assert_eq!(revocations(&refusing).len(), 1);
+
+        // GitHub cannot be reached: nothing listens on the port.
+        let dead = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+            format!("http://{}", l.local_addr().expect("addr"))
+        };
+        let unreachable = Endpoints {
+            oauth: dead.clone(),
+            api: dead,
+        };
+        login_with(&keychain, &gh, None, true, &no_browser).await;
+        let (done, out, err) = logout_with(&keychain, &unreachable, Some("test-secret")).await;
+        assert_eq!(
+            done.expect("logout"),
+            LoggedOut::Deleted { confirmed: false }
+        );
+        assert_eq!(out, format!("{SIGNED_OUT}\n"));
+        assert_eq!(err, format!("{NOT_CONFIRMED}\n"));
+        assert!(deleted(&keychain));
+
+        // A build with no client secret cannot ask GitHub, and says so.
+        login_with(&keychain, &gh, None, true, &no_browser).await;
+        let (done, _, err) = logout_with(&keychain, &gh.endpoints, None).await;
+        assert_eq!(
+            done.expect("logout"),
+            LoggedOut::Deleted { confirmed: false }
+        );
+        assert_eq!(err, format!("{NOT_CONFIRMED}\n"));
+        assert!(deleted(&keychain));
+        assert_eq!(revocations(&gh).len(), 1, "GitHub was not asked again");
+
+        // Nothing held: nothing to delete and nothing to revoke.
+        let (done, out, err) = logout_with(&keychain, &gh.endpoints, Some("test-secret")).await;
+        assert_eq!(done.expect("logout"), LoggedOut::NotSignedIn);
+        assert_eq!(out, "Not signed in to GitHub.\n");
+        assert_eq!(err, "");
+        assert_eq!(revocations(&gh).len(), 1);
+
+        // A keychain that refuses the delete fails the logout, keeps the
+        // item and asks GitHub nothing.
+        let stuck = Undeletable::default();
+        login_with(&stuck.0, &gh, None, true, &no_browser).await;
+        let (done, out, _) = logout_with(&stuck, &gh.endpoints, Some("test-secret")).await;
+        let text = format!("{:#}", done.expect_err("a refused delete fails"));
+        assert!(text.contains("still signed in"), "{text}");
+        assert!(text.contains("locked"), "{text}");
+        assert_eq!(out, "");
+        assert!(stuck.0.raw().is_some());
+        assert_eq!(revocations(&gh).len(), 1);
+    }
+
+    /// A proxy sealing key held in memory, for the redeemer.
+    struct TestKey(p256::ecdsa::SigningKey);
+
+    impl bep::keys::HeldKey for TestKey {
+        fn role(&self) -> bep::keys::Role {
+            bep::keys::Role::Sealing
+        }
+        fn public(&self) -> bep::seal::ProxyPublicKey {
+            bep::seal::ProxyPublicKey::from_sec1_bytes(&self.0.verifying_key().to_sec1_bytes())
+                .expect("a P-256 key")
+        }
+        fn exportable(&self) -> bool {
+            false
+        }
+        fn agree(
+            &self,
+            peer: &bep::seal::ProxyPublicKey,
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, bep::keys::KeyError> {
+            let peer = p256::PublicKey::from_sec1_bytes(&peer.to_sec1_bytes()).expect("peer");
+            let shared = p256::ecdh::diffie_hellman(self.0.as_nonzero_scalar(), peer.as_affine());
+            Ok(zeroize::Zeroizing::new(shared.raw_secret_bytes().to_vec()))
+        }
+        fn probe(&self) -> Result<(), bep::keys::KeyError> {
+            Ok(())
+        }
+    }
+
+    // BEP-044: a sign-in after a logout is redeemed through the references
+    // minted from it, and every reference minted before the logout stays
+    // refused.
+    #[tokio::test]
+    async fn sign_in_after_logout_revives_no_earlier_reference() {
+        use bep::boxes::{Boxes, Stance};
+        use bep::forward::{Redeemer as _, Verdict};
+        use bep::handle::{Claims, ClientKeys};
+        use bep::module::GITHUB;
+        use bep::redeem::{Authority, RequestAuthority};
+        use bep::seal::{Breadth, Context, Member, MemberKind, MemberList, Mode};
+        use p256::ecdsa::SigningKey;
+
+        const NODE: &str = "node-1";
+        let now = now();
+        let keychain = Shared::default();
+        let key = TestKey(SigningKey::from_bytes(&[7u8; 32].into()).expect("key"));
+        let sealing = bep::keys::HeldKey::public(&key);
+        let client = SigningKey::from_bytes(&[9u8; 32].into()).expect("key");
+        let mut clients = ClientKeys::new();
+        clients
+            .register(&client.verifying_key().to_sec1_bytes())
+            .expect("register");
+        let hosts: Vec<Authority<String>> = GITHUB
+            .hosts
+            .iter()
+            .map(|a| Authority {
+                host: a.host.to_owned(),
+                port: a.port,
+            })
+            .collect();
+        let boxes = Arc::new(Boxes::new());
+        for b in ["b1", "b2", "b3"] {
+            boxes.register(b, hosts.clone(), Stance::OwnIp);
+        }
+        let redeemer = bep::redeemer::BoxRedeemer::new(
+            key,
+            NODE,
+            GITHUB,
+            Arc::new(std::sync::RwLock::new(clients)),
+            Arc::clone(&boxes),
+            keychain.clone(),
+        );
+
+        // A reference to the held sign-in, minted for `box_id`: a handle
+        // naming the item's instance, sealed for this proxy.
+        let mint = |box_id: &str| {
+            let instance = keychain.metadata().expect("read").expect("held").instance;
+            let jws = bep::handle::sign(
+                &client,
+                &Claims {
+                    sub: box_id.into(),
+                    node_id: NODE.into(),
+                    store: GITHUB.id.into(),
+                    id: instance,
+                    upstream: GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect(),
+                    inject: None,
+                    iat: now - 10,
+                    exp: now + 3600,
+                    jti: format!("jti-{box_id}"),
+                },
+            );
+            bep::seal::seal(
+                &sealing,
+                &Context {
+                    box_id: box_id.into(),
+                    host: NODE.into(),
+                    module: GITHUB.id.into(),
+                    host_set_version: GITHUB.host_set_version,
+                    mode: Mode::User,
+                    iat: now - 10,
+                    expiry: now + 3600,
+                    kid: sealing.kid(),
+                },
+                &MemberList {
+                    members: vec![Member {
+                        kind: MemberKind::SignIn,
+                        breadth: Breadth::Full,
+                        jws: zeroize::Zeroizing::new(jws),
+                        exp: None,
+                    }],
+                    default_owner: None,
+                },
+            )
+            .expect("seal")
+        };
+        let api = Authority {
+            host: "api.github.com".to_owned(),
+            port: 443,
+        };
+        let request = RequestAuthority {
+            host: Some(api.clone()),
+            target: None,
+        };
+        let admitted =
+            |box_id: &str, sealed: &str| match redeemer.redeem(box_id, &api, &request, sealed) {
+                Verdict::Admit { credential, .. } => {
+                    assert_eq!(credential.as_str(), ACCESS);
+                    true
+                }
+                Verdict::Refuse(_) => false,
+            };
+
+        let gh = fake_github("octocat").await;
+        let (first, _, _) = login_with(&keychain.0, &gh, None, true, &no_browser).await;
+        let before_1 = mint("b1");
+        let before_2 = mint("b2");
+        assert!(admitted("b1", &before_1), "a reference to the held sign-in");
+        assert!(admitted("b2", &before_2), "a reference to the held sign-in");
+
+        let (done, _, _) = logout_with(&keychain, &gh.endpoints, Some("test-secret")).await;
+        assert_eq!(
+            done.expect("logout"),
+            LoggedOut::Deleted { confirmed: true }
+        );
+        // Every reference is refused at its next request.
+        assert!(!admitted("b1", &before_1), "refused after logout");
+        assert!(!admitted("b2", &before_2), "refused after logout");
+
+        // The same account signs in again: a new instance.
+        let (second, _, _) = login_with(&keychain.0, &gh, None, true, &no_browser).await;
+        assert!(second.new_instance);
+        assert_ne!(second.metadata.instance, first.metadata.instance);
+        let after = mint("b3");
+        assert!(
+            admitted("b3", &after),
+            "a reference minted after the sign-in"
+        );
+        assert!(!admitted("b1", &before_1), "minted before the logout");
+        assert!(!admitted("b2", &before_2), "minted before the logout");
     }
 }
