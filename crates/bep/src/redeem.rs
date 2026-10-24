@@ -383,8 +383,9 @@ impl Decision {
     }
 
     /// Whether this decision admits a `host_ip` sender for another live
-    /// `host_ip` box of this host. The connection span records it as the
-    /// cohort flag (BEP-028).
+    /// `host_ip` box of this host (BEP-028). This is the cohort flag for the
+    /// connection span. No span records it yet: the forwarder does not
+    /// receive the decision.
     #[must_use]
     pub fn cohort_attributed(self) -> bool {
         matches!(
@@ -1407,8 +1408,9 @@ mod tests {
     /// BEP-028: a `host_ip` sender that presents a value naming another
     /// live `host_ip` box of this host is admitted once the remaining checks
     /// pass. The admission is attributed to the cohort, and its audit marker
-    /// is `cohort_attributed`. The same value from an `own_ip` box, or with
-    /// the named box outside the cohort, is refused as `cross_box`.
+    /// is `cohort_attributed`. The same value from the `own_ip` address of
+    /// another box, or with the named box outside the cohort, is refused as
+    /// `cross_box`.
     #[test]
     fn host_ip_redemption_is_cohort_attributed() {
         const NAMED: u8 = 7;
@@ -1433,6 +1435,15 @@ mod tests {
         let own_box = decide(&own(NAMED));
         assert_eq!(own_box.marker(), None);
         assert!(!own_box.cohort_attributed());
+
+        // The `own_ip` address of another box is not the named box.
+        let other_box = decide(&Redemption {
+            attribution: Attribution::OwnIp(NAMED + 1),
+            ..own(NAMED)
+        });
+        assert_eq!(other_box, Decision::Refuse(Check::CrossBox));
+        assert_eq!(other_box.marker(), Some("cross_box"));
+        assert!(!other_box.cohort_attributed());
 
         // The named box is not a live `host_ip` box of this host.
         let outside = decide(&Redemption {
