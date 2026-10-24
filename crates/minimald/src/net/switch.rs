@@ -1445,15 +1445,9 @@ pub struct BoxGate {
     /// ([`Self::references_peer`]).
     peer_conversations: PeerConversations,
     /// Whether the box's resolved `quic443` stance blocks UDP to port 443
-    /// (BEP-018). Built from the stance the policy's credentialed upstream
-    /// declares, `auto` when it declares none, resolved on the lane's
-    /// grants and steering.
+    /// (BEP-018). Built from the stance the policy declares, `auto` when it
+    /// declares none, resolved on the lane's grants and steering.
     quic443_blocked: bool,
-    /// The facts the `auto` stance resolves on: whether the box declares a
-    /// credentialed upstream, and its resolved steering mode. Kept only for
-    /// the test hook that replaces the declared stance.
-    #[cfg(test)]
-    quic443_facts: (bool, Steering),
     /// The switch's Box Egress Proxy address. UDP to port 443 there is
     /// rejected in every stance: the proxy has no QUIC listener (BEP-018).
     proxy: Ipv4Addr,
@@ -1514,9 +1508,9 @@ impl BoxGate {
         let (resets, resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         let (box_resets, box_resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         // BEP-018: the declared stance wins, so `block` and `allow`
-        // override `auto`. The `auto` stance resolves on the declared lane's
-        // grants and steering. A policy with no lane has no credentialed
-        // upstream and declares no stance.
+        // override `auto`. The stance is a setting of every box, lane or
+        // not. The `auto` stance resolves on the declared lane's grants and
+        // steering, and a policy with no lane has no credentialed upstream.
         let quic443_facts = policy.credentialed_upstream.as_ref().map_or(
             (false, Steering::default()),
             |upstream| {
@@ -1526,10 +1520,10 @@ impl BoxGate {
                 )
             },
         );
-        let quic443 = policy
-            .credentialed_upstream
-            .as_ref()
-            .and_then(|upstream| upstream.quic443);
+        let quic443_blocked = policy
+            .quic443
+            .unwrap_or_default()
+            .blocks(quic443_facts.0, quic443_facts.1);
         Self {
             allowed: declared_ingress_ports(Some(policy), boxes::IpProto::Tcp),
             // The runtime-published half starts empty: nothing a box's
@@ -1560,23 +1554,10 @@ impl BoxGate {
             dns,
             flows: ReplyFlowGate::new(),
             peer_conversations: PeerConversations::new(subnet),
-            quic443_blocked: quic443
-                .unwrap_or_default()
-                .blocks(quic443_facts.0, quic443_facts.1),
-            #[cfg(test)]
-            quic443_facts,
+            quic443_blocked,
             proxy: subnet.box_egress_proxy_address(),
             quic443_log: Quic443RejectLog::default(),
         }
-    }
-
-    /// Replaces the stance the gate was built with, resolved against the
-    /// credentialed upstream and steering it was built from (BEP-018). A
-    /// test hook: production gates take the stance from the policy.
-    #[cfg(test)]
-    pub(crate) fn set_quic443(&mut self, stance: Quic443) {
-        let (credentialed, steering) = self.quic443_facts;
-        self.quic443_blocked = stance.blocks(credentialed, steering);
     }
 
     /// Whether the box's resolved `quic443` stance blocks UDP to port 443.
@@ -3611,6 +3592,7 @@ pub(crate) mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let gate = BoxGate::for_session(
             "100.64.0.9".into(),
@@ -3784,6 +3766,7 @@ pub(crate) mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let gate = BoxGate::for_session(
             "100.64.0.9".into(),
@@ -3847,6 +3830,7 @@ pub(crate) mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let gate = BoxGate::for_session(
             "100.64.0.9".into(),
@@ -4015,6 +3999,7 @@ pub(crate) mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let gate = BoxGate::for_session(
             LEASE.to_string(),
@@ -4258,6 +4243,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -4346,6 +4332,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         // The gate is compiled with the hostname proxy's port the daemon
         // asks for when none is pinned — the node address's interim opening.
@@ -4483,6 +4470,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&deny_all);
 
@@ -4581,6 +4569,7 @@ pub(crate) mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&allow_all);
         harness.box_end.write_all(&other_port).unwrap();
@@ -4615,6 +4604,7 @@ pub(crate) mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&allow_all);
 
@@ -4686,6 +4676,7 @@ pub(crate) mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&laned);
 
@@ -4793,6 +4784,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -4824,6 +4816,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&policy);
         let peer = Ipv4Addr::new(10, 1, 2, 3);
@@ -4892,6 +4885,7 @@ pub(crate) mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -5347,6 +5341,7 @@ pub(crate) mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -5862,6 +5857,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -5880,6 +5876,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -5900,6 +5897,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -6522,6 +6520,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_relay_for(lease, Some(&deny_all), |_| {});
 
@@ -6954,6 +6953,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -7339,9 +7339,9 @@ pub(crate) mod tests {
     /// address.
     const QUIC_PEER: Ipv4Addr = Ipv4Addr::new(140, 82, 112, 3);
 
-    /// A policy that allows every destination, with a credentialed lane of
-    /// one broker grant under `steering`, or no lane when `steering` is
-    /// `None`.
+    /// A policy that allows every destination and declares no `quic443`
+    /// stance, with a credentialed lane of one broker grant under
+    /// `steering`, or no lane when `steering` is `None`.
     fn quic_policy(steering: Option<Option<Steering>>) -> boxes::BoxPolicy {
         boxes::BoxPolicy {
             egress: None,
@@ -7359,19 +7359,21 @@ pub(crate) mod tests {
                         mode: None,
                     },
                 )]),
-                quic443: None,
             }),
+            quic443: None,
         }
     }
 
-    /// [`quic_policy`] with the lane declaring `stance`, as the client
-    /// registers it from `[session.network] quic443`.
-    fn quic_policy_declaring(steering: Option<Steering>, stance: Quic443) -> boxes::BoxPolicy {
-        let mut policy = quic_policy(Some(steering));
-        if let Some(upstream) = policy.credentialed_upstream.as_mut() {
-            upstream.quic443 = Some(stance);
+    /// [`quic_policy`] with the box declaring `stance`, as the client
+    /// registers it from `[session.network] quic443`, lane or not.
+    fn quic_policy_declaring(
+        steering: Option<Option<Steering>>,
+        stance: Option<Quic443>,
+    ) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            quic443: stance,
+            ..quic_policy(steering)
         }
-        policy
     }
 
     /// Asserts that `reply` is the ICMP port unreachable that answers the
@@ -7472,9 +7474,13 @@ pub(crate) mod tests {
         drop(harness);
 
         // A declared `block` blocks on a box with no lane.
-        let mut harness = spawn_test_relay_with(&quic_policy(None), |gate| {
-            gate.set_quic443(Quic443::Block);
-        });
+        let policy = boxes::BoxPolicy {
+            credentialed_upstream: None,
+            quic443: Some(Quic443::Block),
+            ..quic_policy(None)
+        };
+        let mut harness = spawn_test_relay(&policy);
+        assert!(harness.gate.as_ref().unwrap().quic443_blocked());
         assert_eq!(first_forwarded(&mut harness, &quic).await, sentinel);
         let reply = crate::net::dns_gate::tests::read_box_frame(&harness)
             .await
@@ -7489,11 +7495,7 @@ pub(crate) mod tests {
             (Some(None), Some(Quic443::Allow)),
         ];
         for (lane, stance) in allowed {
-            let mut harness = spawn_test_relay_with(&quic_policy(lane), |gate| {
-                if let Some(stance) = stance {
-                    gate.set_quic443(stance);
-                }
-            });
+            let mut harness = spawn_test_relay(&quic_policy_declaring(lane, stance));
             assert!(!harness.gate.as_ref().unwrap().quic443_blocked());
             assert_eq!(
                 first_forwarded(&mut harness, &quic).await,
@@ -7520,11 +7522,7 @@ pub(crate) mod tests {
         ];
         for lane in lanes {
             for stance in stances {
-                let mut harness = spawn_test_relay_with(&quic_policy(lane), |gate| {
-                    if let Some(stance) = stance {
-                        gate.set_quic443(stance);
-                    }
-                });
+                let mut harness = spawn_test_relay(&quic_policy_declaring(lane, stance));
                 assert_eq!(
                     first_forwarded(&mut harness, &quic).await,
                     sentinel,
@@ -7540,16 +7538,33 @@ pub(crate) mod tests {
 
     /// BEP-018, spec section 5.3: a declared `block` or `allow` overrides
     /// `auto`. The gate takes the stance from the policy the box declares,
-    /// with no test hook. A `proxy_env` grant box that declares `block`
-    /// rejects UDP 443, and a `dns` grant box that declares `allow` sends
-    /// it.
+    /// with no test hook. A box with no credentialed upstream that declares
+    /// `block` rejects UDP 443, and so does a `proxy_env` grant box. A `dns`
+    /// grant box that declares `allow` sends it.
     #[tokio::test]
     async fn declared_quic443_block_rejects_without_test_hook() {
         let quic = udp_frame(LEASE, 40000, QUIC_PEER, 443);
         let sentinel = arp_frame(LEASE);
 
-        for steering in [Some(Steering::ProxyEnv), Some(Steering::Off), None] {
-            let policy = quic_policy_declaring(steering, Quic443::Block);
+        // The box with no lane comes first: its stance rides the policy,
+        // not a credentialed-upstream declaration it does not have.
+        let no_lane = boxes::BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: Some(Quic443::Block),
+        };
+        let lanes = [
+            None,
+            Some(Some(Steering::ProxyEnv)),
+            Some(Some(Steering::Off)),
+            Some(None),
+        ];
+        for steering in lanes {
+            let policy = match steering {
+                None => no_lane.clone(),
+                lane => quic_policy_declaring(lane, Some(Quic443::Block)),
+            };
             let mut harness = spawn_test_relay(&policy);
             assert!(harness.gate.as_ref().unwrap().quic443_blocked());
             assert_eq!(
@@ -7563,7 +7578,7 @@ pub(crate) mod tests {
             assert_port_unreachable(&reply, &quic);
         }
 
-        let policy = quic_policy_declaring(Some(Steering::Dns), Quic443::Allow);
+        let policy = quic_policy_declaring(Some(Some(Steering::Dns)), Some(Quic443::Allow));
         let mut harness = spawn_test_relay(&policy);
         assert!(!harness.gate.as_ref().unwrap().quic443_blocked());
         assert_eq!(first_forwarded(&mut harness, &quic).await, quic);

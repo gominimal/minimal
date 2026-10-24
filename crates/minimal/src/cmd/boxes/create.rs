@@ -150,9 +150,9 @@ impl std::error::Error for GrantNotDelivered {}
 
 /// The project's `[session.network.bep]` settings, `[session.secrets]`
 /// grants, the box spec's own variable names and the `[session.network]
-/// quic443` stance. Only a missing project file reads as empty. A file that exists
-/// but does not load refuses the activation, so a broken file can never
-/// skip the grant checks (BEP-008).
+/// quic443` stance. Only a missing project file reads as empty. A file that
+/// exists but does not load refuses the activation, so a broken file can
+/// never skip the grant checks (BEP-008).
 fn project_bep_and_grants(
     project: &camino::Utf8Path,
 ) -> Result<
@@ -202,13 +202,12 @@ fn project_bep_and_grants(
 /// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
 /// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
 /// setting or a `client_env` grant alone declares nothing. The settings
-/// ride the declaration, and so does the declared `quic443` stance, which
-/// the daemon's gate resolves (BEP-018).
+/// ride the declaration. The declared `quic443` stance does not: it rides
+/// the policy of every box (BEP-018).
 fn credentialed_upstream_for(
     flag: bool,
     bep: &boxes::core::bep::BepSettings,
     secrets: &boxes::core::bep::SecretGrants,
-    quic443: Option<boxes::core::bep::Quic443>,
 ) -> Option<boxes::CredentialedUpstream> {
     let declared = flag
         || secrets
@@ -217,7 +216,6 @@ fn credentialed_upstream_for(
     declared.then(|| boxes::CredentialedUpstream {
         bep: bep.clone(),
         secrets: secrets.clone(),
-        quic443,
     })
 }
 
@@ -835,8 +833,11 @@ pub(crate) async fn activate_box(
                     args.credentialed_upstream,
                     &project_bep,
                     &project_secrets,
-                    project_quic443,
                 ),
+                // BEP-018: the declared stance is a setting of every box, lane
+                // or not, so a declared `block` reaches the gate of a box with
+                // no credentialed upstream.
+                quic443: project_quic443,
             };
 
             // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -2453,7 +2454,7 @@ mod tests {
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
         let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
-        assert!(credentialed_upstream_for(false, &bep, &secrets, None).is_none());
+        assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         refuse_unhonourable_grants(
             boxes::NetworkMode::OwnIp,
             None,
@@ -2477,14 +2478,10 @@ mod tests {
             mode: None,
         };
         let client = SecretGrants::from([("NPM_TOKEN".into(), grant(GrantSource::ClientEnv))]);
-        assert!(credentialed_upstream_for(false, &bep, &client, None).is_none());
-        assert!(credentialed_upstream_for(true, &bep, &client, None).is_some());
+        assert!(credentialed_upstream_for(false, &bep, &client).is_none());
+        assert!(credentialed_upstream_for(true, &bep, &client).is_some());
         let broker = SecretGrants::from([("GH_TOKEN".into(), grant(GrantSource::Broker))]);
-        assert!(credentialed_upstream_for(false, &bep, &broker, None).is_some());
-        // BEP-018: the declared `quic443` stance rides the declaration.
-        let stance = boxes::core::bep::Quic443::Block;
-        let upstream = credentialed_upstream_for(false, &bep, &broker, Some(stance));
-        assert_eq!(upstream.and_then(|u| u.quic443), Some(stance));
+        assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
     }
 
     /// BEP-010: `steering = "off"` with `proxy_env = true` is refused with
@@ -2497,7 +2494,7 @@ mod tests {
             ..Default::default()
         };
         let secrets = boxes::core::bep::SecretGrants::new();
-        assert!(credentialed_upstream_for(false, &bep, &secrets, None).is_none());
+        assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         let err =
             refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false, &[])
                 .expect_err("refused");
