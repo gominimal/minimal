@@ -530,6 +530,10 @@ impl Decision {
 /// cohort leaves as one address, so the most restrictive member wins, and
 /// a grant box costs its whole cohort HTTP/3. An `own_ip` box's stance is
 /// its own, decided at its relay, and never joins this.
+///
+/// Not enforced yet: nothing calls [`Self::join`] or [`Self::leave`], and
+/// no filter rule reads [`Self::blocked`], so a `host_ip` cohort with a
+/// blocked member still sends UDP 443. The enforcement is #2515.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CohortQuic443 {
     /// Each resident member's resolved stance, by box id: `true` where it
