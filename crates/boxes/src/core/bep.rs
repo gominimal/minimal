@@ -950,6 +950,15 @@ pub enum StoreRuleRefusal {
     },
     /// BEP-034: the rule names the GitHub sign-in item.
     SignInItem,
+    /// BEP-034: a field is not in the shape the deny set can judge: an
+    /// upstream that is not a plain `host` or `host:port`, a header that is
+    /// not an HTTP token, or a prefix with a control character.
+    Malformed {
+        /// The field: `upstream`, `header` or `prefix`.
+        field: &'static str,
+        /// The value, as the rule writes it.
+        value: String,
+    },
     /// The rule registers no upstream, or not exactly one injection form.
     Incomplete,
 }
@@ -992,6 +1001,18 @@ impl fmt::Display for StoreRuleRefused {
                      the rule."
                 );
             }
+            StoreRuleRefusal::Malformed { field, value } => {
+                let shape = match *field {
+                    "upstream" => "a host name or host:port",
+                    "header" => "an HTTP header name",
+                    _ => "text without control characters",
+                };
+                return write!(
+                    f,
+                    "The secret-store rule {rule} in {file} has the {field} {value:?}, which is \
+                     not {shape}. Change the rule."
+                );
+            }
             StoreRuleRefusal::Incomplete => {
                 return write!(
                     f,
@@ -1019,6 +1040,12 @@ fn store_rule_refusal(
         return Some(StoreRuleRefusal::SignInItem);
     }
     for (written, host) in rule.upstream.iter().zip(rule.upstream_hosts()) {
+        if !is_plain_authority(written) {
+            return Some(StoreRuleRefusal::Malformed {
+                field: "upstream",
+                value: written.clone(),
+            });
+        }
         if deny.module_hosts.iter().any(|m| normalize_host(m) == host) {
             return Some(StoreRuleRefusal::ModuleHost {
                 host: written.clone(),
@@ -1038,6 +1065,24 @@ fn store_rule_refusal(
         if DENIED_HEADERS.contains(&lower.as_str()) || lower.starts_with("proxy-") {
             return Some(StoreRuleRefusal::DeniedHeader {
                 header: header.clone(),
+            });
+        }
+        if !is_http_token(header) {
+            return Some(StoreRuleRefusal::Malformed {
+                field: "header",
+                value: header.clone(),
+            });
+        }
+    }
+    if let Some(prefix) = &rule.prefix {
+        // A header value is visible characters, spaces and tabs only.
+        if !prefix
+            .chars()
+            .all(|c| c == ' ' || c == '\t' || c.is_ascii_graphic())
+        {
+            return Some(StoreRuleRefusal::Malformed {
+                field: "prefix",
+                value: prefix.clone(),
             });
         }
     }
@@ -1244,6 +1289,32 @@ fn authority_host(authority: &str) -> String {
         _ => authority,
     };
     normalize_host(host)
+}
+
+/// Whether `authority` is a plain `host` or `host:port`: a host of letters,
+/// digits, dots and hyphens, and a port of one to five digits. Anything else
+/// (userinfo, a path, brackets, a wildcard, whitespace) can name a host the
+/// deny set does not see, so the rule is refused.
+fn is_plain_authority(authority: &str) -> bool {
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let host_ok = !host.trim_end_matches('.').is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    let port_ok =
+        port.is_none_or(|p| (1..=5).contains(&p.len()) && p.chars().all(|c| c.is_ascii_digit()));
+    host_ok && port_ok
+}
+
+/// Whether `name` is an HTTP header name: one or more `tchar` (RFC 9110).
+fn is_http_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
 }
 
 fn normalize_host(host: &str) -> String {
@@ -2003,6 +2074,61 @@ mod tests {
             let (_, refused) = check_store_rules(StoreRules::from([("x".into(), r)]), "c", deny());
             assert_eq!(refused.len(), 1, "{header} must be refused");
         }
+    }
+
+    /// BEP-034: a field the deny set cannot judge is refused: an upstream
+    /// that is not a plain host or host:port, a header that is not an HTTP
+    /// token, and a prefix with a control character.
+    #[test]
+    fn store_rule_in_deny_set_is_refused_when_malformed() {
+        // An upstream that is not a plain host or host:port cannot slip past
+        // the deny set (review finding on authority_host).
+        for upstream in [
+            "x@api.github.com",
+            "*.github.com",
+            "[::1]",
+            "api.github.com/x",
+            "api.github.com :443",
+            "api.github.com:",
+            "",
+        ] {
+            let (_, refused) = check_store_rules(
+                StoreRules::from([("x".into(), rule(&[upstream]))]),
+                "c",
+                deny(),
+            );
+            assert_eq!(
+                refused.first().map(|r| &r.reason),
+                Some(&StoreRuleRefusal::Malformed {
+                    field: "upstream",
+                    value: upstream.into()
+                }),
+                "{upstream:?} must be refused"
+            );
+        }
+        // A header that is not an HTTP token, or a prefix with a control
+        // character, cannot inject a second header line.
+        for header in ["X-A\r\nHost: evil", "Host:", "X A"] {
+            let mut r = rule(&["example.com"]);
+            r.header = Some(header.into());
+            let (_, refused) = check_store_rules(StoreRules::from([("x".into(), r)]), "c", deny());
+            assert_eq!(
+                refused.first().map(|r| &r.reason),
+                Some(&StoreRuleRefusal::Malformed {
+                    field: "header",
+                    value: header.into()
+                }),
+                "{header:?} must be refused"
+            );
+        }
+        let mut r = rule(&["example.com"]);
+        r.prefix = Some("Bearer \r\nHost: evil ".into());
+        let (_, refused) = check_store_rules(StoreRules::from([("crlf".into(), r)]), "c", deny());
+        assert_eq!(
+            refused[0].to_string(),
+            "The secret-store rule crlf in c has the prefix \"Bearer \\r\\nHost: evil \", which is \
+             not text without control characters. Change the rule."
+        );
     }
 
     /// BEP-034: a rule or a store reference that names the GitHub sign-in
