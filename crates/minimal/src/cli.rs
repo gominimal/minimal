@@ -1203,6 +1203,13 @@ pub enum AuthCommand {
     ///
     /// Never prints the token.
     Status,
+    /// Sign out of GitHub and remove the sign-in from the host keychain
+    ///
+    /// Boxes created before the sign-out lose GitHub access at their next
+    /// request, and their processes keep running. Also asks GitHub to revoke
+    /// the sign-in. A later `min auth login` gives those boxes no access
+    /// back.
+    Logout,
 }
 
 #[derive(Debug, Args)]
