@@ -9,6 +9,10 @@
 //! key, so a mint stops sealing to the old one. A new root key also gets a
 //! new root certificate.
 //!
+//! `bep --rotate-signing` starts the same way, then issues a new signing
+//! certificate under the unchanged root (BEP-061). A box trusts the root
+//! alone, so nothing inside a running box changes.
+//!
 //! `bep serve` starts the proxy the same way, then serves box connections on
 //! the listener socket ([`bep::listener`]), and client key and box
 //! registrations on the control socket ([`bep::control`]). It reads the
@@ -21,8 +25,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
@@ -46,6 +50,11 @@ struct Args {
     /// or signing.
     #[arg(long, value_name = "ROLE")]
     replace_key: Option<Role>,
+
+    /// Issue a new signing certificate under the same root certificate.
+    /// Running boxes keep working, because they trust only the root.
+    #[arg(long, conflicts_with = "replace_key")]
+    rotate_signing: bool,
 
     /// Where to write the proxy's public keys and fingerprints.
     /// [default: ~/.minimal/bep/identity.json]
@@ -120,6 +129,27 @@ where
             return ExitCode::FAILURE;
         }
         return replace_key(store, role, &path);
+    }
+    if args.rotate_signing {
+        if args.command.is_some() {
+            eprintln!(
+                "`bep --rotate-signing` and `bep serve` do not run together. A running `bep serve` renews its own signing certificate before it expires."
+            );
+            return ExitCode::FAILURE;
+        }
+        let rotated = start(store, &path).and_then(|(keys, root)| {
+            rotate_signing(&keys.root, &keys.signing, root, SystemTime::now())
+        });
+        return match rotated {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let started = start(store, &path).and_then(|(keys, root)| match &args.command {
         Some(Command::Serve(serve_args)) => serve(serve_args, keys, root),
@@ -297,6 +327,89 @@ fn log_root(root: &RootCertificate) {
     );
 }
 
+/// What `bep --rotate-signing` prints when the rotation is done. The task
+/// text fixes these words (BEP-061).
+const ROTATED_SIGNING: &str =
+    "Signing certificate rotated. Running boxes keep working; nothing inside them changes.";
+
+/// `bep --rotate-signing`: issues the signing CA under `root`, then rotates
+/// it. The root does not change, so a box's trust store needs no change
+/// (BEP-061). Gives the line to print.
+fn rotate_signing<K: CaKey>(
+    root_key: &K,
+    signing_key: &K,
+    root: RootCertificate,
+    now: SystemTime,
+) -> Result<&'static str, String> {
+    let refused = |err: CaError| match err {
+        CaError::RootExpired(at) => format!(
+            "The signing certificate was not rotated: the root CA expired at {at}. \
+             Run `bep --replace-key root` to make a new root key. Boxes created before then must be re-created."
+        ),
+        other => format!("The signing certificate was not rotated: {other}."),
+    };
+    let mut ca = Ca::with_root(root_key, signing_key, root, now).map_err(refused)?;
+    ca.renew_signing(now).map_err(refused)?;
+    Ok(ROTATED_SIGNING)
+}
+
+/// How long before the signing CA expires `bep serve` renews it.
+const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How long `bep serve` waits to try again after a renewal fails.
+const RENEW_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// How long to wait at `now` before the signing CA that ends at `expiry` is
+/// due for renewal. Zero when it is due now.
+fn renewal_wait(expiry: SystemTime, now: SystemTime) -> Duration {
+    expiry
+        .checked_sub(RENEW_BEFORE_EXPIRY)
+        .and_then(|due| due.duration_since(now).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Renews the signing CA of a serving proxy before each expiry, so the
+/// proxy keeps signing leaves past one signing CA validity. The root does
+/// not change, so running boxes see no change (BEP-061).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(ca: Arc<Mutex<Ca<'static, K>>>) {
+    let expiry_of = |ca: &Mutex<Ca<'static, K>>| {
+        ca.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .signing_expiry()
+    };
+    std::thread::spawn(move || {
+        loop {
+            let expiry = expiry_of(&ca);
+            std::thread::sleep(renewal_wait(expiry, SystemTime::now()));
+            let renewed = ca
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .renew_signing(SystemTime::now());
+            match renewed {
+                Ok(()) if expiry_of(&ca) > expiry => {}
+                Ok(()) => {
+                    // The signing CA never outlives the root, so a renewal
+                    // near the root's end gains nothing. Stop here.
+                    tracing::warn!(
+                        root_expiry = ?expiry_of(&ca),
+                        "the signing CA ends with the root CA; run `bep --replace-key root` before then"
+                    );
+                    return;
+                }
+                Err(CaError::RootExpired(at)) => {
+                    tracing::error!(%at, "the signing CA did not renew: the root CA expired; run `bep --replace-key root`");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, retry_secs = RENEW_RETRY.as_secs(), "the signing CA did not renew");
+                    std::thread::sleep(RENEW_RETRY);
+                }
+            }
+        }
+    });
+}
+
 /// What a start says when the root key did not issue the root certificate.
 fn root_refusal(err: CaError) -> String {
     match err {
@@ -443,9 +556,11 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     // The published root is the anchor. The signing CA is issued under it.
     let ca = Ca::with_root(root_key, signing, root, SystemTime::now())
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
+    let ca = Arc::new(Mutex::new(ca));
+    keep_signing_renewed(Arc::clone(&ca));
     let proxy = Proxy::new(
         Admission::new(&[GITHUB], [("", 0); 0]),
-        Arc::new(Mutex::new(ca)),
+        ca,
         roots,
         Arc::new(SystemResolver),
         Arc::new(Mutex::new(log)),
@@ -578,6 +693,87 @@ mod tests {
         fn probe(&self) -> Result<(), KeyError> {
             Ok(())
         }
+    }
+
+    /// A software CA key in place of a keychain key.
+    struct CaTestKey {
+        role: Role,
+        pair: rcgen::KeyPair,
+    }
+
+    impl CaTestKey {
+        fn new(role: Role) -> Self {
+            Self {
+                role,
+                pair: rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap(),
+            }
+        }
+    }
+
+    impl HeldKey for CaTestKey {
+        fn role(&self) -> Role {
+            self.role
+        }
+
+        fn public(&self) -> ProxyPublicKey {
+            ProxyPublicKey::from_sec1_bytes(self.pair.public_key_raw()).unwrap()
+        }
+
+        fn exportable(&self) -> bool {
+            false
+        }
+
+        fn agree(&self, _peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            Err(KeyError::Store {
+                role: self.role,
+                detail: "a CA test key does no key agreement".into(),
+            })
+        }
+
+        fn probe(&self) -> Result<(), KeyError> {
+            Ok(())
+        }
+    }
+
+    impl CaKey for CaTestKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            rcgen::SigningKey::sign(&self.pair, msg).map_err(|err| KeyError::Store {
+                role: self.role,
+                detail: err.to_string(),
+            })
+        }
+    }
+
+    // BEP-061: `bep --rotate-signing` prints that running boxes need no
+    // change, and `bep serve` renews its signing CA before it expires.
+    #[test]
+    fn signing_ca_rotation_invisible_to_boxes() {
+        let root_key = CaTestKey::new(Role::Root);
+        let signing_key = CaTestKey::new(Role::Signing);
+        let at = SystemTime::now();
+        let root = bep::ca::issue_root(&root_key, registered_union(), at).unwrap();
+        assert_eq!(
+            rotate_signing(&root_key, &signing_key, root, at).unwrap(),
+            "Signing certificate rotated. Running boxes keep working; nothing inside them changes."
+        );
+
+        let ca = Ca::with_root(
+            &root_key,
+            &signing_key,
+            bep::ca::issue_root(&root_key, registered_union(), at).unwrap(),
+            at,
+        )
+        .unwrap();
+        let expiry = ca.signing_expiry();
+        assert!(expiry > at + RENEW_BEFORE_EXPIRY);
+        let wait = renewal_wait(expiry, at);
+        assert!(wait > Duration::ZERO);
+        assert_eq!(
+            at + wait + RENEW_BEFORE_EXPIRY,
+            expiry,
+            "renewal is due before the signing CA expires"
+        );
+        assert_eq!(renewal_wait(expiry, expiry), Duration::ZERO);
     }
 
     fn now() -> u64 {
