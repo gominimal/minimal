@@ -461,7 +461,9 @@ mod tests {
     async fn colliding_box_id_refuses_creation() {
         static HELD: std::sync::OnceLock<SessionId> = std::sync::OnceLock::new();
         fn mint_the_held_id() -> SessionId {
-            *HELD.get().expect("the held id is set before the store mints")
+            *HELD
+                .get()
+                .expect("the held id is set before the store mints")
         }
 
         let dir = TempDir::new().unwrap();

@@ -1291,6 +1291,9 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         }
     }
@@ -1348,6 +1351,9 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         };
         settle_destroyed_box(&ssh_sock, record.id, &record).await;
