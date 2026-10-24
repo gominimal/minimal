@@ -1237,6 +1237,47 @@ mod tests {
         assert!(!Quic443::Auto.blocks(false, Steering::Dns));
     }
 
+    fn any_quic443() -> impl Strategy<Value = Option<Quic443>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(Quic443::Auto)),
+            Just(Some(Quic443::Block)),
+            Just(Some(Quic443::Allow)),
+        ]
+    }
+
+    proptest! {
+        /// BEP-018: for every `quic443` value, grant set and steering
+        /// mode, the resolved stance is blocked iff the value is `block`,
+        /// or it is `auto` (declared or absent), the spec declares a
+        /// credentialed upstream and the steering resolves to `dns` or
+        /// `both`.
+        #[test]
+        fn prop_quic443_auto_resolves_on_grants_and_steering(
+            quic443 in any_quic443(),
+            network in any_network(),
+            egress in any_egress(),
+            bep in any_bep(),
+            secrets in any_grants(),
+        ) {
+            let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
+            let credentialed = secrets.values().any(|g| g.source == GrantSource::Broker);
+            prop_assert_eq!(spec.has_credentialed_upstream(), credentialed);
+            let resolved = bep.steering.unwrap_or(Steering::Dns);
+            let expected = match quic443.unwrap_or(Quic443::Auto) {
+                Quic443::Block => true,
+                Quic443::Allow => false,
+                Quic443::Auto => {
+                    credentialed && matches!(resolved, Steering::Dns | Steering::Both)
+                }
+            };
+            let blocked = quic443
+                .unwrap_or_default()
+                .blocks(spec.has_credentialed_upstream(), bep.resolved_steering());
+            prop_assert_eq!(blocked, expected);
+        }
+    }
+
     /// The diagnostic text the task fixes for BEP-008.
     #[test]
     fn missing_hosts_message_names_each_host() {

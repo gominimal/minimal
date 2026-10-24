@@ -148,10 +148,11 @@ impl std::fmt::Display for GrantNotDelivered {
 
 impl std::error::Error for GrantNotDelivered {}
 
-/// The project's `[session.network.bep]` settings and `[session.secrets]`
-/// grants. Only a missing project file reads as empty. A file that exists
-/// but does not load refuses the activation, so a broken file can never
-/// skip the grant checks (BEP-008).
+/// The project's `[session.network.bep]` settings, `[session.secrets]`
+/// grants, the box spec's own variable names and the `[session.network]
+/// quic443` stance. Only a missing project file reads as empty. A file that
+/// exists but does not load refuses the activation, so a broken file can
+/// never skip the grant checks (BEP-008).
 fn project_bep_and_grants(
     project: &camino::Utf8Path,
 ) -> Result<
@@ -159,6 +160,7 @@ fn project_bep_and_grants(
         boxes::core::bep::BepSettings,
         boxes::core::bep::SecretGrants,
         Vec<String>,
+        Option<boxes::core::bep::Quic443>,
     ),
     ProjectFileInvalid,
 > {
@@ -189,11 +191,10 @@ fn project_bep_and_grants(
                     .map(|entry| entry.name().as_ref().to_string()),
             )
             .collect();
-        (
-            session.network.and_then(|n| n.bep).unwrap_or_default(),
-            session.secrets,
-            spec_env,
-        )
+        let (bep, quic443) = session
+            .network
+            .map_or_else(Default::default, |n| (n.bep.unwrap_or_default(), n.quic443));
+        (bep, session.secrets, spec_env, quic443)
     }))
 }
 
@@ -201,7 +202,8 @@ fn project_bep_and_grants(
 /// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
 /// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
 /// setting or a `client_env` grant alone declares nothing. The settings
-/// ride the declaration.
+/// ride the declaration. The declared `quic443` stance does not: it rides
+/// the policy of every box (BEP-018).
 fn credentialed_upstream_for(
     flag: bool,
     bep: &boxes::core::bep::BepSettings,
@@ -814,7 +816,8 @@ pub(crate) async fn activate_box(
             let has_ingress = !port_mappings.is_empty()
                 || args.dynamic_ingress.is_some()
                 || args.dynamic_range.is_some();
-            let (project_bep, project_secrets, project_env) = project_bep_and_grants(&utf8_path)?;
+            let (project_bep, project_secrets, project_env, project_quic443) =
+                project_bep_and_grants(&utf8_path)?;
             let policy = boxes::BoxPolicy {
                 egress,
                 ingress: has_ingress.then_some(boxes::IngressPolicy {
@@ -831,6 +834,10 @@ pub(crate) async fn activate_box(
                     &project_bep,
                     &project_secrets,
                 ),
+                // BEP-018: the declared stance is a setting of every box, lane
+                // or not, so a declared `block` reaches the gate of a box with
+                // no credentialed upstream.
+                quic443: project_quic443,
             };
 
             // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -2354,7 +2361,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         // The egress here is unset, so both runs refuse for that too. Only
         // the narrow-scope refusal depends on the acknowledgement.
         let narrow = |acknowledged: bool| {
@@ -2399,7 +2406,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
             let egress = boxes::EgressPolicy {
                 allow_dns_hosts: Some(
                     bep::module::GITHUB
@@ -2445,7 +2452,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         refuse_unhonourable_grants(

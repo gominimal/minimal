@@ -2832,6 +2832,7 @@ mod tests {
             // No credentialed upstream (NET-134): these tests hold no lane,
             // so the compiled egress they observe is the rules' alone.
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -3046,6 +3047,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
 
@@ -3945,6 +3947,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut shared = None;
         let (watcher, _gate, server, mut served) =
@@ -4199,6 +4202,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
 

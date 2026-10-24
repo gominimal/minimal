@@ -488,7 +488,11 @@ pub struct BoxConfig {
     /// The box id the same registration handed back
     /// ([`boxes::Record::box_id`]): the id the host's row of the box
     /// holds. `None` for every activation that handed no box addresses.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
     /// Whether the session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`, and persisted onto
@@ -531,9 +535,13 @@ fn default_hooks_enabled() -> bool {
     true
 }
 
-/// A box's identity on its host ([`boxes::BoxId`]): defined beside the
-/// session record that carries it and re-exported under the path its
-/// clients spell, so no wire form changes.
+/// A box's identity ([`boxes::BoxId`]): the one id type every request and
+/// reply names a box by, the same type as [`SessionId`]. Defined beside the
+/// record that is keyed on it, and re-exported under the path its clients
+/// spell. A session reply spells it in the hyphenated form. The VM host's
+/// box control wire spells it as 32 hex digits, through
+/// [`boxes::box_id_hex`] on each of its fields. Both are the bytes each
+/// reply carried before the two id types merged.
 pub use boxes::BoxId;
 
 /// What a successful registration hands back: the allocated addresses —
@@ -556,6 +564,7 @@ pub struct RegisteredBox {
     pub loopback_address: std::net::Ipv4Addr,
     /// The box id the published row holds: the box's own UUIDv7, handed
     /// back to the registering client.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
     /// The task addresses filed with the box ([`RegisterBoxRequest::task_slots`]):
     /// one switch address per task slot, each a row of its own carrying
@@ -728,7 +737,11 @@ pub struct WithdrawBoxRequest {
     /// client that predates the field, or one that no longer holds the id
     /// (a destroy reads the pair from the session record, which carries
     /// none): the pair proof alone decides, as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 }
 
@@ -759,7 +772,11 @@ pub struct ResumeBoxRequest {
     /// holds it: a registration of the name under another id is a newer
     /// box, and the resume is refused. `None` when the client holds no id
     /// (the session record carries none): the pair proof alone decides.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 }
 
@@ -776,7 +793,11 @@ pub struct RowStandingRequest {
     /// The box id the same registration handed back: the row is answered
     /// as standing only when it is this box's own row. `None`, from a
     /// record that carries no id, is never answered as standing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 }
 
@@ -899,6 +920,7 @@ pub struct BoxRow {
     /// (NET-045). Required the same way [`RegisteredBox::box_id`] is: a
     /// row read from a daemon that predates ids fails the whole parse on
     /// a new client rather than silently naming a box no id names.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
     /// The box's address on the switch: the row's key.
     pub switch_address: std::net::Ipv4Addr,
@@ -1051,6 +1073,7 @@ pub struct RecordAskAnswerRequest {
 pub struct SubscribeAsksRequest {
     /// The row's box id — the host-minted identity the row read hands the
     /// client.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
 }
 
@@ -1064,6 +1087,7 @@ pub struct PendingAskOffer {
     /// The ask's host-minted id: what the recorded answer carries back.
     pub ask_id: AskId,
     /// The row's box id — the identity the client subscribed by.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
     /// The box's name, from the host's own row: the one guest-untouched
     /// field the dialog's text is built from.
@@ -1534,6 +1558,7 @@ pub enum BoxControlReply {
         /// discriminates this from every other shape.
         subscribed: bool,
         /// The row's box id the subscription is attached to.
+        #[serde(with = "boxes::box_id_hex")]
         box_id: BoxId,
     },
     /// A pending ask, pushed to a subscribed client's connection

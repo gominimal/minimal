@@ -525,6 +525,51 @@ impl Decision {
     }
 }
 
+/// The `host_ip` cohort's stance on UDP to port 443 (BEP-018): blocked
+/// when any resident member's resolved `quic443` stance is blocked. The
+/// cohort leaves as one address, so the most restrictive member wins, and
+/// a grant box costs its whole cohort HTTP/3. An `own_ip` box's stance is
+/// its own, decided at its relay, and never joins this.
+///
+/// Not enforced yet: nothing calls [`Self::join`] or [`Self::leave`], and
+/// no filter rule reads [`Self::blocked`], so a `host_ip` cohort with a
+/// blocked member still sends UDP 443. The enforcement is #2515.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CohortQuic443 {
+    /// Each resident member's resolved stance, by box id: `true` where it
+    /// blocks UDP to port 443.
+    members: std::collections::BTreeMap<String, bool>,
+}
+
+impl CohortQuic443 {
+    /// Records that the box `box_id` is resident in the cohort, with its
+    /// resolved stance. A box that joins again replaces its stance.
+    pub fn join(&mut self, box_id: &str, blocked: bool) {
+        self.members.insert(box_id.to_string(), blocked);
+    }
+
+    /// Records that the box `box_id` left the cohort. Its stance stops
+    /// counting at once.
+    pub fn leave(&mut self, box_id: &str) {
+        self.members.remove(box_id);
+    }
+
+    /// Whether the cohort blocks UDP to port 443: any resident member's
+    /// stance blocks it. An empty cohort blocks nothing.
+    pub fn blocked(&self) -> bool {
+        self.members.values().any(|blocked| *blocked)
+    }
+
+    /// The resident members whose stance blocks, the boxes that cost the
+    /// cohort HTTP/3.
+    pub fn blocking_members(&self) -> impl Iterator<Item = &str> {
+        self.members
+            .iter()
+            .filter(|(_, blocked)| **blocked)
+            .map(|(id, _)| id.as_str())
+    }
+}
+
 /// The cgroup v2 delegation contract, the same three files the privileged
 /// step installs and refuses to run without: a delegated cgroup is its
 /// directory plus its `cgroup.procs`, `cgroup.threads` and
@@ -6651,5 +6696,42 @@ mod tests {
             other => panic!("a dead endpoint reads as unknown, not {other:?}"),
         }
         clear_probe_listeners();
+    }
+
+    /// BEP-018: on the shared `host_ip` address the most restrictive
+    /// resident member wins. One blocked member blocks UDP to port 443 for
+    /// the cohort, and the block lifts when the last blocked member leaves.
+    #[test]
+    fn host_ip_cohort_quic_stance_most_restrictive_wins() {
+        use boxes::core::bep::{Quic443, Steering};
+
+        let mut cohort = CohortQuic443::default();
+        assert!(!cohort.blocked(), "an empty cohort blocks nothing");
+
+        // A box with no grant resolves `auto` to allowed.
+        cohort.join("plain", Quic443::Auto.blocks(false, Steering::Dns));
+        assert!(!cohort.blocked());
+
+        // A `dns`-steered grant box resolves `auto` to blocked, and costs
+        // the whole cohort UDP 443, whatever the other members say.
+        cohort.join("grant", Quic443::Auto.blocks(true, Steering::Dns));
+        cohort.join("open", Quic443::Allow.blocks(true, Steering::Dns));
+        assert!(cohort.blocked());
+        assert_eq!(cohort.blocking_members().collect::<Vec<_>>(), ["grant"]);
+
+        // A second blocked member keeps the block after the first leaves.
+        cohort.join("strict", Quic443::Block.blocks(false, Steering::Off));
+        cohort.leave("grant");
+        assert!(cohort.blocked());
+
+        // The block lifts when no resident member blocks.
+        cohort.leave("strict");
+        assert!(!cohort.blocked());
+
+        // A member that joins again replaces its stance.
+        cohort.join("plain", true);
+        assert!(cohort.blocked());
+        cohort.join("plain", false);
+        assert!(!cohort.blocked());
     }
 }
