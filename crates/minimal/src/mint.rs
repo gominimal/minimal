@@ -21,7 +21,8 @@
 //!
 //! The same control socket then registers the box with its declared egress
 //! and its address stance, so the proxy admits the box's requests to those
-//! authorities.
+//! authorities. Last, it submits one `mint` record for each member, which
+//! the proxy appends to its audit log (BEP-067).
 
 use std::fmt;
 use std::io::{self, BufRead as _, BufReader, Write as _};
@@ -298,6 +299,26 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Submits the `mint` record of one member for the box `box_id`, which
+    /// the proxy appends to its audit log (BEP-067). `identifier` names the
+    /// member, as `github:<instance>`.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the record.
+    pub fn record_mint(&mut self, box_id: &str, identifier: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::RecordMint {
+                box_id: box_id.to_owned(),
+                identifier: identifier.to_owned(),
+            },
+            "the box's audit record",
+        )?;
+        tracing::debug!(box_id, identifier, "the proxy recorded the member's mint");
+        Ok(())
+    }
+
     /// Registers the box `box_id` with its declared egress and its address
     /// stance.
     ///
@@ -433,8 +454,11 @@ pub struct GrantBox {
 /// `control` (BEP-005, BEP-063). `now` is the time of the mint, in seconds
 /// since the Unix epoch.
 ///
-/// The client's key is registered last, after every other step succeeded,
-/// so a failed mint leaves no key the proxy trusts and no box uses. When
+/// The client's key is registered after every other step succeeded, so a
+/// failed mint leaves no key the proxy trusts and no box uses. Then one
+/// `mint` record for each member goes to the proxy's audit log (BEP-067).
+/// A record the proxy does not take fails the mint, and the box is
+/// forgotten again. When
 /// the key's registration fails, the box is forgotten again, so a failed
 /// mint leaves neither a key nor a box behind. The
 /// sealed values leave this process only after this function returns, so
@@ -535,6 +559,15 @@ pub fn mint_and_register(
     if let Err(error) = control.register_client_key(key) {
         forget_on_a_new_connection(&control.path, &box_id, "its key was refused");
         return Err(error);
+    }
+    // BEP-067: one record for each member minted, through the proxy, the
+    // log's sole writer. The member names the held sign-in by its instance.
+    let identifier = format!("{}:{}", GITHUB.id, held.instance);
+    for _ in &minted {
+        if let Err(error) = control.record_mint(&box_id, &identifier) {
+            forget_on_a_new_connection(&control.path, &box_id, "its mint was not recorded");
+            return Err(error);
+        }
     }
     Ok(minted)
 }

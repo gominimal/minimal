@@ -3760,7 +3760,7 @@ mod mint_tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use bep::boxes::{BoxRegistry, Stance};
-    use bep::control::{Control, Registry};
+    use bep::control::{Control, Ledger, Registry};
     use bep::module::GITHUB;
     use bep::publish::{Identity, PublishedKey};
     use bep::seal::{Binding, Breadth, MemberKind, Mode, ProxyKey, ProxyPublicKey};
@@ -3829,10 +3829,12 @@ mod mint_tests {
         }
     }
 
-    /// A control socket served on its own runtime, with its registries.
+    /// A control socket served on its own runtime, with its registries and
+    /// the audit log it appends to.
     struct Served {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
+        audit: std::path::PathBuf,
         clients: Registry,
         boxes: BoxRegistry,
         _runtime: tokio::runtime::Runtime,
@@ -3841,6 +3843,10 @@ mod mint_tests {
     fn serve() -> Served {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
+        let audit = dir.path().join("audit");
+        let log = bep::audit::AuditLog::open(audit.join(bep::audit::segment_name(0))).unwrap();
+        let log: Arc<dyn bep::proxy::AuditWriter> = Arc::new(std::sync::Mutex::new(log));
+        let ledger = Ledger::new(log, bep::revoke::RevocationBook::new());
         let clients = Registry::default();
         let boxes = BoxRegistry::default();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3850,11 +3856,13 @@ mod mint_tests {
             .unwrap();
         let control = runtime
             .block_on(async { Control::bind(&path, Arc::clone(&clients), Arc::clone(&boxes)) })
-            .unwrap();
+            .unwrap()
+            .with_ledger(ledger);
         runtime.spawn(control.run());
         Served {
             _dir: dir,
             path,
+            audit,
             clients,
             boxes,
             _runtime: runtime,
@@ -4214,6 +4222,102 @@ mod mint_tests {
         drop(ProxyRegistration::new(gone, kept).unwrap());
     }
 
+    // BEP-067, BEP-043: the client's mint and a live box's destroy each
+    // append a record to the proxy's one audit log, over the control
+    // socket. The records chain, and `min box audit` reads them for the box.
+    // The destroy's line is the one minvmd sends
+    // (`crates/minvmd/src/box_registry.rs`).
+    #[test]
+    fn mint_and_destroy_append_audit_records() {
+        use std::io::{BufRead as _, Write as _};
+
+        let (_, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let mut two = grant_box(Stance::OwnIp);
+        two.grants.push("GITHUB_TOKEN".into());
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &two,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 2);
+
+        // The destroy: a revocation, then the box is forgotten.
+        let stream = std::os::unix::net::UnixStream::connect(&served.path).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        for line in [
+            format!(r#"{{"op":"record_revocation","box_id":"{BOX_ID}"}}"#),
+            format!(r#"{{"op":"forget_box","box_id":"{BOX_ID}"}}"#),
+        ] {
+            writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+            let mut answer = String::new();
+            reader.read_line(&mut answer).unwrap();
+            let reply: bep::control::Reply = serde_json_lenient::from_str(&answer).unwrap();
+            assert!(reply.ok, "{line}: {answer}");
+        }
+        assert!(served.boxes.get(BOX_HEX).is_none());
+
+        let batch = bep::audit::LogReader::new(&served.audit)
+            .read_new()
+            .unwrap();
+        let records: Vec<_> = batch.entries.iter().map(|e| &e.record).collect();
+        let kinds: Vec<_> = records.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                bep::audit::Kind::Mint,
+                bep::audit::Kind::Mint,
+                bep::audit::Kind::Revocation
+            ]
+        );
+        for record in &records {
+            assert_eq!(record.subject, BOX_HEX);
+        }
+        let identifier = format!("github:{instance}");
+        assert_eq!(records[0].identifier, identifier);
+        assert_eq!(records[2].marker.as_deref(), Some("revoked"));
+        // One chain: each record names the hash of the line before it.
+        assert_eq!(records[0].previous_hash, bep::audit::ZERO_HASH);
+        for pair in batch.entries.windows(2) {
+            assert_eq!(
+                pair[1].record.previous_hash,
+                bep::audit::line_hash(&pair[0].line)
+            );
+        }
+        // No token reaches the log.
+        for entry in &batch.entries {
+            assert!(!entry.line.contains("ghu_"), "{}", entry.line);
+            assert!(!entry.line.contains("ghr_"), "{}", entry.line);
+        }
+
+        // A second destroy of the same box appends nothing.
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    format_args!(r#"{{"op":"record_revocation","box_id":"{BOX_HEX}"}}"#)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut answer = String::new();
+        reader.read_line(&mut answer).unwrap();
+        assert!(answer.contains(r#""ok":true"#), "{answer}");
+        let again = bep::audit::LogReader::new(&served.audit)
+            .read_new()
+            .unwrap();
+        assert_eq!(again.entries.len(), 3);
+    }
+
     /// A control socket that registers and forgets boxes as the proxy does,
     /// and refuses every client key. Gives the socket and its boxes.
     fn serve_refusing_keys() -> (
@@ -4255,6 +4359,8 @@ mod mint_tests {
                             }
                             bep::control::Request::RegisterBox { .. } => "register_box",
                             bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RecordMint { .. } => "record_mint",
+                            bep::control::Request::RecordRevocation { .. } => "record_revocation",
                         };
                         served_ops.lock().unwrap().push(op.to_owned());
                         let reply = if op == "register_client_key" {
@@ -4341,6 +4447,8 @@ mod mint_tests {
                         bep::control::Request::RegisterClientKey { .. } => "register_client_key",
                         bep::control::Request::RegisterBox { .. } => "register_box",
                         bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RecordMint { .. } => "record_mint",
+                        bep::control::Request::RecordRevocation { .. } => "record_revocation",
                     };
                     served_ops.lock().unwrap().push(op.to_owned());
                     let reply = bep::control::handle_line(&line, &clients, &served_boxes);
