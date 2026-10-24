@@ -298,6 +298,24 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Has the proxy append the `mint` record of one member minted for the
+    /// box `box_id`, under the member's `identifier` (BEP-067).
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the record.
+    pub fn record_mint(&mut self, box_id: &str, identifier: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::RecordMint {
+                box_id: box_id.to_owned(),
+                identifier: identifier.to_owned(),
+            },
+            "the record of the box's sign-in reference",
+        )?;
+        Ok(())
+    }
+
     /// Registers the box `box_id` with its declared egress and its address
     /// stance.
     ///
@@ -429,8 +447,8 @@ pub struct GrantBox {
 }
 
 /// Mints and seals a sign-in reference for each of `grant_box`'s grants
-/// under `key`, and registers the box and then the key with the proxy over
-/// `control` (BEP-005, BEP-063). `now` is the time of the mint, in seconds
+/// under `key`, and registers the box, the `mint` record of each member and
+/// then the key with the proxy over `control` (BEP-005, BEP-063, BEP-067). `now` is the time of the mint, in seconds
 /// since the Unix epoch.
 ///
 /// The client's key is registered last, after every other step succeeded,
@@ -475,6 +493,7 @@ pub fn mint_and_register(
     let node = sealing.kid();
 
     let mut minted = Vec::with_capacity(grant_box.grants.len());
+    let mut identifiers = Vec::with_capacity(grant_box.grants.len());
     for grant in &grant_box.grants {
         let claims = sign_in_claims(
             &box_id,
@@ -485,6 +504,7 @@ pub fn mint_and_register(
             expiry,
             handle_id()?,
         );
+        identifiers.push(claims.identifier());
         let jws = Zeroizing::new(handle::sign(&key.0, &claims));
         let context = Context {
             box_id: box_id.clone(),
@@ -528,6 +548,14 @@ pub fn mint_and_register(
         }
         return Err(error);
     }
+    // BEP-067: the proxy, the audit log's sole writer, appends one `mint`
+    // record per member, named by the sign-in the member references.
+    for identifier in &identifiers {
+        if let Err(error) = control.record_mint(&box_id, identifier) {
+            forget_on_a_new_connection(&control.path, &box_id, "its mint was not recorded");
+            return Err(error);
+        }
+    }
     // BEP-063: the key is registered before a handle signed under it is
     // delivered. It goes last, so no failed step leaves it registered.
     // A failed key reply, a read timeout for one, can leave the late reply
@@ -565,8 +593,9 @@ fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
 ///
 /// The forget runs only on a failed creation. A Ctrl-C ends the process
 /// in `std::process::exit`, which runs no destructor, so it leaves the box
-/// at the proxy until the box's destroy forgets it
-/// (https://github.com/gominimal/minimal/issues/2277). Inside a
+/// at the proxy until the box's destroy forgets it: the VM host daemon
+/// sends `revoke_box` and then `forget_box` when it withdraws a live box.
+/// Inside a
 /// tokio runtime it runs on a blocking thread, so it never holds up a
 /// runtime worker. It waits at most [`FORGET_TIMEOUT`] for each read and
 /// write.
@@ -617,8 +646,8 @@ impl Drop for ProxyRegistration {
         match tokio::runtime::Handle::try_current() {
             // The runtime waits for its blocking threads before it shuts
             // down, so a runtime shutdown does not lose the forget. A
-            // Ctrl-C exits the process with no drop, and #2277 forgets
-            // that box at its destroy.
+            // Ctrl-C exits the process with no drop, and the box's destroy
+            // forgets that box.
             Ok(runtime) => drop(runtime.spawn_blocking(forget)),
             Err(_) => forget(),
         }

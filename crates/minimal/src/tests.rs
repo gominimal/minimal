@@ -4231,16 +4231,18 @@ mod mint_tests {
         let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
         std::thread::spawn(move || {
             let clients = Arc::new(std::sync::RwLock::new(bep::handle::ClientKeys::new()));
+            let recorder = bep::control::Recorder::in_memory();
             for stream in listener.incoming() {
                 let Ok(stream) = stream else {
                     return;
                 };
                 served_ops.lock().unwrap().push("connect".to_owned());
                 // The proxy serves each connection on its own task.
-                let (clients, served_boxes, served_ops) = (
+                let (clients, served_boxes, served_ops, recorder) = (
                     Arc::clone(&clients),
                     Arc::clone(&served_boxes),
                     Arc::clone(&served_ops),
+                    recorder.clone(),
                 );
                 std::thread::spawn(move || {
                     let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
@@ -4255,6 +4257,8 @@ mod mint_tests {
                             }
                             bep::control::Request::RegisterBox { .. } => "register_box",
                             bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RecordMint { .. } => "record_mint",
+                            bep::control::Request::RevokeBox { .. } => "revoke_box",
                         };
                         served_ops.lock().unwrap().push(op.to_owned());
                         let reply = if op == "register_client_key" {
@@ -4264,7 +4268,7 @@ mod mint_tests {
                                 error: Some("the key is not a P-256 public key".into()),
                             }
                         } else {
-                            bep::control::handle_line(&line, &clients, &served_boxes)
+                            bep::control::handle_request(&line, &clients, &served_boxes, &recorder)
                         };
                         let mut answer = serde_json_lenient::to_string(&reply).unwrap();
                         answer.push('\n');
@@ -4301,6 +4305,7 @@ mod mint_tests {
             [
                 "connect",
                 "register_box",
+                "record_mint",
                 "register_client_key",
                 "connect",
                 "forget_box"
@@ -4341,6 +4346,8 @@ mod mint_tests {
                         bep::control::Request::RegisterClientKey { .. } => "register_client_key",
                         bep::control::Request::RegisterBox { .. } => "register_box",
                         bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RecordMint { .. } => "record_mint",
+                        bep::control::Request::RevokeBox { .. } => "revoke_box",
                     };
                     served_ops.lock().unwrap().push(op.to_owned());
                     let reply = bep::control::handle_line(&line, &clients, &served_boxes);
@@ -4379,6 +4386,121 @@ mod mint_tests {
         assert!(matches!(err, MintError::Control(_)), "{err}");
         assert_eq!(*ops.lock().unwrap(), ["register_box", "forget_box"]);
         assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    // BEP-067, BEP-043: the client's mint and a live box's destroy each
+    // append a record to the proxy's audit log, over the control socket.
+    // The mint appends one `mint` record per member. The VM host daemon's
+    // withdrawal of the live box appends its `revocation` record, then the
+    // proxy forgets the box, and the destroy does not wait on either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mint_and_destroy_append_audit_records() {
+        use bep::audit::{Decision, Kind};
+        use bep::control::Recorder;
+        use bep::revoke::RevocationBook;
+
+        // The proxy's control socket, with its audit log in memory.
+        let dir = tempfile::tempdir().unwrap();
+        let bep_path = dir.path().join("bep/control.sock");
+        let clients = Registry::default();
+        let bep_boxes = BoxRegistry::default();
+        let audit: Arc<std::sync::Mutex<Vec<Decision>>> = Arc::default();
+        let book = RevocationBook::new();
+        let control = Control::bind(&bep_path, Arc::clone(&clients), Arc::clone(&bep_boxes))
+            .unwrap()
+            .recording(Recorder::new(audit.clone(), book.clone()));
+        tokio::spawn(control.run());
+
+        // The VM host daemon's real registry and control server, which
+        // record a live box's revocation on that socket.
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+            .feeding_proxy_attachments(minvmd::bep_attach::Attachments::new())
+            .with_proxy_control(Some(bep_path.clone()));
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry,
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let policy = boxes::BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let registered = minimal_client::box_registration::register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("the control server answers the registration")
+        .expect("an own-address box registers");
+        let id = registered.box_id.expect("the reply carries the box's id");
+        let hex: String = id.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+
+        // The mint: two grants, so two members and two `mint` records.
+        let (_, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let grants = GrantBox {
+            box_id: hex.clone(),
+            grants: vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
+            ..grant_box(Stance::OwnIp)
+        };
+        let path = bep_path.clone();
+        let minted = tokio::task::spawn_blocking(move || {
+            let mut control = ControlClient::connect(&path).unwrap();
+            mint_and_register(
+                &keychain,
+                &identity,
+                std::path::Path::new("identity.json"),
+                &mut control,
+                &ClientKey::generate().unwrap(),
+                &grants,
+                NOW,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(minted.len(), 2);
+        let mint = bep::control::mint_record(&hex, &format!("{}:{instance}", GITHUB.id));
+        assert_eq!(*audit.lock().unwrap(), [mint.clone(), mint.clone()]);
+        assert!(bep_boxes.get(&hex).is_some());
+        assert!(!book.covers(&hex));
+
+        // The destroy: the creator withdraws the live box's row.
+        minimal_client::box_registration::withdraw_box_row(
+            Some(sock_path),
+            Some("web"),
+            Some(registered.addresses),
+            Some(id),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while bep_boxes.get(&hex).is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            bep_boxes.get(&hex).is_none(),
+            "the proxy forgot the destroyed box"
+        );
+        assert!(
+            book.covers(&hex),
+            "the destroyed box's revocation is in force"
+        );
+        let records = audit.lock().unwrap().clone();
+        assert_eq!(
+            records,
+            [mint.clone(), mint, bep::revoke::revocation_record(&hex)]
+        );
+        assert_eq!(records[2].kind, Kind::Revocation);
     }
 
     fn github_secrets() -> boxes::core::bep::SecretGrants {
