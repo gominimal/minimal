@@ -934,7 +934,7 @@ impl StoreDenySet<'_> {
 /// Why a store rule was refused when the configuration was read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreRuleRefusal {
-    /// BEP-034: an upstream is a deep module's host.
+    /// BEP-034: an upstream is a deep module's host or a name under it.
     ModuleHost {
         /// The host, as the rule writes it.
         host: String,
@@ -1047,15 +1047,16 @@ fn store_rule_refusal(
                 value: written.clone(),
             });
         }
-        if deny.module_hosts.iter().any(|m| normalize_host(m) == host) {
+        if deny.module_hosts.iter().any(|m| is_within(&host, m)) {
             return Some(StoreRuleRefusal::ModuleHost {
                 host: written.clone(),
             });
         }
-        if deny.infrastructure.iter().any(|domain| {
-            let domain = normalize_host(domain);
-            host == domain || host.ends_with(&format!(".{domain}"))
-        }) {
+        if deny
+            .infrastructure
+            .iter()
+            .any(|domain| is_within(&host, domain))
+        {
             return Some(StoreRuleRefusal::MinimalInfrastructure {
                 host: written.clone(),
             });
@@ -1330,6 +1331,12 @@ fn is_http_token(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+}
+
+/// Whether the normalised `host` is `domain` or a name under it.
+fn is_within(host: &str, domain: &str) -> bool {
+    let domain = normalize_host(domain);
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 fn normalize_host(host: &str) -> String {
@@ -2102,6 +2109,20 @@ mod tests {
             r.header = Some(header.into());
             let (_, refused) = check_store_rules(StoreRules::from([("x".into(), r)]), "c", deny());
             assert_eq!(refused.len(), 1, "{header} must be refused");
+        }
+    }
+
+    /// BEP-034: a name under a module host is refused as the module host.
+    #[test]
+    fn store_rule_in_deny_set_is_refused_under_module_host() {
+        for host in ["gist.github.com", "www.GitHub.com", "x.api.github.com:443"] {
+            let (_, refused) =
+                check_store_rules(StoreRules::from([("x".into(), rule(&[host]))]), "c", deny());
+            assert_eq!(
+                refused.first().map(|r| &r.reason),
+                Some(&StoreRuleRefusal::ModuleHost { host: host.into() }),
+                "{host}"
+            );
         }
     }
 
