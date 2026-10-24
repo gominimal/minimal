@@ -1,5 +1,6 @@
-//! The proxy's control socket: client key registrations (BEP-063), and the
-//! boxes the proxy serves (BEP-020, BEP-022).
+//! The proxy's control socket: client key registrations (BEP-063), the
+//! boxes the proxy serves (BEP-020, BEP-022), and the mint and revocation
+//! records of a box's trail (BEP-043, BEP-067).
 //!
 //! The control socket is a unix socket of its own, separate from the
 //! listener that takes box connections ([`crate::listener`]). It is mode
@@ -27,6 +28,22 @@
 //! < {"ok":true}
 //! ```
 //!
+//! The client submits one `mint` record for each member it mints. The box's
+//! creator submits a `revocation` record when it destroys a live box. The
+//! proxy appends each one to its audit log, the log's sole writer, so the
+//! records chain with its own decisions. A revocation is in force from its
+//! reply on ([`crate::revoke`]):
+//!
+//! ```text
+//! > {"op":"record_mint","box_id":"<id>","identifier":"github:<instance>"}
+//! < {"ok":true}
+//! > {"op":"record_revocation","box_id":"<id>"}
+//! < {"ok":true}
+//! ```
+//!
+//! A second revocation of the same box changes nothing and appends nothing,
+//! so a creator can send it again after a lost reply.
+//!
 //! A box id is 32 hex digits, or a UUID with its hyphens. The proxy stores it
 //! as 32 lowercase hex digits, the form the listener names the box by, and
 //! refuses any other text.
@@ -49,10 +66,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::audit::{self, Decision, Kind, Mapping, Outcome};
 use crate::boxes::{BoxRegistry, Boxes, Stance};
 use crate::handle::{ClientKeys, parse_authority};
 use crate::listener::bind_owner_only;
-use crate::redeem::Authority;
+use crate::proxy::AuditWriter;
+use crate::redeem::{Authority, Check};
+use crate::revoke::RevocationBook;
 
 /// The longest request line the control socket reads.
 pub const MAX_LINE_LEN: usize = 16 * 1024;
@@ -86,6 +106,88 @@ pub enum Request {
         /// The box id.
         box_id: String,
     },
+    /// Record the mint of one member for a box (BEP-067).
+    RecordMint {
+        /// The box id.
+        box_id: String,
+        /// The member's identifier, such as `github:<instance>`.
+        identifier: String,
+    },
+    /// Record the destroy of a live box, which revokes every sealed value
+    /// that names it (BEP-043).
+    RecordRevocation {
+        /// The box id.
+        box_id: String,
+    },
+}
+
+/// The longest member identifier a mint record takes.
+pub const MAX_IDENTIFIER_LEN: usize = 128;
+
+/// Where the control socket records a box's mints and revocations: the
+/// proxy's audit log and its revocation book.
+#[derive(Clone)]
+pub struct Ledger {
+    audit: Arc<dyn AuditWriter>,
+    revocations: RevocationBook,
+}
+
+impl std::fmt::Debug for Ledger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ledger")
+            .field("revocations", &self.revocations)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Ledger {
+    /// A ledger that appends to `audit` and puts revocations in
+    /// `revocations`.
+    #[must_use]
+    pub fn new(audit: Arc<dyn AuditWriter>, revocations: RevocationBook) -> Self {
+        Self { audit, revocations }
+    }
+
+    fn mint(&self, box_id: &str, identifier: &str) {
+        self.audit.write(&Decision {
+            kind: Kind::Mint,
+            box_id: box_id.to_owned(),
+            authority: audit::NONE.to_owned(),
+            identifier: Some(identifier.to_owned()),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: Outcome::Admit,
+            marker: None,
+        });
+        tracing::debug!(box_id, identifier, "recorded a mint");
+    }
+
+    fn revoke(&self, box_id: &str) {
+        // In force before the record is written: the book is what refuses.
+        if !self.revocations.record(box_id) {
+            tracing::debug!(box_id, "the box's revocation is already in force");
+            return;
+        }
+        self.audit.write(&Decision {
+            kind: Kind::Revocation,
+            box_id: box_id.to_owned(),
+            authority: audit::NONE.to_owned(),
+            identifier: None,
+            mapping: Mapping::ModuleUnmapped,
+            outcome: Outcome::Refuse,
+            marker: Some(Check::Revoked.marker().to_owned()),
+        });
+        tracing::info!(box_id, "recorded a revocation for a destroyed box");
+    }
+}
+
+/// Whether `text` is a member identifier a mint record can carry: a module
+/// id and an instance, in letters, digits and `:-_.` only.
+fn valid_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_IDENTIFIER_LEN
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":-_.".contains(&b))
 }
 
 /// One reply line.
@@ -149,9 +251,31 @@ fn normalise_box_id(text: &str) -> Option<String> {
 }
 
 /// Does one request line against the client key `registry` and the box
-/// registry `boxes`.
+/// registry `boxes`, with no ledger: a mint or revocation record is
+/// refused.
 #[must_use]
 pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> Reply {
+    handle(line, registry, boxes, None)
+}
+
+/// Does one request line against the client key `registry`, the box
+/// registry `boxes` and `ledger`.
+#[must_use]
+pub fn handle_line_with(
+    line: &str,
+    registry: &RwLock<ClientKeys>,
+    boxes: &Boxes,
+    ledger: &Ledger,
+) -> Reply {
+    handle(line, registry, boxes, Some(ledger))
+}
+
+fn handle(
+    line: &str,
+    registry: &RwLock<ClientKeys>,
+    boxes: &Boxes,
+    ledger: Option<&Ledger>,
+) -> Reply {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(err) => return Reply::refused(format!("the request is not valid: {err}")),
@@ -202,6 +326,29 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> 
             boxes.forget(&box_id);
             Reply::done()
         }
+        Request::RecordMint { box_id, identifier } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
+            if !valid_identifier(&identifier) {
+                return Reply::refused("the member identifier is not a module and an instance");
+            }
+            let Some(ledger) = ledger else {
+                return Reply::refused("this proxy keeps no audit log");
+            };
+            ledger.mint(&box_id, &identifier);
+            Reply::done()
+        }
+        Request::RecordRevocation { box_id } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
+            let Some(ledger) = ledger else {
+                return Reply::refused("this proxy keeps no audit log");
+            };
+            ledger.revoke(&box_id);
+            Reply::done()
+        }
     }
 }
 
@@ -211,6 +358,7 @@ pub struct Control {
     inner: UnixListener,
     registry: Registry,
     boxes: BoxRegistry,
+    ledger: Option<Ledger>,
 }
 
 impl Control {
@@ -225,7 +373,16 @@ impl Control {
             inner: bind_owner_only(path)?,
             registry,
             boxes,
+            ledger: None,
         })
+    }
+
+    /// This socket, recording mints and revocations in `ledger`. Without
+    /// one it refuses them.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Ledger) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     /// Serves connections until the accept fails.
@@ -238,13 +395,13 @@ impl Control {
             let stream = crate::listener::accept(&self.inner, "control socket").await?;
             let registry = Arc::clone(&self.registry);
             let boxes = Arc::clone(&self.boxes);
-            tokio::spawn(serve(stream, registry, boxes));
+            tokio::spawn(serve(stream, registry, boxes, self.ledger.clone()));
         }
     }
 }
 
 /// Serves one control connection, line by line.
-async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
+async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry, ledger: Option<Ledger>) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
     let own = unsafe { libc::geteuid() };
@@ -275,7 +432,7 @@ async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
             let _ = write_reply(&mut write, &Reply::refused("the request is too long")).await;
             return;
         }
-        let reply = handle_line(&line, &registry, &boxes);
+        let reply = handle(&line, &registry, &boxes, ledger.as_ref());
         if write_reply(&mut write, &reply).await.is_err() {
             return;
         }
