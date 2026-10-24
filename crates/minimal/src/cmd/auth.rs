@@ -301,11 +301,12 @@ pub(crate) async fn run_logout(
     Ok(LoggedOut::Deleted { confirmed })
 }
 
-/// Ask GitHub to delete the App's grant for the signed-in user, which
-/// revokes the token and its refresh token. `Err` says why GitHub did not
-/// confirm, for the log. It never holds the token.
+/// Ask GitHub to revoke this host's token, which also voids its refresh
+/// token. The App's grant for the account stays, so the account's other
+/// hosts stay signed in. `Err` says why GitHub did not confirm, for the
+/// log. It never holds the token.
 async fn revoke(endpoints: &Endpoints, secret: &str, token: &str) -> Result<(), String> {
-    let url = format!("{}/applications/{CLIENT_ID}/grant", endpoints.api);
+    let url = format!("{}/applications/{CLIENT_ID}/token", endpoints.api);
     let http = reqwest::Client::builder()
         .user_agent(concat!("min/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(15))
@@ -858,7 +859,7 @@ mod tests {
         Flaky,
         /// `authorization_pending` once, then a token in an unexpected form.
         OddToken,
-        /// As `Pending`, but the revocation of a grant is refused.
+        /// As `Pending`, but the revocation of the token is refused.
         RevokeRefused,
     }
 
@@ -945,7 +946,7 @@ mod tests {
                         assert!(headers.contains(&format!("bearer {}", access.to_lowercase())));
                         format!(r#"{{"login":"{account}","id":1}}"#)
                     }
-                    p if p == format!("/applications/{CLIENT_ID}/grant") => {
+                    p if p == format!("/applications/{CLIENT_ID}/token") => {
                         assert_eq!(method, "DELETE");
                         // Basic auth: the client id and the test secret.
                         let basic = base64::engine::general_purpose::STANDARD
@@ -1512,7 +1513,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.starts_with(&format!("DELETE /applications/{CLIENT_ID}/grant")))
+            .filter(|r| r.starts_with(&format!("DELETE /applications/{CLIENT_ID}/token")))
             .cloned()
             .collect()
     }
