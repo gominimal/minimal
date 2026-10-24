@@ -1,6 +1,6 @@
 name: metrics
 
-# Architectural-health snapshot (docs/specs/30-spec-quality-metrics), in a
+# Architectural-health snapshot (docs/specs/31-spec-quality-metrics), in a
 # workflow of its own so it runs on demand as well as nightly: dispatch it
 # alone, or nightly-tests.yml calls it via workflow_call. Only a run on main
 # publishes to `metrics-data`; a run on another branch still uploads the

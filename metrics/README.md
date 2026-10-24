@@ -1,7 +1,7 @@
 # Quality metrics
 
 The architectural-health measurement of this workspace
-([spec 30](../docs/specs/30-spec-quality-metrics/30-spec-quality-metrics.md)).
+([spec 31](../docs/specs/31-spec-quality-metrics/31-spec-quality-metrics.md)).
 `just metrics` writes one snapshot of the tree; the nightly run adds its
 snapshot to the `metrics-data` branch; a change is graded against the newest
 snapshot and thresholds of its base ref. This directory holds what a person

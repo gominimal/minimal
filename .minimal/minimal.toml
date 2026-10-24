@@ -48,7 +48,7 @@ inherit_cwd = true
 exec = "cargo clippy --all-targets -- -D warnings"
 inherit_cwd = true
 
-# Mutation-test the lines this branch changed (spec 30, QM-017). Runs in the
+# Mutation-test the lines this branch changed (spec 31, QM-017). Runs in the
 # Linux sandbox, where the baseline test suite is green (the spec_hasher hash
 # assertions that fail on macOS pass here), which cargo-mutants requires
 # before it tests a single mutant. The diff against the merge-base bounds
@@ -120,7 +120,7 @@ if [ -n "$crates" ]; then
   cargo nextest run --locked $args
 fi
 
-# The quality gate (spec 30), the same run the `quality-gate` task below
+# The quality gate (spec 31), the same run the `quality-gate` task below
 # makes: no compiler, seconds, exit 2 on a regression against the base ref.
 scripts/metrics/run.sh gate --out .scratch/metrics/quality-gate
 """
@@ -132,7 +132,7 @@ scripts/metrics/run.sh gate --out .scratch/metrics/quality-gate
 # --no-deps` is the one cargo call, and cargo-shear is left to `just
 # metrics-diff` because it probes rustc — and ends stdout with one line,
 # `quality-gate: <verdict> report=<path> sha256=<hex>`, the hash being
-# report.json's, which carries no times (spec 30, QM-012 and QM-N01). The
+# report.json's, which carries no times (spec 31, QM-012 and QM-N01). The
 # report itself is metrics/README.md "Grading a change".
 [tasks.quality-gate]
 description = "grade the change against its base ref without compiling; the review runtime's probe"

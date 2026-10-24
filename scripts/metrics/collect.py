@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn raw tool output into one snapshot document (spec 30).
+"""Turn raw tool output into one snapshot document (spec 31).
 
 `run.sh` runs the tools and hands their files here; this file knows the
 shape of each tool's output, attributes every finding to a crate, evaluates

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Crate-layer direction check over `cargo metadata` (spec 30, QM-007, QM-008).
+"""Crate-layer direction check over `cargo metadata` (spec 31, QM-007, QM-008).
 
 Reads `metrics/layers.toml` and the workspace's `cargo metadata`, and reports
 every normal dependency edge between workspace crates that the layer table

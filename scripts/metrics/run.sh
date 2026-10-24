@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Architectural-health snapshot: run the collectors, hand their output to
-# collect.py, and in the grading modes grade the result with diff.py (spec 30).
+# collect.py, and in the grading modes grade the result with diff.py (spec 31).
 #
 # Usage: scripts/metrics/run.sh MODE [BASE] [OPTIONS] [-p CRATE ...]
 #

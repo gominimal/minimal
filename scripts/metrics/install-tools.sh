@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the metrics pipeline's tools at their pinned versions (spec 30).
+# Install the metrics pipeline's tools at their pinned versions (spec 31).
 #
 # One pin per tool, here and nowhere else. `run.sh` records the versions it
 # finds into the snapshot, so a reader can tell a drifted tool from a

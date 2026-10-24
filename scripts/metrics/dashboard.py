@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the quality dashboard from a snapshot history (spec 30, QM-016).
+"""Render the quality dashboard from a snapshot history (spec 31, QM-016).
 
 Reads every `YYYY-MM-DD-<sha7>.json` in the history directory (the file
 names sort chronologically) and writes one self-contained `index.html`:

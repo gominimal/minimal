@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# metrics_test.sh — harness for scripts/metrics/ (spec 30).
+# metrics_test.sh — harness for scripts/metrics/ (spec 31).
 #
 # Every case runs over fixtures under scripts/metrics/testdata; no tool is
 # invoked, no crate is compiled, no network. Cases are named after the

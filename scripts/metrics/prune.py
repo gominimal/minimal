@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prune a snapshot history: daily for ninety days, then monthly (spec 30, QM-015).
+"""Prune a snapshot history: daily for ninety days, then monthly (spec 31, QM-015).
 
 The history is a directory of `YYYY-MM-DD-<sha7>.json` files, one per
 nightly run, so the file name alone says when a snapshot was taken and

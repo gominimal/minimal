@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot schema version 1 (spec 30, QM-001).
+"""Snapshot schema version 1 (spec 31, QM-001).
 
 A hand-rolled validator, stdlib only: the one dependency a JSON Schema
 library would add is not worth an install step on every host that runs

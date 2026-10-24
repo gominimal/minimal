@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grade a head snapshot against its base ref (spec 30, QM-009 to QM-013).
+"""Grade a head snapshot against its base ref (spec 31, QM-009 to QM-013).
 
 `run.sh gate` and `run.sh diff` write a snapshot of the working tree with
 collect.py and then hand it here. This file reads two things the change

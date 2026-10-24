@@ -1,4 +1,4 @@
-# Quality thresholds (spec 30). `scripts/metrics/collect.py` evaluates these
+# Quality thresholds (spec 31). `scripts/metrics/collect.py` evaluates these
 # against a snapshot; `scripts/metrics/diff.py` grades a change against the
 # newest snapshot of its base ref. Gate names are dotted paths into the
 # snapshot's `workspace` and `layers` blocks.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish one snapshot to the metrics history ref (spec 30, QM-014).
+# Publish one snapshot to the metrics history ref (spec 31, QM-014).
 #
 # The history is the orphan branch `metrics-data`: `history/<date>-<sha7>.json`
 # per nightly run plus a README, nothing else, unprotected, and never main.
@@ -98,7 +98,7 @@ else
     cat > "$work/wt/README.md" <<'EOF'
 # metrics-data
 
-The quality-metrics history of `gominimal/minimal` (spec 30). One snapshot per
+The quality-metrics history of `gominimal/minimal` (spec 31). One snapshot per
 nightly run under `history/`, named by date and short commit, written by
 `scripts/metrics/publish-snapshot.sh` from the nightly workflow. Nothing else
 lives here, and nothing here is edited by hand: the gate reads the newest
