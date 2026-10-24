@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use boxes::core::bep::{STORE_RULES_TABLE, StoreDenySet, StoreRules, check_store_rules};
+use boxes::core::bep::{StoreDenySet, StoreRules, check_store_rules};
 
 use crate::GlobalArgs;
 
@@ -25,16 +25,19 @@ pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
 /// disk twice.
 ///
 /// It also reads `[secret-store-rules]` and prints each refused rule on
-/// stderr, as [`read_client_config_and_store_rules`] does, once per process.
+/// stderr, as [`read_client_config_and_store_rules`] does, once per file
+/// in a process.
 pub fn read_client_config(
     global: &GlobalArgs,
 ) -> Result<boxes::client::config::Config, anyhow::Error> {
     Ok(read_client_config_and_store_rules(global)?.0)
 }
 
-/// Read the client config and its `[secret-store-rules]` once. Each rule the
-/// deny set refuses (BEP-034) is printed on stderr and left out of the
-/// returned rules. The refusals print on the first read in a process only,
+/// Read the client config and the `[secret-store-rules]` of the user and
+/// the organization client configuration. Each rule the deny set refuses
+/// (BEP-034) is printed on stderr, naming its file, and left out of the
+/// returned rules. A user rule replaces an organization rule for the same
+/// item. The refusals of a file print on its first read in a process only,
 /// so a command that reads the config more than once prints each one once.
 ///
 /// # Errors
@@ -43,20 +46,32 @@ pub fn read_client_config(
 pub fn read_client_config_and_store_rules(
     global: &GlobalArgs,
 ) -> Result<(boxes::client::config::Config, StoreRules), anyhow::Error> {
-    let cfg_path = resolve_minimal_config_dir(global).join("config.toml");
-    let (config, rules) = read_config_parts(&cfg_path)?;
-    static PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let rules = if PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        refuse_store_rules(rules, &cfg_path, &mut std::io::sink())
-    } else {
-        refuse_store_rules(rules, &cfg_path, &mut std::io::stderr())
-    };
+    let user = resolve_minimal_config_dir(global).join("config.toml");
+    let (config, user_rules) = read_config_parts(&user)?;
+    let (_, org_rules) = read_config_parts(Path::new(ORGANIZATION_CONFIG_PATH))?;
+    let mut rules = refuse_store_rules_once(org_rules, Path::new(ORGANIZATION_CONFIG_PATH));
+    rules.extend(refuse_store_rules_once(user_rules, &user));
     Ok((config, rules))
 }
 
+/// [`refuse_store_rules`] to stderr on the first read of `path` in this
+/// process, and to nowhere after it.
+fn refuse_store_rules_once(rules: StoreRules, path: &Path) -> StoreRules {
+    static PRINTED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = PRINTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    if first {
+        refuse_store_rules(rules, path, &mut std::io::stderr())
+    } else {
+        refuse_store_rules(rules, path, &mut std::io::sink())
+    }
+}
+
 /// Read the client config at `path` and take its `[secret-store-rules]`
-/// table out before the rest is parsed. A missing file is the default
-/// config with no rules.
+/// out of it. A missing file is the default config with no rules.
 ///
 /// # Errors
 ///
@@ -70,20 +85,12 @@ pub fn read_config_parts(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => anyhow::bail!("read `{}`: {e}", path.display()),
     };
-    let mut table: toml::Table =
+    let mut config: boxes::client::config::Config =
         toml::from_str(&text).map_err(|e| anyhow::anyhow!("parse `{}`: {e}", path.display()))?;
-    let rules: StoreRules = match table.remove(STORE_RULES_TABLE) {
-        None => StoreRules::new(),
-        Some(value) => value.try_into().map_err(|e| {
-            anyhow::anyhow!("parse `{}`: [{STORE_RULES_TABLE}]: {e}", path.display())
-        })?,
-    };
-    let config: boxes::client::config::Config = toml::Value::Table(table)
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("parse `{}`: {e}", path.display()))?;
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config `{}`: {e}", path.display()))?;
+    let rules = std::mem::take(&mut config.secret_store_rules);
     Ok((config, rules))
 }
 
@@ -232,5 +239,27 @@ mod tests {
                  secret can never be sent to. Remove or change the rule.\n"
             )
         );
+    }
+
+    /// A config.toml that holds `[secret-store-rules]` still parses through
+    /// the reader the attach path uses, which keeps the rules in `Config`.
+    #[test]
+    fn store_rules_parse_through_attach_reader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\n\
+             header = \"Authorization\"\n",
+        )
+        .expect("write config.toml");
+        let config = boxes::client::config::read_config_or_default(&path).expect("parses");
+        assert_eq!(
+            config.secret_store_rules.keys().collect::<Vec<_>>(),
+            ["claude"]
+        );
+        let (config, rules) = read_config_parts(&path).expect("parses");
+        assert!(config.secret_store_rules.is_empty());
+        assert_eq!(rules.keys().collect::<Vec<_>>(), ["claude"]);
     }
 }
