@@ -377,6 +377,13 @@ fn state_file(control: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// How long `bep serve` tries again to take its state while the lock is
+/// busy.
+const CLAIM_RETRY: Duration = Duration::from_secs(2);
+
+/// How long `bep serve` waits between two tries to take its state.
+const CLAIM_STEP: Duration = Duration::from_millis(50);
+
 /// What a serving proxy keeps on disk so that `bep --rotate-signing` can
 /// reach it: its process id, in a file it holds locked while it runs, and
 /// the fingerprint of the signing CA in use.
@@ -388,10 +395,17 @@ struct ServeState {
 
 impl ServeState {
     /// Takes the lock beside the control socket `control` for the process
-    /// `pid`, whose signing CA is `signing`. Gives `None` when another
-    /// serving proxy holds it. Refuses a directory that another user owns
-    /// or can write, and a symlink at the lock path.
-    fn claim(control: &Path, pid: u32, signing: &[u8]) -> io::Result<Option<Self>> {
+    /// `pid`, whose signing CA is `signing`. Tries again for up to `retry`
+    /// while the lock is busy, because `bep --rotate-signing` holds a shared
+    /// lock for a moment when it probes a stopped proxy. Gives `None` when
+    /// another serving proxy still holds it. Refuses a directory that
+    /// another user owns or can write, and a symlink at the lock path.
+    fn claim(
+        control: &Path,
+        pid: u32,
+        signing: &[u8],
+        retry: Duration,
+    ) -> io::Result<Option<Self>> {
         let dir = control
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
@@ -416,10 +430,18 @@ impl ServeState {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(state_file(control, SERVE_LOCK))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        let deadline = std::time::Instant::now() + retry;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(CLAIM_STEP);
+                }
+                Err(std::fs::TryLockError::Error(err)) => return Err(err),
+            }
         }
         lock.set_len(0)?;
         let state = Self {
@@ -497,7 +519,11 @@ fn request_rotation(
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(not_running()),
         Err(err) => return Err(format!("bep did not read {}: {err}", lock_path.display())),
     };
-    match lock.try_lock_shared() {
+    let probe = lock.try_lock_shared();
+    // Release the probe before anything else, so a `bep serve` that starts
+    // now does not find the lock busy.
+    drop(lock);
+    match probe {
         // Nothing holds the lock, so the file is from a proxy that stopped.
         Ok(()) => return Err(not_running()),
         Err(std::fs::TryLockError::WouldBlock) => {}
@@ -660,7 +686,7 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
 /// serves and renews its signing CA.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn claim_state(control: &Path, signing: &[u8]) -> Option<Arc<ServeState>> {
-    match ServeState::claim(control, std::process::id(), signing) {
+    match ServeState::claim(control, std::process::id(), signing, CLAIM_RETRY) {
         Ok(Some(state)) => Some(Arc::new(state)),
         Ok(None) => {
             tracing::warn!(control = %control.display(), "another `bep serve` holds the state; `bep --rotate-signing` reaches that one");
@@ -1058,20 +1084,38 @@ mod tests {
         let lock_path = state_file(&control, SERVE_LOCK);
         std::os::unix::fs::symlink(&victim, &lock_path).unwrap();
         assert!(
-            ServeState::claim(&control, 4242, &in_use).is_err(),
+            ServeState::claim(&control, 4242, &in_use, Duration::ZERO).is_err(),
             "claim followed a symlink at the lock"
         );
         std::fs::remove_file(&lock_path).unwrap();
         std::os::unix::fs::symlink(&victim, state_file(&fingerprint_path, "new")).unwrap();
 
-        let state = ServeState::claim(&control, 4242, &in_use).unwrap().unwrap();
+        // A `bep --rotate-signing` that holds a shared lock for a moment
+        // does not cost the starting proxy its state.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        reader.try_lock_shared().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(reader);
+        });
+        let state = ServeState::claim(&control, 4242, &in_use, CLAIM_RETRY)
+            .unwrap()
+            .expect("claim gave up while a reader held the lock for a moment");
+        release.join().unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(
             std::fs::read_to_string(&fingerprint_path).unwrap(),
             certificate_fingerprint(&in_use)
         );
         assert!(
-            ServeState::claim(&control, 4343, &in_use)
+            ServeState::claim(&control, 4343, &in_use, Duration::ZERO)
                 .unwrap()
                 .is_none(),
             "a second proxy took the state of a running one"
@@ -1080,7 +1124,9 @@ mod tests {
         let refused = request_rotation(&other, |_| unreachable!(), ROTATE_TIMEOUT);
         assert!(refused.unwrap_err().contains("no `bep serve` is running"));
         assert!(
-            ServeState::claim(&other, 4444, &in_use).unwrap().is_some(),
+            ServeState::claim(&other, 4444, &in_use, Duration::ZERO)
+                .unwrap()
+                .is_some(),
             "two control sockets share one lock"
         );
         // A directory that another user can write is refused.
@@ -1090,7 +1136,7 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o777);
         std::fs::set_permissions(&loose, mode).unwrap();
         assert!(
-            ServeState::claim(&loose.join("control.sock"), 4545, &in_use).is_err(),
+            ServeState::claim(&loose.join("control.sock"), 4545, &in_use, Duration::ZERO).is_err(),
             "claim wrote state in a directory another user can write"
         );
 
