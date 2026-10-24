@@ -23,6 +23,7 @@
 //! issued is the anchor of the CA that signs each leaf.
 
 use std::io::{self, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -390,13 +391,17 @@ impl ServeState {
     /// `pid`. Gives `None` when another serving proxy holds it.
     fn claim(control: &Path, pid: u32) -> io::Result<Option<Self>> {
         if let Some(dir) = control.parent() {
-            std::fs::create_dir_all(dir)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
         }
         let mut lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(state_file(control, SERVE_LOCK))?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -469,6 +474,15 @@ fn request_rotation(
             return Err(format!("bep did not read {}: {err}", lock_path.display()));
         }
     }
+    // Signal only a process that this user recorded. Another user who can
+    // write the file can name any process in it.
+    if let Some(unsafe_path) = not_private(&lock_path) {
+        return Err(format!(
+            "The signing certificate was not rotated, because another user owns or can write {}. \
+             Run `bep --rotate-signing` as the user that runs `bep serve`, or make that path writable only by that user.",
+            unsafe_path.display()
+        ));
+    }
     let pid = std::fs::read_to_string(&lock_path)
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok())
@@ -505,6 +519,24 @@ fn request_rotation(
     }
 }
 
+/// The first of `lock_path` and its directory that another user owns or can
+/// write, or that bep cannot inspect. `None` when both are private to the
+/// caller.
+fn not_private(lock_path: &Path) -> Option<PathBuf> {
+    // SAFETY: `geteuid` takes no argument and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let dir = lock_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    [lock_path, dir]
+        .into_iter()
+        .find_map(|path| match std::fs::metadata(path) {
+            Ok(meta) if meta.uid() == me && meta.mode() & 0o022 == 0 => None,
+            _ => Some(path.to_path_buf()),
+        })
+}
+
 /// Asks the process `pid` to rotate its signing CA, with SIGUSR1.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn signal_rotation(pid: u32) -> io::Result<()> {
@@ -523,6 +555,10 @@ fn signal_rotation(pid: u32) -> io::Result<()> {
 
 /// How long before the signing CA expires `bep serve` renews it.
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The longest `bep serve` sleeps before it checks the signing CA expiry
+/// again.
+const RENEW_CHECK: Duration = Duration::from_secs(60 * 60);
 
 /// How long `bep serve` waits to try again after a renewal fails.
 const RENEW_RETRY: Duration = Duration::from_secs(60 * 60);
@@ -552,9 +588,12 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
     std::thread::spawn(move || {
         loop {
             let expiry = expiry_of(&ca);
-            std::thread::sleep(renewal_wait(expiry, SystemTime::now()));
-            // A rotation on request moves the expiry. Wait for the new one.
-            if expiry_of(&ca) != expiry {
+            // Sleep in short steps and read the clock again after each. A
+            // sleep does not count the time a machine is suspended, and a
+            // rotation on request moves the expiry.
+            let wait = renewal_wait(expiry, SystemTime::now());
+            if !wait.is_zero() {
+                std::thread::sleep(wait.min(RENEW_CHECK));
                 continue;
             }
             match rotate(&ca, state.as_deref(), SystemTime::now()) {
@@ -1017,6 +1056,21 @@ mod tests {
             certificate_fingerprint(ca_now.signing())
         );
         drop(ca_now);
+
+        // A lock file that another user can write names no process to
+        // trust.
+        let lock_path = state_file(&control, SERVE_LOCK);
+        let private = std::fs::metadata(&lock_path).unwrap().permissions();
+        let mut shared = private.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut shared, 0o666);
+        std::fs::set_permissions(&lock_path, shared).unwrap();
+        let planted = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
+        assert!(
+            planted
+                .unwrap_err()
+                .contains("another user owns or can write")
+        );
+        std::fs::set_permissions(&lock_path, private).unwrap();
 
         // A proxy that answers nothing gets a refusal, not a claim.
         let silent = request_rotation(&control, |_| Ok(()), Duration::ZERO);
