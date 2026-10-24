@@ -625,12 +625,18 @@ impl DnsGate {
     /// A steered query is never forwarded. While the proxy's listener is
     /// down it is answered SERVFAIL, and a rate-limited warning names the
     /// name and the box. While the listener is live, each steered A question
-    /// is answered with the proxy's address, and every other question gets
-    /// no answer.
+    /// is answered with the proxy's address, and a steered question of any
+    /// other type gets no answer. A query that mixes a steered question with
+    /// an unsteered one is answered SERVFAIL: forwarding it would send the
+    /// steered name to real DNS, and a partial answer would leave the other
+    /// question unanswered with no error.
     fn answer_steered(&self, query: Message) -> Option<Vec<u8>> {
         let steering = self.steering.as_ref()?;
         let question = query.queries.iter().find(|q| self.steers(q))?.clone();
         let name = normalized(&question.name().to_lowercase().to_string());
+        if query.queries.iter().any(|q| !self.steers(q)) {
+            return self.answer(query, ResponseCode::ServFail, &name, question.query_type());
+        }
         if !steering.listener.is_live() {
             let key = format!("{STEERED_SERVFAIL_RULE}:{name}");
             if self
@@ -3668,6 +3674,24 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(addresses, vec![proxy_address()]);
+
+        // A query mixing a steered and an unsteered question is SERVFAIL,
+        // neither forwarded nor half answered.
+        let mut query = Message::query();
+        query.add_query(Query::query(
+            Name::from_utf8("github.com.").unwrap(),
+            RecordType::A,
+        ));
+        query.add_query(Query::query(
+            Name::from_utf8("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let reply = gate
+            .intercept_query(&SocketAddrV4::new(RESOLVER, 53), &query.to_vec().unwrap())
+            .expect("a mixed query is answered at the gate");
+        let reply = Message::from_vec(&reply).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert!(reply.answers.is_empty(), "a mixed query gets no address");
 
         // Down again: SERVFAIL again, never the real address.
         assert!(listener.set_live(false));
