@@ -27,6 +27,22 @@
 //! < {"ok":true}
 //! ```
 //!
+//! The client appends a `mint` record for each member it mints, and the
+//! box's creator appends a `revocation` record when it destroys a live box
+//! (BEP-067, BEP-043). The proxy is the audit log's only writer, so both go
+//! through this socket. A revocation is in force from its reply on
+//! ([`crate::revoke`]):
+//!
+//! ```text
+//! > {"op":"record_mint","box_id":"<id>","identifier":"github:<instance>"}
+//! < {"ok":true}
+//! > {"op":"record_revocation","box_id":"<id>"}
+//! < {"ok":true}
+//! ```
+//!
+//! A destroy sends `record_revocation` before `forget_box`, so no request
+//! from the box finds it forgotten and not yet revoked.
+//!
 //! A box id is 32 hex digits, or a UUID with its hyphens. The proxy stores it
 //! as 32 lowercase hex digits, the form the listener names the box by, and
 //! refuses any other text.
@@ -52,7 +68,9 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::boxes::{BoxRegistry, Boxes, Stance};
 use crate::handle::{ClientKeys, parse_authority};
 use crate::listener::bind_owner_only;
+use crate::proxy::AuditWriter;
 use crate::redeem::Authority;
+use crate::revoke::{self, Revocations};
 
 /// The longest request line the control socket reads.
 pub const MAX_LINE_LEN: usize = 16 * 1024;
@@ -86,6 +104,54 @@ pub enum Request {
         /// The box id.
         box_id: String,
     },
+}
+
+/// One audit request line: a record that the proxy appends to its audit
+/// log for a client (BEP-067). It is a type of its own beside [`Request`],
+/// and the control socket reads a line as either one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RecordRequest {
+    /// Append the `mint` record of one member the client minted.
+    RecordMint {
+        /// The box id the member names.
+        box_id: String,
+        /// The member's identifier, `<store>:<id>`.
+        identifier: String,
+    },
+    /// Put a revocation of a destroyed live box in force, and append its
+    /// `revocation` record (BEP-043).
+    RecordRevocation {
+        /// The destroyed box's id.
+        box_id: String,
+    },
+}
+
+/// The audit log and the revocations the control socket writes to.
+#[derive(Clone, Default)]
+pub struct Trail {
+    audit: Option<Arc<dyn AuditWriter>>,
+    revocations: Revocations,
+}
+
+impl std::fmt::Debug for Trail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trail")
+            .field("audit", &self.audit.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Trail {
+    /// A trail that appends to `audit` and puts revocations in force in
+    /// `revocations`, the set the redeemer reads.
+    #[must_use]
+    pub fn new(audit: Arc<dyn AuditWriter>, revocations: Revocations) -> Self {
+        Self {
+            audit: Some(audit),
+            revocations,
+        }
+    }
 }
 
 /// One reply line.
@@ -149,9 +215,59 @@ fn normalise_box_id(text: &str) -> Option<String> {
 }
 
 /// Does one request line against the client key `registry` and the box
-/// registry `boxes`.
+/// registry `boxes`, with no audit log: a record request is refused.
 #[must_use]
 pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> Reply {
+    handle_line_with(line, registry, boxes, &Trail::default())
+}
+
+/// Does one record request against `trail`.
+fn handle_record(request: RecordRequest, trail: &Trail) -> Reply {
+    let Some(audit) = &trail.audit else {
+        return Reply::refused("this proxy keeps no audit log");
+    };
+    match request {
+        RecordRequest::RecordMint { box_id, identifier } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
+            let identifier = identifier.trim();
+            if identifier.is_empty() {
+                return Reply::refused("the member identifier is empty");
+            }
+            audit.write(&revoke::mint_record(&box_id, identifier));
+            tracing::debug!(box_id, identifier, "recorded a mint");
+            Reply::done()
+        }
+        RecordRequest::RecordRevocation { box_id } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
+            // In force before the record is written, so the next request
+            // from the box is refused whatever the append does.
+            if revoke::record(&trail.revocations, &box_id) {
+                audit.write(&revoke::revocation_record(&box_id));
+                tracing::info!(box_id, "recorded a revocation of a destroyed box");
+            } else {
+                tracing::debug!(box_id, "the box's revocation is already in force");
+            }
+            Reply::done()
+        }
+    }
+}
+
+/// Does one request line against the client key `registry`, the box
+/// registry `boxes`, and the audit log and revocations of `trail`.
+#[must_use]
+pub fn handle_line_with(
+    line: &str,
+    registry: &RwLock<ClientKeys>,
+    boxes: &Boxes,
+    trail: &Trail,
+) -> Reply {
+    if let Ok(record) = serde_json::from_str::<RecordRequest>(line) {
+        return handle_record(record, trail);
+    }
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(err) => return Reply::refused(format!("the request is not valid: {err}")),
@@ -211,6 +327,7 @@ pub struct Control {
     inner: UnixListener,
     registry: Registry,
     boxes: BoxRegistry,
+    trail: Trail,
 }
 
 impl Control {
@@ -225,7 +342,16 @@ impl Control {
             inner: bind_owner_only(path)?,
             registry,
             boxes,
+            trail: Trail::default(),
         })
+    }
+
+    /// This socket, with `trail` as the audit log and the revocations its
+    /// record requests write to. Without one, a record request is refused.
+    #[must_use]
+    pub fn with_trail(mut self, trail: Trail) -> Self {
+        self.trail = trail;
+        self
     }
 
     /// Serves connections until the accept fails.
@@ -238,13 +364,13 @@ impl Control {
             let stream = crate::listener::accept(&self.inner, "control socket").await?;
             let registry = Arc::clone(&self.registry);
             let boxes = Arc::clone(&self.boxes);
-            tokio::spawn(serve(stream, registry, boxes));
+            tokio::spawn(serve(stream, registry, boxes, self.trail.clone()));
         }
     }
 }
 
 /// Serves one control connection, line by line.
-async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
+async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry, trail: Trail) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
     let own = unsafe { libc::geteuid() };
@@ -275,7 +401,7 @@ async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
             let _ = write_reply(&mut write, &Reply::refused("the request is too long")).await;
             return;
         }
-        let reply = handle_line(&line, &registry, &boxes);
+        let reply = handle_line_with(&line, &registry, &boxes, &trail);
         if write_reply(&mut write, &reply).await.is_err() {
             return;
         }

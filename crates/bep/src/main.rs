@@ -33,14 +33,14 @@ use std::time::{Duration, SystemTime};
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
 use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
-use bep::control::{Control, Registry};
+use bep::control::{Control, Registry, Trail};
 use bep::forward::Redeemer;
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, Proxy, SystemResolver};
+use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
-use bep::redeemer::BoxRedeemer;
+use bep::redeemer::{BoxRedeemer, Revocations};
 use bep::signin::{HostKeychain, Keychain};
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::SignalKind;
@@ -768,11 +768,12 @@ fn unix_now() -> Result<u64, String> {
 }
 
 /// What `bep serve` shares between the control socket and the proxy: the
-/// registered client keys, the registered boxes, and the redeemer that
-/// reads both.
+/// registered client keys, the registered boxes, the revocations in force,
+/// and the redeemer that reads them.
 struct Wiring {
     clients: Registry,
     boxes: BoxRegistry,
+    revocations: Revocations,
     redeemer: Arc<dyn Redeemer>,
 }
 
@@ -789,33 +790,36 @@ where
     let node = sealing.public().kid();
     let clients = Registry::default();
     // `min` sends `register_box` when it creates a box with a GitHub grant
-    // (`crates/minimal/src/cmd/boxes/create.rs`). Interim: nothing sends
-    // `forget_box` at destroy until T20
-    // (https://github.com/gominimal/minimal/issues/2277), in
-    // `crates/minvmd/src/box_registry.rs`.
+    // (`crates/minimal/src/cmd/boxes/create.rs`), and the VM host daemon
+    // sends `record_revocation` and then `forget_box` when it withdraws a
+    // live box's row at its destroy (`crates/minvmd/src/box_registry.rs`).
     let boxes = BoxRegistry::default();
-    // Interim: `BoxRedeemer::new` starts with no revocation in force, and
-    // nothing here gives it one. T20
-    // (https://github.com/gominimal/minimal/issues/2277) records revocations
-    // over the control socket. T33
-    // (https://github.com/gominimal/minimal/issues/2290) restores them from
-    // every retained audit segment at start, the BEP-068 restore-on-start
-    // sub-requirement. Those two are the flip.
+    // The control socket puts each destroyed box's revocation in force in
+    // this set, and the redeemer reads it before it resolves any reference
+    // (BEP-071). Interim: the set starts empty at each start. T33
+    // (https://github.com/gominimal/minimal/issues/2290) restores it from
+    // every retained audit segment, the BEP-068 restore-on-start
+    // sub-requirement, and is the flip.
+    let revocations = Revocations::default();
     //
     // Interim: the redeemer reads no store rules until T25
     // (https://github.com/gominimal/minimal/issues/2280) reads
     // `[secret-store-rules]`, so a store-handle member is never admitted yet.
-    let redeemer = Arc::new(BoxRedeemer::new(
-        sealing,
-        node,
-        GITHUB,
-        Arc::clone(&clients),
-        Arc::clone(&boxes),
-        keychain,
-    ));
+    let redeemer = Arc::new(
+        BoxRedeemer::new(
+            sealing,
+            node,
+            GITHUB,
+            Arc::clone(&clients),
+            Arc::clone(&boxes),
+            keychain,
+        )
+        .with_revocations(Arc::clone(&revocations)),
+    );
     Wiring {
         clients,
         boxes,
+        revocations,
         redeemer,
     }
 }
@@ -830,9 +834,13 @@ impl Wiring {
         proxy.with_redeemer(Arc::clone(&self.redeemer))
     }
 
-    /// The control socket at `path`, which registers into this wiring.
-    fn control(&self, path: &Path) -> io::Result<Control> {
-        Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))
+    /// The control socket at `path`, which registers into this wiring and
+    /// appends the client's records to `audit` (BEP-067).
+    fn control(&self, path: &Path, audit: Arc<dyn AuditWriter>) -> io::Result<Control> {
+        Ok(
+            Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))?
+                .with_trail(Trail::new(audit, Arc::clone(&self.revocations))),
+        )
     }
 }
 
@@ -859,6 +867,9 @@ fn serve<K: CaKey + Send + Sync + 'static>(
             segment.display()
         )
     })?;
+    // One log, one writer: the proxy's decisions and the control socket's
+    // records share it (BEP-067).
+    let log = Arc::new(Mutex::new(log));
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
     // The store rules' authorities join the admitted set when
@@ -883,7 +894,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         ca.clone(),
         roots,
         Arc::new(SystemResolver),
-        Arc::new(Mutex::new(log)),
+        Arc::clone(&log) as Arc<dyn AuditWriter>,
     )
     .map_err(|err| err.to_string())?;
     let wiring = wire(sealing, HostKeychain);
@@ -916,13 +927,12 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         // The redeemer reads the client keys and the boxes this socket
         // registers, at each request.
         let control_socket = wiring
-            .control(&control)
+            .control(&control, log)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
         tracing::warn!(
             "A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
              A store-handle member is not admitted until #2280 lands. \
-             No revocation is in force until #2277 and #2290 land. \
-             Nothing forgets a destroyed box's declared egress until #2277 lands."
+             A revocation recorded before this start is not in force until #2290 lands."
         );
         tracing::info!(
             listener = %args.listener.display(),
@@ -1435,7 +1445,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
         let _proxy = wiring.install(proxy, &path);
-        tokio::spawn(wiring.control(&path).unwrap().run());
+        let records: Arc<dyn AuditWriter> = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        tokio::spawn(wiring.control(&path, records).unwrap().run());
 
         let client = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
         let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
