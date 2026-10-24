@@ -1,5 +1,6 @@
-//! The proxy's control socket: client key registrations (BEP-063), and the
-//! boxes the proxy serves (BEP-020, BEP-022).
+//! The proxy's control socket: client key registrations (BEP-063), the
+//! boxes the proxy serves (BEP-020, BEP-022), and the `mint` and
+//! `revocation` records of a box's trail (BEP-043, BEP-067).
 //!
 //! The control socket is a unix socket of its own, separate from the
 //! listener that takes box connections ([`crate::listener`]). It is mode
@@ -27,6 +28,23 @@
 //! < {"ok":true}
 //! ```
 //!
+//! The client submits one `mint` record for each member it mints. The box's
+//! creator revokes a live box at its destroy, before it forgets the box:
+//!
+//! ```text
+//! > {"op":"record_mint","box_id":"<id>","identifier":"github:<instance>"}
+//! < {"ok":true}
+//! > {"op":"revoke_box","box_id":"<id>"}
+//! < {"ok":true}
+//! ```
+//!
+//! Both append to the proxy's one audit log, of which the proxy is the only
+//! writer ([`crate::revoke`]). A revocation is in force from its reply on,
+//! for every sealed value that names the box. A second revocation of the
+//! same box writes no second record. A refused reply to `revoke_box` means
+//! that the record was not written. The revocation is in force all the
+//! same.
+//!
 //! A box id is 32 hex digits, or a UUID with its hyphens. The proxy stores it
 //! as 32 lowercase hex digits, the form the listener names the box by, and
 //! refuses any other text.
@@ -53,6 +71,7 @@ use crate::boxes::{BoxRegistry, Boxes, Stance};
 use crate::handle::{ClientKeys, parse_authority};
 use crate::listener::bind_owner_only;
 use crate::redeem::Authority;
+use crate::revoke::Revoker;
 
 /// The longest request line the control socket reads.
 pub const MAX_LINE_LEN: usize = 16 * 1024;
@@ -83,6 +102,19 @@ pub enum Request {
     },
     /// Forget a box, at its destroy.
     ForgetBox {
+        /// The box id.
+        box_id: String,
+    },
+    /// Append the `mint` record of one member the client minted.
+    RecordMint {
+        /// The box id the member is sealed for.
+        box_id: String,
+        /// The member's audit identifier, `<store>:<id>`.
+        identifier: String,
+    },
+    /// Revoke every sealed value that names a live box, at its destroy,
+    /// and append the `revocation` record.
+    RevokeBox {
         /// The box id.
         box_id: String,
     },
@@ -149,9 +181,23 @@ fn normalise_box_id(text: &str) -> Option<String> {
 }
 
 /// Does one request line against the client key `registry` and the box
-/// registry `boxes`.
+/// registry `boxes`, with no revocation set and no log: a `revoke_box` or
+/// `record_mint` line is answered and kept nowhere. [`Control`] uses
+/// [`handle_with`].
 #[must_use]
 pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> Reply {
+    handle_with(line, registry, boxes, &Revoker::default())
+}
+
+/// Does one request line against the client key `registry`, the box
+/// registry `boxes` and the revocations and log of `revoker`.
+#[must_use]
+pub fn handle_with(
+    line: &str,
+    registry: &RwLock<ClientKeys>,
+    boxes: &Boxes,
+    revoker: &Revoker,
+) -> Reply {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(err) => return Reply::refused(format!("the request is not valid: {err}")),
@@ -202,6 +248,29 @@ pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> 
             boxes.forget(&box_id);
             Reply::done()
         }
+        Request::RecordMint { box_id, identifier } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
+            match revoker.record_mint(&box_id, identifier.trim()) {
+                Ok(()) => Reply::done(),
+                Err(_) => {
+                    Reply::refused("the proxy did not write the mint record to its audit log")
+                }
+            }
+        }
+        Request::RevokeBox { box_id } => {
+            let Some(box_id) = normalise_box_id(&box_id) else {
+                return Reply::refused("the box id is not 32 hex digits");
+            };
+            match revoker.revoke(&box_id) {
+                Ok(()) => Reply::done(),
+                Err(_) => Reply::refused(
+                    "the proxy did not write the revocation record to its audit log. \
+                     The revocation is in force",
+                ),
+            }
+        }
     }
 }
 
@@ -211,6 +280,7 @@ pub struct Control {
     inner: UnixListener,
     registry: Registry,
     boxes: BoxRegistry,
+    revoker: Revoker,
 }
 
 impl Control {
@@ -225,7 +295,17 @@ impl Control {
             inner: bind_owner_only(path)?,
             registry,
             boxes,
+            revoker: Revoker::default(),
         })
+    }
+
+    /// This control socket, with `revoker` as the revocations it records
+    /// and the log its records go to. Without it, the socket answers a
+    /// `revoke_box` or `record_mint` line and keeps nothing.
+    #[must_use]
+    pub fn with_revoker(mut self, revoker: Revoker) -> Self {
+        self.revoker = revoker;
+        self
     }
 
     /// Serves connections until the accept fails.
@@ -238,13 +318,14 @@ impl Control {
             let stream = crate::listener::accept(&self.inner, "control socket").await?;
             let registry = Arc::clone(&self.registry);
             let boxes = Arc::clone(&self.boxes);
-            tokio::spawn(serve(stream, registry, boxes));
+            let revoker = self.revoker.clone();
+            tokio::spawn(serve(stream, registry, boxes, revoker));
         }
     }
 }
 
 /// Serves one control connection, line by line.
-async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
+async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry, revoker: Revoker) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
     let own = unsafe { libc::geteuid() };
@@ -275,7 +356,7 @@ async fn serve(stream: UnixStream, registry: Registry, boxes: BoxRegistry) {
             let _ = write_reply(&mut write, &Reply::refused("the request is too long")).await;
             return;
         }
-        let reply = handle_line(&line, &registry, &boxes);
+        let reply = handle_with(&line, &registry, &boxes, &revoker);
         if write_reply(&mut write, &reply).await.is_err() {
             return;
         }

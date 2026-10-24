@@ -35,6 +35,7 @@ use bep::module::GITHUB;
 use bep::proxy::{self, Admission, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::BoxRedeemer;
+use bep::revoke::{Append, Revocations, Revoker};
 use bep::signin::{HostKeychain, Keychain};
 use clap::{Parser, Subcommand};
 
@@ -332,20 +333,22 @@ fn unix_now() -> Result<u64, String> {
 }
 
 /// What `bep serve` shares between the control socket and the proxy: the
-/// registered client keys, the registered boxes, and the redeemer that
-/// reads both.
+/// registered client keys, the registered boxes, the revocations in force,
+/// and the redeemer that reads all three.
 struct Wiring {
     clients: Registry,
     boxes: BoxRegistry,
+    revoker: Revoker,
     redeemer: Arc<dyn Redeemer>,
 }
 
 /// The redeemer over the proxy key `sealing` and the sign-in item in
 /// `keychain`, and the registries it reads. The Box Host a sealed value and
 /// its handle name is this proxy's sealing key fingerprint, which the
-/// published identity carries.
+/// published identity carries. The control socket appends the client's
+/// `mint` records and a destroyed box's `revocation` record to `log`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn wire<K, C>(sealing: K, keychain: C) -> Wiring
+fn wire<K, C>(sealing: K, keychain: C, log: Arc<dyn Append>) -> Wiring
 where
     K: HeldKey + Send + Sync + 'static,
     C: Keychain + Send + Sync + 'static,
@@ -353,33 +356,35 @@ where
     let node = sealing.public().kid();
     let clients = Registry::default();
     // `min` sends `register_box` when it creates a box with a GitHub grant
-    // (`crates/minimal/src/cmd/boxes/create.rs`). Interim: nothing sends
-    // `forget_box` at destroy until T20
-    // (https://github.com/gominimal/minimal/issues/2277), in
-    // `crates/minvmd/src/box_registry.rs`.
+    // (`crates/minimal/src/cmd/boxes/create.rs`), and `minvmd` sends
+    // `revoke_box` and then `forget_box` at a live box's destroy
+    // (`crates/minvmd/src/box_registry.rs`).
     let boxes = BoxRegistry::default();
-    // Interim: `BoxRedeemer::new` starts with no revocation in force, and
-    // nothing here gives it one. T20
-    // (https://github.com/gominimal/minimal/issues/2277) records revocations
-    // over the control socket. T33
-    // (https://github.com/gominimal/minimal/issues/2290) restores them from
-    // every retained audit segment at start, the BEP-068 restore-on-start
-    // sub-requirement. Those two are the flip.
+    // The revocations the control socket records are the ones the redeemer
+    // reads. Interim: they live in memory, so a restart starts with none in
+    // force. T33 (https://github.com/gominimal/minimal/issues/2290) restores
+    // them from every retained audit segment at start, the BEP-068
+    // restore-on-start sub-requirement, and is the flip.
+    let revoker = Revoker::new(Revocations::default()).with_log(log);
     //
     // Interim: the redeemer reads no store rules until T25
     // (https://github.com/gominimal/minimal/issues/2280) reads
     // `[secret-store-rules]`, so a store-handle member is never admitted yet.
-    let redeemer = Arc::new(BoxRedeemer::new(
-        sealing,
-        node,
-        GITHUB,
-        Arc::clone(&clients),
-        Arc::clone(&boxes),
-        keychain,
-    ));
+    let redeemer = Arc::new(
+        BoxRedeemer::new(
+            sealing,
+            node,
+            GITHUB,
+            Arc::clone(&clients),
+            Arc::clone(&boxes),
+            keychain,
+        )
+        .with_revocations(revoker.revocations()),
+    );
     Wiring {
         clients,
         boxes,
+        revoker,
         redeemer,
     }
 }
@@ -396,7 +401,10 @@ impl Wiring {
 
     /// The control socket at `path`, which registers into this wiring.
     fn control(&self, path: &Path) -> io::Result<Control> {
-        Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))
+        Ok(
+            Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))?
+                .with_revoker(self.revoker.clone()),
+        )
     }
 }
 
@@ -425,6 +433,9 @@ fn serve<K: CaKey + Send + Sync + 'static>(
             segment.display()
         )
     })?;
+    // One log, one writer: the proxy's decisions and the control socket's
+    // `mint` and `revocation` records share the chain (BEP-067).
+    let log = Arc::new(Mutex::new(log));
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
     // The store rules' authorities join the admitted set when
@@ -448,10 +459,10 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         Arc::new(Mutex::new(ca)),
         roots,
         Arc::new(SystemResolver),
-        Arc::new(Mutex::new(log)),
+        Arc::clone(&log) as Arc<dyn proxy::AuditWriter>,
     )
     .map_err(|err| err.to_string())?;
-    let wiring = wire(sealing, HostKeychain);
+    let wiring = wire(sealing, HostKeychain, log);
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
@@ -465,8 +476,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         tracing::warn!(
             "A token that renews at the proxy is refused github_sign_in_required until #2279 lands. \
              A store-handle member is not admitted until #2280 lands. \
-             No revocation is in force until #2277 and #2290 land. \
-             Nothing forgets a destroyed box's declared egress until #2277 lands."
+             Revocations do not survive a restart until #2290 lands."
         );
         tracing::info!(
             listener = %args.listener.display(),
@@ -621,7 +631,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let wiring = wire(key, keychain);
+        let wiring = wire(key, keychain, Arc::new(Mutex::new(Vec::<Decision>::new())));
 
         let proxy = Proxy::new(
             Admission::new(&[GITHUB], [("", 0); 0]),
