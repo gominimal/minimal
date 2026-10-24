@@ -117,8 +117,24 @@ pub(crate) const SIGNED_OUT: &str =
 
 /// What `min auth logout` prints on stderr when GitHub did not confirm the
 /// revocation. The local deletion is the enforcement (BEP-044).
-pub(crate) const NOT_CONFIRMED: &str =
-    "GitHub did not confirm the sign-out; the sign-in is removed from this machine.";
+pub(crate) const NOT_CONFIRMED: &str = "GitHub did not confirm the sign-out. \
+The sign-in is removed from this machine. \
+To be sure GitHub revoked it, revoke the app at https://github.com/settings/apps/authorizations.";
+
+/// Why the logout failed when the token is still in the host keychain.
+pub(crate) const NOT_REMOVED: &str =
+    "The GitHub sign-in was not removed, so you are still signed in";
+
+/// Why the logout failed when the host keychain could not be read after a
+/// failed delete.
+pub(crate) const NOT_KNOWN: &str = "The GitHub sign-in may still be in the host keychain, \
+because the keychain could not be read after the delete. \
+Run `min auth status` to check";
+
+/// Why the logout failed when the token is gone but the rest of the item
+/// is still held.
+pub(crate) const PARTLY_REMOVED: &str = "Part of the GitHub sign-in is still in the host keychain. \
+Run `min auth logout` again to remove it";
 
 /// The sign-in item, as `min auth logout` deletes it.
 pub(crate) trait SignInItem: Keychain + Sync {
@@ -137,20 +153,26 @@ impl SignInItem for signin::MemoryKeychain {
 impl SignInItem for HostKeychain {
     fn delete(&self) -> anyhow::Result<()> {
         host_delete()?;
-        // Read the item back: a keychain command can exit 0 and delete
-        // nothing.
-        let meta = self.metadata().ok().flatten();
-        let material = self.material().ok().flatten();
-        if meta.is_some() || material.is_some() {
-            bail!("the host keychain still holds the GitHub sign-in after the delete");
-        }
-        Ok(())
+        confirm_deleted(self)
     }
 }
 
-/// Delete the item under [`signin::SERVICE`], which holds the token, then
-/// the metadata. The token goes first: the proxy resolves a reference from
-/// it, so its deletion is what refuses every reference.
+/// Read the item back after a delete: a keychain command can exit 0 and
+/// delete nothing. A read that fails is an error, not "deleted", because the
+/// local deletion is the enforcement (BEP-044).
+fn confirm_deleted(item: &dyn Keychain) -> anyhow::Result<()> {
+    let meta = item.metadata()?;
+    let material = item.material()?;
+    if meta.is_some() || material.is_some() {
+        bail!("the host keychain still holds the GitHub sign-in after the delete");
+    }
+    Ok(())
+}
+
+/// Delete the metadata item under [`signin::META_SERVICE`], then the item
+/// under [`signin::SERVICE`], which holds the token. The token goes last: a
+/// delete that stops part way keeps the token, so "still signed in" stays
+/// true.
 #[cfg(target_os = "macos")]
 fn host_delete() -> anyhow::Result<()> {
     // `security` exits 44 when no item matches.
@@ -176,7 +198,7 @@ fn host_delete() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn host_delete() -> anyhow::Result<()> {
-    for service in [signin::SERVICE, signin::META_SERVICE] {
+    for service in [signin::META_SERVICE, signin::SERVICE] {
         let out = keychain_tool("secret-tool", &["clear", "service", service])?;
         // `secret-tool` fails with no message when nothing matches.
         if !out.status.success() && !out.stderr.is_empty() {
@@ -242,10 +264,20 @@ pub(crate) async fn run_logout(
         .ok()
         .flatten()
         .map(|m| zeroize::Zeroizing::new(m.access_token.clone()));
-    logout
-        .keychain
-        .delete()
-        .context("The GitHub sign-in was not removed, so you are still signed in")?;
+    // The token is read above, before any delete, so a delete that stops
+    // after the token item is gone can still ask GitHub to revoke it.
+    let mut partly = None;
+    if let Err(e) = logout.keychain.delete() {
+        match logout.keychain.material() {
+            Ok(Some(_)) => return Err(e.context(NOT_REMOVED)),
+            Err(read) => {
+                return Err(e.context(format!("{read}")).context(NOT_KNOWN));
+            }
+            // The token is gone, so every reference is refused. The rest of
+            // the item is reported after the revocation.
+            Ok(None) => partly = Some(e),
+        }
+    }
     let revoked = match (token, logout.client_secret.filter(|s| !s.is_empty())) {
         (Some(token), Some(secret)) => revoke(logout.endpoints, secret, &token).await,
         (None, _) => Err("no token was read from the sign-in".to_owned()),
@@ -255,12 +287,16 @@ pub(crate) async fn run_logout(
     tracing::info!(
         account = %account,
         github_confirmed = confirmed,
+        partly_deleted = partly.is_some(),
         detail = revoked.err().as_deref().unwrap_or(""),
         "GitHub sign-in deleted from the host keychain"
     );
     writeln!(out, "{SIGNED_OUT}")?;
     if !confirmed {
         writeln!(err, "{NOT_CONFIRMED}")?;
+    }
+    if let Some(e) = partly {
+        return Err(e.context(PARTLY_REMOVED));
     }
     Ok(LoggedOut::Deleted { confirmed })
 }
@@ -1393,6 +1429,65 @@ mod tests {
         }
     }
 
+    /// What a [`Broken`] keychain does after its delete fails.
+    #[derive(Clone, Copy)]
+    enum After {
+        /// The token item is gone, and the metadata item is still held.
+        TokenGone,
+        /// Every read fails.
+        ReadsRefused,
+    }
+
+    /// A keychain whose delete fails part way.
+    struct Broken {
+        inner: MemoryKeychain,
+        after: After,
+        tried: std::sync::atomic::AtomicBool,
+    }
+
+    impl Broken {
+        fn new(after: After) -> Self {
+            Self {
+                inner: MemoryKeychain::default(),
+                after,
+                tried: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn refused(&self) -> Option<signin::SignInError> {
+            (self.tried.load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(self.after, After::ReadsRefused))
+            .then(|| signin::SignInError::Keychain {
+                action: "read the sign-in",
+                detail: "unreadable".into(),
+            })
+        }
+    }
+
+    impl Keychain for Broken {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.refused().map_or_else(|| self.inner.metadata(), Err)
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            if let Some(e) = self.refused() {
+                return Err(e);
+            }
+            if self.tried.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.material()
+        }
+        fn write(&self, meta: &Metadata, material: &Material) -> Result<(), signin::SignInError> {
+            self.inner.write(meta, material)
+        }
+    }
+
+    impl SignInItem for Broken {
+        fn delete(&self) -> anyhow::Result<()> {
+            self.tried.store(true, std::sync::atomic::Ordering::SeqCst);
+            bail!("the host keychain refused to delete the GitHub sign-in: locked")
+        }
+    }
+
     async fn logout_with(
         keychain: &dyn SignInItem,
         endpoints: &Endpoints,
@@ -1507,6 +1602,47 @@ mod tests {
         assert_eq!(out, "");
         assert!(stuck.0.raw().is_some());
         assert_eq!(revocations(&gh).len(), 1);
+
+        // A delete that stops after the token item is gone: every reference
+        // is refused, so GitHub is still asked, and the command says what
+        // is left and how to remove it.
+        let half = Broken::new(After::TokenGone);
+        login_with(&half.inner, &gh, None, true, &no_browser).await;
+        let (done, out, err) = logout_with(&half, &gh.endpoints, Some("test-secret")).await;
+        let text = format!("{:#}", done.expect_err("a part-way delete fails"));
+        assert!(text.starts_with(PARTLY_REMOVED), "{text}");
+        assert!(!text.contains("still signed in"), "{text}");
+        assert_eq!(out, format!("{SIGNED_OUT}\n"));
+        assert_eq!(err, "");
+        assert_eq!(revocations(&gh).len(), 2, "GitHub was asked to revoke");
+
+        // A failed delete whose read-back also fails cannot say whether the
+        // sign-in is held: the logout fails, says so, and asks GitHub nothing.
+        let unread = Broken::new(After::ReadsRefused);
+        login_with(&unread.inner, &gh, None, true, &no_browser).await;
+        let (done, out, err) = logout_with(&unread, &gh.endpoints, Some("test-secret")).await;
+        let text = format!("{:#}", done.expect_err("an unreadable keychain fails"));
+        assert!(text.starts_with(NOT_KNOWN), "{text}");
+        assert!(text.contains("unreadable"), "{text}");
+        assert_eq!(out, "");
+        assert_eq!(err, "");
+        assert_eq!(revocations(&gh).len(), 2);
+
+        // The host keychain's read-back after a delete: a read that fails is
+        // an error, never "deleted".
+        let e = confirm_deleted(&RefusingKeychain::default()).expect_err("refused read-back");
+        assert!(format!("{e:#}").contains("locked"), "{e:#}");
+        let held = MemoryKeychain::default();
+        login_with(&held, &gh, None, true, &no_browser).await;
+        assert!(
+            confirm_deleted(&held).is_err(),
+            "a held item is not deleted"
+        );
+        held.clear();
+        confirm_deleted(&held).expect("an empty keychain is deleted");
+
+        // The stderr line gives each fact its own sentence.
+        assert!(!NOT_CONFIRMED.contains(';'), "{NOT_CONFIRMED}");
     }
 
     /// A proxy sealing key held in memory, for the redeemer.
