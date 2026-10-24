@@ -98,7 +98,7 @@ bep_pat() {
     printf '%s/.*/bep serve .*local-minvmd[0-9]+/%s/gvproxy-bep\\.sock' \
       "$ROOT_RE" "$(ere_quote "$VM")"
   else
-    printf '%s/.*/bep serve .*/gvproxy-bep\\.sock' "$ROOT_RE"
+    printf '%s/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock' "$ROOT_RE"
   fi
 }
 

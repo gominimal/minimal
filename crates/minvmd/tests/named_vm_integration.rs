@@ -542,10 +542,14 @@ fn reap_scoped_per_checkout() {
     for expected in [
         format!("pkill -f {root}/.*minvmd"),
         format!("pkill -f {root}/.*gvproxy"),
-        format!("pkill -9 -f {root_re}/.*/bep serve .*/gvproxy-bep\\.sock"),
+        format!(
+            "pkill -9 -f {root_re}/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock"
+        ),
         format!("sudo -n pkill -f {root}/.*minvmd"),
         format!("sudo -n pkill -f {root}/.*gvproxy"),
-        format!("sudo -n pkill -9 -f {root_re}/.*/bep serve .*/gvproxy-bep\\.sock"),
+        format!(
+            "sudo -n pkill -9 -f {root_re}/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock"
+        ),
     ] {
         assert!(
             lines.lines().any(|l| l == expected),
@@ -554,8 +558,10 @@ fn reap_scoped_per_checkout() {
     }
     // #2501: the proxy pattern reaps this checkout's `bep serve` of every
     // VM, and nothing else: not another checkout's, not a look-alike path
-    // where the root's `.` would match any character.
-    let bep_bare = format!("{root_re}/.*/bep serve .*/gvproxy-bep\\.sock");
+    // where the root's `.` would match any character, and not one listening
+    // outside a VM's `local-minvmd<N>/` directory.
+    let bep_bare =
+        format!("{root_re}/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock");
     let provider = "/home/u/.minimal/providers/local-minvmd0";
     for (cmdline, want, why) in [
         (
@@ -584,6 +590,11 @@ fn reap_scoped_per_checkout() {
             ),
             false,
             "a look-alike checkout's proxy",
+        ),
+        (
+            format!("{root}/target/debug/bep serve --listener /tmp/gvproxy-bep.sock"),
+            false,
+            "this checkout's proxy on a listener outside every VM's directory",
         ),
     ] {
         assert_eq!(
