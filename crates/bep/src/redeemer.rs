@@ -722,7 +722,7 @@ mod tests {
     // `cohort_attributed`. An admission from the named box itself carries
     // no marker.
     #[test]
-    fn cohort_admit_is_recorded_cohort_attributed() {
+    fn host_ip_redemption_is_cohort_attributed_in_the_audit_record() {
         let world = new_world();
         world.boxes.register("c1", github(), Stance::HostIp);
         world.boxes.register("c2", github(), Stance::HostIp);
