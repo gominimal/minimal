@@ -5398,6 +5398,10 @@ fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
 /// into a run it already handed out, and the run's bounds are checked on
 /// the taken value, so a cursor past its run's end hands out nothing.
 #[cfg(test)]
+#[expect(
+    deprecated,
+    reason = "renamed to try_update past the MSRV floor; the rename lands with the floor"
+)]
 fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
     let next = cursor
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {

@@ -13,6 +13,15 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
 
+# Per-function complexity thresholds for the metrics pipeline's lints
+# (`clippy::cognitive_complexity`, `too_many_lines`, `too_many_arguments`,
+# enabled by scripts/metrics/run.sh, not by `just clippy`). The values are
+# mirrored in metrics/thresholds.toml `[clippy]`; scripts/metrics_test.sh
+# fails when the two disagree.
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
+
 # `Entry::unpack` resolves a hardlink's link name against the process CWD, not
 # the destination root, so a contained entry path can still write outside it.
 # Clippy reads only the nearest clippy.toml above a crate's manifest, so every

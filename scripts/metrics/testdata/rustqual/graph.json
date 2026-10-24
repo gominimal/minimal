@@ -1,0 +1,61 @@
+{
+  "summary": {
+    "total": 24,
+    "integrations": 12,
+    "operations": 8,
+    "violations": 2,
+    "trivial": 2,
+    "iosp_score": 0.91,
+    "quality_score": 0.823,
+    "dimension_scores": [0.91, 0.95, 0.88, 1.0, 1.0, 1.0, 1.0],
+    "complexity_warnings": 1,
+    "duplicate_groups": 1,
+    "dead_code_warnings": 1,
+    "tq_no_assertion_warnings": 0,
+    "architecture_warnings": 0,
+    "orphan_suppressions": 0,
+    "all_suppressions": 0,
+    "suppression_ratio_exceeded": false
+  },
+  "functions": [
+    {
+      "name": "plan",
+      "file": "crates/graph/src/plan.rs",
+      "line": 10,
+      "parent_type": null,
+      "classification": "violation",
+      "severity": "medium",
+      "suppressed": false,
+      "logic": [{"kind": "if", "line": 12}],
+      "calls": [{"name": "resolve", "line": 14}],
+      "parameter_count": 2,
+      "is_trait_impl": false
+    }
+  ],
+  "coupling": {
+    "modules": [
+      {"path": "crates/graph/src/lib.rs", "fan_in": 0, "fan_out": 2, "instability": 1.0},
+      {"path": "crates/graph/src/plan.rs", "fan_in": 1, "fan_out": 1, "instability": 0.5},
+      {"path": "crates/graph/src/types.rs", "fan_in": 2, "fan_out": 0, "instability": 0.0}
+    ],
+    "cycles": [
+      {"modules": ["crates/graph/src/plan.rs", "crates/graph/src/walk.rs"], "length": 2}
+    ],
+    "sdp_violations": []
+  },
+  "duplicates": [
+    {"functions": ["crates/graph/src/plan.rs:plan_a", "crates/graph/src/plan.rs:plan_b"], "similarity": 0.97}
+  ],
+  "dead_code": [
+    {"name": "unused_helper", "file": "crates/graph/src/plan.rs", "line": 40}
+  ],
+  "fragments": [],
+  "boilerplate": [],
+  "wildcard_warnings": [],
+  "tq_warnings": [],
+  "structural_warnings": [],
+  "repeated_matches": [],
+  "srp": {"struct_warnings": [], "module_warnings": [], "param_warnings": []},
+  "architecture_findings": [],
+  "orphan_suppressions": []
+}

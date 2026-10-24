@@ -276,6 +276,10 @@ impl HostHandle {
         }
     }
 
+    #[expect(
+        clippy::result_unit_err,
+        reason = "a dead host is the only error and carries nothing; callers match on Err(())"
+    )]
     pub async fn kill(&self, for_shutdown: bool) -> Result<(), ()> {
         match self
             .sender
@@ -420,6 +424,10 @@ impl HostHandle {
     /// send and the reply reads as `Err(())` rather than a panic: the loop
     /// can drop a queued responder on its way out, and that is a teardown
     /// race, not a bug in the caller.
+    #[expect(
+        clippy::result_unit_err,
+        reason = "a dead host is the only error and carries nothing; callers match on Err(())"
+    )]
     pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -432,6 +440,10 @@ impl HostHandle {
 
     /// Returns a snapshot of the terminal screen. A dead host reads as
     /// `Err(())` rather than a panic, matching [`Self::get_attrs`].
+    #[expect(
+        clippy::result_unit_err,
+        reason = "a dead host is the only error and carries nothing; callers match on Err(())"
+    )]
     pub async fn get_screen(&self) -> Result<minimald_rpc::ScreenSnapshot, ()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.

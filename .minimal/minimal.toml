@@ -48,17 +48,20 @@ inherit_cwd = true
 exec = "cargo clippy --all-targets -- -D warnings"
 inherit_cwd = true
 
-# Mutation-test the graph wire decoder. Runs in the Linux sandbox, where the
-# graph baseline test suite is green (the spec_hasher hash assertions that fail
-# on macOS pass here), which cargo-mutants requires. Scoped to wire.rs to keep
-# the run bounded; widen -f / drop it to cover more.
-[tasks.mutants]
-description = "Mutation-test the graph wire decoder with cargo-mutants"
+# Mutation-test the lines this branch changed (spec 31, QM-017). Runs in the
+# Linux sandbox, where the baseline test suite is green (the spec_hasher hash
+# assertions that fail on macOS pass here), which cargo-mutants requires
+# before it tests a single mutant. The diff against the merge-base bounds
+# the run; the nightly shards cover the rest of the tree.
+[tasks.metrics-mutants]
+description = "cargo-mutants over this branch's changed lines (Linux; baseline suite must be green)"
 inherit_cwd = true
 bash = """
 set -e
-command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
-cargo mutants -p graph -f wire.rs --timeout 120
+# The two tools run.sh needs, at the pins install-tools.sh owns; without
+# either, run.sh fails the run rather than skipping it.
+scripts/metrics/install-tools.sh --only cargo-mutants --only cargo-nextest
+scripts/metrics/run.sh mutants ""
 """
 
 [tasks.ci]
@@ -116,6 +119,27 @@ if [ -n "$crates" ]; then
   # shellcheck disable=SC2086 - the package flags are meant to split
   cargo nextest run --locked $args
 fi
+
+# The quality gate (spec 31), the same run the `quality-gate` task below
+# makes: no compiler, seconds, exit 2 on a regression against the base ref.
+scripts/metrics/run.sh gate --out .scratch/metrics/quality-gate
+"""
+
+# The review runtime runs a declared task as a probe: a 300-second budget, no
+# arguments delivered, and the sha256 of the recorded output cited as
+# attested evidence. So this task takes no parameters, derives its own base
+# ref (the merge-base with origin/main), invokes no compiler — `cargo metadata
+# --no-deps` is the one cargo call, and cargo-shear is left to `just
+# metrics-diff` because it probes rustc — and ends stdout with one line,
+# `quality-gate: <verdict> report=<path> sha256=<hex>`, the hash being
+# report.json's, which carries no times (spec 31, QM-012 and QM-N01). The
+# report itself is metrics/README.md "Grading a change".
+[tasks.quality-gate]
+description = "grade the change against its base ref without compiling; the review runtime's probe"
+inherit_cwd = true
+bash = """
+set -e
+scripts/metrics/run.sh gate --out .scratch/metrics/quality-gate
 """
 
 # `min task run verify` — the same two checks a person can run over the

@@ -8,6 +8,12 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
 
+# Restated from /clippy.toml: the metrics pipeline's per-function complexity
+# thresholds, mirrored in metrics/thresholds.toml `[clippy]`.
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
+
 # Every task and blocking-pool call in minimald goes through `crate::traced`,
 # which carries the caller's span into the task; a bare tokio spawn starts
 # with no span and silently cuts its work out of the request's trace
