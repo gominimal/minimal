@@ -152,6 +152,15 @@ impl SignInItem for signin::MemoryKeychain {
 
 impl SignInItem for HostKeychain {
     fn delete(&self) -> anyhow::Result<()> {
+        // BEP-069: the delete holds the item lock, so a renewal at the proxy
+        // cannot check the item before the delete and write it back after.
+        // A lock that is not taken does not stop the delete: the delete is
+        // the enforcement (BEP-044).
+        let _lock = signin::lock_item()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "the sign-in was deleted without the item lock");
+            })
+            .ok();
         host_delete()?;
         confirm_deleted(self)
     }
