@@ -3571,6 +3571,7 @@ pub(crate) mod tests {
                 },
                 secrets: Default::default(),
             }),
+            quic443: None,
         }
     }
 
