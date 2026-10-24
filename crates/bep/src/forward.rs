@@ -199,6 +199,12 @@ pub enum Verdict {
         identifier: String,
         /// The resource and permission, for the audit.
         mapping: Mapping,
+        /// The admission's audit marker: `cohort_attributed` for a cohort
+        /// admission, `None` for an admission from the named box itself.
+        marker: Option<&'static str>,
+        /// Whether the admission is cohort-attributed, for the
+        /// `box_connection` span (BEP-028).
+        cohort_attributed: bool,
     },
     /// The decision refused the request. The text is the audit marker.
     Refuse(&'static str),
@@ -561,7 +567,10 @@ impl Flow {
                         credential,
                         identifier,
                         mapping,
+                        marker: admitted,
+                        cohort_attributed,
                     } => {
+                        span.record("cohort_attributed", cohort_attributed);
                         if let Err(marker) = substitute(request, &at, &credential, self.validated) {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
@@ -570,7 +579,8 @@ impl Flow {
                             return Err(marker);
                         }
                         span.record("substitution", "substituted");
-                        self.record(Outcome::Admit, None, Some(identifier), mapping);
+                        // BEP-028: a cohort admission keeps its marker.
+                        self.record(Outcome::Admit, admitted, Some(identifier), mapping);
                         Ok(())
                     }
                     Verdict::Refuse(marker) => {
@@ -983,6 +993,8 @@ mod tests {
                 credential: Zeroizing::new(REAL.to_owned()),
                 identifier: "github:member".to_owned(),
                 mapping: Mapping::ModuleUnmapped,
+                marker: None,
+                cohort_attributed: false,
             }
         }
     }
@@ -1421,6 +1433,8 @@ mod tests {
                 credential: Zeroizing::new(REAL.to_owned()),
                 identifier: "github:member".to_owned(),
                 mapping: Mapping::ModuleUnmapped,
+                marker: None,
+                cohort_attributed: false,
             }
         }
     }
@@ -1558,6 +1572,8 @@ mod tests {
                     resource: "repo".to_owned(),
                     permission: "read".to_owned(),
                 },
+                marker: None,
+                cohort_attributed: false,
             }
         }
     }

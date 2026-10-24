@@ -384,8 +384,8 @@ impl Decision {
 
     /// Whether this decision admits a `host_ip` sender for another live
     /// `host_ip` box of this host (BEP-028). This is the cohort flag for the
-    /// connection span. No span records it yet: the forwarder does not
-    /// receive the decision.
+    /// connection span: the forwarder records it as `cohort_attributed` on
+    /// the `box_connection` span.
     #[must_use]
     pub fn cohort_attributed(self) -> bool {
         matches!(
