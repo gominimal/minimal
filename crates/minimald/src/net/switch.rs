@@ -65,6 +65,7 @@ use tokio::task::JoinHandle;
 use super::dns_gate::DnsGate;
 use super::policy::{Direction, PolicyWarnLimiter, Proto};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
+use boxes::core::bep::{Quic443, SecretGrant, Steering};
 use boxes::core::egress::{
     self, DropReason, FrameSummary, FrameVerdict, IngressRules, ListenVerdict,
 };
@@ -900,6 +901,17 @@ where
         {
             notice.emit();
         }
+        // BEP-018: UDP to port 443 that the box may not send is rejected
+        // with an ICMP port unreachable written back into the box, never
+        // dropped in silence, so a QUIC client falls back to TCP at once.
+        // This sits ahead of the egress verdict: the stance decides the
+        // datagram whatever the box's rules say about its destination.
+        if let Some(gate) = &gate
+            && let Some(reply) = gate.refuse_udp_443(&buf[..n])
+        {
+            write_tap_frame(&tap, &reply).await?;
+            continue;
+        }
         // Egress enforcement (NET-062, NET-063, NET-064): every frame is
         // decided against the box's declared policy before it reaches the
         // shared switch. A dropped frame is simply not written on — nothing is
@@ -1430,6 +1442,20 @@ pub struct BoxGate {
     /// switch, read only by the address-reuse question
     /// ([`Self::references_peer`]).
     peer_conversations: PeerConversations,
+    /// Whether the box's resolved `quic443` stance blocks UDP to port 443
+    /// (BEP-018). Built from the policy's credentialed upstream as the
+    /// `auto` stance resolves, and set again by [`Self::with_quic443`]
+    /// when the box declares one.
+    quic443_blocked: bool,
+    /// The facts the `auto` stance resolves on: whether the box declares a
+    /// credentialed upstream, and its resolved steering mode.
+    quic443_facts: (bool, Steering),
+    /// The switch's Box Egress Proxy address. UDP to port 443 there is
+    /// rejected in every stance: the proxy has no QUIC listener (BEP-018).
+    proxy: Ipv4Addr,
+    /// The rate limit on the debug line each rejected UDP 443 datagram
+    /// writes.
+    quic443_log: Quic443RejectLog,
 }
 
 impl BoxGate {
@@ -1483,6 +1509,17 @@ impl BoxGate {
         // what keeps a legitimate source inside it.
         let (resets, resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         let (box_resets, box_resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
+        // BEP-018: the `auto` stance resolves on the declared lane's grants
+        // and steering. A policy with no lane has no credentialed upstream.
+        let quic443_facts = policy.credentialed_upstream.as_ref().map_or(
+            (false, Steering::default()),
+            |upstream| {
+                (
+                    upstream.secrets.values().any(SecretGrant::is_credentialed),
+                    upstream.bep.resolved_steering(),
+                )
+            },
+        );
         Self {
             allowed: declared_ingress_ports(Some(policy), boxes::IpProto::Tcp),
             // The runtime-published half starts empty: nothing a box's
@@ -1513,7 +1550,52 @@ impl BoxGate {
             dns,
             flows: ReplyFlowGate::new(),
             peer_conversations: PeerConversations::new(subnet),
+            quic443_blocked: Quic443::Auto.blocks(quic443_facts.0, quic443_facts.1),
+            quic443_facts,
+            proxy: subnet.box_egress_proxy_address(),
+            quic443_log: Quic443RejectLog::default(),
         }
+    }
+
+    /// Sets the box's declared `quic443` stance, resolved against the
+    /// credentialed upstream and steering this gate was built from
+    /// (BEP-018). A gate built without this call holds the `auto` stance.
+    #[must_use]
+    pub fn with_quic443(mut self, stance: Quic443) -> Self {
+        self.set_quic443(stance);
+        self
+    }
+
+    /// [`Self::with_quic443`] on a gate held by reference.
+    pub(crate) fn set_quic443(&mut self, stance: Quic443) {
+        let (credentialed, steering) = self.quic443_facts;
+        self.quic443_blocked = stance.blocks(credentialed, steering);
+    }
+
+    /// Whether the box's resolved `quic443` stance blocks UDP to port 443.
+    #[must_use]
+    pub fn quic443_blocked(&self) -> bool {
+        self.quic443_blocked
+    }
+
+    /// The ICMP port unreachable that rejects `frame`, when `frame` is UDP to
+    /// port 443 that this box may not send (BEP-018): any such datagram
+    /// while the box's stance is blocked, and one to the Box Egress Proxy's
+    /// address in every stance. `None` passes the frame on to the egress
+    /// verdict. Each rejection writes a rate-limited debug line with the
+    /// box and the destination.
+    fn refuse_udp_443(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        let pkt = parse_ipv4_l4(frame)?;
+        if pkt.proto != IPPROTO_UDP || pkt.dst.port() != QUIC_PORT {
+            return None;
+        }
+        let to_proxy = *pkt.dst.ip() == self.proxy;
+        if !to_proxy && !self.quic443_blocked {
+            return None;
+        }
+        let reply = icmp_port_unreachable(frame)?;
+        self.quic443_log.record(&self.label, pkt.dst, to_proxy);
+        Some(reply)
     }
 
     /// Shrinks the DNS gate's admission window — a test hook for the
@@ -3028,6 +3110,104 @@ fn rst_toward_box_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
         ack,
         true,
     )
+}
+
+/// The UDP port QUIC (HTTP/3) runs on, the one the `quic443` stance
+/// governs (BEP-018).
+const QUIC_PORT: u16 = 443;
+
+/// How long one rejected-UDP-443 debug line covers: the first rejection of
+/// a window writes the line, and the rest are counted into the next one.
+const QUIC443_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+/// The rate limit on a gate's rejected-UDP-443 debug lines. A box that
+/// retries QUIC in a loop writes one line per window, never one per
+/// datagram.
+#[derive(Default)]
+struct Quic443RejectLog {
+    /// The start of the current window and the rejections it has not yet
+    /// written a line for.
+    window: Mutex<Option<(Instant, u64)>>,
+}
+
+impl Quic443RejectLog {
+    /// Records one rejection toward `destination`, and writes the debug line
+    /// when it opens a new window. `to_proxy` says the datagram went to the
+    /// Box Egress Proxy's address, which the stance does not decide.
+    fn record(&self, switch_addr: &str, destination: SocketAddrV4, to_proxy: bool) {
+        let now = Instant::now();
+        let suppressed = {
+            let mut window = self
+                .window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match window.as_mut() {
+                Some((start, count))
+                    if now.saturating_duration_since(*start) < QUIC443_LOG_WINDOW =>
+                {
+                    *count += 1;
+                    return;
+                }
+                _ => {}
+            }
+            let suppressed = window.map_or(0, |(_, count)| count);
+            *window = Some((now, 0));
+            suppressed
+        };
+        let reason = if to_proxy {
+            "box egress proxy address"
+        } else {
+            "quic443 stance blocked"
+        };
+        tracing::debug!(
+            switch_addr,
+            %destination,
+            reason,
+            suppressed,
+            "rejected UDP to port 443 with ICMP port unreachable"
+        );
+    }
+}
+
+/// The ICMP destination unreachable, code port unreachable, that answers the
+/// IPv4 datagram in `request`, addressed back to its sender from the address
+/// it was sent to — the answer a host with no listener on the port gives.
+/// It quotes the datagram's IPv4 header and its first 8 bytes (RFC 792), so
+/// the box's kernel matches it to the socket that sent it. `None` for a
+/// frame too short to quote.
+fn icmp_port_unreachable(request: &[u8]) -> Option<Vec<u8>> {
+    const IPPROTO_ICMP: u8 = 1;
+    const ICMP_DEST_UNREACH: u8 = 3;
+    const ICMP_PORT_UNREACH: u8 = 3;
+    let (requested_dst, rest) = request.split_first_chunk::<6>()?;
+    let (requested_src, _) = rest.split_first_chunk::<6>()?;
+    let ip = request.get(ETH_HDR..)?;
+    let ihl = usize::from(ip.first()? & 0x0f) * 4;
+    let quoted = ip.get(..ihl.checked_add(8)?)?;
+    let sender = ip.get(12..16)?;
+    let receiver = ip.get(16..20)?;
+    let mut icmp = Vec::with_capacity(8 + quoted.len());
+    icmp.extend_from_slice(&[ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0, 0, 0, 0, 0, 0]);
+    icmp.extend_from_slice(quoted);
+    let checksum = refusal::ones_complement(refusal::ones_sum(&icmp));
+    icmp.get_mut(2..4)?.copy_from_slice(&checksum.to_be_bytes());
+    let total = 20 + icmp.len();
+    let mut header = [0u8; 20];
+    header[0] = 0x45;
+    header[2..4].copy_from_slice(&u16::try_from(total).ok()?.to_be_bytes());
+    header[8] = 64;
+    header[9] = IPPROTO_ICMP;
+    header[12..16].copy_from_slice(receiver);
+    header[16..20].copy_from_slice(sender);
+    let checksum = refusal::ipv4_checksum(&header);
+    header[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let mut frame = Vec::with_capacity(ETH_HDR + total);
+    frame.extend_from_slice(requested_src);
+    frame.extend_from_slice(requested_dst);
+    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&icmp);
+    Some(frame)
 }
 
 /// Builds the Ethernet + IPv4 + UDP frame the relay writes back toward the
@@ -7136,5 +7316,182 @@ pub(crate) mod tests {
         deliver_inbound(&mut harness, &refused_too).await;
         assert_not_delivered(&mut harness).await;
         assert_eq!(gate.inbound_flows_refused_at_cap(), 2);
+    }
+
+    /// A public address a box's QUIC client dials, outside every switch
+    /// address.
+    const QUIC_PEER: Ipv4Addr = Ipv4Addr::new(140, 82, 112, 3);
+
+    /// A policy that allows every destination, with a credentialed lane of
+    /// one broker grant under `steering`, or no lane when `steering` is
+    /// `None`.
+    fn quic_policy(steering: Option<Option<Steering>>) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: steering.map(|steering| boxes::CredentialedUpstream {
+                bep: boxes::core::bep::BepSettings {
+                    steering,
+                    ..Default::default()
+                },
+                secrets: std::collections::BTreeMap::from([(
+                    "GH_TOKEN".to_string(),
+                    SecretGrant {
+                        source: boxes::core::bep::GrantSource::Broker,
+                        scopes: vec!["github:user-token".to_string()],
+                        mode: None,
+                    },
+                )]),
+            }),
+        }
+    }
+
+    /// Asserts that `reply` is the ICMP port unreachable that answers the
+    /// UDP `request`: from the address the box sent to, back to the box,
+    /// with honest checksums, quoting the request's IPv4 header and UDP
+    /// header.
+    fn assert_port_unreachable(reply: &[u8], request: &[u8]) {
+        assert_eq!(&reply[..6], &request[6..12], "back to the box's MAC");
+        assert_eq!(&reply[6..12], &request[..6], "from the MAC it sent to");
+        assert_eq!(&reply[12..14], &ETHERTYPE_IPV4.to_be_bytes());
+        let ip = &reply[ETH_HDR..];
+        assert_eq!(ip[9], 1, "an ICMP datagram: {reply:?}");
+        assert_eq!(&ip[12..16], &request[ETH_HDR + 16..ETH_HDR + 20]);
+        assert_eq!(&ip[16..20], &request[ETH_HDR + 12..ETH_HDR + 16]);
+        assert_eq!(refusal::ipv4_checksum(&ip[..20]), 0, "IPv4 checksum");
+        let total = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+        assert_eq!(total, ip.len());
+        let icmp = &ip[20..];
+        assert_eq!((icmp[0], icmp[1]), (3, 3), "destination unreachable, port");
+        assert_eq!(
+            refusal::ones_complement(refusal::ones_sum(icmp)),
+            0,
+            "ICMP checksum"
+        );
+        assert_eq!(
+            &icmp[8..],
+            &request[ETH_HDR..ETH_HDR + 28],
+            "quotes header + 8"
+        );
+    }
+
+    /// Writes `frame` as the box, then a sentinel, and returns what the
+    /// switch received first. The sentinel is read off in either case, so
+    /// the next call starts clean.
+    async fn first_forwarded(harness: &mut RelayHarness, frame: &[u8]) -> Vec<u8> {
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(frame).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the relay forwards the sentinel")
+                .expect("the switch side stays open")
+        };
+        let first = next().await;
+        if first != sentinel {
+            assert_eq!(next().await, sentinel, "the sentinel follows the frame");
+        }
+        first
+    }
+
+    /// BEP-018: while a box's resolved `quic443` stance is blocked, UDP to
+    /// port 443 is rejected with ICMP port unreachable, written back into
+    /// the box and never forwarded. A `dns`-steered grant box resolves
+    /// `auto` to blocked, and so does a declared `block` on any box. Other
+    /// UDP ports and TCP to 443 still pass, and so does UDP 443 where the
+    /// stance resolves to allowed.
+    #[tokio::test]
+    async fn quic443_blocked_rejects_udp_443() {
+        let quic = udp_frame(LEASE, 40000, QUIC_PEER, 443);
+        let sentinel = arp_frame(LEASE);
+
+        // The grant box under the default steering, and under `both`: the
+        // `auto` stance blocks.
+        for steering in [None, Some(Steering::Dns), Some(Steering::Both)] {
+            let mut harness = spawn_test_relay(&quic_policy(Some(steering)));
+            assert!(harness.gate.as_ref().unwrap().quic443_blocked());
+            let first = first_forwarded(&mut harness, &quic).await;
+            assert_eq!(
+                first, sentinel,
+                "UDP 443 never reaches the switch: {steering:?}"
+            );
+            let reply = crate::net::dns_gate::tests::read_box_frame(&harness)
+                .await
+                .expect("the box gets an answer");
+            assert_port_unreachable(&reply, &quic);
+
+            // Only UDP to 443 is rejected.
+            let dns = udp_frame(LEASE, 40001, QUIC_PEER, 53);
+            assert_eq!(first_forwarded(&mut harness, &dns).await, dns);
+            let tcp = egress_tcp_frame(LEASE, QUIC_PEER, 443);
+            assert_eq!(first_forwarded(&mut harness, &tcp).await, tcp);
+        }
+
+        // A declared `block` blocks on a box with no lane.
+        let mut harness = spawn_test_relay_with(&quic_policy(None), |gate| {
+            gate.set_quic443(Quic443::Block);
+        });
+        assert_eq!(first_forwarded(&mut harness, &quic).await, sentinel);
+        let reply = crate::net::dns_gate::tests::read_box_frame(&harness)
+            .await
+            .expect("the box gets an answer");
+        assert_port_unreachable(&reply, &quic);
+
+        // The stance resolves to allowed: the datagram is forwarded as sent.
+        let allowed: [(Option<Option<Steering>>, Option<Quic443>); 4] = [
+            (None, None),
+            (Some(Some(Steering::ProxyEnv)), None),
+            (Some(Some(Steering::Off)), None),
+            (Some(None), Some(Quic443::Allow)),
+        ];
+        for (lane, stance) in allowed {
+            let mut harness = spawn_test_relay_with(&quic_policy(lane), |gate| {
+                if let Some(stance) = stance {
+                    gate.set_quic443(stance);
+                }
+            });
+            assert!(!harness.gate.as_ref().unwrap().quic443_blocked());
+            assert_eq!(
+                first_forwarded(&mut harness, &quic).await,
+                quic,
+                "allowed stance forwards UDP 443: {lane:?} {stance:?}"
+            );
+        }
+    }
+
+    /// BEP-018: UDP to port 443 at the steered proxy address is rejected
+    /// with ICMP port unreachable in every stance, `allow` included, with
+    /// or without a credentialed lane. The proxy has no QUIC listener.
+    #[tokio::test]
+    async fn udp_443_to_steered_proxy_rejected_in_every_stance() {
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        let quic = udp_frame(LEASE, 40000, proxy, 443);
+        let sentinel = arp_frame(LEASE);
+        let lanes = [None, Some(None), Some(Some(Steering::ProxyEnv))];
+        let stances = [
+            None,
+            Some(Quic443::Auto),
+            Some(Quic443::Block),
+            Some(Quic443::Allow),
+        ];
+        for lane in lanes {
+            for stance in stances {
+                let mut harness = spawn_test_relay_with(&quic_policy(lane), |gate| {
+                    if let Some(stance) = stance {
+                        gate.set_quic443(stance);
+                    }
+                });
+                assert_eq!(
+                    first_forwarded(&mut harness, &quic).await,
+                    sentinel,
+                    "UDP 443 to the proxy never reaches the switch: {lane:?} {stance:?}"
+                );
+                let reply = crate::net::dns_gate::tests::read_box_frame(&harness)
+                    .await
+                    .expect("the box gets an answer");
+                assert_port_unreachable(&reply, &quic);
+            }
+        }
     }
 }
