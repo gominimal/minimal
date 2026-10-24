@@ -1590,10 +1590,20 @@ impl BoxGate {
     /// while the box's stance is blocked, and one to the Box Egress Proxy's
     /// address in every stance. `None` passes the frame on to the egress
     /// verdict. Each rejection writes a rate-limited debug line with the
-    /// box and the destination.
+    /// box and the destination. A datagram to a multicast or broadcast
+    /// address, or in a link-layer multicast or broadcast frame, gets no
+    /// answer here: RFC 1122 §3.2.2 forbids an ICMP error for it, and the
+    /// reply would carry the group address as its source.
     fn refuse_udp_443(&self, frame: &[u8]) -> Option<Vec<u8>> {
         let pkt = parse_ipv4_l4(frame)?;
         if pkt.proto != IPPROTO_UDP || pkt.dst.port() != QUIC_PORT {
+            return None;
+        }
+        // The group bit of the destination MAC is set for link-layer
+        // multicast and broadcast alike.
+        let link_group = frame.first().is_some_and(|b| b & 0x01 != 0);
+        let ip = pkt.dst.ip();
+        if link_group || ip.is_multicast() || ip.is_broadcast() {
             return None;
         }
         let to_proxy = *pkt.dst.ip() == self.proxy;
@@ -7445,6 +7455,21 @@ pub(crate) mod tests {
             let tcp = egress_tcp_frame(LEASE, QUIC_PEER, 443);
             assert_eq!(first_forwarded(&mut harness, &tcp).await, tcp);
         }
+
+        // No ICMP error answers a multicast or broadcast datagram
+        // (RFC 1122 §3.2.2), at the IP layer or the link layer.
+        let harness = spawn_test_relay(&quic_policy(Some(None)));
+        let gate = harness.gate.as_ref().unwrap();
+        assert!(gate.quic443_blocked());
+        for group in [Ipv4Addr::new(239, 255, 255, 250), Ipv4Addr::BROADCAST] {
+            let frame = udp_frame(LEASE, 40000, group, 443);
+            assert_eq!(gate.refuse_udp_443(&frame), None, "{group}");
+        }
+        let mut link_broadcast = quic.clone();
+        link_broadcast[..6].fill(0xff);
+        assert_eq!(gate.refuse_udp_443(&link_broadcast), None);
+        assert!(gate.refuse_udp_443(&quic).is_some());
+        drop(harness);
 
         // A declared `block` blocks on a box with no lane.
         let mut harness = spawn_test_relay_with(&quic_policy(None), |gate| {
