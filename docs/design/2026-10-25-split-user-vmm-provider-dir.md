@@ -1,7 +1,10 @@
 # Split-user VMM: provider directory and socket ownership
 
-Status: proposed. The architecture ruling is pending. This document records
-the model that it asks the architecture to rule on, and the fallback.
+Status: ruled. The architecture accepted the split-user model with a
+separate directory for the VM user, not a shared sticky directory. The
+provider directory stays writable only by `<login>`. Every entry that
+`minimal-vmm` creates goes into `<provider dir>/vmm/`, which `minimal-vmm`
+owns. Two open items remain at the end of this document.
 
 ## Question
 
@@ -25,8 +28,11 @@ default VM (`state::provider_dir`).
   `min` run as this user.
 - `minimal-vmm`: the dedicated unprivileged user. On macOS the name is
   `_minimal-vmm`, following the platform convention for service accounts.
-- `minimal-vmm` (group): a group whose members are `minimal-vmm` and
-  `<login>`. It is the primary group of the `minimal-vmm` user.
+- `minimal-vmm` (group): the primary group of the `minimal-vmm` user. It
+  has exactly one login member, `<login>`. `min finalize-install` adds
+  `<login>` and removes any other login member. A second login member can
+  connect to the 0660 sockets of the first user's VM, so the group never
+  has two.
 
 ## What each process does today
 
@@ -74,6 +80,16 @@ This list comes from `sock.rs`, `vm.rs`, `image.rs`, `volume.rs`,
 - On a failed boot the supervisor can remove a blank `data-vol.raw`
   (`cmd/mod.rs`, R2.5 disposition). That needs write access to the
   directory, not to the file.
+- `cmd/run.rs` names the proxy socket with
+  `switch_sock.with_file_name("gvproxy-bep.sock")`, beside the switch
+  socket. `timekeep.rs` names `timekeep.sock` beside the `ssh.sock` path.
+- `control.rs` `serve_connection` reads the peer uid of every connection,
+  on the host door (`control.sock`) and on the guest door
+  (`guest-control.sock`). It admits the supervisor's own uid, and root for
+  the two answerer handover verbs only. It drops every other uid
+  unanswered. `guest_telemetry.rs` `accept_loop` admits only the
+  supervisor's own uid. `net/egress_gate.rs` and the marker socket in
+  `cmd/run.rs` do no peer check.
 
 ## Facts the model depends on
 
@@ -87,149 +103,204 @@ This list comes from `sock.rs`, `vm.rs`, `image.rs`, `volume.rs`,
    socket. The VMM child must set the mode of the sockets it creates.
 4. libkrun binds a socket with the mode that the umask of the process gives.
    The VMM child sets its umask to `0007` before the first `add_vsock_port2`.
-5. A directory with the setgid bit gives its group to every new entry. A
-   3770 directory with group `minimal-vmm` gives every new socket and file the
-   `minimal-vmm` group, whichever of the two users creates it.
-6. A directory with the sticky bit lets a user unlink or rename an entry
-   only when that user owns the entry or owns the directory. In a 3770
-   directory that `<login>` owns, `minimal-vmm` can create entries, but it
-   cannot unlink, rename or replace an entry that `<login>` owns. `<login>`
-   can unlink any entry, because it owns the directory.
+5. Only root can give a file or a directory to another user. A user who is
+   not root can change the group of its own entry only to a group that it is
+   a member of. So `<login>` can set group `minimal-vmm` on its own sockets,
+   but it cannot create a directory that `minimal-vmm` owns.
+6. A socket path exists from `bind(2)`, not from `socket(2)`. An `fchown`
+   or `fchmod` on the descriptor before the bind does not change the path.
+   The owner sets the group and the mode with `chown` and `chmod` on the
+   path after the bind.
 7. `bind(2)` fails with `EADDRINUSE` when any entry, a symlink included,
    already exists at the path. After a bind succeeds, the path is the
-   socket that the caller bound.
+   socket that the caller bound. Only a user that can write the directory
+   can replace it after that.
 8. `sudo` resets the environment and closes inherited descriptors above 2 by
    default. The VMM child reads `MINVMD_MARKER_SOCK`,
    `MINVMD_GUEST_REPORT_SOCK`, `MINVMD_GUEST_TELEMETRY_SOCK` and the state
    identity from its environment. It also inherits the alive lock descriptor
    (`alive_lock.inherit_into`). The drop-in must keep these, or the spawn must
    pass them as arguments.
+9. `sudo -n` never prompts. When no rule admits the command without a
+   password, it exits non-zero at once.
 
 ## Ownership model
 
-The hypothesis: a group that the two users share, a 3770 provider
-directory (setgid and sticky), and 0660 on each socket that the other user opens. A socket or
-file that only one user opens stays 0600. The uid change goes through a
-sudoers drop-in that `min finalize-install` installs. The drop-in permits
-`<login>` to run the `minvmd` and gvproxy binaries as `minimal-vmm`, and
-nothing else.
+The provider directory belongs to `<login>`, and `minimal-vmm` cannot write
+to it. `minimal-vmm` creates its entries only in `<provider dir>/vmm/`, a
+subdirectory that `minimal-vmm` owns and `<login>` cannot write to. So
+gvproxy and `bep serve` share no writable directory. The two users share
+the `minimal-vmm` group. A socket that the other user opens gets 0660 with
+group `minimal-vmm`. A socket or file that only one user opens stays 0600.
+
+The uid change goes through a sudoers drop-in that `min finalize-install`
+installs. The drop-in is a `NOPASSWD` rule that lets `<login>` run as
+`minimal-vmm` exactly two commands: the `minvmd __krun-vmm` spawn of the
+VMM child and the gvproxy spawn. It permits nothing else. The supervisor
+runs both spawns as `sudo -n -u minimal-vmm`, so `min session start` never
+prompts for a password (fact 9).
+
+When `sudo -n` fails, the drop-in or the `minimal-vmm` user is missing. Then
+the supervisor refuses to start the VM, and `min` prints an error that names
+`min finalize-install`. The supervisor never starts gvproxy or the VMM child
+as `<login>` in place of `minimal-vmm`. The proposed text, which T38 pins in
+a test:
+
+```text
+The VM did not start: this machine has no minimal-vmm user, or no sudo rule that lets min start the VM as that user.
+Run `min finalize-install` to set them up.
+```
 
 Every row names the user that creates the entry, the mode it gets, and each
-user that opens it.
+user that opens it. A path that starts with `vmm/` is in `<provider dir>/vmm/`.
 
 | Path | Created by | Mode | Opened by |
 |---|---|---|---|
-| `<provider dir>/` | `<login>` (`prepare_socket_dir`, from the supervisor before the spawn) | 3770, group `minimal-vmm` | `<login>` (supervisor, `min`, `bep serve`), `minimal-vmm` (VMM child, gvproxy) |
-| `ssh.sock` | `minimal-vmm` (VMM child, libkrun bind) | 0660 | `<login>` (`min`), `minimal-vmm` (libkrun bridge) |
-| `timekeep.sock` | `minimal-vmm` (VMM child, libkrun bind) | 0600 | `minimal-vmm` (timekeep thread in the VMM child) |
-| `gvproxy-gate.sock` | `<login>` (supervisor, egress gate) | 0660 | `minimal-vmm` (VMM child, libkrun shuttle) |
-| `guest-control.sock` | `<login>` (supervisor, guest report door) | 0660 | `minimal-vmm` (VMM child, libkrun) |
-| `guest-telemetry.sock` | `<login>` (supervisor, guest telemetry door) | 0660 | `minimal-vmm` (VMM child, libkrun) |
-| `/tmp/minvmd-marker-<pid>-<nonce>.sock` | `<login>` (supervisor) | 0660, group `minimal-vmm` set with `fchown` before `listen` | `minimal-vmm` (VMM child, libkrun) |
-| `boot.log` | `minimal-vmm` (VMM child) | 0640 | `minimal-vmm` (libkrun console), `<login>` (`min diag`) |
-| `data-vol.raw` | `minimal-vmm` (VMM child, `ensure_sparse_raw`) | 0600 | `minimal-vmm` (libkrun data disk) |
-| `gvproxy.yaml` | `<login>` (supervisor, `write_config`) | 0640 | `minimal-vmm` (gvproxy) |
-| `gvproxy-switch.sock` | `minimal-vmm` (gvproxy `-listen`) | 0660 | `<login>` (supervisor, egress gate) |
+| `<provider dir>/` | `<login>` (`prepare_socket_dir`, from the supervisor before the spawn) | 0710, group `minimal-vmm` | `<login>` (supervisor, `min`, `bep serve`), `minimal-vmm` (VMM child, gvproxy; search only) |
+| `<provider dir>/vmm/` | `root` (`min finalize-install`, which gives it to `minimal-vmm`) | 0750, owner `minimal-vmm`, group `minimal-vmm` | `minimal-vmm` (VMM child, gvproxy), `<login>` (supervisor, `min`; read and search only) |
+| `vmm/ssh.sock` | `minimal-vmm` (VMM child, libkrun bind) | 0660 | `<login>` (`min`), `minimal-vmm` (libkrun bridge) |
+| `vmm/timekeep.sock` | `minimal-vmm` (VMM child, libkrun bind) | 0600 | `minimal-vmm` (timekeep thread in the VMM child) |
+| `vmm/boot.log` | `minimal-vmm` (VMM child) | 0640 | `minimal-vmm` (libkrun console), `<login>` (`min diag`) |
+| `vmm/data-vol.raw` | `minimal-vmm` (VMM child, `ensure_sparse_raw`) | 0600 | `minimal-vmm` (libkrun data disk) |
+| `vmm/gvproxy-switch.sock` | `minimal-vmm` (gvproxy `-listen`) | 0660 | `<login>` (supervisor, egress gate) |
+| `gvproxy-gate.sock` | `<login>` (supervisor, egress gate) | 0660, group `minimal-vmm` | `minimal-vmm` (VMM child, libkrun shuttle) |
+| `guest-control.sock` | `<login>` (supervisor, guest report door) | 0660, group `minimal-vmm` | `minimal-vmm` (VMM child, libkrun) |
+| `guest-telemetry.sock` | `<login>` (supervisor, guest telemetry door) | 0660, group `minimal-vmm` | `minimal-vmm` (VMM child, libkrun) |
+| `/tmp/minvmd-marker-<pid>-<nonce>.sock` | `<login>` (supervisor) | 0660, group `minimal-vmm` set with `chown` on the path after `bind` | `minimal-vmm` (VMM child, libkrun) |
+| `gvproxy.yaml` | `<login>` (supervisor, `write_config`) | 0640, group `minimal-vmm` | `minimal-vmm` (gvproxy) |
 | `gvproxy-bep.sock` | `<login>` (`bep serve`, `bind_owner_only`) | 0600 | `<login>` (supervisor, `switch::bep_host`) |
 | `control.sock` | `<login>` (supervisor) | 0600 | `<login>` (`min`) |
 
 Notes on the table:
 
+- `minimal-vmm` can search the provider directory, so it can reach the
+  0660 sockets there by name. It cannot list, create, unlink or rename an
+  entry there. So it cannot replace `control.sock`, `gvproxy-bep.sock`,
+  `gvproxy.yaml` or a door socket with its own.
+- `<login>` can read and search `vmm/`, but it cannot write there. So the
+  supervisor cannot unlink `vmm/data-vol.raw` or a stale socket in `vmm/`.
+  The VMM child removes its own stale sockets (`prepare_socket_dir` already
+  does this). The removal of a blank data volume after a failed boot (R2.5
+  disposition) moves into the VMM child.
 - `data-vol.raw` stays 0600. `min diag` reads only its metadata, and that
-  needs search access to the directory, not read access to the file. The
-  supervisor checks only whether it exists, and it can unlink it through
-  the directory.
+  needs search access to `vmm/`, not read access to the file.
 - `timekeep.sock` stays 0600. Only the VMM child opens it.
-- `gvproxy-bep.sock` and `control.sock` stay 0600, owned by `<login>`. The
-  `minimal-vmm` user can search the directory but cannot connect to them.
-  `control.sock` drives the daemon, and `gvproxy-bep.sock` substitutes
-  credentials, so a compromised VMM must reach neither. The peer uid check in
-  `listener.rs` stays as it is, because its peer runs in the supervisor.
-- The directory has the sticky bit, so `minimal-vmm` cannot unlink or
-  rename `control.sock`, `gvproxy-bep.sock` or any other entry that
-  `<login>` owns (fact 6). Without the sticky bit, a compromised VMM can
-  delete `control.sock` and bind its own socket at that path. Then `min`
-  connects to the VMM's socket. The next section says how each process
-  checks an entry before it uses it.
-- The group gives `minimal-vmm` access to the 0660 sockets that `<login>`
-  binds, and nothing more. The supervisor sets those modes with
-  `enforce_socket_permissions` after each bind. The VMM child sets the mode
-  of the sockets that it creates.
+- `gvproxy-bep.sock` and `control.sock` stay 0600, owned by `<login>`. A
+  compromised VMM must reach neither: `control.sock` drives the daemon, and
+  `gvproxy-bep.sock` substitutes credentials.
+- `gvproxy-bep.sock` stays in the provider directory. `cmd/run.rs` must
+  stop naming it beside the switch socket, because that name now points
+  into `vmm/`, where `bep serve` cannot bind. `timekeep.sock` moves with
+  `ssh.sock`, because `timekeep.rs` names it beside that path.
+- The provider directory is not setgid, so a socket that the supervisor
+  binds gets the primary group of `<login>`. The supervisor sets group
+  `minimal-vmm` and mode 0660 with `chown` and `chmod` on the path after
+  the bind, and before it spawns the VMM child (fact 6). `minimal-vmm`
+  cannot write the provider directory, and `/tmp` is sticky. So nobody else
+  can replace the path between the bind and the `chown` (fact 7).
+
+## Peer checks after the split
+
+The 0660 mode lets `minimal-vmm` connect. Each listener then reads the peer
+uid. This list states the peer that dials each socket and the uids that the
+check admits.
+
+- `control.sock` (host door): `min` dials it as `<login>`. `serve_connection`
+  admits the supervisor's own uid, and root for the two answerer handover
+  verbs. This does not change. `minimal-vmm` is refused.
+- `guest-control.sock` (guest door): the VMM child dials it as
+  `minimal-vmm`. On this door only, `serve_connection` admits the
+  `minimal-vmm` uid, and the supervisor's own uid. The host door keeps its
+  check. The door, not the peer, decides which verbs a connection can ask
+  for, as `control.rs` does today.
+- `guest-telemetry.sock`: the VMM child dials it as `minimal-vmm`.
+  `accept_loop` admits the `minimal-vmm` uid and the supervisor's own uid.
+- `gvproxy-gate.sock` and the marker socket: the VMM child dials them as
+  `minimal-vmm`. They have no peer check today. The 0660 mode and the
+  one-member group are the gate.
+- `gvproxy-bep.sock` (the BEP socket): the supervisor dials it as
+  `<login>`, through `switch::bep_host`. gvproxy never dials it. The
+  `listener.rs` check admits only the uid of `bep serve`, which is
+  `<login>`, and then requires the token. This does not change.
+  `minimal-vmm` is refused by the 0600 mode and by the uid check.
+- `vmm/gvproxy-switch.sock`: the supervisor dials it as `<login>`. gvproxy
+  does no peer check.
+- `vmm/ssh.sock`: `min` dials it as `<login>`. libkrun does no peer check.
+
+The supervisor resolves the `minimal-vmm` uid once at start, with
+`getpwnam`. It refuses to start when the user is missing, with the error in
+the ownership model.
 
 ## How each process checks an entry before use
 
-The sticky bit stops `minimal-vmm` from replacing an entry that `<login>`
-owns. It does not stop `minimal-vmm` from creating an entry at a name that
-does not exist yet. These rules close that gap.
-
-- Bind: the supervisor and `bep serve` `lstat` the path before they bind.
-  An entry that `<login>` owns is a stale socket from an earlier run, and
-  they unlink it. An entry that another user owns, or a symlink, is a
-  refusal: the process logs the path and the owner, and it does not start.
-  When `minimal-vmm` creates the entry between the unlink and the bind, the
-  bind fails with `EADDRINUSE` (fact 7), and that is a refusal too.
-- Mode: the supervisor sets the mode of a socket that it binds with
-  `fchmod` on the listening descriptor where the platform permits it.
-  Otherwise it runs `chmod` on the path only after the bind succeeds. Fact 7
-  and fact 6 together make sure that the path is still its own socket, so a
-  planted symlink cannot redirect the `chmod`.
-- Connect to a `<login>` socket: `min` (for `control.sock`) and the
-  supervisor (for `gvproxy-bep.sock`) `lstat` the path before they connect.
-  They require a socket that their own uid owns, and they refuse anything
-  else. The sticky bit makes sure that `minimal-vmm` cannot swap the entry
-  after the check. `control.rs` and `listener.rs` also keep their peer uid
-  checks on the listening side.
-- Connect to a `minimal-vmm` socket: `min` (for `ssh.sock`) and the
-  supervisor (for `gvproxy-switch.sock`) `lstat` the path and require a
+- Bind in the provider directory: the supervisor and `bep serve` `lstat`
+  the path before they bind. An entry that `<login>` owns is a stale socket
+  from an earlier run, and they unlink it. Only `<login>` can write the
+  directory, so no entry there has another owner. An entry that another
+  user owns, or a symlink, is a refusal: the process logs the path and the
+  owner, and it does not start.
+- Start: the supervisor checks that `vmm/` is a directory, not a symlink,
+  owned by `minimal-vmm` with group `minimal-vmm` and mode 0750. Otherwise
+  it refuses to start the VM with an error that names
+  `min finalize-install`.
+- Connect to a `minimal-vmm` socket: `min` (for `vmm/ssh.sock`) and the
+  supervisor (for `vmm/gvproxy-switch.sock`) `lstat` the path and require a
   socket that `minimal-vmm` owns. These sockets carry the VM's own traffic,
   so a compromised VMM gains nothing here that it does not already have.
 - Supervisor files: the supervisor writes `gvproxy.yaml` with
-  `O_CREAT | O_EXCL | O_NOFOLLOW` after it unlinks a stale copy, and it
-  refuses an entry that another user owns. It removes a blank
-  `data-vol.raw` with `unlink`, which never follows a symlink.
+  `O_CREAT | O_EXCL | O_NOFOLLOW` after it unlinks a stale copy.
 - Migration: a provider directory from before the split holds `ssh.sock`,
-  `timekeep.sock` and `boot.log` owned by `<login>`. The VMM child cannot
-  unlink them under the sticky bit. So the supervisor removes these three
-  entries before it spawns the VMM child.
+  `timekeep.sock`, `boot.log` and `data-vol.raw` owned by `<login>`. The
+  supervisor removes the stale sockets and the old `boot.log`.
+  `data-vol.raw` holds the user's data, and `<login>` cannot write `vmm/`.
+  So `min finalize-install`, as root, moves it into `vmm/` and gives it to
+  `minimal-vmm`.
 
 ## What T38 changes
 
-- `prepare_socket_dir` creates the directory 3770 with group `minimal-vmm`.
-- `restrict_owned_dir` and `verify_provider_dir_ownership` accept 3770 with
-  group `minimal-vmm`. They refuse a directory without the sticky bit, a
-  directory that another uid owns, and a directory that is open to others.
-- The bind, connect and file checks in the section before this one.
+- `prepare_socket_dir` creates the provider directory 0710 with group
+  `minimal-vmm`. The VMM child calls it on `vmm/` and only verifies that
+  directory, because it cannot create it.
+- `restrict_owned_dir` and `verify_provider_dir_ownership` accept 0710 with
+  group `minimal-vmm`. They refuse a provider directory that another uid
+  owns, that the group can write, or that is open to others. A new check
+  verifies `vmm/` as the section before this one says.
+- `ssh.sock`, `timekeep.sock`, `boot.log`, `data-vol.raw` and
+  `gvproxy-switch.sock` move to `vmm/`. `gvproxy-bep.sock` keeps its path in
+  the provider directory.
 - `enforce_socket_permissions` and `verify_socket_permissions` take the
-  mode from the table. The supervisor stops the `chmod` of `ssh.sock`. The
-  VMM child sets it after libkrun binds it, and the supervisor only verifies
-  it.
-- The supervisor spawns the VMM child and gvproxy through `sudo -u
-  minimal-vmm`. The drop-in keeps the environment variables and the alive
-  lock descriptor that fact 8 names.
+  mode and the group from the table. The supervisor stops the `chmod` of
+  `ssh.sock`. The VMM child sets it after libkrun binds it, and the
+  supervisor only verifies it.
+- The guest door and the telemetry door admit the `minimal-vmm` uid, as
+  the peer checks section says.
+- The supervisor spawns the VMM child and gvproxy through
+  `sudo -n -u minimal-vmm`. The drop-in keeps the environment variables
+  and the alive lock descriptor that fact 8 names. When `sudo -n` fails,
+  the start refuses with the error in the ownership model.
 
 ## Fallback: only gvproxy runs as `minimal-vmm`
 
-If the architecture does not accept the shared group, the VMM child stays
-with `<login>`. Then only three rows change from today:
+If T38 cannot move the VMM child, the VMM child stays with `<login>`, and
+only gvproxy runs as `minimal-vmm`. The same subdirectory carries the model:
+`vmm/` holds only the switch socket. These rows change from today:
 
 | Path | Created by | Mode | Opened by |
 |---|---|---|---|
-| `<provider dir>/` | `<login>` (`prepare_socket_dir`) | 3770, group `minimal-vmm` | `<login>` (supervisor, `min`, `bep serve`), `minimal-vmm` (gvproxy) |
+| `<provider dir>/` | `<login>` (`prepare_socket_dir`) | 0710, group `minimal-vmm` | `<login>` (supervisor, `min`, `bep serve`), `minimal-vmm` (gvproxy; search only) |
+| `<provider dir>/vmm/` | `root` (`min finalize-install`, which gives it to `minimal-vmm`) | 0750, owner `minimal-vmm`, group `minimal-vmm` | `minimal-vmm` (gvproxy), `<login>` (supervisor; read and search only) |
 | `gvproxy.yaml` | `<login>` (supervisor) | 0640, group `minimal-vmm` | `minimal-vmm` (gvproxy) |
-| `gvproxy-switch.sock` | `minimal-vmm` (gvproxy `-listen`) | 0660 | `<login>` (supervisor, egress gate) |
+| `vmm/gvproxy-switch.sock` | `minimal-vmm` (gvproxy `-listen`) | 0660 | `<login>` (supervisor, egress gate) |
 
-gvproxy creates its socket in the directory, so the directory needs 3770
-with group `minimal-vmm` here too. The sticky bit and the checks before use
-apply as in the shared group model. The other choice is a subdirectory that
-`minimal-vmm` owns, for the switch socket only. Then the provider directory
-needs only 0710 with group `minimal-vmm`, and `minimal-vmm` cannot write to
-it. Every other entry keeps the owner and the mode it has today.
+Every other entry keeps the owner, the mode and the path it has today.
+`minimal-vmm` cannot write the provider directory here either. The drop-in
+permits only the gvproxy spawn, and the `sudo -n` refusal is the same.
 
-## Open items for the architecture ruling
+## Open items
 
-- Accept or refuse the shared group model, or choose the fallback.
-- Choose between the sticky bit and a separate directory that `minimal-vmm`
-  cannot write for the sockets that `<login>` owns.
 - Confirm that macOS checks socket write permission on `connect(2)`.
 - The tree has no sudoers drop-in and no `min finalize-install` command
   today. The task that installs them (T19 in this plan) must land first.
+  That task must also create `<provider dir>/vmm/` and move a
+  `data-vol.raw` from before the split, because only root can give a
+  directory or a file to `minimal-vmm` (fact 5).

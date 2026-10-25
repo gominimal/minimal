@@ -368,42 +368,91 @@ mod tests {
             .config_path()
             .to_path_buf(),
         );
-        // Every entry in the provider dir, every entry the VMM child or
-        // `prepare_socket_dir` creates, and
-        // every socket the VMM child opens. Derived from the code where the
-        // crate names the file, so a rename breaks this test.
+        // Every entry in the provider dir and in its `vmm/` subdirectory,
+        // every entry the VMM child or `prepare_socket_dir` creates, and
+        // every socket the VMM child opens, each with the user that must
+        // create it. Derived from the code where the crate names the file,
+        // so a rename breaks this test. The entries `minimal-vmm` creates
+        // sit in `vmm/`, because `minimal-vmm` cannot write the provider
+        // dir (arch ruling C1 on the split-user design).
+        let vmm = |name: String| format!("vmm/{name}");
         let required = [
-            "<provider dir>/".to_string(),
-            paths::SSH_SOCK_FILE.to_string(),
-            file_name(crate::timekeep::resolve_timekeep_sock().unwrap()),
-            file_name(crate::net::resolve_gate_sock().unwrap()),
-            crate::control::GUEST_CONTROL_SOCK_FILE.to_string(),
-            crate::guest_telemetry::GUEST_TELEMETRY_SOCK_FILE.to_string(),
-            "/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(),
-            "boot.log".to_string(),
-            "data-vol.raw".to_string(),
-            gvproxy_yaml.clone(),
-            switch_sock.clone(),
+            ("<provider dir>/".to_string(), LOGIN),
+            ("<provider dir>/vmm/".to_string(), ROOT),
+            (vmm(paths::SSH_SOCK_FILE.to_string()), VMM),
+            (
+                vmm(file_name(crate::timekeep::resolve_timekeep_sock().unwrap())),
+                VMM,
+            ),
+            (vmm("boot.log".to_string()), VMM),
+            (vmm("data-vol.raw".to_string()), VMM),
+            (vmm(switch_sock.clone()), VMM),
+            (file_name(crate::net::resolve_gate_sock().unwrap()), LOGIN),
+            (crate::control::GUEST_CONTROL_SOCK_FILE.to_string(), LOGIN),
+            (
+                crate::guest_telemetry::GUEST_TELEMETRY_SOCK_FILE.to_string(),
+                LOGIN,
+            ),
+            ("/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(), LOGIN),
+            (gvproxy_yaml.clone(), LOGIN),
             // `cmd/run.rs` names the proxy socket beside the switch socket
-            // with this literal. No constant carries it.
-            "gvproxy-bep.sock".to_string(),
-            crate::control::CONTROL_SOCK_FILE.to_string(),
+            // with this literal. No constant carries it. It stays in the
+            // provider dir, out of the VM user's reach.
+            ("gvproxy-bep.sock".to_string(), LOGIN),
+            (crate::control::CONTROL_SOCK_FILE.to_string(), LOGIN),
         ];
 
         check_table(&doc, "Ownership model", &required);
-        // The fallback changes only the gvproxy rows, and it names the
-        // directory mode it needs for them.
+        // The fallback changes only the gvproxy rows, and it keeps the
+        // same subdirectory for the switch socket.
         check_table(
             &doc,
             "Fallback: only gvproxy runs as `minimal-vmm`",
-            &["<provider dir>/".to_string(), gvproxy_yaml, switch_sock],
+            &[
+                ("<provider dir>/".to_string(), LOGIN),
+                ("<provider dir>/vmm/".to_string(), ROOT),
+                (gvproxy_yaml, LOGIN),
+                (vmm(switch_sock), VMM),
+            ],
         );
     }
 
+    const LOGIN: &str = "<login>";
+    const VMM: &str = "minimal-vmm";
+    const ROOT: &str = "root";
+
+    /// The users named at the start of each comma-separated entry of `cell`,
+    /// ignoring commas inside parentheses. `None` when an entry does not
+    /// start with one of the three users the design knows.
+    fn users_in(cell: &str) -> Option<Vec<&'static str>> {
+        let mut entries = Vec::new();
+        let (mut depth, mut start) = (0usize, 0usize);
+        for (i, c) in cell.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    entries.push(&cell[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        entries.push(&cell[start..]);
+        entries
+            .into_iter()
+            .map(|entry| {
+                let token = entry.split_whitespace().next()?;
+                [LOGIN, VMM, ROOT].into_iter().find(|u| *u == token)
+            })
+            .collect()
+    }
+
     /// Checks that the table in the `## <heading>` section of `doc` has a
-    /// row for each name in `required`. Each row names a creating user, a
-    /// four-digit octal mode and an opening user.
-    fn check_table(doc: &str, heading: &str, required: &[String]) {
+    /// row for each name in `required`. Each row names the expected
+    /// creating user first, a four-digit octal mode that gives its owner
+    /// some access, and only known users as opening users.
+    fn check_table(doc: &str, heading: &str, required: &[(String, &str)]) {
         let section = doc
             .split("\n## ")
             .find(|s| s.starts_with(&format!("{heading}\n")))
@@ -414,22 +463,24 @@ mod tests {
             .map(|l| {
                 l.trim_matches('|')
                     .split('|')
-                    .map(|c| c.trim().trim_matches('`').to_string())
+                    .map(|c| c.replace('`', "").trim().to_string())
                     .collect()
             })
             .filter(|cells: &Vec<String>| cells.first().is_some_and(|c| c != "Path"))
             .collect();
 
-        let names_a_user = |cell: &str| cell.contains("<login>") || cell.contains("minimal-vmm");
-        for name in required {
+        for (name, creator) in required {
             let row = rows
                 .iter()
                 .find(|cells| &cells[0] == name)
                 .unwrap_or_else(|| panic!("the {heading} table has no row for {name}"));
             assert_eq!(row.len(), 4, "row for {name} has four columns: {row:?}");
-            assert!(
-                names_a_user(&row[1]),
-                "row for {name} names its creating user"
+            let creators = users_in(&row[1])
+                .unwrap_or_else(|| panic!("row for {name} names a known creating user: {row:?}"));
+            assert_eq!(
+                creators.first(),
+                Some(creator),
+                "row for {name} is created by {creator}: {row:?}",
             );
             let mode = row[2].split([' ', ',']).next().unwrap_or("");
             assert!(
@@ -437,10 +488,16 @@ mod tests {
                 "row for {name} names a four-digit octal mode, got {:?}",
                 row[2],
             );
-            assert!(
-                names_a_user(&row[3]),
-                "row for {name} names an opening user"
+            assert_ne!(
+                &mode[1..2],
+                "0",
+                "row for {name} gives its owner some access, got {:?}",
+                row[2],
             );
+            let openers = users_in(&row[3]).unwrap_or_else(|| {
+                panic!("row for {name} names only known opening users: {row:?}")
+            });
+            assert!(!openers.is_empty(), "row for {name} names an opening user");
         }
     }
 }
