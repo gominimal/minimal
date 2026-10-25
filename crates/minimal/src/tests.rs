@@ -4374,6 +4374,7 @@ mod mint_tests {
                             bep::control::Reply {
                                 ok: true,
                                 kid: None,
+                                revoked: Vec::new(),
                                 error: None,
                             }
                         } else {
@@ -4466,6 +4467,7 @@ mod mint_tests {
                         bep::control::Reply {
                             ok: true,
                             kid: None,
+                            revoked: Vec::new(),
                             error: None,
                         }
                     } else {
