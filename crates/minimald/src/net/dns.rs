@@ -222,13 +222,21 @@ impl ProxyListenerState {
         let Some(source) = &self.source else {
             return self.live.load(std::sync::atomic::Ordering::Acquire);
         };
+        // The guard clears `asking` however the ask ends. A task dropped or
+        // panicking mid-ask would otherwise leave `asking` set, and no later
+        // read would ask again. An ask that ends without an answer also
+        // records down, so steered names fail closed.
+        let mut guard = AskGuard {
+            state: self,
+            source,
+            answered: false,
+        };
         let live = super::listeners::proxy_listening(&source.control)
             .await
             .unwrap_or(false);
-        self.set_live(live);
-        source
-            .asking
-            .store(false, std::sync::atomic::Ordering::Release);
+        guard.state.set_live(live);
+        guard.answered = true;
+        drop(guard);
         live
     }
 
@@ -244,6 +252,25 @@ impl ProxyListenerState {
             );
         }
         was != live
+    }
+}
+
+/// Ends one ask of a [`ProxyListenerState`]: clears its `asking` flag on
+/// drop, and records down when the ask ended without an answer.
+struct AskGuard<'a> {
+    state: &'a ProxyListenerState,
+    source: &'a ListenerSource,
+    answered: bool,
+}
+
+impl Drop for AskGuard<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.state.set_live(false);
+        }
+        self.source
+            .asking
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -5324,5 +5351,44 @@ mod tests {
             LoopbackGrant::Granted(boxes::core::loopback::POOL_FIRST),
             "an empty record reads as a fresh host"
         );
+    }
+
+    /// An ask that is dropped before the host answers clears its `asking`
+    /// flag and records down, so a later read asks again and a steered
+    /// name fails closed meanwhile.
+    #[tokio::test]
+    async fn a_dropped_listener_ask_clears_asking_and_reads_down() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let control_sock = dir.path().join("gvproxy.sock");
+        let door = dir.path().join("guest-control.sock");
+        // A door that takes the connection and never answers.
+        let _silent = tokio::net::UnixListener::bind(&door).expect("bind the silent door");
+        super::super::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+        let state = ProxyListenerState {
+            live: std::sync::Arc::default(),
+            source: Some(std::sync::Arc::new(ListenerSource {
+                control: super::super::policy::ControlChannel::Unix(control_sock.clone()),
+                asked: std::sync::Mutex::new(None),
+                asking: std::sync::atomic::AtomicBool::new(true),
+            })),
+        };
+        state.set_live(true);
+        let ask = tokio::time::timeout(Duration::from_millis(50), state.refresh()).await;
+        assert!(
+            ask.is_err(),
+            "the silent door holds the ask past the timeout"
+        );
+
+        let source = state.source.as_ref().expect("the state has a source");
+        assert!(
+            !source.asking.load(std::sync::atomic::Ordering::Acquire),
+            "the dropped ask clears asking"
+        );
+        assert!(
+            !state.live.load(std::sync::atomic::Ordering::Acquire),
+            "the dropped ask records down"
+        );
+        super::super::listeners::clear_vm_report_door_for_tests(&control_sock);
     }
 }
