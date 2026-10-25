@@ -25,6 +25,12 @@ review comments there carry each ruling:
   of the networking design for default deny and fail closed:
   [arch C2](https://github.com/gominimal/minimal/pull/2546#discussion_r4369951621)
   and [arch C1](https://github.com/gominimal/minimal/pull/2546#discussion_r4369951620).
+  Arch ruled at `a591a791` that the citation conforms.
+- The stop of the EGW process as `minimal-gvproxy`, the observed exit
+  before the withdrawal answer, and the fail-closed result when no exit
+  comes:
+  [arch C1 on the stop](https://github.com/gominimal/minimal/pull/2546#discussion_r4369987466)
+  and [arch C1 on the test](https://github.com/gominimal/minimal/pull/2546#discussion_r4369987470).
   This revision answers those two conditions, and arch has not ruled on
   the answer yet.
 
@@ -243,10 +249,13 @@ not in the `minimal-vmm` group, so it cannot search `vmm/`.
 The uid change goes through a sudoers drop-in that `min finalize-install`
 installs. The drop-in has `NOPASSWD` rules that let `<login>` run exactly
 the spawns that this model runs as another user. In this model there are
-three spawns. `minvmd __krun-vmm`, the VMM child, runs as `minimal-vmm`.
-gvproxy and the EGW process run as `minimal-gvproxy`. In the fallback
-there is one spawn: gvproxy as `minimal-vmm`. These rules apply to each
-spawn:
+three spawns and two stop rules. `minvmd __krun-vmm`, the VMM child, runs
+as `minimal-vmm`. gvproxy and the EGW process run as `minimal-gvproxy`.
+Each stop rule runs a fixed `minvmd` subcommand, one as `minimal-gvproxy`
+and one as `minimal-vmm` (the section on the stop of the EGW process). In
+the fallback there is one spawn, gvproxy as `minimal-vmm`, and one stop
+rule as `minimal-vmm`. These rules apply to each spawn and to each stop
+rule:
 
 - The rule names the binary by its absolute path. That path, and every
   directory above it, is owned by root and not writable by any other user.
@@ -259,8 +268,9 @@ spawn:
 - The rule keeps `env_reset`, and its `env_keep` list is empty. A value
   that changes between runs reaches the spawn on descriptor 0, never in the
   environment or the arguments (fact 8).
-- The VMM child rule and the EGW rule set `!use_pty`, so descriptor 0 is
-  the pipe or the socket that the supervisor hands over (fact 8).
+- The VMM child rule, the EGW rule and the stop rule set `!use_pty`, so
+  descriptor 0 is the pipe or the socket that the supervisor hands over
+  (fact 8).
 - The gvproxy rule sets `umask=0077` and `umask_override` (fact 11).
 - The EGW process gets the token of `gvproxy-bep.sock` on the supervisor
   channel, with the box table (the section on the supervisor channel). The
@@ -392,9 +402,10 @@ In the EGW process they get these from the supervisor channel:
   on any other message.
 - Bound on the acknowledgement: the supervisor waits at most 5 seconds for
   the acknowledgement of a withdrawal. On timeout, it stops the EGW process
-  and gvproxy on the EGW exit path below, and then answers the withdrawal.
-  No gate then runs, so the withdrawn row admits no frame after the answer,
-  and the control door does not wait without end.
+  and gvproxy with the stop sequence below. It answers the withdrawal as
+  done only after it observes the exit of both. When no exit comes within
+  the bound of the stop sequence, it answers the withdrawal as failed (the
+  fail-closed result below). The control door does not wait without end.
 - Peer check: the EGW process reads the peer credentials of descriptor 0
   (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS). For a `socketpair`
   end, they are the credentials of the process that created the pair. The
@@ -408,6 +419,75 @@ every frame, and it refuses every publish request. When the channel closes,
 or a message does not parse, the EGW process stops the gate, closes every
 relay and exits non-zero. A supervisor that exits closes its end, so an EGW
 process never outlives it.
+
+### The stop of the EGW process
+
+The EGW process runs as `minimal-gvproxy` behind `sudo`, so `<login>`
+cannot signal it. Today `GvproxySupervisor::stop` sends SIGTERM and then
+SIGKILL to the pid of its child. Under the split that child is `sudo`, and
+the SIGKILL ends `sudo` only. The EGW process then keeps running, with the
+last table it applied. So the supervisor never sends SIGKILL to the `sudo`
+of a spawn as another user. The `Drop` of the handle, which sends SIGKILL
+today, runs the stop rule in its place. These are the facts about `sudo` that the
+stop sequence uses:
+
+- With `!use_pty`, `sudo` forks the command and waits for it. The command
+  runs in the process group of `sudo`. `sudo` exits after the command
+  exits, with the status of the command. T38 pins in a test that the EGW
+  process runs in the process group of its `sudo`.
+- `sudo` relays to the command each signal that it can catch. That
+  includes SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2. It does
+  not relay a signal from a process in the process group of the command.
+- No process can catch SIGKILL or SIGSTOP, so `sudo` relays neither.
+
+The supervisor spawns the `sudo` of the EGW process, of gvproxy and of the
+VMM child, each in a new process group of its own (`process_group(0)`). So
+the group id of each is the pid of its `sudo`. The supervisor is in a
+different group, so `sudo` relays its SIGTERM. The pid of `sudo` stays
+taken until the supervisor reaps it, so the group id cannot go to another
+process before the reap.
+
+The stop sequence, for the EGW process and for gvproxy:
+
+1. The supervisor closes its end of the supervisor channel. The EGW
+   process exits when the channel closes. gvproxy has no channel.
+2. The supervisor sends SIGTERM to `sudo`, and `sudo` relays it to the
+   command. Then it waits for the exit for `term_timeout`
+   (`DEFAULT_TERM_TIMEOUT`, 3 seconds).
+3. When no exit comes, the supervisor runs the stop rule as the user of
+   the command: `sudo -n -u minimal-gvproxy` with a fixed `minvmd`
+   subcommand that T38 names. It hands the group id on descriptor 0. The
+   subcommand sends SIGKILL to that process group with `killpg(2)`, and
+   exits. As `minimal-gvproxy`, it can signal only the processes of
+   `minimal-gvproxy`. The `sudo` of the group runs as root, so the
+   SIGKILL does not reach it. The subcommand refuses a group id that
+   holds no process of its user.
+4. The supervisor waits at most 5 seconds after the stop rule for the
+   exit.
+
+The supervisor observes the exit of the EGW process when two things are
+true. `waitpid(2)` reports the exit of its `sudo`, and the supervisor
+reads end of file on its end of the channel. `sudo` exits only after the
+command exits, and end of file comes only when no process holds the other
+end. For gvproxy, the exit is the exit of its `sudo`.
+
+Fail-closed result: when no exit comes within the 5 seconds after the
+stop rule, the supervisor cannot prove that no gate runs. Then it does
+these things:
+
+- It answers the withdrawal on its control door as failed, never as done.
+- It stops the VMM child. The VMM child is the only process that sends
+  guest frames to the gate socket, so no guest frame then reaches the
+  gate. The VMM child runs as `minimal-vmm` behind `sudo`, so the
+  supervisor stops it with the same sequence and the stop rule as
+  `minimal-vmm`. The VMM child has no channel, so step 1 does not apply.
+- It refuses every later registration, and it exits non-zero after the
+  VMM child exit. The guest has no egress until the next boot.
+
+This follows the networking design: the EGW fails closed
+([networking design section 4.3, line 85](https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md)).
+
+### An unexpected exit of the EGW process
 
 The supervisor handles that exit on the path that handles an unexpected
 gvproxy exit today. `supervise_switch` in `net.rs` holds the child, and an
@@ -433,6 +513,9 @@ needs a wildcard or a wrapper that checks its arguments:
   name. The EGW process finds the gate socket, the switch socket and
   `gvproxy-bep.sock` from the VM name. The token and the table come on the
   supervisor channel.
+- The two stop rules: the arguments are a fixed `minvmd` subcommand and
+  the VM name. The process group id changes between runs, so it comes on
+  descriptor 0.
 - The VMM child: the arguments are `__krun-vmm` and the VM name. Every
   other value that it reads from its environment today comes on
   descriptor 0, from a pipe, as one length-framed record. That includes the
@@ -678,8 +761,19 @@ change while root works there.
   of the gate socket, the dropped frames and refused publish requests
   before the first complete table, and the exit when the channel closes.
   A test holds back the acknowledgement of a withdrawal in a stub EGW
-  process. It pins that after 5 seconds the supervisor stops the EGW
-  process and gvproxy, and only then answers the withdrawal.
+  process. The stub also ignores SIGTERM and the channel close. The test
+  pins that after 5 seconds the supervisor runs the stop sequence, and
+  that the stop rule ends the stub with SIGKILL. It pins that the
+  supervisor does not answer the withdrawal as done before it observes the
+  exit of the stub and of gvproxy.
+  A second test gives the stub a stop rule that sends no SIGKILL, so no
+  exit comes. It pins the fail-closed result: the withdrawal answer is
+  failed, the VMM child stops, a later registration is refused, and the
+  supervisor exits non-zero.
+- The supervisor spawns the `sudo` of the EGW process, of gvproxy and of
+  the VMM child each in a new process group, and never sends SIGKILL to
+  that `sudo`. The drop-in has the two stop rules. A test pins that the
+  EGW process runs in the process group of its `sudo`.
 - `bep serve` binds `gvproxy-bep.sock` with group `minimal-gvproxy` and
   mode 0660, in place of `bind_owner_only`. The `listener.rs` peer check
   admits the `minimal-gvproxy` uid in place of its own uid, and keeps the
@@ -733,7 +827,8 @@ sockets from the provider directory, and they keep the path, the owner and
 the mode they have today. Every other entry keeps the owner, the mode and
 the path it has today.
 `minimal-vmm` cannot write the provider directory here either. The drop-in
-permits only the gvproxy spawn, with the same rules for the path, the
+permits only the gvproxy spawn and the stop rule as `minimal-vmm`, with
+the same rules for the path, the
 arguments and the environment. The `sudo -n` refusal is the same.
 
 In the fallback the egress gate and `switch::bep_host` stay in the
