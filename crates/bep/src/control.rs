@@ -448,12 +448,18 @@ impl KeyFile {
 }
 
 /// Does one request line against the client key `registry` and the box
-/// registry `boxes`. It keeps no revocation and writes no record: a
-/// `revoke_box` goes into a set that ends with the call. A key registered
-/// here is held in memory only: [`Control`] also keeps it across restarts.
-/// The control socket does its lines through [`Control`].
+/// registry `boxes`. It keeps no revocation and writes no record, so it
+/// refuses `record_mint` and `revoke_box` rather than reply that it did
+/// them. A key registered here is held in memory only: [`Control`] also
+/// keeps it across restarts. The control socket does its lines through
+/// [`Control`], which does both.
 #[must_use]
 pub fn handle_line(line: &str, registry: &RwLock<ClientKeys>, boxes: &Boxes) -> Reply {
+    if let Ok(Request::RecordMint { .. } | Request::RevokeBox { .. }) =
+        serde_json::from_str::<Request>(line)
+    {
+        return Reply::refused("this handler keeps no revocation and writes no record");
+    }
     handle_request(line, registry, boxes, &Revocations::default(), None, None)
 }
 

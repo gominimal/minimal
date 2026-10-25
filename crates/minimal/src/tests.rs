@@ -4356,6 +4356,14 @@ mod mint_tests {
                                 kid: None,
                                 error: Some("the key is not a P-256 public key".into()),
                             }
+                        } else if op == "record_mint" || op == "revoke_box" {
+                            // `handle_line` keeps no record, so the stub
+                            // answers these two itself.
+                            bep::control::Reply {
+                                ok: true,
+                                kid: None,
+                                error: None,
+                            }
                         } else {
                             bep::control::handle_line(&line, &clients, &served_boxes)
                         };
@@ -4438,7 +4446,17 @@ mod mint_tests {
                         bep::control::Request::RevokeBox { .. } => "revoke_box",
                     };
                     served_ops.lock().unwrap().push(op.to_owned());
-                    let reply = bep::control::handle_line(&line, &clients, &served_boxes);
+                    let reply = if op == "record_mint" || op == "revoke_box" {
+                        // `handle_line` keeps no record, so the stub
+                        // answers these two itself.
+                        bep::control::Reply {
+                            ok: true,
+                            kid: None,
+                            error: None,
+                        }
+                    } else {
+                        bep::control::handle_line(&line, &clients, &served_boxes)
+                    };
                     if op == "register_box" {
                         // The box is stored, and the reply never comes.
                         break;

@@ -2910,18 +2910,36 @@ const PROXY_CONTROL_SOCKET: &str = ".minimal/bep/control.sock";
 const PROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Sends the revocation of `box_id` to the proxy at `path` on a thread of its
-/// own, so the destroy does not wait for it. A failure is one warning.
+/// own, so the destroy does not wait for it. A failure is one warning that
+/// names the step that failed.
 fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId) {
     let spawned = std::thread::Builder::new()
         .name("bep-revocation".into())
         .spawn(move || {
-            if let Err(error) = submit_revocation(&path, box_id) {
-                tracing::warn!(
-                    box_id = %box_id_hex(box_id),
-                    %error,
-                    "the destroy completed with the Box Egress Proxy unreachable: no revocation \
-                     is recorded, and the withdrawn attachment refuses the box's values"
-                );
+            let submitted = submit_revocation(&path, box_id);
+            let id = box_id_hex(box_id);
+            match (submitted.revoke, submitted.forget) {
+                (Ok(()), Ok(())) => {}
+                (Err(revoke), Ok(())) => tracing::warn!(
+                    box_id = %id,
+                    error = %revoke,
+                    "the destroy completed without a revocation from the Box Egress Proxy: \
+                     the proxy forgot the box, and the withdrawn attachment refuses its values"
+                ),
+                (Err(revoke), Err(forget)) => tracing::warn!(
+                    box_id = %id,
+                    revoke_error = %revoke,
+                    forget_error = %forget,
+                    "the destroy completed without a revocation from the Box Egress Proxy \
+                     and without the proxy forgetting the box: the withdrawn attachment \
+                     refuses its values"
+                ),
+                (Ok(()), Err(forget)) => tracing::warn!(
+                    box_id = %id,
+                    error = %forget,
+                    "the Box Egress Proxy recorded the destroyed box's revocation but did not \
+                     forget the box"
+                ),
             }
         });
     if let Err(error) = spawned {
@@ -2939,15 +2957,40 @@ fn box_id_hex(box_id: BoxId) -> String {
     box_id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The outcome of each of the two requests of [`submit_revocation`].
+struct Submitted {
+    /// The `revoke_box` request's outcome.
+    revoke: std::io::Result<()>,
+    /// The `forget_box` request's outcome.
+    forget: std::io::Result<()>,
+}
+
 /// Records the revocation of the live box `box_id` with the proxy's control
-/// socket at `path`, then forgets the box there (BEP-043, BEP-067). The
-/// protocol is one JSON object per line each way.
+/// socket at `path`, then forgets the box there (BEP-043, BEP-067, T41).
+/// Each request has a connection of its own, so `forget_box` is sent even
+/// when `revoke_box` fails: the proxy then attributes the id to no live box.
+fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> Submitted {
+    let id = box_id_hex(box_id);
+    let revoke = send_control(path, "revoke_box", &id);
+    if revoke.is_ok() {
+        tracing::info!(
+            box_id = %id,
+            "recorded the destroyed box's revocation with the Box Egress Proxy"
+        );
+    }
+    let forget = send_control(path, "forget_box", &id);
+    Submitted { revoke, forget }
+}
+
+/// Sends one `op` request for the box id `id` to the proxy's control socket
+/// at `path`, and reads its reply. The protocol is one JSON object per line
+/// each way.
 ///
 /// # Errors
 ///
 /// The I/O error of the connect, the write or the read, or a refusal the
 /// proxy replied with.
-fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> std::io::Result<()> {
+fn send_control(path: &std::path::Path, op: &str, id: &str) -> std::io::Result<()> {
     use std::io::{BufRead as _, Write as _};
 
     let stream = std::os::unix::net::UnixStream::connect(path)?;
@@ -2955,35 +2998,25 @@ fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> std::io::Result<(
     stream.set_write_timeout(Some(PROXY_CONTROL_TIMEOUT))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    let id = box_id_hex(box_id);
-    for op in ["revoke_box", "forget_box"] {
-        let mut line = serde_json::json!({ "op": op, "box_id": id }).to_string();
-        line.push('\n');
-        writer.write_all(line.as_bytes())?;
-        let mut reply = String::new();
-        if reader.read_line(&mut reply)? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "the proxy closed the control connection",
-            ));
-        }
-        let reply: serde_json::Value =
-            serde_json::from_str(&reply).map_err(std::io::Error::other)?;
-        if reply.get("ok") != Some(&serde_json::Value::Bool(true)) {
-            let why = reply
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("no reason given");
-            return Err(std::io::Error::other(format!(
-                "the proxy refused {op}: {why}"
-            )));
-        }
-        if op == "revoke_box" {
-            tracing::info!(
-                box_id = %id,
-                "recorded the destroyed box's revocation with the Box Egress Proxy"
-            );
-        }
+    let mut line = serde_json::json!({ "op": op, "box_id": id }).to_string();
+    line.push('\n');
+    writer.write_all(line.as_bytes())?;
+    let mut reply = String::new();
+    if reader.read_line(&mut reply)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the proxy closed the control connection",
+        ));
+    }
+    let reply: serde_json::Value = serde_json::from_str(&reply).map_err(std::io::Error::other)?;
+    if reply.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        let why = reply
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason given");
+        return Err(std::io::Error::other(format!(
+            "the proxy refused {op}: {why}"
+        )));
     }
     Ok(())
 }
@@ -10156,38 +10189,44 @@ mod tests {
         );
     }
 
-    // BEP-043: the destroy's revocation is a `revoke_box` line and then a
-    // `forget_box` line, each naming the box id in 32 hex digits. With no
-    // proxy listening, the submission fails, and the destroy does not wait.
-    #[test]
-    fn destroy_revocation_sends_revoke_then_forget() {
+    /// A control socket at `path` that answers one line on each of
+    /// `replies.len()` connections with that reply, and hands back the lines.
+    fn stub_control(
+        path: &std::path::Path,
+        replies: &'static [&'static str],
+    ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
         use std::io::{BufRead as _, Write as _};
 
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            replies
+                .iter()
+                .map(|reply| {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    writer.write_all(reply.as_bytes()).unwrap();
+                    serde_json::from_str(&line).unwrap()
+                })
+                .collect()
+        })
+    }
+
+    // BEP-043: the destroy's revocation is a `revoke_box` line and then a
+    // `forget_box` line, each naming the box id in 32 hex digits. With no
+    // proxy listening, both requests fail, and the destroy does not wait.
+    #[test]
+    fn destroy_revocation_sends_revoke_then_forget() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut writer = stream;
-            let mut lines = Vec::new();
-            for _ in 0..2 {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                writer.write_all(b"{\"ok\":true}\n").unwrap();
-                lines.push(line);
-            }
-            lines
-        });
+        let server = stub_control(&path, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
         let id = [0xab; 16];
-        super::submit_revocation(&path, id).unwrap();
+        let submitted = super::submit_revocation(&path, id);
+        assert!(submitted.revoke.is_ok() && submitted.forget.is_ok());
         let hex = "ab".repeat(16);
-        let lines: Vec<serde_json::Value> = server
-            .join()
-            .unwrap()
-            .iter()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let lines = server.join().unwrap();
         assert_eq!(
             lines[0],
             serde_json::json!({"op": "revoke_box", "box_id": hex})
@@ -10197,6 +10236,29 @@ mod tests {
             serde_json::json!({"op": "forget_box", "box_id": hex})
         );
 
-        assert!(super::submit_revocation(&dir.path().join("absent.sock"), id).is_err());
+        let absent = super::submit_revocation(&dir.path().join("absent.sock"), id);
+        assert!(absent.revoke.is_err() && absent.forget.is_err());
+    }
+
+    // T41: a refused `revoke_box` still sends `forget_box`, so the proxy
+    // attributes the destroyed box's id to no live box.
+    #[test]
+    fn destroy_forgets_the_box_when_the_revocation_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = stub_control(
+            &path,
+            &["{\"ok\":false,\"error\":\"no\"}\n", "{\"ok\":true}\n"],
+        );
+        let id = [0xcd; 16];
+        let submitted = super::submit_revocation(&path, id);
+        let refused = submitted.revoke.unwrap_err().to_string();
+        assert!(refused.contains("refused revoke_box: no"), "{refused}");
+        assert!(submitted.forget.is_ok());
+        let lines = server.join().unwrap();
+        assert_eq!(
+            lines[1],
+            serde_json::json!({"op": "forget_box", "box_id": "cd".repeat(16)})
+        );
     }
 }
