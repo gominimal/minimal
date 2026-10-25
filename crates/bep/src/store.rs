@@ -101,6 +101,22 @@ pub enum StoreError {
         "The proxy path {0} contains a quote, a backslash or a line break, so the keychain cannot name it."
     )]
     ProxyPath(PathBuf),
+    /// The identifier is not one that [`valid_id`] admits.
+    #[error(
+        "`{0}` is not a name a secret can have. Use 1 to {MAX_ID_LEN} letters, digits, `.`, `_` and `-`, not starting with `-`."
+    )]
+    InvalidId(String),
+    /// `set` stored the new value, and then the keychain refused to remove
+    /// the staging copy of it.
+    #[error(
+        "min secret set stored {id}, but a copy of the value remains in the keychain under {STAGING_SERVICE}: {cause}. Remove the copy with `security delete-generic-password -s {STAGING_SERVICE} -a {id}`."
+    )]
+    StagingLeft {
+        /// The identifier.
+        id: String,
+        /// Why the delete failed.
+        cause: Box<StoreError>,
+    },
 }
 
 /// A store of secrets by identifier.
@@ -131,6 +147,16 @@ pub trait SecretStore {
     ///
     /// When the store refuses the delete.
     fn remove(&self, id: &str) -> Result<bool, StoreError>;
+
+    /// Whether this host can use the store at all. `set` asks before it
+    /// reads a value, so nobody types a secret that the store then refuses.
+    ///
+    /// # Errors
+    ///
+    /// When the host has no such store.
+    fn check_available(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// One item of a [`MemorySecretStore`].
@@ -238,6 +264,11 @@ pub fn keychain_add_line(id: &str, value: &[u8], proxy: &Path) -> Result<String,
 
 /// [`keychain_add_line`] under `service`.
 fn add_line(service: &str, id: &str, value: &[u8], proxy: &Path) -> Result<String, StoreError> {
+    // `security -i` splits the line on spaces and quotes, so an `id` that
+    // `valid_id` refuses can add options such as `-A`.
+    if !valid_id(id) {
+        return Err(StoreError::InvalidId(id.to_owned()));
+    }
     let proxy_text = proxy.to_string_lossy();
     if proxy_text.contains(['"', '\\', '\n', '\r']) {
         return Err(StoreError::ProxyPath(proxy.to_path_buf()));
@@ -247,7 +278,7 @@ fn add_line(service: &str, id: &str, value: &[u8], proxy: &Path) -> Result<Strin
         hex.push(char::from(HEX[usize::from(b >> 4)]));
         hex.push(char::from(HEX[usize::from(b & 0x0f)]));
     }
-    // `id` is checked by `valid_id`, so it needs no quoting.
+    // `valid_id` admitted `id` above, so it needs no quoting.
     let line = format!(
         "add-generic-password -s {service} -a {id} -l \"Minimal secret {id}\" -T \"{proxy_text}\" -X {hex}\n"
     );
@@ -347,8 +378,10 @@ fn set_item(kc: &impl Keychain, id: &str, value: &[u8], proxy: &Path) -> Result<
     // A failed run can leave a staged item behind. The add below refuses a
     // duplicate, so that item goes first.
     kc.delete(STAGING_SERVICE, id)?;
-    if let Err(e) = add_checked(kc, STAGING_SERVICE, id, value, proxy) {
-        let _ = kc.delete(STAGING_SERVICE, id);
+    if let Err(mut e) = add_checked(kc, STAGING_SERVICE, id, value, proxy) {
+        if kc.delete(STAGING_SERVICE, id).is_err() {
+            note_staging_left(&mut e, id);
+        }
         return Err(e);
     }
     let result = match kc.delete(SERVICE, id) {
@@ -363,8 +396,28 @@ fn set_item(kc: &impl Keychain, id: &str, value: &[u8], proxy: &Path) -> Result<
             e
         }),
     };
-    let _ = kc.delete(STAGING_SERVICE, id);
-    result
+    match (kc.delete(STAGING_SERVICE, id), result) {
+        (Ok(_), result) => result,
+        (Err(cause), Ok(())) => Err(StoreError::StagingLeft {
+            id: id.to_owned(),
+            cause: Box::new(cause),
+        }),
+        (Err(_), Err(mut e)) => {
+            note_staging_left(&mut e, id);
+            Err(e)
+        }
+    }
+}
+
+/// Add to `e` that a staging copy of the value for `id` can remain, and the
+/// command that removes it.
+fn note_staging_left(e: &mut StoreError, id: &str) {
+    if let StoreError::Refused { detail, .. } = e {
+        detail.push_str(&format!(
+            ". A copy of the new value can remain in the keychain under {STAGING_SERVICE}. \
+             Remove it with `security delete-generic-password -s {STAGING_SERVICE} -a {id}`"
+        ));
+    }
 }
 
 /// Add the item, then read it back with its access control.
@@ -418,6 +471,10 @@ impl SecretStore for HostStore {
 
     fn remove(&self, id: &str) -> Result<bool, StoreError> {
         host::remove(id)
+    }
+
+    fn check_available(&self) -> Result<(), StoreError> {
+        host::check_available()
     }
 }
 
@@ -506,6 +563,11 @@ mod host {
         set_item(&SecurityTool, id, value, proxy)
     }
 
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn check_available() -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// The output of `dump-keychain -a`.
     fn dump() -> Result<String, StoreError> {
         // `dump-keychain` without `-d` decrypts nothing, so it prints no
@@ -557,6 +619,10 @@ mod host {
     pub(super) fn remove(_: &str) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
     }
+
+    pub(super) fn check_available() -> Result<(), StoreError> {
+        Err(StoreError::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +644,10 @@ mod tests {
         refuse_add: Option<usize>,
         /// The 1-based add that stores an item the proxy cannot read.
         lose_access_on: Option<usize>,
+        staging_deletes: Cell<usize>,
+        /// The 1-based delete under [`STAGING_SERVICE`] that the keychain
+        /// refuses.
+        refuse_staging_delete: Option<usize>,
     }
 
     impl FakeKeychain {
@@ -635,6 +705,17 @@ mod tests {
         }
 
         fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
+            if service == STAGING_SERVICE {
+                let n = self.staging_deletes.get() + 1;
+                self.staging_deletes.set(n);
+                if self.refuse_staging_delete == Some(n) {
+                    return Err(StoreError::Refused {
+                        store: NATIVE_STORE,
+                        action: "remove the secret",
+                        detail: "The user name or passphrase you entered is not correct.".into(),
+                    });
+                }
+            }
             Ok(self
                 .items
                 .borrow_mut()
@@ -704,6 +785,60 @@ mod tests {
         set_item(&kc, "claude", b"new", proxy).expect("stored");
         assert_eq!(kc.adds.get(), 1);
         assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"new"[..]));
+    }
+
+    // Review finding 4369348719: a staging copy that the keychain does not
+    // remove is reported, with the command that removes it.
+    #[test]
+    fn secret_set_reports_a_staging_copy_left_behind() {
+        let proxy = Path::new(PROXY);
+        let remedy = format!("security delete-generic-password -s {STAGING_SERVICE} -a claude");
+
+        // The replace succeeds, and the cleanup after it is refused.
+        let kc = FakeKeychain {
+            refuse_staging_delete: Some(2),
+            ..FakeKeychain::holding("claude", b"old")
+        };
+        let err = set_item(&kc, "claude", b"new", proxy).expect_err("reported");
+        assert!(matches!(err, StoreError::StagingLeft { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("stored claude"), "{text}");
+        assert!(text.contains("is not correct"), "{text}");
+        assert!(text.contains(&remedy), "{text}");
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"new"[..]));
+        assert_eq!(
+            kc.value(STAGING_SERVICE, "claude").as_deref(),
+            Some(&b"new"[..])
+        );
+
+        // The final add is refused, and so is the cleanup: the error names
+        // both.
+        let kc = FakeKeychain {
+            refuse_add: Some(2),
+            refuse_staging_delete: Some(2),
+            ..FakeKeychain::holding("claude", b"old")
+        };
+        let text = set_item(&kc, "claude", b"new", proxy)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            text.contains("The old value of claude is removed"),
+            "{text}"
+        );
+        assert!(text.contains(&remedy), "{text}");
+    }
+
+    // Review finding 4369348721: the line that `security -i` parses never
+    // carries an identifier that `valid_id` refuses.
+    #[test]
+    fn keychain_add_line_refuses_an_invalid_id() {
+        let proxy = Path::new(PROXY);
+        for id in ["a\" -A \"b", "claude -A", "", "-A"] {
+            let err = keychain_add_line(id, b"v", proxy).expect_err("refused");
+            assert!(matches!(err, StoreError::InvalidId(_)), "{id:?}: {err:?}");
+            assert!(err.to_string().contains("is not a name a secret can have"));
+        }
+        keychain_add_line("claude", b"v", proxy).expect("valid");
     }
 
     /// The BEP-051 leg on a real keychain: set, list, set again and remove
