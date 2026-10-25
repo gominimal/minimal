@@ -2890,6 +2890,11 @@ pub struct BoxRegistry {
     /// carried learns that the row there may be a new one to mark
     /// ([`BoxTable::carry`]).
     row_epoch: Arc<AtomicU64>,
+    /// The Box Egress Proxy's control socket, where the destroy of a live
+    /// box with a credentialed lane records its revocation
+    /// ([`submit_revocation`], BEP-043). `None` sends nothing: a test's
+    /// registry, or a host with no home directory.
+    proxy_control: Option<Arc<std::path::PathBuf>>,
 }
 
 /// A clone shares the live rows, the hand-out book, and the withdrawal
@@ -2897,6 +2902,92 @@ pub struct BoxRegistry {
 /// the one [`Self::spawn_withdrawal_drainer`] (or a test) drains — holds the
 /// receiving end, so a clone can register, allocate, and file reports like
 /// the original but has nothing to take.
+/// The Box Egress Proxy's control socket, under the home directory.
+const PROXY_CONTROL_SOCKET: &str = ".minimal/bep/control.sock";
+
+/// How long a revocation waits for the proxy, for the connect and for each
+/// reply.
+const PROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Sends the revocation of `box_id` to the proxy at `path` on a thread of its
+/// own, so the destroy does not wait for it. A failure is one warning.
+fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId) {
+    let spawned = std::thread::Builder::new()
+        .name("bep-revocation".into())
+        .spawn(move || {
+            if let Err(error) = submit_revocation(&path, box_id) {
+                tracing::warn!(
+                    box_id = %box_id_hex(box_id),
+                    %error,
+                    "the destroy completed with the Box Egress Proxy unreachable: no revocation \
+                     is recorded, and the withdrawn attachment refuses the box's values"
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(
+            box_id = %box_id_hex(box_id),
+            %error,
+            "the destroy completed without a revocation: the revocation thread did not start"
+        );
+    }
+}
+
+/// The box id as the proxy's control socket takes it: 32 lowercase hex
+/// digits.
+fn box_id_hex(box_id: BoxId) -> String {
+    box_id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Records the revocation of the live box `box_id` with the proxy's control
+/// socket at `path`, then forgets the box there (BEP-043, BEP-067). The
+/// protocol is one JSON object per line each way.
+///
+/// # Errors
+///
+/// The I/O error of the connect, the write or the read, or a refusal the
+/// proxy replied with.
+fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> std::io::Result<()> {
+    use std::io::{BufRead as _, Write as _};
+
+    let stream = std::os::unix::net::UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(PROXY_CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROXY_CONTROL_TIMEOUT))?;
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+    let id = box_id_hex(box_id);
+    for op in ["revoke_box", "forget_box"] {
+        let mut line = serde_json::json!({ "op": op, "box_id": id }).to_string();
+        line.push('\n');
+        writer.write_all(line.as_bytes())?;
+        let mut reply = String::new();
+        if reader.read_line(&mut reply)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the proxy closed the control connection",
+            ));
+        }
+        let reply: serde_json::Value =
+            serde_json::from_str(&reply).map_err(std::io::Error::other)?;
+        if reply.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let why = reply
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason given");
+            return Err(std::io::Error::other(format!(
+                "the proxy refused {op}: {why}"
+            )));
+        }
+        if op == "revoke_box" {
+            tracing::info!(
+                box_id = %id,
+                "recorded the destroyed box's revocation with the Box Egress Proxy"
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Clone for BoxRegistry {
     fn clone(&self) -> Self {
         BoxRegistry {
@@ -2926,6 +3017,7 @@ impl Clone for BoxRegistry {
             persisted_at: self.persisted_at.clone(),
             persist_turn: Arc::clone(&self.persist_turn),
             row_epoch: Arc::clone(&self.row_epoch),
+            proxy_control: self.proxy_control.clone(),
         }
     }
 }
@@ -2969,7 +3061,21 @@ impl BoxRegistry {
             persisted_at: None,
             persist_turn: Arc::new(Mutex::new(())),
             row_epoch: Arc::new(AtomicU64::new(0)),
+            proxy_control: if cfg!(test) {
+                None
+            } else {
+                std::env::home_dir().map(|home| Arc::new(home.join(PROXY_CONTROL_SOCKET)))
+            },
         }
+    }
+
+    /// Sets the Box Egress Proxy control socket that a live box's destroy
+    /// sends its revocation to. `None` sends none. Returns `self`, for the
+    /// caller's chain.
+    #[must_use]
+    pub fn with_proxy_control(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.proxy_control = path.map(Arc::new);
+        self
     }
 
     /// Sets the operator's deny-all opt-out (NET-077) this registry compiles
@@ -4385,6 +4491,15 @@ impl BoxRegistry {
             .as_deref()
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
+        // BEP-043: the destroy of a live box with a credentialed lane
+        // records a revocation of its id with the proxy. The destroy never
+        // waits for it: with the proxy down, the attachment retired above
+        // refuses the box's values (NET-133).
+        if let (Some(record), Some(path)) = (removed.as_deref(), self.proxy_control.as_deref())
+            && record.declares_credentialed_upstream()
+        {
+            spawn_revocation(path.clone(), record.box_id);
+        }
         self.retired(&removed, withdrawal);
         self.retire_task_rows(task_rows, true);
         if let Some(record) = &removed {
@@ -10039,5 +10154,49 @@ mod tests {
             !open_now.is_deny_all(),
             "a guest report never makes a row deny-all"
         );
+    }
+
+    // BEP-043: the destroy's revocation is a `revoke_box` line and then a
+    // `forget_box` line, each naming the box id in 32 hex digits. With no
+    // proxy listening, the submission fails, and the destroy does not wait.
+    #[test]
+    fn destroy_revocation_sends_revoke_then_forget() {
+        use std::io::{BufRead as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut lines = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                writer.write_all(b"{\"ok\":true}\n").unwrap();
+                lines.push(line);
+            }
+            lines
+        });
+        let id = [0xab; 16];
+        super::submit_revocation(&path, id).unwrap();
+        let hex = "ab".repeat(16);
+        let lines: Vec<serde_json::Value> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"op": "revoke_box", "box_id": hex})
+        );
+        assert_eq!(
+            lines[1],
+            serde_json::json!({"op": "forget_box", "box_id": hex})
+        );
+
+        assert!(super::submit_revocation(&dir.path().join("absent.sock"), id).is_err());
     }
 }
