@@ -618,18 +618,18 @@ fn handle_request(
             // stays `ok` because it is in force. The error names the lost
             // record, since a restart cannot restore it from the log.
             if crate::revoke::record(revocations, &box_id) {
-                if let Err(err) = append(audit, Kind::Revocation, &box_id, None) {
-                    tracing::error!(
+                match append(audit, Kind::Revocation, &box_id, None) {
+                    Ok(()) => tracing::info!(
+                        box_id,
+                        "recorded a revocation: every sealed value naming the box is refused"
+                    ),
+                    Err(err) => tracing::error!(
                         box_id,
                         %err,
                         "lost a revocation record: the audit log did not take it, so the \
                          revocation is in force only until the proxy stops"
-                    );
+                    ),
                 }
-                tracing::info!(
-                    box_id,
-                    "recorded a revocation: every sealed value naming the box is refused"
-                );
             }
             Reply::done()
         }

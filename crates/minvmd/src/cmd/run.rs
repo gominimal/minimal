@@ -392,9 +392,6 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
-/// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
-/// the VMM child exits.
-///
 /// The supervisor's box registry: it feeds the proxy attachments, compiles
 /// under the operator's deny-all opt-out, persists to `registry_file`, and
 /// sends a live box's revocation to the Box Egress Proxy control socket under
@@ -412,6 +409,9 @@ fn supervisor_registry(
         .persisting_to(registry_file)
 }
 
+/// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
+/// the VMM child exits.
+///
 /// `root` (the process's root span, entered) and the `supervisor.start` span
 /// under it end once the VM is ready; the rest of the VM's life runs under a
 /// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
