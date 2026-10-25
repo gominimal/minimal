@@ -563,9 +563,8 @@ fn outcome(
 /// or a sign-in reference for another module, has no rule, so it is
 /// refused as `store_handle_invalid`.
 ///
-/// A member of [`crate::seal::MemberKind`] has no store kind yet, so this
-/// reads sign-in references only. The store path of the check is the same
-/// code, and a store member kind reaches it through the `match` below.
+/// A [`crate::seal::MemberKind::Store`] member is read as a store handle,
+/// and a [`crate::seal::MemberKind::SignIn`] member as a sign-in reference.
 pub fn read_opened<R: Rules + ?Sized>(
     opened: &Opened,
     keys: &ClientKeys,
@@ -575,6 +574,7 @@ pub fn read_opened<R: Rules + ?Sized>(
 ) -> Read {
     let kind = match opened.member.kind {
         MemberKind::SignIn => HandleKind::SignIn,
+        MemberKind::Store => HandleKind::Store,
     };
     let origin = Origin {
         kind,

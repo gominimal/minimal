@@ -1220,9 +1220,21 @@ mod tests {
     #[test]
     fn patch_policy_defaults_when_omitted() {
         let policy: PatchesPolicy = toml::from_str("").unwrap();
-        assert!(policy.allow().is_empty());
-        assert!(policy.deny().is_empty());
-        assert!(policy.ignore().is_empty());
+        assert!(
+            policy.allow().is_empty(),
+            "expected empty, got {:?}",
+            policy.allow()
+        );
+        assert!(
+            policy.deny().is_empty(),
+            "expected empty, got {:?}",
+            policy.deny()
+        );
+        assert!(
+            policy.ignore().is_empty(),
+            "expected empty, got {:?}",
+            policy.ignore()
+        );
     }
 
     #[test]

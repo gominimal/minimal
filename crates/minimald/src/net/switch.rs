@@ -5220,8 +5220,8 @@ pub(crate) mod tests {
         summed.extend_from_slice(&20u16.to_be_bytes()); // the TCP length
         summed.extend_from_slice(&frame[34..54]); // the segment, checksum in place
         let mut sum: u32 = 0;
-        for word in summed.chunks_exact(2) {
-            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+        for word in summed.as_chunks::<2>().0 {
+            sum += u32::from(u16::from_be_bytes(*word));
         }
         while sum >> 16 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);

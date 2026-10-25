@@ -301,7 +301,15 @@ fn every_daemon_connection_is_classified() {
             // Test-only: the BEP-063 mint tests register keys with a proxy
             // control socket they serve themselves, so no daemon is involved.
             "mint.rs::a_refused_client_key_is_replaced_and_registered_before_the_mint = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations = ungated",
+            "mint.rs::a_replacement_the_store_does_not_keep_revokes_no_key = ungated",
             "mint.rs::create = ungated",
+            // The proxy's control socket, not the daemon: a replaced client
+            // key is revoked there, and no daemon version applies to it.
+            "mint.rs::local_client_key_at = ungated",
+            "mint.rs::revoke_others = ungated",
             "mint.rs::store_handle_signed_and_key_registered = ungated",
             "mint.rs::store_handle_signed_and_key_registered = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
@@ -4348,6 +4356,8 @@ mod mint_tests {
                             }
                             bep::control::Request::RegisterBox { .. } => "register_box",
                             bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                            bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
                             bep::control::Request::RecordMint { .. } => "record_mint",
                             bep::control::Request::RevokeBox { .. } => "revoke_box",
                         };
@@ -4356,6 +4366,7 @@ mod mint_tests {
                             bep::control::Reply {
                                 ok: false,
                                 kid: None,
+                                revoked: Vec::new(),
                                 error: Some("the key is not a P-256 public key".into()),
                             }
                         } else if op == "record_mint" || op == "revoke_box" {
@@ -4364,6 +4375,7 @@ mod mint_tests {
                             bep::control::Reply {
                                 ok: true,
                                 kid: None,
+                                revoked: Vec::new(),
                                 error: None,
                             }
                         } else {
@@ -4444,6 +4456,8 @@ mod mint_tests {
                         bep::control::Request::RegisterClientKey { .. } => "register_client_key",
                         bep::control::Request::RegisterBox { .. } => "register_box",
                         bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                        bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
                         bep::control::Request::RecordMint { .. } => "record_mint",
                         bep::control::Request::RevokeBox { .. } => "revoke_box",
                     };
@@ -4454,6 +4468,7 @@ mod mint_tests {
                         bep::control::Reply {
                             ok: true,
                             kid: None,
+                            revoked: Vec::new(),
                             error: None,
                         }
                     } else {

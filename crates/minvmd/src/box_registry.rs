@@ -5567,7 +5567,7 @@ fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
 #[cfg(test)]
 fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
     let next = cursor
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .ok()?;
