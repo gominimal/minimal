@@ -41,6 +41,7 @@ use bep::module::GITHUB;
 use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations};
+use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use clap::{Parser, Subcommand};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -572,9 +573,15 @@ struct Wiring {
 /// The redeemer over the proxy key `sealing` and the sign-in item in
 /// `keychain`, and the registries it reads. The Box Host a sealed value and
 /// its handle name is this proxy's sealing key fingerprint, which the
-/// published identity carries.
+/// published identity carries. `restored` is the box ids that the
+/// revocations recorded before this start name.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn wire<K, C>(sealing: K, keychain: C, endpoint: Arc<dyn TokenEndpoint>) -> Wiring
+fn wire<K, C>(
+    sealing: K,
+    keychain: C,
+    endpoint: Arc<dyn TokenEndpoint>,
+    restored: Vec<String>,
+) -> Wiring
 where
     K: HeldKey + Send + Sync + 'static,
     C: Keychain + Send + Sync + 'static,
@@ -587,12 +594,10 @@ where
     // (`crates/minvmd/src/box_registry.rs`).
     let boxes = BoxRegistry::default();
     // The revocations `revoke_box` records over the control socket, which
-    // the redeemer reads at each request (BEP-043, BEP-071). Interim: the
-    // set starts empty at each start. T33
-    // (https://github.com/gominimal/minimal/issues/2290) restores it from
-    // every retained audit segment at start, the BEP-068 restore-on-start
-    // sub-requirement.
-    let revocations = Revocations::default();
+    // the redeemer reads at each request (BEP-043, BEP-071). The set starts
+    // with the revocations restored from every retained audit segment
+    // (BEP-068).
+    let revocations: Revocations = Arc::new(std::sync::RwLock::new(restored));
     //
     // Interim: the redeemer reads no store rules until T25
     // (https://github.com/gominimal/minimal/issues/2280) reads
@@ -653,16 +658,19 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     )?;
     let dir = audit::default_dir()
         .ok_or("bep did not find your home directory, which holds the audit log.")?;
-    let segment = audit::segments(&dir)
-        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?
-        .pop()
-        .unwrap_or_else(|| dir.join(audit::segment_name(0)));
-    let log = AuditLog::open(&segment).map_err(|err| {
-        format!(
-            "bep did not open the audit log {}: {err}",
-            segment.display()
-        )
-    })?;
+    // BEP-068: the log rotates its segments, and the revocations in every
+    // retained segment are in force again from this start.
+    let restored = revoke::restore(&dir)
+        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?;
+    tracing::info!(
+        count = restored.len(),
+        box_ids = ?restored,
+        audit = %dir.display(),
+        "restored the revocations recorded in the audit log"
+    );
+    let log = AuditLog::open_dir(&dir, audit::Rotation::default())
+        .map_err(|err| format!("bep did not open the audit log in {}: {err}", dir.display()))?;
+    let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
     // The store rules' authorities join the admitted set when
@@ -694,7 +702,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         log.clone(),
     )
     .map_err(|err| err.to_string())?;
-    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint));
+    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint), restored);
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
@@ -709,10 +717,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
             .control(&control, log)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca);
-        tracing::warn!(
-            "A store-handle member is not admitted until #2280 lands. \
-             Revocations recorded before this start are not in force until #2290 lands."
-        );
+        tracing::warn!("A store-handle member is not admitted until #2280 lands.");
         tracing::info!(
             listener = %args.listener.display(),
             control = %control.display(),
@@ -1405,7 +1410,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint));
+        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint), Vec::new());
 
         let proxy = Proxy::new(
             Admission::new(&[GITHUB], [("", 0); 0]),
