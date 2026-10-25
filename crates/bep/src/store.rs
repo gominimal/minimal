@@ -438,8 +438,9 @@ fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> 
     let proxy = proxy.to_string_lossy();
     // `dump-keychain -a` lists every keychain in the search list, so one
     // identifier can appear more than once. Review finding 4369647108: the
-    // copies merge, and the identifier has proxy access when any copy grants
-    // it.
+    // copies merge. Review thread 4369745203: the identifier has proxy access
+    // only when every copy grants it, because a copy without the proxy's
+    // entry prompts the proxy.
     let mut items: BTreeMap<String, bool> = BTreeMap::new();
     for record in dump.split("\nkeychain: ") {
         let attr = |key: &str| {
@@ -457,7 +458,10 @@ fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> 
             .split("entry ")
             .skip(1)
             .any(|entry| entry_admits(entry, &proxy));
-        *items.entry(id).or_default() |= proxy_access;
+        items
+            .entry(id)
+            .and_modify(|access| *access &= proxy_access)
+            .or_insert(proxy_access);
     }
     items
         .into_iter()

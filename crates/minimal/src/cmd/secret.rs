@@ -240,6 +240,66 @@ fn check_store(command: &str, store: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
+/// The largest value `set` reads from standard input, in bytes.
+pub(crate) const MAX_VALUE_BYTES: usize = 64 * 1024;
+
+/// The value on `stdin`, as bytes, without one trailing line break.
+///
+/// Review thread 4369746902: the value is bytes, so a value that is not
+/// UTF-8 is stored as is. The buffer holds `MAX_VALUE_BYTES` and a line
+/// break, and the read stops there, so a large pipe does not fill memory.
+/// The buffer has its full size before the read, so it never moves and
+/// leaves no copy behind.
+fn read_stdin_value(stdin: &mut dyn Read) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let mut value = Zeroizing::new(vec![0u8; MAX_VALUE_BYTES + 2]);
+    let mut len = 0;
+    while len < value.len() {
+        match stdin.read(&mut value[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context("min secret set did not read standard input")
+                );
+            }
+        }
+    }
+    // A full buffer with more input after it is too long, whatever its end.
+    let mut more = len == value.len();
+    if more {
+        let mut probe = Zeroizing::new([0u8; 1]);
+        more = loop {
+            match stdin.read(&mut probe[..]) {
+                Ok(n) => break n > 0,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::new(e).context("min secret set did not read standard input")
+                    );
+                }
+            }
+        };
+    }
+    // One trailing line break is the end of the input, not part of the
+    // value.
+    let mut end = len;
+    if value[..end].ends_with(b"\n") {
+        end -= 1;
+        if value[..end].ends_with(b"\r") {
+            end -= 1;
+        }
+    }
+    if more || end > MAX_VALUE_BYTES {
+        bail!(
+            "min secret set stored nothing: the value on standard input is longer than {MAX_VALUE_BYTES} bytes. \
+             Give a value of {MAX_VALUE_BYTES} bytes or fewer."
+        );
+    }
+    value.truncate(end);
+    Ok(value)
+}
+
 /// `set` against `store`: the refusals, then the read, then the write.
 pub(crate) fn run_set(
     store: &dyn SecretStore,
@@ -279,34 +339,22 @@ pub(crate) fn run_set(
              Pipe the value in on standard input, as in `printf %s \"$VALUE\" | min secret set {}`.",
             args.id
         ),
-        ValueSource::Terminal => terminal()?,
-        ValueSource::Stdin => {
-            let mut text = Zeroizing::new(String::new());
-            stdin
-                .read_to_string(&mut text)
-                .context("min secret set did not read standard input")?;
-            // One trailing line break is the end of the input, not part of
-            // the value.
-            let end = text
-                .strip_suffix("\r\n")
-                .or_else(|| text.strip_suffix('\n'))
-                .map_or(text.len(), str::len);
-            text.truncate(end);
-            text
+        ValueSource::Terminal => {
+            let mut typed = terminal()?;
+            Zeroizing::new(std::mem::take(&mut *typed).into_bytes())
         }
+        ValueSource::Stdin => read_stdin_value(stdin)?,
     };
     if value.is_empty() {
         bail!(
             "min secret set stored nothing: the value is empty. Run the command again and give a value."
         );
     }
-    store
-        .set(&args.id, value.as_bytes(), proxy)
-        .map_err(|e| match e {
-            // The new value is stored, so "did not store" is not true.
-            StoreError::StagingLeft { .. } => anyhow::Error::new(e),
-            e => anyhow::Error::new(e).context(format!("min secret set did not store {}", args.id)),
-        })?;
+    store.set(&args.id, &value, proxy).map_err(|e| match e {
+        // The new value is stored, so "did not store" is not true.
+        StoreError::StagingLeft { .. } => anyhow::Error::new(e),
+        e => anyhow::Error::new(e).context(format!("min secret set did not store {}", args.id)),
+    })?;
     tracing::info!(store = store.name(), id = %args.id, "secret stored");
     writeln!(out, "{}", args.id)?;
     Ok(())
@@ -510,6 +558,88 @@ mod tests {
         .unwrap();
         assert_eq!(out, b"claude\n");
         assert_eq!(store.value("claude").as_deref(), Some(&b"typed"[..]));
+    }
+
+    fn set_from_bytes(
+        store: &MemorySecretStore,
+        proxy: &Path,
+        input: &[u8],
+    ) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let mut input = input;
+        let result = run_set(
+            store,
+            &set_args(&["claude"]),
+            proxy,
+            ValueSource::Stdin,
+            &mut no_terminal,
+            &mut input,
+            &mut out,
+        );
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    // Review thread 4369746902: a value that is not UTF-8 is stored as is,
+    // without its one trailing line break.
+    #[test]
+    fn secret_set_stores_binary_stdin_value() {
+        let (_dir, proxy) = proxy();
+        let store = MemorySecretStore::default();
+        for (input, stored) in [
+            (&b"\xff\x00\xfe\n"[..], &b"\xff\x00\xfe"[..]),
+            (&b"\xff\xfe\r\n"[..], &b"\xff\xfe"[..]),
+            (&b"\xff\n\n"[..], &b"\xff\n"[..]),
+        ] {
+            let (result, out) = set_from_bytes(&store, &proxy, input);
+            result.unwrap();
+            assert_eq!(out, "claude\n");
+            assert_eq!(store.value("claude").as_deref(), Some(stored));
+        }
+    }
+
+    // Review thread 4369746902: standard input is read up to a limit, and a
+    // longer value is refused with a message that names the limit.
+    #[test]
+    fn secret_set_refuses_value_over_size_limit() {
+        let (_dir, proxy) = proxy();
+        let store = MemorySecretStore::default();
+
+        // The limit itself, with or without a line break, is stored.
+        for tail in [&b""[..], b"\n", b"\r\n"] {
+            let mut input = vec![b'a'; MAX_VALUE_BYTES];
+            input.extend_from_slice(tail);
+            let (result, _) = set_from_bytes(&store, &proxy, &input);
+            result.unwrap();
+            assert_eq!(
+                store.value("claude").map(|v| v.len()),
+                Some(MAX_VALUE_BYTES)
+            );
+        }
+
+        let store = MemorySecretStore::default();
+        for len in [
+            MAX_VALUE_BYTES + 1,
+            MAX_VALUE_BYTES + 2,
+            MAX_VALUE_BYTES * 4,
+        ] {
+            let mut input = vec![b'a'; len];
+            input.push(b'\n');
+            let (result, out) = set_from_bytes(&store, &proxy, &input);
+            let err = format!("{:#}", result.expect_err("refused"));
+            assert!(
+                err.contains(&format!("longer than {MAX_VALUE_BYTES} bytes")),
+                "{err}"
+            );
+            assert!(out.is_empty());
+            assert_eq!(store.value("claude"), None);
+        }
+        // A value that fills the buffer with a line break and continues after
+        // it is too long as well.
+        let mut input = vec![b'a'; MAX_VALUE_BYTES];
+        input.extend_from_slice(b"\r\nb");
+        let (result, _) = set_from_bytes(&store, &proxy, &input);
+        assert!(result.is_err());
+        assert_eq!(store.value("claude"), None);
     }
 
     #[test]
@@ -881,7 +1011,8 @@ attributes:
         );
         // Review finding 4369647108: `claude` is in two keychains, and only
         // the first copy grants the proxy access. The copies merge, in
-        // either order, and the merged item has the proxy's access.
+        // either order. Review thread 4369745218: the copy without the
+        // proxy's entry prompts the proxy, so the merged item has no access.
         let items = bep::store::parse_dump(&dump, &proxy);
         let (head, tail) = dump.split_at(dump.find("keychain: \"/Library").unwrap());
         let reordered = format!("{tail}\n{head}");
@@ -891,7 +1022,7 @@ attributes:
             vec![
                 bep::store::ItemInfo {
                     id: "claude".into(),
-                    proxy_access: true
+                    proxy_access: false
                 },
                 bep::store::ItemInfo {
                     id: "other".into(),
