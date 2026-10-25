@@ -320,6 +320,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
+            // Not a product path, and not the daemon: the audit test submits
+            // a revocation to a test Box Egress Proxy's control socket.
+            "tests.rs::mint_and_destroy_append_audit_records = ungated",
         ]
     );
 }
@@ -4220,6 +4223,90 @@ mod mint_tests {
         drop(ProxyRegistration::new(gone, kept).unwrap());
     }
 
+    // BEP-067, BEP-043: a mint appends one `mint` record per member, and a
+    // live box's destroy appends one `revocation` record, to the one audit
+    // log, through the proxy's control socket. The records chain, and the
+    // revocation is in force for the box id alone.
+    #[test]
+    fn mint_and_destroy_append_audit_records() {
+        use bep::audit::{AuditLog, Kind, LogReader, Outcome, line_hash, segment_name};
+        use bep::redeemer::Revocations;
+
+        let (_, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let logs = dir.path().join("audit");
+        let log = AuditLog::open(logs.join(segment_name(0))).unwrap();
+        let revocations = Revocations::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_revocations(Arc::clone(&revocations))
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        let mut client = ControlClient::connect(&path).unwrap();
+        let two_grants = GrantBox {
+            grants: vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
+            ..grant_box(Stance::OwnIp)
+        };
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut client,
+            &ClientKey::generate().unwrap(),
+            &two_grants,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 2);
+
+        let mut reader = LogReader::new(&logs);
+        let mints = reader.read_new().unwrap().entries;
+        assert_eq!(mints.len(), 2, "one mint record per member: {mints:?}");
+        for entry in &mints {
+            assert_eq!(entry.record.kind, Kind::Mint);
+            assert_eq!(entry.record.subject, BOX_HEX);
+            assert_eq!(entry.record.identifier, format!("github:{instance}"));
+            assert_eq!(entry.record.decision, Outcome::Admit);
+            assert!(!entry.line.contains("ghu_") && !entry.line.contains("ghr_"));
+        }
+        assert!(revocations.read().unwrap().is_empty());
+
+        // The destroy of the live box, as `minvmd` sends it: the revocation,
+        // then the forget. The hyphenated id names the same box.
+        client.revoke_box(BOX_ID).unwrap();
+        client.forget_box(BOX_ID).unwrap();
+        // A second revocation of the box records nothing new.
+        client.revoke_box(BOX_HEX).unwrap();
+        let revoked = reader.read_new().unwrap().entries;
+        assert_eq!(revoked.len(), 1, "one revocation record: {revoked:?}");
+        assert_eq!(revoked[0].record.kind, Kind::Revocation);
+        assert_eq!(revoked[0].record.subject, BOX_HEX);
+        assert_eq!(revoked[0].record.identifier, bep::audit::NONE);
+        // One chain: the revocation follows the client's mints.
+        assert_eq!(revoked[0].record.previous_hash, line_hash(&mints[1].line));
+        assert_eq!(mints[1].record.previous_hash, line_hash(&mints[0].line));
+        assert_eq!(revocations.read().unwrap().as_slice(), [BOX_HEX.to_owned()]);
+
+        // A request with no box id is refused, and records nothing.
+        assert!(client.revoke_box("web").is_err());
+        assert!(client.record_mint(BOX_HEX, " ").is_err());
+        assert!(reader.read_new().unwrap().entries.is_empty());
+    }
+
     /// A control socket that registers and forgets boxes as the proxy does,
     /// and refuses every client key. Gives the socket and its boxes.
     fn serve_refusing_keys() -> (
@@ -4261,6 +4348,8 @@ mod mint_tests {
                             }
                             bep::control::Request::RegisterBox { .. } => "register_box",
                             bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RecordMint { .. } => "record_mint",
+                            bep::control::Request::RevokeBox { .. } => "revoke_box",
                         };
                         served_ops.lock().unwrap().push(op.to_owned());
                         let reply = if op == "register_client_key" {
@@ -4268,6 +4357,14 @@ mod mint_tests {
                                 ok: false,
                                 kid: None,
                                 error: Some("the key is not a P-256 public key".into()),
+                            }
+                        } else if op == "record_mint" || op == "revoke_box" {
+                            // `handle_line` keeps no record, so the stub
+                            // answers these two itself.
+                            bep::control::Reply {
+                                ok: true,
+                                kid: None,
+                                error: None,
                             }
                         } else {
                             bep::control::handle_line(&line, &clients, &served_boxes)
@@ -4347,9 +4444,21 @@ mod mint_tests {
                         bep::control::Request::RegisterClientKey { .. } => "register_client_key",
                         bep::control::Request::RegisterBox { .. } => "register_box",
                         bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RecordMint { .. } => "record_mint",
+                        bep::control::Request::RevokeBox { .. } => "revoke_box",
                     };
                     served_ops.lock().unwrap().push(op.to_owned());
-                    let reply = bep::control::handle_line(&line, &clients, &served_boxes);
+                    let reply = if op == "record_mint" || op == "revoke_box" {
+                        // `handle_line` keeps no record, so the stub
+                        // answers these two itself.
+                        bep::control::Reply {
+                            ok: true,
+                            kid: None,
+                            error: None,
+                        }
+                    } else {
+                        bep::control::handle_line(&line, &clients, &served_boxes)
+                    };
                     if op == "register_box" {
                         // The box is stored, and the reply never comes.
                         break;

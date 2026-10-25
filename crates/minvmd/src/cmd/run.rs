@@ -392,6 +392,23 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
+/// The supervisor's box registry: it feeds the proxy attachments, compiles
+/// under the operator's deny-all opt-out, persists to `registry_file`, and
+/// sends a live box's revocation to the Box Egress Proxy control socket under
+/// the home directory (BEP-043). Only this start path sets that socket.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn supervisor_registry(
+    proxy_attachments: crate::bep_attach::Attachments,
+    egress_deny_all_opt_out: bool,
+    registry_file: std::path::PathBuf,
+) -> crate::box_registry::BoxRegistry {
+    crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
+        .feeding_proxy_attachments(proxy_attachments)
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
+        .with_proxy_control(crate::box_registry::home_proxy_control())
+        .persisting_to(registry_file)
+}
+
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
 ///
@@ -565,10 +582,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // (NET-138): a supervisor restarted under a session's live box reloads
     // its row detached, for the box to attach again or its creator to
     // resume inside the grace — never from anything the guest reports.
-    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments.clone())
-        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
-        .persisting_to(state_dir.dir().join(crate::box_registry::REGISTRY_FILE));
+    let boxes = supervisor_registry(
+        proxy_attachments.clone(),
+        egress_deny_all_opt_out,
+        state_dir.dir().join(crate::box_registry::REGISTRY_FILE),
+    );
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -3209,6 +3227,23 @@ fn await_publish_report(
 
 #[cfg(test)]
 mod tests {
+    // BEP-043: the daemon's start path sends a live box's revocation to the
+    // proxy's control socket under the home directory.
+    #[test]
+    fn supervisor_registry_sends_revocations_to_the_home_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = super::supervisor_registry(
+            crate::bep_attach::Attachments::new(),
+            false,
+            dir.path().join("registry.json"),
+        );
+        assert_eq!(
+            registry.proxy_control(),
+            crate::box_registry::home_proxy_control().as_deref()
+        );
+        assert!(registry.proxy_control().is_some());
+    }
+
     #[cfg(not(minvmd_libkrun))]
     use super::*;
 

@@ -41,7 +41,8 @@
 //!
 //! The same control socket then registers the box with its declared egress
 //! and its address stance, so the proxy admits the box's requests to those
-//! authorities.
+//! authorities. Last, it records one `mint` record per member in the
+//! proxy's audit log, the log the proxy's decisions go to (BEP-067).
 
 use std::fmt;
 use std::io::{self, BufRead as _, BufReader, Write as _};
@@ -765,6 +766,46 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Records the mint of the member `identifier` for the box `box_id` in
+    /// the proxy's audit log (BEP-067).
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the record.
+    pub fn record_mint(&mut self, box_id: &str, identifier: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::RecordMint {
+                box_id: box_id.to_owned(),
+                identifier: identifier.to_owned(),
+            },
+            "the mint record",
+        )?;
+        tracing::debug!(box_id, identifier, "recorded the mint with the proxy");
+        Ok(())
+    }
+
+    /// Revokes every sealed value that names the box `box_id`, and records
+    /// the revocation in the proxy's audit log (BEP-043, BEP-067). `minvmd`
+    /// sends this request when a live box is destroyed, and `min` never
+    /// does, so only the tests use it here.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the revocation.
+    #[cfg(test)]
+    pub(crate) fn revoke_box(&mut self, box_id: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::RevokeBox {
+                box_id: box_id.to_owned(),
+            },
+            "the box's revocation",
+        )?;
+        tracing::debug!(box_id, "revoked the box's sealed values at the proxy");
+        Ok(())
+    }
+
     /// Registers the box `box_id` with its declared egress and its address
     /// stance.
     ///
@@ -901,7 +942,10 @@ pub struct GrantBox {
 /// since the Unix epoch.
 ///
 /// The client's key is registered last, after every other step succeeded,
-/// so a failed mint leaves no key the proxy trusts and no box uses. When
+/// so a failed mint leaves no key the proxy trusts and no box uses. After
+/// it, one `mint` record per member goes to the proxy's audit log
+/// (BEP-067). A record the proxy does not take is a warn line, and the
+/// mint stands: the box and its key are registered by then. When
 /// the key's registration fails, the box is forgotten again, so a failed
 /// mint leaves neither a key nor a box behind. The
 /// sealed values leave this process only after this function returns, so
@@ -942,6 +986,7 @@ pub fn mint_and_register(
     let node = sealing.kid();
 
     let mut minted = Vec::with_capacity(grant_box.grants.len());
+    let mut identifiers = Vec::with_capacity(grant_box.grants.len());
     for grant in &grant_box.grants {
         let claims = sign_in_claims(
             &box_id,
@@ -952,6 +997,7 @@ pub fn mint_and_register(
             expiry,
             handle_id()?,
         );
+        identifiers.push(claims.identifier());
         let jws = Zeroizing::new(handle::sign(&key.0, &claims));
         let context = Context {
             box_id: box_id.clone(),
@@ -1002,6 +1048,18 @@ pub fn mint_and_register(
     if let Err(error) = control.register_client_key(key) {
         forget_on_a_new_connection(&control.path, &box_id, "its key was refused");
         return Err(error);
+    }
+    // BEP-067: one `mint` record per member, through the proxy, the log's
+    // only writer.
+    for identifier in &identifiers {
+        if let Err(error) = control.record_mint(&box_id, identifier) {
+            tracing::warn!(
+                box_id = %box_id,
+                identifier = %identifier,
+                error = %error,
+                "the proxy did not record the mint"
+            );
+        }
     }
     Ok(minted)
 }
@@ -1148,8 +1206,8 @@ fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
 ///
 /// The forget runs only on a failed creation. A Ctrl-C ends the process
 /// in `std::process::exit`, which runs no destructor, so it leaves the box
-/// at the proxy until the box's destroy forgets it
-/// (https://github.com/gominimal/minimal/issues/2277). Inside a
+/// at the proxy until the box's destroy forgets it: `minvmd` revokes and
+/// forgets a live box when it withdraws the box's row. Inside a
 /// tokio runtime it runs on a blocking thread, so it never holds up a
 /// runtime worker. It waits at most [`FORGET_TIMEOUT`] for each read and
 /// write.
@@ -1200,8 +1258,8 @@ impl Drop for ProxyRegistration {
         match tokio::runtime::Handle::try_current() {
             // The runtime waits for its blocking threads before it shuts
             // down, so a runtime shutdown does not lose the forget. A
-            // Ctrl-C exits the process with no drop, and #2277 forgets
-            // that box at its destroy.
+            // Ctrl-C exits the process with no drop, and the box's
+            // destroy forgets that box.
             Ok(runtime) => drop(runtime.spawn_blocking(forget)),
             Err(_) => forget(),
         }
