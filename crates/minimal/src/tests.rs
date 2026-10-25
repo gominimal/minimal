@@ -4607,3 +4607,151 @@ mod mint_tests {
         );
     }
 }
+
+/// BEP-070: on a host that is not enrolled, each box creation gets a box id
+/// that the host-side creator mints outside the VM: a UUIDv7 whose timestamp
+/// comes from the clock and whose random fields come from the OS CSPRNG.
+/// The test drives the CLI's own registration against the real VM host
+/// tables and control server, and creates the box again and again under one
+/// name. Each creation gets a new id. The CLI presents no id, so the id the
+/// reply returns is the one the host's row holds. A friendly name is an
+/// alias, so a re-created box never inherits the id of its predecessor.
+#[tokio::test]
+async fn box_id_is_a_csprng_uuidv7_per_creation() {
+    use minimal_client::box_registration::{register_box_for_activation, withdraw_box_row};
+
+    const CREATIONS: usize = 8;
+
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is past the epoch")
+                .as_millis(),
+        )
+        .expect("the time in milliseconds fits in 64 bits")
+    }
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let sock_path = provider_dir.join("control.sock");
+    let attachments = minvmd::bep_attach::Attachments::new();
+    let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+        .feeding_proxy_attachments(attachments.clone());
+    let _server = minvmd::control::spawn(
+        sock_path.clone(),
+        registry.clone(),
+        minvmd::net::answerer::AnswererStatus::allocating_for_tests("box-id-test-node"),
+        minvmd::control::ProxyPublishStatus::default(),
+    )
+    .expect("the control server binds its socket");
+
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(CREATIONS);
+    for creation in 0..CREATIONS {
+        let before = now_ms();
+        let registered = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("the real control server answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        let after = now_ms();
+        let id = registered
+            .box_id
+            .expect("the reply returns the id the host minted for this creation");
+        let bytes = id.to_bytes();
+
+        // The host minted it: the row and the attachment that the
+        // registration published hold the id that the reply returned.
+        let row = registry
+            .table()
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration published the box's row");
+        assert_eq!(
+            row.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's row holds"
+        );
+        let attachment = attachments
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration issued the box's attachment");
+        assert_eq!(
+            attachment.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's attachment holds"
+        );
+
+        // A UUIDv7: version 7 and the RFC 9562 variant.
+        assert_eq!(
+            bytes[6] >> 4,
+            7,
+            "creation {creation}: the id is a UUIDv7, got {id}"
+        );
+        assert_eq!(
+            bytes[8] >> 6,
+            0b10,
+            "creation {creation}: the id carries the RFC 9562 variant, got {id}"
+        );
+        // Its 48-bit timestamp is the clock at the mint, not a counter.
+        let mut stamp = [0u8; 8];
+        stamp[2..].copy_from_slice(&bytes[..6]);
+        let stamp = u64::from_be_bytes(stamp);
+        assert!(
+            (before..=after).contains(&stamp),
+            "creation {creation}: the id's timestamp {stamp} is the clock at the mint, \
+             between {before} and {after}"
+        );
+
+        ids.push(bytes);
+        withdraw_box_row(
+            Some(sock_path.clone()),
+            Some("web"),
+            Some(registered.addresses),
+            Some(id),
+        )
+        .await;
+        assert!(
+            !attachments.holds_id(bytes),
+            "creation {creation}: the destroyed box's id is held by no attachment"
+        );
+    }
+
+    // One id per creation: no id returns under the name it was minted for.
+    let distinct: std::collections::BTreeSet<[u8; 16]> = ids.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        CREATIONS,
+        "each creation under one name gets an id of its own, got {ids:02x?}"
+    );
+    // The random fields are random fills, not a counter. The low 32 bits of
+    // `rand_b` are fresh CSPRNG output on every mint (the monotonic counter
+    // the mint keeps sits above them). Eight draws of 32 random bits are all
+    // distinct, and no two consecutive draws differ by one.
+    let tails: Vec<u32> = ids
+        .iter()
+        .map(|bytes| u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]))
+        .collect();
+    let distinct_tails: std::collections::BTreeSet<u32> = tails.iter().copied().collect();
+    assert_eq!(
+        distinct_tails.len(),
+        CREATIONS,
+        "the random fields differ on every creation, got {tails:08x?}"
+    );
+    assert!(
+        tails
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) != 1),
+        "the random fields are not a counter, got {tails:08x?}"
+    );
+}
