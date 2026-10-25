@@ -11850,3 +11850,110 @@ async fn a_hook_launched_shell_of_a_registered_box_is_kept_for_a_terminal() {
          attach-env; got: {published:?}"
     );
 }
+
+/// BEP-015: a GitHub grant box carries a git credential helper. Through the
+/// box's own git configuration, `git credential fill` answers for each grant
+/// host with the sealed value as the password, so git sends it in an
+/// `Authorization` header the proxy substitutes. A host outside the grant
+/// gets no answer. Each answer is logged by host, never by value. A second
+/// start rewrites the helper and does not add the include twice, and keeps
+/// what the box's own configuration holds. A box with no grant, or with a
+/// value that a shell can read as code, gets no helper.
+#[test]
+fn grant_box_git_credential_helper_answers_for_grant_hosts() {
+    use super::bep_git_helper::{
+        GRANT_HOSTS, HELPER_LOG_REL, HELPER_REL, Installed, XDG_GIT_CONFIG_REL, install,
+    };
+    const SEALED: &str = "eyJ0eXAiOiJ4In0..aXY.Y3Q.dGFn";
+    let delivery = |sealed: &str| boxes::SealedDelivery {
+        variable: "GH_TOKEN".to_string(),
+        sealed: sealed.to_string(),
+    };
+    let home = tempfile::tempdir().unwrap();
+    // The box's own configuration, which the helper must not replace.
+    let xdg = home.path().join(XDG_GIT_CONFIG_REL);
+    std::fs::create_dir_all(xdg.parent().unwrap()).unwrap();
+    std::fs::write(&xdg, "[user]\n\tname = Box User").unwrap();
+
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    let config = std::fs::read_to_string(&xdg).unwrap();
+    assert!(
+        config.starts_with("[user]\n\tname = Box User\n"),
+        "{config}"
+    );
+    assert_eq!(config.matches("[include]").count(), 1, "{config}");
+
+    let fill = |host: &str| {
+        let mut child = std::process::Command::new("git")
+            .args(["credential", "fill"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        std::io::Write::write_all(
+            child.stdin.as_mut().unwrap(),
+            format!("protocol=https\nhost={host}\n\n").as_bytes(),
+        )
+        .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    for host in GRANT_HOSTS {
+        let output = fill(host);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{host}: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("password={SEALED}\n")),
+            "{host}: {stdout}"
+        );
+        assert!(
+            stdout.contains("username=x-access-token\n"),
+            "{host}: {stdout}"
+        );
+    }
+    let output = fill("example.com");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(SEALED),
+        "a host outside the grant gets the sealed value"
+    );
+    assert!(
+        !output.status.success(),
+        "git found a credential for example.com"
+    );
+
+    let log = std::fs::read_to_string(home.path().join(HELPER_LOG_REL)).unwrap();
+    assert_eq!(log.lines().count(), GRANT_HOSTS.len(), "{log}");
+    for host in GRANT_HOSTS {
+        assert!(
+            log.contains(&format!("answered for host {host}\n")),
+            "{log}"
+        );
+    }
+    assert!(!log.contains(SEALED), "the log holds the value: {log}");
+
+    // A box with no grant, or a value that is not inert, gets no helper.
+    let plain = tempfile::tempdir().unwrap();
+    assert_eq!(install(plain.path(), &[]).unwrap(), Installed::NoGrant);
+    assert_eq!(
+        install(plain.path(), &[delivery("x'; touch /tmp/owned #")]).unwrap(),
+        Installed::Refused
+    );
+    assert!(!plain.path().join(HELPER_REL).exists());
+    assert!(!plain.path().join(XDG_GIT_CONFIG_REL).exists());
+}
