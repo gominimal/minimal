@@ -48,9 +48,9 @@
 //!
 //! Interim: the client does not keep one key yet. Each `min` box creation
 //! registers a new key, so the file gets one line for each creation, and
-//! nothing removes a line. The client flips to one kept key in a residual
-//! of #2288. Then a creation registers a key that the file already holds,
-//! and the file stops growing.
+//! nothing removes a line. The client flips to one kept key in
+//! <https://github.com/gominimal/minimal/issues/2524>. Then a creation
+//! registers a key that the file already holds, and the file stops growing.
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
