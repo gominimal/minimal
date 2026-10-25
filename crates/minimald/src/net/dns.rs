@@ -89,6 +89,49 @@ pub fn is_zone_name(name: &str) -> bool {
     }
 }
 
+/// Whether the Box Egress Proxy's listener is live, as the DNS gates of the
+/// boxes it steers read it (BEP-062). One state is shared by every gate on
+/// a switch: a clone reads and writes the same flag.
+///
+/// A new state is *down*. A steered name fails closed until the listener
+/// is reported live, so no lookup answered before the first report can
+/// fall back to real DNS.
+// Interim until https://github.com/gominimal/minimal/issues/2523: no production code builds a state yet. Remove the allow when BoxGate::for_session passes one to the gate.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProxyListenerState {
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ProxyListenerState {
+    /// A state that reads down until [`Self::set_live`] reports otherwise.
+    #[must_use]
+    pub(crate) fn down() -> Self {
+        Self::default()
+    }
+
+    /// Whether the listener is live now.
+    #[must_use]
+    pub(crate) fn is_live(&self) -> bool {
+        self.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records whether the listener is live. The change from down to live
+    /// writes one info line, so the log shows when steered names start to
+    /// resolve to the proxy again. Returns whether the state changed.
+    pub(crate) fn set_live(&self, live: bool) -> bool {
+        let was = self.live.swap(live, std::sync::atomic::Ordering::AcqRel);
+        if live && !was {
+            tracing::info!(
+                component = "dns-gate",
+                "the Box Egress Proxy's listener is live; steered names resolve to it again"
+            );
+        }
+        was != live
+    }
+}
+
 /// Default `<host-id>` of the deprecated three-label zone: a stable short name
 /// for this `minimald` instance. The host-id is configurable; this is the value
 /// used when none is configured.
