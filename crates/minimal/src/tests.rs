@@ -318,6 +318,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
+            // Not a product path, and not the daemon: the audit test submits
+            // a revocation to a test Box Egress Proxy's control socket.
+            "tests.rs::mint_and_destroy_append_audit_records = ungated",
         ]
     );
 }
