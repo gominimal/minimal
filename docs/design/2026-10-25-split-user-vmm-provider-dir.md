@@ -1,17 +1,20 @@
 # Split-user VMM: provider directory and socket ownership
 
-Status: proposed, arch ruling applied. Arch reviewed this document on
+Status: proposed, arch conditions open. Arch reviewed this document on
 pull request #2546. Its review at `52231ae0` accepted the model with a
 separate directory for the VM user and set the file-mode condition. Its
 review at `e8be045a` accepted the file modes and the reason to keep
 gvproxy away from the VM user. It did not accept gvproxy as `<login>`,
-the user of `bep serve`. Gatehouse section 6.10 wants the proxy and
-gvproxy to share no writable state. So arch ruled a third user,
+the user of `bep serve`. Gatehouse section 6.10 (line 831) separates
+"the BEP role and the EGW/gvproxy role", and gives the surface that parses
+guest frames to the EGW process. So arch ruled a third user,
 `minimal-gvproxy`, for gvproxy (C1), and a gvproxy directory outside the
-provider directory (C2). This revision applies both rulings. The provider
-directory stays writable only by `<login>`. Every entry that `minimal-vmm`
-creates goes into `<provider dir>/vmm/`, which `minimal-vmm` owns. The
-open items are at the end of this document.
+provider directory (C2). Its review at `391f1317` confirmed both rulings.
+The provider directory stays writable only by `<login>`. Every entry that
+`minimal-vmm` creates goes into `<provider dir>/vmm/`, which `minimal-vmm`
+owns. The placement of the egress gate and `switch::bep_host` is still
+open: they parse guest frames as `<login>` (see "What a compromised
+supervisor can reach"). The open items are at the end of this document.
 
 ## Question
 
@@ -20,11 +23,17 @@ dedicated unprivileged user. The `minvmd run` supervisor, `min` and the
 Box Egress Proxy (`bep serve`) stay with the login user. Each provider
 directory socket and file must stay reachable by the processes that open it.
 
+Gatehouse section 6.10, line 831, separates "the BEP role and the
+EGW/gvproxy role". The line gives the surface that parses guest frames to
+the EGW process, not only to gvproxy.
+
 This design uses three users. The VMM child runs as `minimal-vmm`.
 gvproxy runs as `minimal-gvproxy`, a third user, apart from `<login>` and
 from `minimal-vmm`. So the egress gate is the only path from the VMM to the
 switch (fact 10), and gvproxy shares no writable state with `bep serve`.
-The fallback at the end moves only gvproxy.
+The egress gate and `switch::bep_host` stay in the supervisor as `<login>`.
+So this design does not by itself give the EGW role a user apart from the
+BEP role. The fallback at the end moves only gvproxy.
 
 Today one user owns the provider directory. `sock::prepare_socket_dir`
 creates it with mode 0700. `sock::restrict_owned_dir` tightens it back to
@@ -313,6 +322,25 @@ A VMM child that the guest takes over runs as `minimal-vmm`.
   they run as `<login>`. It cannot signal or trace gvproxy, because gvproxy
   runs as `minimal-gvproxy`.
 
+## What a compromised supervisor can reach
+
+The egress gate (`net/egress_gate.rs`) and the `switch::bep_host` leg run
+inside the `minvmd run` supervisor. They parse guest frames as `<login>`,
+the user of `bep serve`.
+
+- A guest frame that takes over the egress gate or `switch::bep_host` runs
+  as `<login>`.
+- It can trace or signal `bep serve` without root, because `bep serve`
+  runs as the same user.
+- It can connect to `gvproxy-bep.sock` and `control.sock`, and it can
+  write the provider directory.
+
+So this model does not by itself meet Gatehouse section 6.10. That line
+gives the frame-parsing surface to the EGW process, apart from the BEP
+role. The third user for gvproxy removes gvproxy from the BEP role. It
+does not remove the egress gate or `switch::bep_host`. The open items name
+the arch question for their placement.
+
 ## What a compromised gvproxy can reach
 
 A gvproxy that a guest frame takes over runs as `minimal-gvproxy`.
@@ -514,6 +542,13 @@ user, `minimal-gvproxy`. The socket is 0660 with group `minimal-gvproxy`
 in `<gvproxy dir>`, and the umask of the spawn sets that mode (fact 11).
 These items stay open:
 
+- Arch must rule on the placement of the egress gate and the
+  `switch::bep_host` leg. Both parse guest frames as `<login>`, the user of
+  `bep serve` (see "What a compromised supervisor can reach"). The arch
+  question is "egress gate and `bep_host` placement under Gatehouse section
+  6.10". It has no issue number in this repository yet, and the plan must
+  file it in gominimal/arch before T38 is cut. T38 must not claim
+  conformance with Gatehouse section 6.10 until arch rules on it.
 - Confirm that macOS checks socket write permission on `connect(2)`.
 - Confirm that gvproxy removes a stale switch socket before it binds
   `-listen`. `<login>` cannot write `<gvproxy dir>`, so the supervisor

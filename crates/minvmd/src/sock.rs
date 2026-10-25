@@ -468,7 +468,11 @@ mod tests {
     /// Checks that the table in the `## <heading>` section of `doc` has a
     /// row for each name in `required`. Each row names the expected
     /// creating user first, a four-digit octal mode that gives its owner
-    /// some access, and only known users as opening users.
+    /// some access, and only known users as opening users. A mode with no
+    /// group and no other bits admits only its owner, so such a row must
+    /// name no opening user except the owner. The owner is the user after
+    /// `owner` in the mode cell, or else the creating user. The check does
+    /// not prove that a group mode names the right group for each opener.
     fn check_table(doc: &str, heading: &str, required: &[(String, &str)]) {
         let section = doc
             .split("\n## ")
@@ -515,6 +519,22 @@ mod tests {
                 panic!("row for {name} names only known opening users: {row:?}")
             });
             assert!(!openers.is_empty(), "row for {name} names an opening user");
+            // A 0600 entry that lists another opener contradicts itself.
+            let owner = row[2]
+                .split(',')
+                .find_map(|part| part.trim().strip_prefix("owner "))
+                .map(|rest| {
+                    users_in(rest.trim())
+                        .and_then(|users| users.first().copied())
+                        .unwrap_or_else(|| panic!("row for {name} names a known owner: {row:?}"))
+                })
+                .unwrap_or(*creator);
+            if &mode[2..] == "00" {
+                assert!(
+                    openers.iter().all(|u| *u == owner),
+                    "row for {name} has mode {mode}, so only {owner} can open it: {row:?}",
+                );
+            }
         }
     }
 }
