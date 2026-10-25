@@ -381,8 +381,10 @@ fn accept_store_references(
     let outcome = (|| {
         if let Err(refused) = check_store_references(secrets, egress, rules, deny) {
             checked.extend(
-                store_references(secrets)
-                    .map(|reference| format!("{}: refused", store_item(&reference))),
+                refused
+                    .refusals
+                    .iter()
+                    .map(|refusal| format!("refused: {refusal}")),
             );
             return Err(anyhow::Error::from(refused));
         }
@@ -405,10 +407,14 @@ fn accept_store_references(
                     return Err(GrantNotDelivered::StoreReferenceDenied { grant, item }.into());
                 }
                 StoreConsent::Ask => {
+                    let upstream: Vec<String> =
+                        rule.upstream.iter().map(|host| printable(host)).collect();
                     let question = format!(
-                        "The secret {grant} reads the item {item} from the host's secret \
+                        "The secret {} reads the item {} from the host's secret \
                          store and sends it to {}. Allow it for this box?",
-                        rule.upstream.join(", ")
+                        printable(&grant),
+                        printable(&item),
+                        upstream.join(", ")
                     );
                     ask(&question)?
                 }
@@ -428,6 +434,21 @@ fn accept_store_references(
         "checked the box's store references"
     );
     outcome
+}
+
+/// `text` with each control character escaped, so a name from an
+/// untrusted `minimal.toml` cannot move the cursor or fake a line in the
+/// question the person answers.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The names of the project's GitHub grants, in name order.
@@ -2812,6 +2833,10 @@ mod tests {
         assert_eq!(accepted, ask);
         assert_eq!(questions.len(), 1);
         assert!(questions[0].contains("api.openai.com"), "{}", questions[0]);
+        assert_eq!(
+            printable("KEY\u{1b}[2K\nAllow? y"),
+            "KEY\\u{1b}[2K\\nAllow? y"
+        );
 
         let err = accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |_| {
             Ok(false)
