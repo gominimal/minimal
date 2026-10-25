@@ -37,7 +37,9 @@ use crate::redeem::{
     self, Attribution, Authority, Decision, Redemption, RequestAuthority, Unsealed,
 };
 use crate::seal::{self, Binding, OpenError, Opened};
-use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, TokenEndpoint};
+use crate::signin::{
+    self, Keychain, NoTokenEndpoint, RenewError, Resolved, TokenEndpoint, Unsaved,
+};
 
 /// The audit marker of an admitted redemption whose sign-in reference
 /// resolves to no live sign-in: the item is gone, names another sign-in, or
@@ -76,6 +78,10 @@ pub struct BoxRedeemer<K, C> {
     /// When the last renewal of each item failed, by instance. Within
     /// [`RENEW_RETRY_AFTER_SECS`] of it, no request calls GitHub again.
     failed_renewals: Mutex<HashMap<String, u64>>,
+    /// A renewal that GitHub accepted and the item did not take. The next
+    /// renewal writes it and does not call GitHub with the revoked refresh
+    /// token that the item still holds.
+    unsaved: Mutex<Option<Unsaved>>,
 }
 
 /// How long the proxy waits after a failed renewal of an item before it asks
@@ -132,6 +138,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             endpoint: Arc::new(NoTokenEndpoint),
             renewals: SingleFlight::default(),
             failed_renewals: Mutex::new(HashMap::new()),
+            unsaved: Mutex::new(None),
         }
     }
 
@@ -344,7 +351,19 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         }
         if metadata.needs_renewal(now) && !self.renewal_backed_off(instance, now) {
             let ran = self.renewals.run(instance, || {
-                let outcome = signin::renew(&self.keychain, self.endpoint.as_ref(), instance, now);
+                let mut unsaved = self
+                    .unsaved
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                let outcome = signin::renew_holding(
+                    &self.keychain,
+                    self.endpoint.as_ref(),
+                    instance,
+                    now,
+                    &mut unsaved,
+                );
+                *self.unsaved.lock().unwrap_or_else(PoisonError::into_inner) = unsaved;
                 self.record_renewal(instance, &outcome, now);
                 outcome
             });
@@ -1273,6 +1292,88 @@ mod tests {
         assert_eq!(records[0].outcome, Outcome::Refuse);
         let material = world.redeemer.keychain.material().unwrap().unwrap();
         assert_eq!(material.access_token, TOKEN, "the item is unchanged");
+    }
+
+    /// A keychain over a memory keychain that refuses every write while
+    /// `refuse` is set.
+    struct SwitchedWrites {
+        inner: MemoryKeychain,
+        refuse: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Keychain for SwitchedWrites {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.inner.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.inner.material()
+        }
+        fn write(
+            &self,
+            metadata: &Metadata,
+            material: &Material,
+        ) -> Result<(), signin::SignInError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(signin::SignInError::Keychain {
+                    action: "write the sign-in",
+                    detail: "locked".into(),
+                });
+            }
+            self.inner.write(metadata, material)
+        }
+    }
+
+    // BEP-069: GitHub revokes the old refresh token when it renews. A
+    // renewal that the item did not take is kept, and the next renewal
+    // writes it. GitHub is not asked again with the revoked refresh token,
+    // and the renewed token is substituted only after the write.
+    #[test]
+    fn an_unsaved_renewal_is_written_on_the_next_renewal() {
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(NOW));
+        let now = Arc::clone(&clock);
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keychain = SwitchedWrites {
+            inner: MemoryKeychain::default(),
+            refuse: Arc::clone(&refuse),
+        };
+        seed(&keychain, NOW - 1, NOW + 86_400);
+        refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer
+                .with_token_endpoint(Arc::clone(&endpoint) as Arc<dyn TokenEndpoint>)
+                .with_clock(Arc::new(move || {
+                    now.load(std::sync::atomic::Ordering::SeqCst)
+                }))
+        });
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(endpoint.calls(), 1);
+
+        refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+        clock.store(
+            NOW + RENEW_RETRY_AFTER_SECS,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(
+            upstream.contains(&format!("Bearer {RENEWED}")),
+            "{upstream}"
+        );
+        assert_eq!(endpoint.calls(), 1, "GitHub is not asked again");
+        assert_eq!(renewal_records(&records), 1);
+        let material = world.redeemer.keychain.material().unwrap().unwrap();
+        assert_eq!(material.access_token, RENEWED);
+        assert_eq!(material.refresh_token, RENEWED_REFRESH);
+        let metadata = world.redeemer.keychain.metadata().unwrap().unwrap();
+        assert_eq!(metadata.token_expires_at, NOW + 28_800);
     }
 
     // BEP-069: an item deleted while its renewal runs stays deleted. The

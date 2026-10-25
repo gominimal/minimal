@@ -469,13 +469,43 @@ pub enum RenewError {
     #[error("the GitHub sign-in needs a new sign-in")]
     SignInRequired,
     /// GitHub renewed the sign-in, but the item was not written. The renewed
-    /// token is discarded.
+    /// token is not substituted. The caller keeps the renewal as [`Unsaved`]
+    /// for the next attempt to write.
     #[error("the renewed GitHub sign-in was not saved")]
     NotSaved,
     /// The item is gone, or holds another sign-in. The renewed token, if
     /// any, is discarded.
     #[error("the GitHub sign-in was removed")]
     Gone,
+}
+
+/// A renewal that GitHub accepted and the item did not take: the write
+/// failed. GitHub revokes the old refresh token at each renewal, so the item
+/// now holds a refresh token that GitHub refuses. The proxy keeps this pair
+/// in memory, and the next renewal of the item writes it in place of a new
+/// call to GitHub. Debug output redacts the material.
+#[derive(Debug)]
+pub struct Unsaved {
+    metadata: Metadata,
+    material: Material,
+}
+
+/// Renew the sign-in `instance` from its refresh material, when its token
+/// has expired or expires within [`RENEW_WITHIN_SECS`] of `now` (BEP-069).
+///
+/// The same as [`renew_holding`], with no renewal held from an earlier
+/// failed write.
+///
+/// # Errors
+///
+/// [`RenewError`] when no token can be substituted.
+pub fn renew(
+    keychain: &dyn Keychain,
+    endpoint: &dyn TokenEndpoint,
+    instance: &str,
+    now: u64,
+) -> Result<Resolved, RenewError> {
+    renew_holding(keychain, endpoint, instance, now, &mut None)
 }
 
 /// Renew the sign-in `instance` from its refresh material, when its token
@@ -487,20 +517,32 @@ pub enum RenewError {
 /// for first use. When the renewal fails and the held token has not expired
 /// yet, the held token is given.
 ///
+/// `unsaved` carries a renewal whose write failed. When it holds one for
+/// this item, the function writes that renewal and does not call GitHub. If
+/// its token needs renewal too, the function renews from its refresh token,
+/// because the item's refresh token is revoked. When the write fails again,
+/// or a renewal is not written, the renewal goes back into `unsaved`, and
+/// the request is refused with [`RenewError::NotSaved`]. The renewed token
+/// is never substituted before it is written.
+///
 /// # Errors
 ///
 /// [`RenewError`] when no token can be substituted.
-pub fn renew(
+pub fn renew_holding(
     keychain: &dyn Keychain,
     endpoint: &dyn TokenEndpoint,
     instance: &str,
     now: u64,
+    unsaved: &mut Option<Unsaved>,
 ) -> Result<Resolved, RenewError> {
+    // A held renewal of another item is of no use: that item is gone.
+    let pending = unsaved.take().filter(|p| p.metadata.instance == instance);
     let metadata = match keychain.metadata() {
         Ok(Some(metadata)) if metadata.instance == instance => metadata,
         Ok(_) => return Err(RenewError::Gone),
         Err(error) => {
             tracing::warn!(%error, "the sign-in item was not read for its renewal");
+            *unsaved = pending;
             return Err(RenewError::SignInRequired);
         }
     };
@@ -509,6 +551,7 @@ pub fn renew(
         Ok(_) => return Err(RenewError::Gone),
         Err(error) => {
             tracing::warn!(%error, "the sign-in item was not read for its renewal");
+            *unsaved = pending;
             return Err(RenewError::SignInRequired);
         }
     };
@@ -525,46 +568,77 @@ pub fn renew(
         }
     };
     if !metadata.needs_renewal(now) {
+        // Another writer put a token with time to live in the item. A held
+        // renewal is older than that write, so it is dropped.
         return Ok(held(false));
     }
-    if now >= metadata.refresh_expires_at {
-        tracing::warn!(
-            account = %metadata.account,
-            refresh_expires_at = metadata.refresh_expires_at,
-            "the GitHub sign-in was not renewed: its refresh material expired"
-        );
-        return keep();
-    }
-    let refreshed = match endpoint.refresh(metadata.flow, &material.refresh_token) {
-        Ok(refreshed) => refreshed,
-        Err(error) => {
-            tracing::warn!(
+    let candidate = match pending {
+        Some(pending) if !pending.metadata.needs_renewal(now) => {
+            tracing::info!(
                 account = %metadata.account,
-                %error,
-                "GitHub did not renew the sign-in"
+                "writing the GitHub sign-in renewal that was not saved before"
             );
-            return keep();
+            pending
+        }
+        pending => {
+            // The refresh token to use: a held renewal's, since GitHub
+            // revoked the item's when it gave that renewal.
+            let (flow, refresh_expires_at) = match &pending {
+                Some(p) => (p.metadata.flow, p.metadata.refresh_expires_at),
+                None => (metadata.flow, metadata.refresh_expires_at),
+            };
+            if now >= refresh_expires_at {
+                tracing::warn!(
+                    account = %metadata.account,
+                    refresh_expires_at,
+                    "the GitHub sign-in was not renewed: its refresh material expired"
+                );
+                return keep();
+            }
+            let refresh_token = pending
+                .as_ref()
+                .map_or(material.refresh_token.as_str(), |p| {
+                    p.material.refresh_token.as_str()
+                });
+            let refreshed = match endpoint.refresh(flow, refresh_token) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!(
+                        account = %metadata.account,
+                        %error,
+                        "GitHub did not renew the sign-in"
+                    );
+                    // A refresh token that GitHub refused is dead. One that
+                    // was not sent can be used next time.
+                    if matches!(error, RefreshError::Failed(_)) {
+                        *unsaved = pending;
+                    }
+                    return keep();
+                }
+            };
+            Unsaved {
+                metadata: Metadata {
+                    token_expires_at: now.saturating_add(refreshed.expires_in),
+                    refresh_expires_at: now.saturating_add(refreshed.refresh_token_expires_in),
+                    ..metadata.clone()
+                },
+                material: Material {
+                    instance: instance.to_owned(),
+                    access_token: refreshed.access_token.clone(),
+                    refresh_token: refreshed.refresh_token.clone(),
+                },
+            }
         }
     };
-    let renewed_metadata = Metadata {
-        token_expires_at: now.saturating_add(refreshed.expires_in),
-        refresh_expires_at: now.saturating_add(refreshed.refresh_token_expires_in),
-        ..metadata.clone()
-    };
-    let renewed_material = Material {
-        instance: instance.to_owned(),
-        access_token: refreshed.access_token.clone(),
-        refresh_token: refreshed.refresh_token.clone(),
-    };
-    match keychain.update(&renewed_metadata, &renewed_material) {
+    match keychain.update(&candidate.metadata, &candidate.material) {
         Ok(Updated::Written) => {
             tracing::info!(
-                account = %renewed_metadata.account,
-                token_expires_at = renewed_metadata.token_expires_at,
+                account = %candidate.metadata.account,
+                token_expires_at = candidate.metadata.token_expires_at,
                 "renewed the GitHub sign-in at the proxy"
             );
             Ok(Resolved {
-                token: Zeroizing::new(renewed_material.access_token.clone()),
+                token: Zeroizing::new(candidate.material.access_token.clone()),
                 renewed: true,
                 failed: false,
             })
@@ -580,8 +654,9 @@ pub fn renew(
             tracing::warn!(
                 account = %metadata.account,
                 %error,
-                "the renewed GitHub sign-in was not saved; the renewed token was discarded"
+                "the renewed GitHub sign-in was not saved; the proxy keeps it to write on the next renewal"
             );
+            *unsaved = Some(candidate);
             Err(RenewError::NotSaved)
         }
     }
