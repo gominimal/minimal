@@ -46,7 +46,7 @@
 //! is mode `0600`, and the bind refuses a file that another user owns or
 //! that other users can write.
 
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -176,25 +176,11 @@ impl KeyFile {
     /// keys it registered. A missing file holds no keys. A line that is not
     /// a key is skipped with a warning.
     fn restore(&self, registry: &RwLock<ClientKeys>) -> io::Result<usize> {
-        use std::os::unix::fs::MetadataExt as _;
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(err) => return Err(err),
+        let Some((mut file, _)) = self.open(false)? else {
+            return Ok(0);
         };
-        let meta = std::fs::metadata(&self.path)?;
-        // SAFETY: geteuid reads the caller's effective uid. It has no side
-        // effects and cannot fail.
-        let own = unsafe { libc::geteuid() };
-        if meta.uid() != own || meta.mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{} must belong to this user and be writable by this user only",
-                    self.path.display()
-                ),
-            ));
-        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
         let mut registry = registry.write().unwrap_or_else(PoisonError::into_inner);
         let mut restored = 0;
         for (number, line) in text.lines().enumerate() {
@@ -218,16 +204,58 @@ impl KeyFile {
         Ok(restored)
     }
 
+    /// Opens the file once, without following a symlink, and checks the
+    /// open handle: a regular file this user owns that no other user can
+    /// write. With `create`, a missing file is made at mode `0600` and the
+    /// handle appends. Without it, a missing file is `None`.
+    fn open(&self, create: bool) -> io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        if create {
+            options.append(true).create(true).mode(0o600);
+        }
+        let file = match options.open(&self.path) {
+            Ok(file) => file,
+            Err(err) if !create && err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let meta = file.metadata()?;
+        // SAFETY: geteuid reads the caller's effective uid. It has no side
+        // effects and cannot fail.
+        let own = unsafe { libc::geteuid() };
+        if !meta.is_file() || meta.uid() != own || meta.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a file that belongs to this user and is writable by this user only",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(Some((file, meta)))
+    }
+
     /// Appends `key` to the file and syncs it, so the registration
-    /// outlives this process.
+    /// outlives this process. A file whose last line has no newline, as an
+    /// interrupted write leaves it, gets one first, so the new key starts a
+    /// line of its own.
     fn append(&self, key: &str) -> io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.path)?;
-        file.write_all(format!("{key}\n").as_bytes())?;
+        use std::os::unix::fs::FileExt as _;
+        let Some((mut file, meta)) = self.open(true)? else {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        };
+        let mut record = String::new();
+        if meta.len() > 0 {
+            let mut last = [0_u8];
+            file.read_exact_at(&mut last, meta.len() - 1)?;
+            if last[0] != b'\n' {
+                record.push('\n');
+            }
+        }
+        record.push_str(key);
+        record.push('\n');
+        file.write_all(record.as_bytes())?;
         file.sync_data()
     }
 }
@@ -261,16 +289,23 @@ fn handle(
             let Ok(verifying) = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1) else {
                 return Reply::refused("the key is not a P-256 public key");
             };
-            let mut registry = registry.write().unwrap_or_else(PoisonError::into_inner);
+            let known = registry
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&handle::kid(&verifying));
             // The key is kept before it is registered, so a key the proxy
-            // accepts is a key the next start restores.
+            // accepts is a key the next start restores. The file write and
+            // its sync happen outside the registry lock, so handle checks do
+            // not wait on the disk. Two connections that race on one new key
+            // can both append it, and the restore registers it once.
             if let Some(keys) = keys
-                && !registry.contains(&handle::kid(&verifying))
+                && !known
                 && let Err(err) = keys.append(key)
             {
                 tracing::error!(path = %keys.path.display(), %err, "did not keep a client key registration");
                 return Reply::refused(format!("the proxy did not record the key: {err}"));
             }
+            let mut registry = registry.write().unwrap_or_else(PoisonError::into_inner);
             match registry.register(&sec1) {
                 Ok(kid) => {
                     tracing::info!(kid, "registered a client key");
@@ -553,9 +588,28 @@ mod tests {
             .open(client_keys_path(&path))
             .unwrap();
         file.write_all(b"not a key\n").unwrap();
+        // An interrupted write leaves a last line with no newline. The next
+        // key starts a line of its own, and the next start restores it.
+        file.write_all(b"torn").unwrap();
+        drop(file);
         let (restored, third) = start(&path);
         assert!(handle::verify(&jws, &restored.read().unwrap()).is_ok());
+        let next = p256::ecdsa::SigningKey::from_bytes(&[8u8; 32].into()).unwrap();
+        let next_reply = register(&path, &next).await;
+        assert!(next_reply.ok, "{next_reply:?}");
         stop(third).await;
+        let (restored, fourth) = start(&path);
+        assert!(restored.read().unwrap().contains(&next_reply.kid.unwrap()));
+        assert!(handle::verify(&jws, &restored.read().unwrap()).is_ok());
+        stop(fourth).await;
+
+        // A registrations file behind a symlink is refused at the bind.
+        let other = tempfile::tempdir().unwrap();
+        let linked = other.path().join("bep/control.sock");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(client_keys_path(&path), client_keys_path(&linked)).unwrap();
+        let err = Control::bind(&linked, Registry::default(), BoxRegistry::default()).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
     }
 
     // BEP-063: a client whose keychain refused its key registers a
