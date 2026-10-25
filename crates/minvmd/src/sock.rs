@@ -344,9 +344,9 @@ mod tests {
     /// The split-user design (T57) names each socket and file in the list
     /// below with an owner, a mode and the users that open it. The list
     /// covers the provider dir, its `vmm/` subdirectory, and the gvproxy
-    /// dir and gvproxy config dir that `minimal-gvproxy` reads from outside
-    /// the provider dir. The list is written by hand. A new socket that nobody adds to it does not fail
-    /// this test. A rename fails it only for a name the list takes from the
+    /// dir, gvproxy config dir and gate dir that `minimal-gvproxy` uses
+    /// outside the provider dir. The list is written by hand. A new socket
+    /// that nobody adds to it does not fail this test. A rename fails it only for a name the list takes from the
     /// code.
     #[test]
     fn split_user_provider_dir_design_names_every_socket_owner() {
@@ -384,10 +384,15 @@ mod tests {
         // with `bep serve` and only the egress gate reaches it (arch ruling
         // C1 and C2 on pull request #2546). Its switch socket sits in the
         // gvproxy dir, and `gvproxy.yaml` in the gvproxy config dir, both
-        // outside the provider dir.
+        // outside the provider dir. The egress gate and `switch::bep_host`
+        // run in an EGW process as `minimal-gvproxy` (Gatehouse 6.10 line
+        // 831, arch ruling at 4308298d). So the EGW process creates the gate
+        // socket in the gate dir, and dials `gvproxy-bep.sock` in the
+        // gvproxy config dir, which `minimal-vmm` cannot search.
         let vmm = |name: String| format!("vmm/{name}");
         let gvproxy_dir = |name: &str| format!("<gvproxy dir>/{name}");
         let gvproxy_config_dir = |name: &str| format!("<gvproxy config dir>/{name}");
+        let gate_dir = |name: &str| format!("<gate dir>/{name}");
         let required = [
             ("<provider dir>/".to_string(), LOGIN),
             ("<provider dir>/vmm/".to_string(), ROOT),
@@ -402,7 +407,11 @@ mod tests {
             (gvproxy_dir(&switch_sock), GVPROXY),
             (gvproxy_config_dir(""), ROOT),
             (gvproxy_config_dir(&gvproxy_yaml), LOGIN),
-            (file_name(crate::net::resolve_gate_sock().unwrap()), LOGIN),
+            (gate_dir(""), ROOT),
+            (
+                gate_dir(&file_name(crate::net::resolve_gate_sock().unwrap())),
+                GVPROXY,
+            ),
             (crate::control::GUEST_CONTROL_SOCK_FILE.to_string(), LOGIN),
             (
                 crate::guest_telemetry::GUEST_TELEMETRY_SOCK_FILE.to_string(),
@@ -410,9 +419,10 @@ mod tests {
             ),
             ("/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(), LOGIN),
             // `cmd/run.rs` names the proxy socket beside the switch socket
-            // with this literal. No constant carries it. It stays in the
-            // provider dir, out of the VM user's reach.
-            ("gvproxy-bep.sock".to_string(), LOGIN),
+            // with this literal. No constant carries it. It moves to the
+            // gvproxy config dir, where the EGW process can reach it and
+            // the VM user cannot.
+            (gvproxy_config_dir("gvproxy-bep.sock"), LOGIN),
             (crate::control::CONTROL_SOCK_FILE.to_string(), LOGIN),
         ];
 
