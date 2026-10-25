@@ -1053,9 +1053,18 @@ mod tests {
         for name in allowed {
             assert!(permitted.contains(name), "{name} is not permitted");
             let leaf = ca.issue_leaf(name, now()).unwrap();
-            assert!(validates(ca.root(), &leaf, name), "{name} does not validate");
+            assert!(
+                validates(ca.root(), &leaf, name),
+                "{name} does not validate"
+            );
         }
-        for name in ["localhost", "local", "home.arpa", "internal", "corp.internal"] {
+        for name in [
+            "localhost",
+            "local",
+            "home.arpa",
+            "internal",
+            "corp.internal",
+        ] {
             assert!(!denied(name), "{name} is denied");
         }
     }
