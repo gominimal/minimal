@@ -28,4 +28,5 @@ pub mod redeemer;
 pub mod revoke;
 pub mod seal;
 pub mod signin;
+pub mod store;
 pub mod upstream;
