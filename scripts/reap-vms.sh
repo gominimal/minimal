@@ -48,7 +48,13 @@ while [ "$#" -gt 0 ]; do
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
         usage
       fi
-      if [ "$1" = "--vm" ]; then VM="$2"; else ROOT="${2%/}"; fi
+      if [ "$1" = "--vm" ]; then
+        VM="$2"
+      else
+        # Every trailing slash goes, so `//` is refused as `/` is.
+        ROOT="$2"
+        while [ "${ROOT%/}" != "$ROOT" ]; do ROOT="${ROOT%/}"; done
+      fi
       shift 2
       ;;
     *)
@@ -56,7 +62,7 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-# `--root /` strips to nothing, and an empty root would match every minvmd and
+# `--root /` (or `//`) strips to nothing, and an empty root would match every minvmd and
 # gvproxy on the machine, under sudo too.
 if [ -z "$ROOT" ]; then
   echo "$0: --root must name a directory other than /" >&2
@@ -93,11 +99,16 @@ minvmd_pat() {
 
 # The `pkill -f` pattern for this checkout's gvproxy switches. A named VM's
 # switch is the one whose argv carries that VM's per-name socket directory.
+# `gvproxy` must sit in the executable's own path, the first word of the
+# cmdline, so the pattern is anchored at its start: `pkill -f` matches
+# anywhere, and a `bep serve` of this checkout names gvproxy only in its
+# listener's path, which can sit under the checkout too. gvproxy is spawned
+# from its full path, so its cmdline starts with it.
 gvproxy_pat() {
   if [ -n "$VM" ]; then
-    printf '%s/.*gvproxy.*local-minvmd[0-9]+/%s/' "$ROOT_RE" "$(ere_quote "$VM")"
+    printf '^%s/[^ ]*gvproxy.*local-minvmd[0-9]+/%s/' "$ROOT_RE" "$(ere_quote "$VM")"
   else
-    printf '%s/.*gvproxy' "$ROOT_RE"
+    printf '^%s/[^ ]*gvproxy' "$ROOT_RE"
   fi
 }
 

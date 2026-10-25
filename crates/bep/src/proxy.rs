@@ -200,9 +200,23 @@ impl Resolve for SystemResolver {
 pub trait AuditWriter: Send + Sync {
     /// Appends one record. A failure is the writer's to log.
     fn write(&self, decision: &Decision);
+
+    /// Appends one record and reports a failure to the caller, which logs
+    /// it. A writer that cannot fail keeps this default.
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.write(decision);
+        Ok(())
+    }
 }
 
 impl AuditWriter for Mutex<AuditLog> {
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(decision)
+            .map(drop)
+    }
+
     fn write(&self, decision: &Decision) {
         let mut log = self.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(err) = log.append(decision) {

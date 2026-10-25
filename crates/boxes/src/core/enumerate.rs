@@ -452,7 +452,7 @@ mod tests {
     fn fileset_resolve_errors_when_pattern_has_no_walk_root() {
         let fs = crate::core::primitives::FileSet::try_new("**/*.pem").unwrap();
         let (paths, errors) = fs.resolve(false);
-        assert!(paths.is_empty());
+        assert!(paths.is_empty(), "expected empty, got {paths:?}");
         assert_eq!(errors.len(), 1);
         assert!(
             matches!(
