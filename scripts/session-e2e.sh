@@ -12006,6 +12006,164 @@ proof_bep_first_slice_end_to_end() {
   echo "::endgroup::"
 }
 
+# A signing rotation under a running grant box (BEP-061, T52): one grant box
+# clones and pushes, `bep --rotate-signing` rotates the proxy's signing
+# certificate, and the same box clones and pushes again. The box is never
+# re-created: every step runs in the box id the activation printed, and the
+# case checks that the box is still listed under that id after the rotation.
+# `min box spec` prints the root CA fingerprint before and after the
+# rotation, and the two must match: a rotation changes the certificate below
+# the root, never the root the box trusts. The case needs the sign-in a
+# person made with `min auth login` and the private repository
+# E2E_BEP_PRIVATE_REPO, and records NOT RUN without them, as
+# bep_first_slice_end_to_end does. The clone meets the same known gap as
+# that case: no box ships a git credential helper until #2499 lands.
+proof_bep_signing_rotation_keeps_running_box_working() {
+  echo "::group::Box Egress Proxy signing rotation: a running grant box clones and pushes before and after"
+  local sr_case=bep_signing_rotation_keeps_running_box_working sr_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local sr_out sr_spec sr_root_before sr_root_after sr_round sr_step sr_branch sr_bep sr_ls
+  local sr_name=e2e-bep-signing-rotation
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  local sr_control="$HOME/.minimal/bep/control.sock"
+  if [ -z "$sr_repo" ]; then
+    not_run "$sr_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$sr_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$sr_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$sr_case" || { echo "::endgroup::"; return 0; }
+
+  # The bep binary the VM host daemon starts: MINVMD_BEP_BIN, else the bep
+  # beside minvmd (crates/minvmd/src/cmd/run.rs, resolve_bep_binary).
+  sr_bep="${MINVMD_BEP_BIN:-}"
+  if [ -z "$sr_bep" ]; then
+    sr_bep="$(command -v minvmd 2>/dev/null || true)"
+    sr_bep="${sr_bep%/*}/bep"
+  fi
+  if [ ! -x "$sr_bep" ]; then
+    echo "::error::no bep binary at '$sr_bep': set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+    fail
+  fi
+
+  # Not local: sr_cleanup and sr_fail read them.
+  SR_SID=""
+  sr_cleanup() {
+    [ -n "$SR_SID" ] && mnl session destroy --force "$SR_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sr_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    sr_cleanup
+    fail
+  }
+  # The root CA fingerprint from `min box spec` of the project ($1 = the
+  # round, for the error).
+  sr_root_fingerprint() {
+    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+      echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
+      cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    sr_spec="$(printf '%s\n' "$sr_spec" | tr -d '\r' \
+      | sed -n 's/^root CA  certificate \(SHA256:[0-9A-Fa-f:]*\)$/\1/p' | head -n1)"
+    if [ -z "$sr_spec" ]; then
+      echo "::error::'min box spec' of the grant project prints no root CA fingerprint $1 the rotation" >&2
+      return 1
+    fi
+    printf '%s\n' "$sr_spec"
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlrotate.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  sr_root_before="$(sr_root_fingerprint before)" || sr_fail
+  echo "root CA before the rotation: $sr_root_before"
+
+  # The grant box, headless: a sign-in prompt has no terminal to ask on.
+  sr_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$sr_name" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$sr_case.activate.err")" || {
+    echo "::error::'min session activate' of the grant box $sr_name failed"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    echo "--- stderr ---"; cat "$WORK/$sr_case.activate.err" 2>/dev/null || true
+    sr_fail
+  }
+  SR_SID="$(printf '%s\n' "$sr_out" | tail -n1 | tr -d '\r')"
+  echo "grant box: $SR_SID"
+
+  for sr_round in before after; do
+    if [ "$sr_round" = after ]; then
+      # The rotation, through the serving proxy's control socket.
+      if ! sr_out="$("$sr_bep" --rotate-signing --control "$sr_control" \
+        </dev/null 2>"$WORK/$sr_case.rotate.err")"; then
+        echo "::error::'bep --rotate-signing' failed"
+        cat "$WORK/$sr_case.rotate.err" 2>/dev/null || true
+        sr_fail
+      fi
+      if [[ "$sr_out" != "Signing certificate rotated from "* ]]; then
+        echo "::error::'bep --rotate-signing' did not report a rotation"
+        printf '%s\n' "$sr_out"
+        sr_fail
+      fi
+      echo "rotation: $sr_out"
+      # The same box, under the same id: the rotation re-created nothing.
+      # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit
+      # SIGPIPEs the pipeline under pipefail and fails a healthy box.
+      sr_ls="$(mnl ls </dev/null 2>/dev/null)"
+      sr_ls="${sr_ls//$'\r'/}"
+      if [[ "$sr_ls" != *"$SR_SID"* ]]; then
+        echo "::error::'min ls' does not list the grant box $SR_SID after the rotation"
+        printf '%s\n' "$sr_ls"
+        sr_fail
+      fi
+    fi
+    # Each step runs on its own, so a failure names the tool that failed. The
+    # prompt switch only keeps a refused git from waiting on a terminal: it
+    # gives git no credential.
+    sr_branch="e2e-bep-rotate-$sr_round-$(date +%s)-$$"
+    for sr_step in \
+      "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$sr_repo /tmp/bep-repo" \
+      "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$sr_branch" \
+      "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $sr_branch"; do
+      if ! mnl session exec "$SR_SID" sh -c "${sr_step#*:}" \
+        >"$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>&1; then
+        echo "::error::'git ${sr_step%%:*}' against $sr_repo failed in the grant box $sr_round the rotation"
+        cat "$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>/dev/null || true
+        sr_fail
+      fi
+      echo "git ${sr_step%%:*} $sr_round the rotation: OK"
+    done
+  done
+
+  sr_root_after="$(sr_root_fingerprint after)" || sr_fail
+  echo "root CA after the rotation: $sr_root_after"
+  if [ "$sr_root_after" != "$sr_root_before" ]; then
+    echo "::error::the root CA fingerprint changed across the signing rotation: $sr_root_before before, $sr_root_after after"
+    sr_fail
+  fi
+
+  sr_cleanup
+  rm -f "${WORK:?}/${sr_case:?}".*
+  echo "Box Egress Proxy signing rotation OK (the box $SR_SID cloned and pushed $sr_repo before and after the rotation, never re-created, root CA $sr_root_before unchanged)"
+  echo "::endgroup::"
+}
+
 # Logout proof (BEP-044): `min auth logout` deletes the sign-in item, and
 # every running box's next GitHub request is refused, while the boxes keep
 # running. Two boxes that declare a GitHub grant each answer `gh api user`
@@ -23897,6 +24055,7 @@ case "${1:-}" in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_git_and_gh_against_private_repo
     proof_bep_first_slice_end_to_end
+    proof_bep_signing_rotation_keeps_running_box_working
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
     proof_bep_root_ca_present_in_box_trust_store
@@ -23963,6 +24122,7 @@ case "${1:-}" in
     | bep_box_env_holds_sealed_value_only \
     | bep_git_and_gh_against_private_repo \
     | bep_first_slice_end_to_end \
+    | bep_signing_rotation_keeps_running_box_working \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
     | bep_root_ca_present_in_box_trust_store \
@@ -24008,6 +24168,7 @@ case "${1:-}" in
     echo "         bep_box_env_holds_sealed_value_only"
     echo "         bep_git_and_gh_against_private_repo"
     echo "         bep_first_slice_end_to_end"
+    echo "         bep_signing_rotation_keeps_running_box_working"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"

@@ -119,6 +119,8 @@ pub enum Command {
     Proxy(ProxyArgs),
     /// Sign in to GitHub, and show the sign-in that boxes use
     Auth(AuthArgs),
+    /// Store, list and remove the secrets that boxes reference by name
+    Secret(SecretArgs),
     /// Print that there is nothing to mint
     ///
     /// The HTTPS reverse proxy this verb once served is retired, so it
@@ -1217,6 +1219,61 @@ pub struct AuthLoginArgs {
     /// Sign in with a code entered at github.com, not in this browser
     #[arg(long)]
     pub device: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Store a secret in the host keychain under a name
+    ///
+    /// Reads the value from the terminal, or from standard input when it is
+    /// not a terminal. Prints only the name. Only the Box Egress Proxy reads
+    /// the stored value without a prompt.
+    Set(SecretSetArgs),
+    /// List the stored secrets and the rules that use them
+    ///
+    /// Never prints a value.
+    #[command(alias = "ls")]
+    List(SecretListArgs),
+    /// Remove a stored secret
+    Rm(SecretRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SecretSetArgs {
+    /// The name that box specs use for the secret
+    pub id: String,
+    /// The store to keep the secret in (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+    // Neither of these fields carries a value into the store: each one is
+    // here so that `set` refuses a value given on the command line with its
+    // own message (BEP-050), not with a generic usage error.
+    #[arg(hide = true)]
+    pub value: Option<String>,
+    #[arg(long = "env", alias = "from-env", value_name = "VAR", hide = true)]
+    pub env: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretListArgs {
+    /// The store to list (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretRmArgs {
+    /// The name of the secret to remove
+    pub id: String,
+    /// The store that holds the secret (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
 }
 
 /// Arguments for `min login`.
