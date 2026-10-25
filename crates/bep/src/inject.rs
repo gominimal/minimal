@@ -70,6 +70,26 @@ fn token(name: &str) -> bool {
         })
 }
 
+/// Whether `name` is a header that frames the message or is hop-by-hop
+/// (RFC 9110 section 7.6.1, RFC 9112). The parser checks these before
+/// injection, so an injected value in one of them reaches the upstream
+/// unchecked.
+fn framing(name: &str) -> bool {
+    const NAMES: [&str; 10] = [
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+}
+
 /// The header that `form` writes for `value`: its lowercase name and its
 /// value. `other` is the `basic_auth` field the box sent beside its sealed
 /// value, or empty.
@@ -78,7 +98,8 @@ fn token(name: &str) -> bool {
 ///
 /// [`INJECTION_INVALID`] when the value, the prefix or `other` holds a CR,
 /// LF or NUL byte, when a `user` value holds a `:`, or when the form names
-/// no valid header name or field.
+/// no valid header name or field. A framing or hop-by-hop header name, such
+/// as `content-length` or `connection`, is not a valid header name here.
 pub fn header_for(
     form: &Inject,
     value: &[u8],
@@ -90,7 +111,7 @@ pub fn header_for(
     match form {
         Inject::Header { name, prefix } => {
             let prefix = prefix.as_deref().unwrap_or("");
-            if !token(name) || !header_safe(prefix.as_bytes()) {
+            if !token(name) || framing(name) || !header_safe(prefix.as_bytes()) {
                 return Err(INJECTION_INVALID);
             }
             let mut out = Zeroizing::new(Vec::with_capacity(prefix.len() + value.len()));
@@ -326,5 +347,20 @@ mod tests {
             prefix: None,
         };
         assert_eq!(header_for(&name, b"k", b"").unwrap_err(), INJECTION_INVALID);
+        // A header that frames the message or is hop-by-hop is refused, so
+        // an injected value cannot change what the parser checked.
+        for framed in [
+            "Content-Length",
+            "transfer-encoding",
+            "HOST",
+            "connection",
+            "te",
+        ] {
+            let form = Inject::Header {
+                name: framed.into(),
+                prefix: None,
+            };
+            assert_eq!(header_for(&form, b"1", b"").unwrap_err(), INJECTION_INVALID);
+        }
     }
 }

@@ -324,10 +324,12 @@ pub trait Redeemer: Send + Sync {
     /// [`Self::redeem`]'s verdict.
     ///
     /// Interim: no redeemer in this crate returns [`Redeemed::Store`] yet,
-    /// because no store rule is read
-    /// (<https://github.com/gominimal/minimal/issues/2280>). This changes
+    /// so `bep serve` does not inject a store value
+    /// (<https://github.com/gominimal/minimal/issues/2586>). This changes
     /// when `BoxRedeemer` (`redeemer.rs`) overrides this method to return
-    /// [`Redeemed::Store`] for an admitted store member.
+    /// [`Redeemed::Store`] for an admitted store member, and `proxy.rs`
+    /// calls [`Flow::with_store`] with the host store. Remove this note
+    /// when both land.
     fn redeem_reference(
         &self,
         box_id: &str,
@@ -784,11 +786,10 @@ impl Flow {
     /// [`STORE_ITEM_UNREADABLE`].
     ///
     /// Interim: `bep serve` does not call this yet, so a served flow has no
-    /// store, with the store rules
-    /// (<https://github.com/gominimal/minimal/issues/2280>). This changes
-    /// when the `bep serve` path calls this method with the host store,
+    /// store (<https://github.com/gominimal/minimal/issues/2586>). This
+    /// changes when `proxy.rs` calls this method with the host store,
     /// together with the `BoxRedeemer` override of
-    /// [`Redeemer::redeem_reference`].
+    /// [`Redeemer::redeem_reference`]. Remove this note when both land.
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn ValueReader>) -> Self {
         self.store = Some(store);
