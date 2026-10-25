@@ -20,8 +20,9 @@
 //! The proxy keeps the registration across its restarts. The target is one
 //! local key that a [`ClientKeyStore`] keeps. When the store refuses this
 //! program that key, [`local_client_key`] replaces it. The proxy registers
-//! the replacement and revokes every other client key before the store
-//! keeps it, so no handle signed under the refused key verifies again.
+//! the replacement first. After the store keeps the replacement, the proxy
+//! revokes every other client key, so no handle signed under the refused
+//! key verifies again. A revoke that fails is retried at the next creation.
 //!
 //! Box creation reads that key from the host keychain
 //! ([`HostClientKeyStore`]), so every creation signs under one key and the
@@ -284,8 +285,8 @@ pub trait ClientKeyStore {
 /// new one. A store that refuses this program its key gets a replacement
 /// (BEP-063): the key signs handles only, and every mint registers the key
 /// it signs under, so the replacement needs no step from the operator. The
-/// proxy at [`control_path`] registers the replacement and revokes the key
-/// it replaces before the store keeps it.
+/// proxy at [`control_path`] registers the replacement before the store
+/// keeps it, and revokes the key it replaces after the store keeps it.
 ///
 /// # Errors
 ///
@@ -309,9 +310,12 @@ pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintErr
 ///    and the next creation tries again.
 /// 2. The store keeps the replacement. A store that fails leaves every old
 ///    key registered, so running boxes keep their store handles.
-/// 3. `replace_client_key` revokes every other key. A failure here leaves
-///    the replacement registered and in the store, and is logged at warn.
-///    The next creation finds the replacement in the store.
+/// 3. `replace_client_key` revokes every other key. Before this step, a
+///    pending-revoke file next to the control socket records the
+///    replacement's identifier, and a successful revoke removes the file.
+///    A failure here leaves the replacement registered and in the store,
+///    and is logged at warn. The next creation finds the replacement in the
+///    store and the pending file under its identifier, and revokes again.
 ///
 /// # Errors
 ///
@@ -325,8 +329,12 @@ pub fn local_client_key_at(
             MintError::KeyStore(detail)
         }
     };
+    let pending = pending_revoke_path(control);
     let replacing = match store.find() {
-        Ok(Some(key)) => return Ok(key),
+        Ok(Some(key)) => {
+            retry_pending_revoke(&key, control, &pending);
+            return Ok(key);
+        }
         Ok(None) => false,
         Err(ClientKeyError::Refused(detail)) => {
             tracing::warn!(%detail, "the keychain refused the client's signing key; replacing it");
@@ -338,19 +346,54 @@ pub fn local_client_key_at(
     if replacing {
         ControlClient::connect(control)?.register_client_key(&key)?;
     }
+    if replacing && let Err(error) = std::fs::write(&pending, key.kid()) {
+        // Without the file, a failed revoke below is not retried.
+        tracing::warn!(path = %pending.display(), %error, "did not record the pending client key revoke");
+    }
     store.replace(&key).map_err(store_error)?;
-    if replacing
-        && let Err(error) =
-            ControlClient::connect(control).and_then(|mut client| client.replace_client_key(&key))
-    {
-        tracing::warn!(
-            kid = %key.kid(),
-            %error,
-            "did not revoke the replaced client signing keys at the proxy"
-        );
+    if replacing {
+        revoke_others(&key, control, &pending);
     }
     tracing::info!(kid = %key.kid(), "made a new client signing key");
     Ok(key)
+}
+
+/// The file next to the control socket at `control` that names a kept
+/// replacement key whose revoke of the other keys did not finish.
+fn pending_revoke_path(control: &Path) -> PathBuf {
+    let mut name = control.as_os_str().to_owned();
+    name.push(".revoke-pending");
+    PathBuf::from(name)
+}
+
+/// Revokes every client key but `key` at the proxy at `control`, when the
+/// file at `pending` names `key`. A file that names another key is stale:
+/// that key is not in the store, so the file is removed.
+fn retry_pending_revoke(key: &ClientKey, control: &Path, pending: &Path) {
+    let Ok(named) = std::fs::read_to_string(pending) else {
+        return;
+    };
+    if named.trim() == key.kid() {
+        tracing::info!(kid = %key.kid(), "retrying the revoke of the replaced client signing keys");
+        revoke_others(key, control, pending);
+    } else {
+        let _ = std::fs::remove_file(pending);
+    }
+}
+
+/// Revokes every client key but `key` at the proxy at `control`, and
+/// removes the file at `pending` when the proxy records the revoke.
+fn revoke_others(key: &ClientKey, control: &Path, pending: &Path) {
+    match ControlClient::connect(control).and_then(|mut client| client.replace_client_key(key)) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(pending);
+        }
+        Err(error) => tracing::warn!(
+            kid = %key.kid(),
+            %error,
+            "did not revoke the replaced client signing keys at the proxy; the next creation tries again"
+        ),
+    }
 }
 
 /// The keychain item that keeps the client's key: its service.
@@ -1753,6 +1796,63 @@ mod tests {
         let err = local_client_key_at(&store, &refusing).unwrap_err();
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
         assert_eq!(*store.kept.borrow(), Some(*old.secret()));
+    }
+
+    /// A key store that refuses its key once, and that removes the proxy's
+    /// control socket when it keeps the replacement, so the revoke after
+    /// it does not reach the proxy.
+    struct RefusingThenUnlinking {
+        inner: RefusingOnce,
+        socket: PathBuf,
+    }
+
+    impl ClientKeyStore for RefusingThenUnlinking {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            self.inner.find()
+        }
+
+        fn replace(&self, key: &ClientKey) -> Result<(), ClientKeyError> {
+            std::fs::remove_file(&self.socket).unwrap();
+            self.inner.replace(key)
+        }
+    }
+
+    // BEP-063: a revoke that fails after the store keeps the replacement is
+    // retried at the next creation, so the replaced key does not stay
+    // registered.
+    #[test]
+    fn a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (runtime, _) = serve_control(&path);
+        let old = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&old)
+            .unwrap();
+        let store = RefusingThenUnlinking {
+            inner: RefusingOnce {
+                refused: RefCell::new(false),
+                kept: RefCell::new(Some(*old.secret())),
+            },
+            socket: path.clone(),
+        };
+
+        let replacement = local_client_key_at(&store, &path).unwrap();
+        drop(runtime);
+        let pending = pending_revoke_path(&path);
+        assert_eq!(
+            std::fs::read_to_string(&pending).unwrap(),
+            replacement.kid()
+        );
+
+        let (_restarted, clients) = serve_control(&path);
+        assert!(clients.read().unwrap().contains(&old.kid()));
+        let found = local_client_key_at(&store.inner, &path).unwrap();
+        assert_eq!(found.kid(), replacement.kid());
+        assert!(!clients.read().unwrap().contains(&old.kid()));
+        assert!(clients.read().unwrap().contains(&replacement.kid()));
+        assert!(!pending.exists());
     }
 
     /// A key store that refuses its key, and then fails to keep the
