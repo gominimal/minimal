@@ -718,6 +718,8 @@ pub struct ReadBatch {
     pub segments: Vec<PathBuf>,
     /// The lines that did not parse as a record, and were skipped.
     pub skipped: usize,
+    /// The segments that hold a skipped line, oldest first and each once.
+    pub skipped_in: Vec<PathBuf>,
 }
 
 /// A read-only reader over the log in one directory, across every
@@ -821,7 +823,12 @@ impl LogReader {
                         record,
                         line: line.to_owned(),
                     }),
-                    None => out.skipped += 1,
+                    None => {
+                        out.skipped += 1;
+                        if out.skipped_in.last() != Some(&path) {
+                            out.skipped_in.push(path.clone());
+                        }
+                    }
                 }
             }
             self.offsets

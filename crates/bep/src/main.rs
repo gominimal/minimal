@@ -645,6 +645,38 @@ impl Wiring {
     }
 }
 
+/// Refuses the start when the audit log holds a complete line that does not
+/// parse. That line can be a revocation, and a start without it redeems a
+/// value for a destroyed box (BEP-068). The partial last line of a torn
+/// write is cut when the log opens, so it is not counted here.
+fn refuse_unreadable(restored: &revoke::Restored) -> Result<(), String> {
+    if restored.skipped == 0 {
+        return Ok(());
+    }
+    tracing::error!(
+        skipped = restored.skipped,
+        segments = ?restored.unreadable,
+        "refused the start: audit log lines did not parse, and one can be a revocation"
+    );
+    let segments: Vec<String> = restored
+        .unreadable
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect();
+    let (lines, these) = if restored.skipped == 1 {
+        ("1 line".to_owned(), "that line")
+    } else {
+        (format!("{} lines", restored.skipped), "those lines")
+    };
+    Err(format!(
+        "bep did not start. The audit log has {lines} that bep cannot read, in:\n{}\n\
+         A line that bep cannot read can record a destroyed box. \
+         Without it, bep cannot keep refusing that box.\n\
+         Repair or remove {these}, then run `bep serve` again.",
+        segments.join("\n")
+    ))
+}
+
 /// `bep serve`: the listener and the control socket, until one fails.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn serve<K: CaKey + Send + Sync + 'static>(
@@ -668,13 +700,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         audit = %dir.display(),
         "restored the revocations recorded in the audit log"
     );
-    if restored.skipped != 0 {
-        tracing::warn!(
-            skipped = restored.skipped,
-            audit = %dir.display(),
-            "skipped audit log lines that did not parse; a revocation on one is not in force"
-        );
-    }
+    refuse_unreadable(&restored)?;
     let log = AuditLog::open_dir(&dir, audit::Rotation::default())
         .map_err(|err| format!("bep did not open the audit log in {}: {err}", dir.display()))?;
     let segment = log.path().to_path_buf();
@@ -1093,6 +1119,27 @@ mod tests {
     use super::*;
     use bep::ca::Leaf;
     use bep::proxy::LeafIssuer;
+
+    // BEP-068: a line that does not parse can be a revocation, so the start
+    // fails closed and names the segment that holds it.
+    #[test]
+    fn serve_refuses_start_on_unreadable_audit_line() {
+        assert_eq!(refuse_unreadable(&revoke::Restored::default()), Ok(()));
+        let restored = revoke::Restored {
+            box_ids: Vec::new(),
+            skipped: 2,
+            unreadable: vec![PathBuf::from("/audit/audit-0.jsonl")],
+        };
+        let err = refuse_unreadable(&restored).unwrap_err();
+        assert_eq!(
+            err,
+            "bep did not start. The audit log has 2 lines that bep cannot read, in:\n  \
+             /audit/audit-0.jsonl\n\
+             A line that bep cannot read can record a destroyed box. \
+             Without it, bep cannot keep refusing that box.\n\
+             Repair or remove those lines, then run `bep serve` again."
+        );
+    }
 
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.
     struct NoSigningKey;

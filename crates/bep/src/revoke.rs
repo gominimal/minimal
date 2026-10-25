@@ -31,6 +31,8 @@ pub struct Restored {
     /// The complete lines that did not parse as a record. Each one can be a
     /// revocation that is not in force after this start.
     pub skipped: usize,
+    /// The segments that hold a skipped line, oldest first.
+    pub unreadable: Vec<std::path::PathBuf>,
 }
 
 /// The box ids that the revocation records in every retained segment of
@@ -47,6 +49,7 @@ pub fn restore(dir: impl AsRef<Path>) -> io::Result<Restored> {
     Ok(Restored {
         box_ids,
         skipped: batch.skipped,
+        unreadable: batch.skipped_in,
     })
 }
 
@@ -438,6 +441,7 @@ mod tests {
         let restored = restore(&audit).unwrap();
         assert_eq!(restored.box_ids, vec![first]);
         assert_eq!(restored.skipped, 2);
+        assert_eq!(restored.unreadable, vec![segment]);
     }
 
     /// An audit writer whose every append fails, counting the attempts.
