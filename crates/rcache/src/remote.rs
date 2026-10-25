@@ -753,6 +753,9 @@ impl<B: FetchBackend> RemoteCache<B> {
         let mut resp = self.backend.execute(req).await?;
         // An error status must not reach the hasher: an error page is not an
         // artifact, and hashing it reports corruption where there is none.
+        // `error_for_status` classifies it here, so a refused status is a
+        // `Backend` error (retried as transient), where the index path keeps
+        // `Fetch { status }` and leaves a 4xx alone; both ride out a 5xx.
         if !resp.is_success() {
             let status = resp.status_code();
             return Err(match resp.error_for_status() {
@@ -788,11 +791,17 @@ impl<B: FetchBackend> RemoteCache<B> {
     /// bytes, gone on refetch. Persistent corruption pays the backoff and
     /// then surfaces as the same loud HashMismatch. Local I/O errors and a
     /// spec absent from the index are not retried.
+    /// Whether a fetch failure is worth another try: a transport failure, a
+    /// corrupt download, or a status the remote may well answer differently
+    /// next time (a 5xx, or 429). A 4xx is an answer, not an outage: a 401,
+    /// 403 or 404 comes back the same way every time, so retrying one costs
+    /// the whole backoff and then reports "try again shortly" for a refusal.
     fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
-        matches!(
-            e,
-            Error::Backend(_) | Error::Fetch { .. } | Error::HashMismatch { .. }
-        )
+        match e {
+            Error::Backend(_) | Error::HashMismatch { .. } => true,
+            Error::Fetch { status } => *status >= 500 || *status == 429,
+            _ => false,
+        }
     }
 
     /// Download the given spec hash into the local cache. Transient fetch
@@ -1548,6 +1557,42 @@ mod tests {
         );
         // Initial attempt + DEFAULT_FETCH_RETRIES retries.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// A 4xx is the remote's answer, not an outage: one call, no backoff, and
+    /// the status itself surfaces rather than "try again shortly".
+    #[tokio::test(start_paused = true)]
+    async fn index_fetch_4xx_is_not_retried() {
+        let (spec_hash, sha256) = (SpecHash::from_bytes([0x07; 32]), [0x42; 32]);
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        let backend = MockBackend::new(responses).script(
+            &format!("mock://cache/{INDEX_FILENAME}"),
+            vec![(403, b"forbidden".to_vec()), (403, b"forbidden".to_vec())],
+        );
+        let calls = backend.calls.clone();
+
+        let err = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Fetch { status: 403 }),
+            "expected Fetch(403), got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a refusal is not retried"
+        );
     }
 
     #[tokio::test]
