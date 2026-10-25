@@ -250,70 +250,18 @@ impl GvproxyConfig {
     /// Write the gvproxy `-config` YAML for the configured subnet with the given
     /// static `leases`, creating the parent directory if needed.
     ///
-    /// BEP-047: the file is created fresh, never through a symlink, with
-    /// mode 0640. Its group is `minimal-gvproxy` when this process holds
-    /// that group, so gvproxy's own user can read it and not change it.
-    /// A stale copy that this user owns is removed first. An entry with
-    /// another owner, or a symlink, is refused.
-    ///
     /// # Errors
     ///
     /// Returns the I/O error if the parent directory or the file cannot be
-    /// written, or `PermissionDenied` when the path holds an entry that is
-    /// a symlink or has another owner.
+    /// written.
     pub fn write_config(&self, leases: &[(Ipv4Addr, MacAddr)]) -> io::Result<()> {
-        self.write_config_with(
-            leases,
-            crate::sock::held_group_gid(crate::sock::GVPROXY_USER),
-        )
-    }
-
-    /// [`write_config`](Self::write_config) with the group to set, `None`
-    /// to keep the group the file gets at creation.
-    fn write_config_with(
-        &self,
-        leases: &[(Ipv4Addr, MacAddr)],
-        group: Option<u32>,
-    ) -> io::Result<()> {
-        use std::io::Write as _;
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-
         if let Some(dir) = self.config_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        match std::fs::symlink_metadata(&self.config_path) {
-            Ok(meta) => {
-                // SAFETY: geteuid has no preconditions and cannot fail.
-                let euid = unsafe { libc::geteuid() };
-                if meta.file_type().is_symlink() || meta.uid() != euid {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "{} is a symlink or has owner uid {}, not this user's; \
-                             refusing to replace it",
-                            self.config_path.display(),
-                            meta.uid()
-                        ),
-                    ));
-                }
-                std::fs::remove_file(&self.config_path)?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o640)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&self.config_path)?;
-        if let Some(gid) = group {
-            std::os::unix::fs::fchown(&file, None, Some(gid))?;
-        }
-        // The umask can clear bits of the create mode, never add any, so
-        // set the mode on the descriptor to have exactly 0640.
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o640))?;
-        file.write_all(render_gvproxy_config(self.subnet, leases).as_bytes())
+        std::fs::write(
+            &self.config_path,
+            render_gvproxy_config(self.subnet, leases),
+        )
     }
 
     /// Spawn and begin supervising the gvproxy switch process (R1.4), returning
@@ -1204,48 +1152,6 @@ mod tests {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(yaml.contains("dhcpStaticLeases:"));
         assert!(yaml.contains("{}"));
-    }
-
-    /// BEP-047: `gvproxy.yaml` is 0640 with the gvproxy user's group, is
-    /// rewritten over a stale copy, and is never written through a symlink.
-    #[test]
-    fn gvproxy_config_is_written_0640_with_the_gvproxy_group() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let config_dir = dir.path().join("gvproxy-config");
-        let cfg = GvproxyConfig::new(
-            PathBuf::from("/usr/bin/gvproxy"),
-            dir.path().join("gvproxy/gvproxy-switch.sock"),
-        )
-        .with_config_path(config_dir.join("gvproxy.yaml"));
-        // The test stands in this process's own group for `minimal-gvproxy`.
-        // SAFETY: getegid has no preconditions and cannot fail.
-        let gid = unsafe { libc::getegid() };
-        let stale = config_dir.join("gvproxy.yaml");
-        std::fs::create_dir_all(&config_dir).expect("config dir");
-        std::fs::write(&stale, "stale").expect("stale copy");
-        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666))
-            .expect("stale mode");
-
-        cfg.write_config_with(&[], Some(gid)).expect("write config");
-        let meta = std::fs::symlink_metadata(cfg.config_path()).expect("stat config");
-        assert!(meta.file_type().is_file());
-        assert_eq!(meta.mode() & 0o7777, 0o640);
-        assert_eq!(meta.gid(), gid);
-        let body = std::fs::read_to_string(cfg.config_path()).expect("read config");
-        assert!(body.contains("dhcpStaticLeases:"), "{body}");
-
-        // A symlink at the path is refused, and its target is untouched.
-        let target = dir.path().join("target");
-        std::fs::write(&target, "keep").expect("target");
-        std::fs::remove_file(cfg.config_path()).expect("remove config");
-        std::os::unix::fs::symlink(&target, cfg.config_path()).expect("symlink");
-        let err = cfg
-            .write_config_with(&[], Some(gid))
-            .expect_err("symlink refused");
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(std::fs::read_to_string(&target).expect("target"), "keep");
     }
 
     #[test]

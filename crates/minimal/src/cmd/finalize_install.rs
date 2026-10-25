@@ -520,7 +520,9 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
             items.extend(linux::userns_item_on_this_host());
         }
         if global.use_minvmd() {
-            items.push(linux::vm_users_item_on_this_host());
+            // BEP-047: the vm-users item is not offered until minvmd starts
+            // the VM and gvproxy through `sudo -n` (T66, #2566). Its drop-in
+            // names subcommands minvmd does not have at this head.
             items.push(linux::kvm_item_on_this_host());
         } else {
             items.push(linux::classifier_item_on_this_host(global));
@@ -1364,7 +1366,9 @@ pub(crate) mod linux {
     /// The sudoers drop-in. Its name has no `.`, so `sudo` reads it.
     pub(crate) const SUDOERS_DROP_IN: &str = "/etc/sudoers.d/minimal-vm";
     /// A world-readable copy of the drop-in: `/etc/sudoers.d` is not
-    /// readable by the login, so the probe compares this copy.
+    /// readable by the login, so the probe compares this copy. The gap is
+    /// accepted: a drop-in that root deletes or edits while the copy stays
+    /// reads as done, and the `sudo -n` spawn then fails and says so.
     pub(crate) const VM_USERS_RECORD: &str = "/var/lib/minimal/finalize-install-vm-users";
     /// The root-owned base of the gvproxy, gvproxy config and gate dirs.
     pub(crate) const VM_USERS_BASE: &str = "/var/lib/minimal";
@@ -1374,6 +1378,10 @@ pub(crate) mod linux {
     pub(crate) const STOP_SUBCOMMAND: &str = "__stop-group";
     /// The `minvmd` subcommand of the VMM child.
     pub(crate) const VMM_SUBCOMMAND: &str = "__krun-vmm";
+    /// The test that follows every `cd -P` in the script: `..` is the
+    /// directory the walk was in, by device and inode. The caller ends it
+    /// with the message, `" >&2; exit 1; }`.
+    const CD_PARENT_CHECK: &str = "[ \"$(stat -c %d:%i ..)\" = \"$here\" ] || { echo \"";
 
     /// One directory as `lstat` reads it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1468,12 +1476,16 @@ pub(crate) mod linux {
 
     /// `arg` escaped for a sudoers command line: `\`, `,`, `:` and `=`
     /// take a backslash. `None` when it holds a character no rule can carry
-    /// as one literal argument.
+    /// as one literal argument: whitespace, a control character, a quote,
+    /// `#`, or one of the sudoers wildcard and negation characters `*`, `?`,
+    /// `[`, `]` and `!`, which make a rule match more than one command line.
     pub(crate) fn sudoers_arg(arg: &str) -> Option<String> {
         if arg.is_empty()
-            || arg
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"' | '#'))
+            || arg.chars().any(|c| {
+                c.is_whitespace()
+                    || c.is_control()
+                    || matches!(c, '\'' | '"' | '#' | '*' | '?' | '[' | ']' | '!')
+            })
         {
             return None;
         }
@@ -1561,11 +1573,15 @@ pub(crate) mod linux {
             here.push('/');
             here.push_str(name);
             // The login can swap the entry for a symlink between the `-L`
-            // test and the `cd`, so the physical path is checked after it:
-            // `.` is then the directory at the path, whatever was swapped.
+            // test and the `cd`. So the device and inode of `.` are kept
+            // before the `cd`, and `..` must have them after it: the `cd`
+            // went one level down from where the walk was. The physical
+            // path is checked too.
             walk.push_str(&format!(
                 "  [ ! -L '{name}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                 \x20 here=$(stat -c %d:%i .)\n\
                  \x20 cd -P -- '{name}'\n\
+                 \x20 {CD_PARENT_CHECK}{provider}: a component moved\" >&2; exit 1; }}\n\
                  \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 owner=$(stat -c %u .)\n\
                  \x20 {want} || {{ echo \"{provider}: a component has another owner\" >&2; exit 1; }}\n"
@@ -1583,8 +1599,14 @@ pub(crate) mod linux {
              getent group {GVPROXY_USER} >/dev/null || groupadd --system {GVPROXY_USER}\n\
              getent passwd {GVPROXY_USER} >/dev/null || useradd --system --gid {GVPROXY_USER} \
              --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {GVPROXY_USER}\n\
-             gpasswd -M '{op}' {VMM_USER} >/dev/null\n\
-             gpasswd -M '{op}' {GVPROXY_USER} >/dev/null\n\
+             # Each group has one login member. Another member stops the script\n\
+             # here, and nobody is removed from a group.\n\
+             for group in {VMM_USER} {GVPROXY_USER}; do\n\
+             \x20 members=$(getent group \"$group\" | cut -d: -f4)\n\
+             \x20 [ -z \"$members\" ] || [ \"$members\" = '{op}' ] || \
+             {{ echo \"group $group already has the members $members\" >&2; exit 1; }}\n\
+             \x20 gpasswd -a '{op}' \"$group\" >/dev/null\n\
+             done\n\
              # The provider dir and its vmm/ subdirectory, reached from / one checked\n\
              # component at a time and checked with pwd -P; only . is changed.\n\
              (\n\
@@ -1595,7 +1617,9 @@ pub(crate) mod linux {
              \x20 chmod 0710 .\n\
              \x20 [ -e vmm ] || mkdir -m 0700 vmm\n\
              \x20 [ ! -L vmm ] || {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             \x20 here=$(stat -c %d:%i .)\n\
              \x20 cd -P vmm\n\
+             \x20 {CD_PARENT_CHECK}{provider}/vmm moved\" >&2; exit 1; }}\n\
              \x20 [ \"$(pwd -P)\" = '{here}/vmm' ] || \
              {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 owner=$(stat -c %u .)\n\
@@ -1676,10 +1700,49 @@ pub(crate) mod linux {
             );
         };
 
+        // The script walks into the provider dir and does not create it.
+        if !facts.provider.is_some_and(|f| f.is_dir) {
+            return Item::cannot(
+                VM_USERS_ID,
+                VM_USERS_LABEL,
+                format!(
+                    "{} does not exist yet, so there is no VM directory to set up. minvmd \
+                     creates it the first time the VM starts",
+                    facts.layout.provider_dir.display()
+                ),
+            );
+        }
+
         let vmm = passwd_ids(&facts.passwd, VMM_USER);
         let gvp = passwd_ids(&facts.passwd, GVPROXY_USER);
         let vmm_group = group_entry(&facts.group, VMM_USER);
         let gvp_group = group_entry(&facts.group, GVPROXY_USER);
+        // The design gives each group one login member. Another member is
+        // never removed: the item refuses and names it.
+        for (name, entry) in [(VMM_USER, &vmm_group), (GVPROXY_USER, &gvp_group)] {
+            let others: Vec<&str> = entry
+                .iter()
+                .flat_map(|(_, members)| members.iter())
+                .map(String::as_str)
+                .filter(|m| m != op)
+                .collect();
+            if !others.is_empty() {
+                let member = match others.as_slice() {
+                    [one] => *one,
+                    _ => "<member>",
+                };
+                return Item::cannot(
+                    VM_USERS_ID,
+                    VM_USERS_LABEL,
+                    format!(
+                        "the {name} group already has other members: {}. The group can have \
+                         one login member only. Remove each one with `sudo gpasswd -d {member} \
+                         {name}`, then run `min finalize-install` again",
+                        others.join(", ")
+                    ),
+                );
+            }
+        }
         let one_member = |entry: &Option<(u32, Vec<String>)>| {
             entry
                 .as_ref()
@@ -1766,6 +1829,9 @@ pub(crate) mod linux {
     }
 
     /// [`vm_users_item_over`] this host's reads, for the default VM.
+    // BEP-047: not offered until T66 (#2566) spawns through `sudo -n`, so
+    // no caller exists at this head. T66 adds the caller back.
+    #[allow(dead_code)]
     pub(crate) fn vm_users_item_on_this_host() -> Item {
         let operator = crate::resolver::operator_name();
         let provider_dir = paths::provider_instance_dir(
@@ -2854,8 +2920,9 @@ mod tests {
         for line in [
             "getent group minimal-vmm >/dev/null || groupadd --system minimal-vmm\n",
             "getent group minimal-gvproxy >/dev/null || groupadd --system minimal-gvproxy\n",
-            "gpasswd -M 'alice' minimal-vmm >/dev/null\n",
-            "gpasswd -M 'alice' minimal-gvproxy >/dev/null\n",
+            "for group in minimal-vmm minimal-gvproxy; do\n",
+            "  [ -z \"$members\" ] || [ \"$members\" = 'alice' ] || ",
+            "  gpasswd -a 'alice' \"$group\" >/dev/null\n",
             "  chgrp minimal-vmm .\n  chmod 0710 .\n",
             "  chown minimal-vmm:minimal-vmm .\n  chmod 0750 .\n",
             "install -d -o minimal-gvproxy -g minimal-gvproxy -m 0750 \
@@ -2885,6 +2952,27 @@ mod tests {
             "missing {vmm_check:?} in:\n{script}"
         );
         assert!(!script.contains("chmod 0710 /home"), "{script}");
+        // No member list is replaced, so no other login is removed.
+        assert!(!script.contains("gpasswd -M"), "{script}");
+        // A swap between the `-L` test and the `cd -P` moves the walk out
+        // of the directory it was in. Every `cd -P` keeps the inode of `.`
+        // first and requires it at `..` after.
+        let lines: Vec<&str> = script.lines().collect();
+        let cds: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].trim_start().starts_with("cd -P"))
+            .collect();
+        assert_eq!(cds.len(), 8, "seven components and vmm:\n{script}");
+        for i in cds {
+            assert_eq!(lines[i - 1].trim(), "here=$(stat -c %d:%i .)", "{script}");
+            assert!(
+                lines[i + 1]
+                    .trim()
+                    .starts_with("[ \"$(stat -c %d:%i ..)\" = \"$here\" ] || { echo \""),
+                "no parent check after {:?} in:\n{script}",
+                lines[i]
+            );
+            assert!(lines[i + 1].ends_with("\" >&2; exit 1; }"), "{script}");
+        }
 
         let drop_in = sudoers_drop_in(
             "alice",
@@ -2945,15 +3033,9 @@ mod tests {
             ..fresh.clone()
         };
         assert_eq!(vm_users_item_over(&finished).state, ItemState::Done);
-        // A second login member, a gate dir without setgid, or a stale
-        // drop-in each make the step run again.
+        // A gate dir without setgid, a provider dir at the wrong mode, or a
+        // stale drop-in each make the step run again.
         for broken in [
-            VmUsersFacts {
-                group: finished
-                    .group
-                    .replace("minimal-vmm:x:990:alice", "minimal-vmm:x:990:alice,bob"),
-                ..finished.clone()
-            },
             VmUsersFacts {
                 gate_dir: dir(991, 990, 0o710),
                 ..finished.clone()
@@ -2978,7 +3060,39 @@ mod tests {
         assert_eq!(blocked.state, ItemState::Cannot);
         assert!(blocked.script.is_none());
         assert!(root_owned_binary(Path::new("/nonexistent/minvmd")).is_err());
+        // Another login in a group is never removed: the item refuses and
+        // names it, and runs nothing.
+        let shared = VmUsersFacts {
+            group: finished
+                .group
+                .replace("minimal-vmm:x:990:alice", "minimal-vmm:x:990:alice,bob"),
+            ..finished.clone()
+        };
+        let refused = vm_users_item_over(&shared);
+        assert_eq!(refused.state, ItemState::Cannot);
+        assert!(refused.script.is_none());
+        let cause = refused.cause.unwrap();
+        assert!(
+            cause.contains("the minimal-vmm group already has other members: bob."),
+            "{cause}"
+        );
+        assert!(
+            cause.contains("`sudo gpasswd -d bob minimal-vmm`"),
+            "{cause}"
+        );
+        // No provider dir yet: the script has nothing to walk into, so the
+        // item refuses, and the rest of the plan still runs.
+        let no_provider = VmUsersFacts {
+            provider: None,
+            ..fresh.clone()
+        };
+        let not_yet = vm_users_item_over(&no_provider);
+        assert_eq!(not_yet.state, ItemState::Cannot);
+        assert!(not_yet.script.is_none());
         assert_eq!(sudoers_arg("a b"), None);
+        for wild in ["/opt/m*/minvmd", "/opt/m?", "/opt/[ab]", "!minvmd"] {
+            assert_eq!(sudoers_arg(wild), None, "{wild}");
+        }
         assert_eq!(sudoers_arg("x=1,y:2").as_deref(), Some("x\\=1\\,y\\:2"));
     }
 }

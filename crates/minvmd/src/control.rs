@@ -1341,11 +1341,17 @@ fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
     check_peer_uid(peer_uid(stream)?)
 }
 
-/// The uid of the VM user, `minimal-vmm`, read once: `None` on a host
-/// without that user.
+/// The uid of the VM user, `minimal-vmm`: `None` on a host without that
+/// user. A uid found is kept for the process lifetime. A miss is not kept,
+/// so a daemon that starts before `min finalize-install` creates the user
+/// admits it on the next connection.
 fn vmm_uid() -> Option<u32> {
-    static VMM_UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *VMM_UID.get_or_init(|| crate::sock::user_uid(crate::sock::VMM_USER))
+    static VMM_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(uid) = VMM_UID.get() {
+        return Some(*uid);
+    }
+    let uid = crate::sock::user_uid(crate::sock::VMM_USER)?;
+    Some(*VMM_UID.get_or_init(|| uid))
 }
 
 /// Whether a guest door admits `peer_uid`: the daemon's own uid, or the
