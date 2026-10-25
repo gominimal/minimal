@@ -1256,11 +1256,28 @@ impl BoxLauncher for SandboxLauncher {
             .filter(|d| !d.is_empty());
         // BEP-011: the env build adds the trust variables below these, once
         // it knows whether the box's packages ship a CA bundle.
+        //
+        // BEP-015: a box whose grant gave it the git credential helper gets
+        // the helper as git's sole helper for the grant hosts, at command
+        // scope, which git reads after every configuration file. The pairs
+        // follow any that the composition sets.
+        let mut connection = attach_env.connection;
+        let first_git_config = composition_vars
+            .iter()
+            .chain(&connection)
+            .rev()
+            .find(|(key, _)| key == "GIT_CONFIG_COUNT")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        connection.extend(crate::box_actor::bep_git_helper::launch_git_config_env(
+            paths.home.as_utf8_path().as_std_path(),
+            first_git_config,
+        ));
         let env_vars = layer_session_env(
             session_baseline_env(&name, loadouts_display),
             attach_env.inherited,
             composition_vars,
-            attach_env.connection,
+            connection,
         );
         // Which shell this attach starts is decided from the composed
         // `SHELL` (see `crate::attach_shell`). Read before `env_vars`

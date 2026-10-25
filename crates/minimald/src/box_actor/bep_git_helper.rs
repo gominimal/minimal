@@ -9,14 +9,16 @@
 //! value in it, and the proxy puts the credential in its place
 //! (`bep::forward::substitute`).
 //!
-//! The helper's configuration goes in a file of its own, which the box's
-//! XDG git configuration includes. The daemon rewrites that file on every
-//! start of the box, and adds the include line once. A start without a
-//! usable grant removes the helper and that file. The box's own
-//! `~/.gitconfig` is never touched, so a composition that ships one keeps
-//! it.
+//! The helper must be git's sole helper for those hosts, so a `store` or
+//! `cache` helper that the box configures never gets the sealed value. git
+//! reads its command-scope configuration (`GIT_CONFIG_COUNT`) after every
+//! configuration file. So the launch puts the entries of
+//! [`launch_git_config_env`] in the box environment: for each host, an
+//! empty `helper` that clears the list, and then the shipped helper. No git
+//! configuration file in the box is touched. The daemon rewrites the helper
+//! on every start of the box. A start without a usable grant removes it.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -28,30 +30,85 @@ pub(crate) const HELPER_DIR_REL: &str = ".local/state/minimal";
 /// The helper script, relative to the box's home.
 pub(crate) const HELPER_REL: &str = ".local/state/minimal/git-credential-minimal";
 
-/// The git configuration that names the helper, relative to the box's home.
+/// A copy of the configuration that names the helper, relative to the
+/// box's home. git does not read it: the launch sets the same entries in
+/// the box environment. It is there for a person in the box to read.
 pub(crate) const HELPER_CONFIG_REL: &str = ".local/state/minimal/git-credential.gitconfig";
 
 /// The helper's log, relative to the box's home: one line per answer,
 /// naming the host and never the value.
 pub(crate) const HELPER_LOG_REL: &str = ".local/state/minimal/git-credential.log";
 
-/// The box's XDG git configuration, relative to its home. git reads it
-/// beside `~/.gitconfig`.
-pub(crate) const XDG_GIT_CONFIG_REL: &str = ".config/git/config";
+/// The hosts the helper answers for: the GitHub module's host set
+/// (`bep::module::GITHUB`), each authority as git names it in a URL. The
+/// port is left out when it is the HTTPS port. The proxy admits a sealed
+/// value only for these authorities, so the helper answers for no other.
+pub(crate) fn grant_hosts() -> Vec<String> {
+    bep::module::GITHUB
+        .hosts
+        .iter()
+        .map(|authority| {
+            if authority.port == bep::module::HTTPS_PORT {
+                authority.host.to_string()
+            } else {
+                format!("{}:{}", authority.host, authority.port)
+            }
+        })
+        .collect()
+}
 
-/// The include line [`install`] adds to the XDG git configuration.
-const INCLUDE_LINE: &str = "\tpath = ~/.local/state/minimal/git-credential.gitconfig";
+/// The git configuration entries that make the shipped helper git's sole
+/// helper for each grant host: an empty `helper`, which clears the helpers
+/// that git read before it, and then the shipped helper.
+fn helper_entries() -> Vec<(String, String)> {
+    grant_hosts()
+        .into_iter()
+        .flat_map(|host| {
+            let key = format!("credential.https://{host}.helper");
+            [
+                (key.clone(), String::new()),
+                (key, format!("!\"$HOME/{HELPER_REL}\"")),
+            ]
+        })
+        .collect()
+}
 
-/// The GitHub module's v1 host set, as `bep::module::GITHUB` holds it. The
-/// daemon does not link the `bep` crate, so the hosts are repeated here.
-/// The proxy admits a sealed value only for these hosts, so the helper
-/// answers for no other.
-pub(crate) const GRANT_HOSTS: &[&str] = &[
-    "github.com",
-    "api.github.com",
-    "uploads.github.com",
-    "codeload.github.com",
-];
+/// The command-scope git configuration a launch puts in the environment of
+/// the box with home `home` (BEP-015): `GIT_CONFIG_COUNT` and a
+/// `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` pair for each entry of
+/// [`helper_entries`]. The pairs start at index `first`, so the entries that
+/// the box environment already holds stay in front of them. Empty when the
+/// box home holds no helper that [`install`] wrote, so a box without a
+/// usable grant keeps its own helpers.
+pub(crate) fn launch_git_config_env(home: &Path, first: usize) -> Vec<(String, String)> {
+    if !is_installed(home) {
+        return Vec::new();
+    }
+    let entries = helper_entries();
+    let mut env = Vec::with_capacity(entries.len() * 2 + 1);
+    for (offset, (key, value)) in entries.into_iter().enumerate() {
+        let index = first + offset;
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value));
+    }
+    let count = first + env.len() / 2;
+    env.push(("GIT_CONFIG_COUNT".to_string(), count.to_string()));
+    tracing::debug!(
+        hosts = ?grant_hosts(),
+        "set the git credential helper as the sole helper for the grant hosts"
+    );
+    env
+}
+
+/// Whether the box home `home` holds the helper as a regular file, under
+/// directories that are not symbolic links.
+fn is_installed(home: &Path) -> bool {
+    let Ok(Some(dir)) = real_dir(home, HELPER_DIR_REL, false) else {
+        return false;
+    };
+    std::fs::symlink_metadata(dir.join(file_name(HELPER_REL)))
+        .is_ok_and(|meta| meta.file_type().is_file())
+}
 
 /// What [`install`] did.
 #[derive(Debug, PartialEq, Eq)]
@@ -66,8 +123,9 @@ pub(crate) enum Installed {
     Written,
 }
 
-/// Writes the git credential helper and its `credential.helper` lines into
-/// the box home `home`, when the box holds a GitHub grant. The first
+/// Writes the git credential helper and a readable copy of its
+/// `credential.helper` entries into the box home `home`, when the box holds
+/// a GitHub grant. [`launch_git_config_env`] gives git those entries. The first
 /// delivery's sealed value is the placeholder the helper answers with.
 /// The client builds a delivery only from a GitHub grant
 /// (`sealed_deliveries` in `min box create`), so any one of them is
@@ -112,19 +170,16 @@ pub(crate) fn install(
         helper_config().as_bytes(),
         0o644,
     )?;
-    let xdg_dir = made_dir(home, parent_rel(XDG_GIT_CONFIG_REL))?;
-    include_helper_config(&xdg_dir.join(file_name(XDG_GIT_CONFIG_REL)))?;
     tracing::debug!(
         variable = %delivery.variable,
-        hosts = ?GRANT_HOSTS,
+        hosts = ?grant_hosts(),
         "wrote the git credential helper for the GitHub grant"
     );
     Ok(Installed::Written)
 }
 
 /// Removes the helper and its configuration that an earlier start wrote, so
-/// a box that holds no usable grant has no helper that answers. The include
-/// line stays: git ignores an include of a file that does not exist.
+/// a box that holds no usable grant has no helper that answers.
 fn remove_helper(home: &Path) -> std::io::Result<()> {
     let Some(dir) = real_dir(home, HELPER_DIR_REL, false)? else {
         return Ok(());
@@ -142,11 +197,6 @@ fn remove_helper(home: &Path) -> std::io::Result<()> {
 /// The last component of the home-relative path `rel`.
 fn file_name(rel: &str) -> &str {
     rel.rsplit_once('/').map_or(rel, |(_, name)| name)
-}
-
-/// The home-relative path `rel` without its last component.
-fn parent_rel(rel: &str) -> &str {
-    rel.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 /// [`real_dir`] with `create`: the directory `home/rel`, made when absent.
@@ -201,9 +251,17 @@ fn is_inert(sealed: &str) -> bool {
 /// `https` request to a grant host, and stays silent for anything else, so
 /// git asks its next helper or gives up.
 fn helper_script(sealed: &str) -> String {
-    let hosts = GRANT_HOSTS
+    let hosts = bep::module::GITHUB
+        .hosts
         .iter()
-        .flat_map(|host| [host.to_string(), format!("{host}:443")])
+        .flat_map(|authority| {
+            let with_port = format!("{}:{}", authority.host, authority.port);
+            if authority.port == bep::module::HTTPS_PORT {
+                vec![authority.host.to_string(), with_port]
+            } else {
+                vec![with_port]
+            }
+        })
         .collect::<Vec<_>>()
         .join("|");
     format!(
@@ -235,48 +293,23 @@ exit 0
     )
 }
 
-/// The configuration that names the helper, one section per grant host,
-/// so git asks the helper for those hosts only.
+/// The readable copy of [`helper_entries`], in git configuration syntax.
 fn helper_config() -> String {
-    let mut config =
-        String::from("# Written by minimald for this box's GitHub grant. Edits are lost.\n");
-    for host in GRANT_HOSTS {
+    let mut config = String::from(
+        "# Written by minimald for this box's GitHub grant. Edits are lost.\n\
+         # git reads these entries from GIT_CONFIG_COUNT in the box environment, not from this file.\n",
+    );
+    for (key, value) in helper_entries() {
+        let (section, name) = key
+            .strip_prefix("credential.")
+            .and_then(|rest| rest.rsplit_once('.'))
+            .unwrap_or(("", "helper"));
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
         config.push_str(&format!(
-            "[credential \"https://{host}\"]\n\thelper = \"!\\\"$HOME/{HELPER_REL}\\\"\"\n"
+            "[credential \"{section}\"]\n\t{name} = \"{value}\"\n"
         ));
     }
     config
-}
-
-/// Adds the include of the helper's configuration to the git configuration
-/// at `path`, once. Lines already in the file stay as they are. The open
-/// does not follow a symbolic link, and a file that is not a regular file
-/// is refused.
-fn include_helper_config(path: &Path) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    let mut existing = String::new();
-    file.read_to_string(&mut existing)?;
-    if existing.lines().any(|line| line == INCLUDE_LINE) {
-        return Ok(());
-    }
-    let separator = if existing.is_empty() || existing.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    write!(file, "{separator}[include]\n{INCLUDE_LINE}\n")
 }
 
 /// Writes `body` to a new file in `dir` with mode `mode`, and renames it

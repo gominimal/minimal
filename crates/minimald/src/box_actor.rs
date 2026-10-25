@@ -56,7 +56,7 @@ mod kind;
 // messages stay here.
 mod attach;
 // BEP-015: the git credential helper a GitHub grant box carries.
-mod bep_git_helper;
+pub(crate) mod bep_git_helper;
 mod handle;
 mod host;
 mod launcher;
