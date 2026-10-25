@@ -12282,9 +12282,11 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   # Leg 1: the steered A lookup fails closed.
   ds_ans="$(ds_dns api.github.com 1)"
   echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
+  ds_a_gap=""
   if [ "${ds_ans%% *}" = 2 ]; then
     echo "steered A lookup: SERVFAIL while the proxy is down"
   else
+    ds_a_gap=1
     known_gap "$ds_case" "the steered A lookup of api.github.com got '${ds_ans:-no reply}', not SERVFAIL: the relay's DNS gate is not wired to the steering yet (https://github.com/gominimal/minimal/issues/2523)"
   fi
 
@@ -12330,7 +12332,13 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   rm -f "${WORK:?}/${ds_case:?}".*
 
   ds_cleanup
-  echo "DNS steering fails closed: AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  # The closing line claims a full pass only when leg 1 got SERVFAIL. With
+  # the known gap, the steered A lookup did not fail closed.
+  if [ -n "$ds_a_gap" ]; then
+    echo "DNS steering does not fail closed yet: the steered A lookup got no SERVFAIL (known gap). AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  else
+    echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  fi
   echo "::endgroup::"
 }
 
