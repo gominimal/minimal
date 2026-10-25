@@ -365,13 +365,29 @@ impl ClientKeyStore for HostClientKeyStore {
     }
 }
 
+/// How long a keychain tool can run. The tool can wait on an unlock or
+/// access prompt that nobody answers, as in an SSH session, and box
+/// creation must not wait for it forever.
+const KEY_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Runs a keychain tool with `stdin` on its standard input, and gives its
-/// output.
+/// output. A tool that runs past `timeout` is killed. The child is reaped
+/// on every path.
 fn run_key_tool(
+    tool: &str,
+    cmd: std::process::Command,
+    stdin: Option<&str>,
+) -> Result<std::process::Output, ClientKeyError> {
+    run_key_tool_within(tool, cmd, stdin, KEY_TOOL_TIMEOUT)
+}
+
+fn run_key_tool_within(
     tool: &str,
     mut cmd: std::process::Command,
     stdin: Option<&str>,
+    timeout: Duration,
 ) -> Result<std::process::Output, ClientKeyError> {
+    use std::io::Read as _;
     use std::process::Stdio;
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
@@ -387,13 +403,70 @@ fn run_key_tool(
             ClientKeyError::Store(format!("`{tool}` did not start: {error}"))
         }
     })?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input.as_bytes())
-            .map_err(|error| ClientKeyError::Store(error.to_string()))?;
+    let stop = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take())
+        && let Err(error) = pipe.write_all(input.as_bytes())
+    {
+        drop(pipe);
+        stop(&mut child);
+        return Err(ClientKeyError::Store(format!(
+            "`{tool}` did not take its input: {error}"
+        )));
     }
-    child
-        .wait_with_output()
-        .map_err(|error| ClientKeyError::Store(error.to_string()))
+    // The pipes are read on their own threads, so a full pipe never stops
+    // the tool while this thread waits on the deadline.
+    let reader = |pipe: Option<Box<dyn io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = reader(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn io::Read + Send>),
+    );
+    let stderr = reader(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn io::Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                stop(&mut child);
+                let _ = (stdout.join(), stderr.join());
+                return Err(ClientKeyError::Store(format!(
+                    "`{tool}` did not finish in {} seconds. The keychain can be locked, \
+                     or it can wait for an answer to a prompt",
+                    timeout.as_secs()
+                )));
+            }
+            Err(error) => {
+                stop(&mut child);
+                let _ = (stdout.join(), stderr.join());
+                return Err(ClientKeyError::Store(error.to_string()));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// The text a keychain tool printed on its standard error.
@@ -469,6 +542,7 @@ mod host_key {
 
 #[cfg(not(target_os = "macos"))]
 mod host_key {
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use zeroize::Zeroize as _;
@@ -480,8 +554,29 @@ mod host_key {
 
     const SECRET_TOOL: &str = "secret-tool";
 
+    /// The system directories `secret-tool` is taken from. The tool sees
+    /// the client's key, so it is never found through `PATH`, where a
+    /// project directory can put a program of the same name first.
+    const SYSTEM_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/run/current-system/sw/bin"];
+
+    /// The first `secret-tool` in [`SYSTEM_DIRS`].
+    fn secret_tool() -> Result<Command, ClientKeyError> {
+        trusted_tool(&SYSTEM_DIRS).map(Command::new).ok_or_else(|| {
+            ClientKeyError::Store(format!(
+                "`{SECRET_TOOL}` is not installed in {}",
+                SYSTEM_DIRS.join(", ")
+            ))
+        })
+    }
+
+    pub(super) fn trusted_tool(dirs: &[&str]) -> Option<PathBuf> {
+        dirs.iter()
+            .map(|dir| Path::new(dir).join(SECRET_TOOL))
+            .find(|path| path.is_file())
+    }
+
     pub(super) fn find() -> Result<Option<Vec<u8>>, ClientKeyError> {
-        let mut cmd = Command::new(SECRET_TOOL);
+        let mut cmd = secret_tool()?;
         cmd.args([
             "lookup",
             "service",
@@ -504,7 +599,7 @@ mod host_key {
 
     pub(super) fn store(secret: &str) -> Result<(), ClientKeyError> {
         // The Secret Service replaces the item whose attributes all match.
-        let mut cmd = Command::new(SECRET_TOOL);
+        let mut cmd = secret_tool()?;
         cmd.args([
             "store",
             &format!("--label={CLIENT_KEY_LABEL}"),
@@ -1427,6 +1522,44 @@ mod tests {
         assert_eq!(first.kid(), second.kid());
         assert!(clients.read().unwrap().contains(&first.kid()));
         assert_eq!(kept_registrations(&path), vec![first.public()]);
+    }
+
+    // A keychain tool that waits on a prompt nobody answers is killed at
+    // the deadline, and creation gets an error, not a hang.
+    #[test]
+    fn a_key_tool_past_its_deadline_is_killed() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_key_tool_within("sleep", cmd, None, Duration::from_millis(200)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            matches!(&err, ClientKeyError::Store(detail) if detail.contains("did not finish")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_tool_gives_its_output_and_takes_its_input() {
+        let cmd = std::process::Command::new("cat");
+        let out = run_key_tool_within("cat", cmd, Some("secret"), Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"secret");
+    }
+
+    // The tool that sees the client's key is taken from a system directory,
+    // never from a `PATH` entry.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn secret_tool_is_taken_from_the_listed_directories_only() {
+        let listed = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let tool = listed.path().join("secret-tool");
+        std::fs::write(&tool, b"").unwrap();
+        let listed_dir = listed.path().to_str().unwrap();
+        let empty_dir = empty.path().to_str().unwrap();
+        assert_eq!(host_key::trusted_tool(&[empty_dir]), None);
+        assert_eq!(host_key::trusted_tool(&[empty_dir, listed_dir]), Some(tool));
     }
 
     // BEP-063: a key the keychain refuses this program is replaced, kept for
