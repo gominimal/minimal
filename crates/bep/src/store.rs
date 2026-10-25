@@ -212,8 +212,9 @@ impl SecretStore for MemorySecretStore {
 /// The value goes in hexadecimal (`-X`), so no character of it needs
 /// quoting, and it goes on the tool's standard input, never on a command
 /// line. `-T` names the proxy. Without `-A`, every other application
-/// prompts. `-U` replaces an item held under `id` in place. The caller
-/// zeroizes the line.
+/// prompts. The line has no `-U`: an update in place keeps the access
+/// control of the item held under `id`, so the caller removes that item
+/// first. The caller zeroizes the line.
 ///
 /// # Errors
 ///
@@ -230,7 +231,7 @@ pub fn keychain_add_line(id: &str, value: &[u8], proxy: &Path) -> Result<String,
     }
     // `id` is checked by `valid_id`, so it needs no quoting.
     let line = format!(
-        "add-generic-password -U -s {SERVICE} -a {id} -l \"Minimal secret {id}\" -T \"{proxy_text}\" -X {hex}\n"
+        "add-generic-password -s {SERVICE} -a {id} -l \"Minimal secret {id}\" -T \"{proxy_text}\" -X {hex}\n"
     );
     hex.zeroize();
     Ok(line)
@@ -360,13 +361,32 @@ mod host {
 
     pub(super) fn set(id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
         let mut line = keychain_add_line(id, value, proxy)?;
+        // An update in place keeps the old item's access control, so the
+        // old item goes first and the new one carries a fresh one.
+        if let Err(e) = remove(id) {
+            line.zeroize();
+            return Err(e);
+        }
         let out = run("store the secret", &["-i"], Some(&line));
         line.zeroize();
         let out = out?;
-        // `security -i` can exit 0 after a refused command, so read its
-        // stderr too.
-        if !out.status.success() || !out.stderr.is_empty() {
+        if !out.status.success() {
             return Err(refused("store the secret", &out.stderr));
+        }
+        // `security -i` can exit 0 after a refused command, and it can warn
+        // on stderr after a write that succeeded. So the item itself, read
+        // back with its access control, decides the result.
+        let stored = list(proxy)?
+            .iter()
+            .any(|item| item.id == id && item.proxy_access);
+        if !stored {
+            let mut err = refused("store the secret", &out.stderr);
+            if let StoreError::Refused { detail, .. } = &mut err
+                && detail.is_empty()
+            {
+                *detail = "the keychain holds no item for it that the proxy can read".into();
+            }
+            return Err(err);
         }
         Ok(())
     }

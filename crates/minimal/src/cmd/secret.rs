@@ -558,6 +558,8 @@ sentry
             "{line}"
         );
         assert!(!words.contains(&"-A"), "{line}");
+        // An update in place keeps the old access control, so no `-U`.
+        assert!(!words.contains(&"-U"), "{line}");
         assert!(!line.contains("sk-ant"), "{line}");
         assert!(line.trim_end().ends_with("-X 736b2d616e74"), "{line}");
         assert!(keychain_add_line("claude", b"v", Path::new("/a\"b/bep")).is_err());
