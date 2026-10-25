@@ -12021,7 +12021,7 @@ proof_bep_first_slice_end_to_end() {
 proof_bep_signing_rotation_keeps_running_box_working() {
   echo "::group::Box Egress Proxy signing rotation: a running grant box clones and pushes before and after"
   local sr_case=bep_signing_rotation_keeps_running_box_working sr_repo="${E2E_BEP_PRIVATE_REPO:-}"
-  local sr_out sr_spec sr_root_before sr_root_after sr_round sr_step sr_branch sr_bep
+  local sr_out sr_spec sr_root_before sr_root_after sr_round sr_step sr_branch sr_bep sr_ls
   local sr_name=e2e-bep-signing-rotation
   # This reads the real home, as bep_live_gate does.
   # shellcheck disable=SC2031
@@ -12123,9 +12123,13 @@ proof_bep_signing_rotation_keeps_running_box_working() {
       fi
       echo "rotation: $sr_out"
       # The same box, under the same id: the rotation re-created nothing.
-      if ! mnl ls </dev/null 2>/dev/null | tr -d '\r' | grep -qF -- "$SR_SID"; then
+      # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit
+      # SIGPIPEs the pipeline under pipefail and fails a healthy box.
+      sr_ls="$(mnl ls </dev/null 2>/dev/null)"
+      sr_ls="${sr_ls//$'\r'/}"
+      if [[ "$sr_ls" != *"$SR_SID"* ]]; then
         echo "::error::'min ls' does not list the grant box $SR_SID after the rotation"
-        mnl ls </dev/null 2>&1 || true
+        printf '%s\n' "$sr_ls"
         sr_fail
       fi
     fi
